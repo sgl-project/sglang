@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -327,8 +327,6 @@ class LightVAEEncoder(nn.Module):
         z_dim: int = 16,
         pruning_rate: float = 0.75,
         temperal_downsample: tuple[bool, bool, bool] = (False, True, True),
-        fp8_state_path: str | None = None,
-        fp8_required: bool = False,
     ) -> None:
         super().__init__()
         self.latents_mean = list(latents_mean)
@@ -352,11 +350,9 @@ class LightVAEEncoder(nn.Module):
         self.eval().requires_grad_(False)
         self.to(dtype=dtype)
 
-        # Normalization buffers consumed by the native FP8 staged-state
-        # builder (``build_lightvae_encoder_fp8_staged_state`` reads .mean and
-        # .inv_std). Real tensors (moved with .to(device/dtype) by the loader);
-        # ``persistent=False`` keeps them out of state_dict (strict=False load
-        # ignores them anyway).
+        # Per-channel latent normalization buffers (consumed by callers that
+        # need the raw mean / inv_std). ``persistent=False`` keeps them out of
+        # state_dict (strict=False load ignores them anyway).
         self.register_buffer(
             "mean",
             torch.tensor(self.latents_mean, dtype=torch.float32).reshape(-1),
@@ -367,9 +363,6 @@ class LightVAEEncoder(nn.Module):
             (1.0 / torch.tensor(self.latents_std, dtype=torch.float32)).reshape(-1),
             persistent=False,
         )
-
-        # FP8 state path kept for backward compat; native CUDA removed.
-        # Always uses PyTorch eager path (encode is ~5% of total time).
 
     def enable_tiling(self, *args, **kwargs) -> None:  # encode/decode-stage no-op
         return None

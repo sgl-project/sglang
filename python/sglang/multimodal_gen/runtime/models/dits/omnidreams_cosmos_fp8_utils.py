@@ -575,7 +575,9 @@ def prepare_cosmos_quantized_streaming_weights(
     fallback tensors.
     """
 
-    from cosmos_weights import prepare_cosmos_streaming_weights
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_cosmos_weights import (
+        prepare_cosmos_streaming_weights,
+    )
 
     selected_rel_keys = set(
         resolve_cosmos_fp8_linear_policy(

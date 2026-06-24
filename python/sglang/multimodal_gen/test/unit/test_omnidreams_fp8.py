@@ -1,101 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU unit tests for the OmniDreams native FP8 acceleration glue.
+"""CPU unit tests for the OmniDreams FP8 weight utilities (Phase 1).
 
-The native CUDA kernels are `sm_120`-only and cannot run here, so these tests
-cover the CPU-runnable surfaces:
+Phase 1 removed the vendored native CUDA FP8 DiT tree. These tests cover the
+CPU-runnable surfaces that remain:
 
-* The FP8 weight-prep core (``cosmos_fp8_utils`` per-output-channel E4M3
-  quant -> uint8 RCR bytes + per-channel scale) and FP8 linear-key compatibility
-  with SGLang's ``OmniDreamsDiT`` state dict (verifies the near-identity mapping).
-* The native acceleration strategy reports *unavailable* cleanly on CPU, so
-  ``build_fp8_dit`` returns None and the AR loop falls back to the eager DiT.
+* The FP8 weight-prep core (relocated ``omnidreams_cosmos_fp8_utils``
+  per-output-channel E4M3 quant -> uint8 RCR bytes + per-channel scale) and FP8
+  linear-key compatibility with SGLang's ``OmniDreamsDiT`` state dict.
+* ``prepare_fp8_dit_weights`` unfuses the fused ``to_qkv`` into q/k/v before
+  quantization (byte-identical to the pre-refactor split path).
+* Config three-state validation + ``auto``/``required`` back-compat alias
+  mapping + component-config rehydration.
 
-The vendored python helpers are loaded via the native loader; tests ``skip`` if
-the vendored tree is absent.
+The native-ext / CUDA-source-text / LightVAE-FP8-state tests were deleted with
+the native tree.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
-
-
-def _load_helper(name: str):
-    try:
-        from sglang.multimodal_gen.native.singleview_loader import load_python_module
-
-        return load_python_module(name)
-    except Exception as e:  # noqa: BLE001
-        pytest.skip(f"vendored native helper {name!r} unavailable: {e}")
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[5]
-
-
-def _read_src(*parts: str) -> str:
-    """Read a sglang-diffusion source file (path relative to python/sglang/multimodal_gen)."""
-    return (_repo_root() / "python" / "sglang" / "multimodal_gen" / Path(*parts)).read_text()
-
-
-# --------------------------------------------------------------------------- #
-# Native loader / strategy (CPU = unavailable -> fallback)                     #
-# --------------------------------------------------------------------------- #
-def test_native_extension_unavailable_on_cpu():
-    """load_extension() succeeds on CUDA sm_120, returns None on CPU."""
-    from sglang.multimodal_gen.native import load_extension
-
-    ext = load_extension()
-    if torch.cuda.is_available():
-        assert ext is not None, "native extension should load on CUDA sm_120"
-    else:
-        assert ext is None, "native extension should be unavailable on CPU-only"
-
-
-def test_build_fp8_dit_returns_none_on_cpu():
-    """build_fp8_dit(mode='auto') returns FP8 DiT on CUDA when a pre-quantized
-    weight file is available; returns None without one (auto-opt-out)."""
-    import torch as _t
-
-    from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
-    from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
-    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import build_fp8_dit
-
-    cfg = OmniDreamsDiTConfig()
-    with _t.device("meta"):
-        dit = OmniDreamsDiT(config=cfg, hf_config={})
-    # Without a fp8_prepared_path, mode=auto should return None
-    result = build_fp8_dit(dit, cfg.arch_config, mode="auto")
-    if torch.cuda.is_available():
-        pass  # build_fp8_dit may return None without fp8_prepared_path on GPU too
-    else:
-        assert result is None, "FP8 DiT should be unavailable on CPU-only"
-
-
-def test_build_fp8_dit_required_raises_on_cpu():
-    """build_fp8_dit(mode='required') raises FileNotFoundError without a
-    pre-quantized weight file."""
-    from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
-    from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
-    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import build_fp8_dit
-
-    cfg = OmniDreamsDiTConfig()
-    with torch.device("meta"):
-        dit = OmniDreamsDiT(config=cfg, hf_config={})
-    # required mode without fp8_prepared_path → FileNotFoundError
-    with pytest.raises(FileNotFoundError, match="FP8 prepared weights not found"):
-        build_fp8_dit(dit, cfg.arch_config, mode="required")
 
 
 # --------------------------------------------------------------------------- #
 # FP8 weight-prep core (CPU)                                                   #
 # --------------------------------------------------------------------------- #
 def test_cosmos_fp8_per_out_channel_quant_rcr_contract():
-    u = _load_helper("cosmos_fp8_utils")
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_cosmos_fp8_utils import (
+        quantize_fp8_per_out_channel,
+    )
+
     w = torch.randn(256, 512)
-    out = u.quantize_fp8_per_out_channel(w)
+    out = quantize_fp8_per_out_channel(w)
     wq, scale = (out[0], out[1]) if isinstance(out, tuple) else (out, None)
     # Native RCR contract: raw E4M3 bytes as uint8 [out, in] + per-out scale.
     assert wq.dtype == torch.uint8 and tuple(wq.shape) == (256, 512)
@@ -103,9 +39,11 @@ def test_cosmos_fp8_per_out_channel_quant_rcr_contract():
 
 
 def test_fp8_linear_keys_compatible_with_sglang_dit():
-    u = _load_helper("cosmos_fp8_utils")
     from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
     from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_cosmos_fp8_utils import (
+        cosmos_block_fp8_linear_keys,
+    )
 
     with torch.device("meta"):
         dit = OmniDreamsDiT(config=OmniDreamsDiTConfig(), hf_config={})
@@ -119,7 +57,7 @@ def test_fp8_linear_keys_compatible_with_sglang_dit():
     # v_proj) while SGLang's DiT fuses them into to_qkv.  The quantizer will fuse
     # them internally; we check that all non-self-attn-proj keys match the SGLang
     # state dict.
-    req = set(u.cosmos_block_fp8_linear_keys(28))
+    req = set(cosmos_block_fp8_linear_keys(28))
     non_self_attn_proj = {
         k for k in req
         if "qkv_proj" not in k
@@ -160,8 +98,8 @@ def test_prepare_fp8_dit_weights_unfuses_to_qkv_into_qkv_proj():
     state dict (commit 5dff6576c merged self-attn q/k/v into MergedColumnParallelLinear).
 
     Before the fix ``prepare_fp8_dit_weights`` raised KeyError on the missing
-    split ``q_proj``; now it unfuses ``to_qkv`` -> q/k/v, lets the vendored
-    Cosmos prep rebuild ``qkv_proj`` (fp8), and drops the dead ``to_qkv``.
+    split ``q_proj``; now it unfuses ``to_qkv`` -> q/k/v, lets the Cosmos prep
+    rebuild ``qkv_proj`` (fp8), and drops the dead ``to_qkv``.
     """
     from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
         prepare_fp8_dit_weights,
@@ -226,116 +164,81 @@ def test_prepare_fp8_dit_weights_unfused_matches_split_path_bytes():
                 assert torch.equal(got_fused[sk], got_split[sk]), f"scale mismatch: {sk}"
 
 
-def test_sgl_fp8_colscale_wraps_half_scales_before_float_conversion():
-    """Prepared FP8 DiT weight scales are stored as fp16, so the shim must not
-    reinterpret the scale buffer as fp32 before passing it to sgl-kernel."""
-
-    source = _read_src(
-        "native", "omnidreams_singleview", "src", "dit_streaming", "kernels",
-        "sgl_gemm_shim.cuh",
+# --------------------------------------------------------------------------- #
+# Phase 2: FP8-compute linears + CPU fallback                                  #
+# --------------------------------------------------------------------------- #
+def test_fp8_compute_method_matmul_matches_bf16_within_fp8_tolerance():
+    """OmniDreamsFP8ComputeLinearMethod.apply (rowwise _scaled_mm) must produce
+    output within FP8 e4m3 tolerance of the bf16 reference GEMM. GPU-only: the
+    rowwise torch._scaled_mm path needs CUDA + float8_e4m3fn support."""
+    if not torch.cuda.is_available() or not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("FP8 _scaled_mm requires CUDA + float8_e4m3fn")
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+        OmniDreamsFP8ComputeLinearMethod,
     )
 
-    assert "opts_f16 = torch::TensorOptions().dtype(torch::kFloat16)" in source
-    assert (
-        "torch::from_blob(const_cast<void*>(colscale_ptr), {N}, opts_f16).to(torch::kFloat32)"
-        in source
-    )
-    assert "torch::from_blob(const_cast<void*>(colscale_ptr), {N}, opts_f32)" not in source
+    torch.manual_seed(0)
+    N, K, M = 64, 128, 32
+    weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.3
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.3
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    method = OmniDreamsFP8ComputeLinearMethod()
+    out_fp8 = method.apply(layer, x, bias=None)
+    ref = (x.float() @ weight.float().t()).to(torch.bfloat16)
+    # FP8 e4m3 has 3 mantissa bits; per-token/per-channel scales keep drift small.
+    max_abs_err = (out_fp8.float() - ref.float()).abs().max().item()
+    assert max_abs_err < 0.5, f"fp8_compute drift too large: {max_abs_err}"
+    assert out_fp8.shape == (M, N)
 
 
-def test_sgl_fp8_bare_gemm_returns_half_for_half_post_ops():
-    """Bare FP8 GEMM feeds half scratch buffers before CUDA post-op kernels, so
-    it must return fp16 rather than bf16 bytes. The raw FP8 accumulation is
-    prescaled to avoid overflowing fp16 before the post-op scale restores it."""
+def test_install_fp8_compute_on_dit_is_noop_on_cpu():
+    """fp8_compute must gracefully fall back to bf16 on CPU (no _scaled_mm):
+    install_fp8_compute_on_dit returns False and leaves the DiT linears intact.
 
-    source = _read_src(
-        "native", "omnidreams_singleview", "src", "dit_streaming", "kernels",
-        "sgl_gemm_shim.cuh",
-    )
-
-    bare_start = source.index("inline at::Tensor sgl_linear_rcr_fp8_bare")
-    bare_body = source[bare_start:]
-
-    assert "torch::kFloat16" in bare_body
-    assert "float prescale_alpha = 1.0f" in bare_body
-    assert "torch::full({M}, prescale_alpha, opts_f32)" in bare_body
-    assert "return fp8_scaled_mm(a8, b8.t(), ones_a, ones_b, torch::kFloat16" in bare_body
-
-
-def test_linear_utils_fp8_weight_scale_paths_prescale_before_half_post_ops():
-    """Generic FP8 linear helpers use half scratch post-op kernels too; every
-    weight_scale fallback must prescale the raw FP8 GEMM and compensate in the
-    post-op scale multiplier."""
-
-    source = _read_src(
-        "native", "omnidreams_singleview", "src", "dit_streaming", "kernels",
-        "linear_utils.cuh",
-    )
-
-    assert "(no prescale)" not in source
-    assert source.count("k_fp8_linear_prescale_alpha") >= 4
-    assert source.count("k_fp8_linear_scale_mul") >= 4
-
-
-def test_native_loader_prebuilt_fast_path_is_fingerprint_scoped():
-    """The native loader must not load arbitrary stale extension hashes when the
-    source fingerprint changes."""
-
-    source = _read_src("native", "singleview_loader.py")
-
-    assert "prebuilt = _load_prebuilt_extension(extension_name)" in source
-    assert 'f"{extension_name}/{extension_name}.so"' in source
-    assert "_load_prebuilt_extension(locals().get(\"extension_name\"))" in source
-
-
-def test_streaming_dit_fp8_test_helpers_use_same_prescale_contract():
-    """Native test helpers should exercise the same prescaled bare-GEMM contract
-    as the production FP8 paths."""
-
-    source = _read_src(
-        "native", "omnidreams_singleview", "src", "dit_streaming", "pyext",
-        "streaming_dit_bridge.cu",
-    )
-
-    assert source.count("N, in_features, out_features, prescale_alpha") >= 3
-    assert "N, in_features, out_features, 1.0f / 128.0f" in source
-    assert source.count("output_scale_mul") >= 4
-
-
-def test_streaming_dit_fp8_attention_test_helpers_are_exported():
-    """Attention probes are needed to isolate native FP8 quality regressions."""
-
-    source = _read_src(
-        "native", "omnidreams_singleview", "src", "dit_streaming",
-        "streaming_dit_bindings.cpp",
-    )
-
-    for name in (
-        "cosmos_test_fp8_sdpa_selection",
-        "cosmos_test_fp8_dense_ref_sdpa",
-        "cosmos_test_fp8_cudnn_sdpa",
-        "cosmos_test_fp8_attention_backend",
-    ):
-        assert f'"{name}"' in source
-
-
-def test_sglang_fp8_wrapper_uses_fp8_runtime_contract():
-    """The SGLang fast-path wrapper bypasses the vendored executor's
-    _ensure_fp8_runtime(), so it must inject the same FP8 attention/KV config.
+    Only meaningful on CPU-only hosts; on a CUDA host the install proceeds (and
+    is exercised by the GPU E2E test instead), so skip here.
     """
+    if torch.cuda.is_available():
+        pytest.skip("CPU fallback assertion only runs on CPU-only hosts")
+    from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+        install_fp8_compute_on_dit,
+    )
 
-    source = _read_src("runtime", "models", "dits", "omnidreams_fp8.py")
+    with torch.device("meta"):
+        dit = OmniDreamsDiT(config=OmniDreamsDiTConfig(), hf_config={})
+    installed = install_fp8_compute_on_dit(dit)
+    assert installed is False, "install must be a no-op on CPU"
+    assert not getattr(dit, "_fp8_compute_applied", False)
 
-    assert 'else "fp8_cudnn"' in source
-    assert '"cosmos_kv_cache_backend": "fp8"' in source
-    assert '"cosmos_attn_tc_scale_is_ones": True' in source
-    assert '"cosmos_quantized_prepared_strict": True' in source
-    assert 'extra_config["k_self_fp8_caches"]' in source
-    assert '_PY_TO_CPP_ATTN = {"cudnn": "cudnn_bf16"}' not in source
+
+def test_sage3_self_attn_falls_back_to_sdpa_on_cpu():
+    """The sage3 resolver must return None (-> sdpa fallback) on CPU and for
+    unsupported head dims, so the DiT self-attn stays correct off-GPU."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
+        _sage3_self_attn,
+    )
+
+    q = torch.randn(1, 4, 8, 128)
+    k = torch.randn(1, 4, 8, 128)
+    v = torch.randn(1, 4, 8, 128)
+    # CPU input -> None (caller falls back to F.sdpa).
+    assert _sage3_self_attn(q, k, v, "sage3") is None
+    # backend="sdpa" -> None regardless.
+    assert _sage3_self_attn(q, k, v, "sdpa") is None
+    # Unsupported head_dim (33) -> None even if cuda path would otherwise run.
+    if not torch.cuda.is_available():
+        q2 = torch.randn(1, 4, 8, 33)
+        k2 = torch.randn(1, 4, 8, 33)
+        v2 = torch.randn(1, 4, 8, 33)
+        assert _sage3_self_attn(q2, k2, v2, "sage3") is None
 
 
 # --------------------------------------------------------------------------- #
-# LightVAE FP8 encode fallback + state round-trip + mean/inv_std buffers       #
+# LightVAE mean/inv_std buffers                                                #
 # --------------------------------------------------------------------------- #
 def _find_ckpt(env_key: str, *names: str) -> str | None:
     import os as _os
@@ -349,102 +252,6 @@ def _find_ckpt(env_key: str, *names: str) -> str | None:
             if _os.path.isfile(cand):
                 return cand
     return None
-
-
-def test_light_vae_fp8_falls_back_to_pytorch_on_cpu():
-    """On CPU, native FP8 path is skipped (x.is_cuda gate) → PyTorch path used."""
-    from sglang.multimodal_gen.runtime.models.vaes.omnidreams_light_vae import (
-        LightVAEEncoder,
-    )
-
-    ckpt = _find_ckpt("SGLANG_OMNIDREAMS_LIGHTVAE_CKPT", "lightvaew2_1.pth")
-    if ckpt is None:
-        pytest.skip("lightvaew2_1.pth not found")
-    enc = LightVAEEncoder(
-        ckpt,
-        latents_mean=[0.0] * 16,
-        latents_std=[1.0] * 16,
-        dtype=torch.float32,
-        fp8_state_path="/nonexistent/fp8_state.pt",
-        fp8_required=False,
-    )
-    # CPU input: x.is_cuda gate short-circuits the native FP8 path entirely,
-    # so no native attempt is made → _native_disabled stays False.
-    assert enc._fp8_enabled, "fp8_enabled should be True (fp8_state_path provided)"
-    z1 = enc.encode(torch.randn(1, 3, 1, 64, 64)).mode()
-    assert z1.shape == (1, 16, 1, 8, 8) and torch.isfinite(z1).all()
-    assert not enc._native_disabled, (
-        "_native_disabled should stay False: native path was skipped (CPU input), "
-        "not attempted-and-failed"
-    )
-
-    # Second call: still PyTorch (same CPU skip).
-    z2 = enc.encode(torch.randn(1, 3, 5, 64, 64)).mode()
-    assert z2.shape == (1, 16, 2, 8, 8) and torch.isfinite(z2).all()
-
-
-def test_light_vae_fp8_state_roundtrip():
-    """Exercise _quantize_fp8_per_channel + _build_fp8_state header keys on
-    a synthetic state dict (pure-CPU, no native ext needed)."""
-    u = _load_helper("vae_weights")
-
-    # Build a minimal synthetic state dict with one float weight.
-    synthetic = {
-        "encoder.conv1.weight": torch.randn(24, 3, 3, 3, 3),
-        "encoder.downsamples.0.residual.2.weight": torch.randn(24, 24, 3, 3, 3),
-        "some_int": torch.tensor([1], dtype=torch.int32),
-        "some_float": torch.tensor([1.0]),
-    }
-    fp8_type = getattr(torch, "float8_e4m3fn", None)
-    if fp8_type is None:
-        pytest.skip("float8_e4m3fn not available")
-
-    # Use the export tool's quant function (imported inline).
-    # Build a state dict mimicking the export tool output.
-    scale_max = 24.0
-
-    def _quant(tensor, channel_dim=0):
-        reduce_dims = tuple(i for i in range(tensor.dim()) if i != channel_dim)
-        fp32 = tensor.float()
-        amax = fp32.abs().amax(dim=reduce_dims) if reduce_dims else fp32.abs()
-        scale = (amax / float(scale_max)).clamp(min=1.0e-6)
-        scaled = fp32 / scale.reshape(
-            tuple(tensor.shape[i] if i == channel_dim else 1 for i in range(tensor.dim()))
-        )
-        return scaled.to(fp8_type).contiguous().view(torch.uint8), scale.to(torch.float16)
-
-    state: dict = {
-        "__omnidreams_vae_fp8_version__": torch.tensor([1], dtype=torch.int32),
-        "__omnidreams_vae_fp8_model_kind__": torch.tensor([1], dtype=torch.int32),
-        "__omnidreams_vae_fp8_scale_max__": torch.tensor([float(scale_max)], dtype=torch.float32),
-        "encoder.conv1.input.activation_scale": torch.ones(3, dtype=torch.float16),
-    }
-    for name, tensor in synthetic.items():
-        if name.endswith(".weight") and torch.is_floating_point(tensor) and tensor.dim() >= 2:
-            q, scale = _quant(tensor)
-            state[name] = q
-            state[name.replace(".weight", ".weight_scale")] = scale
-        elif torch.is_floating_point(tensor):
-            state[name] = tensor.detach().to(dtype=torch.float16)
-        else:
-            state[name] = tensor.detach()
-
-    # Round-trip via load_lightvae_fp8_state.
-    import tempfile
-    tmp = tempfile.mktemp(suffix=".pt")
-    try:
-        torch.save(state, tmp)
-        loaded = u.load_lightvae_fp8_state(tmp)
-        assert "__omnidreams_vae_fp8_version__" in state
-        assert "encoder.conv1.weight_scale" in loaded
-        assert loaded["encoder.conv1.weight_scale"].ndim == 1
-        assert loaded["encoder.conv1.weight_scale"].shape[0] == 24
-        assert loaded["encoder.conv1.weight"].dtype == torch.uint8
-        assert loaded["encoder.conv1.input.activation_scale"].dtype == torch.float16
-    finally:
-        import os as _os
-        if _os.path.isfile(tmp):
-            _os.unlink(tmp)
 
 
 def test_mean_inv_std_buffers():
@@ -475,14 +282,27 @@ def test_mean_inv_std_buffers():
 # Config three-state validation + migration detection                          #
 # --------------------------------------------------------------------------- #
 def test_config_three_state_valid():
-    """native_dit_acceleration accepts auto/required/disabled."""
+    """Phase 1+2: native_dit_acceleration accepts disabled/weight_only_fp8/fp8_compute."""
     from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
         OmniDreamsPipelineConfig,
     )
 
-    for mode in ("auto", "required", "disabled"):
+    for mode in ("disabled", "weight_only_fp8", "fp8_compute"):
         cfg = OmniDreamsPipelineConfig(native_dit_acceleration=mode)
         assert cfg.native_dit_acceleration == mode
+
+
+def test_config_back_compat_aliases_mapped():
+    """auto/required are accepted as inert back-compat aliases and mapped:
+    auto -> disabled, required -> weight_only_fp8."""
+    from sglang.multimodal_gen.configs.pipeline_configs.omnidreams import (
+        OmniDreamsPipelineConfig,
+    )
+
+    cfg = OmniDreamsPipelineConfig(native_dit_acceleration="auto")
+    assert cfg.native_dit_acceleration == "disabled"
+    cfg = OmniDreamsPipelineConfig(native_dit_acceleration="required")
+    assert cfg.native_dit_acceleration == "weight_only_fp8"
 
 
 def test_config_three_state_invalid():
@@ -491,7 +311,7 @@ def test_config_three_state_invalid():
         OmniDreamsPipelineConfig,
     )
 
-    with pytest.raises(ValueError, match="Invalid native_dit_acceleration"):
+    with pytest.raises(ValueError, match="native_acceleration mode must be"):
         OmniDreamsPipelineConfig(native_dit_acceleration="invalid")
 
 
@@ -501,10 +321,6 @@ def test_config_removed_fields_raise():
         OmniDreamsPipelineConfig,
     )
 
-    # dataclass won't accept unknown kwargs, so we set via object.__setattr__
-    # after construction — but __post_init__ runs at __init__ time, so we test
-    # that the field simply doesn't exist as a valid kwarg.
-    # The __post_init__ guard uses hasattr(), which catches monkey-patched attrs.
     cfg = OmniDreamsPipelineConfig()
     object.__setattr__(cfg, "use_fp8_dit", True)
     with pytest.raises(ValueError, match="use_fp8_dit.*native_dit_acceleration"):
@@ -574,7 +390,7 @@ def test_pipeline_config_nested_configs_exist():
 
 
 # --------------------------------------------------------------------------- #
-# Config setup() routing (impl selection + three-state FP8)                    #
+# Config setup() routing (impl selection)                                      #
 # --------------------------------------------------------------------------- #
 def test_default_latents_match_validated_wan_stats():
     """The component-config default latents must equal the WanVAEArchConfig
@@ -630,40 +446,6 @@ def test_vae_encoder_wanvae_setup_honors_explicit_checkpoint_path():
     assert lw.call_args.args[1] == "/explicit/vae"
 
 
-@pytest.mark.parametrize(
-    "mode,expect_required",
-    [("required", True), ("auto", False), ("disabled", False)],
-)
-def test_vae_encoder_lightvae_three_state_maps_to_fp8_required(mode, expect_required):
-    """LightVAE setup threads the three-state native_acceleration into the
-    encoder's fp8_required bool: only 'required' is hard-required; 'auto' and
-    'disabled' both stay soft (auto falls back, disabled skips FP8)."""
-    from unittest.mock import MagicMock, patch
-
-    from sglang.multimodal_gen.configs.models.omnidreams_components import (
-        OmniDreamsVAEEncoderConfig,
-    )
-
-    cfg = OmniDreamsVAEEncoderConfig(
-        impl="lightvae",
-        checkpoint_path="/fake/lightvae.pth",
-        native_acceleration=mode,
-        fp8_state_path="/fake/fp8.pt",
-    )
-    with patch(
-        "sglang.multimodal_gen.runtime.models.vaes.omnidreams_light_vae.LightVAEEncoder"
-    ) as LV:
-        LV.return_value = MagicMock()
-        cfg.setup()
-    kwargs = LV.call_args.kwargs
-    assert kwargs["fp8_required"] is expect_required
-    # 'disabled' must not pass a calibrated FP8 state at all.
-    if mode == "disabled":
-        assert kwargs["fp8_state_path"] is None
-    else:
-        assert kwargs["fp8_state_path"] == "/fake/fp8.pt"
-
-
 def test_pipeline_config_rehydrates_dict_component_configs():
     """A JSON pipeline-config (via --pipeline-config-path) lands nested component
     configs as raw dicts because the base update_pipeline_config only recurses
@@ -680,12 +462,12 @@ def test_pipeline_config_rehydrates_dict_component_configs():
     cfg = OmniDreamsPipelineConfig()
     cfg.update_pipeline_config(
         {
-            "native_dit_acceleration": "required",
+            "native_dit_acceleration": "weight_only_fp8",
             "encoder_config": {"impl": "lightvae", "native_acceleration": "auto"},
             "decoder_config": {"impl": "lighttae"},
         }
     )
-    assert cfg.native_dit_acceleration == "required"
+    assert cfg.native_dit_acceleration == "weight_only_fp8"
     assert isinstance(cfg.encoder_config, OmniDreamsVAEEncoderConfig)
     assert cfg.encoder_config.impl == "lightvae"
     assert cfg.encoder_config.native_acceleration == "auto"

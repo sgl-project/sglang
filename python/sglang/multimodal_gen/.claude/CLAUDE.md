@@ -113,4 +113,4 @@ Defined in `envs.py` (300+ vars). Key ones:
 - `SGLANG_DIFFUSION_ATTENTION_BACKEND` — attention backend override
 - `SGLANG_CACHE_DIT_ENABLED` — enable Cache-DiT acceleration
 - `SGLANG_CLOUD_STORAGE_TYPE` — cloud output storage (s3, etc.)
-- `SGLANG_OMNIDREAMS_FP8_DIT` — force `native_dit_acceleration="required"` (sm_120 only)
+- `SGLANG_OMNIDREAMS_CUDA_GRAPH` — force-enable AR-rollout DiT CUDA-graph capture

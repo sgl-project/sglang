@@ -48,6 +48,76 @@ def _sp_size() -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 2: optional sage3 self-attention backend (Blackwell FP4 kernel)        #
+# --------------------------------------------------------------------------- #
+# Two sage3 backends, tried in order:
+#   1. standalone ``sageattn3_blackwell`` (bf16 drop-in) — not on PyPI mirrors;
+#   2. sgl-kernel low-level FP4 ops (``omnidreams_sage3_attn.sage3_self_attn``).
+# Both fall back to F.sdpa on CPU / unsupported head_dim / GQA / missing kernel.
+_SAGE3_IMPL = None  # cached: ("standalone", fn) | ("sgl_kernel", fn) | False
+_SAGE3_HEAD_DIMS = (64, 128, 256)
+
+
+def _resolve_sage3_impl():
+    """Resolve a sage3 callable; cache the result. Returns False if unavailable."""
+    global _SAGE3_IMPL
+    if _SAGE3_IMPL is not None:
+        return _SAGE3_IMPL
+    try:
+        from sageattn3 import sageattn3_blackwell
+
+        _SAGE3_IMPL = ("standalone", sageattn3_blackwell)
+        return _SAGE3_IMPL
+    except Exception:
+        pass
+    try:
+        from sglang.multimodal_gen.runtime.models.dits.omnidreams_sage3_attn import (
+            sage3_self_attn,
+        )
+
+        _SAGE3_IMPL = ("sgl_kernel", sage3_self_attn)
+        return _SAGE3_IMPL
+    except Exception:
+        pass
+    _SAGE3_IMPL = False
+    return _SAGE3_IMPL
+
+
+def _sage3_self_attn(
+    q: Tensor, k: Tensor, v: Tensor, backend: str
+) -> Tensor | None:
+    """Run sage3 self-attention, or return None to fall back to ``F.sdpa``.
+
+    ``q``/``k``/``v`` are ``[B, n, S, d]`` (post-RoPE, post-cache-assemble), the
+    same shapes ``F.scaled_dot_product_attention`` sees. sage3 is bidirectional
+    (``is_causal=False``), matching OmniDreams self-attn (no mask over the window).
+    Falls back (returns None) on CPU, unsupported head_dim, GQA, or missing kernel.
+    """
+    if backend != "sage3":
+        return None
+    if not q.is_cuda:
+        return None
+    if q.shape[-1] not in _SAGE3_HEAD_DIMS:
+        return None
+    if q.shape[1] != k.shape[1]:  # GQA (Hq != Hkv) unsupported by sage3
+        return None
+    impl = _resolve_sage3_impl()
+    if impl is False:
+        return None
+    try:
+        if impl[0] == "standalone":
+            return impl[1](q, k, v, is_causal=False)
+        # sgl-kernel low-level FP4 path.
+        import math
+
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        return impl[1](q, k, v, scale=scale, is_causal=False)
+    except Exception:
+        # Shape/stride the kernel can't handle -> caller falls back to sdpa.
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Building blocks (checkpoint-exact module names)                             #
 # --------------------------------------------------------------------------- #
 class GPT2FeedForward(nn.Module):
@@ -229,6 +299,9 @@ class OmniDreamsAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.local_num_heads = divide(n_heads, get_tp_world_size())
+        # Phase 2: self-attn backend ("sdpa" | "sage3"). Set by the denoising
+        # stage from config/env; cross-attn always uses sdpa regardless.
+        self._attn_backend: str = "sdpa"
 
         inner_dim_full = head_dim * n_heads
         if self.is_self_attn:
@@ -327,9 +400,16 @@ class OmniDreamsAttention(nn.Module):
             k = kv_cache.cached_k()
             v = kv_cache.cached_v()
         # SDPA expects [B, n, S, d]; default scale = 1/sqrt(d), no mask.
-        out = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        )
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        # Phase 2: route self-attn through sage3 when enabled (bidirectional, no
+        # mask -- matches the sdpa call above). Cross-attn always uses sdpa.
+        out = None
+        if self.is_self_attn:
+            out = _sage3_self_attn(q_t, k_t, v_t, self._attn_backend)
+        if out is None:
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t)
         out = out.transpose(1, 2).reshape(B, L, n * d)
         out, _ = self.output_proj(out)
         return out

@@ -37,22 +37,13 @@ if TYPE_CHECKING:
     # OmniDreams: force-enable the AR-rollout DiT CUDA-graph capture even when
     # the pipeline config leaves it off. Overrides OmniDreamsPipelineConfig.enable_cuda_graph.
     SGLANG_OMNIDREAMS_CUDA_GRAPH: bool = False
-    # OmniDreams: force-require the native FP8 DiT (optimized_dit_forward).
-    # When set, build_fp8_dit uses mode="required" (raise if the sm_120 native
-    # ext is unavailable) instead of silently falling back to the eager DiT.
-    SGLANG_OMNIDREAMS_FP8_DIT: bool = False
-    # OmniDreams: path to the calibrated LightVAE FP8 encoder state (.pt).
-    # SGLang-prefixed analogue of OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH.
-    SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH: str | None = None
     # OmniDreams: path to W8A8 FP8 text encoder (compressed-tensors format).
     SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH: str | None = None
-    # OmniDreams: after the native FP8 executor is built and the pre-quantized
-    # weights + cross-attn KV are materialized, move the live BF16 DiT params
-    # to CPU to free ~4.1 GiB of GPU VRAM. Mirrors flashdreams'
-    # _release_network_after_fp8_snapshot intent, adapted to sglang's wiring
-    # (the stage still holds the DiT object for patchify/unpatchify, which are
-    # pure einops reshapes with no parameter reads). Default off; set to 1.
-    SGLANG_OMNIDREAMS_FP8_RELEASE_LIVE_DIT: bool = False
+    # OmniDreams: self-attention backend for the AR DiT ("sdpa" | "sage3").
+    # sage3 routes self-attn through the sageattn3 Blackwell kernel (FP4); only
+    # applies to self-attn (cross-attn always uses sdpa). Falls back to sdpa on
+    # CPU / unsupported head_dim / missing sageattn3. Phase 2.
+    SGLANG_OMNIDREAMS_ATTN_BACKEND: str = "sdpa"
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -279,19 +270,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OmniDreams: force-enable the AR-rollout DiT CUDA-graph capture/replay.
     # Overrides OmniDreamsPipelineConfig.enable_cuda_graph when set.
     "SGLANG_OMNIDREAMS_CUDA_GRAPH": _lazy_bool("SGLANG_OMNIDREAMS_CUDA_GRAPH"),
-    # OmniDreams: require the native FP8 DiT (raise if sm_120 ext missing).
-    "SGLANG_OMNIDREAMS_FP8_DIT": _lazy_bool("SGLANG_OMNIDREAMS_FP8_DIT"),
-    # OmniDreams: calibrated LightVAE FP8 encoder state path.
-    "SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH": _lazy_str(
-        "SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH"
-    ),
     # OmniDreams: W8A8 FP8 text encoder (compressed-tensors format) path.
     "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH": _lazy_str(
         "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH"
     ),
-    # OmniDreams: move the live BF16 DiT to CPU after the FP8 executor is built.
-    "SGLANG_OMNIDREAMS_FP8_RELEASE_LIVE_DIT": _lazy_bool(
-        "SGLANG_OMNIDREAMS_FP8_RELEASE_LIVE_DIT"
+    # OmniDreams: self-attn backend (sdpa | sage3). Phase 2.
+    "SGLANG_OMNIDREAMS_ATTN_BACKEND": _lazy_str(
+        "SGLANG_OMNIDREAMS_ATTN_BACKEND", "sdpa"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

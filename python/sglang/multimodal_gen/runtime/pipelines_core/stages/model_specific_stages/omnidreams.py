@@ -46,7 +46,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
     CUDAGraphWrapper,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import build_fp8_dit
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
     RotaryPositionEmbedding3D,
 )
@@ -65,14 +64,23 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.o
     decode_hdmap_ab,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    _ensure_tensor_decode_output,
+    scale_and_shift_latents,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
+)
+from sglang.multimodal_gen.runtime.realtime.causal_state import (
+    RealtimeCausalDecodeState,
+    RealtimeCausalDiTState,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -202,6 +210,16 @@ def _hdmap_chunk_pixel_bounds(
         return 0, 1 + (len_t - 1) * tc
     base = 1 + (len_t - 1) * tc + (chunk_idx - 1) * len_t * tc
     return base, base + len_t * tc
+
+
+def _is_realtime(batch: Req) -> bool:
+    """True when this request is part of a realtime (streaming) session.
+
+    Mirrors the detection contract used by the other realtime stages
+    (``realtime_vae.py``, ``causal_denoising.py``): a non-empty
+    ``realtime_session_id`` plus an attached ``session`` object.
+    """
+    return bool(getattr(batch, "realtime_session_id", None)) and batch.session is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -619,6 +637,17 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         vae_dtype = PRECISION_TO_TYPE[config.vae_precision]
         arch = config.dit_config.arch_config
 
+        # --- realtime session path ----------------------------------------- #
+        # In realtime mode each forward() processes exactly one AR chunk driven
+        # by ``batch.block_idx``. block_idx==0 runs the full one-shot prep (text
+        # encode, i2v reference, schedule, hdmap) and stashes the result into a
+        # persistent ``RealtimeCausalDiTState``; block_idx>0 short-circuits and
+        # only refreshes the per-chunk hdmap pixels from ``condition_inputs``.
+        # The offline path below is bit-identical and untouched.
+        is_realtime = _is_realtime(batch)
+        if is_realtime and batch.block_idx > 0:
+            return self._realtime_before_subsequent_chunk(batch, server_args)
+
         # --- geometry (patchified token grid) ---
         height = int(batch.height)
         width = int(batch.width)
@@ -729,6 +758,199 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             latent_h,
             latent_w,
         )
+
+        # In realtime mode, stash the one-shot prep into the persistent DiT
+        # cache state so subsequent chunks (block_idx>0) skip the text/image
+        # encoders entirely. The denoise stage reads these back via
+        # ``cache_state.runtime_cache``. num_chunks is forced to 1: the
+        # realtime denoise stage processes exactly one chunk per forward().
+        if is_realtime and batch.block_idx == 0:
+            self._realtime_stash_initial_state(
+                batch,
+                server_args,
+                rope=None,  # built lazily in the denoise stage (needs head_dim)
+                text_embeds=text_embeds,
+                image_full=None,  # assembled in the denoise stage (needs device)
+                inject_mask=None,
+                cond_mask_c0=None,
+                cond_mask_zero=None,
+                hdmap_zero=None,
+                cross_attn_kv=None,  # precomputed in the denoise stage
+                scheduler=scheduler,
+                generator=batch.generator,
+                hdmap_encode_cache=None,
+                arch_constants={
+                    "hp": hp,
+                    "wp": wp,
+                    "len_t": len_t,
+                    "tokens_per_frame": tokens_per_frame,
+                    "chunk_tokens": chunk_tokens,
+                    "head_dim": arch.model_channels // arch.num_heads,
+                    "in_d": arch.in_channels
+                    * arch.patch_temporal
+                    * arch.patch_spatial**2,
+                    "hdmap_d": arch.additional_concat_ch
+                    * arch.patch_temporal
+                    * arch.patch_spatial**2,
+                    "mask_d": arch.patch_temporal * arch.patch_spatial**2,
+                    "context_noise": float(
+                        getattr(batch, "context_noise", 128)
+                    ),
+                    "window_size_t": int(getattr(batch, "window_size_t", 6)),
+                    "sink_size_t": int(getattr(batch, "sink_size_t", 0)),
+                },
+                hdmap_tokens=hdmap_tokens,
+                hdmap_pixel=hdmap_pixel,
+                image_token=image_token,
+            )
+            # Realtime per-call: the denoise stage runs exactly one chunk.
+            batch.extra["omnidreams"]["num_chunks"] = 1
+
+        return batch
+
+    def _realtime_stash_initial_state(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        rope,
+        text_embeds: torch.Tensor,
+        image_full,
+        inject_mask,
+        cond_mask_c0,
+        cond_mask_zero,
+        hdmap_zero,
+        cross_attn_kv,
+        scheduler,
+        generator,
+        hdmap_encode_cache,
+        arch_constants: dict,
+        hdmap_tokens,
+        hdmap_pixel,
+        image_token,
+    ) -> None:
+        """Stash one-shot prep into ``RealtimeCausalDiTState.runtime_cache``.
+
+        The denoise stage reads these back on every realtime forward() call.
+        Tensors that need device/dit_dtype assembly (rope, masks, cross_attn_kv,
+        image_full) are built lazily in the denoise stage on the first chunk to
+        avoid duplicating the device-aware construction logic here; only the
+        device-independent inputs (text embeds, image_token, hdmap, scheduler,
+        generator, arch constants) are stashed here.
+        """
+        cache_state = batch.session.get_or_create_state(RealtimeCausalDiTState)
+        rc = cache_state.runtime_cache
+        rc.clear()
+        rc["rope"] = rope
+        rc["text_embeds"] = text_embeds.detach()
+        rc["image_token"] = (
+            image_token.detach() if image_token is not None else None
+        )
+        rc["image_full"] = image_full
+        rc["inject_mask"] = inject_mask
+        rc["cond_mask_c0"] = cond_mask_c0
+        rc["cond_mask_zero"] = cond_mask_zero
+        rc["hdmap_zero"] = hdmap_zero
+        rc["cross_attn_kv"] = cross_attn_kv
+        rc["scheduler"] = scheduler
+        rc["generator"] = generator
+        rc["hdmap_encode_cache"] = hdmap_encode_cache
+        rc["arch_constants"] = dict(arch_constants)
+        # HD-map conditioning (one of these is non-None when HDMap is enabled):
+        #  * ``hdmap_tokens``: list[num_chunks] precomputed per-chunk tokens
+        #    (single-image broadcast fallback);
+        #  * ``hdmap_pixel``: full preprocessed clip on CPU, per-chunk slices
+        #    VAE-encoded in the denoise loop (per-frame video path).
+        rc["hdmap_tokens"] = hdmap_tokens
+        rc["hdmap_pixel"] = hdmap_pixel
+        cache_state.kv_cache = None  # initialized in the denoise stage
+        cache_state.chunk_idx = 0
+
+    @torch.no_grad()
+    def _realtime_before_subsequent_chunk(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Req:
+        """block_idx>0 realtime path: skip encoders, refresh per-chunk hdmap.
+
+        Loads the stashed ``RealtimeCausalDiTState`` and rebuilds a minimal
+        ``batch.extra["omnidreams"]`` for the single-chunk denoise call. The
+        per-chunk HD-map pixels arrive via ``batch.condition_inputs["hdmap"]``
+        (closed-loop); when absent the AR stage falls back to the stashed
+        ``hdmap_pixel`` clip slice or zeros (open-loop).
+        """
+        cache_state = batch.session.get_or_create_state(RealtimeCausalDiTState)
+        rc = cache_state.runtime_cache
+        ac = rc["arch_constants"]
+        hp = ac["hp"]
+        wp = ac["wp"]
+        len_t = ac["len_t"]
+        tokens_per_frame = ac["tokens_per_frame"]
+        chunk_tokens = ac["chunk_tokens"]
+
+        # Per-chunk closed-loop HDMap: the adapter injects this chunk's pixels
+        # via condition_inputs. When present, stash as ``hdmap_pixel_chunk`` so
+        # the denoise stage VAE-encodes just this slice (mirroring the offline
+        # per-frame video path). Otherwise fall back to the stashed clip slice
+        # or zeros (open-loop).
+        hdmap_chunk_pixels = None
+        cond_inputs = getattr(batch, "condition_inputs", None) or {}
+        hdmap_in = cond_inputs.get("hdmap")
+        if hdmap_in is not None and torch.is_tensor(hdmap_in):
+            # [B, 3, T_chunk, H, W] in [-1, 1], already preprocessed by the
+            # adapter. Kept on CPU; the denoise stage moves the slice to GPU.
+            hdmap_chunk_pixels = hdmap_in.detach().cpu()
+
+        batch.extra["omnidreams"] = {
+            "hp": hp,
+            "wp": wp,
+            "len_t": len_t,
+            "tokens_per_frame": tokens_per_frame,
+            "chunk_tokens": chunk_tokens,
+            "latent_h": None,  # not used by the realtime denoise path
+            "latent_w": None,
+            "num_chunks": 1,  # realtime: one chunk per forward()
+            "window_size_t": ac["window_size_t"],
+            "sink_size_t": ac["sink_size_t"],
+            "context_noise": ac["context_noise"],
+            "image_token": rc["image_token"],
+            "hdmap_tokens": rc["hdmap_tokens"],
+            "hdmap_pixel": rc["hdmap_pixel"],
+            # Per-chunk closed-loop override (highest priority in the denoise
+            # stage's HDMap resolution).
+            "hdmap_pixel_chunk": hdmap_chunk_pixels,
+            # Signal to the denoise stage that this is a subsequent realtime
+            # chunk (state already initialized).
+            "realtime_subsequent": True,
+        }
+        # raw_latent_shape lets SDPA-path attn metadata stay a no-op.
+        arch = server_args.pipeline_config.dit_config.arch_config
+        batch.raw_latent_shape = (
+            rc["text_embeds"].shape[0],
+            chunk_tokens,
+            arch.out_channels,
+            None,
+            None,
+        )
+        # Re-hydrate the standard fields the denoise stage reads. The schedule
+        # fields (timesteps / sigmas / num_inference_steps / guidance_scale /
+        # eta) mirror the block_idx==0 Before path (``batch.timesteps =
+        # scheduler.denoising_step_list.to(device)`` above) so
+        # ``DenoisingStage.verify_input`` passes and the AR loop sees the same
+        # 2-step self-forcing schedule on every chunk. The stashed scheduler is
+        # the same object used on chunk 0, so its denoising_step_list is valid.
+        scheduler = rc["scheduler"]
+        device = get_local_torch_device()
+        batch.prompt_embeds = [rc["text_embeds"]]
+        batch.negative_prompt_embeds = None
+        batch.image_embeds = []
+        batch.do_classifier_free_guidance = False
+        batch.scheduler = scheduler
+        batch.timesteps = scheduler.denoising_step_list.to(device)
+        batch.sigmas = scheduler.denoising_sigmas.tolist()
+        batch.num_inference_steps = int(scheduler.denoising_step_list.shape[0])
+        batch.guidance_scale = 1.0
+        batch.eta = 0.0
+        batch.generator = rc["generator"]
         return batch
 
     @staticmethod
@@ -848,6 +1070,17 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 "OmniDreams AR rollout requires a Wan VAE with "
                 "use_feature_cache=True for correct streaming frame counts."
             )
+
+        # --- realtime session path ----------------------------------------- #
+        # One forward() = one AR chunk, driven by ``batch.block_idx``. State
+        # (KV caches, rope, text embeds, masks, cross-attn KV, scheduler,
+        # generator, hdmap cache) persists in ``RealtimeCausalDiTState`` across
+        # calls. The per-chunk math is IDENTICAL to the offline loop body; only
+        # the loop boundary changes (one iteration per call) plus state
+        # persistence + per-chunk streaming decode. The offline path below is
+        # bit-identical and untouched.
+        if _is_realtime(batch):
+            return self._realtime_denoise_forward(batch, server_args)
 
         # Bring the DiT onto the GPU for the whole AR rollout when it is being
         # CPU-offloaded (no-op when it is already resident). The manager keeps a
@@ -1014,14 +1247,14 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             else None
         )
 
-        # Native FP8 DiT (optimized_dit_forward). Mutually exclusive with
-        # the CUDA graph (the native op manages its own graph). GPU/sm_120
-        # only -- build_fp8_dit returns None when the native ext is unavailable,
-        # so this transparently falls back to the eager DiT.
-        fp8_dit = None
+        # FP8 modes (Phase 1): ``weight_only_fp8`` dequantizes pre-quantized FP8
+        # weights to bf16 and runs the standard eager PyTorch DiT; ``disabled``
+        # runs the raw bf16 checkpoint. The native FP8 DiT
+        # (optimized_dit_forward) was removed in Phase 1; a PyTorch-native
+        # ``fp8_compute`` mode may be added in Phase 2. ``auto``/``required`` are
+        # accepted as inert back-compat aliases (mapped in
+        # ``OmniDreamsPipelineConfig.__post_init__``).
         mode = getattr(config, "native_dit_acceleration", "disabled")
-        if envs.SGLANG_OMNIDREAMS_FP8_DIT:
-            mode = "required"  # env forces required mode
 
         if mode == "weight_only_fp8":
             # ---- Weight-only FP8: dequantize FP8→bf16, use eager PyTorch path ----
@@ -1076,86 +1309,42 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     "not found at %s; using raw bf16 checkpoint.",
                     fp8_prepared_path,
                 )
-            fp8_dit = None  # fall through to eager PyTorch path below
 
-        elif mode != "disabled":
+        elif mode == "fp8_compute":
+            # ---- Phase 2: FP8-compute linears (torch._scaled_mm) + optional sage3 ----
+            # Swap the DiT linears to FP8-compute in place (post-load). On non-FP8
+            # HW (CPU) install_fp8_compute_on_dit is a no-op -> eager bf16. The AR
+            # loop below runs unchanged; the swapped quant_method/linears make the
+            # matmuls FP8-compute. Idempotent (guarded by _fp8_compute_applied).
             if cuda_graph_runner is not None:
                 logger.warning(
-                    "OmniDreams: native_dit_acceleration overrides enable_cuda_graph "
-                    "(the native FP8 op manages its own CUDA graph)."
+                    "OmniDreams: fp8_compute mode disables CUDA graph "
+                    "(uses standard PyTorch eager forward)."
                 )
                 cuda_graph_runner = None
-
-            # Resolve fp8_prepared_path: explicit config wins, else infer
-            # alongside the raw checkpoint.
-            model_path = server_args.model_path
-            fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
-            if fp8_prepared_path is None:
-                if os.path.isfile(model_path):
-                    ckpt_dir = os.path.dirname(model_path)
-                else:
-                    ckpt_dir = model_path
-                fp8_prepared_path = os.path.join(ckpt_dir, "omnidreams_fp8_dit.pt")
-
-            # Lightweight fingerprint check: if the pre-quantized file exists
-            # but the raw checkpoint has a newer mtime, warn and fall back
-            # (or error for required mode) — avoids silently using stale
-            # quantized weights after a checkpoint upgrade.
-            if os.path.exists(fp8_prepared_path):
-                try:
-                    payload = torch.load(
-                        fp8_prepared_path, map_location="cpu", weights_only=True
-                    )
-                    meta = payload.get("meta", {})
-                    fp = meta.get("checkpoint_fingerprint", {})
-                    # Resolve raw checkpoint path for fingerprint comparison
-                    _DEFAULT_CKPT_RELPATH = "single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt"
-                    if os.path.isfile(model_path):
-                        raw_path = model_path
-                    else:
-                        raw_path = os.path.join(model_path, _DEFAULT_CKPT_RELPATH)
-                    if os.path.exists(raw_path):
-                        ckpt_stat = os.stat(raw_path)
-                        if (fp.get("file_size") != ckpt_stat.st_size
-                                or fp.get("mtime") != ckpt_stat.st_mtime):
-                            logger.warning(
-                                "OmniDreams: FP8 prepared weights fingerprint "
-                                "mismatch (checkpoint may have been updated). "
-                                "Re-run: python -m sglang.multimodal_gen.tools."
-                                "export_omnidreams_fp8_dit_weights "
-                                "--checkpoint %s --output %s",
-                                raw_path, fp8_prepared_path,
-                            )
-                            if mode == "required":
-                                raise RuntimeError(
-                                    "FP8 prepared weights fingerprint mismatch. "
-                                    "Re-run the offline exporter."
-                                )
-                            fp8_prepared_path = None  # force fallback / skip
-                except Exception:
-                    # Corrupt or old-format file — treat as missing.
-                    logger.warning(
-                        "OmniDreams: failed to read FP8 prepared weights at %s; "
-                        "treating as missing.", fp8_prepared_path
-                    )
-                    if mode == "required":
-                        raise
-                    fp8_prepared_path = None
-
-            fp8_dit = build_fp8_dit(
-                self.transformer,
-                arch,
-                mode=mode,
-                fp8_prepared_path=fp8_prepared_path,
-                attention_backend=getattr(config, "native_dit_backend", "auto"),
+            from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+                install_fp8_compute_on_dit,
             )
-            if fp8_dit is None and mode == "required":
-                raise RuntimeError(
-                    "native_dit_acceleration='required' but native FP8 DiT unavailable. "
-                    "Check sm_120 native ext build."
+
+            installed = install_fp8_compute_on_dit(self.transformer)
+            # Self-attn backend: explicit env override wins, else config field.
+            # (envs.SGLANG_OMNIDREAMS_ATTN_BACKEND defaults to "sdpa", so read the
+            # raw env var to distinguish "unset" from "explicitly sdpa".)
+            attn_backend = os.environ.get(
+                "SGLANG_OMNIDREAMS_ATTN_BACKEND"
+            ) or getattr(config, "omnidreams_attn_backend", "sdpa")
+            if not installed:
+                attn_backend = "sdpa"
+            for block in self.transformer.blocks:
+                block.self_attn._attn_backend = attn_backend
+            if installed:
+                logger.info(
+                    "OmniDreams: fp8_compute active (attn=%s).", attn_backend
                 )
-            elif fp8_dit is None:
-                logger.info("OmniDreams: native FP8 DiT unavailable; using eager DiT.")
+            elif device.type == "cuda":
+                logger.info(
+                    "OmniDreams: fp8_compute requested but unavailable; eager bf16."
+                )
 
         latent_chunks: list[torch.Tensor] = []
         # Persistent streaming VAE-encode cache for the per-frame HD-map path.
@@ -1170,13 +1359,8 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         ):
             hdmap_encode_cache = self.encoder.initialize_ar_encode_cache()
         for chunk_idx in range(num_chunks):
-            # Eager/CUDA-graph paths consume the [L, D] cos|sin cache; the native
-            # FP8 path needs the raw-angle [L,1,1,head_dim] tensor (it takes
-            # cos/sin itself). Only build the latter when native is active.
+            # Eager/CUDA-graph paths consume the [L, D] cos|sin cache (shift_t).
             rope_cos_sin = rope.shift_t(chunk_idx)
-            rope_freqs = (
-                rope.shift_t_freqs(chunk_idx) if fp8_dit is not None else None
-            )
             is_first = chunk_idx == 0
             cond_mask = cond_mask_c0 if is_first else cond_mask_zero
             # HD-map conditioning for this chunk, in three mutually-exclusive
@@ -1220,23 +1404,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             )
 
             def _call_dit(hidden_states, timestep):
-                if fp8_dit is not None:
-                    # Native FP8 path (owns its own KV write at write_start).
-                    return fp8_dit(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=text,
-                        timestep=timestep,
-                        condition_video_input_mask=cond_mask,
-                        rope_freqs=rope_freqs,
-                        hdmap_condition=hdmap_chunk,
-                        kv_caches=caches,
-                        cross_attn_kv=cross_attn_kv,
-                        view_indices=view_indices,
-                        ar_idx=chunk_idx,
-                        len_t=len_t,
-                        hp=hp,
-                        wp=wp,
-                    )
                 if steady_now:
                     return cuda_graph_runner(
                         hidden_states, timestep, cond_mask, rope_cos_sin, hdmap_chunk
@@ -1284,14 +1451,6 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # temporal feature cache flows across chunk boundaries, yielding correct
         # continuity and FlashDreams frame counts.
         batch.latents = torch.cat(latent_chunks, dim=2)
-        # Release the native FP8 executor + its on-GPU FP8 weight snapshot now
-        # the rollout is done -- the DecodingStage (Wan VAE) does not touch the
-        # DiT, so the ~2 GiB of FP8 weights + native workspace are dead weight
-        # through the decode peak. Mirrors flashdreams' post-snapshot release.
-        if fp8_dit is not None:
-            fp8_dit.release_executor()
-            fp8_dit = None
-
         # Phase 6: SP post-process — latents may need gathering when SP is
         # eventually supported. Currently a no-op (SP is guarded at entry).
         batch.latents = self._postprocess_sp_latents(batch, server_args)
@@ -1310,6 +1469,618 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             residency_manager.end_use(encoder_use, self.encoder)
 
         return batch
+
+    # ------------------------------------------------------------------ #
+    # Realtime (streaming) path                                          #
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _realtime_denoise_forward(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Req:
+        """Process exactly one AR chunk per call using persistent session state.
+
+        Numerical parity invariant: the per-chunk body (BlockKVCache
+        before/after_update, shift_t RoPE, 2-step self-forcing denoise via
+        ``scheduler.sample``, context-noise re-forward at ``ctx_noise_t``) is
+        IDENTICAL to the offline loop body. Only the loop boundary differs
+        (one iteration per call) plus state persistence in
+        ``RealtimeCausalDiTState`` and per-chunk streaming VAE decode.
+        """
+        config = server_args.pipeline_config
+        device = get_local_torch_device()
+        dit_dtype = PRECISION_TO_TYPE[config.dit_precision]
+        arch = config.dit_config.arch_config
+
+        # Hold the DiT (and HD-map encoder, when present) resident for this
+        # chunk's forward. Same pattern as the offline path.
+        residency_manager = self._component_residency_manager
+        transformer_use = None
+        encoder_use = None
+        if residency_manager is not None:
+            transformer_use = self._declared_component_use(
+                component_name="transformer"
+            )
+            residency_manager.begin_use(transformer_use, self.transformer)
+            if self.encoder is not None:
+                encoder_use = self._declared_component_use(
+                    component_name="encoder"
+                )
+                residency_manager.begin_use(encoder_use, self.encoder)
+
+        try:
+            return self._realtime_denoise_chunk(
+                batch, server_args, device, dit_dtype, arch
+            )
+        finally:
+            if residency_manager is not None and transformer_use is not None:
+                residency_manager.end_use(transformer_use, self.transformer)
+            if residency_manager is not None and encoder_use is not None:
+                residency_manager.end_use(encoder_use, self.encoder)
+
+    def _realtime_denoise_chunk(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        device: torch.device,
+        dit_dtype: torch.dtype,
+        arch,
+    ) -> Req:
+        """Run one AR chunk + streaming decode for realtime mode."""
+        config = server_args.pipeline_config
+        cache_state = batch.session.get_or_create_state(RealtimeCausalDiTState)
+        rc = cache_state.runtime_cache
+        st = batch.extra["omnidreams"]
+
+        hp = st["hp"]
+        wp = st["wp"]
+        len_t = st["len_t"]
+        tokens_per_frame = st["tokens_per_frame"]
+        chunk_tokens = st["chunk_tokens"]
+        context_noise = st["context_noise"]
+        block_idx = batch.block_idx
+        # chunk_idx is the AR chunk index (cache_state.chunk_idx == block_idx
+        # by construction; the before-stage inits to 0 and we increment after
+        # each chunk).
+        chunk_idx = cache_state.chunk_idx
+
+        head_dim = rc["arch_constants"]["head_dim"]
+        in_d = rc["arch_constants"]["in_d"]
+        hdmap_d = rc["arch_constants"]["hdmap_d"]
+        mask_d = rc["arch_constants"]["mask_d"]
+
+        scheduler = rc["scheduler"].to(device)
+        text = rc["text_embeds"].to(device=device, dtype=dit_dtype)
+        B = text.shape[0]
+        gen = rc["generator"]
+        if gen is not None and gen.device != device:
+            gen = torch.Generator(device=device).manual_seed(gen.initial_seed())
+            rc["generator"] = gen
+
+        # ---- lazy one-shot assembly on chunk 0 (needs device/dit_dtype) ---- #
+        if cache_state.kv_cache is None or rc["rope"] is None:
+            rope = RotaryPositionEmbedding3D(
+                head_dim=head_dim,
+                len_h=hp,
+                len_w=wp,
+                len_t=len_t,
+                h_extrapolation_ratio=3.0,
+                w_extrapolation_ratio=3.0,
+                t_extrapolation_ratio=1.0,
+                device=device,
+            )
+            rc["rope"] = rope
+            caches = self.transformer.init_kv_caches(
+                batch_size=B,
+                chunk_tokens=chunk_tokens,
+                window_tokens=st["window_size_t"] * tokens_per_frame,
+                sink_tokens=st["sink_size_t"] * tokens_per_frame,
+                device=device,
+                dtype=dit_dtype,
+            )
+            cache_state.kv_cache = caches
+
+            frame0 = tokens_per_frame
+            image_token = rc["image_token"]
+            if image_token is not None:
+                image_full = torch.zeros(
+                    B, chunk_tokens, in_d, device=device, dtype=dit_dtype
+                )
+                image_full[:, :frame0, :] = image_token.to(
+                    device=device, dtype=dit_dtype
+                )
+                inject_mask = torch.zeros(
+                    B, chunk_tokens, 1, device=device, dtype=dit_dtype
+                )
+                inject_mask[:, :frame0, :] = 1.0
+                cond_mask_c0 = torch.zeros(
+                    B, chunk_tokens, mask_d, device=device, dtype=dit_dtype
+                )
+                cond_mask_c0[:, :frame0, :] = 1.0
+            else:
+                image_full = inject_mask = None
+                cond_mask_c0 = torch.zeros(
+                    B, chunk_tokens, mask_d, device=device, dtype=dit_dtype
+                )
+            cond_mask_zero = torch.zeros(
+                B, chunk_tokens, mask_d, device=device, dtype=dit_dtype
+            )
+            hdmap_zero = torch.zeros(
+                B, chunk_tokens, hdmap_d, device=device, dtype=dit_dtype
+            )
+            rc["image_full"] = image_full
+            rc["inject_mask"] = inject_mask
+            rc["cond_mask_c0"] = cond_mask_c0
+            rc["cond_mask_zero"] = cond_mask_zero
+            rc["hdmap_zero"] = hdmap_zero
+
+            # Precompute cross-attn K/V once (text context is static).
+            rc["cross_attn_kv"] = self.transformer.precompute_cross_attn_kv(
+                self.transformer.crossattn_proj(text)
+            )
+
+            # Initialize the persistent HD-map streaming encode cache (per-frame
+            # video path only) once per session.
+            if (
+                st.get("hdmap_pixel") is not None
+                and hasattr(self.encoder, "initialize_ar_encode_cache")
+            ):
+                rc["hdmap_encode_cache"] = (
+                    self.encoder.initialize_ar_encode_cache()
+                )
+
+            # FP8 weight-only mode: dequantize once on the first chunk (same
+            # logic as the offline path; the result persists on self.transformer
+            # across calls via the _weight_only_fp8_applied flag).
+            mode = getattr(config, "native_dit_acceleration", "disabled")
+            if mode == "weight_only_fp8":
+                self._maybe_load_weight_only_fp8(batch, server_args)
+            elif mode == "fp8_compute":
+                self._maybe_install_fp8_compute(config, device)
+
+        rope = rc["rope"]
+        caches = cache_state.kv_cache
+        image_full = rc["image_full"]
+        inject_mask = rc["inject_mask"]
+        cond_mask_c0 = rc["cond_mask_c0"]
+        cond_mask_zero = rc["cond_mask_zero"]
+        hdmap_zero = rc["hdmap_zero"]
+        cross_attn_kv = rc["cross_attn_kv"]
+        hdmap_encode_cache = rc["hdmap_encode_cache"]
+
+        # View indices (optional, multi-view cross-view attn).
+        view_count = int(getattr(batch, "num_views", 1) or 1)
+        n_cameras = int(getattr(arch, "n_cameras_emb", 1))
+        if view_count < 1 or view_count > n_cameras:
+            raise ValueError(
+                f"num_views={view_count} out of range [1, {n_cameras}] "
+                "(n_cameras_emb)."
+            )
+        view_indices: torch.Tensor | None = None
+        if view_count > 1 and self.transformer.adaln_view_embedder is not None:
+            view_indices = (
+                torch.arange(view_count, device=device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(B, -1)
+            )
+
+        ctx_noise_t = torch.tensor(
+            context_noise, device=device, dtype=dit_dtype
+        )
+
+        # CUDA-graph + FP8 mode resolution (same as offline). cuda_graph_runner
+        # and fp8 state persist as instance attrs; in realtime the steady-state
+        # graph captures once the KV window fills (same as offline).
+        use_cuda_graph = (
+            getattr(config, "enable_cuda_graph", False)
+            or envs.SGLANG_OMNIDREAMS_CUDA_GRAPH
+        ) and device.type == "cuda"
+        # weight_only_fp8 / fp8_compute disable CUDA graph (same as offline).
+        mode = getattr(config, "native_dit_acceleration", "disabled")
+        if mode in ("weight_only_fp8", "fp8_compute"):
+            use_cuda_graph = False
+        # Per-call runner: in realtime we cannot persist a captured graph
+        # across calls via a local closure (the captured graph references the
+        # call-scoped caches/text tensors which are now session-persistent, so
+        # a fresh wrapper per call is safe and matches the offline capture
+        # semantics once steady-state is reached). The wrapper's internal
+        # warmup counter resets each call, which is acceptable: the graph is
+        # only captured when is_steady_state() is true, and a fresh capture on
+        # the first steady chunk of each call replays correctly for that
+        # chunk's 3 DiT calls.
+        # TODO(realtime): a session-persistent cuda_graph_runner would avoid
+        # re-warming each call; deferred until correctness is verified.
+        def _dit_call(hidden_states, timestep, cond_mask_t, rope_t, hdmap_t):
+            return self.transformer(
+                hidden_states=hidden_states,
+                encoder_hidden_states=text,
+                timestep=timestep,
+                condition_video_input_mask=cond_mask_t,
+                rope_cos_sin=rope_t,
+                hdmap_condition=hdmap_t,
+                kv_caches=caches,
+                cross_attn_kv=cross_attn_kv,
+                view_indices=view_indices,
+            )
+
+        cuda_graph_runner = (
+            CUDAGraphWrapper(
+                _dit_call,
+                warmup_iters=getattr(config, "cuda_graph_warmup_iters", 2),
+            )
+            if use_cuda_graph
+            else None
+        )
+
+        # ---- per-chunk body (IDENTICAL math to the offline loop body) ---- #
+        rope_cos_sin = rope.shift_t(chunk_idx)
+        is_first = chunk_idx == 0
+        cond_mask = cond_mask_c0 if is_first else cond_mask_zero
+
+        # HD-map conditioning for this chunk. Resolution order (mirrors the
+        # offline loop + closed-loop override):
+        #  1. ``hdmap_pixel_chunk``: closed-loop per-chunk pixels from
+        #     ``condition_inputs["hdmap"]`` (set by the before-stage for
+        #     block_idx>0). VAE-encoded here (per-chunk slice).
+        #  2. ``hdmap_pixel``: stashed full clip -> slice this chunk's frames
+        #     and VAE-encode (open-loop per-frame video path, same as offline).
+        #  3. ``hdmap_tokens``: precomputed per-chunk tokens (single-image
+        #     broadcast fallback).
+        #  4. both None -> zeros (HDMap disabled).
+        hdmap_pixel_chunk = st.get("hdmap_pixel_chunk")
+        if hdmap_pixel_chunk is not None:
+            chunk_clip = hdmap_pixel_chunk.to(device=device)
+            chunk_latent = _vae_encode_normalized(
+                chunk_clip,
+                self.encoder,
+                cache=hdmap_encode_cache,
+                is_first_chunk=is_first,
+            ).to(dit_dtype)
+            hdmap_chunk = self.transformer.patchify(chunk_latent)
+        elif st["hdmap_pixel"] is not None:
+            s, e = _hdmap_chunk_pixel_bounds(chunk_idx, len_t)
+            chunk_clip = st["hdmap_pixel"][:, :, s:e].to(device=device)
+            chunk_latent = _vae_encode_normalized(
+                chunk_clip,
+                self.encoder,
+                cache=hdmap_encode_cache,
+                is_first_chunk=is_first,
+            ).to(dit_dtype)
+            hdmap_chunk = self.transformer.patchify(chunk_latent)
+        elif st["hdmap_tokens"] is not None:
+            hdmap_chunk = st["hdmap_tokens"][chunk_idx].to(
+                device=device, dtype=dit_dtype
+            )
+        else:
+            hdmap_chunk = hdmap_zero
+
+        pin = is_first and image_full is not None
+
+        # Roll the per-block KV window BEFORE deciding capture eligibility.
+        for c in caches:
+            c.before_update(chunk_idx)
+        steady_now = (
+            cuda_graph_runner is not None and caches[0].is_steady_state()
+        )
+
+        def _call_dit(hidden_states, timestep):
+            if steady_now:
+                return cuda_graph_runner(
+                    hidden_states,
+                    timestep,
+                    cond_mask,
+                    rope_cos_sin,
+                    hdmap_chunk,
+                )
+            return _dit_call(
+                hidden_states, timestep, cond_mask, rope_cos_sin, hdmap_chunk
+            )
+
+        def predict_flow(noisy: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            if pin:
+                noisy = noisy * (1.0 - inject_mask) + image_full * inject_mask
+            return _call_dit(noisy, t)
+
+        noise = torch.empty(
+            B, chunk_tokens, in_d, device=device, dtype=dit_dtype
+        ).normal_(generator=gen)
+        clean = scheduler.sample(noise, predict_flow=predict_flow, rng=gen)
+        if pin:
+            clean = clean * (1.0 - inject_mask) + image_full * inject_mask
+
+        # Authoritative cache write: re-forward the CLEAN chunk at the
+        # context-noise timestep (identical to the offline loop body).
+        ctx_latent = scheduler.add_noise(clean, ctx_noise_t, rng=gen)
+        if pin:
+            ctx_latent = ctx_latent * (1.0 - inject_mask) + image_full * inject_mask
+        _call_dit(ctx_latent, ctx_noise_t)
+
+        for c in caches:
+            c.after_update(chunk_idx)
+
+        # [B, L, out*pdim] -> [B, out, len_t, h, w].
+        chunk_latent_btchw = self.transformer.unpatchify(clean, len_t, hp, wp)
+
+        # Advance the persistent chunk index for the next call.
+        cache_state.chunk_idx += 1
+
+        # This chunk's latent (for any downstream that reads batch.latents).
+        batch.latents = chunk_latent_btchw
+        _log_omnidreams_stats("realtime_chunk_latents", batch.latents)
+
+        # ---- per-chunk streaming VAE decode ---- #
+        self._realtime_stream_decode(batch, server_args, block_idx)
+
+        return batch
+
+    def _maybe_load_weight_only_fp8(
+        self, batch: Req, server_args: ServerArgs
+    ) -> None:
+        """Dequantize FP8 weights into the DiT once (weight_only_fp8 mode).
+
+        Extracted from the offline forward; idempotent via the
+        ``_weight_only_fp8_applied`` flag on the transformer.
+        """
+        already_loaded = getattr(self.transformer, "_weight_only_fp8_applied", False)
+        if already_loaded:
+            return
+        config = server_args.pipeline_config
+        model_path = server_args.model_path
+        fp8_prepared_path = getattr(config, "native_dit_fp8_prepared_path", None)
+        if fp8_prepared_path is None:
+            if os.path.isfile(model_path):
+                ckpt_dir = os.path.dirname(model_path)
+            else:
+                ckpt_dir = model_path
+            fp8_prepared_path = os.path.join(ckpt_dir, "omnidreams_fp8_dit.pt")
+        if fp8_prepared_path and os.path.exists(fp8_prepared_path):
+            from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+                dequantize_fp8_weights_to_bf16,
+            )
+
+            payload = torch.load(
+                fp8_prepared_path, map_location="cpu", weights_only=True
+            )
+            bf16_weights = dequantize_fp8_weights_to_bf16(payload["weights"])
+            del payload
+            model_keys = set(self.transformer.state_dict().keys())
+            matched = {k: v for k, v in bf16_weights.items() if k in model_keys}
+            del bf16_weights
+            device = next(self.transformer.parameters()).device
+            self.transformer.load_state_dict(
+                {k: v.to(device=device) for k, v in matched.items()},
+                strict=False,
+            )
+            n = len(matched)
+            del matched
+            self.transformer._weight_only_fp8_applied = True
+            logger.info(
+                "OmniDreams: loaded dequantized FP8 weights into DiT "
+                "(weight_only_fp8 mode, %d keys). Caching for reuse.",
+                n,
+            )
+        else:
+            logger.warning(
+                "OmniDreams: weight_only_fp8 mode but FP8 prepared weights "
+                "not found at %s; using raw bf16 checkpoint.",
+                fp8_prepared_path,
+            )
+
+    def _maybe_install_fp8_compute(self, config, device) -> None:
+        """Install FP8-compute linears on the DiT once (fp8_compute mode).
+
+        Extracted from the offline forward; idempotent.
+        """
+        if getattr(self.transformer, "_fp8_compute_applied", False):
+            return
+        from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+            install_fp8_compute_on_dit,
+        )
+
+        installed = install_fp8_compute_on_dit(self.transformer)
+        attn_backend = os.environ.get(
+            "SGLANG_OMNIDREAMS_ATTN_BACKEND"
+        ) or getattr(config, "omnidreams_attn_backend", "sdpa")
+        if not installed:
+            attn_backend = "sdpa"
+        for block in self.transformer.blocks:
+            block.self_attn._attn_backend = attn_backend
+        if installed:
+            logger.info(
+                "OmniDreams: fp8_compute active (attn=%s).", attn_backend
+            )
+        elif device.type == "cuda":
+            logger.info(
+                "OmniDreams: fp8_compute requested but unavailable; eager bf16."
+            )
+
+    @torch.no_grad()
+    def _realtime_stream_decode(
+        self, batch: Req, server_args: ServerArgs, block_idx: int
+    ) -> None:
+        """Per-chunk streaming VAE decode for realtime mode.
+
+        Mirrors ``realtime_vae.py``'s ``CausalVaeDecodingStage``: a persistent
+        ``RealtimeCausalDecodeState`` holds the Wan VAE causal conv cache
+        across chunks. chunk 0 resets the cache; every chunk decodes its own
+        latent slice with ``is_first_chunk=(block_idx==0)``. Decoded frames are
+        written to ``batch.raw_frame_batches`` (list[list[bytes]]) for the
+        realtime adapter to push over the WebSocket.
+        """
+        if self.vae is None:
+            return  # decoder not wired (e.g. LightTAE path handles decode elsewhere)
+
+        decode_state = batch.session.get_or_create_state(
+            RealtimeCausalDecodeState
+        )
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        self.vae = self.vae.to(
+            device=get_local_torch_device(), dtype=vae_dtype
+        )
+        latents = batch.latents.to(get_local_torch_device())
+
+        # Reset the causal VAE conv cache on the first chunk so the streaming
+        # left-context starts fresh (matches realtime_vae.py block_idx==0 reset).
+        reset_fn = getattr(self.vae, "reset_causal_decode_state", None) or getattr(
+            self.vae, "clear_cache", None
+        )
+        if block_idx == 0 and callable(reset_fn):
+            reset_fn()
+            decode_state.conv_cache = None
+            decode_state.next_dec_idx = 0
+
+        # scale_and_shift + preprocess (same as DecodingStage.decode).
+        latents = scale_and_shift_latents(latents, server_args, self.vae)
+        latents = server_args.pipeline_config.preprocess_decoding(
+            latents, server_args, vae=self.vae
+        )
+        vae_autocast_enabled = (
+            vae_dtype != torch.float32
+        ) and not server_args.disable_autocast
+
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=vae_dtype,
+            enabled=vae_autocast_enabled,
+        ):
+            try:
+                if server_args.pipeline_config.vae_tiling:
+                    self.vae.enable_tiling()
+            except Exception:
+                pass
+            if not vae_autocast_enabled:
+                latents = latents.to(vae_dtype)
+
+            is_first_chunk = block_idx == 0
+            decode_fn = getattr(self.vae, "causal_decode", None)
+            if callable(decode_fn):
+                decode_output = decode_fn(latents)
+                image = _ensure_tensor_decode_output(decode_output)
+            elif self._supports_wan_decoder_cache():
+                image = self._decode_wan_with_persistent_cache(
+                    latents,
+                    first_chunk=is_first_chunk,
+                )
+            else:
+                # TODO(realtime): non-causal VAE fallback decodes this chunk
+                # independently (no cross-chunk conv continuity). Correct for
+                # chunk-0; later chunks may have a boundary discontinuity.
+                decode_output = self.vae.decode(latents)
+                image = _ensure_tensor_decode_output(decode_output)
+
+        image = (image / 2 + 0.5).clamp(0, 1)
+        image = server_args.pipeline_config.post_decoding(image, server_args)
+
+        # Encode frames to bytes per realtime_output_format (default raw uint8).
+        batch.raw_frame_batches = self._encode_realtime_frames(
+            image, batch, server_args
+        )
+        # Track the decode frontier for diagnostics / parity checks.
+        decode_state.next_dec_idx += image.shape[2]
+
+    def _supports_wan_decoder_cache(self) -> bool:
+        # Mirrors realtime_vae.CausalVaeDecodingStage._supports_wan_decoder_cache.
+        vae = self.vae
+        return all(
+            hasattr(vae, attr)
+            for attr in (
+                "clear_cache",
+                "post_quant_conv",
+                "decoder",
+                "_feat_map",
+                "_conv_idx",
+            )
+        )
+
+    def _decode_wan_with_persistent_cache(
+        self, latents: torch.Tensor, *, first_chunk: bool
+    ) -> torch.Tensor:
+        """Mirrors ``realtime_vae.CausalVaeDecodingStage`` exactly."""
+        x = self.vae.post_quant_conv(latents)
+        decoded_frames = []
+        for frame_idx in range(x.shape[2]):
+            self.vae._conv_idx = [0]
+            decoded = self.vae.decoder(
+                x[:, :, frame_idx : frame_idx + 1],
+                feat_cache=self.vae._feat_map,
+                feat_idx=self.vae._conv_idx,
+                first_chunk=first_chunk and frame_idx == 0,
+            )
+            decoded_frames.append(decoded)
+        image = torch.cat(decoded_frames, dim=2)
+        from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+            unpatchify as wan_unpatchify,
+        )
+
+        if getattr(self.vae.config, "patch_size", None) is not None:
+            image = wan_unpatchify(image, patch_size=self.vae.config.patch_size)
+        return image.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def _encode_realtime_frames(
+        image: torch.Tensor,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> list[list[bytes]]:
+        """Encode decoded frames ``[B, C, T, H, W]`` in [0,1] to per-batch bytes.
+
+        Default format is raw uint8 RGB24 bytes (one bytes object per frame),
+        matching ``build_raw_rgb_frame_batches`` in ``realtime_video.py``. When
+        ``batch.realtime_output_format`` is ``"jpeg"`` or ``"webp"``, frames are
+        PIL-encoded to the corresponding image format.
+        """
+        import numpy as np
+
+        fmt = (batch.realtime_output_format or "raw").lower()
+        # [B, C, T, H, W] -> per-sample frame list
+        frame_batches: list[list[bytes]] = []
+        samples = (
+            list(image) if isinstance(image, torch.Tensor) else list(image)
+        )
+        for sample in samples:
+            if isinstance(sample, torch.Tensor):
+                # [C, T, H, W] -> [T, H, W, C] uint8
+                arr = (
+                    (sample * 255).clamp(0, 255).to(torch.uint8)
+                    .permute(1, 2, 3, 0)
+                    .contiguous()
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                arr = np.asarray(sample)
+                if arr.ndim == 3:
+                    arr = arr[None]
+            frames: list[bytes] = []
+            for frame_idx in range(arr.shape[0]):
+                frame = arr[frame_idx]
+                if frame.ndim == 2:
+                    frame = frame[:, :, None]
+                if frame.shape[-1] == 1:
+                    frame = np.repeat(frame, 3, axis=-1)
+                elif frame.shape[-1] > 3:
+                    frame = frame[:, :, :3]
+                frame = np.ascontiguousarray(frame)
+                if fmt in ("jpeg", "jpg"):
+                    import io
+
+                    from PIL import Image as _PILImage
+
+                    buf = io.BytesIO()
+                    _PILImage.fromarray(frame).save(buf, format="JPEG")
+                    frames.append(buf.getvalue())
+                elif fmt == "webp":
+                    import io
+
+                    from PIL import Image as _PILImage
+
+                    buf = io.BytesIO()
+                    _PILImage.fromarray(frame).save(buf, format="WEBP")
+                    frames.append(buf.getvalue())
+                else:
+                    # raw RGB24 bytes (default).
+                    frames.append(frame.tobytes())
+            frame_batches.append(frames)
+        return frame_batches
 
     def _postprocess_sp_latents(
         self, batch: Req, server_args: ServerArgs

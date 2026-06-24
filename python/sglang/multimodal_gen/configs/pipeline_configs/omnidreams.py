@@ -8,7 +8,7 @@ time are added in later phases.
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, get_args
+from typing import Any
 
 from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
 from sglang.multimodal_gen.configs.models.omnidreams_components import (
@@ -21,7 +21,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.native.acceleration import NativeAccelerationMode
+from sglang.multimodal_gen.native.acceleration import (
+    NativeAccelerationMode,
+    normalize_native_acceleration_mode,
+)
 
 
 def warp_flow_match_sigmas(
@@ -91,15 +94,26 @@ class OmniDreamsPipelineConfig(PipelineConfig):
         default_factory=lambda: OmniDreamsVAEDecoderConfig(impl="wanvae")
     )
 
-    # DiT FP8 three-state mode (kept as flat fields, not a nested Config).
+    # DiT FP8 acceleration mode (kept as flat fields, not a nested Config).
+    # Phase 1 honors ``disabled`` (eager bf16, default) and ``weight_only_fp8``
+    # (dequantize pre-quantized FP8 → bf16, eager PyTorch forward).
+    # Phase 2 adds ``fp8_compute``: swap the DiT linears to FP8-compute via
+    # ``torch._scaled_mm`` (per-channel weight + per-token activation) and route
+    # self-attn through the sage3 Blackwell kernel when
+    # ``omnidreams_attn_backend="sage3"``. Falls back to eager bf16 on non-FP8
+    # HW (CPU) or when ``sageattn3`` is unavailable.
+    # ``auto``/``required`` are accepted as inert back-compat aliases mapped to
+    # ``disabled``/``weight_only_fp8`` (see __post_init__).
     native_dit_acceleration: NativeAccelerationMode = "disabled"
     # Explicit path to pre-quantized FP8 DiT weights (.pt from the offline
     # exporter).  When None the DenoisingStage infers a default alongside the
     # raw checkpoint (omnidreams_fp8_dit.pt).
     native_dit_fp8_prepared_path: str | None = None
-    native_dit_backend: str = "auto"
-    # Block-sparse top-k ratio for the "sparge" attention backend (0, 1].
-    fp8_dit_sparge_topk: float | None = None
+    # Phase 2: self-attention backend for the AR DiT ("sdpa" | "sage3"). Only
+    # applies when ``native_dit_acceleration="fp8_compute"`` (sage3 is most
+    # useful alongside FP8-compute). Cross-attn always uses sdpa. Overridden by
+    # env ``SGLANG_OMNIDREAMS_ATTN_BACKEND``. Default "sdpa".
+    omnidreams_attn_backend: str = "sdpa"
 
     def __post_init__(self):
         """Detect removed fields and guide migration to new Config structure."""
@@ -111,9 +125,9 @@ class OmniDreamsPipelineConfig(PipelineConfig):
             "use_light_tae": "decoder_config.impl",
             "light_tae_path": "decoder_config.checkpoint_path",
             "use_fp8_dit": "native_dit_acceleration",
-            "fp8_dit_attention_backend": "native_dit_backend",
-            "use_light_vae_fp8": "encoder_config.native_acceleration + encoder_config.fp8_state_path",
-            "light_vae_fp8_state_path": "encoder_config.fp8_state_path / image_encoder_config.fp8_state_path",
+            "fp8_dit_attention_backend": "native_dit_acceleration",
+            "use_light_vae_fp8": "encoder_config.native_acceleration",
+            "light_vae_fp8_state_path": "encoder_config.native_acceleration",
         }
         for old, new in removed_fields.items():
             if hasattr(self, old):
@@ -122,12 +136,12 @@ class OmniDreamsPipelineConfig(PipelineConfig):
                     f"Use '{new}' instead. See docs/omnidreams_config_migration.md"
                 )
 
-        # Validate three-state mode
-        if self.native_dit_acceleration not in get_args(NativeAccelerationMode):
-            raise ValueError(
-                f"Invalid native_dit_acceleration: {self.native_dit_acceleration}. "
-                f"Must be 'auto', 'disabled', or 'required'."
-            )
+        # Normalize + validate the DiT acceleration mode. ``auto``/``required``
+        # are accepted as inert back-compat aliases (mapped with a warning) so
+        # shipped JSON configs keep loading.
+        self.native_dit_acceleration = normalize_native_acceleration_mode(
+            self.native_dit_acceleration
+        )
 
     def denoising_sigmas(self) -> list[float]:
         return warp_flow_match_sigmas(

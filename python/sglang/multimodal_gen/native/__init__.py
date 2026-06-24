@@ -13,32 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native acceleration helpers for OmniDreams integrations."""
+"""Native acceleration config types for OmniDreams integrations.
+
+Phase 1 removed the vendored native CUDA extension + JIT loader; only the
+config-type surface (``NativeAccelerationConfig`` / ``NativeAccelerationMode``)
+remains. FP8 acceleration now runs through PyTorch-native primitives.
+"""
 
 from .acceleration import (
     NativeAccelerationConfig,
     NativeAccelerationMode,
-    NativeAccelerationUnavailable,
-    NativeBackendSelection,
-    require_extension_symbols,
-    select_native_extension,
-)
-from .singleview_loader import (
-    build_info,
-    load_extension,
-    sync_thirdparty,
-    validate_thirdparty,
 )
 
 __all__ = [
     "NativeAccelerationConfig",
     "NativeAccelerationMode",
-    "NativeAccelerationUnavailable",
-    "NativeBackendSelection",
-    "build_info",
-    "load_extension",
-    "require_extension_symbols",
-    "select_native_extension",
-    "sync_thirdparty",
-    "validate_thirdparty",
 ]

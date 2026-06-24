@@ -13,203 +13,88 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared native acceleration policy helpers.
+"""Shared native acceleration config types.
 
-The DiT and VAE native ports should share CUDA-extension selection semantics:
-
-- ``disabled`` never loads native code.
-- ``auto`` uses native code only when it is available and compatible.
-- ``required`` raises instead of continuing without native code.
+Phase 1 removed the vendored native CUDA extension tree
+(``native/omnidreams_singleview/``) and its JIT loader. Only the config-type
+surface remains: ``NativeAccelerationMode`` (valid modes plus ``auto``/``required``
+back-compat aliases) and ``NativeAccelerationConfig``. FP8 acceleration now runs
+through PyTorch-native primitives (``weight_only_fp8`` today; a ``fp8_compute``
+mode via ``torch._scaled_mm`` + ``sageattn3`` is planned for Phase 2).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from types import ModuleType
-from typing import Literal, Protocol, get_args
+from dataclasses import dataclass
+from typing import Literal
 
 from loguru import logger
 
-NativeAccelerationMode = Literal["auto", "disabled", "required", "weight_only_fp8"]
-NATIVE_EXTENSION_SYNC_COMMAND = (
-    "uv run --package flashdreams-omnidreams python "
-    "integrations/omnidreams/omnidreams_singleview/tools/sync_thirdparty.py sync"
-)
+NativeAccelerationMode = Literal[
+    "disabled", "weight_only_fp8", "fp8_compute", "auto", "required"
+]
+"""Native DiT acceleration policy.
+
+- ``disabled``: run the eager bf16 DiT (default).
+- ``weight_only_fp8``: dequantize pre-quantized FP8 weights to bf16 and run the
+  eager PyTorch DiT (Ideogram 4 style weight-only FP8).
+- ``fp8_compute``: FP8-compute GEMM via ``torch._scaled_mm`` + sage3 attention
+  (Phase 2; GPU-gated).
+- ``auto`` / ``required``: inert back-compat aliases, mapped to ``disabled`` /
+  ``weight_only_fp8`` (see :func:`normalize_native_acceleration_mode`).
+"""
+
+_VALID_NATIVE_MODES: tuple[str, ...] = ("disabled", "weight_only_fp8", "fp8_compute")
+_NATIVE_MODE_ALIASES: dict[str, str] = {
+    "auto": "disabled",
+    "required": "weight_only_fp8",
+}
 
 
-class NativeExtensionLoader(Protocol):
-    def __call__(
-        self,
-        *,
-        build_root: str | None = None,
-        max_jobs: int | str | None = None,
-        verbose: bool = False,
-    ) -> ModuleType | None: ...
+def normalize_native_acceleration_mode(mode: str) -> str:
+    """Map ``auto``/``required`` back-compat aliases to real modes and validate.
 
-
-NativeAvailabilityCheck = Callable[[ModuleType], bool | tuple[bool, str]]
-
-
-class NativeAccelerationUnavailable(RuntimeError):
-    """Raised when native execution is required but unavailable."""
+    The native FP8 DiT path (``optimized_dit_forward``) was removed in Phase 1,
+    so ``auto`` no longer has a native path to opt into (→ ``disabled``) and
+    ``required`` is satisfied by the weight-only FP8 dequant path
+    (→ ``weight_only_fp8``). A warning is logged on alias use.
+    """
+    if mode in _NATIVE_MODE_ALIASES:
+        mapped = _NATIVE_MODE_ALIASES[mode]
+        logger.warning(
+            "native_acceleration mode {!r} is a back-compat alias; mapping to "
+            "{!r} (native FP8 DiT removed in Phase 1).",
+            mode,
+            mapped,
+        )
+        return mapped
+    if mode not in _VALID_NATIVE_MODES:
+        raise ValueError(
+            f"native_acceleration mode must be one of {_VALID_NATIVE_MODES} "
+            f"(or 'auto'/'required' back-compat alias), got {mode!r}"
+        )
+    return mode
 
 
 @dataclass(kw_only=True)
 class NativeAccelerationConfig:
-    """Common native acceleration knobs for pipeline components."""
+    """Common native acceleration knobs for pipeline components.
 
-    mode: NativeAccelerationMode = "auto"
-    """Native execution policy: ``auto``, ``disabled``, or ``required``."""
+    Retained as a config-type container; the extension-loading helpers that used
+    to live here were removed with the native CUDA tree.
+    """
+
+    mode: NativeAccelerationMode = "disabled"
+    """Native execution policy (see :data:`NativeAccelerationMode`)."""
 
     build_root: str | None = None
-    """Optional native build/cache root forwarded to the extension loader."""
+    """Unused after native-tree removal; kept for config-compat."""
 
     max_jobs: int | str | None = None
-    """Optional PyTorch/Ninja job cap forwarded to the extension loader."""
+    """Unused after native-tree removal; kept for config-compat."""
 
     verbose_build: bool = False
-    """Forward verbose build output from the extension loader."""
+    """Unused after native-tree removal; kept for config-compat."""
 
     def __post_init__(self) -> None:
-        if self.mode not in get_args(NativeAccelerationMode):
-            raise ValueError(
-                f"mode must be one of {get_args(NativeAccelerationMode)}, "
-                f"got {self.mode!r}"
-            )
-
-
-@dataclass(frozen=True)
-class NativeBackendSelection:
-    """Resolved native backend choice for one pipeline component."""
-
-    component: str
-    mode: NativeAccelerationMode
-    enabled: bool
-    reason: str
-    extension: ModuleType | None = field(default=None, repr=False, compare=False)
-    error: Exception | None = field(default=None, repr=False, compare=False)
-
-    def require_extension(self) -> ModuleType:
-        """Return the loaded extension or raise with this selection's reason."""
-
-        if self.enabled and self.extension is not None:
-            return self.extension
-        raise NativeAccelerationUnavailable(self.reason)
-
-
-def require_extension_symbols(
-    *symbols: str,
-) -> Callable[[ModuleType], tuple[bool, str]]:
-    """Return an availability check for extension symbols needed by a component."""
-
-    def check(extension: ModuleType) -> tuple[bool, str]:
-        missing = tuple(symbol for symbol in symbols if not hasattr(extension, symbol))
-        if missing:
-            return False, "missing native symbol(s): " + ", ".join(missing)
-        return True, "required native symbols are available"
-
-    return check
-
-
-def _native_extension_unavailable_reason(
-    component: str,
-    error: BaseException | None = None,
-) -> str:
-    base = f"native extension unavailable for {component}"
-    if error is not None:
-        base = f"{base}: {error}"
-    return (
-        f"{base}. To sync third-party native sources, run:\n"
-        f"  {NATIVE_EXTENSION_SYNC_COMMAND}"
-    )
-
-
-def select_native_extension(
-    config: NativeAccelerationConfig,
-    *,
-    component: str,
-    extension_loader: NativeExtensionLoader,
-    extension_error: Callable[[], Exception | None],
-    availability_check: NativeAvailabilityCheck | None = None,
-) -> NativeBackendSelection:
-    """Resolve native use for one component."""
-
-    if config.mode == "disabled":
-        return NativeBackendSelection(
-            component=component,
-            mode=config.mode,
-            enabled=False,
-            reason=f"native acceleration disabled for {component}",
-        )
-
-    try:
-        extension = extension_loader(
-            build_root=config.build_root,
-            max_jobs=config.max_jobs,
-            verbose=config.verbose_build,
-        )
-    except Exception as exc:
-        return _unavailable_or_raise(config, component, str(exc), error=exc)
-
-    if extension is None:
-        error = extension_error()
-        reason = _native_extension_unavailable_reason(component, error)
-        logger.warning("[native] {}", reason)
-        return _unavailable_or_raise(config, component, reason, error=error)
-
-    check = availability_check or _default_availability_check
-    try:
-        ok, reason = _normalize_availability_result(check(extension))
-    except Exception as exc:
-        return _unavailable_or_raise(config, component, str(exc), error=exc)
-    if not ok:
-        return _unavailable_or_raise(config, component, reason)
-
-    return NativeBackendSelection(
-        component=component,
-        mode=config.mode,
-        enabled=True,
-        reason=reason,
-        extension=extension,
-    )
-
-
-def _unavailable_or_raise(
-    config: NativeAccelerationConfig,
-    component: str,
-    reason: str,
-    *,
-    error: Exception | None = None,
-) -> NativeBackendSelection:
-    if config.mode == "required":
-        raise NativeAccelerationUnavailable(reason) from error
-    return NativeBackendSelection(
-        component=component,
-        mode=config.mode,
-        enabled=False,
-        reason=reason,
-        error=error,
-    )
-
-
-def _default_availability_check(extension: ModuleType) -> bool | tuple[bool, str]:
-    is_available = getattr(extension, "is_available", None)
-    if is_available is None:
-        return True, "native extension loaded"
-    if not callable(is_available):
-        return False, "native extension is_available is not callable"
-    if is_available():
-        return True, "native extension is_available returned true"
-    return False, "native extension is_available returned false"
-
-
-def _normalize_availability_result(
-    result: bool | tuple[bool, str],
-) -> tuple[bool, str]:
-    if isinstance(result, tuple):
-        ok, reason = result
-        return ok, reason
-    if result:
-        return True, "native extension is available"
-    return False, "native extension is not available"
+        self.mode = normalize_native_acceleration_mode(self.mode)

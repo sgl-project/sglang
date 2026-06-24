@@ -248,9 +248,6 @@ class OmniDreamsVAEEncoderConfig(_OmniDreamsVAEComponentConfig):
 
     impl: Literal["wanvae", "lightvae", "pixelshuffle"] = "wanvae"
 
-    # Calibrated FP8 encoder state (.pt); only meaningful for impl="lightvae".
-    fp8_state_path: str | None = None
-
     def setup(self) -> nn.Module:
         """Instantiate the VAE encoder module."""
         if self.impl == "wanvae":
@@ -262,7 +259,6 @@ class OmniDreamsVAEEncoderConfig(_OmniDreamsVAEComponentConfig):
         raise ValueError(f"Unknown VAE encoder impl: {self.impl}")
 
     def _setup_lightvae(self) -> nn.Module:
-        from sglang.multimodal_gen import envs
         from sglang.multimodal_gen.runtime.models.vaes.omnidreams_light_vae import (
             LightVAEEncoder,
         )
@@ -271,20 +267,14 @@ class OmniDreamsVAEEncoderConfig(_OmniDreamsVAEComponentConfig):
             self.model_path or "", None, "*lightvae*.pth", "light_vae_path"
         )
 
-        fp8_state = None
-        if self.native_acceleration != "disabled":
-            fp8_state = (
-                self.fp8_state_path
-                or envs.SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH
-            )
-
+        # Native VAE FP8 was removed with the native CUDA tree; LightVAE always
+        # runs the pure-Python bf16 eager encode path. ``native_acceleration``
+        # is kept on the config for back-compat but is inert here.
         encoder = LightVAEEncoder(
             checkpoint_path=ckpt,
             latents_mean=list(self.latents_mean),
             latents_std=list(self.latents_std),
             dtype=self.dtype,
-            fp8_state_path=fp8_state,
-            fp8_required=(self.native_acceleration == "required"),
         )
         return encoder.to(self.device).eval()
 
