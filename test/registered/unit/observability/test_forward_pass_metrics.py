@@ -33,6 +33,7 @@ def _make_ps(**overrides) -> ParallelState:
         moe_ep_size=1,
         moe_dp_rank=None,
         moe_dp_size=1,
+        dcp_size=1,
         gpu_id=0,
     )
     defaults.update(overrides)
