@@ -1,4 +1,4 @@
-# Reproduce a relocation commit byte-for-byte
+# 如何证明 commit 是机械移动
 
 The proof that a commit is a pure relocation: regenerate it from the base commit with
 faithful AST primitives, run the formatter, and diff byte-for-byte against the target. An

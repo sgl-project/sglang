@@ -1,4 +1,4 @@
-# Splitting a mechanical change into prep + move
+# 心智模型：将机械变更拆分为准备 + 移动
 
 A "move a method/function from one place to another" change is really **two
 operations with different correctness criteria**:

@@ -30,10 +30,10 @@ reproduce proof). A mechanical commit/PR contains **only** mechanical changes; s
 
 ### Read these to use the skill
 
-- [`reproduce.md`](reproduce.md) — how to **certify a relocation commit**: the auto-generator
+- [`how-to-guide.md`](how-to-guide.md) — how to **certify a relocation commit**: the auto-generator
   command, what its inference covers, the `UNSUPPORTED` cases, and the `Repro` primitives for
   hand-writing a transform when inference falls short.
-- [`prep-and-move.md`](prep-and-move.md) — how to **make an extraction verifiable** by splitting
+- [`mental-model-prep-and-move.md`](mental-model-prep-and-move.md) — how to **make an extraction verifiable** by splitting
   it into prep + move: the two-commit recipe, the class-extraction and new-module
   (trailing-block) techniques, what counts as mechanical, and the anti-patterns.
 

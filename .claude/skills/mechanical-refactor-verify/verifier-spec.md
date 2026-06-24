@@ -4,7 +4,7 @@
 
 - This file is the **single source of truth** for *what the skill certifies* and *how*. The
   code (`mechanical_refactor_reproduce_utils.py`, `mechanical_refactor_reproduce_gen_utils.py`),
-  the tests, and the prose guides (`SKILL.md`, `reproduce.md`, `prep-and-move.md`) all
+  the tests, and the prose guides (`SKILL.md`, `how-to-guide.md`, `mental-model-prep-and-move.md`) all
   implement or describe this file. If any of them disagrees with it, **this file wins** and
   the others are the bug.
 - There is **one property** being certified — *a commit is a pure relocation* — and **one
@@ -70,7 +70,7 @@ list is what they refuse to do, so it surfaces as a residual diff.
 - A **constant re-derived** in the destination module (`_flag = compute_flag()`).
 
 A rename, fresh scaffolding, or a statement reorder is reshape work, so it belongs in the
-**prep** commit, not the move (§2.4, `prep-and-move.md`). The reproduce proof reports such a
+**prep** commit, not the move (§2.4, `mental-model-prep-and-move.md`). The reproduce proof reports such a
 commit as a residual diff (or, when no definition relocated at all, as unsupported) — it does
 not certify it.
 
@@ -174,7 +174,7 @@ so a byte match after the formatter certifies the commit is *exactly* that reloc
   each new module is filled from a single source, or hand-write the `Repro`.
 
 For an inference gap (not a property violation), write the `Repro` by hand (see
-`reproduce.md`); the same byte-diff then certifies it.
+`how-to-guide.md`); the same byte-diff then certifies it.
 
 ## 4. What a verdict asserts (and does not)
 

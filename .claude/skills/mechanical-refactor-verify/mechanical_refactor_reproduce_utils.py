@@ -12,7 +12,7 @@ The ``Repro`` builder composes faithful relocation primitives (``move_symbol``,
 transform, so a move that a formatter re-wrapped can be reproduced and certified. Each primitive does only a
 relocation-faithful edit (it never changes logic), so a byte match after the formatter
 certifies the commit is exactly that relocation. The primitives are deliberately small and
-AST-driven; see reproduce.md.
+AST-driven; see how-to-guide.md.
 
 This module is self-contained and needs only git and the standard library.
 """
