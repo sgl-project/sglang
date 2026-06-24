@@ -3,7 +3,12 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    InsertParams,
+    InsertResult,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.ref_aware_cache_mixin import (
     TIER_HIGH_REF,
@@ -27,6 +32,12 @@ class RefAwareRadixCache(RefAwareCacheMixin, RadixCache):
     def reset(self):
         self._reset_ref_aware_state()
         super().reset()
+
+    def insert(self, params: InsertParams) -> InsertResult:
+        old_size = self.evictable_size_
+        result = super().insert(params)
+        self.unused_evictable_size_ += max(0, self.evictable_size_ - old_size)
+        return result
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:

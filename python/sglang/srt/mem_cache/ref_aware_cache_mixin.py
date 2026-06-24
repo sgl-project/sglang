@@ -371,16 +371,24 @@ class RefAwareCacheMixin:
     # Explicit ref management for multi-turn requests
     # ------------------------------------------------------------------
 
+    def ref_id_for_req(self, req: Req) -> Optional[str]:
+        session_id = getattr(req, "session_id", None)
+        if session_id is None:
+            session_id = getattr(getattr(req, "session", None), "session_id", None)
+        if session_id is not None:
+            return session_id
+        return getattr(req, "rid", None)
+
     def register_ref(self, req: Req):
-        rid = req.rid
-        if not rid:
+        ref_id = self.ref_id_for_req(req)
+        if ref_id is None:
             return
         is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
 
-        if rid not in self.rid_to_ref_info:
-            self.rid_to_ref_info[rid] = RefInfo(is_high=is_high)
+        if ref_id not in self.rid_to_ref_info:
+            self.rid_to_ref_info[ref_id] = RefInfo(is_high=is_high)
 
-        ref_info = self.rid_to_ref_info[rid]
+        ref_info = self.rid_to_ref_info[ref_id]
 
         last_node = getattr(req, "last_node", None)
         if last_node not in (None, self.root_node):
@@ -393,7 +401,7 @@ class RefAwareCacheMixin:
                 return
 
             radix_key = RadixKey(
-                list(token_ids), getattr(req, "extra_key", None)
+                token_ids, getattr(req, "extra_key", None)
             ).page_aligned(self.page_size)
             if len(radix_key) == 0:
                 return
@@ -404,7 +412,7 @@ class RefAwareCacheMixin:
         for node in new_nodes:
             self._inc_priority_ref_single(node, is_high)
             ref_info.nodes.add(node)
-            node.tracked_rids.add(rid)
+            node.tracked_rids.add(ref_id)
 
         ref_info.cached_tokens = sum(len(n.key) for n in ref_info.nodes)
 
@@ -423,6 +431,7 @@ class RefAwareCacheMixin:
             nodes.append(child)
             if prefix_len < len(child.key):
                 break
+            node = child
             key = key[prefix_len:]
         return nodes
 

@@ -456,7 +456,8 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
         return InsertResult(prefix_len=total_prefix_length), last_node
 
     def insert(self, params: InsertParams) -> InsertResult:
-        result, _ = self._insert_with_last_node(params)
+        result, last_node = self._insert_with_last_node(params)
+        result.last_device_node = last_node
         return result
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):

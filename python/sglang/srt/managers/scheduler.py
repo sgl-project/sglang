@@ -716,13 +716,13 @@ class Scheduler(
         rid = recv_req.rid
         new_priority = recv_req.new_priority
         for req in getattr(self.running_batch, "reqs", []) or []:
-            if getattr(req, "rid", None) == rid:
+            if req.rid == rid:
                 req.priority = new_priority
         for req in self.waiting_queue or []:
-            if getattr(req, "rid", None) == rid:
+            if req.rid == rid:
                 req.priority = new_priority
         chunked = getattr(self, "chunked_req", None)
-        if chunked is not None and getattr(chunked, "rid", None) == rid:
+        if chunked is not None and chunked.rid == rid:
             chunked.priority = new_priority
 
         success, msg = self.tree_cache.update_ref(rid, new_priority)
@@ -2079,14 +2079,9 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native sessions use only the top-level session_id.
-        radix_native_session = (
-            recv_req.session_id is not None
-            and self.server_args.enable_session_radix_cache
-        )
 
-        if session_id is None or radix_native_session:
-            # Normal non-session request, or a radix-native session request
+        if session_id is None:
+            # Normal request. Top-level session_id is carried on Req for cache consumers.
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -4185,12 +4180,7 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
-            self.tree_cache.release_radix_session(recv_req.session_id)
-        if recv_req.session_id in self.session_controller or not (
-            self.server_args.enable_session_radix_cache
-        ):
-            self.session_controller.close(recv_req)
+        self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

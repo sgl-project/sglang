@@ -998,10 +998,6 @@ class ServerArgs:
         bool,
         "Enable streaming session mode and StreamingSession wrapper.",
     ] = False
-    enable_session_radix_cache: A[
-        bool,
-        "Hold per-session KV as ordinary evictable radix entries, tagged by session id and bulk-evicted on close. Requires --radix-eviction-policy priority.",
-    ] = False
 
     # -------------------------------------------------------------------------
     # Constrained decoding
@@ -2587,10 +2583,6 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
-        if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
-            raise ValueError(
-                "--enable-session-radix-cache requires --radix-eviction-policy priority"
-            )
 
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
