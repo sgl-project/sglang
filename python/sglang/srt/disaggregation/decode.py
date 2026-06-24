@@ -75,7 +75,10 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.owned_kv import alloc_for_decode_prealloc
+from sglang.srt.mem_cache.owned_kv import (
+    alloc_for_decode_prealloc,
+    init_decode_prealloc_kv,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -1295,15 +1298,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        # TODO(th4): co-locate this req.kv bookkeeping with the real KV
-        # allocation; the pool alloc above and the kv_allocated_len assignment
-        # below should become a single owned-kv allocation step.
-        if req.kv is None:
-            from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-            req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-        else:
-            req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
@@ -1345,6 +1339,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
             assert prefix_len == 0
+
+            init_decode_prealloc_kv(req, fill_len)
 
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.

@@ -11,6 +11,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.kv_cache_utils import write_cache_indices
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.req_state import ReqKvInfo
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -19,7 +20,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.free_space import FreeSpaceProvider
-    from sglang.srt.mem_cache.req_state import ReqKvInfo
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 logger = logging.getLogger(__name__)
@@ -285,6 +285,12 @@ def alloc_for_extend(
             batch.seq_lens_cpu,
         )
 
+    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+        if req.kv is None:
+            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+        else:
+            req.kv.kv_allocated_len = seq_len
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
@@ -402,7 +408,17 @@ def alloc_for_decode(
             token_per_req,
         )
 
+    for req in batch.reqs:
+        req.kv.kv_allocated_len += token_per_req
+
     return out_cache_loc
+
+
+def init_decode_prealloc_kv(req: Req, fill_len: int) -> None:
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
 
 
 def alloc_for_decode_prealloc(
@@ -417,6 +433,8 @@ def alloc_for_decode_prealloc(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
+    init_decode_prealloc_kv(req, fill_len)
+
     if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
     else:
