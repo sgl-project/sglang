@@ -99,6 +99,21 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
     )
 }
 
+/// Pick the worker with the smallest `effective_load`. Stable: ties go to the
+/// lowest index in `healthy_indices`. Mirrors the behavior of the previous
+/// `min_by_key(|&&idx| workers[idx].load())` call so the default-weight case
+/// (every weight == 1.0) is byte-identical to the pre-weighting behavior.
+fn min_effective_load_index(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> Option<usize> {
+    healthy_indices
+        .iter()
+        .copied()
+        .min_by(|&a, &b| {
+            workers[a].effective_load()
+                .partial_cmp(&workers[b].effective_load())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -312,24 +327,23 @@ impl CacheAwarePolicy {
         request_text: &Option<&str>,
         healthy_indices: &[usize],
         tree_key: &str,
-        max_load: usize,
-        min_load: usize,
+        max_load: f32,
+        min_load: f32,
     ) -> Option<usize> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
+            let worker_loads: Vec<(&str, usize, f32, f32)> = workers
+                .iter()
+                .map(|w| (w.url(), w.load(), w.weight(), w.effective_load()))
+                .collect();
             debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                "Load balancing triggered | max_effective: {:.3} | min_effective: {:.3} | workers (url, load, weight, effective_load): {:?}",
                 max_load, min_load, worker_loads
             );
         }
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        // Use shortest queue (capacity-weighted) when imbalanced.
+        let min_load_idx = min_effective_load_index(workers, healthy_indices)?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -390,16 +404,27 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let pivot = workers[healthy_indices[0]].as_ref();
         let tree_key = tree_key_for_worker(pivot);
 
-        // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        // Compute capacity-weighted min/max in a single pass. With every worker
+        // at the default weight (1.0) this collapses to the original integer
+        // load comparison, so existing deployments see no behavior change.
+        let (min_load, max_load) = healthy_indices.iter().fold(
+            (f32::INFINITY, 0.0f32),
+            |(min, max), &idx| {
+                let eff = workers[idx].effective_load();
+                (min.min(eff), max.max(eff))
+            },
+        );
+        let min_load = if min_load.is_finite() { min_load } else { 0.0 };
 
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+        // Check if load is imbalanced. `balance_abs_threshold` is compared against
+        // the effective-load delta (`load / weight`), not raw request counts.
+        // With heterogeneous weights, a threshold of N means "trigger rebalance when
+        // the largest capacity-adjusted queue exceeds the smallest by more than N
+        // effective-load units." For uniform-weight deployments (all weight=1.0),
+        // effective-load equals raw load, so the threshold's practical meaning is
+        // unchanged.
+        let is_imbalanced = (max_load - min_load) > self.config.balance_abs_threshold as f32
+            && max_load > min_load * self.config.balance_rel_threshold;
 
         if is_imbalanced {
             return self.select_worker_min_load(
@@ -438,11 +463,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
-                healthy_indices
-                    .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
-                    .copied()
+                // Low cache match: use worker with minimum capacity-weighted load.
+                min_effective_load_index(workers, &healthy_indices)
             };
 
             if let Some(idx) = selected_idx {
@@ -537,8 +559,26 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    /// Build a `Regular` worker with the given URL and a `priority` / `cost`
+    /// label combo. With the defaults (priority=50, cost=1.0) the derived
+    /// weight is exactly 1.0, which matches the baseline pre-weighting
+    /// behavior.
+    fn weighted_worker(url: &str, priority: u32, cost: f32) -> Arc<dyn Worker> {
+        let mut labels: HashMap<String, String> = HashMap::new();
+        labels.insert("priority".to_string(), priority.to_string());
+        labels.insert("cost".to_string(), cost.to_string());
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .labels(labels)
+                .build(),
+        )
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
@@ -1507,5 +1547,317 @@ mod tests {
             assert!(prefill_ca.trees.is_empty());
             assert!(decode_ca.trees.is_empty());
         }
+    }
+
+    // ============================== Worker weighting ==============================
+    //
+    // These tests cover the heterogeneous-worker weighting added on top of the
+    // existing cache_aware logic. The contract:
+    //
+    //   * `Worker::weight()` returns 1.0 when `priority`/`cost` labels are
+    //     absent or hold the defaults — so unweighted deployments keep their
+    //     original behavior byte-for-byte.
+    //   * `effective_load = load / weight` is the new ordering key for both
+    //     the imbalance check and the two min-load picks (cache-miss path and
+    //     imbalanced-shortest-queue path).
+
+    /// A default-labeled worker has weight 1.0 — guarantees no behavior drift
+    /// for existing deployments that never set `priority` or `cost`.
+    #[test]
+    fn test_worker_weight_defaults_to_one() {
+        let w: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        assert!((w.weight() - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// `weight = priority/50 * 1.0/cost` with the defined defaults.
+    #[test]
+    fn test_worker_weight_combines_priority_and_cost() {
+        // priority=100 → 2× factor; cost=0.5 → 2× factor; product = 4.0
+        let w = weighted_worker("http://big:8000", 100, 0.5);
+        assert!((w.weight() - 4.0).abs() < 1e-5);
+
+        // priority=25 → 0.5×; cost=2.0 → 0.5×; product = 0.25
+        let w = weighted_worker("http://small:8000", 25, 2.0);
+        assert!((w.weight() - 0.25).abs() < 1e-5);
+    }
+
+    /// A misconfigured zero or negative cost must not blow up the divisor —
+    /// the worker falls back to weight 1.0 rather than `inf`/`NaN`.
+    #[test]
+    fn test_worker_weight_guards_against_zero_cost() {
+        let w = weighted_worker("http://broken:8000", 50, 0.0);
+        assert!((w.weight() - 1.0).abs() < f32::EPSILON);
+
+        let w = weighted_worker("http://negative:8000", 50, -1.0);
+        assert!((w.weight() - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// Cache-miss path: when no prefix matches, route to the worker with the
+    /// smallest `load / weight`. With weight=2.0 on w1 vs weight=1.0 on w2,
+    /// w1 should keep absorbing requests until its effective load exceeds w2's.
+    #[tokio::test]
+    async fn test_cache_aware_cache_miss_picks_min_effective_load() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.9,           // force cache-miss path
+            balance_abs_threshold: 1_000,   // never imbalanced
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        // w1 is 2× weight, so it should accept ~2× the load before w2 catches up.
+        let w1 = weighted_worker("http://w1:8000", 100, 1.0); // weight = 2.0
+        let w2 = weighted_worker("http://w2:8000", 50, 1.0);  // weight = 1.0
+        let workers = vec![w1.clone(), w2.clone()];
+        policy.init_workers(&workers);
+
+        // Each iteration runs a unique request with NO shared prefix, so the
+        // cache-affinity branch is never taken — match_rate stays < threshold
+        // and we always fall into the min-effective-load path.
+        let prompts = [
+            "alpha distinct one",
+            "beta different two",
+            "gamma separate three",
+            "delta unique four",
+            "epsilon other five",
+            "zeta novel six",
+        ];
+        for prompt in prompts {
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(prompt),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("a worker must be selected");
+            // Simulate the worker actually picking up the request.
+            workers[idx].increment_load();
+        }
+
+        // After 6 requests, w1 should hold ~4 and w2 ~2 (2:1 weight ratio).
+        // Allow ±1 slack to absorb tie-breaking ordering.
+        let w1_load = w1.load() as i32;
+        let w2_load = w2.load() as i32;
+        assert_eq!(
+            w1_load + w2_load,
+            6,
+            "all 6 requests must land somewhere (got w1={w1_load}, w2={w2_load})"
+        );
+        assert!(
+            w1_load > w2_load,
+            "2× weight worker should carry strictly more load (w1={w1_load}, w2={w2_load})"
+        );
+        assert!(
+            (w1_load - 2 * w2_load).abs() <= 1,
+            "load should split close to the weight ratio 2:1 (w1={w1_load}, w2={w2_load})"
+        );
+    }
+
+    /// Imbalanced path: the shortest-queue fallback also has to use the
+    /// capacity-weighted load. Without weighting, the heavier-loaded big box
+    /// (w1 raw load 10) would be skipped in favor of the small box (raw load 6);
+    /// with weight=4× on w1, its effective load is 2.5 vs w2's 6.0, so traffic
+    /// should still go to the big box.
+    #[tokio::test]
+    async fn test_cache_aware_imbalanced_path_uses_effective_load() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 1,     // trip easily
+            balance_rel_threshold: 1.001,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        // w1: 4× capacity. w2: baseline.
+        let w1 = weighted_worker("http://big:8000", 100, 0.5); // weight = 4.0
+        let w2 = weighted_worker("http://small:8000", 50, 1.0); // weight = 1.0
+        // Raw loads: w1=10, w2=6. Effective: w1=2.5, w2=6.0.
+        for _ in 0..10 {
+            w1.increment_load();
+        }
+        for _ in 0..6 {
+            w2.increment_load();
+        }
+        let workers = vec![w1.clone(), w2.clone()];
+        policy.init_workers(&workers);
+
+        for _ in 0..3 {
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some("imbalanced probe"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("a worker must be selected");
+            assert_eq!(
+                idx, 0,
+                "even at raw load 10 vs 6, the 4× weight box has lower effective load"
+            );
+        }
+    }
+
+    /// Sanity: with every worker at weight=1.0, the new code path picks the
+    /// same worker the old integer-load comparison did. Locks in the no-op
+    /// behavior for default-labeled deployments.
+    #[tokio::test]
+    async fn test_cache_aware_uniform_weights_match_legacy_min_load() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.9,
+            balance_abs_threshold: 1_000,
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        let w0: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w0:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let w1: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        // Make w0 the busier one — legacy min-load would have picked w1.
+        for _ in 0..3 {
+            w0.increment_load();
+        }
+        let workers = vec![w0.clone(), w1.clone()];
+        policy.init_workers(&workers);
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("unique miss"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a worker must be selected");
+        assert_eq!(idx, 1, "uniform-weight path must agree with legacy min-load");
+    }
+
+    /// Cache-hit path: when match_rate > cache_threshold, the policy routes by
+    /// cached tenant URL and ignores weight. This is correct — the KV cache hit
+    /// savings outweigh load balancing. This test confirms that behavior.
+    #[tokio::test]
+    async fn test_cache_aware_cache_hit_ignores_weight() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.1,         // very low → almost everything is a "cache hit"
+            balance_abs_threshold: 1_000, // never imbalanced
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        let w1 = weighted_worker("http://w1:8000", 50, 1.0); // weight = 1.0
+        let w2 = weighted_worker("http://w2:8000", 100, 0.5); // weight = 4.0
+        let workers = vec![w1.clone(), w2.clone()];
+        policy.init_workers(&workers);
+
+        // First request seeds the cache on some worker
+        let first_idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world cache hit test"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Add heavy load to the cached worker so its effective load is much higher
+        for _ in 0..50 {
+            workers[first_idx].increment_load();
+        }
+
+        // Second identical request should still route to the same cached worker
+        // even though its effective load is now much higher
+        let second_idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("hello world cache hit test"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first_idx, second_idx,
+            "cache-hit path must route to cached tenant regardless of weight/load"
+        );
+    }
+
+    /// Three workers with weights 4:2:1 should receive load approximately in
+    /// that ratio when routed through the cache-miss (min-effective-load) path.
+    #[tokio::test]
+    async fn test_cache_aware_three_workers_different_weights() {
+        let config = CacheAwareConfig {
+            cache_threshold: 0.9,           // force cache-miss path
+            balance_abs_threshold: 1_000,   // never imbalanced
+            balance_rel_threshold: 1_000.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        // weight = priority/50 * 1.0/cost
+        let w0 = weighted_worker("http://big:8000", 100, 0.5);    // weight = 4.0
+        let w1 = weighted_worker("http://medium:8000", 100, 1.0); // weight = 2.0
+        let w2 = weighted_worker("http://small:8000", 50, 1.0);   // weight = 1.0
+        let workers = vec![w0.clone(), w1.clone(), w2.clone()];
+        policy.init_workers(&workers);
+
+        // Use truly unique prompts to avoid cache affinity
+        let unique_prompts: Vec<String> = (0..21).map(|i| format!("prompt-{}", i)).collect();
+
+        for prompt in &unique_prompts {
+            let idx = policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        request_text: Some(prompt),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("a worker must be selected");
+            workers[idx].increment_load();
+        }
+
+        let l0 = w0.load() as f32;
+        let l1 = w1.load() as f32;
+        let l2 = w2.load() as f32;
+        assert_eq!(
+            (l0 + l1 + l2) as usize,
+            21,
+            "all 21 requests must land somewhere (got {l0} + {l1} + {l2})"
+        );
+        assert!(
+            l0 > l1,
+            "4x weight worker should carry more than 2x weight worker (got {l0} vs {l1})"
+        );
+        assert!(
+            l1 > l2,
+            "2x weight worker should carry more than 1x weight worker (got {l1} vs {l2})"
+        );
     }
 }

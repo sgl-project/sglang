@@ -273,6 +273,55 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(DEFAULT_WORKER_COST)
     }
 
+    /// Effective capacity weight derived from `priority` and `cost` labels.
+    ///
+    /// Higher weight = more requests should land here. Two heterogeneous workers
+    /// (e.g. one 8-GPU, one 2-GPU) can be balanced by setting their `priority`
+    /// or `cost` labels at registration time so that
+    /// `effective_load = load / weight` keeps each box at the same utilization.
+    ///
+    /// `weight = (priority / DEFAULT_WORKER_PRIORITY) * (DEFAULT_WORKER_COST / cost)`
+    ///
+    /// With the defaults (priority=50, cost=1.0) this returns exactly 1.0 — i.e.
+    /// existing deployments that never set these labels see identical scheduling
+    /// behavior. Clamped to a small positive number to keep `load / weight` well
+    /// defined even if an operator sets `cost=0` by mistake.
+    fn weight(&self) -> f32 {
+        let priority_factor = self.priority() as f32 / DEFAULT_WORKER_PRIORITY as f32;
+        let cost = self.cost();
+        let cost_factor = if cost > 0.0 {
+            DEFAULT_WORKER_COST / cost
+        } else {
+            // Treat a misconfigured / non-positive cost as the baseline rather
+            // than letting it blow up the divisor in `effective_load`.
+            1.0
+        };
+        let w = priority_factor * cost_factor;
+        if w.is_finite() && w > 0.0 {
+            w
+        } else {
+            1.0
+        }
+    }
+
+    /// Per-worker capacity-aware load metric.
+    ///
+    /// `effective_load = load / weight`. A bigger machine (weight > 1.0) is treated
+    /// as if it had a smaller queue than its raw `load()` count suggests, so the
+    /// shortest-effective-load picker sends proportionally more traffic there.
+    ///
+    /// Returns `f32::INFINITY` for any non-positive weight so the worker is
+    /// naturally deprioritized rather than blowing up the comparison.
+    fn effective_load(&self) -> f32 {
+        let load = self.load() as f32;
+        let weight = self.weight();
+        if weight > 0.0 {
+            load / weight
+        } else {
+            f32::INFINITY
+        }
+    }
+
     /// Get tokenizer path for a specific model.
     fn tokenizer_path(&self, model_id: &str) -> Option<&str> {
         self.metadata()
@@ -633,6 +682,9 @@ pub struct BasicWorker {
     /// When set, overrides metadata.models for routing decisions.
     /// Uses std::sync::RwLock for synchronous access in supports_model().
     pub models_override: Arc<StdRwLock<Option<Vec<ModelCard>>>>,
+    /// Capacity weight computed once at build time from `priority` and `cost` labels.
+    /// See `Worker::weight()` for the formula.
+    pub(crate) weight: f32,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -640,6 +692,7 @@ impl fmt::Debug for BasicWorker {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
+            .field("weight", &self.weight)
             .field("circuit_breaker", &self.circuit_breaker)
             .field("grpc_client", &"<RwLock>")
             .finish()
@@ -795,6 +848,10 @@ impl Worker for BasicWorker {
 
     fn metadata(&self) -> &WorkerMetadata {
         &self.metadata
+    }
+
+    fn weight(&self) -> f32 {
+        self.weight
     }
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
@@ -1045,6 +1102,10 @@ impl Worker for DPAwareWorker {
         self.base_worker.metadata()
     }
 
+    fn weight(&self) -> f32 {
+        self.base_worker.weight()
+    }
+
     fn circuit_breaker(&self) -> &CircuitBreaker {
         self.base_worker.circuit_breaker()
     }
@@ -1242,6 +1303,11 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         ConnectionMode::Http => None,
     };
 
+    // Inject the computed weight into metadata labels so operators can verify
+    // the capacity-weight derivation via the API without requiring a crate change.
+    let mut labels = worker.metadata().labels.clone();
+    labels.insert("weight".to_string(), format!("{:.3}", worker.weight()));
+
     WorkerInfo {
         id: url.to_string(),
         url: url.to_string(),
@@ -1258,7 +1324,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         tool_parser: worker.tool_parser(model_id).map(String::from),
         chat_template: worker.chat_template(model_id).map(String::from),
         bootstrap_port,
-        metadata: worker.metadata().labels.clone(),
+        metadata: labels,
         disable_health_check: worker.metadata().health_config.disable_health_check,
         job_status: None,
     }

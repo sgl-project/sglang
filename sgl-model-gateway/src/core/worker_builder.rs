@@ -6,7 +6,7 @@ use super::{
     model_type::ModelType,
     worker::{
         BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerRoutingKeyLoad, WorkerType,
+        WorkerRoutingKeyLoad, WorkerType, DEFAULT_WORKER_COST, DEFAULT_WORKER_PRIORITY,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -161,6 +161,10 @@ impl BasicWorkerBuilder {
             _ => None,
         };
 
+        // Compute capacity weight once at build time from labels, so the
+        // per-request hot path in `Worker::weight()` never needs to parse.
+        let weight = compute_weight(&self.labels);
+
         let metadata = WorkerMetadata {
             url: self.url.clone(),
             api_key: self.api_key,
@@ -204,6 +208,7 @@ impl BasicWorkerBuilder {
             ),
             grpc_client,
             models_override: Arc::new(StdRwLock::new(None)),
+            weight,
         }
     }
 }
@@ -354,6 +359,30 @@ impl DPAwareWorkerBuilder {
         let base_worker = builder.build();
         DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size)
     }
+}
+
+/// Compute the capacity weight from `priority` and `cost` labels.
+///
+/// Mirrors the formula in `Worker::weight()` default implementation so the
+/// builder can cache the result at construction time instead of re-parsing
+/// labels on every per-request call.
+fn compute_weight(labels: &HashMap<String, String>) -> f32 {
+    let priority: u32 = labels
+        .get("priority")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WORKER_PRIORITY);
+    let cost: f32 = labels
+        .get("cost")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_WORKER_COST);
+    let priority_factor = priority as f32 / DEFAULT_WORKER_PRIORITY as f32;
+    let cost_factor = if cost > 0.0 {
+        DEFAULT_WORKER_COST / cost
+    } else {
+        1.0
+    };
+    let w = priority_factor * cost_factor;
+    if w.is_finite() && w > 0.0 { w } else { 1.0 }
 }
 
 #[cfg(test)]
