@@ -1,4 +1,6 @@
-//! Per-component walk/validation logic for `RadixCache`.
+//! Two layers behind `RadixCache`: `Component` is the dynamically-dispatched
+//! orchestration layer that drives per-component tree walks; `Slot` is the
+//! static layer that manages a value and its LRU.
 
 mod full;
 mod mamba;
@@ -26,7 +28,7 @@ pub struct IncLockRefResult {
     pub swa_uuid_for_lock: Option<u64>,
 }
 
-/// Orchestrator-facing per-component trait.
+/// Dynamically-dispatched orchestration layer for one component's tree walks.
 pub trait Component<K: ChildKeyType>: Send {
     /// Stateful validator for one prefix-match walk; `None` if no gating.
     fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>>;
@@ -156,7 +158,7 @@ pub struct LRUData {
     pub in_list: bool,
 }
 
-/// Per-component slot: value, lock_ref, and LRU bookkeeping.
+/// Static layer that manages a value and its LRU (lock_ref, recency, eviction).
 pub trait Slot: Sized {
     /// Component this slot belongs to.
     const COMPONENT: ComponentType;
