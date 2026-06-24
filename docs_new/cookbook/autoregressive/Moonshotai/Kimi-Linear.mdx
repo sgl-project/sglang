@@ -108,7 +108,7 @@ SGLANG_ROCM_FUSED_DECODE_MLA=0 python3 -m sglang.launch_server \
 
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
   --dataset-name random \
@@ -162,7 +162,7 @@ Max ITL (ms):                            11.46
 ### 5.1.2 Medium Concurrency (Balanced)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
   --dataset-name random \
@@ -217,7 +217,7 @@ Max ITL (ms):                            299.89
 ### 5.1.3 High Concurrency (Throughput-Optimized)
 - Benchmark Command:
 ```bash Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
   --dataset-name random \

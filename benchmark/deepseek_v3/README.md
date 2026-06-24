@@ -240,7 +240,7 @@ docker run --gpus all \
     --env "HF_TOKEN=$HF_TOKEN" \
     --ipc=host \
     lmsysorg/sglang:latest \
-    python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --random-input 1 --random-output 512 --random-range-ratio 1 --num-prompts 1 --host 0.0.0.0 --port 40000 --output-file "deepseekv3_multinode.jsonl"
+    python3 -m sglang.bench_serving --backend sglang --dataset-name random --random-input 1 --random-output 512 --random-range-ratio 1 --num-prompts 1 --host 0.0.0.0 --port 40000 --output-file "deepseekv3_multinode.jsonl"
 ```
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
@@ -325,7 +325,7 @@ Then on the **master node**, supposing the ShareGPT data is located at `/path/to
 python3 benchmark/gsm8k/bench_sglang.py --num-questions 1319
 
 # bench serving
-python3 -m sglang.benchmark.serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
+python3 -m sglang.bench_serving --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json --dataset-name random  --random-input 128 --random-output 128 --num-prompts 1000 --request-rate 128 --random-range-ratio 1.0
 ```
 
 > **Note: using `--parallel 200` can accelerate accuracy benchmarking**.

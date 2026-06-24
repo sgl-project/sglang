@@ -206,7 +206,7 @@ To modify Grafana's port to the other one(like 3090) in your Docker Compose file
 *   **No Data on Dashboard:**
     *   Generate some traffic to your SGLang server to produce metrics. For example, run a benchmark:
         ```bash Command
-        python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num-prompts 100 --random-input 128 --random-output 128
+        python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 100 --random-input 128 --random-output 128
         ```
     *   Check the Prometheus UI (`http://localhost:9090`) under `Status` -> `Targets` to see if the SGLang endpoint is being scraped successfully.
     *   Verify the `model_name` and `instance` labels in your Prometheus metrics match the variables used in the Grafana dashboard. You might need to adjust the Grafana dashboard variables or the labels in your Prometheus configuration.
@@ -227,7 +227,7 @@ You can customize the setup by modifying these files. For instance, you might ne
 
 Run:
 ```text Output
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 3000 \

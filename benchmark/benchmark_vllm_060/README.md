@@ -66,10 +66,10 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-70B-Instruct --
 python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.1-70B-Instruct --disable-log-requests --num-scheduler-steps 10 --tensor 4 --max_model_len 4096
 
 # bench serving
-python3 -m sglang.benchmark.serving --backend sglang --dataset-name sharegpt --num-prompts 1200 --request-rate 4
-python3 -m sglang.benchmark.serving --backend sglang --dataset-name sharegpt --num-prompts 2400 --request-rate 8
-python3 -m sglang.benchmark.serving --backend vllm --dataset-name sharegpt --num-prompts 1200 --request-rate 4
-python3 -m sglang.benchmark.serving --backend vllm --dataset-name sharegpt --num-prompts 2400 --request-rate 8
+python3 -m sglang.bench_serving --backend sglang --dataset-name sharegpt --num-prompts 1200 --request-rate 4
+python3 -m sglang.bench_serving --backend sglang --dataset-name sharegpt --num-prompts 2400 --request-rate 8
+python3 -m sglang.bench_serving --backend vllm --dataset-name sharegpt --num-prompts 1200 --request-rate 4
+python3 -m sglang.bench_serving --backend vllm --dataset-name sharegpt --num-prompts 2400 --request-rate 8
 ```
 
 ## Offline benchmarks
@@ -84,6 +84,6 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-70B-Instruct --
 python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.1-70B-Instruct --disable-log-requests --num-scheduler-steps 10 --tensor 4 --max_model_len 4096
 
 # bench serving
-python3 -m sglang.benchmark.serving --backend sglang --dataset-name sharegpt --num-prompts 5000
-python3 -m sglang.benchmark.serving --backend vllm --dataset-name sharegpt --num-prompts 5000
+python3 -m sglang.bench_serving --backend sglang --dataset-name sharegpt --num-prompts 5000
+python3 -m sglang.bench_serving --backend vllm --dataset-name sharegpt --num-prompts 5000
 ```

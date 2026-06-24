@@ -11,8 +11,8 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
+from sglang.bench_serving import RequestFuncOutput
 from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.serving import RequestFuncOutput
 from sglang.benchmark.utils import get_tokenizer
 from sglang.test.kits.cache_hit_kit import (
     async_request_openai_chat_completions,

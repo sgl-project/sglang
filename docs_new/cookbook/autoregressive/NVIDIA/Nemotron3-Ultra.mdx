@@ -422,7 +422,7 @@ Content:
 1. **Define goal & metrics** — peak token throughput (input+output), TTFT, P99 ITL, MFU; measured at fixed accuracy.
 2. **Choose baselines** — Strategy A (TP-only) vs Strategy B (TP + expert-parallel). Hold model checkpoint, precision, and KV-cache dtype constant.
 3. **Sweep** — `{batch ∈ 1,4,16,64, concurrency ∈ 16,64,256, seq_len ∈ 1k,8k,32k}` per strategy.
-4. **Workload** — `sglang.benchmark.serving --dataset-name random` with matched input/output budgets.
+4. **Workload** — `sglang.bench_serving --dataset-name random` with matched input/output budgets.
 5. **Analysis** — per-config throughput table + roofline overlay; bootstrap CIs over 3 reruns to bound noise.
 ```
 
@@ -453,7 +453,7 @@ python3 -m sglang.launch_server \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --model nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --dataset-name random \

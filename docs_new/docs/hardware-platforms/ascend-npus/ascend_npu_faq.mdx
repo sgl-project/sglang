@@ -232,9 +232,9 @@ Retrying in 1s [Retry 1/5].
 Traceback (most recent call last):
   File "<frozen runpy>", line 198, in _run_module_as_main
   File "<frozen runpy>", line 88, in _run_code
-  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/benchmark/serving.py", line 2353, in <module>
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/bench_serving.py", line 2353, in <module>
     run_benchmark(args)
-  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/benchmark/serving.py", line 1848, in run_benchmark
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/bench_serving.py", line 1848, in run_benchmark
     input_requests = get_dataset(args, tokenizer, model_id)
                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/benchmark/datasets/__init__.py", line 44, in get_dataset
@@ -276,7 +276,7 @@ The machine cannot directly access the HuggingFace server due to network restric
 - **Download the dataset manually** — use a machine with network access to download the file, then transfer it to the target machine. Use `--dataset-path` to specify the local file path:
 
   ```bash
-  python -m sglang.benchmark.serving \
+  python -m sglang.bench_serving \
     --dataset-name random \
     --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     ...

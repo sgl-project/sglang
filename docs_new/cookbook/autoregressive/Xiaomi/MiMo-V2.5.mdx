@@ -361,7 +361,7 @@ The user wants to know the weather in Beijing. I have a function available calle
 
 ## 5. Benchmark
 
-Accuracy numbers come from `sglang.test.run_eval` (GSM8K standard 5-shot, MMMU validation split). Speed numbers come from `sglang.benchmark.serving` with generated random prompts; text runs use 1024 input tokens and 1024 output tokens per request, and the image run uses 2 random 720p images per request.
+Accuracy numbers come from `sglang.test.run_eval` (GSM8K standard 5-shot, MMMU validation split). Speed numbers come from `sglang.bench_serving` with generated random prompts; text runs use 1024 input tokens and 1024 output tokens per request, and the image run uses 2 random 720p images per request.
 
 ### 5.1 Accuracy Benchmark
 
@@ -435,7 +435,7 @@ python3 benchmark/mmmu/bench_sglang.py \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -494,7 +494,7 @@ Max ITL (ms):                            19.80
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -563,7 +563,7 @@ Max ITL (ms):                            1600.00
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -623,7 +623,7 @@ Max ITL (ms):                            74.37
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -683,7 +683,7 @@ Max ITL (ms):                            969.61
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
@@ -792,7 +792,7 @@ Test setting: `chunked_prefill_size=32K`, `random_output_len=1`, cache flushed b
 - **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --model XiaomiMiMo/MiMo-V2.5-Pro \
   --host 0.0.0.0 \

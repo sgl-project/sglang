@@ -28,14 +28,14 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
-from sglang.benchmark.datasets.random import sample_random_requests
-from sglang.benchmark.serving import (
+from sglang.bench_serving import (
     RequestFuncInput,
     RequestFuncOutput,
     _create_bench_client_session,
     calculate_metrics,
     get_request,
 )
+from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 DEFAULT_BASE_MODEL_PATH = "meta-llama/Llama-2-7b-hf"

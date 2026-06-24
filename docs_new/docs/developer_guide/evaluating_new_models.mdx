@@ -98,7 +98,7 @@ Performance benchmarks measure **Latency** (Time To First Token - TTFT) and **Th
 This simulates a scenario with low concurrency (e.g., single user) to measure latency.
 
 ```bash Command
-python -m sglang.benchmark.serving \
+python -m sglang.bench_serving \
   --backend sglang \
   --host 0.0.0.0 \
   --port 30000 \
@@ -112,7 +112,7 @@ python -m sglang.benchmark.serving \
 This simulates a high-traffic scenario to measure maximum system throughput.
 
 ```bash Command
-python -m sglang.benchmark.serving \
+python -m sglang.bench_serving \
   --backend sglang \
   --host 0.0.0.0 \
   --port 30000 \

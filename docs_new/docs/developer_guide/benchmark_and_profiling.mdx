@@ -49,7 +49,7 @@ Use `bench_serving` by default unless there are specific needs.
 **`bench_serving`** is an async HTTP load-testing client that sends requests at controlled rates with configurable concurrency to a running server. It measures realistic online serving metrics including time-to-first-token (TTFT), time-per-output-token (TPOT), inter-token latency (ITL), and throughput. Use `num-prompts >= 5 * max-concurrency` to measure steady-state performance. Launch a server with `sglang.launch_server` first.
 
   ```bash Command
-  python3 -m sglang.benchmark.serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
+  python3 -m sglang.bench_serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
   ```
 
 **`bench_one_batch_server`** sends a single batch as one HTTP request to a running server. Due to only having a single batch, the server is never in a steady-state and metrics will be biased. Launch a server with `sglang.launch_server` first.
@@ -77,7 +77,7 @@ Use `bench_serving` by default unless there are specific needs.
 
 [Pytorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) is a convenient basic tool to inspect kernel execution time, call stack, and kernel overlap and occupancy.
 
-### Profile a server with `sglang.benchmark.serving`
+### Profile a server with `sglang.bench_serving`
 
 ```bash Command
 # set trace path
@@ -87,7 +87,7 @@ export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 # send profiling request from client
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
 
 For `bench_serving --profile`, the output directory is selected on the client side from `--profile-output-dir` or `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`), then sent in the `/start_profile` request.
@@ -115,14 +115,14 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --d
 python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 
 # send profiling request targeting prefill workers
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000
 ```
 
 #### Profile Decode Workers
 
 ```bash Command
 # send profiling request targeting decode workers
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001
 ```
 
 #### Important Notes
@@ -131,10 +131,10 @@ python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1
 - Both options support multiple worker URLs for multi-instance setups:
   ```bash Command
   # Profile multiple prefill workers
-  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
+  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
 
   # Profile multiple decode workers
-  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
+  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
   ```
 - Make sure `SGLANG_TORCH_PROFILER_DIR` is set on all worker nodes before starting the servers
 - For more details on setting up PD disaggregation, see [PD Disaggregation Guide](../advanced_features/pd_disaggregation)
@@ -248,7 +248,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
   }'
 
 # Terminal 3: Send requests to generate load
-python -m sglang.benchmark.serving --backend sglang --num-prompts 100
+python -m sglang.bench_serving --backend sglang --num-prompts 100
 
 # Terminal 2: Stop profiling when done
 curl -X POST http://127.0.0.1:30000/stop_profile
@@ -319,7 +319,7 @@ client can generate a small trace file (&lt;100MB) by controlling number of prom
 For example, when profiling a server,
 
 ```bash Command
-python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
+python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
 ```
 
 This command sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
@@ -360,7 +360,7 @@ Additionally, if you want to locate the SGLang Python source code through the cu
    nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node -o sglang.out --delay 60 --duration 70 python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disable-radix-cache
 
    # client
-   python3 -m sglang.benchmark.serving --backend sglang --num-prompts 1000 --dataset-name random --random-input 1024 --random-output 512
+   python3 -m sglang.bench_serving --backend sglang --num-prompts 1000 --dataset-name random --random-input 1024 --random-output 512
    ```
 
    In practice, we recommend users to set `--duration` argument to a large value. Whenever user wants the server to stop profiling. Firstly run:
@@ -438,7 +438,7 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    ```bash Command
    # Terminal 3: Generate workload
-   python -m sglang.benchmark.serving --backend sglang --num-prompts 100
+   python -m sglang.bench_serving --backend sglang --num-prompts 100
    ```
 
 4. Profiling will automatically stop after 10 steps (due to `num_steps: 10`). If you hadn't specified `num_steps`, you would need to manually stop it:
@@ -466,7 +466,7 @@ python -m sglang.launch_server \
 nsys profile --trace-fork-before-exec=true \
   --cuda-graph-trace=node \
   -o layerwise_profile \
-  python -m sglang.benchmark.serving --backend sglang --num-prompts 10
+  python -m sglang.bench_serving --backend sglang --num-prompts 10
 ```
 
 This approach profiles the entire client execution, including all server interactions. The layerwise NVTX markers will be visible in the Nsight Systems timeline.

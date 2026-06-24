@@ -122,7 +122,7 @@ You can benchmark the performance via the `bench_serving` script.
 Run the command in another terminal.
 
 ```bash
-python -m sglang.benchmark.serving   \
+python -m sglang.bench_serving   \
     --dataset-name random        \
     --random-input-len 1024      \
     --random-output-len 1024     \
@@ -134,7 +134,7 @@ python -m sglang.benchmark.serving   \
 The detail explanations of the parameters can be looked up by the command:
 
 ```bash
-python -m sglang.benchmark.serving -h
+python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with

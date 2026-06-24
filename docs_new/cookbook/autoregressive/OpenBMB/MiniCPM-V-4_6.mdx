@@ -375,7 +375,7 @@ We use SGLang's built-in `bench_serving` tool with random text prompts (1000 inp
 #### 5.2.1 Latency Benchmark
 
 ```bash Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
@@ -429,7 +429,7 @@ Max ITL (ms):                            5.79
 #### 5.2.2 Throughput Benchmark
 
 ```bash Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang \
   --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
@@ -487,7 +487,7 @@ We use SGLang's built-in `bench_serving` tool with random images. Each request h
 #### 5.3.1 Latency Benchmark
 
 ```bash Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
@@ -546,7 +546,7 @@ Max ITL (ms):                            2.89
 #### 5.3.2 Throughput Benchmark
 
 ```bash Command
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \

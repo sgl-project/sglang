@@ -9,7 +9,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGFILE="sglang_client_log_$TIMESTAMP.json"
 
 # Run the benchmark with specified parameters and save logs
-python3 -m sglang.benchmark.serving \
+python3 -m sglang.bench_serving \
     --backend sglang \
     --tokenizer Xenova/grok-1-tokenizer \
     --dataset-name random \

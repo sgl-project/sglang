@@ -9,7 +9,7 @@
 - `bench_offline_throughput.py`: Benchmark the performance in the offline mode.
 - `bench_one_batch.py`: Benchmark the latency of running a single static batch without a server.
 - `bench_one_batch_server.py`: Benchmark the latency of running a single batch with a server.
-- `benchmark/serving.py`: Benchmark online serving with dynamic requests.
+- `bench_serving.py`: Benchmark online serving with dynamic requests.
 - `check_env.py`: Check the environment variables and dependencies.
 - `global_config.py`: The global configs and constants.
 - `launch_server.py`: The entry point for launching a local server.
