@@ -97,9 +97,46 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         }
     }
 
-    /// SWA tombstone-recovery hook, called per-overlap-node during insert.
-    /// Recovers an SWA tombstone's value from the incoming slice; returns
-    /// how far into `value_slice` SWA claimed ownership.
+    /// SWA tombstone-recovery hook. Called per-overlap-node during
+    /// insert. If the node is an SWA tombstone (SWA value evicted, FULL
+    /// value remains), recovers the SWA value by replacing the old FULL
+    /// value with the incoming insert value and emitting a `SwaRecover`
+    /// action; the Python orchestrator translates the new full indices
+    /// to SWA indices via `apply_swa_writes`.
+    ///
+    /// Three branches based on where `swa_evicted_seqlen` falls relative
+    /// to the node's position in the token sequence:
+    ///
+    /// ```text
+    ///   0              total_prefix_len                    total_prefix_len + node_key_len
+    ///   |              |                                   |
+    ///   v              v                                   v
+    ///   [== prefix ==][============ node key ==============]
+    ///
+    ///   Branch 1: seqlen <= total_prefix_len
+    ///        seqlen
+    ///          v
+    ///   [== prefix ==][========= in SWA window ============]  → full recover
+    ///
+    ///   Branch 2: total_prefix_len < seqlen < total_prefix_len + node_key_len
+    ///                       seqlen
+    ///                         v
+    ///   [== prefix ==][= out =][====== in SWA window ======]  → split, partial recover
+    ///                    ^
+    ///                    split here (start_idx = seqlen - total_prefix_len)
+    ///
+    ///   Branch 3: seqlen >= total_prefix_len + node_key_len
+    ///                                                        seqlen
+    ///                                                          v
+    ///   [== prefix ==][========= outside SWA window ========]  → no-op
+    /// ```
+    ///
+    /// Returns `consumed_from`: how far into `value_slice` SWA claimed
+    /// ownership.
+    /// - Branch 1: returns 0 (claimed entire slice)
+    /// - Branch 2: returns start_idx (claimed from start_idx onward)
+    /// - Branch 3: returns node_key_len (claimed nothing)
+    /// - Not a tombstone / no SWA frontier: returns node_key_len
     #[allow(clippy::too_many_arguments)]
     fn consume_value(
         &self,
