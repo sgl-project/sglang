@@ -14,12 +14,16 @@ Please remember to sort by variable name within each section.
 import asyncio
 import copy
 import os
+import random
 import subprocess
+import threading
+import time
 from types import SimpleNamespace
-from typing import Awaitable, Callable, NamedTuple, Optional
+from typing import Awaitable, Callable, List, NamedTuple, Optional
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -28,6 +32,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
@@ -178,6 +185,7 @@ MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-B
 # VLM model weights path
 DEEPSEEK_VL2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-vl2")
 GLM_4_5V_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.5V")
+GLM_5_W4A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/GLM-5-w4a8")
 JANUS_PRO_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-1B")
 JANUS_PRO_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-7B")
 KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
@@ -611,9 +619,133 @@ def write_results_to_github_step_summary(results: dict):
         summary += f"| {model} | {server} | {client} | {output_throughput} | {output_throughput_threshold} | {latency} | {latency_threshold} | {accuracy} | {accuracy_threshold} | {status} |\n"
     write_github_step_summary(summary)
 
-
 def write_github_step_summary_once(summary: str):
     if getattr(write_github_step_summary_once, "has_written", False):
         return
     write_github_step_summary_once.has_written = True
     write_github_step_summary(summary)
+
+def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
+    """Print the output in real time with another thread."""
+    while not os.path.exists(filename):
+        time.sleep(0.01)
+
+    pt = 0
+    while pt >= 0:
+        if pt > 0 and not os.path.exists(filename):
+            break
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
+        for line in lines[pt:]:
+            print(line, end="", flush=True)
+            output_lines.append(line)
+            pt += 1
+        time.sleep(0.1)
+
+def run_and_check_memory_leak(
+    workload_func,
+    disable_radix_cache,
+    enable_mixed_chunk,
+    disable_overlap,
+    chunked_prefill_size,
+    assert_has_abort,
+    api_key: Optional[str] = None,
+):
+    other_args = [
+        "--chunked-prefill-size",
+        str(chunked_prefill_size),
+        "--log-level",
+        "debug",
+    ]
+    if disable_radix_cache:
+        other_args += ["--disable-radix-cache"]
+    if enable_mixed_chunk:
+        other_args += ["--enable-mixed-chunk"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
+
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    port = random.randint(4000, 5000)
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Create files and launch the server
+    stdout = open(STDOUT_FILENAME, "w")
+    stderr = open(STDERR_FILENAME, "w")
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
+    )
+
+    # Launch a thread to stream the output
+    output_lines = []
+    t = threading.Thread(target=read_output, args=(output_lines,))
+    t.start()
+
+    # Run the workload
+    workload_func(base_url, model)
+
+    # Clean up everything
+    kill_process_tree(process.pid)
+    stdout.close()
+    stderr.close()
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
+    kill_process_tree(process.pid)
+    t.join()
+
+    # Assert success
+    has_new_server = False
+    has_leak = False
+    has_abort = False
+    for line in output_lines:
+        if "Uvicorn running" in line:
+            has_new_server = True
+        if "leak" in line:
+            has_leak = True
+        if "Abort" in line:
+            has_abort = True
+
+    assert has_new_server
+    assert not has_leak
+    if assert_has_abort:
+        assert has_abort
+
+def run_mmlu_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    disable_overlap=False,
+    chunked_prefill_size=32,
+):
+    def workload_func(base_url, model):
+        # Run the eval
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=128,
+            num_threads=128,
+        )
+
+        try:
+            metrics = run_eval(args)
+            assert metrics["score"] >= 0.65, f"{metrics=}"
+        finally:
+            pass
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        disable_overlap,
+        chunked_prefill_size,
+        assert_has_abort=False,
+    )
