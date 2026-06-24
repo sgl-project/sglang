@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -731,10 +730,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     f"mode={forward_batch.forward_mode}, "
                     f"ratio={compressor.ratio}, loc={loc.numel()}, kv={kv.shape[0]}"
                 )
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and os.environ.get("SGLANG_DSV4_NPU_SKIP_ZERO_COMPRESS_LOC", "1") != "0"
-            ):
+            if forward_batch.forward_mode.is_target_verify():
                 valid = loc != 0
                 if self.graph_mode:
                     kv_mask = valid.to(kv.dtype).view(
@@ -1203,14 +1199,12 @@ class DeepseekV4AscendAttnBackend(
                 fm.positions_cmp_padding_c4,
                 4,
                 verify_seq_lens_cpu,
-                self._get_verify_pos_mode(4),
             )
             self._fill_verify_positions_cmp_padding_one(
                 forward_batch.positions,
                 fm.positions_cmp_padding_c128,
                 128,
                 verify_seq_lens_cpu,
-                self._get_verify_pos_mode(128),
             )
             fm.start_pos.copy_(live_seq_lens.to(torch.int32))
             valid = live_seq_lens[:bs] > 0
@@ -1780,21 +1774,9 @@ class DeepseekV4AscendAttnBackend(
         dst: torch.Tensor,
         ratio: int,
         seq_lens_cpu: torch.Tensor,
-        mode: str,
     ) -> None:
         dst.zero_()
         if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
-            return
-
-        if mode == "legacy":
-            should_compress = ((positions + 1) % ratio) == 0
-            vals = (positions[should_compress] - (ratio - 1)).to(torch.int64)
-            if vals.numel() > 0:
-                assert vals.numel() <= dst.numel(), (
-                    f"replay verify positions_cmp_c{ratio} overflow: "
-                    f"{vals.numel()} > {dst.numel()}"
-                )
-                dst[: vals.numel()].copy_(vals)
             return
 
         n_draft = self.speculative_num_draft_tokens
@@ -1810,31 +1792,7 @@ class DeepseekV4AscendAttnBackend(
             n_draft, dtype=start_positions.dtype
         ).view(1, -1)
         boundary_mask = abs_positions % ratio == 0
-        if mode == "boundary":
-            indices = torch.nonzero(boundary_mask.flatten(), as_tuple=False).flatten()
-        elif mode == "boundary_tail":
-            boundary_indices = torch.nonzero(
-                boundary_mask.flatten(), as_tuple=False
-            ).flatten()
-            tail_indices = []
-            non_boundary = ~boundary_mask
-            for req_idx in range(request_num):
-                row = non_boundary[req_idx]
-                local = torch.nonzero(row, as_tuple=False).flatten()
-                if local.numel() > 0:
-                    tail_indices.append(req_idx * n_draft + local[-1])
-            if tail_indices:
-                tail_indices = torch.stack(tail_indices).to(boundary_indices.dtype)
-                indices = torch.cat((boundary_indices, tail_indices), dim=0)
-            else:
-                indices = boundary_indices
-        elif mode == "gather":
-            indices = torch.argsort((~boundary_mask).flatten(), dim=0, stable=True)
-        else:
-            raise ValueError(
-                "verify positions mode must be boundary/boundary_tail/gather/legacy, "
-                f"got {mode!r}"
-            )
+        indices = torch.nonzero(boundary_mask.flatten(), as_tuple=False).flatten()
 
         if indices.numel() == 0:
             return
@@ -1844,16 +1802,6 @@ class DeepseekV4AscendAttnBackend(
             .to(device=positions.device, non_blocking=True)
         )
         dst[: indices.numel()].copy_(torch.gather(positions, 0, indices))
-
-    def _get_verify_pos_mode(self, ratio: int) -> str:
-        default_mode = os.environ.get("SGLANG_DSV4_NPU_VERIFY_POS_MODE", "boundary")
-        mode = os.environ.get(f"SGLANG_DSV4_NPU_VERIFY_POS_MODE_C{ratio}", default_mode)
-        if mode not in ("boundary", "boundary_tail", "gather", "legacy"):
-            raise ValueError(
-                f"SGLANG_DSV4_NPU_VERIFY_POS_MODE_C{ratio} must be one of "
-                f"'boundary', 'boundary_tail', 'gather', or 'legacy', got {mode!r}"
-            )
-        return mode
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info, cuda_graph_bs: Optional[int]
