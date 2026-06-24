@@ -201,3 +201,65 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             logits[batch_idx, indices] = -float("inf")
 
         return logits
+
+
+class TopNSigmaLogitProcessor(CustomLogitProcessor):
+    """Top-n-sigma logit truncation processor.
+
+    Filters logits based on statistical outlier detection: tokens whose logit
+    value falls more than n standard deviations below the maximum logit are
+    masked to -inf before temperature scaling and softmax.
+
+    Ref: Tang et al., "Top-nσ: Not All Logits Are You Need", ACL 2025.
+         arXiv:2411.07641
+
+    Usage:
+        Set ``custom_params={"top_n_sigma": 2.0}`` on the request and pass the
+        serialized processor via ``custom_logit_processor``.
+    """
+
+    def __call__(self, logits, custom_param_list=None):
+        if not custom_param_list:
+            return logits
+
+        # Collect per-request n-sigma values and their batch indices.
+        n_sigmas = []
+        rows = []
+        for i, params in enumerate(custom_param_list):
+            if not params:
+                continue
+            n = params.get("top_n_sigma")
+            if n is None or not isinstance(n, (int, float)) or n <= 0:
+                continue
+            n_sigmas.append(n)
+            rows.append(i)
+
+        if not rows:
+            return logits
+
+        rows_t = torch.tensor(rows, device=logits.device, dtype=torch.long)
+        selected = logits[rows_t]
+
+        # Compute std once; reuse it both for the edge-case guard and for the
+        # threshold formula to avoid scanning the vocab twice.
+        n_sigmas_t = torch.tensor(
+            n_sigmas, device=logits.device, dtype=selected.dtype
+        )
+        std_all = selected.std(dim=-1, keepdim=True)
+
+        # Skip rows with NaN/Inf logits or all-equal logits (std == 0).
+        finite_mask = torch.isfinite(selected).all(dim=-1).unsqueeze(-1)
+        nonzero_std_mask = std_all != 0
+        process_mask = finite_mask & nonzero_std_mask
+
+        max_logits = selected.max(dim=-1, keepdim=True).values
+        thresholds = max_logits - n_sigmas_t.unsqueeze(-1) * std_all
+
+        # Mask tokens below threshold, only on rows that pass the guards.
+        below_threshold = selected < thresholds
+        selected.masked_fill_(below_threshold & process_mask, float("-inf"))
+        # Write back: advanced indexing produced a copy, so assign the
+        # modified rows back to the original logits tensor.
+        logits[rows_t] = selected
+
+        return logits

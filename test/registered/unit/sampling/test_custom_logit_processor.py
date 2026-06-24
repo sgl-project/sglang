@@ -18,6 +18,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     DeepSeekR1ThinkingBudgetLogitProcessor,
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
+    TopNSigmaLogitProcessor,
     _cache_from_str,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -441,6 +442,142 @@ class TestDeepseekOCRNoRepeatNGramLogitProcessor(CustomTestCase):
         # Batch 1: prefix is (5), no matching prefix in window → no bans
         self.assertEqual(result[1, 3].item(), 0.0)
         self.assertEqual(result[1, 4].item(), 0.0)
+
+
+# TopNSigmaLogitProcessor
+class TestTopNSigmaLogitProcessor(CustomTestCase):
+    VOCAB = 200
+
+    def setUp(self):
+        self.processor = TopNSigmaLogitProcessor()
+
+    def _sharp_logits(self, batch_size=1):
+        """A distribution with a clear peak at token 0."""
+        logits = torch.randn(batch_size, self.VOCAB) * 0.1
+        logits[:, 0] = 10.0  # sharp max
+        return logits
+
+    def test_serialization_round_trip(self):
+        s = TopNSigmaLogitProcessor.to_str()
+        processor = CustomLogitProcessor.from_str(s)
+        self.assertIsInstance(processor, TopNSigmaLogitProcessor)
+
+    def test_none_params_returns_unchanged(self):
+        logits = self._sharp_logits()
+        original = logits.clone()
+        result = self.processor(logits, None)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_empty_params_returns_unchanged(self):
+        logits = self._sharp_logits()
+        original = logits.clone()
+        result = self.processor(logits, [])
+        self.assertTrue(torch.equal(result, original))
+
+    def test_sharp_distribution_filters_tail(self):
+        """Sharp distribution should mask most tail tokens."""
+        logits = self._sharp_logits()
+        params = [{"top_n_sigma": 2.0}]
+        result = self.processor(logits.clone(), params)
+        num_masked = torch.isinf(result[0]).sum().item()
+        # std is small (~0.1), threshold ≈ 10 - 2*0.1 = 9.8, most tokens masked
+        self.assertGreater(num_masked, self.VOCAB * 0.8)
+        # The peak token (0) must survive
+        self.assertFalse(torch.isinf(result[0, 0]))
+
+    def test_argmax_is_invariant(self):
+        """The max-logit token must always survive the filter."""
+        logits = torch.randn(3, self.VOCAB)
+        logits[:, 5] = 100.0  # token 5 is argmax for all rows
+        params = [{"top_n_sigma": n} for n in (0.5, 2.0, 10.0)]
+        result = self.processor(logits.clone(), params)
+        for i in range(3):
+            self.assertFalse(
+                torch.isinf(result[i, 5]),
+                f"argmax token masked in row {i}",
+            )
+
+    def test_zero_std_no_filtering(self):
+        """All-equal logits (std==0) should be left unchanged."""
+        logits = torch.ones(1, self.VOCAB)
+        original = logits.clone()
+        params = [{"top_n_sigma": 2.0}]
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_nan_logits_skipped(self):
+        """Rows with NaN logits should not be modified."""
+        logits = self._sharp_logits(batch_size=2)
+        logits[1] = float("nan")  # row 1 has NaN
+        params = [{"top_n_sigma": 2.0}, {"top_n_sigma": 2.0}]
+        result = self.processor(logits.clone(), params)
+        # Row 0 should be filtered, row 1 left unchanged (NaN guard)
+        self.assertTrue(torch.isinf(result[0]).any())
+        # Row 1: not masked (all NaN → skipped by finite guard)
+        finite_row1 = result[1][torch.isfinite(result[1])]
+        self.assertEqual(finite_row1.numel(), 0)  # all NaN, nothing finite
+
+    def test_n_sigma_none_skipped(self):
+        """Requests with top_n_sigma=None should be skipped."""
+        logits = self._sharp_logits(batch_size=2)
+        original = logits.clone()
+        params = [{"top_n_sigma": None}, {"top_n_sigma": 2.0}]
+        result = self.processor(logits.clone(), params)
+        # Row 0 unchanged (None), row 1 filtered
+        self.assertTrue(torch.equal(result[0], original[0]))
+        self.assertTrue(torch.isinf(result[1]).any())
+
+    def test_n_sigma_negative_skipped(self):
+        """Negative top_n_sigma should be skipped."""
+        logits = self._sharp_logits()
+        original = logits.clone()
+        params = [{"top_n_sigma": -1.0}]
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_n_sigma_zero_skipped(self):
+        """top_n_sigma=0 should be skipped (must be positive)."""
+        logits = self._sharp_logits()
+        original = logits.clone()
+        params = [{"top_n_sigma": 0}]
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_mixed_batch(self):
+        """Some rows with valid params, some without."""
+        logits = self._sharp_logits(batch_size=3)
+        original = logits.clone()
+        params = [
+            {"top_n_sigma": 2.0},
+            None,  # skipped
+            {"top_n_sigma": 1.0},
+        ]
+        result = self.processor(logits.clone(), params)
+        # Row 0, 2 filtered; row 1 unchanged
+        self.assertTrue(torch.isinf(result[0]).any())
+        self.assertTrue(torch.equal(result[1], original[1]))
+        self.assertTrue(torch.isinf(result[2]).any())
+
+    def test_all_skipped_returns_unchanged(self):
+        """When no valid params, logits returned as-is."""
+        logits = self._sharp_logits(batch_size=2)
+        original = logits.clone()
+        params = [{"top_n_sigma": None}, {"top_n_sigma": -1}]
+        result = self.processor(logits, params)
+        self.assertTrue(torch.equal(result, original))
+
+    def test_smaller_n_keeps_more(self):
+        """Smaller n → tighter threshold → fewer tokens survive."""
+        logits = torch.randn(2, self.VOCAB)
+        logits[:, 0] = 10.0
+        params_n5 = [{"top_n_sigma": 5.0}]
+        params_n1 = [{"top_n_sigma": 1.0}]
+        result_n5 = self.processor(logits.clone(), params_n5)
+        result_n1 = self.processor(logits.clone(), params_n1)
+        surviving_n5 = (~torch.isinf(result_n5[0])).sum().item()
+        surviving_n1 = (~torch.isinf(result_n1[0])).sum().item()
+        # n=5 (wider) keeps more than or equal to n=1 (tighter)
+        self.assertGreaterEqual(surviving_n5, surviving_n1)
 
 
 if __name__ == "__main__":
