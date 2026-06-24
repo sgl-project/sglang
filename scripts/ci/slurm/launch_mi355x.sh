@@ -3,9 +3,11 @@
 # Slurm cluster, then emit per-concurrency result JSONs that
 # scripts/ci/slurm/process_result.py aggregates.
 #
-# salloc's two nodes and runs the Docker harness: prefill server on node A,
-# decode server on node B, a standalone load balancer on the prefill node, then
-# an sglang.bench_serving concurrency sweep over MORI.
+# salloc's (prefill_workers + decode_workers) nodes -- one server per node --
+# and runs the Docker harness: prefill server(s) on the first nodes, decode
+# server(s) on the rest, a standalone load balancer on the prefill node, then an
+# sglang.bench_serving concurrency sweep over MORI. Default recipe is 1P1D (2
+# nodes); see the drive.sh note on reserving 2P2D / 1P3D / 3P1D.
 #
 # Required environment variables (set by the GitHub Actions workflow):
 #   MODEL              - HuggingFace model id (table label / served model)
@@ -19,7 +21,7 @@
 # Optional:
 #   MODEL_PATH         - local snapshot dir (preferred over downloading MODEL)
 #   SLURM_PARTITION    - default: amd-sglang
-#   SLURM_NODELIST     - optional explicit 2-node pin (else scheduler chooses)
+#   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   TIME_LIMIT         - salloc time limit, default 01:00:00
 
 set -euo pipefail
@@ -56,6 +58,7 @@ RECIPE_VARS="$(python3 - "$CONFIG_FILE" <<'PY'
 import sys, yaml
 r = yaml.safe_load(open(sys.argv[1]))
 rt = r["runtime"]; b = r["backend"]["sglang_config"]; bn = r["bench"]
+res = r.get("resources", {})
 def emit(k, v): print(f"{k}={v}")
 emit("IMAGE", rt["image"])
 emit("ATTN", rt["attention_backend"])
@@ -72,6 +75,11 @@ emit("CHUNK", rt["chunked_prefill_size"])
 emit("SWA", rt["swa_full_tokens_ratio"])
 emit("PTP", b["prefill"]["tensor-parallel-size"])
 emit("DTP", b["decode"]["tensor-parallel-size"])
+# Worker counts double as node counts here: one server per node (TP == GPUs/node).
+# 1P1D today; bumping these reserves 2P2D / 1P3D / 3P1D. Multi-node-per-worker
+# (TP > GPUs/node, needs --dist-init-addr/--nnodes/--node-rank) is out of scope.
+emit("PW", res.get("prefill_workers", 1))
+emit("DW", res.get("decode_workers", 1))
 emit("CONCS", ",".join(str(c) for c in bn["concurrencies"]))
 emit("NPF", bn["num_prompts_factor"])
 emit("RRR", bn["random_range_ratio"])
@@ -183,30 +191,51 @@ chmod +x "$WORKDIR"/*.sh
 # ---------------------------------------------------------------------------
 # Orchestration drive (runs inside the salloc allocation on the login node).
 # ---------------------------------------------------------------------------
+# drive.sh splits the allocation into the first PW nodes (prefill) and the next
+# DW nodes (decode), launches one server per node, then benches. For 1P1D
+# (PW=DW=1) this is exactly prefill-on-node-A / decode-on-node-B. Larger PW/DW
+# reserve 2P2D / 1P3D / 3P1D: all servers come up, but the load balancer and
+# bench still target the first prefill + first decode (multi-P/D fan-out is the
+# remaining LB piece), so a >1 topology logs an explicit NOTE rather than
+# silently producing partial-coverage numbers.
 cat > "$WORKDIR/drive.sh" <<'DRIVE'
 #!/bin/bash
 set -x
-WORKDIR="$1"
+WORKDIR="$1"; PW="${2:-1}"; DW="${3:-1}"
 mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
-PNODE="${NODES[0]}"; DNODE="${NODES[1]}"
+PNODES=("${NODES[@]:0:PW}")
+DNODES=("${NODES[@]:PW:DW}")
+PNODE="${PNODES[0]}"; DNODE="${DNODES[0]}"
 PIP=$(getent ahostsv4 "$PNODE" | head -1 | awk '{print $1}')
 DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
-echo "[drive] prefill=$PNODE($PIP) decode=$DNODE($DIP)"
-srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill.log" 2>&1 &
-srun --overlap -N1 --nodelist="$DNODE" bash "$WORKDIR/decode.sh"  > "$WORKDIR/decode.log"  2>&1 &
+echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
+echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
+if (( PW > 1 || DW > 1 )); then
+  echo "[drive] NOTE: standalone_lb + bench use the first prefill and first decode only;"
+  echo "[drive]       multi-prefill/multi-decode fan-out is not wired yet (LB work)."
+fi
+for n in "${PNODES[@]}"; do
+  srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1 &
+done
+for n in "${DNODES[@]}"; do
+  srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1 &
+done
 sleep 5
 srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
 echo "[drive] bench done, tearing down"
-srun --overlap -N1 --nodelist="$PNODE" docker kill mi355x_prefill >/dev/null 2>&1 || true
-srun --overlap -N1 --nodelist="$DNODE" docker kill mi355x_decode  >/dev/null 2>&1 || true
+for n in "${PNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_prefill >/dev/null 2>&1 || true; done
+for n in "${DNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_decode  >/dev/null 2>&1 || true; done
 DRIVE
 chmod +x "$WORKDIR/drive.sh"
 
 NODELIST_ARG=()
 [[ -n "${SLURM_NODELIST:-}" ]] && NODELIST_ARG=(--nodelist="$SLURM_NODELIST")
 
-salloc -p "$SLURM_PARTITION" -N2 "${NODELIST_ARG[@]}" -t "$TIME_LIMIT" \
-    bash "$WORKDIR/drive.sh" "$WORKDIR"
+# One node per prefill/decode worker (TP == GPUs/node). 1P1D -> 2 nodes.
+TOTAL_NODES=$((PW + DW))
+
+salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" -t "$TIME_LIMIT" \
+    bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
 
 echo "--- bench.log tail ---"; tail -40 "$WORKDIR/bench.log" || true
 
