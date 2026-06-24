@@ -250,11 +250,6 @@ class EagerRunner(BaseRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
-        category = (
-            "target_verify"
-            if forward_batch.forward_mode.is_target_verify()
-            else "extend"
-        )
 
         if not model_runner.server_args.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -283,7 +278,7 @@ class EagerRunner(BaseRunner):
             forward_positions = sharded_positions
 
         ctx = (
-            model_runner.device_timer.wrap(metadata={"category": category})
+            model_runner.device_timer.wrap(metadata={"category": "extend"})
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
