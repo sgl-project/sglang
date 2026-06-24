@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple
 import torch
 from PIL import Image, ImageOps
 from transformers import (
+    AutoConfig,
     AutoProcessor,
     PretrainedConfig,
     PreTrainedTokenizerFast,
@@ -629,3 +630,9 @@ class UnlimitedVLConfig(PretrainedConfig):
 
 
 AutoProcessor.register(UnlimitedVLConfig, UnlimitedOCRHFProcessor)
+
+# Register the config so the server can load it without trust_remote_code.
+try:
+    AutoConfig.register("unlimited-ocr", UnlimitedVLConfig)
+except ValueError:
+    pass

@@ -41,7 +41,10 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
@@ -483,6 +486,13 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator,
             (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
+        # All-SWA models (e.g. UNLIMITED-OCR) have no full-attention layers and
+        # use a single SWA pool (PureSWATokenToKVPoolAllocator). Their token
+        # budget is the SWA pool; the hybrid path's full-pool accounting would
+        # otherwise reject every prefill request.
+        self.is_all_swa = isinstance(
+            self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
+        )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
         self.rem_swa_token_offset = 0
@@ -517,7 +527,12 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_hybrid_swa:
+        if self.is_all_swa:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+        elif self.is_hybrid_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size()
@@ -544,7 +559,12 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_hybrid_swa:
+        if self.is_all_swa:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+        elif self.is_hybrid_swa:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size()
