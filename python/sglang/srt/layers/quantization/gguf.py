@@ -931,6 +931,23 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         if hasattr(layer, "w13_qweight"):
             del layer.w13_qweight
 
+        if hasattr(layer, 'tp_size') and layer.tp_size > 1:
+            tp_rank = layer.tp_rank
+            tp_size = layer.tp_size
+            # w13 shape: (E, 2*intermediate, hidden) – intermediate is already per-partition? Check.
+            # Actually create_weights set tensor_shape with intermediate_size_per_partition,
+            # so w13_full should already be per-rank. Ensure it is.
+            # w2 shape: (E, hidden, intermediate_full) – we need to split along dim=2
+            inter_full = w2_full.shape[2]
+            assert inter_full % tp_size == 0
+            inter_per_rank = inter_full // tp_size
+            start = tp_rank * inter_per_rank
+            end = start + inter_per_rank
+            w2_full = w2_full[..., start:end].contiguous()
+        
+        layer.register_buffer('w13_dequant', w13_full, persistent=False)
+        layer.register_buffer('w2_dequant', w2_full, persistent=False)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
