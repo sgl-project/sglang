@@ -10,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mechanical_refactor_verify_utils as mrv
 from mechanical_refactor_verify_utils import (
     _commit_changed_lines,
-    _is_plumbing,
+    _commit_import_texts,
+    _import_line_texts,
     _normalize_block,
     dedent,
     exec_command,
@@ -18,6 +19,9 @@ from mechanical_refactor_verify_utils import (
     verify_mechanical_refactor,
     verify_move_commit,
 )
+
+# The rule under test is specified in verifier-spec.md; these tests assert exactly
+# that rule. If a test and the spec disagree, the spec wins.
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -53,63 +57,85 @@ def repo(tmp_path: Path) -> Path:
     return root
 
 
-# --- _is_plumbing --------------------------------------------------------------
+# --- _import_line_texts --------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        "import os",
-        "from a.b import c",
-        "from a.b import (",
-        "    helper,",
-        "helper",
-        "@staticmethod",
-        "if TYPE_CHECKING:",
-        "logger = logging.getLogger(__name__)",
+def test_import_line_texts_collects_single_line_imports() -> None:
+    """Plain import and from-import statements contribute their stripped text."""
+    text = "import os\nfrom a.b import c\n\nx = 1\n"
+    assert _import_line_texts(text) == {"import os", "from a.b import c"}
+
+
+def test_import_line_texts_collects_every_line_of_a_multiline_import() -> None:
+    """A parenthesised import contributes each member line and the brackets."""
+    text = "from pkg import (\n    alpha,\n    beta,\n)\n\nuse(alpha)\n"
+    assert _import_line_texts(text) == {
+        "from pkg import (",
+        "alpha,",
+        "beta,",
         ")",
-        "):",
-        "helper(value)",
-        "module.helper(a, b)",
-        "return helper(value)",
-        "self.x = helper(value)",
-    ],
-)
-def test_is_plumbing_accepts_move_wiring(line: str) -> None:
-    """Imports, decorators, bracket fragments and call sites count as move wiring."""
-    assert _is_plumbing(line) is True
+    }
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        "x = a + b",
-        "if condition:",
-        "return value * 2",
-        "raise ValueError(message)",
-        "for item in items:",
-        "_use_aiter = get_bool_env_var('X') and is_hip()",
-    ],
-)
-def test_is_plumbing_rejects_logic(line: str) -> None:
-    """Real statements (assignments, conditionals, expression returns) are not wiring."""
-    assert _is_plumbing(line) is False
+def test_import_line_texts_excludes_non_import_code() -> None:
+    """Ordinary statements are never reported as import lines."""
+    text = "x = 1\ndef f():\n    return alpha\n"
+    assert _import_line_texts(text) == set()
+
+
+def test_import_line_texts_returns_empty_for_unparseable_text() -> None:
+    """A file that does not parse as Python contributes no import lines."""
+    assert _import_line_texts("this is ::: not python\n") == set()
+
+
+# --- _commit_import_texts ------------------------------------------------------
+
+
+def test_commit_import_texts_collects_before_and_after(repo: Path) -> None:
+    """Before-version and after-version import lines are gathered per side."""
+    _write(repo, **{"m.py": "import os\n\nx = 1\n"})
+    _commit(repo, "base")
+    _write(repo, **{"m.py": "import sys\n\nx = 1\n"})
+    _commit(repo, "swap import")
+    before, after = _commit_import_texts("HEAD", str(repo))
+    assert "import os" in before
+    assert "import sys" in after
 
 
 # --- _normalize_block ----------------------------------------------------------
 
 
-def test_normalize_block_ignores_indentation_blanks_and_one_sided_headers() -> None:
-    """Normalization strips indentation and drops blanks, @staticmethod and __future__."""
+def test_normalize_block_strips_indentation_and_drops_blanks() -> None:
+    """Normalization strips indentation and trailing space and drops blank lines."""
     block = [
-        "    @staticmethod",
         "    def helper(value):",
         "        return value * 2",
         "",
-        "from __future__ import annotations",
+        "   ",
     ]
     assert _normalize_block(block) == Counter(
         {"def helper(value):": 1, "return value * 2": 1}
+    )
+
+
+def test_normalize_block_keeps_decorator_lines() -> None:
+    """A decorator is an ordinary line now: it is kept, not treated as one-sided."""
+    assert _normalize_block(["    @staticmethod", "    def m():"]) == Counter(
+        {"@staticmethod": 1, "def m():": 1}
+    )
+
+
+def test_normalize_block_counts_duplicate_lines() -> None:
+    """Identical body lines are accumulated as separate counts in the Counter."""
+    assert _normalize_block(["    x = 1", "    x = 1", "        x = 1"]) == Counter(
+        {"x = 1": 3}
+    )
+
+
+def test_normalize_block_drops_whitespace_only_lines() -> None:
+    """Lines that are empty or only whitespace are dropped entirely."""
+    assert _normalize_block(["", "   ", "\t", "    real = 1"]) == Counter(
+        {"real = 1": 1}
     )
 
 
@@ -128,11 +154,53 @@ def test_commit_changed_lines_splits_added_removed_without_headers(repo: Path) -
     assert not any(line.startswith(("+++", "---")) for line in removed + added)
 
 
-# --- verify_move_commit --------------------------------------------------------
+def test_commit_changed_lines_add_only_file_has_no_removed_lines(repo: Path) -> None:
+    """A commit that only adds a new file reports added lines and no removed lines."""
+    _write(repo, **{"base.py": "kept\n"})
+    _commit(repo, "base")
+    _write(repo, **{"new.py": "fresh\ncontent\n"})
+    _commit(repo, "add new file")
+    removed, added = _commit_changed_lines("HEAD", str(repo))
+    assert removed == []
+    assert "fresh" in added
+    assert "content" in added
+
+
+def test_commit_changed_lines_delete_only_file_has_no_added_lines(repo: Path) -> None:
+    """A commit that only deletes a file reports removed lines and no added lines."""
+    _write(repo, **{"keep.py": "kept\n", "gone.py": "doomed\nlines\n"})
+    _commit(repo, "base")
+    _write(repo, **{"gone.py": None})
+    _commit(repo, "delete file")
+    removed, added = _commit_changed_lines("HEAD", str(repo))
+    assert "doomed" in removed
+    assert "lines" in removed
+    assert added == []
+
+
+def test_commit_changed_lines_spans_multiple_files_without_diff_headers(
+    repo: Path,
+) -> None:
+    """Changes across several files are merged, and diff/index/hunk headers
+    never leak into the returned line lists."""
+    _write(repo, **{"a.py": "a_old\n", "b.py": "b_old\n"})
+    _commit(repo, "base")
+    _write(repo, **{"a.py": "a_new\n", "b.py": "b_new\n"})
+    _commit(repo, "edit both")
+    removed, added = _commit_changed_lines("HEAD", str(repo))
+    assert {"a_old", "b_old"} <= set(removed)
+    assert {"a_new", "b_new"} <= set(added)
+    combined = removed + added
+    assert not any(line.startswith("@@") for line in combined)
+    assert not any(line.startswith("diff --git") for line in combined)
+    assert not any(line.startswith("index ") for line in combined)
+
+
+# --- verify_move_commit: clean moves -------------------------------------------
 
 
 def test_clean_function_move_is_certified(repo: Path) -> None:
-    """A function moved verbatim to a new module, with import + call site, is clean."""
+    """A function moved verbatim to a new module, with a new import, is clean."""
     _write(
         repo, **{"src.py": "def helper(value):\n    return value * 2\n\n\nhelper(3)\n"}
     )
@@ -148,8 +216,148 @@ def test_clean_function_move_is_certified(repo: Path) -> None:
     assert verify_move_commit("HEAD", repo_root=str(repo)) is True
 
 
-def test_method_to_free_function_is_certified(repo: Path) -> None:
-    """A @staticmethod becoming a dedented free function still verifies as a move."""
+def test_file_split_is_certified(repo: Path) -> None:
+    """Splitting one file into two, with bodies copied verbatim, verifies as a move."""
+    _write(
+        repo,
+        **{"big.py": ("def a():\n    return 1\n\n\ndef b():\n    return 2\n")},
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "big.py": None,
+            "a.py": "def a():\n    return 1\n",
+            "b.py": "def b():\n    return 2\n",
+        },
+    )
+    _commit(repo, "split big.py")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+def test_move_into_existing_module_file_is_certified(repo: Path) -> None:
+    """Relocating a function into an already-existing module file is a clean move."""
+    _write(
+        repo,
+        **{
+            "src.py": "def helper(value):\n    return value * 2\n\n\nhelper(3)\n",
+            "mod.py": "def existing():\n    return 0\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": "from mod import helper\n\nhelper(3)\n",
+            "mod.py": (
+                "def existing():\n    return 0\n\n\ndef helper(value):\n"
+                "    return value * 2\n"
+            ),
+        },
+    )
+    _commit(repo, "move helper into existing mod")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+def test_move_adding_a_multiline_import_is_certified(repo: Path) -> None:
+    """The continuation lines of a parenthesised import the move adds are allowed."""
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "def helper(value):\n    return value * 2\n\n\n"
+                "def other(value):\n    return value + 1\n\n\n"
+                "result = helper(3) + other(4)\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "from mod import (\n    helper,\n    other,\n)\n\n"
+                "result = helper(3) + other(4)\n"
+            ),
+            "mod.py": (
+                "def helper(value):\n    return value * 2\n\n\n"
+                "def other(value):\n    return value + 1\n"
+            ),
+        },
+    )
+    _commit(repo, "move helper and other to mod")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+def test_pure_file_rename_is_certified(repo: Path) -> None:
+    """Renaming a file with no content change is a clean move (delete + add match)."""
+    _write(repo, **{"orig.py": "def a():\n    return 1\n"})
+    _commit(repo, "base")
+    _git(repo, "mv", "orig.py", "renamed.py")
+    _commit(repo, "rename orig.py to renamed.py")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+def test_move_with_reordered_body_is_not_caught_by_multiset_comparison(
+    repo: Path,
+) -> None:
+    """Documents the known order-blind limitation: a relocation that reorders body
+    lines within the moved block is certified clean because the verifier compares
+    line multisets, not sequences. This asserts current behavior, not desired
+    behavior; the --color-moved cross-check in verifier-spec.md flags the reorder."""
+    _write(
+        repo,
+        **{"src.py": ("def helper():\n    step_one()\n    step_two()\n\n\nhelper()\n")},
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": "from mod import helper\n\nhelper()\n",
+            "mod.py": "def helper():\n    step_two()\n    step_one()\n",
+        },
+    )
+    _commit(repo, "move helper and reorder its body")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+
+
+# --- verify_move_commit: not a pure move ---------------------------------------
+
+
+def test_changed_body_line_needs_review(repo: Path) -> None:
+    """If a line inside the moved body actually changes, the move is not certified."""
+    _write(repo, **{"src.py": "def helper(value):\n    return value * 2\n"})
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": "from mod import helper\n",
+            "mod.py": "def helper(value):\n    return value * 3\n",
+        },
+    )
+    _commit(repo, "move and tweak")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+
+
+def test_near_identical_line_change_needs_review(repo: Path, capsys) -> None:
+    """A body line that changed by even one byte (internal spacing) is not a move."""
+    _write(repo, **{"src.py": "def helper(value):\n    return value * 2\n"})
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": "from mod import helper\n",
+            "mod.py": "def helper(value):\n    return value*2\n",
+        },
+    )
+    _commit(repo, "move helper but reflow the body")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+    assert "return value*2" in capsys.readouterr().out
+
+
+def test_staticmethod_drop_with_call_rewrite_needs_review(repo: Path) -> None:
+    """The old lenient case: dropping @staticmethod and rewriting C.helper -> helper
+    leaves non-import leftovers, so under the strict rule it needs review."""
     _write(
         repo,
         **{
@@ -188,40 +396,78 @@ def test_method_to_free_function_is_certified(repo: Path) -> None:
         },
     )
     _commit(repo, "extract helper")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
 
 
-def test_file_split_is_certified(repo: Path) -> None:
-    """Splitting one file into two, with bodies copied verbatim, verifies as a move."""
+def test_move_with_self_attr_call_site_rewrite_needs_review(repo: Path) -> None:
+    """A move that also rewrites a `self.x = C.helper(...)` call site is not pure."""
     _write(
         repo,
-        **{"big.py": ("def a():\n    return 1\n\n\ndef b():\n    return 2\n")},
+        **{
+            "src.py": (
+                "class C:\n"
+                "    @staticmethod\n"
+                "    def helper(value):\n"
+                "        return value * 2\n"
+                "\n"
+                "    def m(self):\n"
+                "        self.x = C.helper(self.v)\n"
+            )
+        },
     )
     _commit(repo, "base")
     _write(
         repo,
         **{
-            "big.py": None,
-            "a.py": "def a():\n    return 1\n",
-            "b.py": "def b():\n    return 2\n",
+            "src.py": (
+                "from mod import helper\n"
+                "\n"
+                "\n"
+                "class C:\n"
+                "    def m(self):\n"
+                "        self.x = helper(self.v)\n"
+            ),
+            "mod.py": "def helper(value):\n    return value * 2\n",
         },
     )
-    _commit(repo, "split big.py")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
+    _commit(repo, "extract helper; rewrite self.x call site")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
 
 
-def test_changed_body_line_needs_review(repo: Path) -> None:
-    """If a line inside the moved body actually changes, the move is not certified."""
-    _write(repo, **{"src.py": "def helper(value):\n    return value * 2\n"})
+def test_constant_rederivation_in_new_module_needs_review(repo: Path, capsys) -> None:
+    """A constant re-derived in the destination module is a non-import added line."""
+    _write(
+        repo,
+        **{"src.py": "def helper(value):\n    return value * 2\n\n\nhelper(3)\n"},
+    )
     _commit(repo, "base")
     _write(
         repo,
         **{
-            "src.py": "from mod import helper\n",
-            "mod.py": "def helper(value):\n    return value * 3\n",
+            "src.py": "from mod import helper\n\nhelper(3)\n",
+            "mod.py": (
+                "_flag = compute_flag()\n\n\ndef helper(value):\n    return value * 2\n"
+            ),
         },
     )
-    _commit(repo, "move and tweak")
+    _commit(repo, "move helper; re-derive _flag")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+    assert "_flag = compute_flag()" in capsys.readouterr().out
+
+
+def test_call_site_rewrite_without_a_move_is_not_clean(repo: Path) -> None:
+    """A 'fix consumer' commit that only rewrites call sites relocates nothing, so it
+    cannot read CLEAN merely because its lines look move-shaped."""
+    _write(
+        repo,
+        **{"src.py": "result = old.compute(a, b)\nother = old.compute(c, d)\n"},
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{"src.py": "result = new.compute(a, b)\nother = new.compute(c, d)\n"},
+    )
+    _commit(repo, "point consumers at new")
     assert verify_move_commit("HEAD", repo_root=str(repo)) is False
 
 
@@ -231,6 +477,15 @@ def test_pure_logic_change_is_not_a_move(repo: Path) -> None:
     _commit(repo, "base")
     _write(repo, **{"src.py": "def helper(value):\n    return value * 3\n"})
     _commit(repo, "edit logic")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+
+
+def test_commit_that_relocates_nothing_returns_false(repo: Path) -> None:
+    """A commit that adds only unrelated brand-new content relocates nothing."""
+    _write(repo, **{"src.py": "def a():\n    return 1\n"})
+    _commit(repo, "base")
+    _write(repo, **{"other.py": "def brand_new():\n    return 99\n"})
+    _commit(repo, "add unrelated file")
     assert verify_move_commit("HEAD", repo_root=str(repo)) is False
 
 
@@ -250,6 +505,27 @@ def test_changed_line_appears_in_review_output(repo: Path, capsys) -> None:
     out = capsys.readouterr().out
     assert "[review]" in out
     assert "return value + 99" in out
+
+
+def test_added_import_is_labelled_import_not_review(repo: Path, capsys) -> None:
+    """The new import a move adds is reported under [import], never [review]."""
+    _write(
+        repo,
+        **{"src.py": "def helper(value):\n    return value * 2\n\n\nhelper(3)\n"},
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": "from mod import helper\n\nhelper(3)\n",
+            "mod.py": "def helper(value):\n    return value * 2\n",
+        },
+    )
+    _commit(repo, "move helper")
+    verify_move_commit("HEAD", repo_root=str(repo))
+    out = capsys.readouterr().out
+    assert "[import] from mod import helper" in out
+    assert "[review]" not in out.split("line(s) to review:")[1]
 
 
 # --- verify_mechanical_refactor ------------------------------------------------
@@ -311,6 +587,69 @@ def test_reproduce_exits_when_transform_diverges(
 
     with pytest.raises(SystemExit):
         verify_mechanical_refactor(base, target, wrong_transform)
+
+
+def test_reproduce_creates_verify_branch_on_pass(
+    repo: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A PASS run leaves a verify-mechanical-<base[:8]> branch in the repo."""
+    _write(repo, **{"src.py": "line1\nline2\nline3\n"})
+    base = _commit(repo, "base")
+    _write(repo, **{"src.py": None, "a.py": "line1\nline2\n", "b.py": "line3\n"})
+    target = _commit(repo, "split")
+
+    def transform(root: Path) -> None:
+        lines = (root / "src.py").read_text().splitlines(keepends=True)
+        (root / "a.py").write_text("".join(lines[0:2]))
+        (root / "b.py").write_text("".join(lines[2:3]))
+        (root / "src.py").unlink()
+        mrv.git_add_and_commit("split", cwd=str(root))
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(mrv.tempfile, "mkdtemp", lambda prefix="": str(tmp_path / "wt"))
+    _silence_precommit(monkeypatch)
+
+    verify_mechanical_refactor(base, target, transform)
+    assert "PASS" in capsys.readouterr().out
+    branch = f"verify-mechanical-{base[:8]}"
+    assert _git(repo, "branch", "--list", branch).endswith(branch)
+
+
+def _precommit_writes_file(monkeypatch, filename: str, contents: str) -> None:
+    real = mrv.exec_command
+
+    def fake(cmd: str, cwd=None, check=True):
+        if cmd.startswith("pre-commit"):
+            (Path(cwd) / filename).write_text(contents)
+            return ""
+        return real(cmd, cwd=cwd, check=check)
+
+    monkeypatch.setattr(mrv, "exec_command", fake)
+
+
+def test_reproduce_commits_pre_commit_fixes_when_tree_left_dirty(
+    repo: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """When pre-commit reformats and leaves the tree dirty, a 'pre-commit fixes'
+    commit is created on top of the transform commit."""
+    _write(repo, **{"src.py": "hello\n"})
+    base = _commit(repo, "base")
+    _write(repo, **{"src.py": "hello world\n", "formatted.py": "auto\n"})
+    target = _commit(repo, "edit")
+
+    def transform(root: Path) -> None:
+        (root / "src.py").write_text("hello world\n")
+        mrv.git_add_and_commit("transform", cwd=str(root))
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(mrv.tempfile, "mkdtemp", lambda prefix="": str(tmp_path / "wt"))
+    _precommit_writes_file(monkeypatch, "formatted.py", "auto\n")
+
+    verify_mechanical_refactor(base, target, transform)
+    assert "PASS" in capsys.readouterr().out
+    branch = f"verify-mechanical-{base[:8]}"
+    subjects = _git(repo, "log", "--format=%s", "-2", branch).splitlines()
+    assert subjects == ["pre-commit fixes", "transform"]
 
 
 # --- exec_command --------------------------------------------------------------
@@ -400,349 +739,3 @@ def test_dedent_preserves_blank_lines_and_trailing_newline() -> None:
 def test_dedent_preserves_absence_of_trailing_newline() -> None:
     """A text without a trailing newline keeps it absent after dedenting."""
     assert dedent("    a\n    b", 4) == "a\nb"
-
-
-# --- _is_plumbing: additional wiring forms -------------------------------------
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        "import x as y",
-        "from a import b as c",
-        "aliased as renamed,",
-        "",
-        "(",
-        "]",
-        "},",
-        "a.b.c(x)",
-    ],
-)
-def test_is_plumbing_accepts_more_move_wiring(line: str) -> None:
-    """Aliased imports, lone bracket fragments and method-chain calls are wiring."""
-    assert _is_plumbing(line) is True
-
-
-@pytest.mark.parametrize(
-    "line",
-    [
-        "return value",
-        "self.attr.x = foo(a)",
-        "total = (a + b)",
-        "x = f(a) + g(b)",
-    ],
-)
-def test_is_plumbing_rejects_logic_that_superficially_resembles_calls(
-    line: str,
-) -> None:
-    """Returns of bare names, nested-attribute assignments and multi-call
-    expressions are logic, even when they contain parentheses or a call."""
-    assert _is_plumbing(line) is False
-
-
-# --- _normalize_block: additional edge cases -----------------------------------
-
-
-def test_normalize_block_drops_classmethod_decorator() -> None:
-    """The @classmethod header line is treated as one-sided and dropped."""
-    assert _normalize_block(["    @classmethod", "    def m(cls):"]) == Counter(
-        {"def m(cls):": 1}
-    )
-
-
-def test_normalize_block_counts_duplicate_lines() -> None:
-    """Identical body lines are accumulated as separate counts in the Counter."""
-    assert _normalize_block(["    x = 1", "    x = 1", "        x = 1"]) == Counter(
-        {"x = 1": 3}
-    )
-
-
-def test_normalize_block_drops_whitespace_only_lines() -> None:
-    """Lines that are empty or only whitespace are dropped entirely."""
-    assert _normalize_block(["", "   ", "\t", "    real = 1"]) == Counter(
-        {"real = 1": 1}
-    )
-
-
-def test_normalize_block_drops_multiple_one_sided_headers() -> None:
-    """Several one-sided header lines are all removed in a single block."""
-    block = [
-        "    @staticmethod",
-        "    @classmethod",
-        "from __future__ import annotations",
-        "    keep = 1",
-    ]
-    assert _normalize_block(block) == Counter({"keep = 1": 1})
-
-
-# --- _commit_changed_lines: additional shapes ----------------------------------
-
-
-def test_commit_changed_lines_add_only_file_has_no_removed_lines(repo: Path) -> None:
-    """A commit that only adds a new file reports added lines and no removed lines."""
-    _write(repo, **{"base.py": "kept\n"})
-    _commit(repo, "base")
-    _write(repo, **{"new.py": "fresh\ncontent\n"})
-    _commit(repo, "add new file")
-    removed, added = _commit_changed_lines("HEAD", str(repo))
-    assert removed == []
-    assert "fresh" in added
-    assert "content" in added
-
-
-def test_commit_changed_lines_delete_only_file_has_no_added_lines(repo: Path) -> None:
-    """A commit that only deletes a file reports removed lines and no added lines."""
-    _write(repo, **{"keep.py": "kept\n", "gone.py": "doomed\nlines\n"})
-    _commit(repo, "base")
-    _write(repo, **{"gone.py": None})
-    _commit(repo, "delete file")
-    removed, added = _commit_changed_lines("HEAD", str(repo))
-    assert "doomed" in removed
-    assert "lines" in removed
-    assert added == []
-
-
-def test_commit_changed_lines_spans_multiple_files_without_diff_headers(
-    repo: Path,
-) -> None:
-    """Changes across several files are merged, and diff/index/hunk headers
-    never leak into the returned line lists."""
-    _write(repo, **{"a.py": "a_old\n", "b.py": "b_old\n"})
-    _commit(repo, "base")
-    _write(repo, **{"a.py": "a_new\n", "b.py": "b_new\n"})
-    _commit(repo, "edit both")
-    removed, added = _commit_changed_lines("HEAD", str(repo))
-    assert {"a_old", "b_old"} <= set(removed)
-    assert {"a_new", "b_new"} <= set(added)
-    combined = removed + added
-    assert not any(line.startswith("@@") for line in combined)
-    assert not any(line.startswith("diff --git") for line in combined)
-    assert not any(line.startswith("index ") for line in combined)
-
-
-# --- verify_move_commit: additional relocation shapes --------------------------
-
-
-def test_move_into_existing_module_file_is_certified(repo: Path) -> None:
-    """Relocating a function into an already-existing module file is a clean move."""
-    _write(
-        repo,
-        **{
-            "src.py": "def helper(value):\n    return value * 2\n\n\nhelper(3)\n",
-            "mod.py": "def existing():\n    return 0\n",
-        },
-    )
-    _commit(repo, "base")
-    _write(
-        repo,
-        **{
-            "src.py": "from mod import helper\n\nhelper(3)\n",
-            "mod.py": (
-                "def existing():\n    return 0\n\n\ndef helper(value):\n"
-                "    return value * 2\n"
-            ),
-        },
-    )
-    _commit(repo, "move helper into existing mod")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
-
-
-def test_move_with_self_attr_call_site_rewrite_is_certified(repo: Path) -> None:
-    """A move that rewrites a `self.x = foo(...)` call site is recognized as wiring."""
-    _write(
-        repo,
-        **{
-            "src.py": (
-                "class C:\n"
-                "    @staticmethod\n"
-                "    def helper(value):\n"
-                "        return value * 2\n"
-                "\n"
-                "    def m(self):\n"
-                "        self.x = C.helper(self.v)\n"
-            )
-        },
-    )
-    _commit(repo, "base")
-    _write(
-        repo,
-        **{
-            "src.py": (
-                "from mod import helper\n"
-                "\n"
-                "\n"
-                "class C:\n"
-                "    def m(self):\n"
-                "        self.x = helper(self.v)\n"
-            ),
-            "mod.py": "def helper(value):\n    return value * 2\n",
-        },
-    )
-    _commit(repo, "extract helper; rewrite self.x call site")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
-
-
-def test_move_with_bare_call_site_rewrite_is_certified(repo: Path) -> None:
-    """A move that rewrites a bare `foo(...)` statement call site is clean."""
-    _write(
-        repo,
-        **{
-            "src.py": (
-                "class C:\n"
-                "    @staticmethod\n"
-                "    def helper(value):\n"
-                "        return value * 2\n"
-                "\n"
-                "    def keep(self):\n"
-                "        return 0\n"
-                "\n"
-                "\n"
-                "C.helper(3)\n"
-            )
-        },
-    )
-    _commit(repo, "base")
-    _write(
-        repo,
-        **{
-            "src.py": (
-                "from mod import helper\n"
-                "\n"
-                "\n"
-                "class C:\n"
-                "    def keep(self):\n"
-                "        return 0\n"
-                "\n"
-                "\n"
-                "helper(3)\n"
-            ),
-            "mod.py": "def helper(value):\n    return value * 2\n",
-        },
-    )
-    _commit(repo, "extract helper; bare call site")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
-
-
-def test_move_with_real_adaptation_line_needs_review(repo: Path, capsys) -> None:
-    """A relocation that also adds a genuine logic line needs review and lists it."""
-    _write(
-        repo,
-        **{"src.py": "def helper(value):\n    return value * 2\n\n\nhelper(3)\n"},
-    )
-    _commit(repo, "base")
-    _write(
-        repo,
-        **{
-            "src.py": (
-                "from mod import helper\n"
-                "\n"
-                '_use_aiter = get_bool_env_var("X") and is_hip()\n'
-                "\n"
-                "helper(3)\n"
-            ),
-            "mod.py": "def helper(value):\n    return value * 2\n",
-        },
-    )
-    _commit(repo, "move helper + add adaptation line")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
-    out = capsys.readouterr().out
-    assert "[review]" in out
-    assert '_use_aiter = get_bool_env_var("X") and is_hip()' in out
-
-
-def test_commit_that_relocates_nothing_returns_false(repo: Path) -> None:
-    """A commit that adds only unrelated brand-new content relocates nothing."""
-    _write(repo, **{"src.py": "def a():\n    return 1\n"})
-    _commit(repo, "base")
-    _write(repo, **{"other.py": "def brand_new():\n    return 99\n"})
-    _commit(repo, "add unrelated file")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is False
-
-
-def test_move_with_reordered_body_is_not_caught_by_multiset_comparison(
-    repo: Path,
-) -> None:
-    """Documents the known order-blind limitation: a relocation that reorders body
-    lines within the moved block is certified clean because the verifier compares
-    line multisets, not sequences. This asserts current behavior, not desired
-    behavior; a true sequence-aware check would flag the reorder."""
-    _write(
-        repo,
-        **{"src.py": ("def helper():\n    step_one()\n    step_two()\n\n\nhelper()\n")},
-    )
-    _commit(repo, "base")
-    _write(
-        repo,
-        **{
-            "src.py": "from mod import helper\n\nhelper()\n",
-            "mod.py": "def helper():\n    step_two()\n    step_one()\n",
-        },
-    )
-    _commit(repo, "move helper and reorder its body")
-    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
-
-
-# --- verify_mechanical_refactor: worktree branch and pre-commit-fixes path ------
-
-
-def test_reproduce_creates_verify_branch_on_pass(
-    repo: Path, tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """A PASS run leaves a verify-mechanical-<base[:8]> branch in the repo."""
-    _write(repo, **{"src.py": "line1\nline2\nline3\n"})
-    base = _commit(repo, "base")
-    _write(repo, **{"src.py": None, "a.py": "line1\nline2\n", "b.py": "line3\n"})
-    target = _commit(repo, "split")
-
-    def transform(root: Path) -> None:
-        lines = (root / "src.py").read_text().splitlines(keepends=True)
-        (root / "a.py").write_text("".join(lines[0:2]))
-        (root / "b.py").write_text("".join(lines[2:3]))
-        (root / "src.py").unlink()
-        mrv.git_add_and_commit("split", cwd=str(root))
-
-    monkeypatch.chdir(repo)
-    monkeypatch.setattr(mrv.tempfile, "mkdtemp", lambda prefix="": str(tmp_path / "wt"))
-    _silence_precommit(monkeypatch)
-
-    verify_mechanical_refactor(base, target, transform)
-    assert "PASS" in capsys.readouterr().out
-    branch = f"verify-mechanical-{base[:8]}"
-    assert _git(repo, "branch", "--list", branch).endswith(branch)
-
-
-def _precommit_writes_file(monkeypatch, filename: str, contents: str) -> None:
-    real = mrv.exec_command
-
-    def fake(cmd: str, cwd=None, check=True):
-        if cmd.startswith("pre-commit"):
-            (Path(cwd) / filename).write_text(contents)
-            return ""
-        return real(cmd, cwd=cwd, check=check)
-
-    monkeypatch.setattr(mrv, "exec_command", fake)
-
-
-def test_reproduce_commits_pre_commit_fixes_when_tree_left_dirty(
-    repo: Path, tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """When pre-commit reformats and leaves the tree dirty, a 'pre-commit fixes'
-    commit is created on top of the transform commit."""
-    _write(repo, **{"src.py": "hello\n"})
-    base = _commit(repo, "base")
-    _write(repo, **{"src.py": "hello world\n", "formatted.py": "auto\n"})
-    target = _commit(repo, "edit")
-
-    def transform(root: Path) -> None:
-        (root / "src.py").write_text("hello world\n")
-        mrv.git_add_and_commit("transform", cwd=str(root))
-
-    monkeypatch.chdir(repo)
-    monkeypatch.setattr(mrv.tempfile, "mkdtemp", lambda prefix="": str(tmp_path / "wt"))
-    _precommit_writes_file(monkeypatch, "formatted.py", "auto\n")
-
-    verify_mechanical_refactor(base, target, transform)
-    assert "PASS" in capsys.readouterr().out
-    branch = f"verify-mechanical-{base[:8]}"
-    subjects = _git(repo, "log", "--format=%s", "-2", branch).splitlines()
-    assert subjects == ["pre-commit fixes", "transform"]

@@ -8,15 +8,18 @@ Two complementary checks, both self-contained in this file (no external scripts)
   re-wraps lines. See SKILL.md for the script template.
 
 - Verify mode (``verify_move_commit``): inspect a single commit and certify it is a
-  faithful relocation (function move, file split, module extraction) without any
-  reproduce script -- it confirms the moved block is byte-identical on both sides
-  and prints whatever is left over for review. Use for a stack of commits (each its
-  own PR) where only some commits are mechanical. Runnable directly:
+  pure relocation (function move, file split, module extraction) without any
+  reproduce script -- it confirms every changed line is either relocated byte-for-byte
+  or an import, and prints whatever is left over for review. Use for a stack of commits
+  (each its own PR) where only some commits are mechanical. Runnable directly:
 
       python3 mechanical_refactor_verify_utils.py move <commit>
+
+The exact rule the verify mode enforces is specified in verifier-spec.md (the source
+of truth); this module implements that file and nothing more.
 """
 
-import re
+import ast
 import shlex
 import subprocess
 import sys
@@ -101,51 +104,71 @@ def verify_mechanical_refactor(
 
 
 # ---------------------------------------------------------------------------
-# Verify mode: certify one commit is a faithful relocation by inspecting its diff.
+# Verify mode: certify one commit is a pure relocation by inspecting its diff.
+# The rule below is specified in verifier-spec.md; keep the two in lockstep.
 # ---------------------------------------------------------------------------
 
-# Header lines that legitimately appear on only one side of a relocation: a
-# decorator dropped/added when a method becomes a free function, and the
-# ``__future__`` import a freshly created module file carries.
-_MOVE_ONE_SIDED = {
-    "@staticmethod",
-    "@classmethod",
-    "from __future__ import annotations",
-}
 
-_IMPORT_ITEM = re.compile(r"[A-Za-z_][A-Za-z0-9_]*( as [A-Za-z_][A-Za-z0-9_]*)?,?$")
-# A line that is entirely a call expression -- the rewritten call site of the moved
-# symbol (optionally assigned or returned). Args are unchanged by a move, so the
-# only difference vs the old call site is the qualifier (``self.``/``ClassName.``).
-_CALL_LINE = re.compile(
-    r"(self\.[A-Za-z_]\w* = |return )?[A-Za-z_][A-Za-z0-9_.]*\(.*\)"
-)
+def _git_show_file(commit_ish: str, path: str, repo_root: str) -> str:
+    """Exact content of ``path`` at ``commit_ish`` ("" if it does not exist there).
 
-
-def _is_plumbing(line: str) -> bool:
-    """A residual line that is expected wiring of a move rather than logic:
-    imports, the moved symbol's new import-list items, call-site openings, a
-    module logger, a TYPE_CHECKING guard, and lone bracket/punctuation lines that
-    a formatter leaves behind when wrapping changes.
+    Unlike ``exec_command`` this does not strip, so ``ast`` line numbers stay aligned
+    with the file's real lines.
     """
-    s = line.strip()
-    if not s:
-        return True
-    if s.startswith(("import ", "from ", "@")):
-        return True
-    if s == "if TYPE_CHECKING:":
-        return True
-    if s.startswith("logger = logging.getLogger"):
-        return True
-    if all(c in "()[]{}:,." for c in s):
-        return True
-    if _IMPORT_ITEM.fullmatch(s):
-        return True
-    if s.endswith("("):  # a call-site opening (the new free-function call)
-        return True
-    if _CALL_LINE.fullmatch(s):  # a one-line call site of the moved symbol
-        return True
-    return False
+    print(f"  $ git show {commit_ish}:{path}", flush=True)
+    result = subprocess.run(
+        ["git", "show", f"{commit_ish}:{path}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _import_line_texts(file_text: str) -> set[str]:
+    """Stripped text of every line that is part of an import statement.
+
+    Found structurally via ``ast`` (not regex), so single-line imports and
+    parenthesised multi-line imports (each member line) are both covered. A file
+    that does not parse as Python contributes nothing. See verifier-spec.md step 2.
+    """
+    try:
+        tree = ast.parse(file_text)
+    except SyntaxError:
+        return set()
+    lines = file_text.splitlines()
+    texts: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            end = node.end_lineno or node.lineno
+            for lineno in range(node.lineno, end + 1):
+                if 1 <= lineno <= len(lines):
+                    texts.add(lines[lineno - 1].strip())
+    return texts
+
+
+def _commit_import_texts(commit: str, repo_root: str) -> tuple[set[str], set[str]]:
+    """Import-line texts across every file the commit touches, before and after.
+
+    Renames are not followed (``-M`` off), so a rename shows as delete + add and both
+    its sides are parsed. See verifier-spec.md step 2.
+    """
+    status = exec_command(
+        f"git show {shlex.quote(commit)} --name-status --format= --no-color --no-ext-diff",
+        cwd=repo_root,
+    )
+    before: set[str] = set()
+    after: set[str] = set()
+    for line in status.splitlines():
+        if "\t" not in line:
+            continue
+        code, path = line.split("\t", 1)
+        status_code = code[:1]
+        if status_code in ("A", "M", "C"):
+            after |= _import_line_texts(_git_show_file(commit, path, repo_root))
+        if status_code in ("D", "M"):
+            before |= _import_line_texts(_git_show_file(f"{commit}^", path, repo_root))
+    return before, after
 
 
 def _commit_changed_lines(commit: str, repo_root: str) -> tuple[list[str], list[str]]:
@@ -167,49 +190,56 @@ def _commit_changed_lines(commit: str, repo_root: str) -> tuple[list[str], list[
 
 
 def _normalize_block(lines: list[str]) -> Counter:
-    """Strip indentation/trailing space, drop blanks and one-sided header lines."""
+    """Strip indentation/trailing space and drop blank lines. See verifier-spec.md step 3."""
     counts: Counter = Counter()
     for raw in lines:
         stripped = raw.strip()
-        if stripped and stripped not in _MOVE_ONE_SIDED:
+        if stripped:
             counts[stripped] += 1
     return counts
 
 
 def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
-    """Certify a commit is a faithful relocation (function move / file split).
+    """Certify a commit is a pure relocation (function move / file split / rename).
 
-    A clean move deletes a block from one place and adds the byte-identical block
-    (ignoring indentation and decorator / ``__future__`` header lines) somewhere
-    else. Whatever is left over is split into expected wiring (imports, call sites)
-    and "to review" lines. A move is certified only when nothing needs review;
-    otherwise the to-review lines -- the only ones a human must read -- are listed.
+    Implements verifier-spec.md exactly: every changed line must either be relocated
+    byte-for-byte (indentation ignored) or be an import statement. Imports are the only
+    tolerated non-moved change; anything else -- a call-site rewrite, a dropped
+    decorator, a re-derived constant, a line that changed by even one byte -- is listed
+    for review and the commit is not certified.
     """
     root = repo_root or exec_command("git rev-parse --show-toplevel")
     removed, added = _commit_changed_lines(commit, root)
+    imports_before, imports_after = _commit_import_texts(commit, root)
     rem, add = _normalize_block(removed), _normalize_block(added)
 
     relocated = sum((rem & add).values())
-    residual = sorted((rem - add).elements()) + sorted((add - rem).elements())
-    wiring = [r for r in residual if _is_plumbing(r)]
-    to_review = [r for r in residual if not _is_plumbing(r)]
+    imports: list[str] = []
+    to_review: list[str] = []
+    for line in sorted((rem - add).elements()):
+        (imports if line in imports_before else to_review).append(line)
+    for line in sorted((add - rem).elements()):
+        (imports if line in imports_after else to_review).append(line)
 
-    print(f"commit {commit}: move check")
+    print(f"commit {commit}: move check (rule: verifier-spec.md)")
     print(f"  {relocated} line(s) relocated byte-for-byte (indentation ignored)")
-    print(f"  {len(wiring)} wiring line(s) (imports / call sites):")
-    for line in wiring:
-        print(f"    [wiring] {line}")
+    print(f"  {len(imports)} import line(s) (the only allowed non-moved change):")
+    for line in imports:
+        print(f"    [import] {line}")
     print(f"  {len(to_review)} line(s) to review:")
     for line in to_review:
         print(f"    [review] {line}")
 
-    clean = relocated > 0 and not to_review
-    if clean:
+    nothing_changed = not removed and not added
+    clean = not to_review and (relocated > 0 or nothing_changed)
+    if clean and relocated > 0:
         print(
-            "  => CLEAN MOVE (relocation is byte-faithful; only imports/call sites changed)"
+            "  => CLEAN MOVE (every changed line is a byte-identical move or an import)"
         )
+    elif clean:
+        print("  => CLEAN (pure rename; no content changed)")
     else:
-        print("  => NEEDS REVIEW (no relocation detected, or non-wiring lines changed)")
+        print("  => NEEDS REVIEW (a non-import line changed, or nothing was relocated)")
     return clean
 
 

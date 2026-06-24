@@ -5,6 +5,9 @@ commits are mechanical (mixed with semantic ones). See `SKILL.md` for when to pi
 this mode over reproduce mode. There is no reproduce script; you certify each
 mechanical commit directly from its diff.
 
+The exact rule the verifier enforces is specified in `verifier-spec.md`; this page is
+the workflow around it.
+
 ## Step 1: Classify each commit
 
 A mechanical *relocation* (function move, file split, module extraction) vs a
@@ -20,15 +23,16 @@ python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_uti
 It reports, for the commit's diff:
 
 - how many lines were **relocated byte-for-byte** (indentation ignored, so a method
-  becoming an indentation-shifted free function still counts);
-- the **wiring** lines (the new import and the rewritten call sites);
-- any **to review** lines — the only thing a human must read.
+  body dedented to module level or re-indented under another class still counts);
+- the **import** lines — the only non-relocated change a clean move may contain;
+- any **to review** lines — everything else, the only thing a human must read.
 
-`CLEAN MOVE` means nothing needs review. Otherwise read the (usually tiny) to-review
-set and confirm each line is an equivalent adaptation (for example a call site that
-changed only its qualifier, or a constant re-derived in the new module). A line that
-is a real behavior change means the commit is not a pure move — it should be a prep +
-move pair (see below).
+`CLEAN MOVE` means every changed line was either relocated byte-for-byte or an import,
+so nothing needs review. Otherwise each to-review line is a non-import change — a
+rewritten call site, a dropped decorator, a re-derived constant, or a line that changed
+by even one byte — which means the commit is not a pure move. It should be a prep + move
+pair (see below), or, if a formatter re-wrapped the relocated lines, verified with
+reproduce mode instead.
 
 Optional eyeball cross-check of the same commit:
 
@@ -38,12 +42,14 @@ git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-
 
 ### What `CLEAN MOVE` does and does not assert
 
-- It compares the deleted and added line sets (indentation ignored), so it certifies
-  the body **did not change** during the move. It does **not** check line order within
-  the moved block — the `--color-moved` cross-check above catches a reordered block.
-- It judges the **shape of the diff**, not intent. A commit that is not really a move
-  but whose few changed lines happen to look move-shaped can read `CLEAN MOVE`. Always
-  confirm intent from the commit subject and the wiring lines before trusting it.
+- It compares the deleted and added line multisets (indentation ignored), so it
+  certifies the body **did not change** during the move. It does **not** check line
+  order within the moved block — the `--color-moved` cross-check above catches a
+  reordered block.
+- It judges the **shape of the diff**, not intent. Because imports are the only
+  tolerated leftover, a commit that changes any non-import line cannot read
+  `CLEAN MOVE` — but still confirm the commit's purpose from its subject before trusting
+  the verdict.
 
 ## Step 3: Semantic commits
 

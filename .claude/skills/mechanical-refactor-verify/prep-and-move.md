@@ -6,7 +6,7 @@ operations with different correctness criteria**:
 | Operation | What it does | How you check it |
 |---|---|---|
 | **Semantic reshape** | method → free function or method; `self.X` → a parameter, or `self` retyped to the target class; signature / typing change | behavior unchanged: lint + tests pass |
-| **Physical move** | cut from the source, paste into the target, fix imports + call sites | the moved body is byte-identical, line for line |
+| **Physical move** | cut from the source, paste into the target, fix imports | the moved body is byte-identical, line for line, and the only other change is an import |
 
 Put both in one commit and the two criteria contaminate each other: a single hunk then
 contains the reshape **and** an indentation shift **and** a cross-file relocation, so
@@ -24,42 +24,42 @@ the same idea in both: a pure relocation whose body is byte-identical.
 
 ## Case 1: method → free function (in a module)
 
-### Commit 1 — prep: detach from `self`, in place
+### Commit 1 — prep: de-self into a module-level free function, in place
 
-Reshape the method in its **original file and position** so it no longer depends on
-`self`, and qualify the call site:
+Reshape the method into a **module-level free function in the same file**, so it no
+longer depends on `self` and the caller refers to it by a bare name:
 
 - `self.X` (read) → pass `X` in as a parameter.
 - `self.X = v` (write) → `return v`; the caller assigns. (Or pass an explicit mutable
   object.)
 - `self.other_method(...)` → prep that method in the same commit, or inject it as a
   `Callable` argument.
-- once `self` is gone, mark it `@staticmethod`; the body **stays where it is**.
-- call site: `self.foo(args)` → `TheClass.foo(args)` (class-qualified).
+- define `def foo(...)` at **module level** in the source file (not a `@staticmethod`
+  on the class) and remove the method from the class.
+- call site: `self.foo(args)` → `foo(args)` (bare name; `foo` is now module-level in the
+  same file).
 
-Qualifying the call site now reflects the real fact that `foo` no longer needs an
-instance (rather than relying on "a staticmethod happens to be callable on an
-instance"), and it makes the move commit's call-site change a pure prefix deletion
-(`TheClass.foo` → `foo`) that a tool can verify.
+Making it a free function — rather than a `@staticmethod` left on the class — is what
+lets the next commit be certified. The caller already uses the bare name `foo(...)`,
+which does **not** change when `foo` later moves to another module; only the import
+does. A `@staticmethod` would instead force the move to also rewrite `TheClass.foo` →
+`foo` and drop the decorator, and those are non-import changes the move verifier
+rejects.
 
-**Check:** lint + tests pass; the diff is limited to the body reshape plus the
-call-site prefix rewrite.
+**Check:** lint + tests pass; the diff is the body reshape plus the bare-name call site.
 
 ### Commit 2 — move: relocate to the module
 
-Cut the `@staticmethod` block, paste it into the target module, and do only the
-minimal sealing:
+Cut the free function, paste it into the target module, and do only the minimal sealing:
 
-- drop `@staticmethod`, dedent to module level; the body is **unchanged, line for
-  line**.
-- source file: remove the now-unused imports.
-- target file: add the import of the moved symbol.
-- call site: `TheClass.foo(args)` → `foo(args)` (prefix deletion; args untouched).
+- move `def foo(...)` to the target module; the body is **unchanged, line for line**.
+- source file: add `from target import foo`, and remove any now-unused imports.
+- the call site `foo(args)` is **untouched** — only the import changed.
 
-**Check:** the moved hunk is byte-identical — `verify_move_commit <commit>` reports
-`CLEAN MOVE`, and
-`git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
-marks the whole block as moved.
+**Check:** the only non-relocated change is the import, so `verify_move_commit <commit>`
+reports `CLEAN MOVE`; cross-check with
+`git show <commit> --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`,
+which marks the whole block as moved.
 
 ## Case 2: method → method on a class
 
@@ -142,8 +142,14 @@ method); the body is **unchanged, line for line**:
   omitted).
 - caller: `Source.foo(self.component, ...)` → `self.component.foo(...)`.
 
-**Check:** byte-identical — `verify_move_commit <commit>` reports `CLEAN MOVE`, and
-`git --color-moved` marks the whole block as moved.
+**Check:** the body is byte-identical, but this move also drops `@staticmethod` and
+changes the caller's qualifier (`Source.foo` → `self.component.foo`) — both non-import
+changes — so `verify_move_commit` reports `NEEDS REVIEW` and lists exactly those lines.
+A class-to-class method move cannot be import-residual-only, so it is not certified by
+the move verifier; verify it with reproduce mode (a transform script, see
+`reproduce-mode.md`) or read those few lines by hand. The split still pays off: because
+prep left the body untouched, the move is a clean cut/paste and the only lines to read
+are the decorator and the caller.
 
 ## Anti-pattern: prep adds the body, move deletes it
 
@@ -195,7 +201,7 @@ See `.claude/skills/large-class-style/SKILL.md`.
 A move that is split uses two consecutive commits with reserved suffixes:
 
 ```
-<id>-prep    # commit 1: in-place reshape (Case 1 detach-self, or Case 2 retype-self)
+<id>-prep    # commit 1: in-place reshape (Case 1 → free function, or Case 2 retype-self)
 <id>-move    # commit 2: pure relocation
 ```
 
