@@ -17,6 +17,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
@@ -71,6 +72,33 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     if padded_len % sp_world_size != 0:
         padded_len += sp_world_size - (padded_len % sp_world_size)
     return padded_len // sp_world_size
+
+
+def _shard_text_for_sp(
+    encoder_hidden_states: torch.Tensor,
+    freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
+) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    """Shard the replicated text stream evenly across SP ranks.
+
+    The image latents are already sharded by the pipeline while the text stream
+    is replicated. This splits the text embeddings (and their RoPE cache) so each
+    rank keeps ``1/sp_size`` of the text tokens, making the joint attention fully
+    sequence-sharded (``num_replicated_prefix=0``). Callers must ensure the text
+    length divides evenly across SP ranks.
+    """
+    sp_size = get_sp_world_size()
+    if sp_size == 1:
+        return encoder_hidden_states, freqs_cis
+
+    sp_rank = get_sp_parallel_rank()
+    encoder_hidden_states = torch.chunk(encoder_hidden_states, sp_size, dim=1)[sp_rank]
+
+    if freqs_cis is not None:
+        img_cache, txt_cache = freqs_cis
+        txt_cache = torch.chunk(txt_cache, sp_size, dim=0)[sp_rank]
+        freqs_cis = (img_cache, txt_cache)
+
+    return encoder_hidden_states, freqs_cis
 
 
 def _get_qkv_projections(
@@ -659,6 +687,9 @@ class QwenImageCrossAttention(nn.Module):
         # Varlen metadata precomputed in QwenImageTransformer2DModel.forward,
         # paired with the same ``attn_mask`` for the USPAttention FA fast path.
         attn_mask_meta = cross_attention_kwargs.get("attn_mask_meta")
+        # When the text stream is sharded across SP ranks the joint sequence is
+        # fully sequence-parallel, so no leading tokens are replicated.
+        sp_text_sharded = cross_attention_kwargs.get("sp_text_sharded", False)
 
         (
             img_query,
@@ -740,7 +771,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_value,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
-            num_replicated_prefix=seq_len_txt,
+            num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
         )
 
         # Reshape back
@@ -1348,6 +1379,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         encoder_hidden_states, _ = self.txt_in(encoder_hidden_states)
 
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
+        sp_text_sharded = False
         if encoder_hidden_states_mask is not None:
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(
                 device=hidden_states.device, dtype=torch.bool
@@ -1365,6 +1397,21 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             block_attention_kwargs["attn_mask_meta"] = build_varlen_mask_meta(
                 joint_mask
             )
+        elif (
+            get_sp_world_size() > 1
+            and encoder_hidden_states.shape[1] % get_sp_world_size() == 0
+        ):
+            # No per-token text mask (single-request path) and the text length
+            # divides evenly across SP ranks: shard the otherwise replicated
+            # text stream instead of duplicating it. When it does NOT divide
+            # evenly we skip sharding and fall through to the replicated-text
+            # path, avoiding the masked (SDPA) attention fallback on non-FA
+            # backends.
+            encoder_hidden_states, freqs_cis = _shard_text_for_sp(
+                encoder_hidden_states, freqs_cis
+            )
+            sp_text_sharded = True
+        block_attention_kwargs["sp_text_sharded"] = sp_text_sharded
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
