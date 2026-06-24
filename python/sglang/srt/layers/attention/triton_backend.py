@@ -114,6 +114,7 @@ class TritonAttnBackend(AttentionBackend):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
+            decode_attention_fwd_fp4,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             build_unified_kv_indices,
@@ -127,6 +128,7 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.decode_attention_fwd_fp4 = torch.compiler.disable(decode_attention_fwd_fp4)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -1664,11 +1666,73 @@ class TritonAttnBackend(AttentionBackend):
                 device=q.device,
             )
             self.forward_metadata.attn_lse.fill_(-float("inf"))
-            self.decode_attention_fwd(
-                q_for_decode,
-                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                o_for_decode,
+            if (
+                getattr(self.token_to_kv_pool, "supports_fp4_decode_attention", False)
+                and not self.use_mla
+            ):
+                self.decode_attention_fwd_fp4(
+                    q_for_decode,
+                    self.token_to_kv_pool.get_key_fp4_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_key_scale_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_value_fp4_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_value_scale_buffer(layer.layer_id),
+                    o_for_decode,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    self.forward_metadata.attn_lse,
+                    self.forward_metadata.num_kv_splits,
+                    self.max_kv_splits,
+                    layer.scaling,
+                    k_descale,
+                    v_descale,
+                    logit_cap=logits_soft_cap,
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                    has_mla=self.use_mla,
+                    use_pdl=self.use_pdl,
+                )
+            else:
+                self.decode_attention_fwd(
+                    q_for_decode,
+                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    o_for_decode,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    self.forward_metadata.attn_lse,
+                    self.forward_metadata.num_kv_splits,
+                    self.max_kv_splits,
+                    layer.scaling,
+                    k_descale,
+                    v_descale,
+                    logit_cap=logits_soft_cap,
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                )
+            local_lse = torch.logsumexp(
+                self.forward_metadata.attn_lse[
+                    : q_for_decode.shape[0], : q_for_decode.shape[1], :
+                ],
+                dim=-1,
+            )
+            o = cp_lse_ag_out_rs(o_for_decode, local_lse, group)
+            return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
+
+        q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        if (
+            getattr(self.token_to_kv_pool, "supports_fp4_decode_attention", False)
+            and not self.use_mla
+        ):
+            self.decode_attention_fwd_fp4(
+                q_view,
+                self.token_to_kv_pool.get_key_fp4_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_key_scale_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_fp4_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_scale_buffer(layer.layer_id),
+                o_view,
                 kv_indptr,
                 kv_indices,
                 attn_logits,
@@ -1681,36 +1745,30 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
+                use_pdl=self.use_pdl,
             )
-            local_lse = torch.logsumexp(
-                self.forward_metadata.attn_lse[
-                    : q_for_decode.shape[0], : q_for_decode.shape[1], :
-                ],
-                dim=-1,
+        else:
+            self.decode_attention_fwd(
+                q_view,
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o_view,
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
+                use_pdl=self.use_pdl,
             )
-            o = cp_lse_ag_out_rs(o_for_decode, local_lse, group)
-            return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
-
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            k_descale,
-            v_descale,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-            has_mla=self.use_mla,
-            use_pdl=self.use_pdl,
-        )
         return o
 
 
