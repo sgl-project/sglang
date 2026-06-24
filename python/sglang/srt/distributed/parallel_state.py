@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
+    is_cuda,
     is_cuda_alike,
     is_hip,
     is_musa,
@@ -1991,7 +1992,7 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda_alike()):
+    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda()):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
             "currently only supported on the AMD HIP platform or CUDA platform, but got "
