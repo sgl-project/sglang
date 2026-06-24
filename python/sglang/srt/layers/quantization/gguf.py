@@ -931,7 +931,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             del layer.w13_qweight
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config({"all_gather_finalize_routing": True})
+            layer.dispatcher.set_quant_config({"get_name": gguf})
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
