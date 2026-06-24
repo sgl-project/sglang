@@ -28,6 +28,7 @@ class GroupedMatmul(BaseMatmul):
         output_dtype: torch.dtype,
         group_list_type,
         **scale_args,
+        split_item,
     ) -> torch.Tensor:
         # Use cached weight attribute if available, otherwise fall back to direct getattr
         weight = getattr(quant_info, f"{weight_prefix}_weight", None)
@@ -39,7 +40,7 @@ class GroupedMatmul(BaseMatmul):
             x=[hidden_states],
             weight=[weight],
             **scale_args,
-            split_item=2,
+            split_item=split_item,
             group_list_type=group_list_type,
             group_type=0,
             group_list=expert_tokens,
