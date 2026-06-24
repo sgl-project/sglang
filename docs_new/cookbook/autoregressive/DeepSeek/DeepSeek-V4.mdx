@@ -291,6 +291,15 @@ PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
 TCP, which can lead to garbled KV transfer on large checkpoints.
 
+**Ada (L20 / SM89) note**
+
+On NVIDIA L20 (SM89), SGLang supports the converted
+[`sgl-project/DeepSeek-V4-Flash-FP8`](https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8)
+checkpoint through the default DeepSeek-V4 FP8 indexer path. The SM89 route uses
+a Triton paged-MQA logits fallback and avoids Hopper/Blackwell-only kernels such
+as FlashMLA, DeepGEMM indexer metadata, and `topk_v2` cluster kernels. Hopper and
+Blackwell routes keep their existing optimized kernels.
+
 **RTX PRO 6000 (SM120 / Blackwell Desktop) note**
 
 RTX PRO 6000 (96 GB) runs **Flash only** — V4-Pro doesn't fit on 8× 96 GB. It uses the
