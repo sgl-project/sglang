@@ -40,13 +40,10 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_world_group,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -57,6 +54,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
@@ -261,12 +259,6 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
-        hf_quant_config["hf_config"] = model_config.hf_config
-
-        # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
-        if model_config.quantization in REQUANTIZATION_METHODS:
-            hf_quant_config["requantization_method"] = model_config.quantization
-
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -1333,7 +1325,7 @@ def row_parallel_weight_loader(
     param: torch.Tensor, loaded_weight: torch.Tensor
 ) -> None:
     """Load weights that are row-parallelized."""
-    tp_rank = get_tensor_model_parallel_rank()
+    tp_rank = get_parallel().tp_rank
     shard_dim = 0 if param.dim() != 1 else None
 
     if shard_dim is not None:
@@ -1351,7 +1343,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_attention_tp_rank()
+        tp_rank = get_parallel().attn_tp_rank
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
@@ -1359,9 +1351,8 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
-                or loaded_weight.size(0)
-                < get_tensor_model_parallel_world_size() * shard_size
+                loaded_weight.size(0) % get_parallel().tp_size != 0
+                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):
