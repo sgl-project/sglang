@@ -5292,6 +5292,10 @@ class ServerArgs:
             raise ValueError(
                 "--enable-cp-kv-layer-split is currently supported only on CUDA"
             )
+        if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+            raise ValueError(
+                "--enable-cp-kv-layer-split requires the Compressor V2 path"
+            )
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )

@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -93,6 +94,15 @@ class TestCpKvLayerSplitServerArgs(CustomTestCase):
             return_value=True,
         ):
             with self.assertRaisesRegex(ValueError, "unified_kv_triton"):
+                args._handle_cp_kv_layer_split()
+
+    def test_rejects_compressor_v1(self):
+        args = _make_layer_split_args()
+
+        with envs.SGLANG_OPT_USE_COMPRESSOR_V2.override(False), patch(
+            "sglang.srt.server_args.is_hip", return_value=False
+        ):
+            with self.assertRaisesRegex(ValueError, "Compressor V2"):
                 args._handle_cp_kv_layer_split()
 
 
