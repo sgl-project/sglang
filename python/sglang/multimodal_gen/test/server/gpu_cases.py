@@ -463,6 +463,7 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
+            T2V_sampling_params,
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
@@ -843,7 +844,7 @@ FILE_SUITES = {
         "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
     ],
     "1-gpu-b200": [
-        "../single_test_file/test_server_b200.py",
+        "test_server_b200.py",
     ],
 }
 

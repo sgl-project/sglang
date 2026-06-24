@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from sglang.multimodal_gen.test.single_test_file.cli_generate_common import CLIBase
+from sglang.multimodal_gen.test.single_test_file import cli_generate_common
 
 
 class TestCLIBaseHelpers(unittest.TestCase):
@@ -14,7 +14,7 @@ class TestCLIBaseHelpers(unittest.TestCase):
             def get_default_extension():
                 return "png"
 
-        class _ImageCLI(CLIBase):
+        class _ImageCLI(cli_generate_common.CLIBase):
             model_path = "dummy/model"
             extra_args = ("--dummy-extra",)
             data_type = _ImageDataType()
