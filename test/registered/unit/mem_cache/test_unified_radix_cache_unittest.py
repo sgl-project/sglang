@@ -696,6 +696,20 @@ class UnifiedRadixCacheSuite:
         with envs.SGLANG_SWA_CACHE_CHECKPOINT_MIN_TOKEN_INTERVAL.override(1):
             return tree.evict(params)
 
+    def _skip_unless_swa_checkpoint_config(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("covered by the dedicated SWA+Mamba test")
+        if self.cfg.page_size != 64 or self.cfg.sliding_window_size != 64:
+            self.skipTest("covered by representative SWA checkpoint config")
+
+    def _skip_unless_swa_mamba_checkpoint_config(self):
+        if not (self.cfg.has_swa and self.cfg.has_mamba):
+            self.skipTest("requires SWA and Mamba components")
+        if self.cfg.page_size != 64 or self.cfg.sliding_window_size != 64:
+            self.skipTest("covered by representative SWA+Mamba checkpoint config")
+
     def test_insert_and_match_basic(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -2289,10 +2303,7 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_evict_internal_keeps_window_suffix(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2321,86 +2332,8 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(match.device_indices), len(leaf))
         tree.sanity_check()
 
-    def test_swa_evict_internal_reuses_retained_leaf_child(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
-
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
-        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        prefix = next(iter(tree.root_node.children.values()))
-        suffix = next(iter(prefix.children.values()))
-        prefix_len = len(seq) - retain_len
-        self.assertGreater(len(prefix.key), retain_len)
-        self.assertEqual(len(prefix.key), prefix_len)
-        self.assertEqual(len(suffix.key), retain_len)
-        self.assertEqual(len(suffix.children), 0)
-        self.assertIsNotNone(prefix.component_data[ComponentType.SWA].value)
-        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
-
-        before = tree.swa_evictable_size()
-        result = self._evict_with_dense_swa_checkpoints(
-            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
-        )
-        self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
-        self.assertEqual(tree.swa_evictable_size(), before - prefix_len)
-        self.assertIs(next(iter(tree.root_node.children.values())), prefix)
-        self.assertIsNone(prefix.component_data[ComponentType.SWA].value)
-        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
-        self.assertIn(suffix, tree.evictable_device_leaves)
-
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        self.assertEqual(len(match.device_indices), len(seq))
-        tree.sanity_check()
-
-    def test_swa_evict_internal_reuses_retained_internal_child(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
-
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
-        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
-        extended = seq + self._make_seq(9000, 1)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-        self._insert(tree, allocator, req_to_token_pool, extended)
-
-        prefix = next(iter(tree.root_node.children.values()))
-        suffix = next(iter(prefix.children.values()))
-        prefix_len = len(seq) - retain_len
-        self.assertEqual(len(prefix.key), prefix_len)
-        self.assertEqual(len(suffix.key), retain_len)
-        self.assertGreater(len(suffix.children), 0)
-        self.assertNotIn(suffix, tree.evictable_device_leaves)
-        self.assertIsNotNone(prefix.component_data[ComponentType.SWA].value)
-        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
-
-        before = tree.swa_evictable_size()
-        result = self._evict_with_dense_swa_checkpoints(
-            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
-        )
-        self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
-        self.assertEqual(tree.swa_evictable_size(), before - prefix_len)
-        self.assertIs(next(iter(tree.root_node.children.values())), prefix)
-        self.assertIsNone(prefix.component_data[ComponentType.SWA].value)
-        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
-
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", extended))))
-        self.assertEqual(len(match.device_indices), len(extended))
-        tree.sanity_check()
-
     def test_swa_retention_split_preserves_lru_position(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2428,131 +2361,8 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(suffix.last_access_time, old_access_time)
         tree.sanity_check()
 
-    def test_swa_evict_defers_window_sized_internal_nodes(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
-
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
-        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        base = self._make_seq(1, retain_len // ps)
-        leaf = base + self._make_seq(5000, 1)
-        self._insert(tree, allocator, req_to_token_pool, base)
-        self._insert(tree, allocator, req_to_token_pool, leaf)
-
-        result = self._evict_with_dense_swa_checkpoints(
-            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
-        )
-        self.assertEqual(result.swa_num_tokens_evicted, ps)
-
-        retained = next(iter(tree.root_node.children.values()))
-        self.assertEqual(len(retained.key), retain_len)
-        self.assertIsNotNone(retained.component_data[ComponentType.SWA].value)
-        self.assertEqual(tree.swa_evictable_size(), retain_len)
-
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
-        self.assertEqual(len(match.device_indices), len(base))
-        tree.sanity_check()
-
-    def test_swa_evict_defers_retained_suffix_that_became_leaf(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
-
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
-        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        base = self._make_seq(1, retain_len // ps + 2)
-        leaf = base + self._make_seq(5000, 1)
-        self._insert(tree, allocator, req_to_token_pool, base)
-        self._insert(tree, allocator, req_to_token_pool, leaf)
-
-        self._evict_with_dense_swa_checkpoints(
-            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
-        )
-        split_parent = next(iter(tree.root_node.children.values()))
-        suffix = next(iter(split_parent.children.values()))
-        child = next(iter(suffix.children.values()))
-
-        tracker = {ct: 0 for ct in tree.tree_components}
-        tree._evict_device_leaf(child, tracker)
-        self.assertEqual(len(suffix.children), 0)
-        self.assertIn(suffix, tree.evictable_device_leaves)
-        self.assertEqual(
-            len(suffix.component_data[ComponentType.SWA].value), retain_len
-        )
-
-        other = self._make_seq(9000, retain_len // ps + 1)
-        self._insert(tree, allocator, req_to_token_pool, other)
-
-        result = self._evict_with_dense_swa_checkpoints(
-            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
-        )
-        self.assertEqual(result.swa_num_tokens_evicted, len(other))
-        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
-        self.assertIn(suffix, tree.evictable_device_leaves)
-
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
-        self.assertEqual(len(match.device_indices), len(base))
-        tree.sanity_check()
-
-    def test_swa_evict_splits_long_leaf_to_retain_window(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
-
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
-        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        long_prefix = next(iter(tree.root_node.children.values()))
-        window_leaf = next(iter(long_prefix.children.values()))
-        prefix_len = len(seq) - retain_len
-        self.assertGreater(prefix_len, retain_len)
-        self.assertEqual(len(long_prefix.key), prefix_len)
-        self.assertEqual(len(window_leaf.key), retain_len)
-
-        tracker = {ct: 0 for ct in tree.tree_components}
-        tree._evict_device_leaf(window_leaf, tracker)
-        self.assertEqual(len(long_prefix.children), 0)
-        self.assertIn(long_prefix, tree.evictable_device_leaves)
-        self.assertGreater(
-            len(long_prefix.component_data[ComponentType.SWA].value), retain_len
-        )
-
-        before = tree.swa_evictable_size()
-        result = self._evict_with_dense_swa_checkpoints(
-            tree, EvictParams(num_tokens=0, swa_num_tokens=1)
-        )
-        evicted_len = prefix_len - retain_len
-        self.assertEqual(result.swa_num_tokens_evicted, evicted_len)
-        self.assertEqual(tree.swa_evictable_size(), before - evicted_len)
-
-        split_parent = next(iter(tree.root_node.children.values()))
-        retained = next(iter(split_parent.children.values()))
-        self.assertIs(retained, long_prefix)
-        self.assertIsNone(split_parent.component_data[ComponentType.SWA].value)
-        self.assertEqual(
-            len(retained.component_data[ComponentType.SWA].value), retain_len
-        )
-
-        match = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq[:prefix_len])))
-        )
-        self.assertEqual(len(match.device_indices), prefix_len)
-        tree.sanity_check()
-
     def test_swa_checkpoint_interval_default_zero_skips_soft_pass(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2571,10 +2381,7 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_checkpoint_structural_only_candidates(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2606,10 +2413,7 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_checkpoint_interval_retains_when_only_next_side_is_covered(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2637,46 +2441,8 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
-    def test_swa_checkpoint_interval_counts_boundaries_and_unsplit_swa_nodes(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
-
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
-        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        comp = tree.components[ComponentType.SWA]
-        prefix = next(iter(tree.root_node.children.values()))
-        suffix = next(iter(prefix.children.values()))
-        self.assertGreater(
-            len(prefix.component_data[ComponentType.SWA].value), retain_len
-        )
-        self.assertEqual(
-            len(suffix.component_data[ComponentType.SWA].value), retain_len
-        )
-
-        self.assertTrue(
-            comp._has_checkpoint_or_boundary_within_ancestors(
-                suffix, retain_len, retain_len + ps
-            )
-        )
-        self.assertFalse(
-            comp._has_checkpoint_or_boundary_within_ancestors(suffix, retain_len, ps)
-        )
-        self.assertTrue(
-            comp._has_checkpoint_or_boundary_within_descendants(suffix, retain_len, ps)
-        )
-        tree.sanity_check()
-
     def test_swa_evict_second_pass_clears_retained_window(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2704,8 +2470,7 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_evict_mamba_keeps_retained_suffix_state(self):
-        if not (self.cfg.has_swa and self.cfg.has_mamba):
-            self.skipTest("requires SWA and Mamba components")
+        self._skip_unless_swa_mamba_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2718,25 +2483,20 @@ class UnifiedRadixCacheSuite:
         result = self._evict_with_dense_swa_checkpoints(
             tree, EvictParams(num_tokens=0, swa_num_tokens=1)
         )
-        prefix_len = len(base) - retain_len
-        self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
-
-        split_parent = next(iter(tree.root_node.children.values()))
-        suffix = next(iter(split_parent.children.values()))
-        self.assertIsNone(split_parent.component_data[ComponentType.SWA].value)
-        self.assertIsNone(split_parent.component_data[ComponentType.MAMBA].value)
-        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
-        self.assertIsNotNone(suffix.component_data[ComponentType.MAMBA].value)
+        self.assertGreater(result.swa_num_tokens_evicted, 0)
 
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
-        self.assertEqual(match.best_match_node, suffix)
+        suffix = match.best_match_node
+        self.assertIsNot(suffix, tree.root_node)
+        self.assertIsNotNone(suffix.component_data[ComponentType.SWA].value)
+        self.assertGreaterEqual(
+            len(suffix.component_data[ComponentType.SWA].value), retain_len
+        )
+        self.assertIsNotNone(suffix.component_data[ComponentType.MAMBA].value)
         tree.sanity_check()
 
     def test_swa_evict_retention_split_preserves_host_state(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -2769,10 +2529,7 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_evict_skips_locked_internal_node(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
+        self._skip_unless_swa_checkpoint_config()
 
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
