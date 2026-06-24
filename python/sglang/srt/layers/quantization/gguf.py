@@ -797,7 +797,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         # Use the same unquant kernel for both w13 and w2
         self.w13_kernel = NPUUnquantMoEMethod()
-        self.w2_kernel = NPUUnquantMoEMethod()
+        self.w2_kernel = NPUUnquantMoEMethodGGUF()
 
     def create_weights(
         self,
