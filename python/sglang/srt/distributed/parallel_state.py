@@ -230,9 +230,20 @@ def aiter_fused_allreduce_rmsnorm(
         registered=torch.cuda.is_current_stream_capturing(),
         use_1stage=use_1stage_ar,
     )
-    if out is None:
-        raise RuntimeError("AITER fused_ar_rms returned None.")
-    return out
+    if out is not None:
+        return out
+
+    # fake/real parity safety net: the fake impl returns two tensors, so the
+    # real impl must always return a valid tuple. AITER's fused_ar_rms does not
+    # return None today, but if a future kernel declines a shape, fall back to
+    # an opaque allreduce + residual-add + RMSNorm so PCG / CUDA-graph capture
+    # (the only contexts that reach this op) never crash on None.
+    reduced = group.all_reduce(input_)
+    new_residual = reduced + residual_inp_
+    normed = torch.nn.functional.rms_norm(
+        new_residual, (new_residual.shape[-1],), weight_, eps
+    )
+    return normed, new_residual
 
 
 @register_custom_op(mutates_args=["output"])
@@ -741,19 +752,18 @@ class GroupCoordinator:
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
 
-        if hasattr(ca_comm, "fused_ar_rms"):
-            try:
-                return aiter_fused_allreduce_rmsnorm(
-                    input_, residual_inp_, weight_, eps, self.unique_name
-                )
-            except Exception:
-                if is_in_tc_piecewise_cuda_graph():
-                    raise
-                logger.debug(
-                    "AITER registered fused allreduce+rmsnorm failed; "
-                    "falling back to legacy fused path.",
-                    exc_info=True,
-                )
+        # Use the Dynamo-opaque custom op only inside a graph context: TC
+        # piecewise CUDA graph (Dynamo must not trace AITER's pybind/JIT kernel)
+        # or an active CUDA graph capture (decode graph needs registered
+        # buffers). Plain eager falls through to custom_fused_ar_rms below, which
+        # keeps the oversized-shape fallback callers/tests rely on.
+        if hasattr(ca_comm, "fused_ar_rms") and (
+            is_in_tc_piecewise_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return aiter_fused_allreduce_rmsnorm(
+                input_, residual_inp_, weight_, eps, self.unique_name
+            )
 
         # Prefer communicator-native fused API when provided.
         if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
