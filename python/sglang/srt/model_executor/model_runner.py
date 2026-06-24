@@ -41,9 +41,9 @@ from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
+    bootstrap,
     get_tp_group,
 )
-from sglang.srt.distributed.bootstrap import init_torch_distributed
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     maybe_init_shared_mooncake_transfer_engine,
 )
@@ -73,13 +73,12 @@ from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.n_gram_embedding_manager import NgramEmbeddingManager
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -90,11 +89,11 @@ from sglang.srt.lora.lora_manager import (
 )
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
-from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
@@ -108,6 +107,7 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.model_runner_components import quantization_checks
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
     configure_aux_hidden_state_capture,
@@ -143,9 +143,6 @@ from sglang.srt.model_executor.model_runner_components.pool_configurator import 
 )
 from sglang.srt.model_executor.model_runner_components.pp_proxy import (
     resolve_pp_proxy_topk_size,
-)
-from sglang.srt.model_executor.model_runner_components.quantization_checks import (
-    check_quantized_moe_compatibility,
 )
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transport import (
     RemoteInstanceWeightTransport,
@@ -190,12 +187,12 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
+    numa_utils,
     require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )
-from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
@@ -292,7 +289,7 @@ class ModelRunner:
 
         self.init_remote_instance_weight_transport()
 
-        self.msprobe_debugger = create_msprobe_debugger(server_args)
+        self.init_msprobe()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
@@ -306,9 +303,7 @@ class ModelRunner:
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
-            self.local_omp_cpuid = init_threads_binding(
-                tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
-            )
+            self.init_threads_binding()
 
         # Set float32 matmul precision
         if server_args.enable_tf32_matmul:
@@ -316,24 +311,10 @@ class ModelRunner:
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
-        result = init_torch_distributed(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            device=self.device,
-            ps=self.ps,
-            dist_port=self.dist_port,
-            is_draft_worker=self.is_draft_worker,
-            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
-        )
-        self.tp_group = result.tp_group
-        self.pp_group = result.pp_group
-        self.attention_tp_group = result.attention_tp_group
-        self.pre_model_load_memory = result.pre_model_load_memory
+        self.init_torch_distributed()
 
         # Initialize MooncakeTransferEngine
-        maybe_init_shared_mooncake_transfer_engine(
-            server_args=self.server_args, gpu_id=self.gpu_id
-        )
+        self.init_shared_mooncake_transfer_engine()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -365,12 +346,7 @@ class ModelRunner:
 
         # Load model weights and configure
         self.initialize()
-        check_quantized_moe_compatibility(
-            model_config=self.model_config,
-            tp_size=self.ps.tp_size,
-            moe_ep_size=self.ps.moe_ep_size,
-            moe_dp_size=self.ps.moe_dp_size,
-        )
+        self.check_quantized_moe_compatibility()
 
         if (
             self.server_args.elastic_ep_backend is not None
@@ -395,6 +371,56 @@ class ModelRunner:
         # For weight updates
         self.init_weight_updater()
         self.init_weight_exporter()
+
+    def init_msprobe(self):
+        self.msprobe_debugger = create_msprobe_debugger(self.server_args)
+
+    def init_threads_binding(self):
+        self.local_omp_cpuid = numa_utils.init_threads_binding(
+            tp_rank=self.ps.tp_rank, tp_size=self.ps.tp_size
+        )
+
+    def init_torch_distributed(self):
+        result = bootstrap.init_torch_distributed(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            device=self.device,
+            ps=self.ps,
+            dist_port=self.dist_port,
+            is_draft_worker=self.is_draft_worker,
+            local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
+        )
+        self.tp_group = result.tp_group
+        self.pp_group = result.pp_group
+        self.attention_tp_group = result.attention_tp_group
+        self.pre_model_load_memory = result.pre_model_load_memory
+
+    def init_shared_mooncake_transfer_engine(self):
+        maybe_init_shared_mooncake_transfer_engine(
+            server_args=self.server_args, gpu_id=self.gpu_id
+        )
+
+    def check_quantized_moe_compatibility(self):
+        quantization_checks.check_quantized_moe_compatibility(
+            model_config=self.model_config,
+            tp_size=self.ps.tp_size,
+            moe_ep_size=self.ps.moe_ep_size,
+            moe_dp_size=self.ps.moe_dp_size,
+        )
+
+    def apply_torch_tp(self):
+        model_parallel.apply_torch_tp(
+            model=self.model, device=self.device, tp_size=self.ps.tp_size
+        )
+
+    def configure_kv_cache_dtype(self):
+        self.server_args.kv_cache_dtype, self.kv_cache_dtype = (
+            kv_cache_dtype.configure_kv_cache_dtype(
+                server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
+                model=self.model,
+                model_dtype=self.dtype,
+            )
+        )
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -578,9 +604,7 @@ class ModelRunner:
         # Apply torch TP if the model supports it
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
-            apply_torch_tp(
-                model=self.model, device=self.device, tp_size=self.ps.tp_size
-            )
+            self.apply_torch_tp()
 
         # Init lora
         if server_args.enable_lora:
@@ -593,11 +617,7 @@ class ModelRunner:
             enable_batch_invariant_mode()
 
         # Deduce KV cache dtype
-        self.server_args.kv_cache_dtype, self.kv_cache_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=self.server_args.kv_cache_dtype,
-            model=self.model,
-            model_dtype=self.dtype,
-        )
+        self.configure_kv_cache_dtype()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         return resolve_pp_proxy_topk_size(
