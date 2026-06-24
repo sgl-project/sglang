@@ -124,7 +124,7 @@ class NPUSwigluStepAndMul(BaseActivation):
 # =============================================================================
 # Generic TP all‑gather wrapper – used by the runner when needed
 # =============================================================================
-class AllGatherWrapper(BaseActivation):
+class AllGatherActivationWrapper(BaseActivation):
     """
     Wraps any activation and adds an all‑gather along `dim` if TP > 1.
 
