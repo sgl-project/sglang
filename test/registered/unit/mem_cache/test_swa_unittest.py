@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheFinishParams,
     DecLockRefParams,
     EvictParams,
     EvictResult,
@@ -41,6 +42,31 @@ class _DummyReq:
 
     def pop_committed_kv_cache(self):
         return self._kv_committed_len
+
+
+def _finish(tree, req, is_insert=True):
+    kv_committed_len = req._kv_committed_len
+    kv_indices = tree.req_to_token_pool.req_to_token[
+        req.req_pool_idx, :kv_committed_len
+    ]
+    tree.cache_finished_req(
+        CacheFinishParams(
+            token_ids=(list(req.origin_input_ids) + list(req.output_ids))[
+                :kv_committed_len
+            ],
+            extra_key=req.extra_key,
+            kv_indices=kv_indices,
+            kv_committed_len=kv_committed_len,
+            prev_prefix_len=req.cache.cache_protected_len,
+            prefix_indices_len=len(req.prefix_indices),
+            swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+            is_insert=is_insert,
+            last_node=req.cache.last_node,
+            swa_uuid_for_lock=req.cache.swa_uuid_for_lock,
+            swa_prefix_lock_released=req.cache.swa_prefix_lock_released,
+            req=req,
+        )
+    )
 
 
 def _build_swa_tree(
@@ -644,7 +670,7 @@ class TestSWA(unittest.TestCase):
             return original_insert(params)
 
         tree.insert = wrapped_insert
-        tree.cache_finished_req(req, is_insert=True)
+        _finish(tree, req, is_insert=True)
 
         self.assertEqual(captured["prev_prefix_len"], req.cache.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
@@ -676,7 +702,7 @@ class TestSWA(unittest.TestCase):
             return original_free(indices)
 
         allocator.free = wrapped_free
-        tree.cache_finished_req(req2, is_insert=False)
+        _finish(tree, req2, is_insert=False)
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:

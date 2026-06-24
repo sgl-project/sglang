@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -34,7 +34,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    harvest_and_finish_req,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -643,6 +646,11 @@ class UnifiedRadixCacheSuite:
         )
         self._rid += 1
         req_to_token_pool.alloc([req])
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
+        req.cache.cache_protected_len = 0
+        req.cache.last_node = None
+        req.cache.swa_uuid_for_lock = None
+        req.cache.swa_prefix_lock_released = False
         return req
 
     def _apply_match_to_req(self, req, match):
@@ -677,6 +685,9 @@ class UnifiedRadixCacheSuite:
         assert full_indices is not None and swa_indices is not None
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
+
+    def _finish(self, tree, req, is_insert=True):
+        harvest_and_finish_req(req, tree, is_insert=is_insert)
 
     def _insert(self, tree, allocator, req_to_token_pool, tokens, priority=0):
         """Insert tokens, attaching mamba data when the config has mamba."""
@@ -902,7 +913,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.mamba.mamba_last_track_seqlen = kv_len
 
-        tree.cache_finished_req(req, is_insert=True)
+        self._finish(tree, req, is_insert=True)
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -939,8 +950,8 @@ class UnifiedRadixCacheSuite:
         get_global_server_args().strip_thinking_cache = True
         try:
             avail_before = allocator.available_size()
-            tree.cache_finished_req(req, is_insert=True)
-            start_p, end_p = req.pop_overallocated_kv_cache()
+            self._finish(tree, req, is_insert=True)
+            start_p, end_p = req.effective_kv_committed_len(), req.kv.kv_allocated_len
         finally:
             get_global_server_args().strip_thinking_cache = False
         if ps > 1:
@@ -980,7 +991,7 @@ class UnifiedRadixCacheSuite:
         req.fill_len = len(req.full_untruncated_fill_ids)
 
         avail_before = allocator.available_size()
-        tree.cache_finished_req(req, is_insert=False)
+        self._finish(tree, req, is_insert=False)
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -1135,7 +1146,7 @@ class UnifiedRadixCacheSuite:
             req.mamba.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        tree.cache_finished_req(req, is_insert=True)
+        self._finish(tree, req, is_insert=True)
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]

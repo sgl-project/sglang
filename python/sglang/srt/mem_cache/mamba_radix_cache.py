@@ -34,10 +34,12 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
     EvictResult,
+    FinishResult,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -513,22 +515,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_committed_len: int
-    ) -> None:
+    def cache_finished_req(self, params: CacheFinishParams) -> Optional[FinishResult]:
         """Cache request when it finishes."""
+        req = params.req
+        is_insert = params.is_insert
+        kv_committed_len = params.kv_committed_len
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
-            ]
+            kv_indices = params.kv_indices[:kv_committed_len]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
-            return
+            return None
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
+        token_ids = params.token_ids
+        kv_indices = params.kv_indices[:kv_committed_len]
 
         if is_insert:
             cache_len = (
@@ -539,7 +538,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
-                cache_end_idx = max(cache_len, req.cache.cache_protected_len)
+                cache_end_idx = max(cache_len, params.prev_prefix_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
@@ -590,10 +589,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             result = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                    key=RadixKey(token_ids[:page_aligned_len], params.extra_key),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
-                    prev_prefix_len=req.cache.cache_protected_len,
+                    prev_prefix_len=params.prev_prefix_len,
                 )
             )
             mamba_exist = result.mamba_exist
@@ -601,9 +600,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # state already cached -> the int8 slot we just allocated is a duplicate
                 self.int8_ckpt_pool.free(mamba_value)
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache.cache_protected_len :]
-            )
+            self.token_to_kv_pool_allocator.free(kv_indices[params.prev_prefix_len :])
             mamba_exist = True
 
         if mamba_exist:
@@ -623,7 +620,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
             )
 
-        self.dec_lock_ref(req.cache.last_node)
+        assert (
+            params.last_node is not None
+        ), "cache_finished_req expects the req to still hold its cache lock"
+        self.dec_lock_ref(params.last_node)
+        return None
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""

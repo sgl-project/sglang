@@ -13,10 +13,12 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
     EvictResult,
+    FinishResult,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -76,14 +78,11 @@ class ChunkCache(BasePrefixCache):
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_committed_len: int
-    ):
-        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ]
+    def cache_finished_req(self, params: CacheFinishParams) -> Optional[FinishResult]:
+        # For decode server: if output_ids is empty, we want to free all origin_input_ids
+        kv_indices = params.kv_indices[: params.kv_committed_len]
         self.token_to_kv_pool_allocator.free(kv_indices)
+        return None
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[

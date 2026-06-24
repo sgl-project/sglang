@@ -8,10 +8,12 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheFinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
     EvictResult,
+    FinishResult,
     IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
@@ -169,24 +171,22 @@ class RadixCacheCpp(BasePrefixCache):
     def total_size(self):
         return self.tree.total_size()
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_committed_len: int
-    ):
+    def cache_finished_req(self, params: CacheFinishParams) -> Optional[FinishResult]:
         """Cache request when it finishes."""
-        assert req.req_pool_idx is not None
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
-        ].to(dtype=torch.int64, copy=True)
+        kv_committed_len = params.kv_committed_len
+        token_ids = params.token_ids
+        kv_indices = params.kv_indices[:kv_committed_len].to(
+            dtype=torch.int64, copy=True
+        )
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
-        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
+        old_prefix_len = params.prefix_indices_len // self.page_size * self.page_size
         page_aligned_overall_len = kv_committed_len // self.page_size * self.page_size
 
-        if is_insert:
+        if params.is_insert:
             new_prefix_len = self._insert(
-                RadixKey(token_ids, req.extra_key), kv_indices
+                RadixKey(token_ids, params.extra_key), kv_indices
             )
             # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
             assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -206,7 +206,11 @@ class RadixCacheCpp(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
 
         # Remove req slot release the cache lock
-        self.dec_lock_ref(req.cache.last_node)
+        assert (
+            params.last_node is not None
+        ), "cache_finished_req expects the req to still hold its cache lock"
+        self.dec_lock_ref(params.last_node)
+        return None
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

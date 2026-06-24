@@ -12,7 +12,11 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheFinishParams,
+    EvictParams,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.triton_ops.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
@@ -643,6 +647,43 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def harvest_and_finish_req(
+    req: Req, tree_cache: BasePrefixCache, is_insert: bool = True
+) -> None:
+    kv_committed_len = req.effective_kv_committed_len()
+    owned_start = req.cache.cache_protected_len
+    kv_indices = tree_cache.req_to_token_pool.req_to_token[
+        req.req_pool_idx, :kv_committed_len
+    ]
+    finish_params = CacheFinishParams(
+        token_ids=(req.origin_input_ids + req.output_ids)[:kv_committed_len],
+        extra_key=req.extra_key,
+        kv_indices=kv_indices,
+        kv_committed_len=kv_committed_len,
+        prev_prefix_len=owned_start,
+        prefix_indices_len=len(req.prefix_indices),
+        swa_evicted_seqlen=req.kv.swa_evicted_seqlen if req.kv is not None else 0,
+        priority=getattr(req, "priority", 0) or 0,
+        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+        last_node=req.cache.last_node,
+        swa_uuid_for_lock=req.cache.swa_uuid_for_lock,
+        swa_prefix_lock_released=req.cache.swa_prefix_lock_released,
+        rid=req.rid,
+        req=req,
+    )
+    finish_result = tree_cache.cache_finished_req(finish_params)
+
+    if finish_result is not None and req.kv is not None:
+        if finish_result.prefix_len is not None:
+            tree_cache.token_to_kv_pool_allocator.free(
+                kv_indices[owned_start : finish_result.prefix_len]
+            )
+        if finish_result.key_len is not None:
+            tree_cache.token_to_kv_pool_allocator.free(
+                kv_indices[finish_result.key_len :]
+            )
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
@@ -658,11 +699,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     kv_committed_len = req.effective_kv_committed_len()
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_committed_len=kv_committed_len,
-    )
+
+    harvest_and_finish_req(req, tree_cache, is_insert=is_insert)
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
