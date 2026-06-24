@@ -20,8 +20,7 @@ def _aligned(t: torch.Tensor) -> bool:
 
 def _blackwell_or_newer(device: torch.device) -> bool:
     return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device)[0] >= 10
+        torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 10
     )
 
 

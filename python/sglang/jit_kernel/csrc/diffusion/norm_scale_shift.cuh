@@ -11,11 +11,12 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>    // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/math.cuh>    // For device::math::rsqrt
-#include <sgl_kernel/utils.cuh>   // For SGL_DEVICE, bf16_t, LaunchKernel
-#include <sgl_kernel/vec.cuh>     // For AlignedVector
-#include <sgl_kernel/warp.cuh>    // For warp::reduce_sum
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+
+#include <sgl_kernel/math.cuh>   // For device::math::rsqrt
+#include <sgl_kernel/utils.cuh>  // For SGL_DEVICE, bf16_t, LaunchKernel
+#include <sgl_kernel/vec.cuh>    // For AlignedVector
+#include <sgl_kernel/warp.cuh>   // For warp::reduce_sum
 
 #include <cstdint>
 
@@ -141,11 +142,12 @@ inline uint32_t verify_qwen_geometry(host::SymbolicSize& num_rows) {
 }  // namespace
 
 struct QwenImageNormScaleShiftKernel {
-  static void run(tvm::ffi::TensorView y,
-                  tvm::ffi::TensorView x,
-                  tvm::ffi::TensorView scale,
-                  tvm::ffi::TensorView shift,
-                  double eps) {
+  static void
+  run(tvm::ffi::TensorView y,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      double eps) {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
@@ -170,14 +172,15 @@ struct QwenImageNormScaleShiftKernel {
 };
 
 struct QwenImageScaleResidualNormScaleShiftKernel {
-  static void run(tvm::ffi::TensorView y,
-                  tvm::ffi::TensorView res_out,
-                  tvm::ffi::TensorView residual,
-                  tvm::ffi::TensorView x,
-                  tvm::ffi::TensorView gate,
-                  tvm::ffi::TensorView scale,
-                  tvm::ffi::TensorView shift,
-                  double eps) {
+  static void
+  run(tvm::ffi::TensorView y,
+      tvm::ffi::TensorView res_out,
+      tvm::ffi::TensorView residual,
+      tvm::ffi::TensorView x,
+      tvm::ffi::TensorView gate,
+      tvm::ffi::TensorView scale,
+      tvm::ffi::TensorView shift,
+      double eps) {
     using namespace host;
     auto N = SymbolicSize{"num_rows"};
     auto device = SymbolicDevice{};
