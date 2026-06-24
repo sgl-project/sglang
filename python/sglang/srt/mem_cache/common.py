@@ -186,3 +186,4 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
     # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
     tree_cache.req_to_token_pool.free(req)
+    req.kv = None
