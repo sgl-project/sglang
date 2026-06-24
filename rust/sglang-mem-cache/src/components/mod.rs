@@ -12,6 +12,7 @@ use tch::Tensor;
 use crate::component_type::{ComponentType, NUM_COMPONENT_TYPES};
 use crate::deferred_action::DeferredAction;
 use crate::error::RadixCacheRuntimeError;
+use crate::radix_cache::MatchResult;
 use crate::tree_node_pool::{ChildKeyType, ComponentNodeState, NodeIdx, TreeNode, TreeNodePool};
 
 /// Per-walk predicate gating the match-prefix boundary advance.
@@ -32,6 +33,18 @@ pub struct IncLockRefResult {
 pub trait Component<K: ChildKeyType>: Send {
     /// Stateful validator for one prefix-match walk; `None` if no gating.
     fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>>;
+
+    /// Post-match hook: fill this component's `MatchResult` fields (e.g. Mamba
+    /// branching seqlen + value). Default no-op, keeping the driver agnostic.
+    fn finalize_match_result(
+        &self,
+        _pool: &TreeNodePool<K>,
+        _last_matched_node_idx: NodeIdx,
+        _values: &[Tensor],
+        _last_device_value_len: usize,
+        _result: &mut MatchResult,
+    ) {
+    }
 
     /// Per-component inc-lock walk from `node_idx` up the tree.
     fn inc_lock_ref(

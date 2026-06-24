@@ -270,29 +270,24 @@ impl<K: ChildKeyType> RadixCache<K> {
             Tensor::cat(&values[..last_device_value_len], 0)
         };
 
-        let (mamba_branching_seqlen, mamba_value) = match self.mamba_cache_chunk_size {
-            Some(chunk_size) => {
-                // Populated only when the walk extended past the boundary.
-                let branching_seqlen = if last_device_value_len < values.len() {
-                    let total: usize = values.iter().map(|v| v.size()[0] as usize).sum();
-                    let aligned = total / chunk_size * chunk_size;
-                    (aligned > 0).then_some(aligned)
-                } else {
-                    None
-                };
-                let mv = MambaSlot::value(self.tree_node_pool.get(last_matched_node_idx))
-                    .map(|t| t.shallow_clone());
-                (branching_seqlen, mv)
-            }
-            None => (None, None),
-        };
-
-        Ok(MatchResult {
+        // Each component fills its own MatchResult fields; the driver stays
+        // component-agnostic (mirrors Python's _match_post_processor loop).
+        let mut result = MatchResult {
             device_indices,
             last_device_node_idx,
-            mamba_branching_seqlen,
-            mamba_value,
-        })
+            mamba_branching_seqlen: None,
+            mamba_value: None,
+        };
+        for component in &self.components {
+            component.finalize_match_result(
+                &self.tree_node_pool,
+                last_matched_node_idx,
+                &values,
+                last_device_value_len,
+                &mut result,
+            );
+        }
+        Ok(result)
     }
 
     /// Insert `(key, value)` into the `extra_key` namespace, deep-copying the

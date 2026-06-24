@@ -1,16 +1,18 @@
 //! Mamba component for the radix tree.
 
+use tch::Tensor;
+
 use super::{Component, IncLockRefResult, MatchValidator};
 use super::{
     EvictRequest, EvictResult, Slot, dec_lock_ref_non_full, evict_non_full, inc_lock_ref_non_full,
 };
 use crate::component_type::ComponentType;
 use crate::error::RadixCacheInitError;
+use crate::radix_cache::MatchResult;
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNode, TreeNodePool};
 
 /// Mamba radix-tree component.
 pub struct MambaComponent {
-    #[allow(dead_code)]
     mamba_cache_chunk_size: usize,
 }
 
@@ -43,6 +45,25 @@ impl MambaComponent {
 impl<K: ChildKeyType> Component<K> for MambaComponent {
     fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>> {
         Some(Box::new(MambaMatchValidator))
+    }
+
+    /// Fill the Mamba branching seqlen + cached state on the match result.
+    fn finalize_match_result(
+        &self,
+        pool: &TreeNodePool<K>,
+        last_matched_node_idx: NodeIdx,
+        values: &[Tensor],
+        last_device_value_len: usize,
+        result: &mut MatchResult,
+    ) {
+        // Branching seqlen only when the walk extended past the device boundary.
+        if last_device_value_len < values.len() {
+            let total: usize = values.iter().map(|v| v.size()[0] as usize).sum();
+            let aligned = total / self.mamba_cache_chunk_size * self.mamba_cache_chunk_size;
+            result.mamba_branching_seqlen = (aligned > 0).then_some(aligned);
+        }
+        result.mamba_value =
+            MambaSlot::value(pool.get(last_matched_node_idx)).map(|t| t.shallow_clone());
     }
 
     fn inc_lock_ref(
