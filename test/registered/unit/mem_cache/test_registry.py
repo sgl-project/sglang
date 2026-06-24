@@ -29,11 +29,14 @@ def _make_ctx(
     enable_hierarchical_cache=False,
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
+    architectures=None,
 ):
     server_args = MagicMock()
     server_args.radix_cache_backend = backend
     server_args.enable_streaming_session = enable_streaming
     server_args.enable_lmcache = enable_lmcache
+    model_config = MagicMock()
+    model_config.hf_config.architectures = architectures or []
     return TreeCacheBuildContext(
         server_args=server_args,
         params=MagicMock(),
@@ -43,7 +46,7 @@ def _make_ctx(
         disable_radix_cache=disable_radix_cache,
         effective_chunked_prefill_size=effective_chunked_prefill_size,
         tp_worker=MagicMock(),
-        model_config=MagicMock(),
+        model_config=model_config,
         tp_size=1,
         tp_rank=0,
         tp_group=MagicMock(),
@@ -215,6 +218,25 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             result = default_radix_cache_factory(ctx)
             fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_unlimited_ocr_uses_unified_radix_cache(self):
+        ctx = _make_ctx(
+            is_hybrid_swa=True,
+            architectures=["UnlimitedOCRForCausalLM"],
+        )
+        fake_components = MagicMock()
+        fake_radix = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache_components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
+        self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_hi_radix_cache_when_hierarchical(self):
         ctx = _make_ctx(enable_hierarchical_cache=True)

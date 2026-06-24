@@ -565,6 +565,13 @@ class SWAComponent(TreeComponent):
         is_finished: bool,
     ) -> Optional[int]:
         if is_finished:
+            prefill_floor = getattr(req, "swa_evict_floor", 0)
+            if prefill_floor > 0:
+                # Prefill-aware SWA has two live ranges at completion:
+                # [0, prefill_floor) and the trailing decode window. Cache only
+                # the reusable prefill range; UnifiedRadixCache frees the rest.
+                insert_params.swa_evicted_seqlen = 0
+                return min(prefill_floor, token_ids_len)
             insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
 

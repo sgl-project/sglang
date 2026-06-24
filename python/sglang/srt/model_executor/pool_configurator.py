@@ -296,8 +296,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             return (x // page_size) * page_size
 
         if self._full_layers_num == 0:
-            # All-SWA: no full pool, max_total = actual SWA pool size.
-            # Ratio is not applied -- see __init__ comment.
+            # All-SWA: there are no full KV layers, so this full sub-pool
+            # allocates no KV tensors. Keep its token capacity equal to the SWA
+            # pool, however, because req_to_token stores full-side logical
+            # indices and SWA attention translates them through full->SWA mapping.
             swa_tokens = align_page_size(max_total_num_tokens)
             logger.info(
                 f"Use sliding window memory pool (all SWA). "
@@ -305,7 +307,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
             return MemoryPoolConfig(
                 max_total_num_tokens=swa_tokens,
-                full_max_total_num_tokens=0,
+                full_max_total_num_tokens=swa_tokens,
                 swa_max_total_num_tokens=swa_tokens,
             )
 

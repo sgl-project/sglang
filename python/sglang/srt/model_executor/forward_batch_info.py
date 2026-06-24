@@ -398,6 +398,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
 
+    # Protected prefill length for models that retain prefill under SWA.
+    swa_evict_floors: Optional[torch.Tensor] = None
+    swa_evict_floors_cpu: Optional[List[int]] = None
+
     # For logprob
     top_logprobs_nums: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
@@ -668,6 +672,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        swa_evict_floors = swa_evict_floors_cpu = None
+        if getattr(model_runner, "prefill_aware_swa", False):
+            swa_evict_floors_cpu = [req.swa_evict_floor for req in batch.reqs]
+            swa_evict_floors = torch.tensor(
+                swa_evict_floors_cpu,
+                dtype=torch.int32,
+                device=batch.seq_lens.device,
+            )
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -705,6 +718,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
+            swa_evict_floors=swa_evict_floors,
+            swa_evict_floors_cpu=swa_evict_floors_cpu,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             mm_inputs=batch.multimodal_inputs,

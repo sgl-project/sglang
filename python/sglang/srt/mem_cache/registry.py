@@ -78,6 +78,8 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Built-in Radix Cache selection chain."""
     server_args = ctx.server_args
     params = ctx.params
+    architectures = getattr(ctx.model_config.hf_config, "architectures", []) or []
+    is_prefill_aware_swa = "UnlimitedOCRForCausalLM" in architectures
 
     if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
         if not ctx.is_hybrid_swa:
@@ -94,6 +96,9 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
+
+    if is_prefill_aware_swa:
+        return _create_unified_radix_cache(ctx, server_args, params)
 
     if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
         return _create_unified_radix_cache(ctx, server_args, params)

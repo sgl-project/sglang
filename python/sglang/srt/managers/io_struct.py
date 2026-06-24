@@ -297,6 +297,9 @@ class GenerateReqInput(BaseReq):
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # UNLIMITED-OCR image processing controls
+    images_config: Optional[Dict] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -756,6 +759,7 @@ class GenerateReqInput(BaseReq):
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            images_config=self.images_config,
         )
         cache[i] = sub
         return sub

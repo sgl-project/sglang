@@ -418,6 +418,9 @@ class MultimodalProcessorOutput:
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
+    # Number of prompt-suffix tokens that remain in the decode sliding window.
+    prefix_token_count: int = 0
+
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
@@ -438,6 +441,7 @@ class MultimodalProcessorOutput:
             vision_position_ids=d.get("vision_position_ids"),
             media_nums_per_sample=d.get("media_nums_per_sample"),
             visible_frame_counts=d.get("visible_frame_counts"),
+            prefix_token_count=d.get("prefix_token_count", 0),
         )
 
     @staticmethod
@@ -495,6 +499,9 @@ class MultimodalInputs:
     vision_position_ids: Optional[torch.Tensor] = None
     media_nums_per_sample: Optional[List[int]] = None
     visible_frame_counts: Optional[torch.Tensor] = None
+
+    # Number of prompt-suffix tokens that remain in the decode sliding window.
+    prefix_token_count: int = 0
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
@@ -567,6 +574,8 @@ class MultimodalInputs:
             val = getattr(obj, arg, None)
             if val is not None:
                 setattr(mm_inputs, arg, val)
+
+        mm_inputs.prefix_token_count = getattr(obj, "prefix_token_count", 0)
 
         return mm_inputs
 
@@ -748,6 +757,8 @@ class Req(ReqDllmMixin):
         #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
         # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
         self.swa_evicted_seqlen = 0
+        self.swa_evict_floor = 0
+        self.prefix_token_count = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0

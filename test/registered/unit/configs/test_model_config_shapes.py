@@ -3,7 +3,12 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import (
+    ModelConfig,
+    get_hybrid_layer_ids,
+    is_hybrid_swa_model,
+    is_multimodal_model,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -65,6 +70,19 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.v_head_dim, 96)
         self.assertEqual(model_config.swa_head_dim, 64)
         self.assertEqual(model_config.swa_v_head_dim, 48)
+
+    def test_unlimited_ocr_uses_swa_for_every_layer(self):
+        architectures = ["UnlimitedOCRForCausalLM"]
+        text_config = _make_text_config(num_hidden_layers=6)
+
+        self.assertTrue(is_multimodal_model(architectures))
+        self.assertTrue(is_hybrid_swa_model(architectures, text_config))
+        swa_layers, full_layers = get_hybrid_layer_ids(
+            architectures,
+            text_config,
+        )
+        self.assertEqual(swa_layers, list(range(6)))
+        self.assertEqual(full_layers, [])
 
 
 if __name__ == "__main__":

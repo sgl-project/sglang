@@ -67,6 +67,7 @@ class SeparatorStyle(IntEnum):
     GEMMA3 = auto()
     MPT = auto()
     PADDLE_OCR = auto()
+    UNLIMITED_OCR = auto()
 
 
 @dataclasses.dataclass
@@ -398,6 +399,14 @@ class Conversation:
                 else:
                     ret += role + ": "  # must be end with a space
             return ret
+        elif self.sep_style == SeparatorStyle.UNLIMITED_OCR:
+            seps = [self.sep, self.sep2]
+            ret = "" if not system_prompt else system_prompt + seps[0]
+            for i, (role, message) in enumerate(self.messages):
+                ret += role + (message or "")
+                if message:
+                    ret += seps[i % 2]
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -643,7 +652,7 @@ def generate_chat_conv(
                         conv.modalities.append(content.modalities)
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name not in ("qwen2-vl", "moss-vl")
+                    if conv.name not in ("qwen2-vl", "moss-vl", "unlimited-ocr")
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
@@ -656,7 +665,7 @@ def generate_chat_conv(
                 video_token = conv.video_token
                 for content in message.content:
                     if content.type == "text":
-                        if num_image_url > 16:
+                        if num_image_url > 16 and conv.name != "unlimited-ocr":
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":
@@ -902,6 +911,22 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="unlimited-ocr",
+        system_template="{system_message}",
+        system_message="",
+        roles=("", ""),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.UNLIMITED_OCR,
+        sep="",
+        sep2="",
+        image_token="<image>",
+        image_token_at_prefix=True,
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="deepseek-vl2",
         system_template="{system_message}",
         # system_message="You are a helpful assistant. Please answer truthfully and write out your "
@@ -1078,6 +1103,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "deepseek-ocr": "deepseek-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
+    "unlimited-ocr": "unlimited-ocr",
 }
 
 
@@ -1194,5 +1220,13 @@ def match_paddle_ocr(model_path: str):
 def match_whisper(model_path: str):
     if "whisper" in model_path.lower():
         return "whisper"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_unlimited_ocr(model_path: str):
+    if "unlimited" in model_path.lower():
+        return "unlimited-ocr"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)

@@ -27,6 +27,7 @@ from sglang.srt.parser.conversation import (
     generate_embedding_convs,
     get_conv_template_by_model_path,
     get_model_type,
+    match_unlimited_ocr,
     register_conv_template,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -811,6 +812,22 @@ class TestTemplateRegistry(CustomTestCase):
         result = get_conv_template_by_model_path("deepseek-ai/deepseek-ocr-base")
         self.assertEqual(result, "deepseek-ocr")
 
+    def test_get_conv_template_by_model_path_unlimited_ocr(self):
+        result = get_conv_template_by_model_path("baidu/Unlimited-OCR")
+        self.assertEqual(result, "unlimited-ocr")
+
+    def test_unlimited_ocr_matcher_rejects_other_model_types(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                json.dump({"model_type": "deepseek-ocr"}, f)
+            self.assertIsNone(match_unlimited_ocr(tmpdir))
+
+    def test_unlimited_ocr_matcher_accepts_model_type(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                json.dump({"model_type": "unlimited-ocr"}, f)
+            self.assertEqual(match_unlimited_ocr(tmpdir), "unlimited-ocr")
+
     def test_get_conv_template_by_model_path_points(self):
         """Test that points model path is matched correctly."""
         result = get_conv_template_by_model_path("WePOINTS/points-v1.5")
@@ -966,6 +983,29 @@ class TestGenerateChatConv(CustomTestCase):
         self.assertEqual(len(conv.messages), 2)
         self.assertIn("Hello", conv.messages[0][1])
         self.assertIsNone(conv.messages[1][1])
+
+    def test_unlimited_ocr_image_token_is_prefixed_without_separator(self):
+        request = self._make_request(
+            [
+                ChatCompletionMessageUserParam(
+                    role="user",
+                    content=[
+                        ChatCompletionMessageContentTextPart(
+                            type="text",
+                            text="document parsing.",
+                        ),
+                        ChatCompletionMessageContentImagePart(
+                            type="image_url",
+                            image_url=ChatCompletionMessageContentImageURL(
+                                url="https://example.com/document.png"
+                            ),
+                        ),
+                    ],
+                )
+            ]
+        )
+        conv = generate_chat_conv(request, "unlimited-ocr")
+        self.assertEqual(conv.get_prompt(), "<image>document parsing.")
 
     def test_system_then_user(self):
         """Test system message followed by user message."""

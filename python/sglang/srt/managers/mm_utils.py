@@ -47,6 +47,8 @@ _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
 
+_SHM_MODEL_SPECIFIC_TENSOR_THRESHOLD_BYTES = 1 << 20
+
 
 def init_feature_buffer(device):
     global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
@@ -1726,6 +1728,24 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     return value
 
 
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def _wrap_large_tensor_or_list(value):
+    """Wrap large CPU tensors in model-specific data in SHM pointers."""
+    if isinstance(value, torch.Tensor) and value.is_cpu:
+        if _tensor_nbytes(value) >= _SHM_MODEL_SPECIFIC_TENSOR_THRESHOLD_BYTES:
+            return ShmPointerMMData(value)
+        return value
+    elif isinstance(value, (list, tuple)):
+        wrapped = [_wrap_large_tensor_or_list(t) for t in value]
+        return type(value)(wrapped) if isinstance(value, tuple) else wrapped
+    elif isinstance(value, dict):
+        return {k: _wrap_large_tensor_or_list(v) for k, v in value.items()}
+    return value
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
@@ -1747,6 +1767,9 @@ def wrap_shm_features(obj):
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings, precomputed_hash=item_hash
                 )
+            if getattr(item, "model_specific_data", None):
+                for key, value in item.model_specific_data.items():
+                    item.model_specific_data[key] = _wrap_large_tensor_or_list(value)
     return obj
 
 
@@ -1755,7 +1778,15 @@ def _feature_has_shm(feat) -> bool:
     if isinstance(feat, ShmPointerMMData):
         return True
     if isinstance(feat, (list, tuple)):
-        return any(isinstance(t, ShmPointerMMData) for t in feat)
+        return any(_feature_has_shm(t) for t in feat)
+    return False
+
+
+def _value_has_shm(value) -> bool:
+    if _feature_has_shm(value):
+        return True
+    if isinstance(value, dict):
+        return any(_value_has_shm(v) for v in value.values())
     return False
 
 
@@ -1771,6 +1802,11 @@ def has_shm_features(recv_reqs):
                     return True
                 if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
                     return True
+                if any(
+                    _value_has_shm(value)
+                    for value in getattr(item, "model_specific_data", {}).values()
+                ):
+                    return True
     return False
 
 
@@ -1779,10 +1815,10 @@ def _unwrap_tensor_or_list(value):
     if isinstance(value, ShmPointerMMData):
         return value.materialize()
     elif isinstance(value, (list, tuple)):
-        unwrapped = [
-            t.materialize() if isinstance(t, ShmPointerMMData) else t for t in value
-        ]
+        unwrapped = [_unwrap_tensor_or_list(t) for t in value]
         return type(value)(unwrapped) if isinstance(value, tuple) else unwrapped
+    elif isinstance(value, dict):
+        return {k: _unwrap_tensor_or_list(v) for k, v in value.items()}
     return value
 
 
@@ -1810,4 +1846,7 @@ def unwrap_shm_features(obj):
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
+            if getattr(item, "model_specific_data", None):
+                for key, value in item.model_specific_data.items():
+                    item.model_specific_data[key] = _unwrap_tensor_or_list(value)
     return obj

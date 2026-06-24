@@ -54,6 +54,7 @@ from sglang.srt.configs import (
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
+    UnlimitedVLConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
@@ -110,6 +111,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3p7Config,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
+        UnlimitedVLConfig,
     ]
 }
 

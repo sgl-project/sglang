@@ -2183,6 +2183,7 @@ class Scheduler(
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
+            req.prefix_token_count = image_inputs.prefix_token_count
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -2963,6 +2964,16 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        if getattr(self.tp_worker.model_runner, "prefill_aware_swa", False):
+            for req in new_batch.reqs:
+                prefill_len = len(req.get_fill_ids())
+                # The optional suffix is window-only; the stable prompt/image
+                # region remains permanently addressable from the SWA pool.
+                req.swa_evict_floor = max(
+                    req.swa_evict_floor,
+                    prefill_len - req.prefix_token_count,
+                )
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(

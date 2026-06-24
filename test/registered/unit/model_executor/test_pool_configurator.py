@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -477,9 +478,11 @@ class TestAllSWAConfigurator(unittest.TestCase):
             config = cfg.calculate_pool_sizes(available_bytes, page_size)
         return mr, cfg, config
 
-    def test_full_max_is_zero(self):
+    def test_full_logical_capacity_matches_swa_capacity(self):
         _, _, config = self._run(10_000_000)
-        self.assertEqual(config.full_max_total_num_tokens, 0)
+        self.assertEqual(
+            config.full_max_total_num_tokens, config.swa_max_total_num_tokens
+        )
 
     def test_max_total_equals_swa(self):
         _, _, config = self._run(10_000_000)
@@ -500,6 +503,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
         with mock_cpu_env():
             config = cfg.calculate_pool_sizes_from_max_tokens(500, page_size=1)
         self.assertEqual(config.max_total_num_tokens, 500)
+        self.assertEqual(config.full_max_total_num_tokens, 500)
         self.assertEqual(config.swa_max_total_num_tokens, 500)
 
 
@@ -586,6 +590,26 @@ class TestFactory(unittest.TestCase):
 
         self.assertIsInstance(_cfg(2), SWAChunkCapPoolConfigurator)
         self.assertNotIsInstance(_cfg(None), SWAChunkCapPoolConfigurator)
+
+
+class TestModelRunnerPoolSize(unittest.TestCase):
+    def test_all_swa_uses_swa_pool_for_token_capacity(self):
+        mr = SimpleNamespace(
+            is_hybrid_swa=True,
+            full_max_total_num_tokens=0,
+            swa_max_total_num_tokens=1234,
+        )
+
+        self.assertEqual(ModelRunner.max_token_pool_size.fget(mr), 1234)
+
+    def test_hybrid_swa_uses_full_pool_for_token_capacity(self):
+        mr = SimpleNamespace(
+            is_hybrid_swa=True,
+            full_max_total_num_tokens=567,
+            swa_max_total_num_tokens=1234,
+        )
+
+        self.assertEqual(ModelRunner.max_token_pool_size.fget(mr), 567)
 
 
 if __name__ == "__main__":
