@@ -8,11 +8,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mechanical_refactor_reproduce_utils as rr
 from mechanical_refactor_reproduce_utils import (
+    Repro,
+    _def_span,
+    _find_class,
+    _find_def,
+    _had_magic_comma,
+    _replace_span,
+    _slice_span,
     dedent,
     exec_command,
     git_add_and_commit,
     verify_mechanical_refactor,
 )
+
+
+def _apply(repro: Repro, root: Path) -> None:
+    """Run a built Repro's recorded operations against a plain directory (no git)."""
+    for op in repro.ops:
+        op(root)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -259,3 +272,224 @@ def test_reproduce_commits_pre_commit_fixes_when_tree_left_dirty(
     branch = f"verify-mechanical-{base[:8]}"
     subjects = _git(repo, "log", "--format=%s", "-2", branch).splitlines()
     assert subjects == ["pre-commit fixes", "transform"]
+
+
+# --- span / call helpers -------------------------------------------------------
+
+
+def test_replace_span_single_line() -> None:
+    """A span within one line is replaced in place."""
+    assert _replace_span("ab cd ef\n", 1, 3, 1, 5, "XY") == "ab XY ef\n"
+
+
+def test_replace_span_across_lines() -> None:
+    """A span crossing lines collapses to the replacement between the kept prefix/suffix."""
+    text = "a = foo(\n    x,\n) + 1\n"
+    assert _replace_span(text, 1, 4, 3, 1, "bar()") == "a = bar() + 1\n"
+
+
+def test_slice_span_returns_the_overwritten_text() -> None:
+    """_slice_span returns exactly the region _replace_span would overwrite."""
+    text = "a = foo(\n    x,\n) + 1\n"
+    assert _slice_span(text, 1, 4, 3, 1) == "foo(\n    x,\n)"
+
+
+def test_had_magic_comma_detects_trailing_comma() -> None:
+    """A trailing comma before the closing paren is the formatter's magic comma."""
+    assert _had_magic_comma("f(\n    a,\n    b,\n)")
+    assert not _had_magic_comma("f(a, b)")
+    assert not _had_magic_comma("f(\n    a,\n    b\n)")
+
+
+def test_find_def_span_includes_decorators() -> None:
+    """A def's span starts at its first decorator and ends at its last body line."""
+    src = "class C:\n    @staticmethod\n    def foo(self):\n        return 1\n"
+    node = _find_def(rr.ast.parse(src), "foo")
+    assert node is not None and _def_span(node) == (2, 4)
+
+
+def test_find_class_returns_named_class_or_none() -> None:
+    """_find_class locates a class by name and returns None when absent."""
+    tree = rr.ast.parse("class A:\n    pass\nclass B:\n    pass\n")
+    assert _find_class(tree, "B").name == "B"
+    assert _find_class(tree, "Z") is None
+
+
+# --- lower_call_sites ----------------------------------------------------------
+
+
+def test_lower_call_sites_moves_receiver_out_of_args(tmp_path: Path) -> None:
+    """Owner.foo(receiver, rest) becomes receiver.foo(rest)."""
+    (tmp_path / "m.py").write_text("x = ModelRunner.foo(self.r, a, b)\n")
+    r = Repro("b", "t").lower_call_sites("foo", "ModelRunner", paths=["m.py"])
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "x = self.r.foo(a, b)\n"
+
+
+def test_lower_call_sites_handles_only_receiver_arg(tmp_path: Path) -> None:
+    """Owner.foo(receiver) becomes receiver.foo() without re-lowering the result."""
+    (tmp_path / "m.py").write_text("ModelRunner.foo(self.r)\n")
+    r = Repro("b", "t").lower_call_sites("foo", "ModelRunner", paths=["m.py"])
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "self.r.foo()\n"
+
+
+def test_lower_call_sites_ignores_a_different_owner(tmp_path: Path) -> None:
+    """A same-named call on another receiver (e.g. the moved body's own call) is untouched."""
+    (tmp_path / "m.py").write_text("worker.foo(zmq)\n")
+    r = Repro("b", "t").lower_call_sites("foo", "ModelRunner", paths=["m.py"])
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "worker.foo(zmq)\n"
+
+
+def test_lower_call_sites_preserves_magic_trailing_comma(tmp_path: Path) -> None:
+    """A magic trailing comma is kept so the formatter re-explodes the lowered call."""
+    (tmp_path / "m.py").write_text("ModelRunner.foo(\n    self.r,\n    a,\n)\n")
+    r = Repro("b", "t").lower_call_sites("foo", "ModelRunner", paths=["m.py"])
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "self.r.foo(a,)\n"
+
+
+# --- requalify_call_sites ------------------------------------------------------
+
+
+def test_requalify_call_sites_drops_the_qualifier(tmp_path: Path) -> None:
+    """Owner.bar(args) becomes bar(args) when bar moves to a free function."""
+    (tmp_path / "m.py").write_text("y = ModelRunner.bar(a, b)\n")
+    r = Repro("b", "t").requalify_call_sites("bar", "ModelRunner", paths=["m.py"])
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "y = bar(a, b)\n"
+
+
+# --- remove_import -------------------------------------------------------------
+
+
+def test_remove_import_scoped_leaves_module_level_same_text(tmp_path: Path) -> None:
+    """Scoped to a function, it removes the local import but not a same-text module-level
+    one (e.g. a TYPE_CHECKING guard), and drops the import's trailing blank line."""
+    (tmp_path / "m.py").write_text(
+        "from typing import TYPE_CHECKING\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from pkg.mod import Thing\n"
+        "\n"
+        "def caller(self):\n"
+        "    from pkg.mod import Thing\n"
+        "\n"
+        "    return Thing.go(self.x)\n"
+    )
+    r = Repro("b", "t").remove_import(
+        "m.py", "from pkg.mod import Thing", in_function="caller"
+    )
+    _apply(r, tmp_path)
+    out = (tmp_path / "m.py").read_text()
+    assert out.count("from pkg.mod import Thing") == 1
+    assert "if TYPE_CHECKING:\n    from pkg.mod import Thing" in out
+    assert "def caller(self):\n    return Thing.go(self.x)\n" in out
+
+
+def test_remove_import_removes_every_occurrence_in_scope(tmp_path: Path) -> None:
+    """All matching local imports in the function are removed, not just the first."""
+    (tmp_path / "m.py").write_text(
+        "def caller(self):\n"
+        "    from pkg import M\n"
+        "\n"
+        "    M.a(self.x)\n"
+        "    if cond:\n"
+        "        from pkg import M\n"
+        "\n"
+        "        M.b(self.y)\n"
+    )
+    r = Repro("b", "t").remove_import("m.py", "from pkg import M", in_function="caller")
+    _apply(r, tmp_path)
+    assert "from pkg import M" not in (tmp_path / "m.py").read_text()
+
+
+# --- add_import ----------------------------------------------------------------
+
+
+def test_add_import_appends_after_last_top_level_import(tmp_path: Path) -> None:
+    """A new import is inserted right after the last module-level import."""
+    (tmp_path / "m.py").write_text("import os\nimport sys\n\nx = 1\n")
+    r = Repro("b", "t").add_import("m.py", "from pkg import Thing")
+    _apply(r, tmp_path)
+    assert (
+        tmp_path / "m.py"
+    ).read_text() == "import os\nimport sys\nfrom pkg import Thing\n\nx = 1\n"
+
+
+# --- move_symbol ---------------------------------------------------------------
+
+
+def test_move_symbol_into_class_drops_decorator_and_appends(tmp_path: Path) -> None:
+    """The def leaves the source, its @staticmethod is dropped, and it lands at the end of
+    the destination class with its body verbatim."""
+    (tmp_path / "src.py").write_text(
+        "class Old:\n"
+        "    @staticmethod\n"
+        "    def foo(x):\n"
+        "        return x + 1\n"
+        "\n"
+        "    def keep(self):\n"
+        "        return 0\n"
+    )
+    (tmp_path / "dst.py").write_text(
+        "class New:\n    def existing(self):\n        return 1\n"
+    )
+    r = Repro("b", "t").move_symbol("foo", src="src.py", dst="dst.py", into_class="New")
+    _apply(r, tmp_path)
+    src_out = (tmp_path / "src.py").read_text()
+    dst_out = (tmp_path / "dst.py").read_text()
+    assert "def foo" not in src_out and "def keep" in src_out
+    assert "@staticmethod" not in dst_out
+    assert dst_out.index("def existing") < dst_out.index("def foo")
+    assert "        return x + 1\n" in dst_out
+
+
+def test_move_symbol_to_module_level_with_dedent(tmp_path: Path) -> None:
+    """With into_class=None and a dedent, the def lands at module level, dedented."""
+    (tmp_path / "src.py").write_text(
+        "class Old:\n    @staticmethod\n    def helper(x):\n        return x * 2\n"
+    )
+    (tmp_path / "dst.py").write_text("import os\n")
+    r = Repro("b", "t").move_symbol(
+        "helper", src="src.py", dst="dst.py", into_class=None, dedent=4
+    )
+    _apply(r, tmp_path)
+    assert "def helper(x):\n    return x * 2\n" in (tmp_path / "dst.py").read_text()
+    assert "def helper" not in (tmp_path / "src.py").read_text()
+
+
+# --- Repro.run end-to-end ------------------------------------------------------
+
+
+def test_repro_run_passes_on_a_faithful_call_site_lowering(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    """End-to-end: a lowering reproduces the commit byte-for-byte (pre-commit stubbed)."""
+    _write(repo, **{"c.py": "r = Old.foo(self.n, 5)\n"})
+    base = _commit(repo, "base")
+    _write(repo, **{"c.py": "r = self.n.foo(5)\n"})
+    target = _commit(repo, "lower the call site")
+    monkeypatch.chdir(repo)
+    _silence_precommit(monkeypatch)
+
+    diff = Repro(base, target).lower_call_sites("foo", "Old", paths=["c.py"]).run()
+    assert diff == ""
+    assert "PASS" in capsys.readouterr().out
+
+
+def test_repro_run_reports_residual_when_a_change_is_bundled(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    """A bundled non-relocation change surfaces as a non-empty residual diff."""
+    _write(repo, **{"c.py": "r = Old.foo(self.n, 5)\nUNRELATED = 1\n"})
+    base = _commit(repo, "base")
+    _write(repo, **{"c.py": "r = self.n.foo(5)\nUNRELATED = 2\n"})
+    target = _commit(repo, "lower the call AND change a constant")
+    monkeypatch.chdir(repo)
+    _silence_precommit(monkeypatch)
+
+    diff = Repro(base, target).lower_call_sites("foo", "Old", paths=["c.py"]).run()
+    assert "UNRELATED" in diff
+    assert "RESIDUAL" in capsys.readouterr().out
