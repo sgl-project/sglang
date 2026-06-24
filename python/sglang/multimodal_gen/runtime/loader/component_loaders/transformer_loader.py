@@ -79,6 +79,14 @@ class TransformerLoader(ComponentLoader):
     ]
     expected_library = "diffusers"
 
+    def should_raise_customized_load_error(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+        return component_server_args.transformer_weights_path is not None
+
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
