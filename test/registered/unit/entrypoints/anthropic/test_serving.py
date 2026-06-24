@@ -22,6 +22,11 @@ from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
+# Claude Code's per-request attribution header, sent as a system text block.
+_BILLING_HEADER = (
+    "x-anthropic-billing-header: cc_version=2.1.37.abc; cc_entrypoint=cli;"
+)
+
 
 class _FakeOpenAIServingChat:
     def __init__(self, stream_lines=None):
@@ -1351,6 +1356,190 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual(request.system, "be terse")
         self.assertEqual([m.role for m in request.messages], ["user", "user"])
+
+    def test_billing_header_stripped_from_system_blocks(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            system=[
+                {"type": "text", "text": "You are a helpful assistant."},
+                {"type": "text", "text": _BILLING_HEADER},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are a helpful assistant.")
+
+    def test_system_blocks_without_billing_header_joined_unchanged(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            system=[
+                {"type": "text", "text": "You are a helpful assistant."},
+                {"type": "text", "text": "Be concise."},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(
+            system_msgs[0].content, "You are a helpful assistant.\nBe concise."
+        )
+
+    def test_system_string_without_billing_header_unchanged(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False, system="You are a helpful assistant."
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are a helpful assistant.")
+
+    def test_system_string_that_is_only_billing_header_is_dropped(self):
+        serving = self._serving()
+        request = self._anthropic_request(stream=False, system=_BILLING_HEADER)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(system_msgs, [])
+
+    def test_system_block_list_with_only_billing_header_yields_no_system(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            system=[{"type": "text", "text": _BILLING_HEADER}],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(system_msgs, [])
+
+    def test_billing_header_in_inline_system_block_is_stripped(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Reply with exactly: OK"},
+                        {"type": "text", "text": _BILLING_HEADER},
+                    ],
+                },
+                {"role": "user", "content": "go"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "Reply with exactly: OK")
+        self.assertEqual(
+            [m.role for m in chat_request.messages], ["system", "user", "user"]
+        )
+
+    def test_inline_system_string_that_is_only_billing_header_is_dropped(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": _BILLING_HEADER},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(system_msgs, [])
+        self.assertEqual([m.role for m in chat_request.messages], ["user", "user"])
+
+    def test_billing_header_merged_with_top_level_system_is_stripped(self):
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            system=[{"type": "text", "text": "You are terse."}],
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": _BILLING_HEADER},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are terse.")
+
+    def test_billing_header_stripped_when_request_built_programmatically(self):
+        """Also covers count_tokens, which builds the request programmatically."""
+        serving = self._serving()
+        request = AnthropicMessagesRequest(
+            model="test-model",
+            max_tokens=1,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            system=[
+                {"type": "text", "text": "You are a helpful assistant."},
+                {"type": "text", "text": _BILLING_HEADER},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are a helpful assistant.")
+
+    def test_billing_header_string_preserves_surrounding_whitespace(self):
+        serving = self._serving()
+        kept_prefix = "  Keep this leading indent.\ntrailing space here   \n"
+        system = kept_prefix + _BILLING_HEADER + "\nfinal line\n"
+        request = self._anthropic_request(stream=False, system=system)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, kept_prefix + "final line\n")
+
+    def test_billing_header_string_preserves_crlf_terminators(self):
+        serving = self._serving()
+        system = f"You are terse.\r\n{_BILLING_HEADER}\r\nBe concise."
+        request = self._anthropic_request(stream=False, system=system)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are terse.\r\nBe concise.")
+
+    def test_billing_header_string_final_header_after_crlf(self):
+        serving = self._serving()
+        system = f"You are terse.\r\n{_BILLING_HEADER}"
+        request = self._anthropic_request(stream=False, system=system)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are terse.")
+
+    def test_billing_header_string_final_header_after_lf(self):
+        serving = self._serving()
+        system = f"You are terse.\n{_BILLING_HEADER}"
+        request = self._anthropic_request(stream=False, system=system)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are terse.")
+
+    def test_billing_header_string_final_header_after_cr(self):
+        serving = self._serving()
+        system = f"You are terse.\r{_BILLING_HEADER}"
+        request = self._anthropic_request(stream=False, system=system)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are terse.")
+
+    def test_billing_header_string_final_header_with_trailing_newline(self):
+        serving = self._serving()
+        system = f"You are terse.\n{_BILLING_HEADER}\n"
+        request = self._anthropic_request(stream=False, system=system)
+        chat_request = serving._convert_to_chat_completion_request(request)
+        system_msgs = [m for m in chat_request.messages if m.role == "system"]
+        self.assertEqual(len(system_msgs), 1)
+        self.assertEqual(system_msgs[0].content, "You are terse.")
 
     def test_thinking_history_drop_on_missing_detector(self):
         """Replaying a thinking block on a non-reasoning model should not 400."""

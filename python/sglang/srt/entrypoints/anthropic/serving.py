@@ -84,6 +84,12 @@ ERROR_TYPE_MAP = {
 }
 
 
+# Claude Code attaches this attribution header to the system prompt as a
+# separate text block. It carries a per-request hash that would defeat
+# prefix caching, so the serving layer strips it before tokenization.
+ANTHROPIC_BILLING_HEADER = "x-anthropic-billing-header"
+
+
 def _cached_prompt_tokens(usage) -> int:
     prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
@@ -158,6 +164,29 @@ def _scrub_error_message(message: str, status_code: int) -> str:
     if len(cleaned) > 500:
         cleaned = cleaned[:500] + "…"
     return cleaned or "Request failed"
+
+
+def _strip_billing_header(system_text: str) -> str:
+    """Remove ``x-anthropic-billing-header`` lines from a system prompt.
+
+    The request validator folds inline ``role: "system"`` turns into the
+    top-level ``system`` string, so the per-request hash can surface here as
+    an ordinary line. Other bytes are preserved verbatim, and when the header
+    is the final line its trailing separator is dropped to match the
+    block-list path (``"\n".join``) and avoid a dangling ``\r``.
+    """
+    lines = system_text.splitlines(keepends=True)
+    kept = [ln for ln in lines if not ln.startswith(ANTHROPIC_BILLING_HEADER)]
+    if len(kept) == len(lines):
+        return system_text
+    result = "".join(kept)
+    if lines[-1].startswith(ANTHROPIC_BILLING_HEADER):
+        # The header's separator terminator rides on the preceding line.
+        if result.endswith("\r\n"):
+            result = result[:-2]
+        elif result.endswith("\n") or result.endswith("\r"):
+            result = result[:-1]
+    return result
 
 
 class AnthropicServing:
@@ -356,18 +385,20 @@ class AnthropicServing:
                 )
                 return None
 
-        # Add system message if provided
+        # Strip the billing-header block (per-request hash that defeats prefix
+        # caching) from the system prompt in both block and string form.
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
-                openai_messages.append(
-                    {"role": "system", "content": anthropic_request.system}
-                )
+                system_text = _strip_billing_header(anthropic_request.system)
             else:
                 system_parts = []
                 for block in anthropic_request.system:
                     if block.type == "text" and block.text:
+                        if block.text.startswith(ANTHROPIC_BILLING_HEADER):
+                            continue
                         system_parts.append(block.text)
                 system_text = "\n".join(system_parts)
+            if system_text:
                 openai_messages.append({"role": "system", "content": system_text})
 
         def _emit_user_message(parts: list[dict]) -> None:
