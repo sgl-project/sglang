@@ -796,9 +796,6 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         self.w13_kernel = NPUUnquantMoEMethod()
         self.w2_kernel = NPUUnquantMoEMethod()
 
-    # ------------------------------------------------------------------
-    # Weight creation (unchanged from your code)
-    # ------------------------------------------------------------------
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -808,6 +805,9 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        layer.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        layer.intermediate_size = intermediate_size_per_partition * tp_size
         tensor_shape = (num_experts, 2 * intermediate_size_per_partition, hidden_size)
         w13_qweight = GGUFUninitializedParameter(requires_grad=False)
         set_weight_attrs(
@@ -860,109 +860,114 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
 
         self.params_dtype = params_dtype
 
-    # ------------------------------------------------------------------
-    # Pre‑dequantize + fix layout + TP split
-    # ------------------------------------------------------------------
     def process_weights_after_loading(self, layer: torch.nn.Module):
         from sglang.srt.distributed.parallel_state import (
             get_tensor_model_parallel_world_size,
             get_tensor_model_parallel_rank,
         )
-
+    
+        # Unpack GGUF data if needed
         if hasattr(layer, "materialize_gguf_weights"):
             layer.materialize_gguf_weights()
-
+    
+        # Model dimensions (obtained from the layer or the model config)
+        # You must know these. For Qwen MoE, they can be retrieved from the parent model.
+        # For now, infer from w13_qweight shape after loading? Better to pass them explicitly
+        # or read from the layer's own attributes if set during create_weights.
+        hidden_size = layer.hidden_size          # need to set this earlier (see note)
+        intermediate_size = layer.intermediate_size  # full intermediate
+    
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        inter_per_rank = intermediate_size // tp_size
+    
+        # ---------- w13 ----------
         w13_qweight = layer.w13_qweight
         w13_qtype = layer.w13_qweight_type.weight_type
-
-        # ---------- w13 (gate + up) ----------
+        num_experts = w13_qweight.shape[0]
+    
         if w13_qtype not in UNQUANTIZED_TYPES:
-            num_experts = w13_qweight.shape[0]
-            w13_dequant_list = []
             block_size, type_size = gguf.GGML_QUANT_SIZES[w13_qtype]
+            w13_dequant = []
             for e in range(num_experts):
                 qweight_cpu = w13_qweight[e].cpu().numpy()
-                rows = w13_qweight[e].shape[0]          # 2*intermediate_per_partition
-                cols = w13_qweight[e].shape[1] // type_size * block_size  # hidden
+                # The raw dequantised shape should be (2*intermediate_full, hidden)
+                rows = 2 * intermediate_size
+                cols = hidden_size
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w13_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w13_qweight.device)
-                    .reshape(rows, cols)               # (2*inter, hidden)
-                    .transpose(-1, -2)                 # (hidden, 2*inter)
+                    .reshape(rows, cols)
+                    .transpose(-1, -2)        # -> (hidden, 2*intermediate_full)
                     .contiguous()
                 )
-                w13_dequant_list.append(dequant)
-            w13_full = torch.stack(w13_dequant_list, dim=0)  # (E, hidden, 2*inter_full)
+                w13_dequant.append(dequant)
+            w13_full = torch.stack(w13_dequant, dim=0)  # (E, hidden, 2*intermediate_full)
         else:
-            # already float – might need to transpose if stored as (E, 2*inter, hidden)
+            # Already float, but may need reshape
             w13_full = w13_qweight.data
-            if w13_full.shape[1] != 2 * w13_full.shape[2]:  # not (hidden, 2*inter)
-                w13_full = w13_full.transpose(1, 2).contiguous()
-
-        # ---------- w2 (down) ----------
+            if w13_full.shape != (num_experts, hidden_size, 2 * intermediate_size):
+                w13_full = w13_full.reshape(num_experts, hidden_size, 2 * intermediate_size).contiguous()
+    
+        # Split w13 along intermediate dimension (dim=1 of the 2*intermediate part)
+        if tp_size > 1:
+            # w13_full has shape (E, hidden, 2*intermediate_full). We split the intermediate_full portion.
+            # Each rank takes a slice of size inter_per_rank from the gate half and the up half.
+            # The full intermediate dimension is split into tp parts.
+            gate_start = tp_rank * inter_per_rank
+            gate_end   = gate_start + inter_per_rank
+            up_start   = intermediate_size + tp_rank * inter_per_rank
+            up_end     = up_start + inter_per_rank
+            gate_part = w13_full[:, :, gate_start:gate_end]
+            up_part   = w13_full[:, :, up_start:up_end]
+            w13_full = torch.cat([gate_part, up_part], dim=-1).contiguous()
+            # Now shape (E, hidden, 2*inter_per_rank)
+    
+        layer.register_buffer("w13_dequant", w13_full, persistent=False)
+    
+        # ---------- w2 ----------
         w2_qweight = layer.w2_qweight
         w2_qtype = layer.w2_qweight_type.weight_type
-
+    
         if w2_qtype not in UNQUANTIZED_TYPES:
-            num_experts = w2_qweight.shape[0]
-            w2_dequant_list = []
             block_size, type_size = gguf.GGML_QUANT_SIZES[w2_qtype]
+            w2_dequant = []
             for e in range(num_experts):
                 qweight_cpu = w2_qweight[e].cpu().numpy()
-                rows = w2_qweight[e].shape[0]          # intermediate_per_partition
-                cols = w2_qweight[e].shape[1] // type_size * block_size  # hidden
+                # The raw dequantised shape should be (intermediate_full, hidden)
+                rows = intermediate_size
+                cols = hidden_size
                 dequant_np = gguf_dequantize(qweight_cpu.flatten(), w2_qtype)
                 dequant = (
                     torch.from_numpy(dequant_np)
                     .to(dtype=self.params_dtype, device=w2_qweight.device)
-                    .reshape(rows, cols)               # (inter, hidden)
-                    .transpose(-1, -2)                 # (hidden, inter)
+                    .reshape(rows, cols)
+                    .transpose(-1, -2)        # -> (hidden, intermediate_full)
                     .contiguous()
                 )
-                w2_dequant_list.append(dequant)
-            # After stack: (E, hidden, inter_full)
-            w2_full = torch.stack(w2_dequant_list, dim=0)
-            # The NPU grouped matmul for w2 expects weight (E, K, N) = (E, inter, hidden)
-            # So we need to permute (E, hidden, inter) -> (E, inter, hidden)
-            w2_full = w2_full.permute(0, 2, 1).contiguous()   # (E, inter_full, hidden)
+                w2_dequant.append(dequant)
+            w2_full = torch.stack(w2_dequant, dim=0)  # (E, hidden, intermediate_full)
         else:
             w2_full = w2_qweight.data
-            # Ensure same layout: (E, inter, hidden)
-            if w2_full.shape[1] != w2_full.shape[2]:  # not (inter, hidden) maybe
-                w2_full = w2_full.permute(0, 2, 1).contiguous()
-
-        # ---------- TP split ----------
-        tp_size = get_tensor_model_parallel_world_size()
+            if w2_full.shape != (num_experts, hidden_size, intermediate_size):
+                w2_full = w2_full.reshape(num_experts, hidden_size, intermediate_size).contiguous()
+    
+        # Split w2 along intermediate dimension (dim=2)
         if tp_size > 1:
-            tp_rank = get_tensor_model_parallel_rank()
-            inter_full = w2_full.shape[1]          # intermediate dimension size
-            inter_per_rank = inter_full // tp_size
             start = tp_rank * inter_per_rank
-            end = start + inter_per_rank
-
-            # w13: shape (E, hidden, 2*inter_full) → split the inter part for gate & up
-            gate = w13_full[:, :, :inter_full]      # gate half
-            up   = w13_full[:, :, inter_full:]      # up half
-            gate = gate[:, :, start:end]            # per-rank slice
-            up   = up[:, :, start:end]
-            w13_full = torch.cat([gate, up], dim=-1).contiguous()  # (E, hidden, 2*inter_per_rank)
-
-            # w2: shape (E, inter_full, hidden) → split inter dimension
-            w2_full = w2_full[:, start:end, :].contiguous()  # (E, inter_per_rank, hidden)
-
-        layer.register_buffer("w13_dequant", w13_full, persistent=False)
+            end   = start + inter_per_rank
+            w2_full = w2_full[:, :, start:end].contiguous()
+            # Now shape (E, hidden, inter_per_rank)
+    
         layer.register_buffer("w2_dequant", w2_full, persistent=False)
-
-        # Clean up quantized raw tensors
+    
+        # Clean up quantised data
         if hasattr(layer, "w13_qweight"):
             del layer.w13_qweight
         if hasattr(layer, "w2_qweight"):
             del layer.w2_qweight
 
-    # ------------------------------------------------------------------
-    # Runner creation
-    # ------------------------------------------------------------------
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -975,28 +980,16 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
             backend = MoeRunnerBackend.TORCH_NPU
         self.runner = MoeRunner(backend, moe_runner_config)
 
-    # ------------------------------------------------------------------
-    # Forward – all‑reduce after w2, wrap in StandardCombineInput
-    # ------------------------------------------------------------------
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        #from sglang.srt.distributed.communication_op import tensor_model_parallel_all_reduce
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         quant_info = TorchNpuQuantInfo(
             w13_weight=layer.w13_dequant,
             w2_weight=layer.w2_dequant,
         )
-        runner_output = self.runner.run(dispatch_output, quant_info)
-        hidden_states = runner_output.hidden_states
-
-        # TP: sum partial hidden outputs after the down projection
-        if get_tensor_model_parallel_world_size() > 1:
-            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-
+        return self.runner.run(dispatch_output, quant_info)
 
 class GGUFEmbeddingAscendMethod(GGUFLinearAscendMethod):
     """Embedding method for GGUF on Ascend NPU."""
