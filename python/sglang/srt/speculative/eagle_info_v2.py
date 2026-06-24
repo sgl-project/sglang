@@ -7,14 +7,8 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.eviction import CacheFreeSpaceProvider
-from sglang.srt.mem_cache.kv_cache_utils import (
-    get_alloc_reserve_per_decode,
-    get_last_loc,
-)
-from sglang.srt.mem_cache.owned_kv import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-)
+from sglang.srt.mem_cache.kv_cache_utils import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.owned_kv import alloc_for_spec_decode
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )
@@ -32,8 +26,6 @@ if TYPE_CHECKING:
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         batch.maybe_evict_swa()
-
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
         bs = batch.batch_size()
 
@@ -57,7 +49,6 @@ class EagleDraftInputV2Mixin:
             cur_kv_lens[i] = cur
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
-            r.kv.kv_allocated_len = nxt
             r.decode_batch_idx += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
@@ -82,34 +73,15 @@ class EagleDraftInputV2Mixin:
         # barrier has chained to the prev forward -> host stalls a full forward.
         cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
         nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-        if page_size == 1:
-            out_cache_loc = alloc_token_slots(
-                batch.token_to_kv_pool_allocator,
-                num_needed_tokens,
-                space=CacheFreeSpaceProvider(batch.tree_cache),
-            )
-        else:
-            last_loc = get_last_loc(
-                batch.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                cur_kv_lens_device,
-            )
-            out_cache_loc = alloc_paged_token_slots_extend(
-                batch.token_to_kv_pool_allocator,
-                cur_kv_lens_device,
-                cur_kv_lens_cpu,
-                nxt_kv_lens_device,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                space=CacheFreeSpaceProvider(batch.tree_cache),
-            )
-
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            cur_kv_lens_device,
-            nxt_kv_lens_device,
-            out_cache_loc,
-            bs,
+        alloc_for_spec_decode(
+            batch.token_to_kv_pool_allocator,
+            batch.req_to_token_pool,
+            reqs=batch.reqs,
+            req_pool_indices=batch.req_pool_indices,
+            cur_kv_lens=cur_kv_lens_device,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens=nxt_kv_lens_device,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            space=CacheFreeSpaceProvider(batch.tree_cache),
         )

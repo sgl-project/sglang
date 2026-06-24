@@ -51,22 +51,18 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
-    # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
+    # kv_allocated_len is settled inside the owned-kv alloc functions (op28);
+    # spec v2 draft decode (eagle + dflash) settles it inside alloc_for_spec_decode (op30).
     ("mem_cache/owned_kv.py", "alloc_for_extend", "evict"): 1,
     ("mem_cache/owned_kv.py", "alloc_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/owned_kv.py", "alloc_for_decode", "evict"): 1,
     ("mem_cache/owned_kv.py", "alloc_for_decode", "kv_allocated_len"): 1,
+    ("mem_cache/owned_kv.py", "alloc_for_spec_decode", "kv_allocated_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     (*_MIXIN, "decode_batch_idx"): 1,
     (*_MIXIN, "evict"): 1,
-    (*_MIXIN, "kv_allocated_len"): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
-    (
-        "speculative/dflash_info_v2.py",
-        "DFlashDraftInputV2.prepare_for_decode",
-        "kv_allocated_len",
-    ): 1,
     # disaggregation decode prealloc
     (
         "disaggregation/decode.py",

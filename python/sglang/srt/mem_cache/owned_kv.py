@@ -9,7 +9,11 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.mem_cache.kv_cache_utils import write_cache_indices
+from sglang.srt.mem_cache.kv_cache_utils import (
+    assign_req_to_token_pool_func,
+    get_last_loc,
+    write_cache_indices,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.req_state import ReqKvInfo
 from sglang.srt.utils import is_npu
@@ -471,3 +475,48 @@ def alloc_for_decode_prealloc(
                 extend_num_tokens=delta_len,
             )
     return kv_loc
+
+
+def alloc_for_spec_decode(
+    allocator: BaseTokenToKVPoolAllocator,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    reqs: list[Req],
+    req_pool_indices: torch.Tensor,
+    cur_kv_lens: torch.Tensor,
+    cur_kv_lens_cpu: torch.Tensor,
+    nxt_kv_lens: torch.Tensor,
+    nxt_kv_lens_cpu: torch.Tensor,
+    num_needed_tokens: int,
+    space: FreeSpaceProvider,
+) -> None:
+    if num_needed_tokens > 0:
+        if allocator.page_size == 1:
+            out_cache_loc = alloc_token_slots(allocator, num_needed_tokens, space=space)
+        else:
+            last_loc = get_last_loc(
+                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
+            )
+            out_cache_loc = alloc_paged_token_slots_extend(
+                allocator,
+                cur_kv_lens,
+                cur_kv_lens_cpu,
+                nxt_kv_lens,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+                space=space,
+            )
+        # Updating req_to_token is a write to a shared tensor: callers that overlap
+        # with a prior forward must invoke this inside their plan-stream context.
+        assign_req_to_token_pool_func(
+            req_pool_indices,
+            req_to_token_pool.req_to_token,
+            cur_kv_lens,
+            nxt_kv_lens,
+            out_cache_loc,
+            len(reqs),
+        )
+
+    for i, req in enumerate(reqs):
+        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
