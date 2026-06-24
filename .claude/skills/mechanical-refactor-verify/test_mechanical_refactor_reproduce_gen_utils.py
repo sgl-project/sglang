@@ -100,11 +100,57 @@ def test_infer_recipe_method_onto_class(repo: Path) -> None:
         (m["name"], m["src"], m["dst"], m["into_class"], m["dedent"])
         for m in recipe.moves
     ] == [("foo", "model.py", "comp.py", "C", 0)]
-    assert recipe.lowerings == [{"name": "foo", "owner": "M", "path": "caller.py"}]
+    assert recipe.lowerings == [
+        {"name": "foo", "owner": "M", "path": "caller.py", "kind": "lower"}
+    ]
     assert recipe.import_removals == [
         {"path": "caller.py", "text": "from model import M", "in_function": "run"}
     ]
     assert recipe.import_additions == []
+
+
+def test_infer_recipe_free_function_move_uses_requalify(repo: Path) -> None:
+    """A move to a module-level free function dedents and requalifies the call site
+    (drops the qualifier), rather than lowering a receiver."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n"
+                "    @staticmethod\n"
+                "    def foo(x):\n"
+                "        return x + 1\n"
+                "\n"
+                "    def other(self):\n"
+                "        return 0\n"
+            ),
+            "util.py": "import os\n",
+            "caller.py": (
+                "class K:\n"
+                "    def run(self):\n"
+                "        from model import M\n"
+                "\n"
+                "        return M.foo(9)\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "class M:\n    def other(self):\n        return 0\n",
+            "util.py": "import os\n\n\ndef foo(x):\n    return x + 1\n",
+            "caller.py": ("class K:\n    def run(self):\n        return foo(9)\n"),
+        },
+    )
+    _commit(repo, "move foo to util as a free function")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert [(m["name"], m["into_class"], m["dedent"]) for m in recipe.moves] == [
+        ("foo", None, 4)
+    ]
+    assert recipe.lowerings == [
+        {"name": "foo", "owner": "M", "path": "caller.py", "kind": "requalify"}
+    ]
 
 
 def test_infer_recipe_excludes_the_moved_bodys_own_call(repo: Path) -> None:

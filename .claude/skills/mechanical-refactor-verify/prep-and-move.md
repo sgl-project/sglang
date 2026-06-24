@@ -157,6 +157,32 @@ caller line(s). Read those few lines, or verify the whole commit with reproduce 
 transform script, see `reproduce-mode.md`). The split still pays off: because prep left
 the body untouched, the move is a clean cut/paste and the only line to read is the caller.
 
+## Extracting to a new module: prep builds the module, move adds only the body
+
+When the destination module does not exist yet, **prep creates it** — with everything the
+new module needs *except* the moved body:
+
+- the module scaffolding: `from __future__ import annotations`, the module-level imports the
+  moved code uses, a `logger = logging.getLogger(__name__)`, any module-level constants the
+  body reads, an `if TYPE_CHECKING:` block;
+- if a constant must be **re-derived** for the new module (e.g. the source cached
+  `_is_hip = is_hip()` and the new module needs `_use_aiter = ... and is_hip()`), that
+  re-derivation is a prep decision — a human confirms it is equivalent — so it lands in prep.
+
+The **move** then only cuts the body verbatim into the already-built module and adds the
+consumer import. The new file in the move's diff therefore contains **only the relocated
+body plus imports** — nothing else. If the move's new file also introduces a logger, a
+constant, or a `TYPE_CHECKING` guard, that scaffolding leaked in and belongs back in prep.
+Likewise, removing a now-unused module-level constant from the source is prep/follow-up, not
+move — the move whitelists only *import* removals.
+
+## A move never renames
+
+The moved symbol keeps the **same name on both sides**. A rename — even a privacy flip
+(`_foo` → `foo`) — is a separate single-purpose commit *before* the move (rename in place,
+update call sites), so the move stays a same-named relocation. A move commit that also
+renames cannot be machine-certified and must be split: rename first, then move.
+
 ## Anti-pattern: prep adds the body, move deletes it
 
 If the prep commit **adds** a large block to the target file and the move commit

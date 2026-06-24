@@ -156,7 +156,6 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         recipe.supported = False
         recipe.notes.append("new-file extract: not yet inferred")
 
-    dst_paths: set[str] = set()
     for name in sorted(moved_names):
         src = next(
             (p for p, f in files.items() if name in def_names(f["removed"])), None
@@ -175,7 +174,6 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         dst_def = rr._find_def(dst_tree, name)
         src_indent = _def_indent(files[src]["removed"], name) or 0
         dst_indent = _def_indent(files[dst]["added"], name) or 0
-        dst_paths.add(dst)
         recipe.moves.append(
             {
                 "name": name,
@@ -190,8 +188,13 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         src_class = _enclosing_class_of_def(ast.parse(src_before), name)
         if src_class is None:
             recipe.supported = False
-            recipe.notes.append(f"free-function move of {name}: callers not inferred")
+            recipe.notes.append(
+                f"{name}: source is already a free function; callers not inferred"
+            )
             continue
+        # A move onto a class lowers the receiver out of the args; a move to a module-level
+        # free function only drops the qualifier (requalify).
+        kind = "lower" if into_class is not None else "requalify"
         src_module = _module_of_path(src)
 
         # A caller is a before-state call `<src_class>.name(...)`; its receiver moves out of
@@ -209,7 +212,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                     isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
                     and node.func.attr == name
-                    and node.args
+                    and (node.args or kind == "requalify")
                     and ast.unparse(node.func.value) == src_class
                 ):
                     fn = _enclosing_function(tree, node.lineno)
@@ -217,7 +220,9 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                         caller_fns.add(fn)
             if not caller_fns:
                 continue
-            recipe.lowerings.append({"name": name, "owner": src_class, "path": path})
+            recipe.lowerings.append(
+                {"name": name, "owner": src_class, "path": path, "kind": kind}
+            )
             for fn in sorted(caller_fns):
                 imp = _local_import_of(tree, fn, src_module, src_class)
                 if imp is not None and any(imp in r for r in f["removed"]):
@@ -225,13 +230,16 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                         {"path": path, "text": imp, "in_function": fn}
                     )
 
-    for dst in sorted(dst_paths):
-        before = _git_output(["show", f"{commit}^:{dst}"], root)
-        after = _git_output(["show", f"{commit}:{dst}"], root)
+    # Module-level imports any touched file gained: the destination needs the moved code's
+    # imports, and a caller of a moved free function gains an import of it. (In a pure move
+    # commit the only import changes are move-related.)
+    for path in sorted(files):
+        before = _git_output(["show", f"{commit}^:{path}"], root)
+        after = _git_output(["show", f"{commit}:{path}"], root)
         before_imports = _module_imports(before) if before.strip() else {}
         for stmt in _module_imports(after):
             if stmt not in before_imports:
-                recipe.import_additions.append({"path": dst, "text": stmt})
+                recipe.import_additions.append({"path": path, "text": stmt})
     return recipe
 
 
@@ -241,7 +249,10 @@ def build_repro(recipe: Recipe) -> rr.Repro:
     body; moves run last in destination order so multiple methods land correctly."""
     repro = rr.Repro(base=recipe.base, target=recipe.target)
     for lo in recipe.lowerings:
-        repro.lower_call_sites(lo["name"], lo["owner"], paths=[lo["path"]])
+        if lo["kind"] == "requalify":
+            repro.requalify_call_sites(lo["name"], lo["owner"], paths=[lo["path"]])
+        else:
+            repro.lower_call_sites(lo["name"], lo["owner"], paths=[lo["path"]])
     for im in recipe.import_removals:
         repro.remove_import(im["path"], im["text"], in_function=im["in_function"])
     for im in recipe.import_additions:
@@ -278,8 +289,11 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
         f"r = Repro(base={recipe.base!r}, target={recipe.target!r})",
     ]
     for lo in recipe.lowerings:
+        method = (
+            "requalify_call_sites" if lo["kind"] == "requalify" else "lower_call_sites"
+        )
         lines.append(
-            f"r.lower_call_sites({lo['name']!r}, {lo['owner']!r}, paths=[{lo['path']!r}])"
+            f"r.{method}({lo['name']!r}, {lo['owner']!r}, paths=[{lo['path']!r}])"
         )
     for im in recipe.import_removals:
         lines.append(
