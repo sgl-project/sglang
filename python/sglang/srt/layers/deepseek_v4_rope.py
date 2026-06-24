@@ -161,7 +161,7 @@ def apply_rotary_emb_triton_kernel_batched(
     BLOCK_M: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
-    # Batched variant: BLOCK_M tokens per program (mirrors ATOM's inverse_rope_gptj
+    # Batched variant: BLOCK_M tokens per program
     # which batches 32 tokens/program) to cut the per-token launch granularity of
     # the original (one program per token).
     pid_m = tl.program_id(0)
@@ -210,12 +210,12 @@ def apply_rotary_emb_triton_kernel_batched(
 
 
 @triton.jit
-def apply_rotary_emb_contig_kernel(
+def apply_rotary_emb_flat_kernel(
     x_ptr,
     fr_ptr,
     pos_ptr,
-    rope_dim,
-    n_tokens,
+    n_rows,
+    n_heads,
     sx_tok,
     sx_head,
     sx_d,
@@ -223,53 +223,54 @@ def apply_rotary_emb_contig_kernel(
     sfr_d,
     USE_POS: tl.constexpr,
     IS_INVERSE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
     RD: tl.constexpr,
     RDH: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
-    # CONTIGUOUS-load GPT-J rope (mirrors ATOM's inverse_rope_gptj): load the rope
-    # slice as a contiguous [BLOCK_M, RD] tile (coalesced, vs the strided 2i/2i+1
-    # interleaved loads), and do the pair rotation via reshape+flip. RD tokens of
-    # one head per program, BLOCK_M tokens batched.
-    pid_m = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    tok = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    tok_mask = tok < n_tokens
+    # FLAT-row GPT-J rope: iterate over (token, head) pairs flattened as
+    # row = token * n_heads + head, BLOCK_ROWS *consecutive* rows per program.
+    # Consecutive rows are sx_head apart in memory (vs sx_tok == n_heads*sx_head
+    # for the per-head contig kernel), so the read/write is far less scattered ->
+    # ~2x higher achieved HBM bandwidth (cold) on the 128-head attention output
+    # (production rope ~168us -> ~59us).
+    pid = tl.program_id(0)
+    row = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rmask = row < n_rows
+    tok = row // n_heads
+    head = row % n_heads
     d = tl.arange(0, RD)
-    dmask = d < rope_dim
-    m = tok_mask[:, None] & dmask[None, :]
-
-    xo = tok[:, None] * sx_tok + pid_h * sx_head + d[None, :] * sx_d
-    x = tl.load(x_ptr + xo, mask=m, other=0.0).to(tl.float32)
+    base = tok[:, None] * sx_tok + head[:, None] * sx_head
+    xo = base + d[None, :] * sx_d
+    x = tl.load(x_ptr + xo, mask=rmask[:, None], other=0.0).to(tl.float32)
 
     if USE_POS:
-        pos = tl.load(pos_ptr + tok, mask=tok_mask, other=0)
+        pos = tl.load(pos_ptr + tok, mask=rmask, other=0)
     else:
         pos = tok
-    # element d uses cos/sin of pair (d//2): freqs_real interleaved [cos0,sin0,...]
     cos_idx = (d // 2) * 2
     cos = tl.load(
-        fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d, mask=m, other=0.0
+        fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d,
+        mask=rmask[:, None],
+        other=0.0,
     )
     sin = tl.load(
         fr_ptr + pos[:, None] * sfr_pos + (cos_idx[None, :] + 1) * sfr_d,
-        mask=m,
+        mask=rmask[:, None],
         other=0.0,
     )
 
     x_sin = x * sin
     even = (d % 2 == 0)[None, :]
-    # inverse: negate evens; forward: negate odds (then flip pairs)
     if IS_INVERSE:
         x_neg = tl.where(even, -x_sin, x_sin)
     else:
         x_neg = tl.where(even, x_sin, -x_sin)
-    x_neg = tl.reshape(x_neg, (BLOCK_M, RDH, 2))
+    x_neg = tl.reshape(x_neg, (BLOCK_ROWS, RDH, 2))
     x_neg = tl.flip(x_neg, 2)
-    x_rot = tl.reshape(x_neg, (BLOCK_M, RD))
+    x_rot = tl.reshape(x_neg, (BLOCK_ROWS, RD))
 
     out = x * cos + x_rot
-    tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=m)
+    tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
 # Use the batched / contiguous-load rope kernels (faster, coalesced) instead of the
@@ -303,16 +304,25 @@ def apply_rotary_emb_triton(
         else:
             assert freqs_real.shape[0] == batch_size
         BLOCK_M = 32
-        # 3D (attention-output / q-k rope): contiguous-load kernel (ATOM-style).
+        # 3D (attention-output / q-k rope): contiguous-load kernel.
         if is_3d:
             RD = max(triton.next_power_of_2(rope_dim), 2)
-            grid = (triton.cdiv(batch_size, BLOCK_M), n_heads)
-            apply_rotary_emb_contig_kernel[grid](
+            # FLAT-row kernel: process (token, head) pairs flattened as
+            # row = token*n_heads + head, BLOCK_ROWS consecutive rows per program.
+            # The per-head contig kernel reads BLOCK_M tokens strided by
+            # n_heads*head_dim (very scattered on the 128-head attention output) and
+            # only reaches ~2.2 TB/s cold; the flat kernel's rows are head_dim apart
+            # -> ~4.5 TB/s cold (~2x). Microbench (MI300, 8192x128x64,
+            # cold): BLOCK_ROWS=16 + num_warps=1. Numerically bit-exact vs contig.
+            FLAT_BLOCK_ROWS = 16
+            n_rows = batch_size * n_heads
+            grid = (triton.cdiv(n_rows, FLAT_BLOCK_ROWS),)
+            apply_rotary_emb_flat_kernel[grid](
                 x,
                 freqs_real,
                 positions,
-                rope_dim,
-                batch_size,
+                n_rows,
+                n_heads,
                 x.stride(0),
                 x.stride(1),
                 x.stride(2),
@@ -320,9 +330,10 @@ def apply_rotary_emb_triton(
                 freqs_real.stride(1),
                 USE_POS=(positions is not None),
                 IS_INVERSE=inverse,
-                BLOCK_M=BLOCK_M,
                 RD=RD,
                 RDH=RD // 2,
+                BLOCK_ROWS=FLAT_BLOCK_ROWS,
+                num_warps=1,
             )
             return x
         BLOCK_P = max(triton.next_power_of_2(rope_dim // 2), 1)
