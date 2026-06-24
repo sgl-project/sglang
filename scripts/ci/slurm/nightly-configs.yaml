@@ -61,4 +61,4 @@ dsv4flash-fp8-mi355x-sglang:
       osl: 1024
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
-          config_file: recipes/mi355x-fp8/1k1k/1p1d.yaml
+          config_file: scripts/ci/slurm/recipes/mi355x-fp8/1k1k/1p1d.yaml
