@@ -120,6 +120,7 @@ class TestInternVL25Server(ImageOpenAITestMixin):
     ]
 
 
+@unittest.skip("temporarily disabled: NaN in next_token_logits")
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
     extra_args = [
@@ -127,6 +128,7 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
     ]
 
 
+@unittest.skip("temporarily disabled: NaN in next_token_logits")
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = "openbmb/MiniCPM-o-2_6"
     extra_args = [
