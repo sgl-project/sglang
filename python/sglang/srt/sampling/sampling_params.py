@@ -70,7 +70,7 @@ class SamplingParams:
 
     def __init__(
         self,
-        max_new_tokens: int = 128,
+        max_new_tokens: Optional[int] = None,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         stop_regex: Optional[Union[str, List[str]]] = None,
