@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pool-side handler for sliding-window attention."""
+"""Orchestration-side handler for sliding-window attention."""
 
 from __future__ import annotations
 

@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pool-side handler for Mamba / linear attention.
+"""Orchestration-side handler for Mamba / linear attention.
 
 Owns the Mamba SSM-slot pool ops: eviction frees, the match copy-on-write, and
 the per-request caching lifecycle (extract / fork / release), which the

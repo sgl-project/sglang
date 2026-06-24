@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pool-side handler for FULL attention (always-present baseline)."""
+"""Orchestration-side handler for FULL attention (always-present baseline)."""
 
 from __future__ import annotations
 

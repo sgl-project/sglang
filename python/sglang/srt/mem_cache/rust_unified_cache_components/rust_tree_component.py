@@ -11,12 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Base pool-side per-component handler for the Rust radix cache.
+"""Base orchestration-side per-component handler for the Rust radix cache.
 
-Parallels `unified_cache_components/tree_component.py`, but is the POOL-HALF only:
-the Rust crate's `Component`/`Slot` own the tree-side logic (walks, LRU, lock-ref),
-so these handlers own just the allocator ops Python must perform. The methods here
-therefore do NOT mirror `TreeComponent` one-for-one.
+Parallels `unified_cache_components/tree_component.py`, but owns only the POOL
+ops: the Rust crate's `Component`/`Slot` own the tree-side logic (walks, LRU,
+lock-ref), so these handlers run just the allocator ops Python must perform. The
+methods here therefore do NOT mirror `TreeComponent` one-for-one.
 """
 
 from __future__ import annotations
