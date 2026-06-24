@@ -46,12 +46,6 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     get_moe_a2a_backend,
 )
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.distributed.communication_op import (
-    tensor_model_parallel_all_gather,
-)
 
 # ---------------------------------------------------------------------------
 # Runner IO dataclasses
