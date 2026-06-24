@@ -232,6 +232,8 @@ class RustUnifiedRadixCache(BasePrefixCache):
             return
         for action in deferred_actions:
             self.components[action[0]].stage_insert_action(action)
+        # Commit once per insert: each component flushes its staged actions in
+        # a single batch (e.g. SWA emits one apply_swa_writes call).
         for comp in self.components.values():
             comp.commit_insert_actions()
 

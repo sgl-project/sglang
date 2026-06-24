@@ -57,7 +57,9 @@ class RustTreeComponent:
         """Apply one routed insert DeferredAction (may buffer for `commit`)."""
 
     def commit_insert_actions(self) -> None:
-        """Flush anything `stage_insert_action` buffered. Default no-op."""
+        """Flush anything `stage_insert_action` buffered. Called once per insert,
+        after every action is staged (so batched writes go out in one call).
+        Default no-op."""
 
     def finalize_match(self, params: Any, rust_result: Any) -> None:
         """Pool-side match post-processing (e.g. Mamba CoW). Default no-op."""

@@ -32,12 +32,12 @@ class RustFullComponent(RustTreeComponent):
             alloc.free(t)
 
     def stage_insert_action(self, action):
-        # (ComponentType.Full, "FullFree", full_to_free)
-        if action[1] != "FullFree":
+        _component_type, tag, full_to_free = action
+        if tag != "FullFree":
             raise RadixCacheRuntimePyError(
-                f"RustFullComponent: unknown insert action {action[1]!r}"
+                f"RustFullComponent: unknown insert action {tag!r}"
             )
-        self.cache.token_to_kv_pool_allocator.free(action[2])
+        self.cache.token_to_kv_pool_allocator.free(full_to_free)
 
     def evictable_size(self):
         return self.cache._rust_radix.evictable_token_size()
