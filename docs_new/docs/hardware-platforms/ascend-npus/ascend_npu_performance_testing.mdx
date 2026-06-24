@@ -672,11 +672,11 @@ Max ITL (ms):                            11309.91
 
 Test `Qwen/Qwen3-Embedding-8B` on the embedding API endpoint.
 
-<Note>Before running any benchmark in this section, make sure the SGLang embedding server is running with `--is-embedding` at `http://127.0.0.1:30000`. See [Start SGLang server](#11-start-sglang-server) and use the Embedding tab for the launch command. AISBench does not support embedding endpoints — use `bench_serving` or Evalscope instead.</Note>
+<Note>Before running any benchmark in this section, make sure the SGLang embedding server is running with `--is-embedding` at `http://127.0.0.1:30000`. See [Start SGLang server](#1-1-start-sglang-server) and use the Embedding tab for the launch command. AISBench does not support embedding endpoints — use `bench_serving` or Evalscope instead.</Note>
 
 ### 4.1 Using Evalscope
 
-<Note>Prerequisites: [Evalscope installed](#12-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang embedding server running with `--is-embedding` at `http://127.0.0.1:30000`.</Note>
+<Note>Prerequisites: [Evalscope installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang embedding server running with `--is-embedding` at `http://127.0.0.1:30000`.</Note>
 
 Evalscope supports embedding evaluation. For performance testing the embedding API directly:
 
@@ -695,7 +695,7 @@ evalscope perf \
 
 <Tip>If the model has already been downloaded, you can point `--tokenizer-path` to the local model path instead of the model id.</Tip>
 
-<Note>Evalscope's embedding performance testing support may vary by version. If the `perf` command does not accept the embeddings endpoint, use [`bench_serving` with `--backend sglang-embedding`](#42-using-bench_serving-embedding-backend) as the primary option.</Note>
+<Note>Evalscope's embedding performance testing support may vary by version. If the `perf` command does not accept the embeddings endpoint, use [`bench_serving` with `--backend sglang-embedding`](#4-2-using-bench_serving-embedding-backend) as the primary option.</Note>
 
 ### 4.2 Using bench_serving (embedding backend)
 

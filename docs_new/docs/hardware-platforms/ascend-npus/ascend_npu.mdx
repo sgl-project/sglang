@@ -193,50 +193,50 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 
 1. Download SGLang image
 
-    <Tip>
-    We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
-    </Tip>
+<Tip>
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+</Tip>
 
-    <Tabs>
-      <Tab title="Atlas 800I A3">
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
-    ```bash Command
-    # Stable release
-    docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+```bash Command
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-    # Daily build
-    docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
-    ```
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
+```
 
-      </Tab>
-      <Tab title="Atlas 800I A2">
+  </Tab>
+  <Tab title="Atlas 800I A2">
 
-    ```bash Command
-    # Stable release
-    docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+```bash Command
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
 
-    # Daily build
-    docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
-    ```
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
+```
 
-      </Tab>
-    </Tabs>
+  </Tab>
+</Tabs>
 
 2. Build an image based on Dockerfile
 
-    ```bash Command
-    # Clone the SGLang repository
-    git clone https://github.com/sgl-project/sglang.git
-    cd sglang/docker
+```bash Command
+# Clone the SGLang repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang/docker
 
-    # Build the docker image
-    # Replace <arch_tag> with the target architecture, e.g. amd64, arm64.
-    # Optional build arguments:
-    #   --build-arg DEVICE_TYPE=910b          # Required for Atlas 800I A2
-    #   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror too improve download speed
-    # If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
-    docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
-    ```
+# Build the docker image
+# Replace <arch_tag> with the target architecture, e.g. amd64, arm64.
+# Optional build arguments:
+#   --build-arg DEVICE_TYPE=910b          # Required for Atlas 800I A2
+#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror too improve download speed
+# If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
+docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
+```
 
 #### Create Docker
 
@@ -343,115 +343,115 @@ python3 -m sglang.launch_server \
 
 1. Launch Prefill Server
 
-    <Tabs>
-      <Tab title="Atlas 800I A3">
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
-    ```bash Command
-    # Enabling CPU Affinity
-    export SGLANG_SET_CPU_AFFINITY=1
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
 
-    # PREFILL_IP: IP address of the first Prefill Server
-    # FREE_PORT: any available port
-    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-    python3 -m sglang.launch_server \
-        --model-path meta-llama/Llama-3.1-8B-Instruct \
-        --disaggregation-mode prefill \
-        --disaggregation-transfer-backend ascend \
-        --disaggregation-bootstrap-port 8995 \
-        --attention-backend ascend \
-        --device npu \
-        --base-gpu-id 0 \
-        --tp-size 1 \
-        --host 127.0.0.1 \
-        --port 8000
-    ```
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8000
+```
 
-      </Tab>
-      <Tab title="Atlas 800I A2">
+  </Tab>
+  <Tab title="Atlas 800I A2">
 
-    ```bash Command
-    # Enabling CPU Affinity
-    export SGLANG_SET_CPU_AFFINITY=1
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
 
-    # PREFILL_IP: IP address of the first Prefill Server
-    # FREE_PORT: any available port
-    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-    export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
-    python3 -m sglang.launch_server \
-        --model-path meta-llama/Llama-3.1-8B-Instruct \
-        --disaggregation-mode prefill \
-        --disaggregation-transfer-backend ascend \
-        --disaggregation-bootstrap-port 8995 \
-        --attention-backend ascend \
-        --device npu \
-        --base-gpu-id 0 \
-        --tp-size 1 \
-        --host 127.0.0.1 \
-        --port 8000
-    ```
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8000
+```
 
-      </Tab>
-    </Tabs>
+  </Tab>
+</Tabs>
 
 2. Launch Decode Server
 
-    <Tabs>
-      <Tab title="Atlas 800I A3">
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
-    ```bash Command
-    # PREFILL_IP: IP address of the first Prefill Server
-    # FREE_PORT: any available port
-    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-    python3 -m sglang.launch_server \
-        --model-path meta-llama/Llama-3.1-8B-Instruct \
-        --disaggregation-mode decode \
-        --disaggregation-transfer-backend ascend \
-        --attention-backend ascend \
-        --device npu \
-        --base-gpu-id 1 \
-        --tp-size 1 \
-        --host 127.0.0.1 \
-        --port 8001
-    ```
+```bash Command
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8001
+```
 
-      </Tab>
-      <Tab title="Atlas 800I A2">
+  </Tab>
+  <Tab title="Atlas 800I A2">
 
-    ```bash Command
-    # PREFILL_IP: IP address of the first Prefill Server
-    # FREE_PORT: any available port
-    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-    export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
-    python3 -m sglang.launch_server \
-        --model-path meta-llama/Llama-3.1-8B-Instruct \
-        --disaggregation-mode decode \
-        --disaggregation-transfer-backend ascend \
-        --attention-backend ascend \
-        --device npu \
-        --base-gpu-id 1 \
-        --tp-size 1 \
-        --host 127.0.0.1 \
-        --port 8001
-    ```
+```bash Command
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8001
+```
 
-      </Tab>
-    </Tabs>
+  </Tab>
+</Tabs>
 
 3. Launch Router
 
-    ```bash Command
-    python3 -m sglang_router.launch_router \
-        --pd-disaggregation \
-        --policy cache_aware \
-        --prefill http://127.0.0.1:8000 8995 \
-        --decode http://127.0.0.1:8001 \
-        --host 127.0.0.1 \
-        --port 6688
-    ```
+```bash Command
+python3 -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --policy cache_aware \
+    --prefill http://127.0.0.1:8000 8995 \
+    --decode http://127.0.0.1:8001 \
+    --host 127.0.0.1 \
+    --port 6688
+```
 
 ### Running Service For Multimodal Language Models
 
