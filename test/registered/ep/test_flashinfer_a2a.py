@@ -47,6 +47,7 @@ class TestFlashinferA2ATrtllmRoutedFP4(CustomTestCase):
                 "flashinfer_trtllm_routed",
                 "--quantization",
                 "modelopt_fp4",
+                "--disable-flashinfer-autotune",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true}',
             ],
@@ -101,6 +102,7 @@ class TestFlashinferA2ATrtllmRoutedFP8(CustomTestCase):
                 "0.7",
                 "--mamba-ssm-dtype",
                 "bfloat16",
+                "--disable-flashinfer-autotune",
             ],
         )
 
