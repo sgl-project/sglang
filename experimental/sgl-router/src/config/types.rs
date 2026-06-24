@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
@@ -16,6 +16,7 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+    pub admission: AdmissionConfig,
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
@@ -62,6 +63,35 @@ impl Default for ActiveLoadConfig {
         Self {
             stale_request_timeout_secs: default_stale_request_timeout_secs(),
         }
+    }
+}
+
+/// Router-side admission control. Opt-in: [`AdmissionConfig::Disabled`] (the
+/// default) dispatches every request immediately, exactly as the router behaved
+/// before admission control existed.
+///
+/// Modelling this as an enum makes the illegal "wait-queue depth without a
+/// per-worker cap" state unrepresentable (the queue field only exists inside
+/// [`AdmissionConfig::Enabled`]), and `NonZeroUsize` rules out a `0` cap, which
+/// would wedge every worker as permanently full.
+#[derive(Debug, Clone, Copy)]
+pub enum AdmissionConfig {
+    /// No admission control: every request is dispatched immediately.
+    Disabled,
+    /// Cap in-flight requests per worker; park (and optionally shed) the rest.
+    Enabled {
+        /// Maximum in-flight requests the router dispatches to a single worker.
+        max_concurrent_per_worker: NonZeroUsize,
+        /// Maximum requests parked waiting for a slot before further arrivals
+        /// are shed with 503. `None` leaves the wait queue unbounded (park,
+        /// never shed).
+        max_queued_requests: Option<usize>,
+    },
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self::Disabled
     }
 }
 

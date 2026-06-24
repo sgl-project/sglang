@@ -9,7 +9,7 @@ use crate::server::error::ApiError;
 use crate::server::metrics::{
     MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
-use crate::workers::{LoadGuard, Worker};
+use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -182,12 +182,14 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
+    // Admission gate: pick a worker and claim an in-flight slot, parking until
+    // one frees if every candidate is at its cap. A pass-through (immediate
+    // dispatch, unconditional guard) when no per-worker cap is configured.
+    // Yields 503 `service_overloaded` when the wait queue is full.
+    let (worker, guard) = ctx
+        .admission
+        .acquire(&workers, policy.as_ref(), &selection_ctx, &model_str)
+        .await?;
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -260,7 +262,8 @@ pub async fn chat_completions(
     // 0 here: the active-load registry's decode axis is reserved for a
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
-    let guard = worker.load_guard();
+    // `guard` (this request's per-worker in-flight slot) was claimed by the
+    // admission gate above; it is held until the dispatch guards below drop.
     // Use the exact token count from the ingress tokenization when available;
     // fall back to the byte-count heuristic for load-only policies that don't
     // tokenize. The exact count makes the cache-aware load-imbalance fast-path
@@ -403,7 +406,7 @@ pub async fn chat_completions(
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
-        let prefill_holds: (LoadGuard, _) = (guard, active_guard);
+        let prefill_holds = (guard, active_guard);
         tokio::spawn(async move {
             // The tuple binding extends both guards' lifetime to the
             // end of this async block, which lasts until the prefill
@@ -506,7 +509,7 @@ pub async fn chat_completions(
         // lifetime to the end of the function — the `forward_json_to`
         // future does not need them (it does not return until the
         // body is buffered).
-        let _holds: (LoadGuard, _) = (guard, active_guard);
+        let _holds = (guard, active_guard);
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             &worker.breaker,

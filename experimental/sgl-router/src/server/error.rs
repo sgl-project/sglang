@@ -106,6 +106,13 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
+    /// Every eligible worker is at its in-flight cap and the admission wait
+    /// queue is full, so the router sheds this request instead of piling more
+    /// onto saturated workers. Surfaced as 503 (retryable) so clients / the
+    /// upstream load balancer back off rather than fail-fast.
+    #[error("service overloaded for model {model}")]
+    ServiceOverloaded { model: String },
+
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -140,6 +147,9 @@ impl ApiError {
             ApiError::BreakerOpen { .. } => (StatusCode::SERVICE_UNAVAILABLE, "breaker_open"),
             ApiError::WorkerMisconfigured { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "worker_misconfigured")
+            }
+            ApiError::ServiceOverloaded { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, "service_overloaded")
             }
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
@@ -244,6 +254,10 @@ impl IntoResponse for ApiError {
                     "worker URL emitted by discovery is malformed",
                 );
                 "service unavailable".to_string()
+            }
+            ApiError::ServiceOverloaded { model } => {
+                tracing::warn!(model = %model, reason = "service_overloaded", "shedding request: all workers at capacity and wait queue full");
+                "service overloaded".to_string()
             }
             ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
         };
@@ -388,6 +402,18 @@ mod tests {
         );
         assert_ne!(env.error.code, "internal_error");
         assert_ne!(env.error.code, "model_not_found");
+    }
+
+    #[test]
+    fn service_overloaded_maps_to_503_with_code() {
+        let err = ApiError::ServiceOverloaded { model: "m".into() };
+        let resp = err.into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code_header.as_deref(), Some("service_overloaded"));
+        assert_eq!(env.error.code, "service_overloaded");
+        assert_eq!(env.error.typ, "server_error");
     }
 
     #[test]

@@ -7,13 +7,13 @@
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig,
+    Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -125,6 +125,19 @@ pub struct Cli {
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
 
+    // ---- admission control ----
+    /// Maximum in-flight requests dispatched to a single worker. When set,
+    /// the router parks a request once every candidate worker is at this cap
+    /// and dispatches it when a slot frees. Must be > 0. Unset (default)
+    /// disables admission control: requests dispatch immediately as before.
+    #[arg(long)]
+    pub max_concurrent_requests_per_worker: Option<NonZeroUsize>,
+    /// Maximum requests parked in the admission wait queue before further
+    /// arrivals are shed with 503. Requires `--max-concurrent-requests-per-worker`.
+    /// Unset leaves the wait queue unbounded (park, never shed).
+    #[arg(long)]
+    pub max_queued_requests: Option<usize>,
+
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
     #[arg(long, default_value = "info")]
@@ -226,6 +239,15 @@ impl Cli {
             None
         };
 
+        // A wait-queue depth is meaningless without a per-worker cap (nothing
+        // ever parks), so reject it rather than silently ignore it.
+        if self.max_queued_requests.is_some() && self.max_concurrent_requests_per_worker.is_none() {
+            return Err(anyhow!(
+                "--max-queued-requests requires --max-concurrent-requests-per-worker \
+                 (the wait queue only fills once workers hit their in-flight cap)"
+            ));
+        }
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -274,6 +296,13 @@ impl Cli {
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
+            },
+            admission: match self.max_concurrent_requests_per_worker {
+                Some(max_concurrent_per_worker) => AdmissionConfig::Enabled {
+                    max_concurrent_per_worker,
+                    max_queued_requests: self.max_queued_requests,
+                },
+                None => AdmissionConfig::Disabled,
             },
         };
         config.validate()?;
@@ -391,6 +420,68 @@ mod tests {
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+    }
+
+    #[test]
+    fn admission_control_disabled_by_default() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
+        assert!(matches!(c.admission, AdmissionConfig::Disabled));
+    }
+
+    #[test]
+    fn admission_flags_map_into_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--max-concurrent-requests-per-worker",
+            "32",
+            "--max-queued-requests",
+            "8",
+        ]))
+        .unwrap();
+        match c.admission {
+            AdmissionConfig::Enabled {
+                max_concurrent_per_worker,
+                max_queued_requests,
+            } => {
+                assert_eq!(max_concurrent_per_worker.get(), 32);
+                assert_eq!(max_queued_requests, Some(8));
+            }
+            AdmissionConfig::Disabled => panic!("expected Enabled, got Disabled"),
+        }
+    }
+
+    #[test]
+    fn zero_per_worker_cap_is_rejected() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--max-concurrent-requests-per-worker",
+            "0",
+        ]))
+        .expect_err("a zero per-worker cap must be rejected");
+        // clap rejects `0` for a NonZeroUsize-typed flag at parse time.
+        assert!(
+            err.to_string()
+                .contains("max-concurrent-requests-per-worker")
+                || err.to_string().to_lowercase().contains("0"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn max_queued_requests_requires_per_worker_cap() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--max-queued-requests",
+            "8",
+        ]))
+        .expect_err("--max-queued-requests without a per-worker cap must be rejected");
+        assert!(
+            err.to_string().contains("--max-queued-requests requires"),
+            "got: {err}",
+        );
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the

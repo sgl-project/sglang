@@ -94,6 +94,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            admission: AdmissionConfig::default(),
         }
     }
 

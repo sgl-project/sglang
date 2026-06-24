@@ -43,6 +43,7 @@ fn config_for(_worker_url: &str) -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        admission: sgl_router::config::AdmissionConfig::default(),
     }
 }
 
@@ -1426,5 +1427,100 @@ async fn non_streaming_error_path_drops_active_load_guard() {
         active_load.inflight_count(),
         0,
         "error path must drop the active-load guard",
+    );
+}
+
+/// End-to-end admission control: with a per-worker cap of 1, a second request
+/// parks at the router (does NOT 503) while the first holds the only slot
+/// mid-stream, and is admitted once the first stream completes and frees the
+/// slot. Exercises the real handler wiring (`acquire` + the `AdmissionGuard`
+/// firing on stream end), which the `AdmissionQueue` unit tests cannot reach.
+#[tokio::test]
+async fn admission_parks_second_request_until_first_stream_frees_the_slot() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(80),
+    )
+    .await;
+
+    // cap=1 per worker, bounded wait queue large enough that a parked request
+    // is not shed.
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
+        max_queued_requests: Some(4),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+
+    let make_req = || {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .unwrap();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // Request A claims the only slot. Hold its response (don't drain) so the
+    // slot stays occupied for the stream's lifetime.
+    let res_a = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+
+    // Request B must park (cap=1, A holds the slot). Spawn it and confirm it
+    // neither completes nor sheds while A is in flight.
+    let ctx_b = ctx.clone();
+    let b = tokio::spawn(async move { build_router(ctx_b).oneshot(make_req()).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !b.is_finished(),
+        "B should park while A holds the only slot, not return"
+    );
+    assert!(
+        ctx.metrics
+            .render()
+            .contains("sgl_router_queued_requests 1\n"),
+        "B should be counted as parked: {}",
+        ctx.metrics.render(),
+    );
+
+    // Drain A: frees the slot and wakes B.
+    let _ = BodyExt::collect(res_a.into_body()).await.unwrap();
+
+    // B is now admitted and completes successfully.
+    let res_b = tokio::time::timeout(Duration::from_secs(2), b)
+        .await
+        .expect("B must be admitted once A frees the slot")
+        .expect("B task panicked");
+    assert_eq!(res_b.status(), StatusCode::OK);
+    let _ = BodyExt::collect(res_b.into_body()).await.unwrap();
+
+    // Wait queue fully drained.
+    assert!(
+        ctx.metrics
+            .render()
+            .contains("sgl_router_queued_requests 0\n"),
+        "queue should drain to 0: {}",
+        ctx.metrics.render(),
     );
 }

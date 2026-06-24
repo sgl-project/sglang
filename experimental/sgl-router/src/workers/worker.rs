@@ -38,6 +38,7 @@ fn parse_bootstrap_host(url: &str) -> String {
 /// drop the guard on the same line, so the counter would never see the
 /// in-flight request.  The compile-time warning catches that misuse.
 #[must_use = "LoadGuard must be held for the request's lifetime; dropping it immediately decrements active_requests"]
+#[derive(Debug)]
 pub struct LoadGuard {
     counter: Arc<AtomicUsize>,
 }
@@ -46,6 +47,31 @@ impl LoadGuard {
     pub(crate) fn new(counter: Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
         Self { counter }
+    }
+
+    /// Claim a slot only while the counter is below `cap`, returning `None`
+    /// when the worker is already at capacity (counter left unchanged).
+    ///
+    /// Each claim is a compare-and-swap retried until it succeeds or the cap is
+    /// hit, so the cap holds *exactly* even when many callers race for the last
+    /// slot: at most `cap` guards can coexist. This is what makes the per-worker
+    /// admission limit a hard bound rather than a check-then-act race.
+    pub(crate) fn try_new(counter: Arc<AtomicUsize>, cap: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= cap {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -164,6 +190,13 @@ impl Worker {
     pub fn load_guard(&self) -> LoadGuard {
         LoadGuard::new(self.active_requests.clone())
     }
+
+    /// Like [`Worker::load_guard`], but only admits while `active_requests` is
+    /// below `cap`; returns `None` when the worker is already at capacity. Used
+    /// by the admission gate to enforce a hard per-worker in-flight limit.
+    pub fn try_load_guard(&self, cap: usize) -> Option<LoadGuard> {
+        LoadGuard::try_new(self.active_requests.clone(), cap)
+    }
 }
 
 impl std::fmt::Debug for Worker {
@@ -200,6 +233,71 @@ mod tests {
         assert_eq!(w.active_load(), 1);
         drop(g2);
         assert_eq!(w.active_load(), 0);
+    }
+
+    #[test]
+    fn try_load_guard_enforces_cap() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("m".into())],
+            bootstrap_port: None,
+        });
+        let cap = 2;
+        let g1 = w.try_load_guard(cap);
+        assert!(g1.is_some());
+        assert_eq!(w.active_load(), 1);
+        let _g2 = w.try_load_guard(cap);
+        assert!(_g2.is_some());
+        assert_eq!(w.active_load(), 2);
+        // At cap: refused, counter unchanged.
+        assert!(w.try_load_guard(cap).is_none());
+        assert_eq!(w.active_load(), 2);
+        // Freeing a slot re-opens admission.
+        drop(g1);
+        assert_eq!(w.active_load(), 1);
+        let _g3 = w.try_load_guard(cap);
+        assert!(_g3.is_some());
+        assert_eq!(w.active_load(), 2);
+    }
+
+    #[test]
+    fn try_load_guard_never_exceeds_cap_under_concurrency() {
+        use std::sync::{Barrier, Mutex};
+        use std::thread;
+
+        let w = Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("m".into())],
+            bootstrap_port: None,
+        }));
+        let cap = 8;
+        let n_threads = 64;
+        let barrier = Arc::new(Barrier::new(n_threads));
+        let granted: Arc<Mutex<Vec<LoadGuard>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let w = Arc::clone(&w);
+                let barrier = Arc::clone(&barrier);
+                let granted = Arc::clone(&granted);
+                thread::spawn(move || {
+                    barrier.wait();
+                    if let Some(guard) = w.try_load_guard(cap) {
+                        // Hold the guard so the claimed slot is never released.
+                        granted.lock().unwrap().push(guard);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(granted.lock().unwrap().len(), cap);
+        assert_eq!(w.active_load(), cap);
     }
 
     #[test]

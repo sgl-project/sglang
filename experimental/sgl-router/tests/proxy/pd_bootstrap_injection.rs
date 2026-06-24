@@ -55,6 +55,7 @@ fn config() -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        admission: sgl_router::config::AdmissionConfig::default(),
     }
 }
 
