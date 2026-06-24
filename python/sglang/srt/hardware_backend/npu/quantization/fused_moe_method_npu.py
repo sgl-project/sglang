@@ -714,15 +714,3 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
             output_dtype,
             group_list_type=group_list_type,
         )
-
-class NPUUnquantMoEMethodGGUF(NPUUnquantMoEMethod):
-
-    def apply(self, quant_info, hidden_states, expert_tokens, pertoken_scale,
-              output_dtype, weight_prefix, group_list_type):
-        out = super().apply(quant_info, hidden_states, expert_tokens,
-                            pertoken_scale, output_dtype, weight_prefix,
-                            group_list_type)
-        if weight_prefix == "w2":
-            if get_tensor_model_parallel_world_size() > 1:
-                out = tensor_model_parallel_all_gather(out, dim=-1)
-        return out
