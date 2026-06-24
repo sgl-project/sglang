@@ -112,6 +112,8 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             # Non‑DeepEP (torch_npu) path
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
                 self.activation = NPUSwigluQuant()
+            elif isinstance(kernel, NPUUnquantMoEMethodGGUF):
+                self.activation = NPUSwigluAllGather()
             else:
                 if config.activation == "npu_swiglu_oai":
                     self.activation = NPUSwigluOAI(layer=config.layer)
@@ -163,9 +165,6 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             hidden_states, pertoken_scale = self.activation._apply_activation(
                 hidden_states
             )
-            # TP all-gather for intermediate dimension if needed
-            if self.enable_all_gather:
-                hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
 
         # --- w2 (down) projection ---
         hidden_states = self.config.layer.w2_kernel.apply(
