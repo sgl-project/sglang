@@ -69,6 +69,7 @@ class TorchNpuDispatcher(BaseDispatcher):
 
         # If the quantisation is GGUF and TP is active, wrap the finalizer
         # with an all‑gather so that the dispatcher stays completely clean.
+        print(self.quant_config)
         is_gguf = (
             self.quant_config
             and hasattr(self.quant_config, "get_name")
@@ -77,7 +78,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         if is_gguf and self.tp_size > 1:
             # The wrapper will perform tensor_model_parallel_all_gather
             # automatically after the standard finalize routing.
-            self.finalize = FinalizeRoutingWrapper(self.finalize, dim=-1)
+            self.finalize = AllGatherFinalizeRoutingWrapper(self.finalize, dim=-1)
 
     def set_ascend_dispatcher_output_dtype(self) -> None:
         """Choose init & finalize routing kernels based on quant config."""
