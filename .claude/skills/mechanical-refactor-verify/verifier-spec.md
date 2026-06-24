@@ -29,9 +29,10 @@ side-effects of relocating code:
 - **requalifying a moved symbol's call sites** — `self.foo(x)` becomes `foo(x)`, or
   `Old.foo(x)` becomes `New.foo(x)`: same symbol, same arguments, only the qualifier
   differs;
-- **module scaffolding copied to a new destination module** — a top-level `logger`, a
-  module constant, or a `TYPE_CHECKING` guard the destination needs, copied **byte-for-byte
-  from a source file that still has it** (so it was not itself relocated).
+- **module scaffolding the destination module needs** — a top-level line copied
+  **byte-for-byte from a source file that still has it** (so it was not itself relocated),
+  plus the universal boilerplate `logger = logging.getLogger(...)` and `if TYPE_CHECKING:`
+  which count even when freshly added (they never carry logic).
 
 Everything else is `NEEDS REVIEW`: a **reorder**, a **non-uniform** indentation change, a
 **trailing-whitespace** change, a **line merge/split**, a changed **argument**, a

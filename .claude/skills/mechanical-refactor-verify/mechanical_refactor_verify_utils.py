@@ -256,23 +256,29 @@ def _peel_artifacts(
     return imports, decorators, block
 
 
+_LOGGER_RE = re.compile(r"^logger = logging\.getLogger\(")
+
+
+def _is_universal_scaffold(stripped: str) -> bool:
+    """A top-level line that is benign module boilerplate regardless of the source: a
+    ``TYPE_CHECKING`` guard or a logger definition (these never carry logic)."""
+    return stripped == "if TYPE_CHECKING:" or bool(_LOGGER_RE.match(stripped))
+
+
 def _peel_scaffold(
     lines: list[str], source_module_lines: set[str], removed_stripped: set[str]
 ) -> tuple[list[str], list[str]]:
-    """Remove top-level lines that copy a module-level statement from a source file and
-    were not themselves relocated -- carried-over module scaffolding (a logger, a module
-    constant, a ``TYPE_CHECKING`` guard) the destination module needs. The "not relocated"
-    guard (``not in removed_stripped``) keeps a moved module-level function in the block.
-    See verifier-spec.md (whitelist)."""
+    """Remove top-level module scaffolding the destination module needs: a line copied
+    byte-for-byte from a source file that was not itself relocated, or universal boilerplate
+    (a logger / ``TYPE_CHECKING`` guard). The "not relocated" guard keeps a moved
+    module-level function in the block. See verifier-spec.md (whitelist)."""
     scaffold, block = [], []
     for line in lines:
         stripped = line.strip()
-        if (
-            stripped
-            and not line[:1].isspace()
-            and stripped in source_module_lines
-            and stripped not in removed_stripped
-        ):
+        top_level = bool(stripped) and not line[:1].isspace()
+        carried = top_level and stripped in source_module_lines
+        universal = top_level and _is_universal_scaffold(stripped)
+        if (carried or universal) and stripped not in removed_stripped:
             scaffold.append(stripped)
         else:
             block.append(line)

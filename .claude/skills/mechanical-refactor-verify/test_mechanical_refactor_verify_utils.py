@@ -156,6 +156,17 @@ def test_peel_scaffold_removes_carried_top_level_lines_not_relocated() -> None:
     assert block == ["def helper():", "    return logger"]
 
 
+def test_peel_scaffold_removes_universal_boilerplate_even_if_fresh() -> None:
+    """A TYPE_CHECKING guard or logger line is scaffolding even when the source lacked it."""
+    block, scaffold = _peel_scaffold(
+        ["if TYPE_CHECKING:", "logger = logging.getLogger(__name__)", "def f():"],
+        set(),
+        set(),
+    )
+    assert scaffold == ["if TYPE_CHECKING:", "logger = logging.getLogger(__name__)"]
+    assert block == ["def f():"]
+
+
 # --- _block_signature ----------------------------------------------------------
 
 
