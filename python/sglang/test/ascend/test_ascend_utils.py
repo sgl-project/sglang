@@ -619,11 +619,13 @@ def write_results_to_github_step_summary(results: dict):
         summary += f"| {model} | {server} | {client} | {output_throughput} | {output_throughput_threshold} | {latency} | {latency_threshold} | {accuracy} | {accuracy_threshold} | {status} |\n"
     write_github_step_summary(summary)
 
+
 def write_github_step_summary_once(summary: str):
     if getattr(write_github_step_summary_once, "has_written", False):
         return
     write_github_step_summary_once.has_written = True
     write_github_step_summary(summary)
+
 
 def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
@@ -644,6 +646,7 @@ def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
             output_lines.append(line)
             pt += 1
         time.sleep(0.1)
+
 
 def run_and_check_memory_leak(
     workload_func,
@@ -718,6 +721,7 @@ def run_and_check_memory_leak(
     assert not has_leak
     if assert_has_abort:
         assert has_abort
+
 
 def run_mmlu_test(
     disable_radix_cache=False,
