@@ -78,6 +78,17 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         self.linear_backend = getattr(
             model_runner.model_config.hf_config, "linear_backend", "seg_la"
         )
+        # seg_la_vk: same kernel family with [v,k] state layout for all kernels.
+        # The state pool is square (H,D,D) — inner k/v ordering is kernel-internal.
+        # The MTP scatter is a layout-agnostic whole-slot copy, so as long as every
+        # seg_la kernel (including mtp's intermediate_ssm write) uses [v,k], the
+        # path is end-to-end self-consistent with no memory_pool / scatter changes.
+        self.seg_la_state_layout = "kv"
+        if self.linear_backend == "seg_la_vk":
+            self.seg_la_state_layout = "vk"
+            self.linear_backend = (
+                "seg_la"  # reuse all existing seg_la branches unchanged
+            )
         logger.info(
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
         )
@@ -266,6 +277,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             caches=temp_cache,
             cache_indices=intermediate_state_indices,
             decouple=True,
+            state_layout=self.seg_la_state_layout,
         )
         return hidden
 
