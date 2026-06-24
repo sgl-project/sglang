@@ -403,7 +403,7 @@ torch::Tensor cosmos_test_linear_fp8_out_fp8(
     {
       at::Tensor _s = omnidreams_singleview::sgl_linear_rcr_fp8_bare(
           input_fp8.data_ptr<uint8_t>(), weight_fp8_u8.data_ptr<uint8_t>(),
-          N, in_features, out_features);
+          N, in_features, out_features, prescale_alpha);
       cudaMemcpyAsync(half_scratch.data_ptr<at::Half>(), _s.data_ptr(),
                       _s.numel() * _s.element_size(), cudaMemcpyDeviceToDevice, stream);
     }
@@ -452,9 +452,11 @@ torch::Tensor cosmos_test_linear_fp8_gelu_out_fp8(
                 "alias_output is only supported on the fused output_scale=1 path");
 
     auto u8_opts = torch::TensorOptions().dtype(torch::kUInt8).device(input_bf16.device());
+    auto h_opts = torch::TensorOptions().dtype(torch::kFloat16).device(input_bf16.device());
     torch::Tensor scratch_fp8;
     torch::Tensor input_fp8;
     torch::Tensor output_fp8;
+    auto half_scratch = torch::empty({N, out_features}, h_opts);
     if (alias_output) {
         const int scratch_features = std::max(in_features, out_features);
         scratch_fp8 = torch::empty({int64_t(N) * scratch_features}, u8_opts);
@@ -475,11 +477,13 @@ torch::Tensor cosmos_test_linear_fp8_gelu_out_fp8(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess, "input BF16->FP8 quantization failed: ", cudaGetErrorString(err));
 
+    constexpr float prescale_alpha = 1.0f / 128.0f;
+    constexpr float output_scale_mul = 128.0f;
     if (output_scale == 1.0) {
     {
       at::Tensor _s = omnidreams_singleview::sgl_linear_rcr_fp8_bare(
           input_fp8.data_ptr<uint8_t>(), weight_fp8_u8.data_ptr<uint8_t>(),
-          N, in_features, out_features);
+          N, in_features, out_features, prescale_alpha);
       cudaMemcpyAsync(half_scratch.data_ptr<at::Half>(), _s.data_ptr(),
                       _s.numel() * _s.element_size(), cudaMemcpyDeviceToDevice, stream);
     }
@@ -489,18 +493,13 @@ torch::Tensor cosmos_test_linear_fp8_gelu_out_fp8(
         reinterpret_cast<const cutlass::half_t*>(weight_scale.data_ptr<at::Half>()),
         nullptr,
         N, out_features, stream,
-        1.0f);
+        output_scale_mul);
         TORCH_CHECK(err == cudaSuccess, "fused GELU FP8-output linear failed: ", cudaGetErrorString(err));
     } else {
-        auto half_scratch = torch::empty(
-            {N, out_features},
-            torch::TensorOptions().dtype(torch::kFloat16).device(input_bf16.device()));
-        constexpr float prescale_alpha = 1.0f / 128.0f;
-        constexpr float output_scale_mul = 128.0f;
     {
       at::Tensor _s = omnidreams_singleview::sgl_linear_rcr_fp8_bare(
           input_fp8.data_ptr<uint8_t>(), weight_fp8_u8.data_ptr<uint8_t>(),
-          N, in_features, out_features);
+          N, in_features, out_features, prescale_alpha);
       cudaMemcpyAsync(half_scratch.data_ptr<at::Half>(), _s.data_ptr(),
                       _s.numel() * _s.element_size(), cudaMemcpyDeviceToDevice, stream);
     }
@@ -591,7 +590,6 @@ torch::Tensor cosmos_test_linear_fp8_residual_scaled_bf16(
     input_bf16 = input_bf16.contiguous();
     weight_fp8_u8 = weight_fp8_u8.contiguous();
     alpha = alpha.to(torch::kFloat16).contiguous();
-    auto output_bf16 = residual_bf16.contiguous().clone();
 
     const int N = static_cast<int>(input_bf16.size(0));
     const int in_features = static_cast<int>(input_bf16.size(1));
@@ -599,13 +597,16 @@ torch::Tensor cosmos_test_linear_fp8_residual_scaled_bf16(
     TORCH_CHECK(weight_fp8_u8.size(1) == in_features,
                 "weight_fp8_u8 shape mismatch: expected second dim ", in_features,
                 ", got ", weight_fp8_u8.size(1));
-    TORCH_CHECK(output_bf16.size(0) == N && output_bf16.size(1) == out_features,
+    TORCH_CHECK(residual_bf16.size(0) == N && residual_bf16.size(1) == out_features,
                 "residual_bf16 must be [N, out_features]");
     TORCH_CHECK(alpha.dim() == 1 && alpha.size(0) == out_features,
                 "alpha must be [out_features]");
 
     auto u8_opts = torch::TensorOptions().dtype(torch::kUInt8).device(input_bf16.device());
+    auto h_opts = torch::TensorOptions().dtype(torch::kFloat16).device(input_bf16.device());
     auto input_fp8 = torch::empty({N, in_features}, u8_opts);
+    auto half_scratch = torch::empty({N, out_features}, h_opts);
+    auto residual_half = residual_bf16.to(torch::kFloat16).contiguous();
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     constexpr int threads = 256;
@@ -620,18 +621,18 @@ torch::Tensor cosmos_test_linear_fp8_residual_scaled_bf16(
     {
       at::Tensor _s = omnidreams_singleview::sgl_linear_rcr_fp8_bare(
           input_fp8.data_ptr<uint8_t>(), weight_fp8_u8.data_ptr<uint8_t>(),
-          N, in_features, out_features);
+          N, in_features, out_features, 1.0f / 128.0f);
       cudaMemcpyAsync(half_scratch.data_ptr<at::Half>(), _s.data_ptr(),
                       _s.numel() * _s.element_size(), cudaMemcpyDeviceToDevice, stream);
     }
-    err = omnidreams_singleview::cosmos_col_scale_residual_gate_bf16(
+    err = omnidreams_singleview::apply_col_scale_bias_residual(
         reinterpret_cast<const cutlass::half_t*>(half_scratch.data_ptr<at::Half>()),
+        reinterpret_cast<cutlass::half_t*>(residual_half.data_ptr<at::Half>()),
         reinterpret_cast<const cutlass::half_t*>(alpha.data_ptr<at::Half>()),
-        reinterpret_cast<cutlass::bfloat16_t*>(output_bf16.data_ptr<at::BFloat16>()),
-        gate.data_ptr<at::BFloat16>() ? reinterpret_cast<const cutlass::bfloat16_t*>(gate.data_ptr<at::BFloat16>()) : nullptr,
-        N, out_features, B, stream, 1.0f);
+        nullptr,
+        N, out_features, stream, 128.0f);
     TORCH_CHECK(err == cudaSuccess, "fused residual BF16 FP8 linear failed: ", cudaGetErrorString(err));
-    return output_bf16;
+    return residual_half.to(torch::kBFloat16);
 }
 
 py::dict cosmos_test_fp8_linear_tile_selection(

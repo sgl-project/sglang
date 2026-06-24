@@ -31,40 +31,29 @@ inline at::Tensor sgl_linear_rcr_fp8_colscale_bf16(
   // stream is current during the forward, so no explicit stream wiring needed.
   (void)stream;
   auto opts_fp8 = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA);
+  auto opts_f16 = torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA);
   auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
   at::Tensor a8 = torch::from_blob(const_cast<void*>(a8_ptr), {M, K}, opts_fp8);
   at::Tensor b8 = torch::from_blob(const_cast<void*>(b8_ptr), {N, K}, opts_fp8);
-  at::Tensor colscale = torch::from_blob(const_cast<void*>(colscale_ptr), {N}, opts_f32);
+  at::Tensor colscale =
+      torch::from_blob(const_cast<void*>(colscale_ptr), {N}, opts_f16).to(torch::kFloat32);
   at::Tensor ones = torch::ones({M}, opts_f32);
   return fp8_scaled_mm(a8, b8.t(), ones, colscale, torch::kBFloat16, c10::nullopt);
 }
 
 
-// Bare FP8 GEMM (scales_b=1, no colscale) -> bf16 output for unfused post-op
+// Bare FP8 GEMM (scales_b=1, no colscale) -> fp16 output for unfused post-op
 // paths (#2 gelu_fp8, #3 residual_bf16, #4 residual_ln_to_fp8).
 inline at::Tensor sgl_linear_rcr_fp8_bare(
     const void* a8_ptr, const void* b8_ptr,
-    int M, int K, int N) {
+    int M, int K, int N,
+    float prescale_alpha = 1.0f) {
   auto opts_fp8 = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA);
   auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
   at::Tensor a8 = torch::from_blob(const_cast<void*>(a8_ptr), {M, K}, opts_fp8);
   at::Tensor b8 = torch::from_blob(const_cast<void*>(b8_ptr), {N, K}, opts_fp8);
-  at::Tensor ones_a = torch::ones({M}, opts_f32);
+  at::Tensor ones_a = torch::full({M}, prescale_alpha, opts_f32);
   at::Tensor ones_b = torch::ones({N}, opts_f32);
-  return fp8_scaled_mm(a8, b8.t(), ones_a, ones_b, torch::kBFloat16, c10::nullopt);
-}
-
-// Bare FP8 GEMM (scales_b=1, no colscale) -> bf16 output for unfused post-op
-// paths (#2 gelu_fp8, #3 residual_bf16, #4 residual_ln_to_fp8).
-inline at::Tensor sgl_linear_rcr_fp8_bare(
-    const void* a8_ptr, const void* b8_ptr,
-    int M, int K, int N) {
-  auto opts_fp8 = torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA);
-  auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-  at::Tensor a8 = torch::from_blob(const_cast<void*>(a8_ptr), {M, K}, opts_fp8);
-  at::Tensor b8 = torch::from_blob(const_cast<void*>(b8_ptr), {N, K}, opts_fp8);
-  at::Tensor ones_a = torch::ones({M}, opts_f32);
-  at::Tensor ones_b = torch::ones({N}, opts_f32);
-  return fp8_scaled_mm(a8, b8.t(), ones_a, ones_b, torch::kBFloat16, c10::nullopt);
+  return fp8_scaled_mm(a8, b8.t(), ones_a, ones_b, torch::kFloat16, c10::nullopt);
 }
 }  // namespace omnidreams_singleview

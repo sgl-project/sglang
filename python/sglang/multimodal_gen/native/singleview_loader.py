@@ -348,17 +348,18 @@ def load_extension(
             return _extension
         _extension_load_error = None
 
-        # Fast path: prebuilt .so already exists
-        prebuilt = _load_prebuilt_extension()
-        if prebuilt is not None:
-            _extension = prebuilt
-            return _extension
-
         try:
-            from torch.utils.cpp_extension import load as load_torch_extension
-
             thirdparty_info = validate_thirdparty()
             extension_name = _extension_name(thirdparty_info)
+
+            # Fast path: prebuilt .so for the current source fingerprint.
+            prebuilt = _load_prebuilt_extension(extension_name)
+            if prebuilt is not None:
+                _extension = prebuilt
+                return _extension
+
+            from torch.utils.cpp_extension import load as load_torch_extension
+
             cutlass_dir = Path(thirdparty_info["cutlass"]["path"])
             cutlass_include = cutlass_dir / "include"
             cudnn_frontend_include = (
@@ -511,8 +512,8 @@ def load_extension(
                 )
         except Exception as exc:  # pragma: no cover - environment-specific build path
             _extension_load_error = exc
-            # Fallback: try loading a previously compiled .so
-            _extension = _load_prebuilt_extension()
+            # Fallback: try loading the expected source-fingerprint-matched .so.
+            _extension = _load_prebuilt_extension(locals().get("extension_name"))
             if _extension is not None:
                 _extension_load_error = None
                 return _extension
@@ -538,7 +539,7 @@ def _thirdparty_info_no_validation() -> dict[str, Any]:
     return info
 
 
-def _load_prebuilt_extension() -> ModuleType | None:
+def _load_prebuilt_extension(extension_name: str | None = None) -> ModuleType | None:
     """Try to load a previously compiled .so from the build directory."""
     # Add pip CUDA + torch lib paths so the prebuilt .so can resolve
     # libcudnn.so.9 and libc10.so at load time.
@@ -559,8 +560,19 @@ def _load_prebuilt_extension() -> ModuleType | None:
                 os.environ["LD_LIBRARY_PATH"] = lib + ":" + _existing
 
     build_dir = _ROOT / "build" / "torch_extensions"
-    for pattern in ("omnidreams_singleview_native_*/omnidreams*.so",
-                     "*/omnidreams*.so"):
+    # Prefer a fingerprint-matched .so (dir name == _extension_name()), but fall
+    # back to the wide globs: torch's build hash can diverge from _extension_name()
+    # (e.g. an existing .so built by a prior source version), and without the
+    # fallback load_extension() would miss a perfectly valid cached .so and
+    # trigger a multi-minute JIT rebuild (or return None when rebuild is skipped).
+    patterns: list[str] = []
+    if extension_name:
+        patterns.append(f"{extension_name}/{extension_name}.so")
+    patterns.extend((
+        "omnidreams_singleview_native_*/omnidreams*.so",
+        "*/omnidreams*.so",
+    ))
+    for pattern in patterns:
         candidates = sorted(glob.glob(str(build_dir / pattern)))
         for so_path in candidates:
             try:

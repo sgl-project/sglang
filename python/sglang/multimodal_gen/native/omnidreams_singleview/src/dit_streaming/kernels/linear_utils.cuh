@@ -84,9 +84,10 @@ static inline cudaError_t apply_linear_row(
       }
       return cudaSuccess;
     }
-    // sgl-kernel bare FP8 GEMM (no prescale) + col_scale_bias post-op.
+    // sgl-kernel bare FP8 GEMM with prescale + col_scale_bias post-op.
     at::Tensor _s = omnidreams_singleview::sgl_linear_rcr_fp8_bare(
-        fp8_buf, const_cast<cutlass::float_e4m3_t*>(weight), M, in_features, out_features);
+        fp8_buf, const_cast<cutlass::float_e4m3_t*>(weight), M, in_features, out_features,
+        k_fp8_linear_prescale_alpha);
     cudaMemcpyAsync(output_row, _s.data_ptr(),
                     _s.numel() * _s.element_size(), cudaMemcpyDeviceToDevice, stream);
     return apply_col_scale_bias(
@@ -95,7 +96,7 @@ static inline cudaError_t apply_linear_row(
       reinterpret_cast<const cutlass::half_t*>(bias),
       M, out_features,
       stream,
-      1.0f);
+      k_fp8_linear_scale_mul);
   } else {
     static_assert(std::is_same<WeightT, int8_t>::value || std::is_same<WeightT, cutlass::half_t>::value || std::is_same<WeightT, cutlass::float_e4m3_t>::value,
                   "Unsupported WeightT");
@@ -224,9 +225,10 @@ static inline cudaError_t apply_linear_row_gelu(
         stream,
         1.0f);
     }
-    // sgl-kernel bare FP8 GEMM (no prescale) + col_scale_bias_gelu post-op.
+    // sgl-kernel bare FP8 GEMM with prescale + col_scale_bias_gelu post-op.
     at::Tensor _s = omnidreams_singleview::sgl_linear_rcr_fp8_bare(
-        fp8_buf, const_cast<cutlass::float_e4m3_t*>(weight), M, in_features, out_features);
+        fp8_buf, const_cast<cutlass::float_e4m3_t*>(weight), M, in_features, out_features,
+        k_fp8_linear_prescale_alpha);
     cudaMemcpyAsync(output_row, _s.data_ptr(),
                     _s.numel() * _s.element_size(), cudaMemcpyDeviceToDevice, stream);
     if (fp8_next_input) {
@@ -237,7 +239,7 @@ static inline cudaError_t apply_linear_row_gelu(
         reinterpret_cast<const cutlass::half_t*>(bias),
         M, out_features,
         stream,
-        1.0f);
+        k_fp8_linear_scale_mul);
     }
     return apply_col_scale_bias_gelu(
       reinterpret_cast<cutlass::half_t*>(output_row),
@@ -245,7 +247,7 @@ static inline cudaError_t apply_linear_row_gelu(
       reinterpret_cast<const cutlass::half_t*>(bias),
       M, out_features,
       stream,
-      1.0f);
+      k_fp8_linear_scale_mul);
   } else {
     static_assert(std::is_same<WeightT, int8_t>::value || std::is_same<WeightT, cutlass::half_t>::value || std::is_same<WeightT, cutlass::float_e4m3_t>::value,
                   "Unsupported WeightT");
@@ -376,9 +378,10 @@ static inline cudaError_t apply_linear_row_fused_residual(
         1.0f);
     }
     if (temp_out == nullptr) return cudaErrorInvalidValue;
-    // sgl-kernel bare FP8 GEMM (no prescale) + col_scale_bias_residual post-op.
+    // sgl-kernel bare FP8 GEMM with prescale + col_scale_bias_residual post-op.
     at::Tensor _s = omnidreams_singleview::sgl_linear_rcr_fp8_bare(
-        fp8_buf, const_cast<cutlass::float_e4m3_t*>(weight), M, in_features, out_features);
+        fp8_buf, const_cast<cutlass::float_e4m3_t*>(weight), M, in_features, out_features,
+        k_fp8_linear_prescale_alpha);
     cudaMemcpyAsync(temp_out, _s.data_ptr(),
                     _s.numel() * _s.element_size(), cudaMemcpyDeviceToDevice, stream);
     return apply_col_scale_bias_residual(
@@ -388,7 +391,7 @@ static inline cudaError_t apply_linear_row_fused_residual(
       reinterpret_cast<const cutlass::half_t*>(bias),
       M, out_features,
       stream,
-      1.0f);
+      k_fp8_linear_scale_mul);
   } else {
     static_assert(std::is_same<WeightT, int8_t>::value || std::is_same<WeightT, cutlass::half_t>::value || std::is_same<WeightT, cutlass::float_e4m3_t>::value,
                   "Unsupported WeightT");

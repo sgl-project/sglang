@@ -16,6 +16,8 @@ the vendored tree is absent.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -27,6 +29,15 @@ def _load_helper(name: str):
         return load_python_module(name)
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"vendored native helper {name!r} unavailable: {e}")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[5]
+
+
+def _read_src(*parts: str) -> str:
+    """Read a sglang-diffusion source file (path relative to python/sglang/multimodal_gen)."""
+    return (_repo_root() / "python" / "sglang" / "multimodal_gen" / Path(*parts)).read_text()
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +127,211 @@ def test_fp8_linear_keys_compatible_with_sglang_dit():
     }
     missing = [k for k in non_self_attn_proj if k not in sgl_keys]
     assert not missing, f"SGLang DiT missing FP8 linear keys: {missing[:5]}"
+
+
+def _fake_fused_dit_state_dict(num_blocks: int, *, qdim: int = 64, inner: int = 48):
+    """Minimal bf16 state dict mimicking the post-to_qkv-refactor OmniDreamsDiT.
+
+    Self-attn Q/K/V is fused into ``to_qkv`` (q,k,v row order); cross-attn K/V
+    is fused into ``to_kv`` (unused by Cosmos FP8 prep, must pass through).
+    """
+    torch.manual_seed(0)
+    sd: dict[str, torch.Tensor] = {}
+    for i in range(num_blocks):
+        p = f"blocks.{i}."
+        q = torch.randn(inner, qdim, dtype=torch.bfloat16)
+        k = torch.randn(inner, qdim, dtype=torch.bfloat16)
+        v = torch.randn(inner, qdim, dtype=torch.bfloat16)
+        sd[p + "self_attn.to_qkv.weight"] = torch.cat([q, k, v], dim=0).contiguous()
+        sd[p + "self_attn.output_proj.weight"] = torch.randn(qdim, inner, dtype=torch.bfloat16)
+        sd[p + "cross_attn.q_proj.weight"] = torch.randn(inner, qdim, dtype=torch.bfloat16)
+        sd[p + "cross_attn.to_kv.weight"] = torch.randn(2 * inner, qdim, dtype=torch.bfloat16)
+        sd[p + "cross_attn.output_proj.weight"] = torch.randn(qdim, inner, dtype=torch.bfloat16)
+        sd[p + "mlp.layer1.weight"] = torch.randn(inner * 2, qdim, dtype=torch.bfloat16)
+        sd[p + "mlp.layer2.weight"] = torch.randn(qdim, inner * 2, dtype=torch.bfloat16)
+        sd[p + "self_attn.q_norm.weight"] = torch.ones(inner, dtype=torch.bfloat16)
+        sd[p + "self_attn.k_norm.weight"] = torch.ones(inner, dtype=torch.bfloat16)
+        sd[p + "cross_attn.k_norm.weight"] = torch.ones(inner, dtype=torch.bfloat16)
+    return sd
+
+
+def test_prepare_fp8_dit_weights_unfuses_to_qkv_into_qkv_proj():
+    """The offline exporter must accept the post-refactor fused ``to_qkv`` DiT
+    state dict (commit 5dff6576c merged self-attn q/k/v into MergedColumnParallelLinear).
+
+    Before the fix ``prepare_fp8_dit_weights`` raised KeyError on the missing
+    split ``q_proj``; now it unfuses ``to_qkv`` -> q/k/v, lets the vendored
+    Cosmos prep rebuild ``qkv_proj`` (fp8), and drops the dead ``to_qkv``.
+    """
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        prepare_fp8_dit_weights,
+    )
+
+    nb = 2
+    inner = 48  # matches _fake_fused_dit_state_dict default
+    sd = _fake_fused_dit_state_dict(nb)
+    fused_snapshot = {i: sd[f"blocks.{i}.self_attn.to_qkv.weight"].clone() for i in range(nb)}
+
+    out = prepare_fp8_dit_weights(sd, num_blocks=nb, linear_policy="all")
+
+    for i in range(nb):
+        # to_qkv dropped (dead bf16 must not ship in the fp8 artifact).
+        assert f"blocks.{i}.self_attn.to_qkv.weight" not in out
+        # rebuilt fused qkv_proj is fp8 with a per-out-channel scale.
+        qk = f"blocks.{i}.self_attn.qkv_proj.weight"
+        sk = qk + "_scale"
+        assert out[qk].dtype == torch.uint8, f"{qk} not fp8"
+        assert tuple(out[sk].shape) == (out[qk].shape[0],)
+        # split q/k/v are NOT retained (default drops them in favor of qkv_proj).
+        for rel in ("q_proj", "k_proj", "v_proj"):
+            assert f"blocks.{i}.self_attn.{rel}.weight" not in out
+        # dequant recovers the original to_qkv within e4m3 precision, with the
+        # q/k/v shard boundaries intact (q rows 0..inner, k inner..2*inner, ...).
+        deq = (
+            out[qk].view(torch.float8_e4m3fn).to(torch.float32)
+            * out[sk].to(torch.float32).unsqueeze(1)
+        )
+        orig = fused_snapshot[i].to(torch.float32)
+        assert (deq - orig).abs().max().item() < 1.0, f"block {i} dequant drift"
+        assert torch.allclose(deq[:inner], orig[:inner], atol=1.0)
+
+
+def test_prepare_fp8_dit_weights_unfused_matches_split_path_bytes():
+    """Per-output-channel FP8 scales are row-independent, so unfusing to_qkv
+    then quantizing must be byte-identical to the pre-refactor split-q/k/v path
+    (the artifact sglang currently ships). Guards against a regression that
+    changes the unfuse shard order or re-introduces a stale-weight mismatch."""
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
+        _unfuse_self_attn_qkv_for_cosmos,
+        prepare_fp8_dit_weights,
+    )
+
+    nb = 2
+    fused = _fake_fused_dit_state_dict(nb)
+    # Pre-refactor equivalent: split to_qkv back into q/k/v BEFORE prep (bypass
+    # the unfuse inside prepare_fp8_dit_weights by feeding already-split input
+    # that has no to_qkv key).
+    split = _unfuse_self_attn_qkv_for_cosmos(dict(fused))
+
+    got_fused = prepare_fp8_dit_weights(dict(fused), num_blocks=nb, linear_policy="all")
+    got_split = prepare_fp8_dit_weights(dict(split), num_blocks=nb, linear_policy="all")
+
+    assert set(got_fused) == set(got_split)
+    for key in got_fused:
+        a, b = got_fused[key], got_split[key]
+        if isinstance(a, torch.Tensor) and a.dtype == torch.uint8:
+            assert torch.equal(a, b), f"fp8 byte mismatch: {key}"
+            sk = key + "_scale"
+            if sk in got_fused:
+                assert torch.equal(got_fused[sk], got_split[sk]), f"scale mismatch: {sk}"
+
+
+def test_sgl_fp8_colscale_wraps_half_scales_before_float_conversion():
+    """Prepared FP8 DiT weight scales are stored as fp16, so the shim must not
+    reinterpret the scale buffer as fp32 before passing it to sgl-kernel."""
+
+    source = _read_src(
+        "native", "omnidreams_singleview", "src", "dit_streaming", "kernels",
+        "sgl_gemm_shim.cuh",
+    )
+
+    assert "opts_f16 = torch::TensorOptions().dtype(torch::kFloat16)" in source
+    assert (
+        "torch::from_blob(const_cast<void*>(colscale_ptr), {N}, opts_f16).to(torch::kFloat32)"
+        in source
+    )
+    assert "torch::from_blob(const_cast<void*>(colscale_ptr), {N}, opts_f32)" not in source
+
+
+def test_sgl_fp8_bare_gemm_returns_half_for_half_post_ops():
+    """Bare FP8 GEMM feeds half scratch buffers before CUDA post-op kernels, so
+    it must return fp16 rather than bf16 bytes. The raw FP8 accumulation is
+    prescaled to avoid overflowing fp16 before the post-op scale restores it."""
+
+    source = _read_src(
+        "native", "omnidreams_singleview", "src", "dit_streaming", "kernels",
+        "sgl_gemm_shim.cuh",
+    )
+
+    bare_start = source.index("inline at::Tensor sgl_linear_rcr_fp8_bare")
+    bare_body = source[bare_start:]
+
+    assert "torch::kFloat16" in bare_body
+    assert "float prescale_alpha = 1.0f" in bare_body
+    assert "torch::full({M}, prescale_alpha, opts_f32)" in bare_body
+    assert "return fp8_scaled_mm(a8, b8.t(), ones_a, ones_b, torch::kFloat16" in bare_body
+
+
+def test_linear_utils_fp8_weight_scale_paths_prescale_before_half_post_ops():
+    """Generic FP8 linear helpers use half scratch post-op kernels too; every
+    weight_scale fallback must prescale the raw FP8 GEMM and compensate in the
+    post-op scale multiplier."""
+
+    source = _read_src(
+        "native", "omnidreams_singleview", "src", "dit_streaming", "kernels",
+        "linear_utils.cuh",
+    )
+
+    assert "(no prescale)" not in source
+    assert source.count("k_fp8_linear_prescale_alpha") >= 4
+    assert source.count("k_fp8_linear_scale_mul") >= 4
+
+
+def test_native_loader_prebuilt_fast_path_is_fingerprint_scoped():
+    """The native loader must not load arbitrary stale extension hashes when the
+    source fingerprint changes."""
+
+    source = _read_src("native", "singleview_loader.py")
+
+    assert "prebuilt = _load_prebuilt_extension(extension_name)" in source
+    assert 'f"{extension_name}/{extension_name}.so"' in source
+    assert "_load_prebuilt_extension(locals().get(\"extension_name\"))" in source
+
+
+def test_streaming_dit_fp8_test_helpers_use_same_prescale_contract():
+    """Native test helpers should exercise the same prescaled bare-GEMM contract
+    as the production FP8 paths."""
+
+    source = _read_src(
+        "native", "omnidreams_singleview", "src", "dit_streaming", "pyext",
+        "streaming_dit_bridge.cu",
+    )
+
+    assert source.count("N, in_features, out_features, prescale_alpha") >= 3
+    assert "N, in_features, out_features, 1.0f / 128.0f" in source
+    assert source.count("output_scale_mul") >= 4
+
+
+def test_streaming_dit_fp8_attention_test_helpers_are_exported():
+    """Attention probes are needed to isolate native FP8 quality regressions."""
+
+    source = _read_src(
+        "native", "omnidreams_singleview", "src", "dit_streaming",
+        "streaming_dit_bindings.cpp",
+    )
+
+    for name in (
+        "cosmos_test_fp8_sdpa_selection",
+        "cosmos_test_fp8_dense_ref_sdpa",
+        "cosmos_test_fp8_cudnn_sdpa",
+        "cosmos_test_fp8_attention_backend",
+    ):
+        assert f'"{name}"' in source
+
+
+def test_sglang_fp8_wrapper_uses_fp8_runtime_contract():
+    """The SGLang fast-path wrapper bypasses the vendored executor's
+    _ensure_fp8_runtime(), so it must inject the same FP8 attention/KV config.
+    """
+
+    source = _read_src("runtime", "models", "dits", "omnidreams_fp8.py")
+
+    assert 'else "fp8_cudnn"' in source
+    assert '"cosmos_kv_cache_backend": "fp8"' in source
+    assert '"cosmos_attn_tc_scale_is_ones": True' in source
+    assert '"cosmos_quantized_prepared_strict": True' in source
+    assert 'extra_config["k_self_fp8_caches"]' in source
+    assert '_PY_TO_CPP_ATTN = {"cudnn": "cudnn_bf16"}' not in source
 
 
 # --------------------------------------------------------------------------- #

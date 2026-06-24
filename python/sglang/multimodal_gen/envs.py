@@ -46,6 +46,13 @@ if TYPE_CHECKING:
     SGLANG_OMNIDREAMS_LIGHTVAE_FP8_STATE_PATH: str | None = None
     # OmniDreams: path to W8A8 FP8 text encoder (compressed-tensors format).
     SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH: str | None = None
+    # OmniDreams: after the native FP8 executor is built and the pre-quantized
+    # weights + cross-attn KV are materialized, move the live BF16 DiT params
+    # to CPU to free ~4.1 GiB of GPU VRAM. Mirrors flashdreams'
+    # _release_network_after_fp8_snapshot intent, adapted to sglang's wiring
+    # (the stage still holds the DiT object for patchify/unpatchify, which are
+    # pure einops reshapes with no parameter reads). Default off; set to 1.
+    SGLANG_OMNIDREAMS_FP8_RELEASE_LIVE_DIT: bool = False
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -281,6 +288,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OmniDreams: W8A8 FP8 text encoder (compressed-tensors format) path.
     "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH": _lazy_str(
         "SGLANG_OMNIDREAMS_TEXT_ENCODER_FP8_PATH"
+    ),
+    # OmniDreams: move the live BF16 DiT to CPU after the FP8 executor is built.
+    "SGLANG_OMNIDREAMS_FP8_RELEASE_LIVE_DIT": _lazy_bool(
+        "SGLANG_OMNIDREAMS_FP8_RELEASE_LIVE_DIT"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.

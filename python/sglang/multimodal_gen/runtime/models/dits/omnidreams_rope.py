@@ -73,6 +73,13 @@ class RotaryPositionEmbedding3D:
                 w_extrapolation_ratio,
             ],
         )
+        # Per-axis NTK extrapolation ratios, reused by shift_t_freqs (the
+        # shared NDRotaryEmbedding.build_freqs drops theta_rescale_factor).
+        self._extrapolation_ratios = (
+            t_extrapolation_ratio,
+            h_extrapolation_ratio,
+            w_extrapolation_ratio,
+        )
 
     def _positions(self, autoregressive_index: int) -> Tensor:
         """``[L, 3]`` (t, h, w) integer coordinates in (t h w) flatten order."""
@@ -99,22 +106,34 @@ class RotaryPositionEmbedding3D:
         ``_make_cosmos_rope_cache``), so it needs the raw frequency×position
         angles rather than the precomputed cos|sin cache returned by
         :meth:`shift_t`.
+
+        Matches flashdreams ``RotaryPositionEmbedding3D.shift_t``: per-axis
+        NTK-rescaled base frequencies (``_compute_freqs``) concatenated with
+        the non-interleaved ``[t, h, w, t, h, w]`` layout (``_cat_freqs``).
+        The shared ``NDRotaryEmbedding.build_freqs`` deliberately drops
+        ``theta_rescale_factor`` (see mrope.py), so the rescale is applied
+        here; using ``build_freqs`` directly produced the wrong layout
+        (``[t, t, h, h, w, w]``) AND dropped the h/w NTK extrapolation,
+        which corrupted the native FP8 RoPE and caused blur.
         """
         pos = self._positions(autoregressive_index)  # [L, 3] (t, h, w)
         dim_t, dim_h, dim_w = rope_dims(self.head_dim)
-        parts: list[Tensor] = []
+        ratios = self._extrapolation_ratios  # (t, h, w)
+        halves: list[Tensor] = []
         for axis_idx, axis_dim in enumerate((dim_t, dim_h, dim_w)):
-            gen = self._rope.rope_generators[self._rope.dim_idx_to_gen_idx[axis_idx]]
-            pos_i = pos[:, axis_idx].to(gen.dtype) * gen.interpolation_factor
-            base_freqs = gen.build_freqs(pos.device)  # [dim/2]
-            angles = torch.outer(pos_i, base_freqs)  # [L, dim/2]
-            # Duplicate for NeoX non-interleaved layout: (d, d+dim/2) pair.
-            if gen.use_real and gen.repeat_interleave_real:
-                angles = angles.repeat_interleave(2, dim=1)
-            else:
-                angles = torch.cat([angles, angles], dim=-1)  # [L, dim]
-            parts.append(angles)
-        raw = torch.cat(parts, dim=-1)  # [L, D]
+            ratio = ratios[axis_idx]
+            theta = 10000.0
+            if ratio != 1.0:
+                theta = theta * (ratio ** (axis_dim / (axis_dim - 2)))
+            dim_range = torch.arange(
+                0, axis_dim, 2, dtype=torch.float32, device=pos.device
+            )[: axis_dim // 2] / axis_dim
+            base_freqs = 1.0 / (theta**dim_range)  # [dim//2]
+            angles = torch.outer(pos[:, axis_idx].float(), base_freqs)  # [L, dim//2]
+            halves.append(angles)
+        ft, fh, fw = halves
+        # Non-interleaved _cat_freqs: cat([t, h, w] * 2) -> [L, D].
+        raw = torch.cat([ft, fh, fw, ft, fh, fw], dim=-1)
         return raw.unsqueeze(1).unsqueeze(1)  # [L, 1, 1, D]
 
 

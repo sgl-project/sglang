@@ -49,6 +49,13 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Version of the export tool (stored in meta for compatibility checks)",
     )
+    parser.add_argument(
+        "--keep-bf16-prepared",
+        action="store_true",
+        help="Retain the BF16 .weight_prepared (transposed) aliases. By default "
+        "they are dropped (~44%% smaller artifact) since the FP8 runtime never "
+        "reads them. Keep them only if the .pt will also feed the BF16-native path.",
+    )
     return parser.parse_args()
 
 
@@ -64,12 +71,28 @@ def _load_and_fuse_dit(checkpoint_path: Path) -> Any:
     import torch
 
     from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        maybe_init_distributed_environment_and_model_parallel,
+        model_parallel_is_initialized,
+    )
     from sglang.multimodal_gen.runtime.loader.fsdp_load import (
         load_model_from_full_model_state_dict,
         set_default_torch_dtype,
     )
     from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
     from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
+
+    # OmniDreamsDiT.__init__ builds MergedColumnParallelLinear (to_qkv / to_kv)
+    # which calls get_tp_world_size(); the TP group must be initialized first.
+    # Export is always single-process (TP=1, full unsharded weights), so set the
+    # env:// rendezvous vars the way the test conftest does.
+    if not model_parallel_is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29505")
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
     dit_config = OmniDreamsDiTConfig()
     with set_default_torch_dtype(torch.bfloat16), torch.device("meta"):
@@ -135,11 +158,24 @@ def main() -> None:
     )
     del cpu_state
 
+    # Drop the BF16 ``.weight_prepared`` (transposed) aliases: the native FP8
+    # runtime runs with cosmos_quantized_prepared=True, under which the C++ path
+    # uses the ``_fp8_prepared`` uint8 tensors and never touches ``.weight_prepared``
+    # (cosmos_block.cu only reads weight_prepared when !use_fp8). They are ~44%
+    # of the artifact (3.3 GB of bf16 transposes) and pure dead weight on the FP8
+    # path. Pass --keep-bf16-prepared to retain them for a BF16-native fallback .pt.
+    if not args.keep_bf16_prepared:
+        dropped = [k for k in fp8_weights if k.endswith(".weight_prepared")]
+        for k in dropped:
+            del fp8_weights[k]
+        print(f"Dropped {len(dropped)} redundant BF16 .weight_prepared aliases.")
+
     fingerprint = _get_checkpoint_fingerprint(checkpoint_path)
     meta = {
         "export_tool_version": export_tool_version,
         "checkpoint_fingerprint": fingerprint,
         "num_blocks": num_blocks,
+        "dropped_bf16_prepared": not args.keep_bf16_prepared,
     }
 
     num_keys = len(fp8_weights)
@@ -148,6 +184,7 @@ def main() -> None:
     torch.save({"weights": fp8_weights, "meta": meta}, output_path)
     print(f"Done. Export saved to {output_path}")
     print(f"  Fingerprint: size={fingerprint['file_size']}, mtime={fingerprint['mtime']}")
+    print(f"  dropped_bf16_prepared={not args.keep_bf16_prepared}")
 
 
 if __name__ == "__main__":

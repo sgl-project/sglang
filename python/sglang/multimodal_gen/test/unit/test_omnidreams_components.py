@@ -99,6 +99,125 @@ def test_shift_t_advances_only_time_frequencies():
     assert torch.allclose(f0[:, 64 + dt :], f1[:, 64 + dt :])  # sin_h | sin_w
 
 
+# ---- shift_t_freqs (native FP8 raw-angle path) regression guards ------------ #
+# These pin the fp8 blur root cause (2026-06-24): shift_t_freqs must reproduce
+# flashdreams' shift_t — per-axis NTK-rescaled base freqs + non-interleaved
+# [t, h, w, t, h, w] _cat_freqs layout. The prior implementation used
+# NDRotaryEmbedding.build_freqs (which drops theta_rescale_factor) and a
+# [t, t, h, h, w, w] layout, corrupting the C++ RoPE and collapsing AR frames
+# (Laplacian rest-mean 1.7 vs eager 56.8). See
+# docs/superpowers/omnidreams_fp8_blur_investigation.md §12-13.
+def _fd_reference_shift_t_freqs(
+    *, head_dim, len_h, len_w, len_t, ratios, ar_idx=0, device="cpu"
+):
+    """Flashdreams ``RotaryPositionEmbedding3D.shift_t`` reference: per-axis
+    NTK-rescaled base frequencies (``_compute_freqs``) concatenated with the
+    non-interleaved ``[t, h, w, t, h, w]`` layout (``_cat_freqs``). This is the
+    contract the native FP8 C++ ``_make_cosmos_rope_cache`` consumes."""
+    dim_t, dim_h, dim_w = rope_dims(head_dim)
+
+    def _freqs(dim, ratio):
+        dim_range = torch.arange(0, dim, 2, dtype=torch.float32, device=device)[
+            : dim // 2
+        ] / dim
+        theta = 10000.0 * (ratio ** (dim / (dim - 2)))
+        return 1.0 / (theta**dim_range)
+
+    rt, rh, rw = ratios
+    t = torch.arange(len_t, device=device) + ar_idx * len_t
+    h = torch.arange(len_h, device=device)
+    w = torch.arange(len_w, device=device)
+    tt, hh, ww = torch.meshgrid(t, h, w, indexing="ij")
+    ft = torch.outer(tt.reshape(-1).float(), _freqs(dim_t, rt))
+    fh = torch.outer(hh.reshape(-1).float(), _freqs(dim_h, rh))
+    fw = torch.outer(ww.reshape(-1).float(), _freqs(dim_w, rw))
+    raw = torch.cat([ft, fh, fw, ft, fh, fw], dim=-1)  # [L, D]
+    return raw.unsqueeze(1).unsqueeze(1)  # [L, 1, 1, D]
+
+
+def _rope_axis_slices(head_dim=128):
+    """Index ranges for the non-interleaved ``[t, h, w, t, h, w]`` layout.
+
+    Returns ``(t_slice, h_slice, w_slice, (ht, hh, hw, mid))`` where ``mid`` is
+    the half-width (``ht + hh + hw``); the second copy of each axis starts at
+    ``mid``.
+    """
+    dim_t, dim_h, dim_w = rope_dims(head_dim)
+    ht, hh, hw = dim_t // 2, dim_h // 2, dim_w // 2
+    mid = ht + hh + hw
+    return slice(0, ht), slice(ht, ht + hh), slice(ht + hh, mid), (ht, hh, hw, mid)
+
+
+def test_shift_t_freqs_matches_fd_reference_formula():
+    # Golden: shift_t_freqs must equal flashdreams' shift_t exactly. The old
+    # implementation diverged (cos~0.64 vs fd) via wrong layout + dropped NTK.
+    emb = RotaryPositionEmbedding3D(
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
+        t_extrapolation_ratio=1.0,
+    )
+    for ar in (0, 1, 2):
+        got = emb.shift_t_freqs(ar)
+        ref = _fd_reference_shift_t_freqs(
+            head_dim=128,
+            len_h=4,
+            len_w=5,
+            len_t=2,
+            ratios=(1.0, 3.0, 3.0),
+            ar_idx=ar,
+        )
+        assert got.shape == ref.shape == (2 * 4 * 5, 1, 1, 128)
+        assert torch.allclose(got, ref, atol=1e-5), f"ar={ar} diverged from fd reference"
+
+
+def test_shift_t_freqs_uses_noninterleaved_cat_freqs_layout():
+    # Layout must be [t, h, w, t, h, w] (fd _cat_freqs non-interleaved): each
+    # axis's second copy sits at [mid:mid+ax], NOT adjacent to its first copy.
+    # The buggy [t, t, h, h, w, w] layout would fail the mid-offset equality.
+    emb = RotaryPositionEmbedding3D(head_dim=128, len_h=4, len_w=5, len_t=2)
+    raw = emb.shift_t_freqs(0).reshape(-1, 128)
+    t_sl, h_sl, w_sl, (ht, hh, hw, mid) = _rope_axis_slices()
+    assert torch.equal(raw[:, 0:ht], raw[:, mid : mid + ht])  # ft first == second
+    assert torch.equal(raw[:, ht : ht + hh], raw[:, mid + ht : mid + ht + hh])  # fh
+    assert torch.equal(raw[:, ht + hh : mid], raw[:, mid + ht + hh :])  # fw
+
+
+def test_shift_t_freqs_applies_h_w_ntk_extrapolation():
+    # The h/w NTK rescale (theta *= ratio**(dim/(dim-2))) must be applied. The
+    # old code called build_freqs which DROPS theta_rescale_factor, leaving h/w
+    # angles identical regardless of the extrapolation ratio.
+    r1 = RotaryPositionEmbedding3D(
+        head_dim=128, len_h=4, len_w=5, len_t=2,
+        h_extrapolation_ratio=1.0, w_extrapolation_ratio=1.0,
+    )
+    r3 = RotaryPositionEmbedding3D(
+        head_dim=128, len_h=4, len_w=5, len_t=2,
+        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+    )
+    f1 = r1.shift_t_freqs(0).reshape(-1, 128)
+    f3 = r3.shift_t_freqs(0).reshape(-1, 128)
+    t_sl, h_sl, w_sl, _ = _rope_axis_slices()
+    assert torch.equal(f1[:, t_sl], f3[:, t_sl])  # t ratio=1.0 both -> unchanged
+    assert not torch.allclose(f1[:, h_sl], f3[:, h_sl])  # h rescale changes angles
+    assert not torch.allclose(f1[:, w_sl], f3[:, w_sl])  # w rescale changes angles
+
+
+def test_shift_t_freqs_advances_only_time_frequencies():
+    # Mirror of test_shift_t_advances_only_time_frequencies for the fp8 raw-angle
+    # path: advancing the AR index shifts only the t band; h/w are unchanged.
+    emb = RotaryPositionEmbedding3D(head_dim=128, len_h=4, len_w=5, len_t=2)
+    f0 = emb.shift_t_freqs(0).reshape(-1, 128)
+    f1 = emb.shift_t_freqs(1).reshape(-1, 128)
+    t_sl, h_sl, w_sl, _ = _rope_axis_slices()
+    assert not torch.allclose(f0[:, t_sl], f1[:, t_sl])  # t advances
+    assert torch.equal(f0[:, h_sl], f1[:, h_sl])  # h unchanged
+    assert torch.equal(f0[:, w_sl], f1[:, w_sl])  # w unchanged
+
+
 # ----------------------------------------------------------------- KV cache -- #
 def _chunk(val, B=1, n=2, d=3, size=2):
     t = torch.full((B, size, n, d), float(val))

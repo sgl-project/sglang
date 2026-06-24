@@ -64,6 +64,47 @@ def _load_native(mode: str = "auto") -> _NativeHandles | None:
 # --------------------------------------------------------------------------- #
 # FP8 weight preparation (CPU-runnable)                                       #
 # --------------------------------------------------------------------------- #
+def _unfuse_self_attn_qkv_for_cosmos(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Split fused ``self_attn.to_qkv`` back into q/k/v for the vendored Cosmos prep.
+
+    The sglang OmniDreamsDiT stores self-attention Q/K/V as a single
+    ``MergedColumnParallelLinear`` (``to_qkv`` = ``cat([q, k, v], dim=0)``,
+    q/k/v row order -- see ``OmniDreamsAttention.__init__``), but the vendored
+    Cosmos weight-prep / FP8-quant helpers
+    (``prepare_cosmos_streaming_weights``, ``quantize_cosmos_fp8_weights``)
+    expect the legacy split ``q_proj``/``k_proj``/``v_proj`` keys. This splits
+    the fused weight back into three equal row shards so those helpers run
+    unchanged and produce byte-identical artifacts to the pre-merge path:
+    per-output-channel FP8 scales are row-independent, so quantizing the fused
+    tensor then splitting == splitting then quantizing (verified EXACT on the
+    30 self-attn QKV tensors).
+
+    The fused ``to_qkv`` key is dropped from the output: the native FP8 runtime
+    consumes the rebuilt ``qkv_proj`` and does not read ``to_qkv``, so keeping
+    it would only ship ~1.3 GB of dead bf16 in the artifact.
+    """
+    suffix = "self_attn.to_qkv.weight"
+    fused_keys = [k for k in state_dict if k.endswith(suffix)]
+    if not fused_keys:
+        return state_dict
+    out = dict(state_dict)
+    for fused_key in fused_keys:
+        prefix = fused_key[: -len(suffix)]  # "blocks.{i}."
+        fused = out.pop(fused_key)
+        if fused.dim() != 2 or fused.shape[0] % 3 != 0:
+            raise ValueError(
+                f"cannot split {fused_key!r} (shape {tuple(fused.shape)}) into "
+                "3 equal q/k/v row shards"
+            )
+        q_weight, k_weight, v_weight = torch.chunk(fused, 3, dim=0)
+        out[f"{prefix}self_attn.q_proj.weight"] = q_weight.contiguous()
+        out[f"{prefix}self_attn.k_proj.weight"] = k_weight.contiguous()
+        out[f"{prefix}self_attn.v_proj.weight"] = v_weight.contiguous()
+    return out
+
+
 def prepare_fp8_dit_weights(
     state_dict: dict[str, torch.Tensor],
     num_blocks: int,
@@ -75,6 +116,10 @@ def prepare_fp8_dit_weights(
         from sglang.multimodal_gen.native.singleview_loader import load_python_module
         cosmos_fp8_utils = load_python_module("cosmos_fp8_utils")
     cpu_state = {k: v.detach().cpu() for k, v in state_dict.items()}
+    # sglang's DiT fuses self-attn Q/K/V into ``to_qkv``; the vendored Cosmos
+    # prep/quant helpers expect the legacy split q/k/v keys. Unfuse first so
+    # they run unchanged (see _unfuse_self_attn_qkv_for_cosmos).
+    cpu_state = _unfuse_self_attn_qkv_for_cosmos(cpu_state)
     return cosmos_fp8_utils.prepare_cosmos_quantized_streaming_weights(
         cpu_state, num_blocks=num_blocks, device=None, linear_policy=linear_policy,
     )
@@ -224,6 +269,45 @@ class OmniDreamsFP8DiT:
         # _ensure_executor at first __call__, when the device is known.
         self._prepared_weights = fp8_prepared_weights
 
+    @staticmethod
+    def _move_prepared_weights_to_device(
+        prepared: dict[str, Any], device: torch.device
+    ) -> dict[str, Any]:
+        """Move the CPU FP8 weight dict to GPU, preserving storage sharing.
+
+        ``cosmos_fp8_utils.add_cosmos_fp8_prepared_aliases`` sets each
+        ``{key}_fp8_prepared`` alias to ``weight.contiguous()`` -- i.e. the
+        *same bytes* as the canonical ``{key}`` (same for the scale alias).
+        A naive ``{k: v.to(device).contiguous() for k, v in ...}`` moves each
+        tensor independently and breaks that storage sharing, duplicating the
+        ~1.6 GiB of FP8 weights (and the C++ bridge reads the alias, not the
+        canonical). Preserve sharing by moving the canonical first and pointing
+        the alias at the same on-GPU tensor.
+        """
+        alias_suffixes = ("_fp8_prepared", "_fp8_prepared_scale")
+        moved: dict[str, Any] = {}
+        for k, v in prepared.items():
+            if not isinstance(v, torch.Tensor):
+                moved[k] = v
+                continue
+            if k.endswith(alias_suffixes):
+                # Strip the longer suffix first so "_fp8_prepared_scale" is
+                # handled before the "_fp8_prepared" substring it ends with.
+                canonical_key = k.removesuffix("_fp8_prepared_scale").removesuffix(
+                    "_fp8_prepared"
+                )
+                base = moved.get(canonical_key)
+                if (
+                    isinstance(base, torch.Tensor)
+                    and base.dtype == v.dtype
+                    and base.shape == v.shape
+                    and base.is_contiguous()
+                ):
+                    moved[k] = base  # share storage with the moved canonical
+                    continue
+            moved[k] = v.to(device=device).contiguous()
+        return moved
+
     def _ensure_executor(self, len_t: int, height: int, width: int) -> Any:
         if self._executor is None:
             adapter = _SGLTransformerAdapter(
@@ -240,12 +324,44 @@ class OmniDreamsFP8DiT:
             assert self._prepared_weights is not None, \
                 "FP8 prepared weights missing; build_fp8_dit must inject them"
             device = next(self._sgl_dit.parameters()).device
-            self._executor._optimized_weights = {
-                k: v.to(device=device).contiguous() if isinstance(v, torch.Tensor) else v
-                for k, v in self._prepared_weights.items()
-            }
+            self._executor._optimized_weights = self._move_prepared_weights_to_device(
+                self._prepared_weights, device
+            )
             self._prepared_weights = None  # release CPU ref
+
+            # Release the live BF16 DiT params from GPU VRAM. After the executor
+            # is built and the FP8 weights + cross-attn KV are materialized, the
+            # native C++ forward consumes only ``_optimized_weights`` + cache
+            # tensors; the AR loop's only other use of the DiT is
+            # ``patchify``/``unpatchify`` (pure einops reshapes, no parameter
+            # reads). This mirrors flashdreams' ``_release_network_after_fp8_snapshot``
+            # intent: the ~4.1 GiB of BF16 params are dead weight once the FP8
+            # snapshot exists. We move them to CPU (not drop the object) so the
+            # stage's ``self.transformer`` reference stays valid for
+            # patchify/unpatchify. No ``empty_cache()``: the caching allocator
+            # reuses the freed block for the C++ forward's workspace/KV, which
+            # is what actually lowers peak VRAM.
+            if envs.SGLANG_OMNIDREAMS_FP8_RELEASE_LIVE_DIT:
+                self._sgl_dit.cpu()
         return self._executor
+
+    def release_executor(self) -> None:
+        """Drop the native FP8 executor + its on-GPU weight snapshot.
+
+        After the AR rollout the executor (``_optimized_weights`` ~2 GiB of
+        FP8 weights + the native workspace/KV template refs) is dead -- the
+        DecodingStage runs the Wan VAE, which does not touch the DiT. Releasing
+        it before the decode peak lowers fp8 peak VRAM toward eager. Mirrors
+        the flashdreams "release after fp8 snapshot" intent at the stage
+        boundary. Idempotent.
+        """
+        if self._executor is not None:
+            # Drop the injected FP8 weight dict first so it frees even if the
+            # C++ side retains a ref to the executor object.
+            self._executor._optimized_weights = None
+        self._executor = None
+        self._sgl_dit = None
+        self._native = None
 
     @torch.inference_mode()
     def __call__(
@@ -306,13 +422,9 @@ class OmniDreamsFP8DiT:
         # Inject runtime config + workspace (mirrors _ensure_fp8_runtime which
         # is normally bypassed in the SGLang fast path — see call trace doc).
         ex._resolve_runtime_attention_backend(noisy.device)
-        # Map Python-side attention names to C++ bridge names
-        _PY_TO_CPP_ATTN = {"cudnn": "cudnn_bf16"}
-        attn_backend = _PY_TO_CPP_ATTN.get(ex._attention_backend, ex._attention_backend)
-        # KV cache backend: FP8 for sage3_fp8 (native FP8 attention),
-        # BF16 for cudnn_bf16 (cuDNN FMHA with BF16 KV cache).
-        use_fp8_kv = attn_backend == "sage3_fp8"
-        kv_backend = "fp8" if use_fp8_kv else "bf16"
+        use_sage3 = ex._attention_backend == "sage3_fp8"
+        use_sparge = ex._attention_backend == "sparge"
+        attn_backend = ex._attention_backend if (use_sage3 or use_sparge) else "fp8_cudnn"
         tokens = int(T * HW)
         # max_attn_tokens = max sequence length across all KV caches (self + cross)
         max_attn_tokens = tokens
@@ -330,11 +442,10 @@ class OmniDreamsFP8DiT:
             lora_dim=int(getattr(self._arch, "adaln_lora_dim", 256)),
             device=noisy.device,
             dtype=torch.bfloat16,
-            use_sage3_fp8_attention=(attn_backend == "sage3_fp8"),
+            use_sage3_fp8_attention=use_sage3,
         )
         # Build KV cache tensors in the layout the C++ bridge expects.
         # Mirrors vendored ``_ensure_fp8_runtime`` (optimized_dit.py:1203-1269).
-        use_sage3 = attn_backend == "sage3_fp8"
         extra_config: dict[str, Any] = {}
         k_cross_fp8: list[torch.Tensor] = []
         v_cross_fp8: list[torch.Tensor] = []
@@ -358,8 +469,8 @@ class OmniDreamsFP8DiT:
                 tensors[3] for tensors in sage3_cross
             ]
             # k/v_cross_fp8 stay empty: Sage3 consumes FP4 directly.
-        elif use_fp8_kv:
-            # Sparge / generic FP8 attention path.
+        else:
+            # Generic FP8 attention path: cuDNN FP8 or Sparge consumes FP8 KV.
             k_cross_fp8 = [
                 t.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
                 for t in k_cross
@@ -369,22 +480,41 @@ class OmniDreamsFP8DiT:
                 for t in v_cross
             ]
 
-        if use_fp8_kv:
-            extra_config["k_cross_fp8_caches"] = k_cross_fp8
-            extra_config["v_cross_fp8_caches"] = v_cross_fp8
-            extra_config["k_self_fp8_caches"] = [
-                torch.zeros_like(t, dtype=torch.uint8) for t in k_self
-            ]
-            extra_config["v_self_fp8_caches"] = [
-                torch.zeros_like(t, dtype=torch.uint8) for t in v_self
-            ]
+        extra_config["k_cross_fp8_caches"] = k_cross_fp8
+        extra_config["v_cross_fp8_caches"] = v_cross_fp8
+        # FP8 self-KV cache: the C++ bridge writes the current chunk's K/V at
+        # [write_start, write_start+M) and self-attention reads [0, write_start+M).
+        # The AR-context prefix [0, write_start) must already hold the previous
+        # chunks' K/V. The bf16 self-cache (k_self/v_self) carries the correctly
+        # rolled AR context (maintained by the pipeline via
+        # BlockKVCache.before_update), so re-quantize it into the fp8 cache each
+        # call. (flashdreams persists + left-rolls the fp8 cache directly; this
+        # stateless fast path re-quantizes from bf16 instead -- same result with
+        # no cross-sequence state and no accumulating fp8 roll error.)
+        extra_config["k_self_fp8_caches"] = [
+            t.to(torch.float8_e4m3fn).view(torch.uint8).contiguous() for t in k_self
+        ]
+        extra_config["v_self_fp8_caches"] = [
+            t.to(torch.float8_e4m3fn).view(torch.uint8).contiguous() for t in v_self
+        ]
+        extra_config["_last_rolled"] = {}
+        trace_tensor = None
+        if os.environ.get("SGLANG_OMNIDREAMS_FP8_TRACE"):
+            trace_tensor = torch.empty(
+                (int(self._arch.num_blocks), 4, B, tokens, D),
+                device=noisy.device,
+                dtype=torch.bfloat16,
+            )
+            extra_config["cosmos_trace_tensor"] = trace_tensor
 
         ex._apply_runtime_config({
             "cosmos_linear_backend": "fp8",
             "cosmos_attention_backend": attn_backend,
-            "cosmos_kv_cache_backend": kv_backend,
+            "cosmos_kv_cache_backend": "fp8",
             "cosmos_quantized_prepared": True,
+            "cosmos_quantized_prepared_strict": True,
             "cosmos_workspace": workspace,
+            "cosmos_attn_tc_scale_is_ones": True,
             **extra_config,
         })
 
@@ -394,7 +524,23 @@ class OmniDreamsFP8DiT:
             rope_cos, rope_sin, inv.block_mods_sa, inv.block_mods_ca, inv.block_mods_mlp,
             k_cross, v_cross, k_self, v_self, write_start,
         )
+        if trace_tensor is not None:
+            self._log_trace_std(trace_tensor)
         return out.reshape(B, L, out.shape[-1]).to(hidden_states.dtype)
+
+    @staticmethod
+    def _log_trace_std(trace_tensor: torch.Tensor) -> None:
+        """Log per-block std-dev of the native FP8 trace (debug-only)."""
+        trace_stats = trace_tensor.float().std(dim=(2, 3, 4)).detach().cpu()
+        labels = ("sa", "ca", "mlp", "block")
+        rows = []
+        for block_idx in range(trace_stats.shape[0]):
+            stats = " ".join(
+                f"{labels[j]}={float(trace_stats[block_idx, j]):.4f}"
+                for j in range(trace_stats.shape[1])
+            )
+            rows.append(f"b{block_idx:02d} {stats}")
+        logger.info("OmniDreams FP8 native trace std: %s", " | ".join(rows))
 
 
 def build_fp8_dit(

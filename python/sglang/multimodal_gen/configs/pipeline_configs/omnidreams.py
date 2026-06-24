@@ -48,9 +48,12 @@ class OmniDreamsPipelineConfig(PipelineConfig):
     task_type: ModelTaskType = ModelTaskType.I2V
     # CFG disabled for the distilled checkpoint.
     should_use_guidance: bool = False
-    # Native bf16 DiT; VAE in fp32 for numerical stability.
+    # Native bf16 DiT; VAE in bf16. Measured vs fp32: ~1.5-1.9 GiB lower peak
+    # VRAM, 20-27% faster decode, no quality regression (AR causal feature
+    # cache stays numerically continuous across chunks; 13f rest-mean 53.4 vs
+    # 52.6). Set "fp32" if you need bit-exact VAE numerics.
     dit_precision: str = "bf16"
-    vae_precision: str = "fp32"
+    vae_precision: str = "bf16"
     # Flow-match warp shift (also drives warp_flow_match_sigmas).
     flow_shift: float | None = 5.0
 

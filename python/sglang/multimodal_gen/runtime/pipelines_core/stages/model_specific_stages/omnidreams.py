@@ -132,7 +132,6 @@ def _log_omnidreams_stats(label: str, tensor: torch.Tensor) -> None:
     logger.info("\n".join(lines))
 
 
-@torch.no_grad()
 def _vae_encode_normalized(
     x: torch.Tensor,
     vae: nn.Module,
@@ -1285,6 +1284,13 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # temporal feature cache flows across chunk boundaries, yielding correct
         # continuity and FlashDreams frame counts.
         batch.latents = torch.cat(latent_chunks, dim=2)
+        # Release the native FP8 executor + its on-GPU FP8 weight snapshot now
+        # the rollout is done -- the DecodingStage (Wan VAE) does not touch the
+        # DiT, so the ~2 GiB of FP8 weights + native workspace are dead weight
+        # through the decode peak. Mirrors flashdreams' post-snapshot release.
+        if fp8_dit is not None:
+            fp8_dit.release_executor()
+            fp8_dit = None
 
         # Phase 6: SP post-process — latents may need gathering when SP is
         # eventually supported. Currently a no-op (SP is guarded at entry).
