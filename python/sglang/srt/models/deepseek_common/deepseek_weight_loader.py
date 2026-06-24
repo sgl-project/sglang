@@ -605,6 +605,35 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_vc = (
                         self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
                     )
+                # Optional (opt-in): quantize bf16 absorbed MLA weights to fp8 so
+                # forward_absorb takes the fused batched a8w8 per-token-group-prequant
+                # kernel on ROCm/gfx95 instead of bmm(q, w.to(bf16)*w_scale). Off by
+                # default: MXFP4 checkpoints keep attention in bf16 on purpose, so this
+                # changes numerics -- validate accuracy (e.g. GSM8K) before enabling.
+                if (
+                    get_bool_env_var("SGLANG_FP8_MLA_ABSORB")
+                    and _is_hip
+                    and self_attn.w_kc.dtype == torch.bfloat16
+                    and self_attn.w_vc.dtype == torch.bfloat16
+                ):
+                    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+                    # per-head (per batched-tensor) scale, shared by w_kc and w_vc
+                    amax = torch.maximum(
+                        self_attn.w_kc.abs().amax(dim=(1, 2), keepdim=True),
+                        self_attn.w_vc.abs().amax(dim=(1, 2), keepdim=True),
+                    ).clamp(min=1e-4)
+                    w_scale = (amax / fp8_max).to(torch.float32)
+                    self_attn.w_kc = (
+                        (self_attn.w_kc.float() / w_scale)
+                        .clamp(-fp8_max, fp8_max)
+                        .to(torch.float8_e4m3fn)
+                    )
+                    self_attn.w_vc = (
+                        (self_attn.w_vc.float() / w_scale)
+                        .clamp(-fp8_max, fp8_max)
+                        .to(torch.float8_e4m3fn)
+                    )
+                    self_attn.w_scale = w_scale.view(-1)
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
