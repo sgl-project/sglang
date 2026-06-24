@@ -11,18 +11,23 @@ reproduce-mode helper. The exact rule it enforces is specified in verifier-spec.
 source of truth); this module implements that file and nothing more. Runnable directly:
 
     python3 mechanical_refactor_verify_utils.py <commit>
-    python3 mechanical_refactor_verify_utils.py <base>..<tip> [--match REGEX]
+    python3 mechanical_refactor_verify_utils.py <base>..<tip> [--match REGEX] [--html OUT.html]
 
 The range form verifies every commit in the range oldest first; ``--match`` restricts it
-to commits whose subject matches the regex (e.g. ``--match -move``) and skips the rest.
+to commits whose subject matches the regex (e.g. ``--match -move:``) and skips the rest;
+``--html`` also writes a standalone, self-contained HTML report for eyeballing.
 """
 
 import ast
 import difflib
+import html
+import json
 import re
 import subprocess
 import sys
 from collections import Counter
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 
 def _git_output(args: list[str], cwd: str) -> str:
@@ -249,11 +254,26 @@ def _peel_requalifications(
     return rem_remaining, add_pool, count
 
 
-def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
-    """Certify a commit is a pure relocation. Implements verifier-spec.md exactly."""
-    root = repo_root or _repo_root()
-    removed, added = _commit_changed_lines(commit, root)
-    imports_before, imports_after = _commit_import_texts(commit, root)
+@dataclass
+class MoveCheck:
+    """The structured verdict for one commit (so the CLI text and the HTML report render
+    from the same data)."""
+
+    commit: str
+    clean: bool
+    kind: str
+    relocated: int
+    imports: list[str]
+    decorators: list[str]
+    requalified: int
+    review_diff: list[str]
+    subject: str = ""
+
+
+def _check_move(commit: str, repo_root: str) -> MoveCheck:
+    """Compute the verdict for a commit (no printing). Implements verifier-spec.md."""
+    removed, added = _commit_changed_lines(commit, repo_root)
+    imports_before, imports_after = _commit_import_texts(commit, repo_root)
 
     rem_keys = Counter(line.strip() for line in removed if line.strip())
     add_keys = Counter(line.strip() for line in added if line.strip())
@@ -276,86 +296,240 @@ def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
     nothing_changed = not removed and not added
     clean = block_matches and (relocated > 0 or nothing_changed)
 
-    print(f"commit {commit}: move check (rule: verifier-spec.md)")
-    for text in sorted(set(rem_imports + add_imports)):
-        print(f"    [import] {text}")
-    for text in sorted(set(rem_decos + add_decos)):
-        print(f"    [decorator] {text}")
-    if requalified:
-        print(f"  {requalified} call-site requalification(s) of moved symbol(s)")
     if clean and relocated > 0:
+        kind, review_diff = "CLEAN MOVE", []
+    elif clean:
+        kind, review_diff = "CLEAN (pure rename)", []
+    else:
+        kind = "NEEDS REVIEW"
+        review_diff = list(
+            difflib.unified_diff(
+                rem_signature, add_signature, "removed", "added", lineterm=""
+            )
+        )
+    return MoveCheck(
+        commit=commit,
+        clean=clean,
+        kind=kind,
+        relocated=relocated,
+        imports=sorted(set(rem_imports + add_imports)),
+        decorators=sorted(set(rem_decos + add_decos)),
+        requalified=requalified,
+        review_diff=review_diff,
+    )
+
+
+def _print_check(check: MoveCheck) -> None:
+    print(f"commit {check.commit}: move check (rule: verifier-spec.md)")
+    for text in check.imports:
+        print(f"    [import] {text}")
+    for text in check.decorators:
+        print(f"    [decorator] {text}")
+    if check.requalified:
+        print(f"  {check.requalified} call-site requalification(s) of moved symbol(s)")
+    if check.clean and check.relocated > 0:
         print(
-            f"  {relocated} line(s) relocated in order (uniform indentation shift allowed)"
+            f"  {check.relocated} line(s) relocated in order (uniform indentation shift allowed)"
         )
         print("  => CLEAN MOVE")
-    elif clean:
+    elif check.clean:
         print("  => CLEAN (pure rename; no content changed)")
     else:
         print("  the moved block is not an in-order, uniform-shift match:")
-        for line in difflib.unified_diff(
-            rem_signature,
-            add_signature,
-            fromfile="removed",
-            tofile="added",
-            lineterm="",
-        ):
+        for line in check.review_diff:
             print(f"    [review] {line}")
         print("  => NEEDS REVIEW")
-    return clean
+
+
+def verify_move_commit(commit: str, *, repo_root: str | None = None) -> bool:
+    """Certify a commit is a pure relocation. Implements verifier-spec.md exactly."""
+    check = _check_move(commit, repo_root or _repo_root())
+    _print_check(check)
+    return check.clean
 
 
 def verify_move_range(
-    rev_range: str, *, match: str | None = None, repo_root: str | None = None
+    rev_range: str,
+    *,
+    match: str | None = None,
+    html_path: str | None = None,
+    repo_root: str | None = None,
 ) -> bool:
     """Verify every commit in a git range (e.g. ``main..branch``), oldest first.
 
-    With ``match`` (a regex) only commits whose subject matches are verified; the rest
-    are skipped, so a long chain's log stays focused on, say, the ``-move`` commits.
-    Prints each verified commit's report and a final summary; returns True iff every
-    verified commit is clean.
+    With ``match`` (a regex) only commits whose subject matches are verified; the rest are
+    skipped, so a long chain's log stays focused on, say, the ``-move`` commits. With
+    ``html_path`` a standalone HTML report is also written. Prints each verified commit's
+    report and a final summary; returns True iff every verified commit is clean.
     """
     root = repo_root or _repo_root()
     commits = _git_output(["rev-list", "--reverse", rev_range], root).split()
     pattern = re.compile(match) if match else None
 
-    results: list[tuple[str, str, bool]] = []
+    checks: list[MoveCheck] = []
     skipped = 0
     for commit in commits:
         subject = _git_output(["log", "-1", "--format=%s", commit], root).strip()
         if pattern is not None and not pattern.search(subject):
             skipped += 1
             continue
-        clean = verify_move_commit(commit, repo_root=root)
+        check = _check_move(commit, root)
+        check.subject = subject
+        _print_check(check)
         print()
-        results.append((commit[:9], subject, clean))
+        checks.append(check)
 
-    n_clean = sum(1 for _, _, clean in results if clean)
+    n_clean = sum(1 for c in checks if c.clean)
     print("=" * 72)
     print(
-        f"verified {len(results)} commit(s)"
+        f"verified {len(checks)} commit(s)"
         + (f", skipped {skipped} (no subject match)" if pattern is not None else "")
-        + f": {n_clean} clean, {len(results) - n_clean} need review"
+        + f": {n_clean} clean, {len(checks) - n_clean} need review"
     )
-    for short, subject, clean in results:
-        print(f"  {'CLEAN ' if clean else 'REVIEW'}  {short}  {subject}")
-    return all(clean for _, _, clean in results)
+    for check in checks:
+        mark = "CLEAN " if check.clean else "REVIEW"
+        print(f"  {mark}  {check.commit[:9]}  {check.subject}")
+    if html_path is not None:
+        _write_verify_html(html_path, rev_range, checks)
+        print(f"html: {html_path}")
+    return all(c.clean for c in checks)
+
+
+def _write_verify_html(path: str, title: str, checks: list[MoveCheck]) -> None:
+    """Write a standalone HTML report; the data is embedded as a JSON blob and rendered by
+    the template's own JS, so the page is self-contained and offline."""
+    payload = {
+        "title": title,
+        "clean": sum(1 for c in checks if c.clean),
+        "review": sum(1 for c in checks if not c.clean),
+        "checks": [asdict(c) for c in checks],
+    }
+    data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    content = _VERIFY_HTML_TEMPLATE.replace("__TITLE__", html.escape(title)).replace(
+        "__DATA_JSON__", data_json
+    )
+    Path(path).write_text(content)
+
+
+_VERIFY_HTML_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>move verify __TITLE__</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#fff;color:#1f2328;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+header{position:sticky;top:0;z-index:2;background:#fff;border-bottom:1px solid #d1d9e0;padding:10px 16px}
+header h1{margin:0 0 4px;font-size:15px}
+#meta{font-size:12px;color:#59636e}
+#meta code{background:#f6f8fa;padding:1px 4px;border-radius:4px}
+.chip{display:inline-block;padding:1px 8px;border-radius:10px;margin-right:6px;font-size:12px}
+.chip.clean{background:#e6ffec;border:1px solid #4ac26b}
+.chip.review{background:#ffebe9;border:1px solid #ff8182}
+label.toggle{font-size:12px;color:#59636e;margin-left:8px;cursor:pointer;user-select:none}
+main{padding:8px 16px 40px}
+.card{border:1px solid #d1d9e0;border-left-width:4px;border-radius:6px;margin:8px 0}
+.card.clean{border-left-color:#4ac26b}
+.card.review{border-left-color:#ff8182}
+.hd{padding:6px 10px;cursor:pointer;font-size:13px;display:flex;align-items:center;gap:8px}
+.hd:hover{background:#f6f8fa}
+.hd .sub{overflow-wrap:anywhere}
+.badge{font-size:11px;font-weight:600;padding:1px 7px;border-radius:10px;flex:none}
+.badge.clean{background:#e6ffec;border:1px solid #4ac26b;color:#1a7f37}
+.badge.review{background:#ffebe9;border:1px solid #ff8182;color:#cf222e}
+.hd code{color:#59636e;flex:none}
+.bd{display:none;padding:6px 10px;border-top:1px solid #f0f1f3;font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.card.open .bd{display:block}
+.sec{margin:3px 0}
+.sec.ok{color:#1a7f37}
+.sec .k{color:#59636e}
+.diff{border-collapse:collapse;width:100%;margin-top:4px;table-layout:fixed}
+.diff td{white-space:pre-wrap;word-break:break-all;padding:0 6px}
+.diff tr.add td{background:#e6ffec}
+.diff tr.del td{background:#ffebe9}
+.diff tr.hdr td{background:#eff5ff;color:#0550ae}
+.diff tr.meta td{color:#59636e}
+</style>
+</head>
+<body>
+<header>
+<h1>move verify: <code>__TITLE__</code></h1>
+<div id="meta"></div>
+<div style="margin-top:6px"><span id="counts"></span><label class="toggle"><input type="checkbox" id="onlyReview"> show only NEEDS REVIEW</label></div>
+</header>
+<main id="list"></main>
+<script id="data" type="application/json">__DATA_JSON__</script>
+<script>
+'use strict';
+const DATA = JSON.parse(document.getElementById('data').textContent);
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function lineClass(l){
+  if(l.startsWith('@@')) return 'hdr';
+  if(l.startsWith('+++')||l.startsWith('---')) return 'meta';
+  if(l[0]==='+') return 'add';
+  if(l[0]==='-') return 'del';
+  return 'ctx';
+}
+function render(onlyReview){
+  let out = '';
+  DATA.checks.forEach((c,i) => {
+    if(onlyReview && c.clean) return;
+    const cls = c.clean ? 'clean' : 'review';
+    out += '<div class="card '+cls+(c.clean?'':' open')+'">';
+    out += '<div class="hd"><span class="badge '+cls+'">'+(c.clean?'CLEAN':'REVIEW')+'</span>';
+    out += '<code>'+esc(c.commit.slice(0,9))+'</code><span class="sub">'+esc(c.subject||c.commit)+'</span></div>';
+    out += '<div class="bd">';
+    if(c.imports.length) out += '<div class="sec"><span class="k">imports:</span> '+c.imports.map(esc).join('<br>&nbsp;&nbsp;')+'</div>';
+    if(c.decorators.length) out += '<div class="sec"><span class="k">decorators:</span> '+c.decorators.map(esc).join(', ')+'</div>';
+    if(c.requalified) out += '<div class="sec"><span class="k">requalified call sites:</span> '+c.requalified+'</div>';
+    if(c.review_diff.length){
+      out += '<table class="diff"><tbody>';
+      c.review_diff.forEach(l => { out += '<tr class="'+lineClass(l)+'"><td>'+esc(l)+'</td></tr>'; });
+      out += '</tbody></table>';
+    } else {
+      out += '<div class="sec ok">'+c.relocated+' line(s) relocated in order &mdash; '+esc(c.kind)+'</div>';
+    }
+    out += '</div></div>';
+  });
+  document.getElementById('list').innerHTML = out || '<p>(no commits matched)</p>';
+}
+document.getElementById('meta').innerHTML = 'range <code>'+esc(DATA.title)+'</code>';
+document.getElementById('counts').innerHTML = '<span class="chip clean">'+DATA.clean+' CLEAN</span><span class="chip review">'+DATA.review+' NEEDS REVIEW</span>';
+document.getElementById('list').addEventListener('click', e => {
+  const hd = e.target.closest('.hd');
+  if(hd) hd.parentNode.classList.toggle('open');
+});
+const onlyReview = document.getElementById('onlyReview');
+onlyReview.addEventListener('change', () => render(onlyReview.checked));
+render(false);
+</script>
+</body>
+</html>"""
+
+
+def _take_option(argv: list[str], name: str) -> tuple[str | None, list[str]]:
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1], argv[:i] + argv[i + 2 :]
+    return None, argv
 
 
 def _main(argv: list[str]) -> int:
-    match: str | None = None
-    if "--match" in argv:
-        i = argv.index("--match")
-        if i + 1 < len(argv):
-            match = argv[i + 1]
-            argv = argv[:i] + argv[i + 2 :]
+    match, argv = _take_option(argv, "--match")
+    html_path, argv = _take_option(argv, "--html")
     if len(argv) == 1:
         target = argv[0]
         if ".." in target:
-            return 0 if verify_move_range(target, match=match) else 1
+            return (
+                0 if verify_move_range(target, match=match, html_path=html_path) else 1
+            )
         return 0 if verify_move_commit(target) else 1
     print(
         "usage: python3 mechanical_refactor_verify_utils.py <commit>\n"
-        "       python3 mechanical_refactor_verify_utils.py <base>..<tip> [--match REGEX]",
+        "       python3 mechanical_refactor_verify_utils.py <base>..<tip> "
+        "[--match REGEX] [--html OUT.html]",
         file=sys.stderr,
     )
     return 2

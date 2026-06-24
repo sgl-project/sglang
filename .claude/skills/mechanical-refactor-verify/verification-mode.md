@@ -21,11 +21,14 @@ python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_uti
 ```
 
 To sweep a whole chain at once, pass a range; `--match` keeps the log focused on the
-commits you care about (e.g. the `-move` commits) and skips the rest, ending with a
-per-commit CLEAN/REVIEW summary:
+commits you care about (e.g. `-move:` for just the move commits) and skips the rest,
+ending with a per-commit CLEAN/REVIEW summary. `--html` also writes a standalone,
+self-contained page (verdict-coloured cards, click to expand, "show only NEEDS REVIEW"
+toggle) for eyeballing in a browser:
 
 ```bash
-python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_utils.py <base>..<tip> --match -move
+python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_verify_utils.py \
+    <base>..<tip> --match -move: --html report.html
 ```
 
 It reports, for each commit's diff:

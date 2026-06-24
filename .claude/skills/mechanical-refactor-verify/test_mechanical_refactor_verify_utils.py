@@ -742,3 +742,17 @@ def test_verify_move_range_without_match_verifies_every_commit(
     out = capsys.readouterr().out
     assert result is False
     assert "verified 2 commit(s)" in out
+
+
+def test_verify_move_range_writes_self_contained_html(
+    repo: Path, tmp_path: Path
+) -> None:
+    """--html writes one standalone page embedding each commit's subject and verdict."""
+    base = _make_move_then_tweak(repo)
+    out = tmp_path / "report.html"
+    verify_move_range(f"{base}..HEAD", html_path=str(out), repo_root=str(repo))
+    text = out.read_text()
+    assert text.startswith("<!doctype html>")
+    assert "extract-helper-move" in text
+    assert "tweak-helper" in text
+    assert '"review":' in text and '"clean":' in text
