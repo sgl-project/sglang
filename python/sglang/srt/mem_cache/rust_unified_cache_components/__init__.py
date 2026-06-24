@@ -11,15 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pool-side per-component handlers for the Rust radix cache orchestrator.
-
-The Rust core owns the tree (lock-ref, LRU, eviction); these handlers own only
-the pool ops for one component — the half that must run in Python because Python
-owns the allocators. Mirrors `unified_cache_components/` (one file/class per
-component, `Rust`-prefixed) but scoped to pool ownership: the orchestrator builds
-one per configured component and dispatches uniformly instead of branching per
-component inline.
-"""
+"""Python orchestration-layer tree components that own the custom cache-management
+logic for each component type."""
 
 from __future__ import annotations
 
