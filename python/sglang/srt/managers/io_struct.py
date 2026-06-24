@@ -25,9 +25,20 @@ from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+)
 
 import torch
+import zmq
+import zmq.asyncio
 from pydantic import PlainValidator
 
 from sglang.srt.lora.lora_registry import LoRARef
@@ -46,6 +57,8 @@ from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
+
+    from sglang.srt.managers.tokenizer_manager import SenderWrapper
 else:
     Image = Any
 
@@ -1756,8 +1769,14 @@ class SetInternalStateReqOutput(BaseReq):
     server_args: Dict[str, Any]
 
 
+class ProfileReqType(Enum):
+    START_PROFILE = 1
+    STOP_PROFILE = 2
+
+
 @dataclass
-class ProfileReqInput(BaseReq):
+class ProfileReq(BaseReq):
+    req_type: ProfileReqType = ProfileReqType.START_PROFILE
     # The output directory
     output_dir: Optional[str] = None
     # Specify the steps to start the profiling
@@ -1774,32 +1793,12 @@ class ProfileReqInput(BaseReq):
     with_stack: Optional[bool] = None
     # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
     # The prefix of the profile filenames
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
-    profile_stages: Optional[List[str]] = None
-
-
-class ProfileReqType(Enum):
-    START_PROFILE = 1
-    STOP_PROFILE = 2
-
-
-@dataclass
-class ProfileReq(BaseReq):
-    type: ProfileReqType
-    output_dir: Optional[str] = None
-    start_step: Optional[int] = None
-    num_steps: Optional[int] = None
-    activities: Optional[List[str]] = None
-    profile_by_stage: bool = False
-    with_stack: Optional[bool] = None
-    record_shapes: Optional[bool] = None
-    profile_id: Optional[str] = None
-    merge_profiles: bool = False
-    profile_prefix: Optional[str] = None
     profile_stages: Optional[List[str]] = None
 
 
@@ -2189,6 +2188,30 @@ class DumperControlReqOutput(BaseReq):
     success: bool
     response: List[Dict[str, Any]]
     error: str = ""
+
+
+def sock_send(
+    sender: Union[zmq.Socket, zmq.asyncio.Socket, SenderWrapper],
+    obj: Any,
+    flags: int = 0,
+) -> None:
+    sender.send_pyobj(obj, flags=flags)
+
+
+def sock_recv(socket, flags=0):
+    return socket.recv_pyobj(flags=flags)
+
+
+async def async_sock_send(
+    sender: Union[zmq.asyncio.Socket, SenderWrapper],
+    obj: Any,
+    flags: int = 0,
+) -> None:
+    await sender.send_pyobj(obj, flags=flags)
+
+
+async def async_sock_recv(socket, flags=0):
+    return await socket.recv_pyobj(flags=flags)
 
 
 def _check_all_req_types():
