@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
@@ -385,8 +386,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
             )
-
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
+            o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            # decode context parallel needs lse to correct attn_output via online softmax
+            if dcp_enabled():
+                return o, lse
+            return o
 
     def forward_extend(
         self,
