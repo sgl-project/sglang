@@ -889,48 +889,50 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(
-            hidden_states, gemm_output_zero_allocator
-        )
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
             else None
         )
+        # Shared experts run on the alt (side) stream so the routed experts own
+        # the main stream, letting the deferred MoE finalize fuse with the main
+        # stream add. Mirrors the tokenspeed execution order.
         with torch.cuda.stream(self.alt_stream):
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
+
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(self, "is_hash", False) else {}
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=dispatch_info,
+            **topk_kwargs,
+        )
+        deferred_finalize = (
+            shared_output is not None
+            and not self._shared_expert_tp1
+            and topk_output.format == TopKOutputFormat.BYPASSED
+            and self.experts.supports_deferred_finalize
+        )
+        if deferred_finalize:
+            final_hidden_states = self.experts.forward_deferred_finalize(
+                hidden_states, topk_output
             )
-            deferred_finalize = (
-                shared_output is not None
-                and not self._shared_expert_tp1
-                and topk_output.format == TopKOutputFormat.BYPASSED
-                and self.experts.supports_deferred_finalize
-            )
-            if deferred_finalize:
-                final_hidden_states = self.experts.forward_deferred_finalize(
-                    hidden_states, topk_output
-                )
-            else:
-                final_hidden_states = self.experts(hidden_states, topk_output)
-            if (
-                not _is_cuda
-                and not _is_musa
-                and not _use_aiter
-                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-            ):
-                final_hidden_states *= self.routed_scaling_factor
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        if (
+            not _is_cuda
+            and not _is_musa
+            and not _use_aiter
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
+            final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
 
