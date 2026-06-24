@@ -21,7 +21,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -33,6 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -125,7 +125,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         if (
             is_npu()
             and get_global_server_args().speculative_draft_model_quantization is None

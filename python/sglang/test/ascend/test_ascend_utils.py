@@ -18,7 +18,7 @@ import subprocess
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NamedTuple, Optional
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -108,6 +108,7 @@ META_LLAMA_3_1_8B_INSTRUCT = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Meta-Llama-3.1-8B-Instruct"
 )
 MIMO_7B_RL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-7B-RL")
+MIMO_V2_FLASH_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2-Flash")
 MINICPM3_4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "OpenBMB/MiniCPM3-4B")
 MISTRAL_7B_INSTRUCT_V0_2_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "mistralai/Mistral-7B-Instruct-v0.2"

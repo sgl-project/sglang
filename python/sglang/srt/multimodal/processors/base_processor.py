@@ -277,6 +277,7 @@ class BaseMultimodalProcessor(ABC):
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+                self.server_args.base_gpu_id,
             )
 
     def compute_mrope_positions(self, input_ids, mm_items):
@@ -536,13 +537,13 @@ class BaseMultimodalProcessor(ABC):
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
-                if (
-                    discard_alpha_channel
-                    and not isinstance(img, torch.Tensor)
-                    and img.mode != "RGB"
-                ):
-                    # Needed only when `img` is a PIL image
-                    img = img.convert("RGB")
+                if isinstance(img, torch.Tensor):
+                    return img  # JPEG already decoded on GPU by nvJPEG
+                # PIL decodes lazily; do it here in the io worker so the decode
+                # doesn't run later on the event-loop thread.
+                if discard_alpha_channel and img.mode != "RGB":
+                    return img.convert("RGB")
+                img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
