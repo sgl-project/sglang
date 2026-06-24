@@ -105,6 +105,24 @@ def create_indexer_capturer(
     hf_text_config = model_config.hf_text_config
     num_indexer_layers = get_num_indexer_layers(hf_text_config)
     index_topk = getattr(hf_text_config, "index_topk", 0)
+    return _create_indexer_capturer_raw(
+        enable=enable,
+        num_indexer_layers=num_indexer_layers,
+        index_topk=index_topk,
+        num_tokens=num_tokens,
+        max_running_requests=max_running_requests,
+        device=device,
+    )
+
+
+def _create_indexer_capturer_raw(
+    enable: bool,
+    num_indexer_layers: int,
+    index_topk: int,
+    num_tokens: int,
+    max_running_requests: int,
+    device: str,
+) -> Optional[IndexerTopkCapturer]:
     if not enable:
         return None
     if num_indexer_layers == 0:
