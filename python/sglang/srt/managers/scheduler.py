@@ -462,9 +462,7 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
-        # Reconcile: only keep the flag if tree_cache is actually RefAwareHiRadixCache.
-        # This handles cases where enable_ref_aware_kv_buffer is set but tree_cache
-        # ends up as a different type (e.g. UnifiedRadixCache for hybrid SSM/SWA).
+        # TODO (zhangmj): Can be removed if support ref-aware HiRadixCache in UnifiedRadixCache for hybrid SSM/SWA.
         if self.enable_ref_aware_kv_buffer:
             from sglang.srt.mem_cache.ref_aware_hiradix_cache import (
                 RefAwareHiRadixCache,

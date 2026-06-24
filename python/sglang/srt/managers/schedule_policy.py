@@ -798,6 +798,7 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         elif self.enable_ref_aware_kv_buffer:
+            # TODO (zhangmj): need to support is_hybrid_swa.
             req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
             budget = int(self._rem_total_tokens_ref_aware(req_is_high)) - self.page_size
             _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
