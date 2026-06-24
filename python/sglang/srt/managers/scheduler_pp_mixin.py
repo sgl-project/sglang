@@ -93,13 +93,19 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                # Publish this microbatch slot's last batch (mirrors the old
+                # self.last_batch = self.last_mbs[mb_id]) so out-of-loop readers
+                # (e.g. disagg decode prebuilt-extend accounting) see the batch
+                # that just finished for this slot. idle is set per round below.
                 self.last_iter = self._last_iter_snapshot(self.last_mbs[mb_id])
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
+                self.last_mbs[mb_id] = self._maybe_apply_pending_pause(
+                    self.last_mbs[mb_id]
+                )
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -108,10 +114,9 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    self.mbs[mb_id] = self.get_next_batch_to_run(self.last_batch)
+                    self.mbs[mb_id] = self.get_next_batch_to_run(self.last_mbs[mb_id])
                 self.running_mbs[mb_id] = self.running_batch
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
-                if self.cur_batch:
+                if self.mbs[mb_id]:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 next_pp_outputs = None
@@ -125,7 +130,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
-                if self.cur_batch:
+                if self.mbs[mb_id]:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
@@ -148,7 +153,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
+                    if self.mbs[mb_id]:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -223,7 +228,10 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                # Publish this microbatch slot's last batch (mirrors the old
+                # self.last_batch = self.last_mbs[mb_id]) so out-of-loop readers
+                # (e.g. disagg decode prebuilt-extend accounting) see the batch
+                # that just finished for this slot. idle is set per round below.
                 self.last_iter = self._last_iter_snapshot(self.last_mbs[mb_id])
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
@@ -236,6 +244,9 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                self.last_mbs[mb_id] = self._maybe_apply_pending_pause(
+                    self.last_mbs[mb_id]
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -254,8 +265,7 @@ class SchedulerPPMixin:
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
-                if self.cur_batch:
+                if self.mbs[mb_id]:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
@@ -267,7 +277,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
-                if self.cur_batch:
+                if self.mbs[mb_id]:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
@@ -327,7 +337,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.cur_batch:
+                    if self.mbs[mb_id]:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -370,7 +380,10 @@ class SchedulerPPMixin:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                # Publish this microbatch slot's last batch (mirrors the old
+                # self.last_batch = self.last_mbs[mb_id]) so out-of-loop readers
+                # (e.g. disagg decode prebuilt-extend accounting) see the batch
+                # that just finished for this slot. idle is set per round below.
                 self.last_iter = self._last_iter_snapshot(self.last_mbs[mb_id])
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
@@ -384,6 +397,9 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                self.last_mbs[mb_id] = self._maybe_apply_pending_pause(
+                    self.last_mbs[mb_id]
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -406,11 +422,10 @@ class SchedulerPPMixin:
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
-                if self.cur_batch:
+                if self.mbs[mb_id]:
                     server_is_idle = False
                     pp_proxy_tensors = None
-                    if not self.cur_batch.forward_mode.is_prebuilt():
+                    if not self.mbs[mb_id].forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
                 # early send output if possible
@@ -423,7 +438,7 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
 
-                if self.cur_batch:
+                if self.mbs[mb_id]:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         pp_proxy_tensors,
@@ -512,7 +527,7 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
+                    if self.mbs[mb_id] and not self.mbs[mb_id].forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -1246,13 +1261,13 @@ class SchedulerPPMixin:
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
                 set_time_batch(
-                    self.cur_batch.reqs,
+                    self.mbs[mb_id].reqs,
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
-                result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+                result = self.run_batch(self.mbs[mb_id], pp_proxy_tensors)
                 set_time_batch(
-                    self.cur_batch.reqs,
+                    self.mbs[mb_id].reqs,
                     "set_run_batch_cpu_end_time",
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
@@ -1268,7 +1283,7 @@ class SchedulerPPMixin:
                         (
                             event,
                             PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, self.cur_batch)
+                                self._pp_prepare_tensor_dict(result, self.mbs[mb_id])
                             ),
                         )
                     )
