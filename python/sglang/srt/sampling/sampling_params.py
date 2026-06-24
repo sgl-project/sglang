@@ -70,14 +70,15 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     for the documentation.
     """
 
+    # --- API parameters (set by callers) ---
     max_new_tokens: Optional[int] = 128
-    stop: Optional[Union[str, List[str]]] = None
-    stop_strs: Optional[Union[str, List[str]]] = None
+    stop: Optional[Union[str, List[str]]] = (
+        None  # API input alias, copied to stop_strs then cleared in normalize()
+    )
     stop_token_ids: Optional[Set[int]] = None
-    stop_regex: Optional[Union[str, List[str]]] = None
-    stop_regex_strs: Optional[Union[str, List[str]]] = None
-    stop_str_max_len: int = 0
-    stop_regex_max_len: int = 0
+    stop_regex: Optional[Union[str, List[str]]] = (
+        None  # API input alias, copied to stop_regex_strs then cleared in normalize()
+    )
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = TOP_K_ALL
@@ -99,7 +100,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
-    is_normalized: bool = False
+
+    # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
+    stop_strs: Optional[Union[str, List[str]]] = None  # from stop
+    stop_regex_strs: Optional[Union[str, List[str]]] = None  # from stop_regex
+    stop_str_max_len: int = 0  # set by normalize()
+    stop_regex_max_len: int = 0  # set by normalize()
+    is_normalized: bool = False  # set by normalize()
 
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
@@ -252,6 +259,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
         )
 
+        # Clear API input aliases so omit_defaults=True drops them from the wire.
+        self.stop = None
+        self.stop_regex = None
         self.is_normalized = True
 
 
