@@ -440,14 +440,15 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP swaps in a PagedTokenToKVPoolAllocator whose page_size is
+    # DCP (HIP-only) swaps in a PagedTokenToKVPoolAllocator whose page_size is
     # server_args.page_size * dcp_size, so it can be > 1 even when
     # tree_cache.page_size (== server_args.page_size) is 1. Only on the HIP DCP
     # path do we branch on the real allocator's page_size so the paged path is
     # taken; everywhere else tree_cache.page_size is authoritative and the two
     # are equal (dcp_size == 1), so behavior is unchanged.
-    if get_global_server_args().dcp_size > 1:
+    if _is_hip and get_global_server_args().dcp_size > 1:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
+    # DCP(CUDA-only) tree_cache.page_size is server_args.page_size * dcp_size
     return batch.tree_cache.page_size
 
 
@@ -484,7 +485,8 @@ def alloc_for_extend(
     if _alloc_page_size(batch) == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
-        # Since tree_cache.page_size is (page_size * dcp_world_size), for dcp, always use alloc_paged_token_slots_extend
+        # Since tree_cache.page_size is (page_size * dcp_world_size), for dcp
+        # on cuda platform, always use alloc_paged_token_slots_extend
         # Paged allocation - build last_loc
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
