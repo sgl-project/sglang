@@ -1095,7 +1095,7 @@ def build_bench_command(
     command = [
         sys.executable,
         "-m",
-        "sglang.bench_serving",
+        "sglang.benchmark.serving",
         "--backend",
         backend,
         "--base-url",
