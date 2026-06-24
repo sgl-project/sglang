@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluOAI,
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
+    NPUSwigluAllGather,
 )
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int8MoEMethod,
