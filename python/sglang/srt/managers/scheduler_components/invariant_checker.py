@@ -283,12 +283,14 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
+                if req.kv is None:
+                    continue
                 _add_owner(
                     req,
                     f"req {req.rid}",
                     req.req_pool_idx,
                     req.kv_committed_len,
-                    req.kv.kv_allocated_len if req.kv is not None else 0,
+                    req.kv.kv_allocated_len,
                 )
         sess = getattr(self.tree_cache, "slots", None)
         if sess:

@@ -53,12 +53,6 @@ def _new_cache() -> ReqCacheInfo:
     )
 
 
-def _new_kv() -> ReqKvInfo:
-    from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-    return ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
-
-
 @dataclass
 class SessionSlot:
     """Holds KV state between streaming session turns."""
@@ -70,15 +64,13 @@ class SessionSlot:
     kv_committed_len: int = 0
 
     cache: ReqCacheInfo = field(default_factory=_new_cache)
-    kv: ReqKvInfo = field(default_factory=_new_kv)
+    kv: Optional[ReqKvInfo] = None
     mamba: Optional[ReqMambaInfo] = None
 
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
-        # TODO: this should key off resource-object presence once opid6 makes
-        # the objects Optional; kept req_pool_idx-based to preserve behavior.
-        return self.req_pool_idx is not None
+        return self.kv is not None
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
@@ -95,6 +87,7 @@ class SessionSlot:
         # TODO: to form real move semantics the slot should TAKE these objects
         # instead of the copy.copy above. Kept as-is to preserve original behavior.
         req.req_pool_idx = None
+        req.kv = None
         req.mamba = None
 
     def restore_to_req(self, req: Req):
@@ -206,7 +199,7 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or slot.req_pool_idx is None:
+        if slot is None or slot.kv is None:
             return None
         if req.to_finish is not None:
             req.session.abort_req()
@@ -300,6 +293,7 @@ class StreamingSession(BasePrefixCache):
             )
             self.release_session(session_id)
             req.req_pool_idx = None
+            req.kv = None
             req.session.abort_req()
             return True
 
