@@ -817,6 +817,7 @@ def append_state_component(
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
+    data_layout: Optional[List[tuple]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -826,6 +827,7 @@ def append_state_component(
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
+    kv_args.state_data_layouts.append(data_layout or [])
 
 
 def setup_state_kv_args(
@@ -856,6 +858,7 @@ def setup_state_kv_args(
     kv_args.state_dim_per_tensor = []
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
+    kv_args.state_data_layouts = []
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
@@ -872,8 +875,18 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            data_layout = (
+                token_to_kv_pool.get_state_transfer_layout()
+                if hasattr(token_to_kv_pool, "get_state_transfer_layout")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                data_layout=data_layout,
             )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.

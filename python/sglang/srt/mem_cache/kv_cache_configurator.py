@@ -39,6 +39,10 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.cp_kv_layer_split import should_use_cp_kv_layer_split_pool
+from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_pool import (
+    CpKvLayerSplitDeepSeekV4TokenToKVPool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -921,11 +925,17 @@ class KVCacheConfigurator:
                 max_num_reqs=max_running_requests,
             )
         else:
-            pool_cls = DeepSeekV4TokenToKVPool
+            if (
+                not self.is_draft_worker
+                and should_use_cp_kv_layer_split_pool(self.server_args)
+            ):
+                pool_cls = CpKvLayerSplitDeepSeekV4TokenToKVPool
+            else:
+                pool_cls = DeepSeekV4TokenToKVPool
             c4_state_pool_size = c4_state_pool_size
             c128_state_pool_size = c128_state_pool_size
 
-        token_to_kv_pool = pool_cls(
+        pool_kwargs = dict(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
             # past max_running_requests (pre-alloc), so size to the real capacity.
@@ -955,6 +965,22 @@ class KVCacheConfigurator:
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
         )
+        if pool_cls is CpKvLayerSplitDeepSeekV4TokenToKVPool:
+            token_to_kv_pool = pool_cls(
+                cp_rank=get_parallel().attn_cp_rank,
+                cp_size=get_parallel().attn_cp_size,
+                model_num_hidden_layers=len(self.model_config.compress_ratios),
+                cp_kv_layer_split_staging_context_len=self.model_config.context_len,
+                cp_kv_layer_split_staging_chunked_prefill_size=(
+                    self.server_args.chunked_prefill_size
+                ),
+                cp_kv_layer_split_staging_max_prefill_tokens=(
+                    self.server_args.max_prefill_tokens
+                ),
+                **pool_kwargs,
+            )
+        else:
+            token_to_kv_pool = pool_cls(**pool_kwargs)
         return token_to_kv_pool
 
     def _build_oot_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -1614,6 +1640,18 @@ class KVCacheConfigurator:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        if (
+            not self.is_draft_worker
+            and should_use_cp_kv_layer_split_pool(self.server_args)
+        ):
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_parallel().attn_cp_group.cpu_group,
             )
             token_capacity = tensor.item()
 

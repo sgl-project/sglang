@@ -31,6 +31,12 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.cp_kv_layer_split import (
+    assert_cp_kv_layer_split_hicache_supported,
+    build_cp_kv_layer_split_deepseek_v4_worst_case_pool_layout,
+    cp_kv_layer_split_sharding_flags,
+    should_use_cp_kv_layer_split_pool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -585,6 +591,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.context_len = kvc.model_config.context_len
+        self.model_num_hidden_layers = len(cfg.compress_ratios)
+        self.compress_ratios = cfg.compress_ratios
+        self.start_layer = kvc.layer_info.start_layer
+        self.end_layer = kvc.layer_info.end_layer
+        self.use_cp_kv_layer_split = should_use_cp_kv_layer_split_pool(
+            kvc.server_args
+        )
+        if self.use_cp_kv_layer_split:
+            assert_cp_kv_layer_split_hicache_supported(kvc.server_args)
+        self.attn_cp_size = kvc.server_args.attn_cp_size
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
@@ -628,6 +644,31 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        self.num_layers_ca4_indexer = self.num_layers_ca4
+        self.num_layers_ca4_state = self.num_layers_ca4
+        self.num_layers_ca128_state = self.num_layers_ca128
+        self.num_layers_ca4_indexer_state = self.num_layers_ca4
+
+        if self.use_cp_kv_layer_split:
+            layout = build_cp_kv_layer_split_deepseek_v4_worst_case_pool_layout(
+                self.attn_cp_size,
+                self.model_num_hidden_layers,
+                self.start_layer,
+                self.end_layer,
+                self.compress_ratios,
+            )
+            self.num_layers_total = layout.swa_layer_num
+            self.num_layers_ca4 = layout.c4_layer_num
+            self.num_layers_ca128 = layout.c128_layer_num
+            self.num_layers_ca4_indexer = layout.c4_indexer_layer_num
+            self.num_layers_ca4_state = layout.c4_state_layer_num
+            self.num_layers_ca128_state = layout.c128_state_layer_num
+            self.num_layers_ca4_indexer_state = layout.c4_indexer_state_layer_num
+            logger.info(
+                "CP KV LayerSplit: sharding=%s, layout=%s",
+                cp_kv_layer_split_sharding_flags(),
+                layout,
+            )
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
@@ -698,18 +739,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
-        return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * indexer_bytes * self.num_layers_ca4
-            + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
-            + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
-            + self.swa_ratio
+        components = {
+            "swa_kv": self.swa_ratio * kv_bytes * self.num_layers_total,
+            "c4_kv": c4_frac * kv_bytes * self.num_layers_ca4,
+            "c128_kv": 1 / 128 * kv_bytes * self.num_layers_ca128,
+            "c4_indexer_kv": 1 / 4 * indexer_bytes * self.num_layers_ca4_indexer,
+            "c4_state": self.swa_ratio
+            * c4_state_ratio
+            * c4_state_bytes
+            * self.num_layers_ca4_state,
+            "c128_state": self.swa_ratio
+            * c128_state_ratio
+            * c128_state_bytes
+            * self.num_layers_ca128_state,
+            "c4_indexer_state": self.swa_ratio
             * c4_state_ratio
             * c4_indexer_state_bytes
-            * self.num_layers_ca4
-        )
+            * self.num_layers_ca4_indexer_state,
+        }
+        total = sum(components.values())
+        return total
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size

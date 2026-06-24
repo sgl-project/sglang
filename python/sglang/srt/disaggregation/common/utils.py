@@ -1,5 +1,6 @@
 import ctypes
 import dataclasses
+import json
 import struct
 import threading
 from collections import deque
@@ -60,6 +61,47 @@ def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
     return [
         list(struct.unpack(f"<{len(b)//width}{fmt}", b))
         for b in unpack_list_of_buffers(buf)
+    ]
+
+
+def pack_int_list(values, fmt: str) -> bytes:
+    if len(values) == 0:
+        return b""
+    return struct.pack(f"<{len(values)}{fmt}", *values)
+
+
+def unpack_int_list(buf: bytes, fmt: str) -> List[int]:
+    if not buf:
+        return []
+    width = struct.calcsize(fmt)
+    return list(struct.unpack(f"<{len(buf)//width}{fmt}", buf))
+
+
+def pack_transfer_layout(layout) -> bytes:
+    """Pack optional transfer descriptors for ZMQ registration messages."""
+    if not layout:
+        return b""
+    return json.dumps(layout, separators=(",", ":")).encode("utf-8")
+
+
+def unpack_transfer_layout(buf: bytes):
+    if not buf:
+        return []
+    return [None if x is None else tuple(x) for x in json.loads(buf.decode("utf-8"))]
+
+
+def pack_nested_transfer_layout(layouts) -> bytes:
+    if not layouts:
+        return b""
+    return json.dumps(layouts, separators=(",", ":")).encode("utf-8")
+
+
+def unpack_nested_transfer_layout(buf: bytes):
+    if not buf:
+        return []
+    return [
+        [None if x is None else tuple(x) for x in component_layout]
+        for component_layout in json.loads(buf.decode("utf-8"))
     ]
 
 
