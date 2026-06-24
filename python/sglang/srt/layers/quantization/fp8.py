@@ -143,6 +143,9 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
+# OCP MXFP4 micro-scaling block size: one e8m0 scale per 32 e2m1 elements.
+MXFP4_BLOCK_SIZE = 32
+
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
@@ -156,6 +159,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        store_dtype: str = "fp8",
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -178,6 +182,12 @@ class Fp8Config(QuantizationConfig):
             )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
+        assert store_dtype in ("fp8", "mxfp4")
+        if store_dtype == "mxfp4":
+            assert is_checkpoint_fp8_serialized and activation_scheme == "dynamic"
+            if weight_block_size is None:
+                weight_block_size = [128, 128]
+        self.store_dtype = store_dtype
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -238,6 +248,7 @@ class Fp8Config(QuantizationConfig):
                 normalized.append(f"model.{base}")
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        store_dtype = cls.get_from_keys_or(config, ["store_dtype"], "fp8")
         if use_mxfp8 and weight_block_size is not None:
             logger.warning(
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
@@ -250,6 +261,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            store_dtype=store_dtype,
         )
 
     def get_quant_method(
@@ -952,6 +964,65 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         )
 
         # WEIGHTS
+        if self.quant_config.store_dtype == "mxfp4":
+            mx_block = MXFP4_BLOCK_SIZE
+            assert (
+                hidden_size % mx_block == 0
+            ), f"mxfp4 requires hidden_size divisible by {mx_block}, got {hidden_size}"
+            assert intermediate_size_per_partition % mx_block == 0, (
+                f"mxfp4 requires intermediate_size_per_partition divisible by {mx_block}, "
+                f"got {intermediate_size_per_partition}"
+            )
+            w13_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // 2,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            w2_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // 2,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight", w13_weight)
+            set_weight_attrs(w13_weight, extra_weight_attrs)
+            layer.register_parameter("w2_weight", w2_weight)
+            set_weight_attrs(w2_weight, extra_weight_attrs)
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // mx_block,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // mx_block,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            extra_weight_attrs.update(
+                {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+            )
+            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+            return
         if self.is_fp4_expert:
             w13_weight = torch.nn.Parameter(
                 torch.empty(
@@ -1578,7 +1649,70 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
+    def _mxfp4_dequant_to_block_fp8(self, layer: Module) -> None:
+        """Convert mxfp4 storage (uint8 packed e2m1 + uint8 e8m0 block scales)
+        to block-wise fp8 (e4m3 + fp32 scale_inv) once at load time so the
+        runtime forward path is identical to a regular fp8 block-quant MoE."""
+        from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+        from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
+        mx_block = MXFP4_BLOCK_SIZE
+        logger.info(
+            "mxfp4->fp8: converting MoE weights. w13=%s w2=%s",
+            getattr(layer, "w13_weight", None) is not None,
+            getattr(layer, "w2_weight", None) is not None,
+        )
+
+        def _convert(weight_name: str, scale_name: str):
+            packed = getattr(layer, weight_name).data
+            scale = getattr(layer, scale_name).data
+            num_experts = packed.shape[0]
+            fp8_chunks = []
+            scale_chunks = []
+            for e in range(num_experts):
+                w_bf16 = MXFP4QuantizeUtil.dequantize(
+                    packed[e].cuda(),
+                    dtype=torch.bfloat16,
+                    scale=scale[e].cuda(),
+                    block_sizes=[mx_block],
+                )
+                w_fp8, w_scale = per_block_cast_to_fp8(w_bf16)
+                fp8_chunks.append(w_fp8)
+                scale_chunks.append(w_scale)
+            return (
+                torch.stack(fp8_chunks, dim=0).contiguous(),
+                torch.stack(scale_chunks, dim=0).contiguous(),
+            )
+
+        w13_fp8, w13_scale_inv = _convert("w13_weight", "w13_weight_scale")
+        w2_fp8, w2_scale_inv = _convert("w2_weight", "w2_weight_scale")
+
+        del layer.w13_weight, layer.w13_weight_scale
+        del layer.w2_weight, layer.w2_weight_scale
+
+        layer.register_parameter(
+            "w13_weight", torch.nn.Parameter(w13_fp8, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w13_weight_scale_inv",
+            torch.nn.Parameter(w13_scale_inv, requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_weight", torch.nn.Parameter(w2_fp8, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w2_weight_scale_inv",
+            torch.nn.Parameter(w2_scale_inv, requires_grad=False),
+        )
+
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.quant_config.store_dtype == "mxfp4":
+            logger.info("store_dtype=mxfp4: dispatching to _mxfp4_dequant_to_block_fp8")
+            self._mxfp4_dequant_to_block_fp8(layer)
+            # Fall through to block_quant post-processing (deep_gemm ue8m0,
+            # triton swizzle, etc.) since the converted weights are now
+            # standard fp8 block-quant.
+
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
