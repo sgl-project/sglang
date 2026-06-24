@@ -215,17 +215,44 @@ if (( PW > 1 || DW > 1 )); then
   echo "[drive] NOTE: standalone_lb + bench use the first prefill and first decode only;"
   echo "[drive]       multi-prefill/multi-decode fan-out is not wired yet (LB work)."
 fi
+# Each server's srun runs here on the login node and returns exactly when its
+# compute-node container exits. Wrap it so the return code lands in a marker
+# file on shared NFS. The monitor then watches for markers instead of polling
+# PIDs -- unambiguous (no zombie/kill -0 guesswork) and it records which role
+# died and with what code. (A hung-but-alive server is NOT caught here; that is
+# bounded by bench.sh's health-wait timeout.)
+rm -f "$WORKDIR"/server_exit_* "$WORKDIR/bench_exit"
 for n in "${PNODES[@]}"; do
-  srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1 &
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/prefill.sh" > "$WORKDIR/prefill_$n.log" 2>&1
+    echo "prefill@$n rc=$?" > "$WORKDIR/server_exit_prefill_$n" ) &
 done
 for n in "${DNODES[@]}"; do
-  srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1 &
+  ( srun --overlap -N1 --nodelist="$n" bash "$WORKDIR/decode.sh" > "$WORKDIR/decode_$n.log" 2>&1
+    echo "decode@$n rc=$?" > "$WORKDIR/server_exit_decode_$n" ) &
 done
 sleep 5
-srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
-echo "[drive] bench done, tearing down"
+# Bench in the background with its own marker, so the wait loop is purely file
+# based: finish when bench writes its marker, abort if any server marker shows up
+# first (a server died before the sweep completed).
+( srun --overlap -N1 --nodelist="$PNODE" bash "$WORKDIR/bench.sh" "$PIP" "$DIP" > "$WORKDIR/bench.log" 2>&1
+  echo $? > "$WORKDIR/bench_exit" ) &
+BENCH_BG=$!
+RC=0
+while [[ ! -f "$WORKDIR/bench_exit" ]]; do
+  if compgen -G "$WORKDIR/server_exit_*" > /dev/null; then
+    echo "[drive] ERROR: a server exited early before bench finished:"
+    cat "$WORKDIR"/server_exit_* || true
+    kill "$BENCH_BG" 2>/dev/null || true
+    RC=1
+    break
+  fi
+  sleep 10
+done
+[[ "$RC" -eq 0 ]] && RC=$(cat "$WORKDIR/bench_exit" 2>/dev/null || echo 1)
+echo "[drive] bench finished (rc=$RC), tearing down"
 for n in "${PNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_prefill >/dev/null 2>&1 || true; done
 for n in "${DNODES[@]}"; do srun --overlap -N1 --nodelist="$n" docker kill mi355x_decode  >/dev/null 2>&1 || true; done
+exit "$RC"
 DRIVE
 chmod +x "$WORKDIR/drive.sh"
 
@@ -241,10 +268,24 @@ EXCLUSIVE_ARG=()
 # One node per prefill/decode worker (TP == GPUs/node). 1P1D -> 2 nodes.
 TOTAL_NODES=$((PW + DW))
 
+set +e
 salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUSIVE_ARG[@]}" -t "$TIME_LIMIT" \
     bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW"
+SALLOC_RC=$?
+set -e
 
 echo "--- bench.log tail ---"; tail -40 "$WORKDIR/bench.log" || true
+
+# drive.sh exits non-zero when a server died or bench failed. Surface the server
+# logs (the actual root cause). We still fall through to normalize whatever raw
+# results the completed concurrencies produced -- partial perf data is worth
+# uploading -- and propagate the failure via the exit code at the end.
+if [[ "$SALLOC_RC" -ne 0 ]]; then
+    echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); prefill/decode logs:" >&2
+    for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
+        [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # Normalize raw bench_serving output -> process_result.py schema.
@@ -290,6 +331,12 @@ PY
     PROCESSED=$((PROCESSED + 1))
 done
 
+# Propagate a benchmark/allocation failure even though we emitted partial
+# results above (the workflow uploads them with `always()`).
+if [[ "$SALLOC_RC" -ne 0 ]]; then
+    echo "ERROR: benchmark failed (rc=$SALLOC_RC); emitted $PROCESSED partial result file(s)." >&2
+    exit "$SALLOC_RC"
+fi
 if [[ "$PROCESSED" -eq 0 ]]; then
     echo "ERROR: no result files produced" >&2
     exit 1
