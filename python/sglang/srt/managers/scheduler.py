@@ -1515,7 +1515,7 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            batch = self.get_next_batch_to_run(self.last_batch)
             self.cur_batch = batch
 
             # Launch the current batch
@@ -1556,9 +1556,11 @@ class Scheduler(
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            batch = self.get_next_batch_to_run(self.last_batch)
             self.cur_batch = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                batch, self.last_batch
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1583,7 +1585,7 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
+                self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -1591,7 +1593,9 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
-    def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
+    def is_disable_overlap_for_batch(
+        self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    ) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
         # In DP attention mode, use the globally synchronized is_extend_in_batch
@@ -1603,7 +1607,7 @@ class Scheduler(
             is_extend = lambda b: b and b.forward_mode.is_extend()
 
         batch_is_extend = is_extend(batch)
-        last_batch_is_extend = is_extend(self.last_batch)
+        last_batch_is_extend = is_extend(last_batch)
 
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
@@ -2552,7 +2556,9 @@ class Scheduler(
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+    def get_next_batch_to_run(
+        self, last_batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -2597,32 +2603,32 @@ class Scheduler(
 
         if (
             not self.enable_hisparse
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and last_batch
+            and last_batch.forward_mode.is_extend()
         ):
-            if self.last_batch.chunked_req is not None:
+            if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+                chunked_req_to_exclude.add(last_batch.chunked_req)
 
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
+            if self.dllm_config is not None and last_batch.reqs:
+                chunked_req_to_exclude.update(last_batch.reqs)
 
             # Filter batch
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
+            last_bs = last_batch.batch_size()
+            last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if self.last_batch.batch_size() < last_bs:
+            if last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
-            if not self.last_batch.is_empty():
+            if not last_batch.is_empty():
                 if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                    self.running_batch = last_batch
                 else:
                     # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+                    self.running_batch.merge_batch(last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -3333,7 +3339,7 @@ class Scheduler(
         )
 
     def launch_batch_sample_if_needed(
-        self, batch_result: GenerationBatchResult
+        self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
@@ -3349,8 +3355,8 @@ class Scheduler(
                 batch_result.future_indices, batch_result.next_token_ids
             )
             batch_result.copy_to_cpu(
-                return_logprob=self.cur_batch.return_logprob,
-                return_hidden_states=self.cur_batch.return_hidden_states,
+                return_logprob=cur_batch.return_logprob,
+                return_hidden_states=cur_batch.return_hidden_states,
             )
 
         # Release the closure and large GPU tensors that are no longer needed.

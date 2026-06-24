@@ -107,7 +107,7 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    self.mbs[mb_id] = self.get_next_batch_to_run()
+                    self.mbs[mb_id] = self.get_next_batch_to_run(self.last_batch)
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
