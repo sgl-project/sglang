@@ -11,6 +11,7 @@ from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import 
     fused_scale_residual_norm_scale_shift,
     validate_scale_shift,
 )
+from sglang.jit_kernel.diffusion import norm_scale_shift_native
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=28, suite="base-b-kernel-unit-1-gpu-large")
@@ -134,6 +135,95 @@ def test_validate_scale_shift_rejects_non_divisible_frames():
             10,
             256,
         )
+
+
+class _FakeNativeModule:
+    def __init__(self):
+        self.nss_calls = 0
+        self.srnss_calls = 0
+
+    def qwen_image_nss_bf16_row(self, y, x, scale, shift, eps):
+        self.nss_calls += 1
+        y.copy_(x)
+
+    def qwen_image_srnss_bf16_row(
+        self, y, res_out, residual, x, gate, scale, shift, eps
+    ):
+        self.srnss_calls += 1
+        res_out.copy_(residual + gate.view(1, -1) * x)
+        y.copy_(res_out)
+
+
+def _patch_native_module(monkeypatch):
+    fake = _FakeNativeModule()
+    monkeypatch.setattr(norm_scale_shift_native, "_blackwell_or_newer", lambda device: True)
+    monkeypatch.setattr(norm_scale_shift_native, "_module", lambda: fake)
+    return fake
+
+
+def test_qwen_image_native_helper_only_dispatches_bf16_row_nss(monkeypatch):
+    fake = _patch_native_module(monkeypatch)
+    x = torch.randn(1, 6, 3072, device=DEVICE, dtype=torch.bfloat16)
+    scale = torch.randn(1, 1, 3072, device=DEVICE, dtype=torch.bfloat16)
+    shift = torch.randn(1, 3072, device=DEVICE, dtype=torch.bfloat16)
+
+    y = norm_scale_shift_native.try_fused_norm_scale_shift(
+        x, None, None, scale, shift, "layer", 1e-6
+    )
+    assert y is not None
+    assert y.shape == x.shape
+    assert fake.nss_calls == 1
+
+    per_token_scale = torch.randn(1, 6, 3072, device=DEVICE, dtype=torch.bfloat16)
+    assert (
+        norm_scale_shift_native.try_fused_norm_scale_shift(
+            x, None, None, per_token_scale, shift, "layer", 1e-6
+        )
+        is None
+    )
+    assert fake.nss_calls == 1
+
+    x_fp16 = x.to(torch.float16)
+    assert (
+        norm_scale_shift_native.try_fused_norm_scale_shift(
+            x_fp16, None, None, scale, shift, "layer", 1e-6
+        )
+        is None
+    )
+    assert fake.nss_calls == 1
+
+
+def test_qwen_image_native_helper_only_dispatches_bf16_row_srnss(monkeypatch):
+    fake = _patch_native_module(monkeypatch)
+    residual = torch.randn(1, 6, 3072, device=DEVICE, dtype=torch.bfloat16)
+    x = torch.randn(1, 6, 3072, device=DEVICE, dtype=torch.bfloat16)
+    gate = torch.randn(1, 1, 3072, device=DEVICE, dtype=torch.bfloat16)
+    scale = torch.randn(3072, device=DEVICE, dtype=torch.bfloat16)
+    shift = torch.randn(1, 3072, device=DEVICE, dtype=torch.bfloat16)
+
+    y, res_out = norm_scale_shift_native.try_fused_scale_residual_norm_scale_shift(
+        residual, x, gate, None, None, scale, shift, "layer", 1e-6
+    )
+    assert y.shape == x.shape
+    assert res_out.shape == x.shape
+    assert fake.srnss_calls == 1
+
+    assert (
+        norm_scale_shift_native.try_fused_scale_residual_norm_scale_shift(
+            residual, x, None, None, None, scale, shift, "layer", 1e-6
+        )
+        is None
+    )
+    assert fake.srnss_calls == 1
+
+    weight = torch.randn(3072, device=DEVICE, dtype=torch.bfloat16)
+    assert (
+        norm_scale_shift_native.try_fused_scale_residual_norm_scale_shift(
+            residual, x, gate, weight, None, scale, shift, "layer", 1e-6
+        )
+        is None
+    )
+    assert fake.srnss_calls == 1
 
 
 @torch.no_grad()
