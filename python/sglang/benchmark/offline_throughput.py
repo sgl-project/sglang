@@ -418,7 +418,7 @@ def throughput_test(
     # Parse args
     extra_request_body = {}
     if bench_args.extra_request_body:
-        extra_request_body = json.loads(args.extra_request_body)
+        extra_request_body = json.loads(bench_args.extra_request_body)
 
     # Read dataset
     input_requests = get_dataset(bench_args, tokenizer)
@@ -504,7 +504,7 @@ def throughput_test(
     return result
 
 
-if __name__ == "__main__":
+def cli_main():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
@@ -541,3 +541,7 @@ if __name__ == "__main__":
 
     while bench_args.do_not_exit:
         pass
+
+
+if __name__ == "__main__":
+    cli_main()
