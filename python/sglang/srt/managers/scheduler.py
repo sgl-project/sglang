@@ -3250,16 +3250,20 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            stash_payload = (
-                                RelayPayload.from_draft_input(
-                                    batch_result.next_draft_input
+                            # ngram precomputes its draft and does not relay
+                            # through the FutureMap (stash() no-ops for it); its
+                            # verify input also has no bonus_tokens to project.
+                            if not batch.spec_algorithm.is_ngram():
+                                stash_payload = (
+                                    RelayPayload.from_draft_input(
+                                        batch_result.next_draft_input
+                                    )
+                                    if not batch.spec_algorithm.is_none()
+                                    else RelayPayload(
+                                        bonus_tokens=batch_result.next_token_ids
+                                    )
                                 )
-                                if not batch.spec_algorithm.is_none()
-                                else RelayPayload(
-                                    bonus_tokens=batch_result.next_token_ids
-                                )
-                            )
-                            self.future_map.stash(future_indices, stash_payload)
+                                self.future_map.stash(future_indices, stash_payload)
                             # Result D2H on copy_stream overlaps the next forward
                             # instead of serializing on forward_stream; it's a leaf
                             # gated by copy_done, so nothing on forward_stream waits.
