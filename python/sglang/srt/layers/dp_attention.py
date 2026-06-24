@@ -580,13 +580,11 @@ def _dp_gather_via_all_gatherv(
     else:
         local_real = local_tokens.new_zeros((local_rows, *local_tokens.shape[1:]))
         local_real[: local_tokens.shape[0]].copy_(local_tokens)
-    gathered = get_tp_group().all_gatherv(local_real, sizes=sizes)
-    if isinstance(gathered, list):
-        # all_gatherv may return a list of per-rank tensors; concatenate them
-        # along the token dim (taking [0] would drop all but rank 0's tokens).
-        gathered = torch.cat(gathered, dim=0)
-    # gathered rows == sum(sizes); must equal the buffer length.
-    global_tokens[: gathered.shape[0]].copy_(gathered)
+    # sum(sizes) == global_tokens.shape[0] is guaranteed by the caller (else it
+    # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
+    # the gather writes directly into it -- avoids the previous extra full-buffer
+    # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
+    get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
 def _dp_gather(

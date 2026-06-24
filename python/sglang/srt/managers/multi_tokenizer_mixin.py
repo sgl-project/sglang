@@ -49,6 +49,10 @@ from sglang.srt.managers.io_struct import (
     PauseContinueBroadcast,
     PauseGenerationReqInput,
     TokenizerWorkerRegistration,
+    async_sock_recv,
+    async_sock_send,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
@@ -97,7 +101,7 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
-        self._mapping[ipc_name].send_pyobj(output)
+        sock_send(self._mapping[ipc_name], output)
 
 
 def _extract_field_by_index(
@@ -334,7 +338,7 @@ class MultiHttpWorkerDetokenizerMixin:
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
@@ -431,7 +435,7 @@ class MultiTokenizerRouter:
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
+            recv_obj = await async_sock_recv(self.receive_from_worker)
 
             if isinstance(recv_obj, TokenizerWorkerRegistration):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
@@ -456,15 +460,15 @@ class MultiTokenizerRouter:
                     isinstance(recv_obj, PauseGenerationReqInput)
                     and recv_obj.mode == "abort"
                 ):
-                    await self.send_to_scheduler.send_pyobj(recv_obj)
+                    await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
@@ -505,7 +509,7 @@ class MultiDetokenizerRouter:
 
     def event_loop(self):
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
 
             # FreezeGCReq must freeze every detokenizer process.
             if isinstance(recv_obj, FreezeGCReq):
@@ -600,7 +604,7 @@ class TokenizerWorker(TokenizerManager):
 
         # Register this worker with the router for pause/continue broadcasting
         reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
-        self.send_to_scheduler.send_pyobj(reg)
+        sock_send(self.send_to_scheduler, reg)
 
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
@@ -618,7 +622,7 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
-        self.send_to_scheduler.send_pyobj(obj)
+        sock_send(self.send_to_scheduler, obj)
         await self._pause_continue_future
 
         if obj.mode == "abort":
@@ -633,7 +637,7 @@ class TokenizerWorker(TokenizerManager):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        self.send_to_scheduler.send_pyobj(obj)
+        sock_send(self.send_to_scheduler, obj)
         await self._pause_continue_future
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
@@ -734,14 +738,3 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
-
-
-class SenderWrapper:
-    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
-        self.port_args = port_args
-        self.send_to_scheduler = send_to_scheduler
-
-    def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
-            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(obj)
