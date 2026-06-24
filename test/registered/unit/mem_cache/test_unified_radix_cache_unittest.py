@@ -7,6 +7,7 @@ import time
 import unittest
 from array import array
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -627,9 +628,74 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertFalse(node.evicted)
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
 
+    def test_radix_session_release_frees_device_and_host_copies(self):
+        tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        self._init_hicache(tree)
+        tree.take_events()
+
+        session_id = "session-a"
+        seq = [1, 2, 3, 4]
+        result = self._insert(tree, allocator, seq)
+        node = result.last_device_node
+        tree.register_radix_session(session_id)
+        tree._tag_session_leaf(
+            SimpleNamespace(session_id=session_id),
+            RadixKey(array("q", seq)),
+            node=node,
+        )
+        self._backup_node(tree, node)
+        tree.take_events()
+
+        self.assertGreater(tree.release_radix_session(session_id), 0)
+        self.assertNotIn(node, tree.evictable_device_leaves)
+        self.assertNotIn(node, tree.evictable_host_leaves)
+        self.assertNotIn(session_id, tree._session_leaves)
+        self.assertEqual(
+            len(
+                tree.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq)))
+                ).device_indices
+            ),
+            0,
+        )
+        removed = [
+            event for event in tree.take_events() if isinstance(event, BlockRemoved)
+        ]
+        self.assertTrue(any(event.medium == StorageMedium.GPU for event in removed))
+        self.assertTrue(any(event.medium == StorageMedium.CPU for event in removed))
+
+    def test_radix_session_release_retries_after_unlock(self):
+        tree, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(tree)
+
+        session_id = "session-a"
+        seq = [1, 2, 3, 4]
+        node = self._insert(tree, allocator, seq).last_device_node
+        tree.register_radix_session(session_id)
+        tree._tag_session_leaf(
+            SimpleNamespace(session_id=session_id),
+            RadixKey(array("q", seq)),
+            node=node,
+        )
+        tree.inc_lock_ref(node)
+
+        self.assertEqual(tree.release_radix_session(session_id), 0)
+        self.assertIn(session_id, tree._pending_radix_session_releases)
+
+        tree.dec_lock_ref(node)
+        tree.check_hicache_events()
+        self.assertNotIn(session_id, tree._pending_radix_session_releases)
+        self.assertEqual(
+            len(
+                tree.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", seq)))
+                ).device_indices
+            ),
+            0,
+        )
+
 
 class UnifiedRadixCacheSuite:
-
     cfg: CacheConfig
     _rid: int = 0
 
@@ -711,6 +777,28 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(len(m.device_indices), 0)
 
+        tree.sanity_check()
+
+    def test_radix_session_release_frees_all_components(self):
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        result = self._insert(tree, allocator, req_to_token_pool, seq)
+        session_id = "session-a"
+        tree.register_radix_session(session_id)
+        tree._tag_session_leaf(
+            SimpleNamespace(session_id=session_id),
+            RadixKey(array("q", seq)),
+            node=result.last_device_node,
+        )
+
+        self.assertGreater(tree.release_radix_session(session_id), 0)
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertEqual(tree.full_evictable_size(), 0)
+        if self.cfg.has_swa:
+            self.assertEqual(tree.swa_evictable_size(), 0)
+        if self.cfg.has_mamba:
+            self.assertEqual(tree.mamba_evictable_size(), 0)
         tree.sanity_check()
 
     def test_shared_prefix_split(self):
@@ -885,6 +973,8 @@ class UnifiedRadixCacheSuite:
         ps = self.cfg.page_size
 
         req = self._make_req(req_to_token_pool)
+        req.session_id = "session-a"
+        tree.register_radix_session(req.session_id)
         input_ids = self._make_seq(1, 3)
         output_ids = self._make_seq(2000, 1)
         req.origin_input_ids = array("q", input_ids)
@@ -910,6 +1000,7 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", all_ids[:aligned_len])))
         )
         self.assertEqual(len(m.device_indices), aligned_len)
+        self.assertIn(m.last_device_node, tree._session_leaves[req.session_id])
         tree.sanity_check()
 
     def test_cache_finished_req_strips_thinking(self):
@@ -4151,7 +4242,6 @@ class UnifiedRadixCacheSuite:
 
 
 class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
-
     components = (ComponentType.FULL, ComponentType.SWA)
 
     def _make_node(self, key_len: int) -> UnifiedTreeNode:

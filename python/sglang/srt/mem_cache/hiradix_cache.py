@@ -1264,6 +1264,7 @@ class HiRadixCache(RadixCache):
                     self._record_remove_event(node, medium=StorageMedium.GPU)
                     self.cache_controller.mem_pool_device_allocator.free(node.value)
                     self._delete_leaf(node)
+                    self._update_host_leaf_status(parent)
                 else:
                     key = node.key.child_key(self.page_size)
                     popped = parent.children.pop(key, None)

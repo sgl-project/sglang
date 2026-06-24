@@ -41,6 +41,9 @@ class SessionRadixCacheMixin:
         self._closed_session_ids.pop(session_id, None)
         self._session_leaves.setdefault(session_id, set())
 
+    def register_radix_session(self, session_id: str) -> None:
+        self.register_session(session_id)
+
     def _remember_closed_session(self, session_id: str) -> None:
         self._closed_session_ids[session_id] = None
         self._closed_session_ids.move_to_end(session_id)
@@ -124,3 +127,6 @@ class SessionRadixCacheMixin:
             freed,
         )
         return freed
+
+    def release_radix_session(self, session_id: str) -> int:
+        return self.release_session(session_id)

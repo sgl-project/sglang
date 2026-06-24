@@ -4064,7 +4064,7 @@ class Scheduler(
         if self.server_args.enable_session_radix_cache:
             # Radix-native: open is implicit; explicit open only permits id reuse.
             session_id = recv_req.session_id
-            self.tree_cache.register_session(session_id)
+            self.tree_cache.register_radix_session(session_id)
             output = OpenSessionReqOutput(session_id, session_id is not None)
         else:
             output = self.session_controller.open(recv_req)
@@ -4075,7 +4075,7 @@ class Scheduler(
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.server_args.enable_session_radix_cache:
             # "Close" just triggers eviction of the session's tagged KV.
-            self.tree_cache.release_session(recv_req.session_id)
+            self.tree_cache.release_radix_session(recv_req.session_id)
         else:
             self.session_controller.close(recv_req)
 

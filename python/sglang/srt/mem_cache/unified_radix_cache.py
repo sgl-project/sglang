@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -302,7 +303,7 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+class UnifiedRadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -456,6 +457,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
         }
         self.session.slots.clear()
+        self._reset_session_radix_state()
+        self._pending_radix_session_releases = set()
 
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
@@ -723,6 +726,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = None
         insert_params = None
+        session_leaf = None
 
         if is_insert:
             insert_params = InsertParams(
@@ -758,11 +762,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
+            session_leaf = result.last_device_node
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            radix_key = RadixKey(
+                token_ids, req.extra_key, is_bigram=self.is_eagle
+            ).page_aligned(self.page_size)
+
+        self._tag_session_leaf(req, radix_key, node=session_leaf)
 
         self.dec_lock_ref(
             req.last_node,
@@ -870,6 +880,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        self._tag_session_leaf(req, radix_key, node=new_last_node)
 
         # cleanup
         for comp in self._components_tuple:
@@ -1105,7 +1116,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._touch_node(node)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return InsertResult(prefix_len=0, mamba_exist=True)
+            return InsertResult(prefix_len=0, last_device_node=node, mamba_exist=True)
 
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
@@ -1173,7 +1184,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # resources here or propagate a flag so that
                 # cleanup_after_caching_req can free them properly.
                 self.token_to_kv_pool_allocator.free(value)
-                return InsertResult(prefix_len=total_prefix_length)
+                return InsertResult(
+                    prefix_len=total_prefix_length, last_device_node=node
+                )
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
@@ -1181,7 +1194,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
-        result = InsertResult(prefix_len=total_prefix_length)
+        result = InsertResult(
+            prefix_len=total_prefix_length, last_device_node=target_node
+        )
         for component in self._components_tuple:
             component.commit_insert_component_data(
                 node=target_node,
@@ -1310,6 +1325,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
+        self._discard_session_leaf(node)
 
     def _evict_component_and_detach_lru(
         self,
@@ -2468,6 +2484,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        for session_id in tuple(self._pending_radix_session_releases):
+            self.release_radix_session(session_id)
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -2497,6 +2515,81 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def supports_mamba(self) -> bool:
         return ComponentType.MAMBA in self.components
+
+    # ---- Radix-native session API ----
+
+    def register_radix_session(self, session_id: str) -> None:
+        self._pending_radix_session_releases.discard(session_id)
+        super().register_radix_session(session_id)
+
+    def release_radix_session(self, session_id: str) -> int:
+        """Free a session's last-holder nodes across all cache components."""
+        self._ensure_session_radix_state()
+        self._remember_closed_session(session_id)
+        self._pending_radix_session_releases.discard(session_id)
+        indexed = self._session_leaves.pop(session_id, set())
+        deferred = set()
+        freed = 0
+
+        for leaf in sorted(indexed, key=lambda node: node.id, reverse=True):
+            if session_id not in getattr(leaf, "session_ids", ()):
+                continue
+            node = leaf
+            while True:
+                if node is self.root_node:
+                    break
+                if any(
+                    data.lock_ref != 0 or data.host_lock_ref != 0
+                    for data in node.component_data
+                ):
+                    if session_id in getattr(node, "session_ids", ()):
+                        deferred.add(node)
+                    break
+
+                session_ids = getattr(node, "session_ids", None)
+                if session_ids is not None:
+                    session_ids.discard(session_id)
+                    if not session_ids:
+                        delattr(node, "session_ids")
+                if (
+                    node.children
+                    or getattr(node, "session_ids", None)
+                    or (
+                        node not in self.evictable_device_leaves
+                        and node not in self.evictable_host_leaves
+                    )
+                ):
+                    break
+
+                parent = node.parent
+                full_data = node.component_data[BASE_COMPONENT_TYPE]
+                if full_data.value is not None:
+                    self._record_remove_event(node, medium=StorageMedium.GPU)
+                if full_data.host_value is not None:
+                    self._record_remove_event(node, medium=StorageMedium.CPU)
+                for component in self._components_tuple:
+                    self._evict_component_and_detach_lru(
+                        node, component, target=EvictLayer.ALL
+                    )
+                full_data.value = None
+                self.evictable_device_leaves.discard(node)
+                self.evictable_host_leaves.discard(node)
+                self._remove_leaf_from_parent(node)
+                self._update_evictable_leaf_sets(parent)
+                freed += 1
+                node = parent
+
+        if deferred:
+            self._session_leaves[session_id].update(deferred)
+            self._pending_radix_session_releases.add(session_id)
+        logger.info(
+            "release_radix_session %s: indexed %d leaves, freed %d nodes, deferred %d",
+            session_id,
+            len(indexed),
+            freed,
+            len(deferred),
+        )
+        return freed
 
     # ---- Streaming session API (delegates to composed StreamingSession) ----
 
