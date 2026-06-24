@@ -313,6 +313,13 @@ def _nvfp4_inner_pool_and_layer_id(token_to_kv_pool, layer_id: int):
     )
     return inner_pool, local_layer_id
 
+def _shape_nvfp4_kv_scale_for_flashinfer(scale: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if scale is None:
+        return None
+    if scale.dim() == 3:
+        return scale.unsqueeze(1)
+    return scale
+
 
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
@@ -541,12 +548,38 @@ class FlashInferAttnBackend(AttentionBackend):
             self.token_to_kv_pool, layer.layer_id
         )
         k_sf, v_sf = kv_pool.get_kv_scale_buffer(local_layer_id)
+        k_sf = _shape_nvfp4_kv_scale_for_flashinfer(k_sf)
+        v_sf = _shape_nvfp4_kv_scale_for_flashinfer(v_sf)
         k_global, v_global = kv_pool.get_kv_global_scale(local_layer_id)
         return kv_cache, {
             "kv_cache_sf": (k_sf, v_sf),
             "k_scale": k_global,
             "v_scale": v_global,
         }
+
+    def _should_vo_split(self, layer: RadixAttention) -> bool:
+        return self.enable_vo_split and layer.head_dim == 512
+
+    @staticmethod
+    def _slice_last_dim_for_vo_split(x: Optional[torch.Tensor], pass_id: int):
+        if x is None:
+            return None
+        half = x.shape[-1] // 2
+        return x[..., pass_id * half : (pass_id + 1) * half]
+
+    def _vo_split_paged_inputs(self, paged_kv_cache, paged_kv_kwargs, pass_id: int):
+        k_cache, v_cache = paged_kv_cache
+        split_kwargs = dict(paged_kv_kwargs)
+        if split_kwargs.get("kv_cache_sf") is not None:
+            k_sf, v_sf = split_kwargs["kv_cache_sf"]
+            split_kwargs["kv_cache_sf"] = (
+                k_sf,
+                self._slice_last_dim_for_vo_split(v_sf, pass_id),
+            )
+        return (
+            k_cache,
+            self._slice_last_dim_for_vo_split(v_cache, pass_id),
+        ), split_kwargs
 
     def _run_paged_native(
         self,
@@ -560,7 +593,45 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap,
         return_lse,
         paged_kv_kwargs,
+        trace_label=None,
+        trace_layer=None,
+        vo_split: bool = False,
     ):
+        if vo_split:
+            outs = []
+            lse = None
+            for pass_id in range(2):
+                split_cache, split_kwargs = self._vo_split_paged_inputs(
+                    paged_kv_cache, paged_kv_kwargs, pass_id
+                )
+                result = self._run_paged_native(
+                    wrapper,
+                    q,
+                    split_cache,
+                    causal=causal,
+                    sm_scale=sm_scale,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    return_lse=return_lse,
+                    paged_kv_kwargs=split_kwargs,
+                    trace_label=(
+                        f"{trace_label}_vosplit{pass_id}"
+                        if trace_label is not None
+                        else None
+                    ),
+                    trace_layer=trace_layer,
+                    vo_split=False,
+                )
+                if return_lse:
+                    out_i, lse_i = result
+                    if lse is None:
+                        lse = lse_i
+                    outs.append(out_i)
+                else:
+                    outs.append(result)
+            out = torch.cat(outs, dim=-1)
+            return (out, lse) if return_lse else out
+
         wrapper._causal = causal
         wrapper._pos_encoding_mode = "NONE"
         wrapper._use_fp16_qk_reduction = False
@@ -569,9 +640,100 @@ class FlashInferAttnBackend(AttentionBackend):
         wrapper._sm_scale = sm_scale
         wrapper._rope_scale = None
         wrapper._rope_theta = None
-        return wrapper.run(
+        self._trace_gemma4_geometry_dispatch(
+            label=trace_label,
+            layer=trace_layer,
+            paged_kv_cache=paged_kv_cache,
+            paged_kv_kwargs=paged_kv_kwargs,
+            wrapper=wrapper,
+            vo_split=vo_split,
+        )
+        out = wrapper.run(
             q, paged_kv_cache, return_lse=return_lse, **paged_kv_kwargs
         )
+        if self.is_nvfp4_native and _fp4_kv_module_trace_enabled():
+            layer_id = getattr(trace_layer, "layer_id", None)
+            key = (trace_label, int(layer_id) if layer_id is not None else None)
+            if key not in self._nvfp4_module_trace_seen:
+                self._nvfp4_module_trace_seen.add(key)
+                extra_flags = os.environ.get("FLASHINFER_EXTRA_CUDAFLAGS", "")
+                k_sf, v_sf = paged_kv_kwargs.get("kv_cache_sf", (None, None))
+                logger.warning(
+                    "FP4 KV FlashInfer module trace label=%s layer=%s "
+                    "extra_cuda_flags=%r deswizzle_macro_active=%s "
+                    "wrapper=%s kv_cache=%s k_sf=%s v_sf=%s k_scale=%s v_scale=%s",
+                    trace_label,
+                    layer_id,
+                    extra_flags,
+                    "FLASHINFER_PAGED_V_SF_DESWIZZLE" in extra_flags,
+                    _flashinfer_wrapper_trace_summary(wrapper),
+                    _tensor_trace_summary(paged_kv_cache),
+                    _tensor_trace_summary(k_sf),
+                    _tensor_trace_summary(v_sf),
+                    _scale_trace_value(paged_kv_kwargs.get("k_scale")),
+                    _scale_trace_value(paged_kv_kwargs.get("v_scale")),
+                )
+        return out
+
+    def _plan_decode_as_prefill_vo_split(
+        self,
+        *,
+        decode_wrapper,
+        prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper,
+        q: torch.Tensor,
+        layer: RadixAttention,
+    ) -> None:
+        if self.skip_prefill:
+            raise RuntimeError("VO-split decode-as-prefill requires prefill wrappers")
+
+        wrapper_id = self._get_wrapper_idx(layer)
+        geom = self.wrapper_geometries[wrapper_id]
+        bs = q.shape[0]
+        qo_indptr = self.qo_indptr[wrapper_id]
+        qo_indptr[: bs + 1].copy_(
+            torch.arange(bs + 1, dtype=torch.int32, device=qo_indptr.device)
+        )
+        qo_indptr = qo_indptr[: bs + 1]
+
+        if not all(
+            hasattr(decode_wrapper, name)
+            for name in (
+                "_paged_kv_indptr_buf",
+                "_paged_kv_indices_buf",
+                "_paged_kv_last_page_len_buf",
+            )
+        ):
+            raise RuntimeError(
+                "VO-split decode-as-prefill requires a planned decode wrapper"
+            )
+
+        updater = self.indices_updater_prefill
+        plan_kwargs = {
+            "head_dim_vo": geom.head_dim_vo,
+            "q_data_type": updater.q_data_type,
+            "kv_data_type": updater.kv_data_type,
+            "custom_mask": None,
+            "non_blocking": True,
+            "fixed_split_size": self.prefill_split_tile_size,
+        }
+        if updater.k_data_type != updater.v_data_type:
+            plan_kwargs.update(
+                k_data_type=updater.k_data_type,
+                v_data_type=updater.v_data_type,
+            )
+
+        prefill_wrapper.begin_forward(
+            qo_indptr,
+            decode_wrapper._paged_kv_indptr_buf[: bs + 1],
+            decode_wrapper._paged_kv_indices_buf,
+            decode_wrapper._paged_kv_last_page_len_buf[:bs],
+            geom.num_qo_heads,
+            geom.num_kv_heads,
+            geom.head_dim,
+            1,
+            **plan_kwargs,
+        )
+
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -1083,6 +1245,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                     return_lse=False,
                     paged_kv_kwargs=paged_kv_kwargs,
+                    vo_split=self._should_vo_split(layer),
                 )
             else:
                 o = prefill_wrapper_paged.forward(
@@ -1161,6 +1324,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         logits_soft_cap=logits_soft_cap,
                         return_lse=True,
                         paged_kv_kwargs=paged_kv_kwargs,
+                        vo_split=self._should_vo_split(layer),
                     )
                 else:
                     o2, s2 = prefill_wrapper_paged.forward_return_lse(
@@ -1230,6 +1394,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 logits_soft_cap=layer.logit_cap,
                 return_lse=False,
                 paged_kv_kwargs=paged_kv_kwargs,
+                vo_split=self._should_vo_split(layer),
             )
         else:
             o = decode_wrapper.forward(
