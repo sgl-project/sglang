@@ -205,12 +205,11 @@ def benchmark(
         f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} {'ntask':>6s} | "
         f"{'maxAtom':>7s} {'DSL(us)':>9s} | "
         f"{'maxNa':>5s} {'DSL(us)':>9s} {'max_atom/max_na':>15s} | "
-        f"{'DG-exp(us)':>11s} {'DG-nat(us)':>11s} {'exp/DSL_maxA':>13s} {'nat/DSL_maxA':>13s}"
+        f"{'DG-nat(us)':>11s} {'nat/DSL_maxA':>13s}"
     )
     print(hdr)
-    print("  exp = DG-expanded (q=[B*next_n,1,H,D]) — what SGLang's indexer uses today")
     print(
-        "  nat = DG-native   (q=[B,next_n,H,D])   — TRT-LLM's path; not reachable from SGLang"
+        "  nat = DG-native   (q=[B,next_n,H,D])   — TRT-LLM's path; now also SGLang's"
     )
     print("  maxAtom = baseline picker (min waves, tie-break largest atom = least HBM)")
     print(
@@ -349,42 +348,6 @@ def benchmark(
                         clean_logits=False,
                     )
 
-                # DG-expanded: SGLang's actual indexer path. q is reshaped to
-                # next_n=1 with B'=B*next_n batches; block_table and ctx_lens
-                # are repeat_interleave'd to match. Schedule input is
-                # (B', 1) -> num_next_n_atoms=1. This is `nsa_indexer.py`'s
-                # unconditional q.unsqueeze(1) layout.
-                B_exp = batch_size * next_n
-                q_exp = data["q_fp8"].reshape(B_exp, 1, num_heads, head_dim)
-                weights_exp = data["weights"]  # already [B*next_n, H]
-                # ctx per token = ctx_len for all next_n positions of a batch
-                # (same as SGLang's seqlens_expanded layout for target_verify).
-                ctx_exp = (
-                    data["context_lens"]
-                    .unsqueeze(-1)
-                    .expand(-1, next_n)
-                    .reshape(B_exp, 1)
-                    .contiguous()
-                )
-                bt_exp = (
-                    data["block_table"].repeat_interleave(next_n, dim=0).contiguous()
-                )
-                dg_exp_schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-                    ctx_exp, DG_METADATA_BLOCK_KV, num_sms
-                )
-
-                def _dg_expanded():
-                    deep_gemm.fp8_paged_mqa_logits(
-                        q_exp,
-                        data["kv_fused"],
-                        weights_exp,
-                        ctx_exp,
-                        bt_exp,
-                        dg_exp_schedule_meta,
-                        data["max_model_len"],
-                        clean_logits=False,
-                    )
-
                 bench_kwargs = dict(
                     dry_run_iters=5,
                     repeat_iters=30,
@@ -405,11 +368,9 @@ def benchmark(
                     if strats_diverge
                     else base_ms
                 )
-                dg_exp_ms = np.median(bench_gpu_time(_dg_expanded, **bench_kwargs))
                 dg_nat_ms = np.median(bench_gpu_time(_dg_native, **bench_kwargs))
 
                 strat_speedup = base_ms / exp_ms if exp_ms > 0 else float("nan")
-                exp_ratio = dg_exp_ms / base_ms if base_ms > 0 else float("nan")
                 nat_ratio = dg_nat_ms / base_ms if base_ms > 0 else float("nan")
                 base_lab = f"{na_base}/{atom_base}"
                 exp_lab = f"{na_exp}/{atom_exp}"
@@ -417,8 +378,7 @@ def benchmark(
                     f"{batch_size:5d} {context_len:7d} {next_n:6d} {nblk:7d} {ntask:6d} | "
                     f"{base_lab:>7s} {base_ms * 1e3:9.2f} | "
                     f"{exp_lab:>5s} {exp_ms * 1e3:9.2f} {strat_speedup:14.3f}x | "
-                    f"{dg_exp_ms * 1e3:11.2f} {dg_nat_ms * 1e3:11.2f} "
-                    f"{exp_ratio:12.3f}x {nat_ratio:12.3f}x"
+                    f"{dg_nat_ms * 1e3:11.2f} {nat_ratio:12.3f}x"
                 )
 
                 torch.cuda.empty_cache()
@@ -441,9 +401,9 @@ def main():
         "--next_n",
         type=int,
         nargs="+",
-        default=[1, 2, 4],
-        help="next_n values to sweep (default: 1 2 4 — covers decode and "
-        "spec-decode target_verify with num_draft_tokens in {2, 4}).",
+        default=[1, 2, 4, 6],
+        help="next_n values to sweep (default: 1 2 4 6 — covers decode and "
+        "spec-decode target_verify with num_draft_tokens in {2, 4, 6}).",
     )
     parser.add_argument(
         "--context_len",

@@ -725,15 +725,17 @@ class Indexer(MultiPlatformOp):
             schedule_metadata_dsl = schedule_metadata
             # Wave-aware atom-split decision is computed once per forward batch
             # in `dsa_backend.init_forward_metadata*` (CPU-side, cuda-graph
-            # safe). `factor > 1` means the picker chose to split; reshape Q +
-            # rebuild ctx_lens / block_tables / schedule_metadata to match.
+            # safe), with invariant `factor * atom == speculative_num_draft_tokens`
+            # (the target_verify-time next_n). The reshape
+            # `(B, next_n, ...) -> (B*factor, atom, ...)` is only valid when the
+            # caller actually supplies next_n == factor * atom tokens, so gate on
+            # that equality: a multi-step draft loop can reuse the same metadata
+            # with next_n mutated to 1, which must fall back to the kernel-native
+            # next_n path instead of splitting.
             factor = getattr(metadata, "dsl_expand_factor", 1)
             atom = getattr(metadata, "dsl_atom", 1)
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                and next_n >= 2
-                and factor > 1
-            ):
+            dsl_atom_split = factor > 1 and next_n == factor * atom
+            if forward_batch.forward_mode.is_target_verify() and dsl_atom_split:
                 exp_B = B * factor
                 q_dsl = q_fp8[:q_offset].view(
                     exp_B, atom, q_fp8.shape[1], q_fp8.shape[2]
@@ -746,9 +748,7 @@ class Indexer(MultiPlatformOp):
                     ctx_lens_1d.unsqueeze(-1), blocksize, self.sm_count
                 )
             elif forward_batch.forward_mode.is_target_verify() and next_n >= 2:
-                q_dsl = q_fp8[:q_offset].view(
-                    B, next_n, q_fp8.shape[1], q_fp8.shape[2]
-                )
+                q_dsl = q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2])
                 block_tables_dsl = block_tables[::next_n]
             else:
                 q_dsl = q_fp8[:q_offset].unsqueeze(1)
