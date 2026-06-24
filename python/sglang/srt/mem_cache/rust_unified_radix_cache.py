@@ -52,10 +52,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_INIT_NODE_CAPACITY = 1024
 
-_FULL = int(ComponentType.Full)
-_SWA = int(ComponentType.Swa)
-_MAMBA = int(ComponentType.Mamba)
-
 
 class RustUnifiedRadixCache(BasePrefixCache):
     """Orchestration layer: route tree ops to the Rust radix cache and process
@@ -275,9 +271,9 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         self.update_eviction_metrics(sum(result.evicted), start_time)
         return EvictResult(
-            num_tokens_evicted=result.evicted[_FULL],
-            swa_num_tokens_evicted=result.evicted[_SWA],
-            mamba_num_evicted=result.evicted[_MAMBA],
+            num_tokens_evicted=result.evicted[ComponentType.Full],
+            swa_num_tokens_evicted=result.evicted[ComponentType.Swa],
+            mamba_num_evicted=result.evicted[ComponentType.Mamba],
         )
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -299,10 +295,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return DecLockRefResult()
 
     def evictable_size(self) -> int:
-        return self.components[_FULL].evictable_size()
+        return self.components[ComponentType.Full].evictable_size()
 
     def protected_size(self) -> int:
-        return self.components[_FULL].protected_size()
+        return self.components[ComponentType.Full].protected_size()
 
     def total_size(self):
         return self._rust_radix.total_size()
@@ -314,23 +310,23 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return self.protected_size()
 
     def swa_evictable_size(self) -> int:
-        comp = self.components.get(_SWA)
+        comp = self.components.get(ComponentType.Swa)
         return comp.evictable_size() if comp is not None else 0
 
     def swa_protected_size(self) -> int:
-        comp = self.components.get(_SWA)
+        comp = self.components.get(ComponentType.Swa)
         return comp.protected_size() if comp is not None else 0
 
     def mamba_evictable_size(self) -> int:
-        comp = self.components.get(_MAMBA)
+        comp = self.components.get(ComponentType.Mamba)
         return comp.evictable_size() if comp is not None else 0
 
     def mamba_protected_size(self) -> int:
-        comp = self.components.get(_MAMBA)
+        comp = self.components.get(ComponentType.Mamba)
         return comp.protected_size() if comp is not None else 0
 
     def mamba_total_size(self) -> int:
-        comp = self.components.get(_MAMBA)
+        comp = self.components.get(ComponentType.Mamba)
         return comp.total_size() if comp is not None else 0
 
     def sanity_check(self) -> None:
@@ -339,10 +335,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
         return None
 
     def supports_swa(self) -> bool:
-        return _SWA in self.components
+        return ComponentType.Swa in self.components
 
     def supports_mamba(self) -> bool:
-        return _MAMBA in self.components
+        return ComponentType.Mamba in self.components
 
     # TODO(Jialin): expose Rust-side iteration; leak-diagnostic only.
     def all_values_flatten(self) -> torch.Tensor:

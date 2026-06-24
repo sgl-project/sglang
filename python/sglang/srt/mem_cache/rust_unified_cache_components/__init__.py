@@ -53,13 +53,13 @@ __all__ = [
 
 def build_components(
     cache: "RustUnifiedRadixCache",
-) -> "dict[int, RustTreeComponent]":
-    """One handler per configured component, keyed by `int(ComponentType)`."""
-    components: dict[int, RustTreeComponent] = {
-        int(ComponentType.Full): RustFullComponent(cache)
+) -> "dict[ComponentType, RustTreeComponent]":
+    """One handler per configured component, keyed by `ComponentType`."""
+    components: dict[ComponentType, RustTreeComponent] = {
+        ComponentType.Full: RustFullComponent(cache)
     }
     if cache.sliding_window_size is not None:
-        components[int(ComponentType.Swa)] = RustSWAComponent(cache)
+        components[ComponentType.Swa] = RustSWAComponent(cache)
     if cache.mamba_cache_chunk_size is not None:
-        components[int(ComponentType.Mamba)] = RustMambaComponent(cache)
+        components[ComponentType.Mamba] = RustMambaComponent(cache)
     return components

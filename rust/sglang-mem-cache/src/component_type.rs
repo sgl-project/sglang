@@ -12,6 +12,15 @@ pub enum ComponentType {
     Mamba = 2,
 }
 
+#[pymethods]
+impl ComponentType {
+    /// Use the discriminant directly as a positional index into per-component
+    /// arrays (e.g. `result.freed[ComponentType.Full]`) — no `int(...)` needed.
+    fn __index__(&self) -> usize {
+        *self as usize
+    }
+}
+
 /// Length of per-component arrays, derived from the highest discriminant.
 pub const NUM_COMPONENT_TYPES: usize = ComponentType::Mamba as usize + 1;
 
