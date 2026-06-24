@@ -26,7 +26,7 @@ First, launch the SGLang environment using the provided container image:
   <Tab title="Atlas 800I A3">
 
 ```shell Command
-export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -49,7 +49,7 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
   <Tab title="Atlas 800I A2">
 
 ```shell Command
-export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \

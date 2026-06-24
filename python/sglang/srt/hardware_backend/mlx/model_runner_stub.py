@@ -196,3 +196,7 @@ class MlxModelRunnerStub(ModelRunner):
             f"max_running_requests={self.max_running_requests}, "
             f"zero GPU KV cache allocation)"
         )
+
+    def alloc_memory_pool(self, memory_pool_config=None):
+        """No-op: MLX manages its own KV cache."""
+        pass
