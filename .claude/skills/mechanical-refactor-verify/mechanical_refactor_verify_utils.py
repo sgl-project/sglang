@@ -208,12 +208,13 @@ def _strip_moved_qualifiers(line: str, names: set[str]) -> str:
     return line
 
 
-_SELF_ANNOTATION = re.compile(r"(\bdef\s+\w+\(\s*self)\s*:[^,)]+")
+_SELF_ANNOTATION = re.compile(r"((?:\bdef\s+\w+\(\s*|^\s*)self)\s*:[^,)]+")
 
 
 def _strip_self_annotation(line: str) -> str:
     """Drop a type annotation on a definition's ``self`` parameter
-    (``def foo(self: Target)`` -> ``def foo(self)``).
+    (``def foo(self: Target)`` -> ``def foo(self)``), whether ``self`` sits right after the
+    ``def`` or on a wrapped parameter line.
 
     Relocating a ``@staticmethod def foo(self: Target)`` into ``Target`` as a normal
     instance method ``def foo(self)`` drops the decorator (a whitelisted artifact) and the
@@ -313,6 +314,124 @@ def _peel_requalifications(
     return rem_remaining, add_pool, count
 
 
+def _bracket_depth(line: str) -> int:
+    return sum(line.count(c) for c in "([{") - sum(line.count(c) for c in ")]}")
+
+
+def _split_caller_items(
+    block: list[str], names: set[str]
+) -> list[tuple[bool, list[str]]]:
+    """Split a block into ordered (is_call, lines) items: a moved-method call group runs
+    from a caller line until its brackets balance; everything else is a single line.
+
+    Grouping starts only at a caller line, so an unbalanced body line -- whose closing
+    bracket is unchanged context and thus absent from the diff -- cannot swallow a later
+    call expression. See verifier-spec.md (whitelist)."""
+    items: list[tuple[bool, list[str]]] = []
+    index, size = 0, len(block)
+    while index < size:
+        line = block[index]
+        if _is_moved_caller(line, names):
+            group = [line]
+            depth = _bracket_depth(line)
+            cursor = index + 1
+            while depth > 0 and cursor < size:
+                group.append(block[cursor])
+                depth += _bracket_depth(block[cursor])
+                cursor += 1
+            items.append((True, group))
+            index = cursor
+        else:
+            items.append((False, [line]))
+            index += 1
+    return items
+
+
+def _is_balanced(text: str) -> bool:
+    depth = 0
+    for char in text:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _is_moved_caller(joined: str, names: set[str]) -> bool:
+    return any(re.search(rf"\.{re.escape(name)}\(", joined) for name in names)
+
+
+def _canonical_call(joined: str, names: set[str], lower_receiver: bool) -> str:
+    """A whitespace-free canonical form of a call expression. With ``lower_receiver`` the
+    ``Owner.method(receiver, rest)`` form is lowered to ``receiver.method(rest)`` for each
+    moved method, and a redundant ``= (...)`` wrapper is dropped -- so a staticmethod call
+    and the instance-method call it becomes canonicalise to the same string. See
+    verifier-spec.md (whitelist)."""
+    # Collapse whitespace and strip it around punctuation only, so reflow is absorbed while
+    # word boundaries survive (``return Source`` does not become ``returnSource``).
+    text = re.sub(r"\s+", " ", joined).strip()
+    text = re.sub(r"\s*([(){}\[\],:=.])\s*", r"\1", text)
+    if lower_receiver:
+        for name in names:
+            text = re.sub(
+                rf"\b[\w.]+\.{re.escape(name)}\(([\w.]+)(,|\))",
+                lambda m: f"{m.group(1)}.{name}(" + ("" if m.group(2) == "," else ")"),
+                text,
+            )
+    marker = text.find("=(")
+    if marker != -1 and text.endswith(")") and _is_balanced(text[marker + 2 : -1]):
+        text = text[: marker + 1] + text[marker + 2 : -1]
+    return text
+
+
+def _peel_receiver_calls(
+    rem_block: list[str], add_block: list[str], names: set[str]
+) -> tuple[list[str], list[str], int]:
+    """Remove pairs where a ``Owner.method(receiver, rest)`` call site became
+    ``receiver.method(rest)`` for a moved method -- a staticmethod call turning into an
+    instance-method call, possibly reflowed by a formatter. The moved body, which is not a
+    qualified call to a moved symbol, is left untouched. See verifier-spec.md (whitelist).
+    """
+    if not names:
+        return rem_block, add_block, 0
+
+    add_items = _split_caller_items(add_block, names)
+    add_canonical = [
+        (
+            _canonical_call(" ".join(s.strip() for s in lines), names, False)
+            if is_call
+            else None
+        )
+        for is_call, lines in add_items
+    ]
+    add_peeled = [False] * len(add_items)
+
+    rem_rest: list[str] = []
+    lowered = 0
+    for is_call, lines in _split_caller_items(rem_block, names):
+        matched = False
+        if is_call:
+            key = _canonical_call(" ".join(s.strip() for s in lines), names, True)
+            for k in range(len(add_items)):
+                if not add_peeled[k] and add_canonical[k] == key:
+                    add_peeled[k] = True
+                    matched = True
+                    lowered += 1
+                    break
+        if not matched:
+            rem_rest.extend(lines)
+
+    add_rest = [
+        line
+        for k, (_, lines) in enumerate(add_items)
+        if not add_peeled[k]
+        for line in lines
+    ]
+    return rem_rest, add_rest, lowered
+
+
 @dataclass
 class MoveCheck:
     """The structured verdict for one commit (so the CLI text and the HTML report render
@@ -337,8 +456,15 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
     before_module_lines = _commit_before_module_lines(commit, repo_root)
     removed_stripped = {line.strip() for line in removed if line.strip()}
 
-    rem_keys = Counter(line.strip() for line in removed if line.strip())
-    add_keys = Counter(line.strip() for line in added if line.strip())
+    # Normalise the self annotation before matching def lines, so a method relocated as
+    # def foo(self: Target) -> def foo(self) is still recognised as a moved symbol (and its
+    # call sites may then be requalified / lowered).
+    rem_keys = Counter(
+        _strip_self_annotation(line.strip()) for line in removed if line.strip()
+    )
+    add_keys = Counter(
+        _strip_self_annotation(line.strip()) for line in added if line.strip()
+    )
     moved_names = _moved_symbol_names(list((rem_keys & add_keys).elements()))
 
     rem_imports, rem_decos, rem_block = _peel_artifacts(removed, imports_before)
@@ -349,6 +475,10 @@ def _check_move(commit: str, repo_root: str) -> MoveCheck:
     rem_block, add_block, requalified = _peel_requalifications(
         rem_block, add_block, moved_names
     )
+    rem_block, add_block, lowered = _peel_receiver_calls(
+        rem_block, add_block, moved_names
+    )
+    requalified += lowered
 
     rem_signature = [
         _strip_self_annotation(line) for line in _block_signature(rem_block)
@@ -394,7 +524,7 @@ def _print_check(check: MoveCheck) -> None:
     for text in check.scaffold:
         print(f"    [scaffold] {text}")
     if check.requalified:
-        print(f"  {check.requalified} call-site requalification(s) of moved symbol(s)")
+        print(f"  {check.requalified} call-site adaptation(s) of moved symbol(s)")
     if check.clean and check.relocated > 0:
         print(
             f"  {check.relocated} line(s) relocated in order (uniform indentation shift allowed)"
@@ -551,7 +681,7 @@ function render(onlyReview){
     if(c.imports.length) out += '<div class="sec"><span class="k">imports:</span> '+c.imports.map(esc).join('<br>&nbsp;&nbsp;')+'</div>';
     if(c.decorators.length) out += '<div class="sec"><span class="k">decorators:</span> '+c.decorators.map(esc).join(', ')+'</div>';
     if(c.scaffold.length) out += '<div class="sec"><span class="k">scaffold:</span> '+c.scaffold.map(esc).join('<br>&nbsp;&nbsp;')+'</div>';
-    if(c.requalified) out += '<div class="sec"><span class="k">requalified call sites:</span> '+c.requalified+'</div>';
+    if(c.requalified) out += '<div class="sec"><span class="k">call-site adaptations:</span> '+c.requalified+'</div>';
     if(c.review_diff.length){
       out += '<table class="diff"><tbody>';
       c.review_diff.forEach(l => { out += '<tr class="'+lineClass(l)+'"><td>'+esc(l)+'</td></tr>'; });

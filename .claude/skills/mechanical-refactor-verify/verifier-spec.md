@@ -29,6 +29,10 @@ side-effects of relocating code:
 - **requalifying a moved symbol's call sites** — `self.foo(x)` becomes `foo(x)`, or
   `Old.foo(x)` becomes `New.foo(x)`: same symbol, same arguments, only the qualifier
   differs;
+- **lowering a moved method's call site** — a staticmethod call `Owner.method(receiver,
+  rest)` becoming the instance-method call `receiver.method(rest)` (the receiver moves out
+  of the argument list), compared on the whole call expression so a formatter's wrapping of
+  the line is tolerated;
 - **module scaffolding the destination module needs** — a top-level line copied
   **byte-for-byte from a source file that still has it** (so it was not itself relocated),
   plus the universal boilerplate `logger = logging.getLogger(...)` and `if TYPE_CHECKING:`
@@ -84,7 +88,15 @@ Given a commit (diffed against its first parent):
    - **call-site requalifications** — a removed line and an added line that become equal
      after dropping a `Qualifier.` prefix before a **moved symbol** (a qualifier must
      actually be present, so a verbatim body line is not consumed). The moved symbols are
-     the `def` / `class` names that appear on both sides (ignoring indentation).
+     the `def` / `class` names that appear on both sides (ignoring indentation, and after
+     the self-annotation drop, so a method relocated as `def foo(self: T)` -> `def foo(self)`
+     still counts);
+   - **call-site lowerings** — a call group starting at `Owner.method(receiver, ...)` whose
+     canonical form (whitespace-collapsed, receiver moved to the front, redundant `= (...)`
+     wrapper dropped) equals an added `receiver.method(...)` call group. A line-based diff
+     cannot reassemble a call the formatter split across an `= (` line or whose closing
+     bracket was unchanged context, so heavily reflowed call sites still need review (use
+     reproduce mode).
 
 4. **Compare the remaining block as an ordered signature.** A block's **signature** is its
    non-blank lines with the block's common leading indent removed, in order, and with a
@@ -109,7 +121,9 @@ Given a commit (diffed against its first parent):
 - A **`self` type annotation dropped** from the moved definition.
 - **Carried-over module scaffolding** — a top-level line copied byte-for-byte from a source
   file that still has it (a logger, a module constant, a `TYPE_CHECKING` guard).
-- A **call-site requalification of a moved symbol**.
+- A **call-site requalification of a moved symbol**, or a **call-site lowering**
+  (`Owner.method(receiver, rest)` → `receiver.method(rest)`) tolerant of a formatter's
+  line wrapping.
 - **Blank-line changes** — ignored.
 
 ## Not allowed (→ NEEDS REVIEW)

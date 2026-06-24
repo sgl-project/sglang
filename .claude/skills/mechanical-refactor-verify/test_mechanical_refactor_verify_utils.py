@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mechanical_refactor_verify_utils import (
     _block_signature,
+    _canonical_call,
     _commit_changed_lines,
     _commit_import_texts,
     _import_line_texts,
@@ -136,6 +137,35 @@ def test_strip_self_annotation_leaves_plain_self_and_other_params() -> None:
     """A plain self, and annotations on other parameters, are untouched."""
     assert _strip_self_annotation("def foo(self) -> None:") == "def foo(self) -> None:"
     assert _strip_self_annotation("def foo(self, x: int):") == "def foo(self, x: int):"
+
+
+def test_strip_self_annotation_handles_wrapped_parameter_line() -> None:
+    """A self annotation on a continuation line of a multi-line def is also dropped."""
+    assert (
+        _strip_self_annotation('    self: "Target", batch: Optional[X]')
+        == "    self, batch: Optional[X]"
+    )
+
+
+def test_canonical_call_lowers_static_to_instance_call() -> None:
+    """Owner.method(receiver, args) and receiver.method(args) canonicalise the same."""
+    removed = _canonical_call("ret = Owner.foo(self.comp, x)", {"foo"}, True)
+    added = _canonical_call("ret = self.comp.foo(x)", {"foo"}, False)
+    assert removed == added
+
+
+def test_canonical_call_handles_only_receiver_arg() -> None:
+    """Owner.method(receiver) lowers to receiver.method() without re-lowering."""
+    removed = _canonical_call("Owner.foo(self.comp)", {"foo"}, True)
+    added = _canonical_call("self.comp.foo()", {"foo"}, False)
+    assert removed == added
+
+
+def test_canonical_call_drops_redundant_assignment_parens() -> None:
+    """A redundant '= (...)' wrapper a formatter adds is stripped before comparison."""
+    removed = _canonical_call("ok = Owner.foo(self.x, a, b)", {"foo"}, True)
+    added = _canonical_call("ok = ( self.x.foo(a, b) )", {"foo"}, False)
+    assert removed == added
 
 
 def test_module_level_lines_collects_only_top_level_nonblank() -> None:
@@ -498,6 +528,49 @@ def test_changed_module_constant_still_needs_review(repo: Path) -> None:
     )
     _commit(repo, "move helper but change _FLAG in the new module")
     assert verify_move_commit("HEAD", repo_root=str(repo)) is False
+
+
+def test_static_to_instance_call_site_is_certified(repo: Path) -> None:
+    """A move whose call site turns Source.foo(self.component, x) into
+    self.component.foo(x) -- a staticmethod call becoming an instance-method call -- is a
+    clean move; the receiver moving out of the argument list is a mechanical artifact.
+    """
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "class Source:\n"
+                "    @staticmethod\n"
+                '    def foo(self: "Target", x):\n'
+                "        return x * 2\n"
+                "\n"
+                "    def caller(self):\n"
+                "        return Source.foo(self.component, 5)\n"
+            ),
+            "tgt.py": "class Target:\n    def existing(self):\n        return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "src.py": (
+                "class Source:\n"
+                "    def caller(self):\n"
+                "        return self.component.foo(5)\n"
+            ),
+            "tgt.py": (
+                "class Target:\n"
+                "    def existing(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def foo(self, x):\n"
+                "        return x * 2\n"
+            ),
+        },
+    )
+    _commit(repo, "move foo to Target; lower the call site")
+    assert verify_move_commit("HEAD", repo_root=str(repo)) is True
 
 
 # --- verify_move_commit: the new order / whitespace rules ----------------------
