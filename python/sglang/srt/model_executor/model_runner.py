@@ -78,7 +78,6 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.n_gram_embedding_manager import NgramEmbeddingManager
@@ -243,17 +242,9 @@ class ModelRunner:
         model_config: ModelConfig,
         mem_fraction_static: float,
         gpu_id: int,
-        tp_rank: int,
-        tp_size: int,
-        moe_ep_rank: int,
-        moe_ep_size: int,
-        pp_rank: int,
-        pp_size: int,
+        ps: ParallelState,
         nccl_port: int,
         server_args: ServerArgs,
-        dp_rank: Optional[int] = None,
-        attn_cp_rank: Optional[int] = None,
-        moe_dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -269,37 +260,8 @@ class ModelRunner:
         self.device = server_args.device
         self.gpu_id = gpu_id
         self.dcp_size = server_args.dcp_size
-        self.dcp_rank = tp_rank % self.dcp_size
-        dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
-        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-            compute_dp_attention_world_info(
-                server_args.enable_dp_attention,
-                tp_rank,
-                tp_size,
-                dp_size,
-                server_args.attn_cp_size,
-            )
-        )
-        self.ps = ParallelState(
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-            dp_rank=dp_rank,
-            dp_size=dp_size,
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=attn_tp_size,
-            attn_cp_rank=attn_cp_rank,
-            attn_cp_size=server_args.attn_cp_size,
-            attn_dp_rank=attn_dp_rank,
-            attn_dp_size=attn_dp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=moe_ep_size,
-            moe_dp_rank=moe_dp_rank,
-            moe_dp_size=server_args.moe_dp_size,
-            dcp_size=server_args.dcp_size,
-            gpu_id=self.gpu_id,
-        )
+        self.dcp_rank = ps.tp_rank % self.dcp_size
+        self.ps = ps
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -382,7 +344,9 @@ class ModelRunner:
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+        set_offloader(
+            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
+        )
 
         self._weight_checker = WeightChecker(model_runner=self)
 
