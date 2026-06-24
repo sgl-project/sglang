@@ -1170,7 +1170,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return DFlashDraftInputV2(
             topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
-            bonus_tokens=bonus_tokens.to(dtype=torch.int32),
+            bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
@@ -1190,7 +1190,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return DFlashDraftInputV2(
             topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
-            bonus_tokens=bonus_tokens.to(dtype=torch.int32),
+            bonus_tokens=bonus_tokens.to(dtype=torch.int64),
             new_seq_lens=new_seq_lens.to(dtype=torch.int64),
             hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
             verify_done=verify_done,
@@ -1296,7 +1296,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
-                bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int32),
+                bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
                 new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
             )
             if on_publish is not None:

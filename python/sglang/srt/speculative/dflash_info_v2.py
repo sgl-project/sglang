@@ -122,7 +122,7 @@ class DFlashDraftInputV2(SpecInput):
         return cls(
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
-            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int64),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
             verify_done=None,
