@@ -31,7 +31,29 @@ def resolve_spec_aux_hidden_state_config(
     is_draft_worker: bool,
 ) -> SpecAuxHiddenStateConfig:
     config = SpecAuxHiddenStateConfig()
+    _resolve_eagle_aux_hidden_state(
+        config=config,
+        server_args=server_args,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
+    _resolve_dflash_aux_hidden_state(
+        config=config,
+        server_args=server_args,
+        model_config=model_config,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
+    return config
 
+
+def _resolve_eagle_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    server_args: ServerArgs,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
     if (
         (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
         and not is_draft_worker
@@ -71,6 +93,15 @@ def resolve_spec_aux_hidden_state_config(
                 # if there is no aux layer, set to None
                 config.eagle_aux_hidden_state_layer_ids = None
 
+
+def _resolve_dflash_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
     if spec_algorithm.is_dflash_family() and not is_draft_worker:
         from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
@@ -132,5 +163,3 @@ def resolve_spec_aux_hidden_state_config(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
-
-    return config
