@@ -389,12 +389,20 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
-            if forward_batch.out_cache_loc is not None:
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
+            # For hybrid SWA models (like Gemma4), we must always set swa_out_cache_loc
+            # because some layers need it. If out_cache_loc is None (shouldn't happen
+            # in normal decode), we can't translate it, so raise an error early.
+            if forward_batch.out_cache_loc is None:
+                raise ValueError(
+                    f"out_cache_loc is None for hybrid SWA model in "
+                    f"forward_mode={forward_batch.forward_mode}. This should not happen "
+                    f"during normal decode operations."
                 )
+            metadata.swa_out_cache_loc = (
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
 
         if self.use_mla:
             workspace_size = flash_mla_get_workspace_size(
@@ -410,22 +418,6 @@ class XPUAttentionBackend(AttentionBackend):
             ):
                 self.workspace = torch.empty(
                     workspace_size, device=self.device, dtype=torch.uint8
-                )
-
-        # Translate full-pool indices to SWA-pool indices for hybrid models
-        if self.use_sliding_window_kv_pool:
-            # flash_attn_with_kvcache requires int32 page tables; the SWA index
-            # mapping is int64, so cast (matches flashattention_backend.py).
-            metadata.swa_page_table = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    metadata.page_table
-                ).to(torch.int32)
-            )
-            if forward_batch.out_cache_loc is not None:
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
                 )
 
         # Convert the page table to a strided format which is needed by FA3 API
@@ -480,7 +472,7 @@ class XPUAttentionBackend(AttentionBackend):
                         layer,
                         KVWriteLoc(
                             cache_loc,
-                            getattr(self.forward_metadata, "swa_out_cache_loc", None),
+                            self.forward_metadata.swa_out_cache_loc,
                         ),
                         k,
                         v,
@@ -797,7 +789,7 @@ class XPUAttentionBackend(AttentionBackend):
                         layer,
                         KVWriteLoc(
                             cache_loc,
-                            getattr(self.forward_metadata, "swa_out_cache_loc", None),
+                            self.forward_metadata.swa_out_cache_loc,
                         ),
                         k,
                         v,
@@ -1098,6 +1090,19 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.encoder_page_table = self.encoder_metadata[
                     "encoder_page_table"
                 ][:bs, :]
+            # For hybrid SWA models, initialize swa_out_cache_loc
+            if self.use_sliding_window_kv_pool:
+                if forward_batch.out_cache_loc is None:
+                    raise ValueError(
+                        f"out_cache_loc is None for hybrid SWA model in graph capture "
+                        f"(forward_mode={forward_batch.forward_mode}). This should not happen."
+                    )
+                metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
+                )
+
             self.decode_cuda_graph_metadata[bs] = metadata
             self.forward_metadata = metadata
         else:
@@ -1157,6 +1162,19 @@ class XPUAttentionBackend(AttentionBackend):
                 if self.page_size > 1:
                     raw_page = raw_page // self.page_size
                 metadata.page_table[:bs, :max_seq_pages].copy_(raw_page.to(torch.int32))
+
+            # For hybrid SWA models, update swa_out_cache_loc during replay
+            if self.use_sliding_window_kv_pool:
+                if forward_batch.out_cache_loc is None:
+                    raise ValueError(
+                        f"out_cache_loc is None for hybrid SWA model in graph replay "
+                        f"(forward_mode={forward_batch.forward_mode}). This should not happen."
+                    )
+                metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
+                )
 
             self.forward_metadata = metadata
 
