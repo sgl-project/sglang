@@ -74,9 +74,9 @@ class TorchNpuDispatcher(BaseDispatcher):
         self.set_ascend_dispatcher_output_dtype()
         self.tp_size = get_tensor_model_parallel_world_size()
         is_gguf = (
-            self.quant_confi
+            self.quant_config
             and hasattr(self.quant_config, "get_name")
-            and self.quant_config.get_name() == "gguf
+            and self.quant_config.get_name() == "gguf"
         )
         if is_gguf and self.tp_size > 1:
             self.enable_all_gather = True
