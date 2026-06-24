@@ -275,8 +275,7 @@ def create_dcp_kv_indices(
     BLOCK_SIZE: tl.constexpr = 512
     pid = tl.program_id(axis=0)
     prefix_len = tl.load(extend_prefix_lens_ptr + pid)
-    local_prefix_len = prefix_len // dcp_world_size
-    prefix_start = tl.load(extend_cu_prefix_lens_ptr + pid) // dcp_world_size
+    prefix_start = tl.load(extend_cu_prefix_lens_ptr + pid)
     kv_ind_start = tl.load(kv_indptr + pid)
     num_loop = tl.cdiv(prefix_len, BLOCK_SIZE)
     for i in range(num_loop):
@@ -359,10 +358,10 @@ def prepare_decode_context_parallel_metadata(
     if not dcp_enabled():
         return None
     # dcp_kv_buffer tokens' layout
-    # [ rank0_r1.prefix_tokens, rank0_r2.prefix_tokens,
+    # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,
-    #   rank8_r2.prefix_tokens, rank8_r3.prefix_tokens,
-    #   r1.extend_tokens, r2.extent_tokens, r3.extend_tokens ]
+    #   rank0_rn.prefix_tokens, rank1_rn.prefix_tokens, ..., rank7_rn.prefix_tokens,
+    #   r1.extend_tokens, r2.extent_tokens, rn.extend_tokens ]
     extend_prefix_starts = torch.zeros(
         len(seq_lens),
         dtype=torch.int32,
