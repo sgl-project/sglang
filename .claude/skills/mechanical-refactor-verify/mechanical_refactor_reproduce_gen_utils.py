@@ -9,9 +9,11 @@ emits a standalone ``repro_scripts/<sha>.py`` (importing only the reproduce util
 reproduces the commit and diffs it byte-for-byte. ``generate_range`` writes a whole folder
 (scripts + output.log + output.html) for a commit range.
 
-Currently handles the "method moved onto an existing class, call sites lowered, local
-imports removed" pattern. New-file extracts, free-function moves, and renames are not yet
-inferred (they are reported as unsupported). Runnable directly:
+Handles a method moved onto an existing class (call sites lowered) and a method moved to a
+module-level free function (call sites requalified), with local-import removal and gained
+module imports. New-file extracts are reported as unsupported (per prep-and-move.md a new
+module's scaffolding belongs in prep, so once the chain is split the move targets an
+existing module). A move that also renames is likewise not a pure move. Runnable directly:
 
     python3 mechanical_refactor_reproduce_gen_utils.py <commit>
     python3 mechanical_refactor_reproduce_gen_utils.py <base>..<tip> --match -move: --out DIR
