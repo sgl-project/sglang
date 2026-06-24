@@ -2,18 +2,20 @@
 reproduce script. Lets the verifier turn a commit a formatter re-wrapped into an auditable,
 runnable reproduce script -- no one hand-writes it.
 
-A recipe is inferred from the commit's diff and its before-state AST: which symbol moved
-(src -> dst, into which class), which call sites were lowered, which local imports the
-lowering orphaned, and which module-level imports the destination gained. ``recipe_to_script``
-emits a standalone ``repro_scripts/<sha>.py`` (importing only the reproduce util); running it
-reproduces the commit and diffs it byte-for-byte. ``generate_range`` writes a whole folder
-(scripts + output.log + output.html) for a commit range.
+A recipe is inferred from the commit's diff and its before-state AST: which symbols moved
+(src -> dst, into which class, or into a new module), which call sites were adapted, which
+imports were repathed, and which module-level or TYPE_CHECKING imports each file gained (lost
+imports are left to ruff's F401 --fix).
+``recipe_to_script`` emits a standalone ``repro_scripts/<sha>.py`` (importing only the
+reproduce util); running it reproduces the commit and diffs it byte-for-byte.
+``generate_range`` writes a whole folder (scripts + output.log + output.html) for a range.
 
-Handles a method moved onto an existing class (call sites lowered) and a method moved to a
-module-level free function (call sites requalified), with local-import removal and gained
-module imports. New-file extracts are reported as unsupported (per prep-and-move.md a new
-module's scaffolding belongs in prep, so once the chain is split the move targets an
-existing module). A move that also renames is likewise not a pure move. Runnable directly:
+Handles a method moved onto an existing class (call sites lowered), a method moved to a
+module-level free function (call sites requalified), a free-function-source move to an
+existing module (callers repath their import), and a new-file extract -- where the prep
+commit staged the whole module body (scaffolding plus def) as a trailing block in the
+source, so the move cuts that tail into the new file (extract_to_new_module). A rename or a
+statement-level reorder relocates no def and is reported unsupported. Runnable directly:
 
     python3 mechanical_refactor_reproduce_gen_utils.py <commit>
     python3 mechanical_refactor_reproduce_gen_utils.py <base>..<tip> --match -move: --out DIR
@@ -23,6 +25,7 @@ import ast
 import html
 import json
 import re
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,7 +33,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mechanical_refactor_reproduce_utils as rr
-from mechanical_refactor_verify_utils import _git_output, _repo_root
+
+
+def _git_output(args: list[str], cwd: str) -> str:
+    """Raw stdout of a git command ("" if it fails). Not stripped, so ``ast`` line numbers
+    stay aligned with a file's real lines."""
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    return result.stdout if result.returncode == 0 else ""
+
+
+def _repo_root() -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _removed_symbol_names(lines: list[str]) -> set[str]:
+    """Names of top-level defs and classes among removed diff lines (the extract's source
+    relinquishes these), so a moved class is found, not just a moved def."""
+    return {
+        m.group(2)
+        for ln in lines
+        if (m := re.match(r"\s*(?:async\s+)?(def|class)\s+(\w+)", ln))
+    }
 
 
 def _def_indent(lines: list[str], name: str) -> int | None:
@@ -103,12 +131,55 @@ def _module_of_path(path: str) -> str:
     return path.removeprefix("python/").removesuffix(".py").replace("/", ".")
 
 
-def _module_imports(text: str) -> dict[str, ast.AST]:
-    out: dict[str, ast.AST] = {}
+def _import_pairs(text: str) -> dict:
+    """Module-level imports keyed one entry per imported name, so removing a single name from
+    a multi-name ``from x import a, b`` is not mistaken for the whole statement changing. The
+    value is the one-name ``add_import`` text for a gained name (the import sorter merges it).
+    """
+    pairs: dict = {}
     for node in ast.parse(text).body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            out[ast.unparse(node)] = node
-    return out
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                stmt = "import " + alias.name
+                if alias.asname:
+                    stmt += f" as {alias.asname}"
+                pairs[stmt] = stmt
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            for alias in node.names:
+                name = alias.name + (f" as {alias.asname}" if alias.asname else "")
+                pairs[(module, alias.name, alias.asname)] = (
+                    f"from {module} import {name}"
+                )
+    return pairs
+
+
+def _typechecking_pairs(text: str) -> dict:
+    """Imports inside the module's ``if TYPE_CHECKING:`` block, keyed per name (same shape as
+    ``_import_pairs``), so a type-only import the destination gains for a moved annotation is
+    inferable separately from the runtime imports."""
+    pairs: dict = {}
+    for node in ast.parse(text).body:
+        if not (
+            isinstance(node, ast.If)
+            and ast.unparse(node.test) in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
+        ):
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, ast.ImportFrom):
+                module = "." * stmt.level + (stmt.module or "")
+                for alias in stmt.names:
+                    name = alias.name + (f" as {alias.asname}" if alias.asname else "")
+                    pairs[(module, alias.name, alias.asname)] = (
+                        f"from {module} import {name}"
+                    )
+            elif isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    stmt_text = "import " + alias.name
+                    if alias.asname:
+                        stmt_text += f" as {alias.asname}"
+                    pairs[stmt_text] = stmt_text
+    return pairs
 
 
 def _local_import_of(
@@ -133,14 +204,165 @@ class Recipe:
     target: str
     supported: bool = True
     moves: list = field(default_factory=list)
+    extracts: list = field(default_factory=list)
     lowerings: list = field(default_factory=list)
+    repaths: list = field(default_factory=list)
     import_removals: list = field(default_factory=list)
     import_additions: list = field(default_factory=list)
+    typechecking_additions: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
 
+def _infer_call_adaptations(
+    recipe: Recipe,
+    files: dict[str, dict],
+    *,
+    name: str,
+    src: str,
+    src_class: str,
+    into_class: str | None,
+    commit: str,
+    root: str,
+) -> None:
+    """A method-source move adapts its call sites: a move onto a class lowers the receiver
+    out of the args; a move to a module-level free function drops the qualifier. A caller is
+    a before-state call ``<src_class>.name(...)`` -- matched on ``src_class`` (not a loose
+    text search) so the moved body's own same-named calls on a different receiver are
+    excluded -- and its orphaned local import of ``src_class`` is removed."""
+    kind = "lower" if into_class is not None else "requalify"
+    src_module = _module_of_path(src)
+    for path, f in files.items():
+        before = _git_output(["show", f"{commit}^:{path}"], root)
+        try:
+            tree = ast.parse(before)
+        except SyntaxError:
+            continue
+        caller_fns: set[str] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+                and (node.args or kind == "requalify")
+                and ast.unparse(node.func.value) == src_class
+            ):
+                fn = _enclosing_function(tree, node.lineno)
+                if fn is not None:
+                    caller_fns.add(fn)
+        if not caller_fns:
+            continue
+        recipe.lowerings.append(
+            {"name": name, "owner": src_class, "path": path, "kind": kind}
+        )
+        for fn in sorted(caller_fns):
+            imp = _local_import_of(tree, fn, src_module, src_class)
+            if imp is not None and any(imp in r for r in f["removed"]):
+                recipe.import_removals.append(
+                    {"path": path, "text": imp, "in_function": fn}
+                )
+
+
+def _infer_function_scoped_repaths(
+    recipe: Recipe,
+    files: dict[str, dict],
+    *,
+    name: str,
+    src: str,
+    dst: str,
+    commit: str,
+    root: str,
+) -> None:
+    """A moved free function keeps the same bare call, so a caller only repaths its import.
+    Module-level repaths fall out of the symmetric import diff; only function-scoped imports
+    (which ``add_import`` cannot place) need an explicit in-place repath."""
+    src_module = _module_of_path(src)
+    dst_module = _module_of_path(dst)
+    for path in sorted(files):
+        if path == src:
+            continue
+        before = _git_output(["show", f"{commit}^:{path}"], root)
+        try:
+            tree = ast.parse(before)
+        except SyntaxError:
+            continue
+        top_level = {id(node) for node in tree.body}
+        nested = any(
+            isinstance(node, ast.ImportFrom)
+            and id(node) not in top_level
+            and node.module == src_module
+            and any(alias.name == name for alias in node.names)
+            for node in ast.walk(tree)
+        )
+        if nested:
+            recipe.repaths.append(
+                {
+                    "path": path,
+                    "old_module": src_module,
+                    "new_module": dst_module,
+                    "name": name,
+                }
+            )
+
+
+def _self_annotation_dropped(src_def: ast.AST | None, dst_def: ast.AST | None) -> bool:
+    """Whether the move drops a ``self: Target`` annotation -- the source had it and the
+    destination does not. Some class moves keep it (a retyped self that stays annotated), so
+    this is inferred from both sides rather than assumed."""
+
+    def has_self_annotation(node: ast.AST | None) -> bool:
+        return bool(
+            node is not None
+            and node.args.args
+            and node.args.args[0].arg == "self"
+            and node.args.args[0].annotation is not None
+        )
+
+    return has_self_annotation(src_def) and not has_self_annotation(dst_def)
+
+
+def _wants_future_import(files: dict[str, dict], src: str, dst: str) -> bool:
+    future = "from __future__ import annotations"
+    gained = any(future in line for line in files[dst]["added"])
+    travelled = any(future in line for line in files[src]["removed"])
+    return gained and not travelled
+
+
+def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
+    """Whether ``symbols`` sit at the end of the source as a contiguous block of defs/classes
+    and the scaffolding leading into them -- the trailing block a prep commit stages for a
+    new-module extract. A method still inside a class, or a symbol separated from the tail by
+    other code, fails this and is not an extractable tail."""
+    body = ast.parse(src_text).body
+    wanted = set(symbols)
+    scaffolding = (ast.Import, ast.ImportFrom, ast.If, ast.Assign, ast.AnnAssign)
+    cut = len(body)
+    while cut > 0:
+        node = body[cut - 1]
+        is_symbol = (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name in wanted
+        )
+        if is_symbol or isinstance(node, scaffolding):
+            cut -= 1
+        else:
+            break
+    present = {
+        node.name
+        for node in body[cut:]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    return wanted <= present
+
+
 def infer_recipe(commit: str, root: str) -> Recipe:
-    """Infer a faithful relocation recipe for a move commit from its diff + before-state."""
+    """Infer a faithful relocation recipe for a move commit from its diff + before-state.
+
+    A move onto an existing module/class becomes a ``move_symbol``; a move whose destination
+    file is new becomes an ``extract_to_new_module`` (the prep commit staged the whole module
+    body -- scaffolding plus def -- as a trailing block in the source, so the move cuts that
+    tail into the new file). Method-source moves adapt their call sites; free-function-source
+    moves keep the bare call and only repath imports. A rename or a statement-level reorder
+    relocates no def, so nothing is inferred and the commit is reported unsupported."""
     files = _per_file_diff(commit, root)
     recipe = Recipe(base=f"{commit}~1", target=commit)
 
@@ -151,27 +373,74 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             if (m := re.match(r"\s*(?:async\s+)?def\s+(\w+)", ln))
         }
 
+    new_files = {p for p, f in files.items() if f["new"]}
+
+    # A new file is a staged module body cut from one source: its top-level defs and classes
+    # are exactly the relocated symbols (the prep commit inlined them, scaffolding included, as
+    # a trailing block in the source). Take the symbol list from the new file itself so a
+    # moved class -- not just a moved def -- is in the cut tail.
+    for dst in sorted(new_files):
+        dst_after = _git_output(["show", f"{commit}:{dst}"], root)
+        try:
+            dst_body = ast.parse(dst_after).body
+        except SyntaxError:
+            continue
+        symbols = [
+            node.name
+            for node in dst_body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        if not symbols:
+            continue
+        srcs = {
+            p
+            for name in symbols
+            for p, f in files.items()
+            if p not in new_files and name in _removed_symbol_names(f["removed"])
+        }
+        if len(srcs) != 1:
+            recipe.supported = False
+            recipe.notes.append(
+                f"{dst}: extract source not a single file ({sorted(srcs)})"
+            )
+            continue
+        src = next(iter(srcs))
+        if not _symbols_form_tail(
+            _git_output(["show", f"{commit}^:{src}"], root), symbols
+        ):
+            recipe.supported = False
+            recipe.notes.append(
+                f"{dst}: source is not a staged trailing block "
+                "(prep should inline the module body at the source tail first)"
+            )
+            continue
+        recipe.extracts.append(
+            {
+                "src": src,
+                "dst": dst,
+                "symbols": symbols,
+                "future_import": _wants_future_import(files, src, dst),
+            }
+        )
+
+    # A move whose destination already exists becomes a move_symbol (the def relocated in
+    # order); a moved class to an existing file is left unsupported (move_symbol moves defs).
     all_removed = [ln for f in files.values() for ln in f["removed"]]
     all_added = [ln for f in files.values() for ln in f["added"]]
-    moved_names = def_names(all_removed) & def_names(all_added)
-    if any(f["new"] for f in files.values()):
-        recipe.supported = False
-        recipe.notes.append("new-file extract: not yet inferred")
-
-    for name in sorted(moved_names):
+    for name in sorted(def_names(all_removed) & def_names(all_added)):
         src = next(
             (p for p, f in files.items() if name in def_names(f["removed"])), None
         )
         dst = next((p for p, f in files.items() if name in def_names(f["added"])), None)
-        if src is None or dst is None or src == dst:
+        if src is None or dst is None or src == dst or dst in new_files:
             continue
         src_before = _git_output(["show", f"{commit}^:{src}"], root)
         if _nested_in_function(ast.parse(src_before), name):
             recipe.notes.append(f"skip {name}: nested function (moves with parent)")
             continue
-
-        dst_after = _git_output(["show", f"{commit}:{dst}"], root)
-        dst_tree = ast.parse(dst_after)
+        src_tree = ast.parse(src_before)
+        src_class = _enclosing_class_of_def(src_tree, name)
+        dst_tree = ast.parse(_git_output(["show", f"{commit}:{dst}"], root))
         into_class = _enclosing_class_of_def(dst_tree, name)
         dst_def = rr._find_def(dst_tree, name)
         src_indent = _def_indent(files[src]["removed"], name) or 0
@@ -184,81 +453,80 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 "into_class": into_class,
                 "dedent": src_indent - dst_indent,
                 "dst_order": dst_def.lineno if dst_def else 0,
+                "drop_self_annotation": _self_annotation_dropped(
+                    rr._find_def(src_tree, name), dst_def
+                ),
             }
         )
-
-        src_class = _enclosing_class_of_def(ast.parse(src_before), name)
-        if src_class is None:
-            recipe.supported = False
-            recipe.notes.append(
-                f"{name}: source is already a free function; callers not inferred"
+        if src_class is not None:
+            _infer_call_adaptations(
+                recipe,
+                files,
+                name=name,
+                src=src,
+                src_class=src_class,
+                into_class=into_class,
+                commit=commit,
+                root=root,
             )
-            continue
-        # A move onto a class lowers the receiver out of the args; a move to a module-level
-        # free function only drops the qualifier (requalify).
-        kind = "lower" if into_class is not None else "requalify"
-        src_module = _module_of_path(src)
-
-        # A caller is a before-state call `<src_class>.name(...)`; its receiver moves out of
-        # the argument list. The moved body's own calls have a different receiver, so they
-        # are excluded -- which is why we match on src_class, not a loose text search.
-        for path, f in files.items():
-            before = _git_output(["show", f"{commit}^:{path}"], root)
-            try:
-                tree = ast.parse(before)
-            except SyntaxError:
-                continue
-            caller_fns: set[str] = set()
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == name
-                    and (node.args or kind == "requalify")
-                    and ast.unparse(node.func.value) == src_class
-                ):
-                    fn = _enclosing_function(tree, node.lineno)
-                    if fn is not None:
-                        caller_fns.add(fn)
-            if not caller_fns:
-                continue
-            recipe.lowerings.append(
-                {"name": name, "owner": src_class, "path": path, "kind": kind}
+        else:
+            _infer_function_scoped_repaths(
+                recipe, files, name=name, src=src, dst=dst, commit=commit, root=root
             )
-            for fn in sorted(caller_fns):
-                imp = _local_import_of(tree, fn, src_module, src_class)
-                if imp is not None and any(imp in r for r in f["removed"]):
-                    recipe.import_removals.append(
-                        {"path": path, "text": imp, "in_function": fn}
-                    )
 
-    # Module-level imports any touched file gained: the destination needs the moved code's
-    # imports, and a caller of a moved free function gains an import of it. (In a pure move
-    # commit the only import changes are move-related.)
+    # Module-level imports a file gained: the destination needs the moved code's imports, and
+    # a caller of a moved free function gains an import of it. Removals are not inferred --
+    # ruff's F401 --fix prunes the now-unused imports during pre-commit, exactly as the chain
+    # itself was committed. A new file is written whole by extract_to_new_module, so it is
+    # skipped.
+    extract_dsts = {ex["dst"] for ex in recipe.extracts}
     for path in sorted(files):
+        if path in new_files or path in extract_dsts:
+            continue
         before = _git_output(["show", f"{commit}^:{path}"], root)
         after = _git_output(["show", f"{commit}:{path}"], root)
-        before_imports = _module_imports(before) if before.strip() else {}
-        for stmt in _module_imports(after):
-            if stmt not in before_imports:
+        before_pairs = _import_pairs(before) if before.strip() else {}
+        after_pairs = _import_pairs(after) if after.strip() else {}
+        for key, stmt in after_pairs.items():
+            if key not in before_pairs:
                 recipe.import_additions.append({"path": path, "text": stmt})
+        before_tc = _typechecking_pairs(before) if before.strip() else {}
+        after_tc = _typechecking_pairs(after) if after.strip() else {}
+        for key, stmt in after_tc.items():
+            if key not in before_tc:
+                recipe.typechecking_additions.append({"path": path, "text": stmt})
+
+    if not recipe.moves and not recipe.extracts:
+        recipe.supported = False
+        if not recipe.notes:
+            recipe.notes.append(
+                "no def relocated (rename or statement-level change): review as prep"
+            )
     return recipe
 
 
 def build_repro(recipe: Recipe) -> rr.Repro:
-    """A Repro that lowers/fixes imports BEFORE moving, so a call to a moved method from
-    inside another moved method is lowered while still in the source and travels with the
-    body; moves run last in destination order so multiple methods land correctly."""
+    """A Repro that adapts call sites and repaths/removes imports BEFORE moving, so a call to
+    a moved method from inside another moved method is lowered while still in the source and
+    travels with the body; relocations run next (move_symbol in destination order, then the
+    new-module extracts), and import_additions run LAST so a consumer import is placed after
+    the extract has cut the trailing block out of the source (otherwise it would be swept
+    into the new module)."""
     repro = rr.Repro(base=recipe.base, target=recipe.target)
     for lo in recipe.lowerings:
         if lo["kind"] == "requalify":
             repro.requalify_call_sites(lo["name"], lo["owner"], paths=[lo["path"]])
         else:
             repro.lower_call_sites(lo["name"], lo["owner"], paths=[lo["path"]])
+    for rp in recipe.repaths:
+        repro.repath_import(
+            rp["path"],
+            old_module=rp["old_module"],
+            new_module=rp["new_module"],
+            name=rp["name"],
+        )
     for im in recipe.import_removals:
         repro.remove_import(im["path"], im["text"], in_function=im["in_function"])
-    for im in recipe.import_additions:
-        repro.add_import(im["path"], im["text"])
     for mv in sorted(recipe.moves, key=lambda m: (m["dst"], m["dst_order"])):
         repro.move_symbol(
             mv["name"],
@@ -266,7 +534,19 @@ def build_repro(recipe: Recipe) -> rr.Repro:
             dst=mv["dst"],
             into_class=mv["into_class"],
             dedent=mv["dedent"],
+            drop_self_annotation=mv["drop_self_annotation"],
         )
+    for ex in recipe.extracts:
+        repro.extract_to_new_module(
+            ex["src"],
+            ex["dst"],
+            symbols=ex["symbols"],
+            future_import=ex["future_import"],
+        )
+    for im in recipe.import_additions:
+        repro.add_import(im["path"], im["text"])
+    for im in recipe.typechecking_additions:
+        repro.add_typechecking_import(im["path"], im["text"])
     return repro
 
 
@@ -297,6 +577,11 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
         lines.append(
             f"r.{method}({lo['name']!r}, {lo['owner']!r}, paths=[{lo['path']!r}])"
         )
+    for rp in recipe.repaths:
+        lines.append(
+            f"r.repath_import({rp['path']!r}, old_module={rp['old_module']!r}, "
+            f"new_module={rp['new_module']!r}, name={rp['name']!r})"
+        )
     for im in recipe.import_removals:
         lines.append(
             f"r.remove_import({im['path']!r}, {im['text']!r}, "
@@ -304,10 +589,18 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
         )
     for im in recipe.import_additions:
         lines.append(f"r.add_import({im['path']!r}, {im['text']!r})")
+    for im in recipe.typechecking_additions:
+        lines.append(f"r.add_typechecking_import({im['path']!r}, {im['text']!r})")
     for mv in sorted(recipe.moves, key=lambda m: (m["dst"], m["dst_order"])):
         lines.append(
             f"r.move_symbol({mv['name']!r}, src={mv['src']!r}, dst={mv['dst']!r}, "
-            f"into_class={mv['into_class']!r}, dedent={mv['dedent']})"
+            f"into_class={mv['into_class']!r}, dedent={mv['dedent']}, "
+            f"drop_self_annotation={mv['drop_self_annotation']!r})"
+        )
+    for ex in recipe.extracts:
+        lines.append(
+            f"r.extract_to_new_module({ex['src']!r}, {ex['dst']!r}, "
+            f"symbols={ex['symbols']!r}, future_import={ex['future_import']!r})"
         )
     lines += ["r.run()", ""]
     return "\n".join(lines)
@@ -354,14 +647,18 @@ def generate_range(
         script = recipe_to_script(recipe, subject)
         (scripts_dir / f"{commit[:9]}.py").write_text(script)
         passed, residual = False, ""
-        if recipe.supported and recipe.moves:
-            residual = build_repro(recipe).run()
-            passed = residual == ""
+        relocates = bool(recipe.moves or recipe.extracts)
+        if recipe.supported and relocates:
+            try:
+                residual = build_repro(recipe).run()
+                passed = residual == ""
+            except Exception as exc:
+                residual = f"reproduce raised {type(exc).__name__}: {exc}"
         results.append(
             GenResult(
                 commit=commit,
                 subject=subject,
-                supported=recipe.supported and bool(recipe.moves),
+                supported=recipe.supported and relocates,
                 passed=passed,
                 residual=residual,
                 script=script,
@@ -506,7 +803,7 @@ def _main(argv: list[str]) -> int:
             recipe, _git_output(["log", "-1", "--format=%s", target], root)
         )
     )
-    if recipe.supported and recipe.moves:
+    if recipe.supported and (recipe.moves or recipe.extracts):
         build_repro(recipe).run()
     return 0
 

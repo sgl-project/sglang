@@ -278,8 +278,12 @@ def test_infer_recipe_infers_added_module_imports(repo: Path) -> None:
     assert {"path": "comp.py", "text": "import gc"} in recipe.import_additions
 
 
-def test_infer_recipe_marks_new_file_extract_unsupported(repo: Path) -> None:
-    """An extract into a newly created module is reported as not yet inferable."""
+def test_infer_recipe_new_file_extract_from_class_method_unsupported(
+    repo: Path,
+) -> None:
+    """A method still inside the class cut straight into a new module is not a staged trailing
+    block, so the extract is reported unsupported (prep should inline it at the tail first).
+    """
     _write(
         repo,
         **{
@@ -305,6 +309,110 @@ def test_infer_recipe_marks_new_file_extract_unsupported(repo: Path) -> None:
     _commit(repo, "extract foo to a new module")
     recipe = infer_recipe("HEAD", str(repo))
     assert recipe.supported is False
+    assert any("staged trailing block" in note for note in recipe.notes)
+
+
+def test_infer_recipe_new_file_extract_from_staged_tail(repo: Path) -> None:
+    """A staged trailing block (scaffolding + def at the source tail) cut into a new file
+    infers an extract_to_new_module, prepending the future import."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "class M:\n"
+                "    def keep(self):\n"
+                "        return 1\n"
+                "\n"
+                "\n"
+                "import logging\n"
+                "\n"
+                "logger = logging.getLogger(__name__)\n"
+                "\n"
+                "\n"
+                "def foo(x):\n"
+                "    return x + 1\n"
+            )
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "class M:\n    def keep(self):\n        return 1\n",
+            "newmod.py": (
+                "from __future__ import annotations\n"
+                "\n"
+                "import logging\n"
+                "\n"
+                "logger = logging.getLogger(__name__)\n"
+                "\n"
+                "\n"
+                "def foo(x):\n"
+                "    return x + 1\n"
+            ),
+        },
+    )
+    _commit(repo, "extract foo to a new module")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert recipe.supported
+    assert recipe.moves == []
+    assert recipe.extracts == [
+        {
+            "src": "model.py",
+            "dst": "newmod.py",
+            "symbols": ["foo"],
+            "future_import": True,
+        }
+    ]
+
+
+def test_infer_recipe_free_function_source_move_repaths_caller(repo: Path) -> None:
+    """A free function moved to an existing module becomes a move_symbol with the call left
+    bare; a caller's function-scoped import is repathed."""
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n\n\ndef resolve(m):\n    return m\n",
+            "util.py": "import os\n",
+            "caller.py": (
+                "class K:\n"
+                "    def run(self):\n"
+                "        from model import resolve\n"
+                "\n"
+                "        return resolve(self.m)\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n",
+            "util.py": "import os\n\n\ndef resolve(m):\n    return m\n",
+            "caller.py": (
+                "class K:\n"
+                "    def run(self):\n"
+                "        from util import resolve\n"
+                "\n"
+                "        return resolve(self.m)\n"
+            ),
+        },
+    )
+    _commit(repo, "move resolve to util")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert recipe.supported
+    assert [(m["name"], m["src"], m["dst"], m["into_class"]) for m in recipe.moves] == [
+        ("resolve", "model.py", "util.py", None)
+    ]
+    assert recipe.lowerings == []
+    assert recipe.repaths == [
+        {
+            "path": "caller.py",
+            "old_module": "model",
+            "new_module": "util",
+            "name": "resolve",
+        }
+    ]
 
 
 def test_recipe_to_script_is_self_contained_and_ordered(repo: Path) -> None:
