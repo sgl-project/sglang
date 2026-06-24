@@ -123,6 +123,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
+    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -146,8 +147,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    sock_send,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_writer
+from sglang.srt.managers.min_free_slots_delayer import (
+    MinFreeSlotsDelayer,
+    resolve_min_free_slots,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     decide_needs_cpu_seq_lens,
@@ -235,11 +241,7 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.dflash_utils import (
-    resolve_dflash_prefill_refill_target,
-    should_delay_dflash_prefill_for_batching,
-    validate_dflash_request,
-)
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -583,7 +585,7 @@ class Scheduler(
             from sglang.srt.hardware_backend.npu.utils import init_zbal
 
             if self.ps.pp_size > 1:
-                logger.error(f"only zbal mix mode support pp_size > 1!")
+                logger.error("only zbal mix mode support pp_size > 1!")
             init_zbal(
                 self.ps.tp_size, self.ps.gpu_id, self.ps.tp_rank
             )  # only switch allocator if is mix mode
@@ -892,11 +894,18 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        self.dflash_prefill_refill_target = (
-            resolve_dflash_prefill_refill_target(self.max_running_requests)
-            if self.spec_algorithm.is_dflash()
-            else 1
+        # DFlash auto-enables the legacy formula; other workloads opt in via
+        # --min-free-slots-delay. Built independently of the prefill delayer.
+        self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
+        min_free_slots = resolve_min_free_slots(
+            self.server_args.min_free_slots_delay,
+            self.max_running_requests,
+            is_dflash=self.spec_algorithm.is_dflash(),
         )
+        if min_free_slots is not None:
+            self.min_free_slots_delayer = MinFreeSlotsDelayer(
+                min_free_slots=min_free_slots
+            )
         if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.ps.pp_size, 1
@@ -1644,7 +1653,7 @@ class Scheduler(
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
                 else:
                     if self.ipc_channels.recv_from_rpc is not None:
-                        self.ipc_channels.recv_from_rpc.send_pyobj(output)
+                        sock_send(self.ipc_channels.recv_from_rpc, output)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -2003,9 +2012,39 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
+        # Radix-native session: session_id is just a tag; KV bulk-freed on close.
+        radix_native_session = (
+            session_id is not None and self.server_args.enable_session_radix_cache
+        )
+        if radix_native_session:
+            sp = recv_req.session_params
+            if (
+                sp.rid is not None
+                or sp.offset is not None
+                or sp.replace is not None
+                or sp.drop_previous_output is not None
+            ):
+                error_msg = (
+                    "Invalid request: radix-native sessions do not support "
+                    "session_params rid/offset/replace/drop_previous_output; "
+                    "send full context each turn."
+                )
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    vocab_size=self.model_config.vocab_size,
+                    http_worker_ipc=recv_req.http_worker_ipc,
+                )
+                req.tokenizer = self.tokenizer
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
-        if session_id is None:
-            # Normal non-session request
+        if session_id is None or radix_native_session:
+            # Normal non-session request, or a radix-native session request
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
@@ -2056,6 +2095,8 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            if radix_native_session:
+                req.session_id = session_id
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2686,19 +2727,6 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def _should_delay_dflash_prefill_for_batching(self, running_bs: int) -> bool:
-        if not self.spec_algorithm.is_dflash():
-            return False
-        if running_bs <= 0 or self.chunked_req is not None:
-            return False
-
-        return should_delay_dflash_prefill_for_batching(
-            running_bs=running_bs,
-            num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
-            max_running_requests=self.max_running_requests,
-            prefill_refill_target=self.dflash_prefill_refill_target,
-        )
-
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2741,7 +2769,15 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        if self._should_delay_dflash_prefill_for_batching(running_bs):
+        # Skipped during a chunked prefill: that pass must proceed regardless.
+        if (
+            self.min_free_slots_delayer is not None
+            and self.chunked_req is None
+            and self.min_free_slots_delayer.should_delay(
+                running_bs=running_bs,
+                num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
+            )
+        ):
             return None
 
         # Ignore the check if self.chunked_req is not None.
@@ -4020,13 +4056,23 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        output = self.session_controller.open(recv_req)
+        if self.server_args.enable_session_radix_cache:
+            # Radix-native: open is implicit; explicit open only permits id reuse.
+            session_id = recv_req.session_id
+            self.tree_cache.register_session(session_id)
+            output = OpenSessionReqOutput(session_id, session_id is not None)
+        else:
+            output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
-        self.session_controller.close(recv_req)
+        if self.server_args.enable_session_radix_cache:
+            # "Close" just triggers eviction of the session's tagged KV.
+            self.tree_cache.release_session(recv_req.session_id)
+        else:
+            self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
