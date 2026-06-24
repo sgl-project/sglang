@@ -309,6 +309,7 @@ class Session:
             return_routed_experts=req.return_routed_experts,
             routed_experts_start_len=req.routed_experts_start_len,
             priority=req.priority,
+            agent_hints=req.agent_hints,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
             http_worker_ipc=req.http_worker_ipc,

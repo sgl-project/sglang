@@ -201,11 +201,28 @@ class UsageInfo(BaseModel):
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
 
-
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
 
+class AgentHints(BaseModel):
+    workflow_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    step_id: Optional[str] = None
+    parent_step_id: Optional[str] = None
+    expected_tool_duration_ms: Optional[int] = None
+    cache_ttl_ms: Optional[int] = None
+    reuse_hint: Optional[Literal["low", "normal", "high", "keep", "reuse"]] = None
+
+    # Accept for forward compatibility, but do not use it for matching/reuse in this PR.
+    shared_prefix_hash: Optional[str] = None
+
+    @field_validator("expected_tool_duration_ms", "cache_ttl_ms")
+    @classmethod
+    def validate_non_negative(cls, value):
+        if value is not None and value < 0:
+            raise ValueError("must be non-negative")
+        return value
 
 class JsonSchemaResponseFormat(BaseModel):
     name: str
@@ -381,6 +398,8 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Agent-aware KV cache hints. Optional experimental metadata.
+    agent_hints: Optional[AgentHints] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -753,6 +772,8 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Agent-aware KV cache hints. Optional experimental metadata.
+    agent_hints: Optional[AgentHints] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
