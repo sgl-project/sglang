@@ -71,7 +71,7 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
-    staging: Optional["StagingTransferInfo"] = None
+    staging: Optional[StagingTransferInfo] = None
 
     def is_dummy(self):
         # A transfer is "dummy" only for CP non-authoritative ranks.
@@ -124,7 +124,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
-    staging: Optional["StagingRegisterInfo"] = None
+    staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -246,7 +246,7 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
-            from nixl._api import nixl_agent, nixl_agent_config
+            from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
@@ -267,7 +267,13 @@ class NixlKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
-        agent_config = nixl_agent_config(backends=[], num_threads=num_threads)
+        # self.transfer_worker and self._start_bootstrap_thread runs concurrently
+        # so we cannot use sync_mode=None which is thread-unsafe.
+        agent_config = nixl_agent_config(
+            backends=[],
+            num_threads=num_threads,
+            sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
+        )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
@@ -1293,9 +1299,9 @@ class NixlKVManager(CommonKVManager):
     def _do_staging_transfer(
         self,
         staging_strategy,
-        kv_chunk: "TransferKVChunk",
-        req: "TransferInfo",
-        dst_info: "KVArgsRegisterInfo",
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+        dst_info: KVArgsRegisterInfo,
         queue: FastQueue,
     ):
         """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
@@ -1612,7 +1618,7 @@ class NixlKVManager(CommonKVManager):
                         dst_gpu_id,
                         comp_notif,
                     )
-            elif st in (StateType.SWA, StateType.DSA):
+            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."

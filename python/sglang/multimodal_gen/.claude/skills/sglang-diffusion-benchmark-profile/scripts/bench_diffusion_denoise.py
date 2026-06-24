@@ -97,6 +97,8 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
+            "--num-gpus=2",
+            "--tp-size=2",
             "--dit-layerwise-offload",
             "false",
         ],
@@ -109,6 +111,8 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
+            "--num-gpus=2",
+            "--tp-size=2",
             "--dit-layerwise-offload",
             "false",
         ],
@@ -121,6 +125,8 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
+            "--num-gpus=2",
+            "--tp-size=2",
         ],
     },
     # 4. Nightly: qwen_image_edit_2511
@@ -133,6 +139,8 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
+            "--num-gpus=2",
+            "--tp-size=2",
         ],
     },
     # 5. Nightly: zimage_turbo_t2i_1024
@@ -143,6 +151,8 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
+            "--num-gpus=2",
+            "--tp-size=2",
         ],
     },
     # 6. Nightly: wan22_t2v_a14b_720p
@@ -342,11 +352,10 @@ MODELS = {
         "prompt": "A beautiful sunset over the ocean",
         "env": {
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-            "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
         },
         "extra_args": [
             "--pipeline-class-name=LTX2TwoStageHQPipeline",
-            "--ltx2-two-stage-device-mode=snapshot",
+            "--ltx2-two-stage-device-mode=original",
             "--width=1920",
             "--height=1088",
             "--num-frames=121",
@@ -532,6 +541,9 @@ MODELS = {
 
 
 def required_gpus_for_model(model_key: str) -> int:
+    parsed_args = _parse_cli_args(MODELS[model_key].get("extra_args", []))
+    if "num-gpus" in parsed_args:
+        return int(parsed_args["num-gpus"])
     if model_key in {"wan-t2v", "wan-i2v"}:
         return 4
     if model_key == "mova-720p":
