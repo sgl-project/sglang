@@ -98,6 +98,7 @@ class StandardDispatcher(BaseDispatcher):
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
+            or backend.is_flashinfer_cutedsl_sm120()
             or backend.is_flashinfer_trtllm()
             or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()

@@ -95,6 +95,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_CUTEDSL_SM120 = "flashinfer_cutedsl_sm120"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     AITER = "aiter"
@@ -130,6 +131,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_cutedsl(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTEDSL
+
+    def is_flashinfer_cutedsl_sm120(self):
+        return self == MoeRunnerBackend.FLASHINFER_CUTEDSL_SM120
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
@@ -233,6 +237,7 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     # 4. flashinfer_cutedsl and is_cutlass expects BF16 dispatch
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
+        or get_moe_runner_backend().is_flashinfer_cutedsl_sm120()
         or get_moe_runner_backend().is_cutlass()
     ):
         return DeepEPOutputDtype.BF16
