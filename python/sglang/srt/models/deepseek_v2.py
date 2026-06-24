@@ -830,6 +830,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        skip_shared_experts: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
@@ -870,6 +871,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    skip_shared_experts=skip_shared_experts,
                 )
         else:
             return self.forward_deepep(
@@ -969,6 +971,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        skip_shared_experts: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -981,8 +984,16 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         defer_shared = not self.experts.moe_runner_config.inplace
+        # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
+        # hidden in the decoder layer (before the dp gather) and added after the
+        # reduce_scatterv. When set, never compute/add it here (on the global buffer).
+        shared_output = None
         if hidden_states.shape[0] > 0:
-            if not defer_shared and not self._fuse_shared_experts_inside_sbo:
+            if (
+                not defer_shared
+                and not self._fuse_shared_experts_inside_sbo
+                and not skip_shared_experts
+            ):
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
@@ -1005,7 +1016,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
 
-        if self._fuse_shared_experts_inside_sbo:
+        if self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
             shared_output = None
 
             def _pre_combine_hook(
@@ -1053,6 +1064,7 @@ class DeepseekV2MoE(nn.Module):
             defer_shared
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
+            and not skip_shared_experts
         ):
             shared_output = self._forward_shared_experts(
                 hidden_states, gemm_output_zero_allocator
@@ -2387,6 +2399,13 @@ class DeepseekV2Model(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
+    def _dsa_forward_uses_topk(self) -> bool:
+        if not self.use_dsa:
+            return False
+        backend = get_attn_backend()
+        backend = getattr(backend, "primary", backend)
+        return not getattr(backend, "use_mha", False)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2396,6 +2415,7 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
+        dsa_forward_uses_topk = self._dsa_forward_uses_topk()
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -2411,6 +2431,7 @@ class DeepseekV2Model(nn.Module):
                 not forward_batch.forward_mode.is_idle()
                 and hidden_states.shape[0] != 0
                 and self.use_dsa
+                and dsa_forward_uses_topk
                 and dsa_layer_skips_topk(self.config, self.start_layer)
                 and topk_indices is None
             ), (
@@ -2515,6 +2536,7 @@ class DeepseekV2Model(nn.Module):
             }
             if (
                 self.use_dsa
+                and dsa_forward_uses_topk
                 and self.end_layer < self.config.num_hidden_layers
                 and dsa_layer_skips_topk(self.config, self.end_layer)
             ):
