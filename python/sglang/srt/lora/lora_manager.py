@@ -896,7 +896,7 @@ class LoRAManager:
                 self.lora_modules[layer_id][module_name] = lora_module
 
 
-def _init_lora_cuda_graph_moe_buffers(
+def init_lora_cuda_graph_moe_buffers(
     *,
     server_args: ServerArgs,
     model: torch.nn.Module,

@@ -114,7 +114,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
-from sglang.srt.lora.lora_manager import LoRAManager, _init_lora_cuda_graph_moe_buffers
+from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
@@ -1686,7 +1686,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             lora_paths=self.server_args.lora_paths,
         )
         if not cuda_graph_fully_disabled():
-            _init_lora_cuda_graph_moe_buffers(
+            init_lora_cuda_graph_moe_buffers(
                 server_args=self.server_args,
                 model=self.model,
                 lora_manager=self.lora_manager,
