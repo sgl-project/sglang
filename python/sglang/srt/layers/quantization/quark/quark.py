@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 __all__ = ["QuarkLinearMethod", "QuarkFusedMoEMethod"]
 
@@ -111,7 +112,8 @@ class QuarkConfig(QuantizationConfig):
     ) -> None:
         """Register a model's dense-FP8 policy (quark owns no names/thresholds):
         ``include``/``exclude`` module-name substrings and a min output size. Only
-        excluded (bf16) layers matching the policy are promoted, under --enable-dense-fp8."""
+        excluded (bf16) layers matching the policy are promoted, under --enable-dense-fp8.
+        """
         self._dense_fp8_include = tuple(
             dict.fromkeys((*self._dense_fp8_include, *include))
         )
