@@ -847,11 +847,8 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # Pre-quantized (fp8, scale) tuple from a fused silu+mul / rmsnorm-quant
         # kernel. apply_fp8_linear has no tuple path, so route to the aiter PTPC
-        # helper. use_per_token_if_dynamic is only set on aiter (ROCm) when the
-        # weight was shuffled for gemm_a8w8_bpreshuffle, so gating on it keeps this
-        # branch invisible to every other platform. The helper expects the weight
-        # as (N, K); Fp8LinearMethod stores it transposed as (K, N), so undo that
-        # with .T (mirroring apply_fp8_linear, which feeds gemm_a8w8_bpreshuffle weight.T).
+        # helper. The helper expects the weight as (N, K); Fp8LinearMethod stores
+        # it as (K, N), so undo that with .T
         if self.use_per_token_if_dynamic and isinstance(x, tuple):
             return apply_fp8_ptpc_linear(
                 input=x,

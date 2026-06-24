@@ -49,19 +49,6 @@ _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
     "down_proj",
 )
 
-# Selective dense-FP8: route bf16 dense projections the checkpoint left unquantized to
-# online w8a8 FP8. quark holds no per-model names/thresholds; each model registers its
-# own policy via register_dense_fp8_modules(). Gated by --enable-dense-fp8.
-
-
-def _dense_fp8_enabled() -> bool:
-    from sglang.srt.server_args import get_global_server_args
-
-    try:
-        return get_global_server_args().enable_dense_fp8
-    except ValueError:
-        return False
-
 
 class QuarkConfig(QuantizationConfig):
 
@@ -135,6 +122,14 @@ class QuarkConfig(QuantizationConfig):
             self._dense_fp8_min_output_size, min_output_size
         )
 
+    def _dense_fp8_enabled(self) -> bool:
+        from sglang.srt.server_args import get_global_server_args
+
+        try:
+            return get_global_server_args().enable_dense_fp8
+        except ValueError:
+            return False
+
     def _dense_fp8_eligible(self, prefix: str, layer: torch.nn.Module) -> bool:
         if any(b in prefix for b in self._dense_fp8_exclude):
             return False
@@ -146,6 +141,8 @@ class QuarkConfig(QuantizationConfig):
         return n is None or n >= self._dense_fp8_min_output_size
 
     def _get_dense_fp8_method(self, prefix: str) -> "Fp8LinearMethod":
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
         cfg = getattr(self, "_dense_fp8_config", None)
         if cfg is None:
             cfg = Fp8Config(
@@ -186,7 +183,7 @@ class QuarkConfig(QuantizationConfig):
             fused_mapping=self.packed_modules_mapping,
         ):
             if isinstance(layer, LinearBase):
-                if _dense_fp8_enabled() and self._dense_fp8_eligible(
+                if self._dense_fp8_enabled() and self._dense_fp8_eligible(
                     prefix, layer
                 ):
                     return self._get_dense_fp8_method(prefix)

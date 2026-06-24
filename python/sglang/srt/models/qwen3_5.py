@@ -1170,9 +1170,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
-        # Register the dense-FP8 policy before layers are built (quant method is
-        # resolved per-layer). Aiter-only, where it was tuned; not registering on other
-        # platforms keeps dense-FP8 a no-op there.
         if (
             _use_aiter
             and quant_config is not None
