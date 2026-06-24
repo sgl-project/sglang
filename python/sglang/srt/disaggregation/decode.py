@@ -1297,13 +1297,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if was_fresh:
             from sglang.srt.managers.schedule_batch import ReqKvInfo
 
-            req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
-
-        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        req.kv.kv_allocated_len = fill_len
+            req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+        else:
+            req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
