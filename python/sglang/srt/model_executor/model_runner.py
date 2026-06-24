@@ -934,6 +934,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             zero_pool(pool, loc)
 
+    def _disable_cuda_graph_for_nvfp4_kv_if_needed(self) -> None:
+        """Avoid graph-captured native FP4 KV until the FlashInfer path is graph-safe."""
+        if not self._get_nvfp4_native_kv_pools():
+            return
+        if os.environ.get("SGLANG_FP4_KV_ENABLE_CUDA_GRAPH", "0") == "1":
+            return
+
+        disabled = False
+        if not self.server_args.disable_cuda_graph:
+            self.server_args.disable_cuda_graph = True
+            disabled = True
+        if not self.server_args.disable_piecewise_cuda_graph:
+            self.server_args.disable_piecewise_cuda_graph = True
+            disabled = True
+        if disabled:
+            logger.warning(
+                "Disabling CUDA graph capture for native FP4 KV cache. "
+                "Current FlashInfer FA2 NVFP4 KV graph capture can produce "
+                "corrupt decode output; set SGLANG_FP4_KV_ENABLE_CUDA_GRAPH=1 "
+                "only for graph-safety experiments."
+            )
+
+
     def _calibrate_nvfp4_kv_cache(self) -> None:
         """Run one eager prefill to freeze NVFP4 KV global scales before capture."""
         fp4_pools = self._get_nvfp4_native_kv_pools()
@@ -1178,6 +1201,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Freeze NVFP4 KV global scales via one eager prefill before
         # the eager runner warms kernels and cuda graphs capture.
         self._calibrate_nvfp4_kv_cache()
+        self._disable_cuda_graph_for_nvfp4_kv_if_needed()
         self.eager_runner = EagerRunner(self)
 
         # cuda-graph capture: prefill before decode, so both coalesce onto the

@@ -704,6 +704,11 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.v_head_dim,
                     }
+                token_to_kv_pool_class = (
+                    MHATokenToKVPoolFP4
+                    if is_float4_e2m1fn_x2(self.kv_cache_dtype)
+                    else MHATokenToKVPool
+                )
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -720,6 +725,7 @@ class ModelRunnerKVCacheMixin:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    token_to_kv_pool_class=token_to_kv_pool_class,
                     **kwargs,
                 )
             elif config := self.mambaish_config:
