@@ -2063,7 +2063,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
-            req.kv.kv_allocated_len = seq_len
+            if req.kv is None:
+                req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+            else:
+                req.kv.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
