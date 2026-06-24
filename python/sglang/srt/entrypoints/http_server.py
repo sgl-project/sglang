@@ -39,6 +39,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import numpy as np
 import requests
 import uvicorn
@@ -1416,17 +1417,10 @@ async def load_lora_adapter(
 ):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    content = msgspec.structs.asdict(result)
 
-    if result.success:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.OK,
-        )
-    else:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    return ORJSONResponse(content, status_code=status_code)
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
@@ -1437,11 +1431,10 @@ async def load_lora_adapter_from_tensors(
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
         obj, request
     )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    content = msgspec.structs.asdict(result)
 
-    if result.success:
-        return ORJSONResponse(result, status_code=HTTPStatus.OK)
-    else:
-        return ORJSONResponse(result, status_code=HTTPStatus.BAD_REQUEST)
+    return ORJSONResponse(content, status_code=status_code)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
@@ -1451,17 +1444,10 @@ async def unload_lora_adapter(
 ):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    content = msgspec.structs.asdict(result)
 
-    if result.success:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.OK,
-        )
-    else:
-        return ORJSONResponse(
-            result,
-            status_code=HTTPStatus.BAD_REQUEST,
-        )
+    return ORJSONResponse(content, status_code=status_code)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])

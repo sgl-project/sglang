@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
+    unwrap_from_pickle,
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
@@ -88,6 +89,11 @@ class SchedulerRequestReceiver:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+
+        # PickleWrapper is only used on the external tokenizer/DP -> scheduler
+        # msgspec IPC edge. PP stages forward already-unwrapped objects via pickle.
+        if self.ps.pp_rank == 0:
+            self.unwrap_pickle_wrapper(recv_reqs)
 
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
@@ -194,6 +200,21 @@ class SchedulerRequestReceiver:
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
+
+    def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
+        if not recv_reqs:
+            return
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                req.mm_inputs = unwrap_from_pickle(req.mm_inputs)
+                req.time_stats = unwrap_from_pickle(req.time_stats)
+            elif isinstance(
+                req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+            ):
+                for sub_req in req:
+                    sub_req.mm_inputs = unwrap_from_pickle(sub_req.mm_inputs)
+                    sub_req.time_stats = unwrap_from_pickle(sub_req.time_stats)
 
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode
