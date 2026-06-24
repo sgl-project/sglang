@@ -19,7 +19,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -27,17 +26,23 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 from ..mock_server_args import make_mock_server_args
 
 # DSV4 backend pre-resolves attention TP at construction; pin to single-rank.
-_dp_attention.get_attention_tp_size = lambda: 1
-_dp_attention.get_attention_tp_rank = lambda: 0
-_dp_attention.get_attention_cp_size = lambda: 1
-_dp_attention.get_attention_cp_rank = lambda: 0
+_parallel_override = get_parallel().override(
+    attn_tp_size=1, attn_tp_rank=0, attn_cp_size=1, attn_cp_rank=0
+)
+_parallel_override.__enter__()
 
 # DSV4 hard-coded geometry. Do not change.
 DSV4_PAGE_SIZE = 256
@@ -308,8 +313,9 @@ class MockDSV4ModelRunner:
         # case's per-request input length (target_verify uses the draft count
         # directly; draft_extend uses the accepted-token count). Non-spec cases
         # leave it at 0 so the backend skips the speculative branches.
-        if case.forward_mode.is_target_verify() or case.forward_mode.is_draft_extend(
-            include_v2=True
+        if (
+            case.forward_mode.is_target_verify()
+            or case.forward_mode.is_draft_extend_v2()
         ):
             speculative_num_draft_tokens = case.input_lens[0] if case.input_lens else 0
             speculative_eagle_topk = 1
@@ -329,8 +335,18 @@ class MockDSV4ModelRunner:
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(
+                    backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
+                ),
+                prefill=PhaseConfig(
+                    backend=(
+                        Backend.DISABLED
+                        if (disable_cuda_graph or disable_piecewise_cuda_graph)
+                        else Backend.TC_PIECEWISE
+                    ),
+                ),
+            ),
             disable_radix_cache=False,
             disaggregation_mode=None,
             dp_size=1,
@@ -374,7 +390,8 @@ class MockDSV4ModelRunner:
             page_size=case.page_size,
             swa_page_size=DSV4_SWA_WINDOW,
             dtype=torch.float8_e4m3fn,
-            state_dtype=dtype,
+            c4_state_dtype=dtype,
+            c128_state_dtype=dtype,
             qk_nope_head_dim=DSV4_QK_NOPE_HEAD_DIM,
             qk_rope_head_dim=DSV4_QK_ROPE_HEAD_DIM,
             indexer_head_dim=128,
@@ -395,6 +412,7 @@ class MockDSV4ModelRunner:
         self.sliding_window_size = DSV4_SWA_WINDOW
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):
@@ -518,9 +536,12 @@ class ProjectedDSV4Attention(nn.Module):
             # `[num_tokens, 1, hidden_dim]`.
             k_flat = k.reshape(k.shape[0], -1).to(torch.bfloat16)
             pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_flat)
-            attn_backend.token_to_kv_pool.set_swa_key_buffer_radix(
+            pool = attn_backend.token_to_kv_pool
+            pool.set_swa_key_buffer_radix(
                 layer_id=self.attn.layer_id,
-                raw_loc=forward_batch.out_cache_loc.to(torch.int64),
+                swa_loc=pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc.to(torch.int64)
+                ),
                 cache_nope_fp8_rope_bf16_pack=pack,
             )
         out = attn_backend.forward(
@@ -546,7 +567,9 @@ def _write_swa_cache(
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_bf16.to(torch.bfloat16))
     runner.token_to_kv_pool.set_swa_key_buffer_radix(
         layer_id=layer_id,
-        raw_loc=loc.to(torch.int64),
+        swa_loc=runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+            loc.to(torch.int64)
+        ),
         cache_nope_fp8_rope_bf16_pack=pack,
     )
 
@@ -1079,7 +1102,6 @@ def _seed_c4_if_needed(fixture: DSV4AttentionFixture) -> None:
     compress_ratios.
     """
     if fixture.case.compress_ratio == 4:
-        fixture.backend._maybe_upgrade_forward_metadata()
         _seed_c4_sparse_indices(fixture, num_entries=_DSV4_EXTRA_ENTRIES)
 
 
@@ -1273,7 +1295,6 @@ def _pure_torch_dsv4_combined_reference(
     # `c4_sparse_page_indices` back to all -1 on the next upgrade) — the
     # reference must observe the same seeded indices the backend forward saw.
     _seed_c4_if_needed(fixture)
-    fixture.backend._maybe_upgrade_forward_metadata()
     md = fixture.backend.forward_metadata.core_metadata
     runner = fixture.runner
     max_context_len = runner.req_to_token_pool.req_to_token.shape[1]
@@ -1474,8 +1495,8 @@ def run_dsv4_draft_extend_attention_case(
         "`deepseek_v4_backend.py:636-663` and the 'Production-Unsupported' "
         "section in dsv4/README.md."
     )
-    assert case.forward_mode.is_draft_extend(
-        include_v2=True
+    assert (
+        case.forward_mode.is_draft_extend_v2()
     ), f"run_dsv4_draft_extend_attention_case requires DRAFT_EXTEND; got {case.forward_mode}"
     from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
         _make_eagle_draft_extend_input,
@@ -1554,9 +1575,6 @@ def run_dsv4_compress_attention_case(
     q_input, _ = fixture.actual_module.project(fixture.input_hidden)
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
-        # Trigger lazy upgrade so we can patch the metadata that the smoke
-        # case relies on (specifically c4_sparse_page_indices).
-        fixture.backend._maybe_upgrade_forward_metadata()
         if case.compress_ratio == 4:
             _seed_c4_sparse_indices(fixture, num_entries=extra_entries)
         actual = fixture.backend.forward(

@@ -49,6 +49,14 @@ from sglang.srt.managers.io_struct import (
     PauseContinueBroadcast,
     PauseGenerationReqInput,
     TokenizerWorkerRegistration,
+    async_sock_recv,
+    async_sock_send,
+    sock_recv,
+    sock_send,
+)
+from sglang.srt.managers.load_snapshot import (
+    create_load_snapshot_reader,
+    zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -93,7 +101,7 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
-        self._mapping[ipc_name].send_pyobj(output)
+        sock_send(self._mapping[ipc_name], output)
 
 
 def _extract_field_by_index(
@@ -159,6 +167,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -249,6 +260,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -324,7 +338,7 @@ class MultiHttpWorkerDetokenizerMixin:
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
@@ -381,6 +395,19 @@ class MultiTokenizerRouter:
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
         )
+
+        # In multi-tokenizer mode the N TokenizerWorker processes cannot each
+        # bind the zmq PULL socket used for load snapshots, so the single
+        # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
+        # read SHM only. Drain it event-driven via the socket's fd instead of
+        # polling on a timer.
+        self.load_snapshot_reader = None
+        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
+            self.load_snapshot_reader = create_load_snapshot_reader(
+                server_args, port_args, caller="MultiTokenizerRouter"
+            )
+            self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
+
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
 
         # Worker IPC names for pause/continue broadcasting
@@ -391,10 +418,24 @@ class MultiTokenizerRouter:
     def _run_loop(self):
         self._loop.run_forever()
 
+    def _register_load_snapshot_reader(self):
+        """Drain zmq load snapshots into SHM whenever the PULL socket is readable.
+
+        zmq exposes an edge-triggered fd; ``poll()`` drains it until empty, which
+        also re-arms the fd, so TokenizerWorkers reading SHM stay up to date
+        without any timer.
+        """
+        assert self.load_snapshot_reader is not None
+        self._loop.add_reader(
+            self.load_snapshot_reader.fileno(), self.load_snapshot_reader.poll
+        )
+        # Drain anything already queued before the fd was registered.
+        self.load_snapshot_reader.poll()
+
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
+            recv_obj = await async_sock_recv(self.receive_from_worker)
 
             if isinstance(recv_obj, TokenizerWorkerRegistration):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
@@ -419,15 +460,15 @@ class MultiTokenizerRouter:
                     isinstance(recv_obj, PauseGenerationReqInput)
                     and recv_obj.mode == "abort"
                 ):
-                    await self.send_to_scheduler.send_pyobj(recv_obj)
+                    await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
@@ -468,7 +509,7 @@ class MultiDetokenizerRouter:
 
     def event_loop(self):
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
 
             # FreezeGCReq must freeze every detokenizer process.
             if isinstance(recv_obj, FreezeGCReq):
@@ -563,7 +604,7 @@ class TokenizerWorker(TokenizerManager):
 
         # Register this worker with the router for pause/continue broadcasting
         reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
-        self.send_to_scheduler.send_pyobj(reg)
+        sock_send(self.send_to_scheduler, reg)
 
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
@@ -581,7 +622,7 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
-        self.send_to_scheduler.send_pyobj(obj)
+        sock_send(self.send_to_scheduler, obj)
         await self._pause_continue_future
 
         if obj.mode == "abort":
@@ -596,7 +637,7 @@ class TokenizerWorker(TokenizerManager):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        self.send_to_scheduler.send_pyobj(obj)
+        sock_send(self.send_to_scheduler, obj)
         await self._pause_continue_future
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
@@ -647,16 +688,9 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """Get the main process ID.
-
-    Supports override via SGLANG_GRANIAN_PARENT_PID for workers whose
-    multiprocessing parent PID differs from the shared-memory owner.
     """
-    from sglang.srt.environ import envs
-
-    override = envs.SGLANG_GRANIAN_PARENT_PID.get()
-    if override is not None:
-        return override
+    Get the main process ID.
+    """
     return multiprocessing.current_process()._parent_pid
 
 
@@ -704,14 +738,3 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
-
-
-class SenderWrapper:
-    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
-        self.port_args = port_args
-        self.send_to_scheduler = send_to_scheduler
-
-    def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
-            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(obj)
