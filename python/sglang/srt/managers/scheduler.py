@@ -3340,9 +3340,18 @@ class Scheduler(
                     req.extend_range.length if req.extend_range is not None else 0
                     for req in batch.reqs
                 ]
-                batch_result.extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
+                # extend_logprob_start_lens is the forward-time snapshot (already
+                # encoder-adjusted). It is aligned with batch.reqs only right after
+                # prepare_for_extend/mix_with_running; filter_batch/merge_batch do not
+                # maintain it, so a decode batch may carry a stale, misaligned list.
+                # That is harmless (decode never consumes it) but we fall back to zeros
+                # to keep the per-req list aligned with batch.reqs.
+                start_lens = batch.extend_logprob_start_lens
+                batch_result.extend_logprob_start_len_per_req = (
+                    list(start_lens)
+                    if start_lens is not None and len(start_lens) == len(batch.reqs)
+                    else [0] * len(batch.reqs)
+                )
             else:
                 batch_result.extend_input_len_per_req = None
                 batch_result.extend_logprob_start_len_per_req = None
