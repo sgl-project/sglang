@@ -34,9 +34,9 @@ def _install_cache_dit_stub():
 
     cache_dit.refresh_context = refresh_context
     cache_dit.steps_mask = steps_mask
-    cache_dit.BlockAdapter = object
+    cache_dit.BlockAdapter = types.SimpleNamespace
     cache_dit.DBCacheConfig = _FakeDBCacheConfig
-    cache_dit.ForwardPattern = object
+    cache_dit.ForwardPattern = types.SimpleNamespace(Pattern_3="Pattern_3")
     cache_dit.ParamsModifier = object
     cache_dit.TaylorSeerCalibratorConfig = object
 
@@ -125,28 +125,29 @@ def _install_torch_stub():
     }
 
 
-class TestCacheDitRefreshContext(unittest.TestCase):
-    def _import_module_with_stub(self):
-        stub_modules = _install_cache_dit_stub()
-        stub_modules.update(_install_sglang_dependency_stubs())
-        stub_modules.update(_install_torch_stub())
-        module_path = (
-            Path(__file__).resolve().parents[2]
-            / "runtime"
-            / "cache"
-            / "cache_dit_integration.py"
+def _import_module_with_stub():
+    stub_modules = _install_cache_dit_stub()
+    stub_modules.update(_install_sglang_dependency_stubs())
+    stub_modules.update(_install_torch_stub())
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "runtime"
+        / "cache"
+        / "cache_dit_integration.py"
+    )
+    with patch.dict(sys.modules, stub_modules):
+        spec = importlib.util.spec_from_file_location(
+            "test_cache_dit_integration_target", module_path
         )
-        with patch.dict(sys.modules, stub_modules):
-            spec = importlib.util.spec_from_file_location(
-                "test_cache_dit_integration_target", module_path
-            )
-            module = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            spec.loader.exec_module(module)
-        return module
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    return module
 
+
+class TestCacheDitRefreshContext(unittest.TestCase):
     def test_refresh_context_without_scm_preset_skips_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_transformer(
             transformer="transformer",
             num_inference_steps=50,
@@ -166,7 +167,7 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
     def test_refresh_context_with_scm_preset_uses_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_transformer(
             transformer="transformer",
             num_inference_steps=8,
@@ -187,7 +188,7 @@ class TestCacheDitRefreshContext(unittest.TestCase):
         )
 
     def test_dual_refresh_without_scm_preset_skips_steps_mask(self):
-        module = self._import_module_with_stub()
+        module = _import_module_with_stub()
         module.refresh_context_on_dual_transformer(
             transformer="transformer",
             transformer_2="transformer_2",
@@ -214,6 +215,40 @@ class TestCacheDitRefreshContext(unittest.TestCase):
                 "steps_computation_policy": None,
             },
         )
+
+
+def _make_transformer(class_name, layers=None):
+    transformer = type(class_name, (), {})()
+    if layers is not None:
+        transformer.layers = layers
+    return transformer
+
+
+class TestBuildCustomBlockAdapter(unittest.TestCase):
+    def test_builds_adapter_for_registered_class(self):
+        module = _import_module_with_stub()
+        blocks = ["block_0", "block_1"]
+        transformer = _make_transformer("ErnieImageTransformer2DModel", blocks)
+
+        adapter = module._build_custom_block_adapter(transformer)
+
+        self.assertIsNotNone(adapter)
+        self.assertEqual(adapter.blocks, blocks)
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
+        self.assertTrue(adapter.has_separate_cfg)
+
+    def test_returns_none_for_unknown_class(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("SomeUnregisteredTransformer", ["b0"])
+
+        self.assertIsNone(module._build_custom_block_adapter(transformer))
+
+    def test_raises_when_blocks_attr_missing(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("ErnieImageTransformer2DModel")
+
+        with self.assertRaises(ValueError):
+            module._build_custom_block_adapter(transformer)
 
 
 if __name__ == "__main__":

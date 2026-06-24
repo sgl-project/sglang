@@ -247,7 +247,7 @@ class StreamingSession(BasePrefixCache):
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
         # already applied). min handles retract retry where committed_len
         # can exceed len(token_ids) by 1.
-        prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
+        prefix_len = min(req.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).
@@ -331,9 +331,15 @@ class StreamingSession(BasePrefixCache):
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
+        target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
         slot.save_from_req(req, is_first=is_first)
+        # Inherit the authoritative finished length on the slot, not the lagging
+        # req clock (under overlap + honest committed the clock lags the in-flight
+        # verify by ~1, which would short-change inheritance). Clamp to allocated
+        # to keep committed <= allocated for prepare_for_decode.
+        slot.kv_committed_len = min(target, slot.kv_allocated_len)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)

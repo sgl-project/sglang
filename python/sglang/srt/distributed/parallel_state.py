@@ -42,12 +42,14 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -61,6 +63,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -763,8 +766,12 @@ class GroupCoordinator:
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
-        elif torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
-            torch_symm_mem_comm.all_reduce(input_)
+        elif (
+            torch_symm_mem_comm is not None
+            and not torch_symm_mem_comm.disabled
+            and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
@@ -1006,10 +1013,14 @@ class GroupCoordinator:
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
         sizes: Optional[List[int]] = None,
+        output: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
         Supports varying sizes per rank and input tensor list.
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
+        `output`: optional pre-allocated destination buffer (single-tensor input only).
+            When given, NCCL writes the gathered result directly into it, avoiding an
+            extra output allocation + caller-side copy.
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -1020,7 +1031,9 @@ class GroupCoordinator:
             ), "pynccl is required for all_gatherv"
 
             def _all_gather_allocate_output(
-                input_: torch.Tensor, sizes: Optional[List[int]] = None
+                input_: torch.Tensor,
+                sizes: Optional[List[int]] = None,
+                output: Optional[torch.Tensor] = None,
             ):
                 input_size = input_.size()
                 if sizes is not None:
@@ -1032,6 +1045,12 @@ class GroupCoordinator:
                         sizes = None
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
+                if output is not None:
+                    assert tuple(output.shape) == tuple(output_size), (
+                        f"all_gatherv output buffer shape {tuple(output.shape)} "
+                        f"!= expected {tuple(output_size)}"
+                    )
+                    return output, sizes
                 # Allocate output tensor.
                 with self.use_symmetric_memory(self, disabled=sizes is not None):
                     output_tensor = torch.empty(
@@ -1039,13 +1058,18 @@ class GroupCoordinator:
                     )
                 return output_tensor, sizes
 
-            if isinstance(input_, torch.Tensor):
+            single_input = isinstance(input_, torch.Tensor)
+            if single_input:
                 input_ = [input_]
+            elif output is not None:
+                raise ValueError("all_gatherv `output` requires a single-tensor input")
 
             output_list = []
             size_list = []
             for inp in input_:
-                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+                output_tensor, s = _all_gather_allocate_output(
+                    inp, sizes=sizes, output=output
+                )
                 output_list.append(output_tensor)
                 size_list.append(s)
 
@@ -1557,6 +1581,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1591,6 +1616,11 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context parallel group is not initialized"
+    return _DCP
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -1660,8 +1690,8 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
         get_pp_group().graph_capture(context),
     ):
         with contextlib.ExitStack() as stack:
-            seen = {id(_TP)}
-            for group in (_MOE_EP, _MOE_TP):
+            seen = {id(_TP), id(_PP)}
+            for group in (_DCP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -1690,17 +1720,14 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-_DEVICE_TO_DISTRIBUTED_BACKEND = {
-    "cuda": "nccl",
-    "xpu": "xccl",
-    "hpu": "hccl",
-    "cpu": "gloo",
-    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
-    "musa": "mccl",
-}
-
-
+# TODO: refactor in-tree platforms to get rid of this wrapper
 def get_default_distributed_backend(device: str) -> str:
+    # We deliberately go through ``platforms.current_platform`` (rather than
+    # ``from ... import current_platform``) so each call resolves through the
+    # platforms package's lazy ``__getattr__`` and picks up runtime overrides
+    # of ``_current_platform`` (e.g. in tests).
+    if device == platforms.current_platform.device_type:
+        return platforms.current_platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
@@ -1853,6 +1880,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
@@ -1874,6 +1902,11 @@ def initialize_model_parallel(
             parallelism.
         moe_data_model_parallel_size: number of GPUs used for moe data
             parallelism.
+        decode_context_parallel_size: number of GPUs used for decode context
+            parallelism, which splits the KV cache across GPUs within each
+            tensor-parallel group during decoding. Must be a divisor of
+            tensor_model_parallel_size and is currently only supported on the
+            AMD HIP platform.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1912,6 +1945,22 @@ def initialize_model_parallel(
             f"world_size ({world_size}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+        )
+    if decode_context_parallel_size < 1:
+        raise RuntimeError(
+            f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
+        )
+    if decode_context_parallel_size > 1 and not is_hip():
+        raise RuntimeError(
+            "Decode context parallel (decode_context_parallel_size > 1) is "
+            "currently only supported on the AMD HIP platform, but got "
+            f"decode_context_parallel_size ({decode_context_parallel_size}) "
+            "on a non-HIP platform."
+        )
+    if tensor_model_parallel_size % decode_context_parallel_size != 0:
+        raise RuntimeError(
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
+            f"decode_context_parallel_size ({decode_context_parallel_size})"
         )
 
     # Build the tensor model-parallel groups.
@@ -1954,6 +2003,25 @@ def initialize_model_parallel(
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
+
+    # Build decode context-parallel groups inside each TP group only when DCP is enabled.
+    global _DCP
+    assert _DCP is None, "decode context parallel group is already initialized"
+    if decode_context_parallel_size > 1:
+        dcp_group_ranks = []
+        for tp_group in group_ranks:
+            for start in range(0, len(tp_group), decode_context_parallel_size):
+                dcp_group_ranks.append(
+                    tp_group[start : start + decode_context_parallel_size]
+                )
+        _DCP = init_model_parallel_group(
+            dcp_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="dcp",
+            recovered_rank=recovered_rank,
+        )
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
@@ -2187,6 +2255,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     expert_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -2196,10 +2265,11 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size,
-            expert_model_parallel_size,
-            pipeline_model_parallel_size,
-            backend,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            decode_context_parallel_size=decode_context_parallel_size,
+            backend=backend,
         )
         return
 
@@ -2346,6 +2416,11 @@ def destroy_model_parallel():
         _PP.destroy()
     _PP = None
 
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
+
     global _MOE_EP
     if _MOE_EP:
         _MOE_EP.destroy()
@@ -2441,7 +2516,9 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
         with contextlib.suppress(OSError):
             if rank == source_rank:
                 # create a shared memory segment
-                shm = shared_memory.SharedMemory(create=True, size=128)
+                shm = shared_memory.SharedMemory(
+                    create=True, size=128, name=make_shm_name("nodecheck")
+                )
                 shm.buf[: len(magic_message)] = magic_message
                 torch.distributed.broadcast_object_list(
                     [shm.name], src=ranks[source_rank], group=pg

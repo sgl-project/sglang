@@ -180,7 +180,9 @@ def sgemm_lora_a_fwd(
     if (
         lora_envs.SGLANG_OPT_LORA_CUBLAS.get()
         or lora_envs.SGLANG_OPT_LORA_CUBLAS_A.get()
-    ):
+    ) and weights.shape[
+        0
+    ] == 1:  # single-adapter fast path: only valid with one resident slot
         # Honor out_alloc_stream like the Triton path below: under SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC
         # the shrink output must be allocated on the MAIN (consumer) stream so the caching allocator
         # frees/reuses it on the consumer's schedule (cuda-graph WAR). F.linear has no out=, so
