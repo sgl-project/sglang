@@ -2516,11 +2516,6 @@ def destroy_model_parallel():
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
 
-    global _DCP
-    if _DCP:
-        _DCP.destroy()
-    _DCP = None
-
 
 def destroy_distributed_environment():
     global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
