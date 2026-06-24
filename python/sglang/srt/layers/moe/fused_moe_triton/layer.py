@@ -14,10 +14,6 @@ from torch.nn.parameter import UninitializedParameter
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -70,6 +66,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -187,6 +184,7 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        gate_up_interleaved: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -201,10 +199,10 @@ class FusedMoE(torch.nn.Module):
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
-        self.moe_tp_size = get_moe_tensor_parallel_world_size()
-        self.moe_tp_rank = get_moe_tensor_parallel_rank()
+        self.moe_ep_size = get_parallel().moe_ep_size
+        self.moe_ep_rank = get_parallel().moe_ep_rank
+        self.moe_tp_size = get_parallel().moe_tp_size
+        self.moe_tp_rank = get_parallel().moe_tp_rank
 
         # DeepEP/MegaMOE use one physical shared slot per rank. Other backends
         # keep the shared expert as a global slot.
@@ -277,6 +275,7 @@ class FusedMoE(torch.nn.Module):
             swiglu_limit=swiglu_limit,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
+            gate_up_interleaved=gate_up_interleaved,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None

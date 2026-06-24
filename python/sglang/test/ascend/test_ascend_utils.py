@@ -18,7 +18,7 @@ import subprocess
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NamedTuple, Optional
 
-from sglang.bench_serving import run_benchmark
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -164,9 +164,6 @@ QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"
 )
 QWQ_32B_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "vllm-ascend/QWQ-32B-W8A8")
-REDHATAI_QWEN2_5_0_5B_INSTRUCT_QUANTIZED_W8A8_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
-)
 SMOLLM_1_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "HuggingFaceTB/SmolLM-1.7B")
 STABLELM_2_1_6B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "stabilityai/stablelm-2-1_6b"

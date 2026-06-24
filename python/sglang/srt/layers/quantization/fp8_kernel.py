@@ -464,17 +464,29 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_ue8m0: bool,
 ):
     if scale_ue8m0:
-        assert column_major_scales and scale_tma_aligned
-        *x_batch, x_q_mn, x_q_k = x_shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = ceil_align(x_s_mn, 4)
-        aligned_k = ceil_align(x_s_k, 4)
-        # TODO(FIXME): Fix cuda kernel and recover here to empty.
-        return torch.empty(
-            (*x_batch, aligned_k // 4, aligned_mn),
-            device=device,
-            dtype=torch.int,
-        ).transpose(-1, -2)[..., :x_s_mn, :]
+        if column_major_scales and scale_tma_aligned:
+            *x_batch, x_q_mn, x_q_k = x_shape
+            x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+            aligned_mn = ceil_align(x_s_mn, 4)
+            aligned_k = ceil_align(x_s_k, 4)
+            # TODO(FIXME): Fix cuda kernel and recover here to empty.
+            return torch.empty(
+                (*x_batch, aligned_k // 4, aligned_mn),
+                device=device,
+                dtype=torch.int,
+            ).transpose(-1, -2)[..., :x_s_mn, :]
+        else:
+            assert not column_major_scales, (
+                "column_major_scales requires scale_tma_aligned=True "
+                "when scale_ue8m0 is enabled"
+            )
+            # Row-major UE8M0 keeps the scale as float32 power-of-two values,
+            # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
+            return torch.empty(
+                x_shape[:-1] + (x_shape[-1] // group_size,),
+                device=device,
+                dtype=torch.float32,
+            )
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
@@ -1166,7 +1178,9 @@ def get_w8a8_block_fp8_configs(
         sanitized = {}
         clamped_ms = []
         for m_key, cfg in raw.items():
-            if cfg["BLOCK_SIZE_K"] < block_k:
+            if cfg["BLOCK_SIZE_K"] < block_k and (
+                not _is_cuda or block_k % cfg["BLOCK_SIZE_K"] != 0
+            ):
                 clamped_ms.append((m_key, cfg["BLOCK_SIZE_K"]))
                 cfg = {**cfg, "BLOCK_SIZE_K": block_k}
             sanitized[m_key] = cfg

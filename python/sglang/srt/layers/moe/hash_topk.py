@@ -22,9 +22,12 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_is_npu = is_npu()
 
 
 class HashTopK(nn.Module):
@@ -65,7 +68,14 @@ class HashTopK(nn.Module):
         )
         self._init_default_tid2eid()
 
-        assert not apply_routed_scaling_factor_on_output, "not implemented"
+        self.apply_routed_scaling_factor_on_output = (
+            apply_routed_scaling_factor_on_output
+        )
+        if apply_routed_scaling_factor_on_output and num_fused_shared_experts > 0:
+            raise NotImplementedError(
+                "HashTopK + apply_routed_scaling_factor_on_output is not supported "
+                "with fused shared experts; pass --disable-shared-experts-fusion."
+            )
 
     def _init_default_tid2eid(self) -> None:
         topk = self.tid2eid.shape[1]
@@ -193,9 +203,11 @@ class HashTopK(nn.Module):
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
-
-        if is_hip():
+        if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
+
+        if self.apply_routed_scaling_factor_on_output:
+            topk_weights = topk_weights * self.routed_scaling_factor
 
         num_fused_shared_experts = self.num_fused_shared_experts
         use_per_rank_shared_slots = (
