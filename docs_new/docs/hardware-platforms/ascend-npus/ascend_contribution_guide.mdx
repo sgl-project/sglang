@@ -87,9 +87,9 @@ If you need to use model which is not in `python/sglang/test/ascend/test_ascend_
   If this is not the case, use following command on CI server:
 
     ```bash
-    modelscope download
-    --model {your_model_repo}/{your_model}
-    --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
+    modelscope download \
+      --model {your_model_repo}/{your_model} \
+      --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
     ```
 
     > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
