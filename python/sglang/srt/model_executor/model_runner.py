@@ -944,16 +944,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         buffer holds and trip a DeepEP assert. Capped at DeepEP's FINISHED_SUM_TAG
         ceiling (1024). User env wins; only ever raised above the default.
         """
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+        )
+
         env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
         if env.is_set():
             return
-        if (
-            self.server_args.moe_a2a_backend != "deepep"
-            or self.server_args.deepep_mode == "normal"
-        ):
+        if not self._is_deepep_low_latency():
             return
 
-        num_max = min(self.req_to_token_pool.size, 1024)
+        num_max = min(
+            self.req_to_token_pool.size, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+        )
         if num_max > env.get():
             env.set(num_max)
             log_info_on_rank0(

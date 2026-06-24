@@ -1,18 +1,23 @@
-"""Unit tests for DeepEP num_max_dispatch_tokens_per_rank auto-tuning.
+"""Unit tests for DeepEP low_latency dispatch-cap auto-tuning.
 
-Two pieces, both CPU-only and fully mocked:
+All CPU-only and fully mocked:
   - The dispatcher resolves SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
     lazily (honoring a value auto-tuned after construction) and caches it.
   - ModelRunner._maybe_auto_tune_deepep_num_max_dispatch_tokens sizes the cap to
     the scheduler's decode concurrency (request-pool size, capped at 1024), only
     for the DeepEP low_latency path, and never overrides an explicit user env.
+  - _clamp_deepep_low_latency_concurrency caps per-rank decode concurrency to the
+    FINISHED_SUM_TAG bound and takes the EP-group minimum so the collective
+    dispatch buffer is uniform and no rank overruns it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import types
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,6 +25,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _ENV = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+
+_MIXIN_MODULE = "sglang.srt.model_executor.model_runner_kv_cache_mixin"
 
 try:
     from sglang.srt.layers.moe.token_dispatcher.deepep import _DeepEPDispatcherImplBase
@@ -30,6 +37,9 @@ except Exception:
 
 try:
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+        ModelRunnerKVCacheMixin,
+    )
 
     _HAS_MODEL_RUNNER = True
 except Exception:
@@ -49,6 +59,20 @@ def _env_unset():
             _ENV.set(old)
         else:
             _ENV.clear()
+
+
+def _deepep_runner(backend="deepep", mode="auto", **extra):
+    runner = SimpleNamespace(
+        server_args=SimpleNamespace(moe_a2a_backend=backend, deepep_mode=mode),
+        device="cuda",
+        gpu_id=0,
+        **extra,
+    )
+    if _HAS_MODEL_RUNNER:
+        runner._is_deepep_low_latency = types.MethodType(
+            ModelRunnerKVCacheMixin._is_deepep_low_latency, runner
+        )
+    return runner
 
 
 @unittest.skipUnless(_HAS_DEEPEP_MODULE, "deepep token dispatcher not importable")
@@ -90,10 +114,9 @@ class TestDeepEPAutoTune(unittest.TestCase):
     """ModelRunner._maybe_auto_tune_deepep_num_max_dispatch_tokens behavior."""
 
     def _runner(self, backend="deepep", mode="auto", pool_size=4096):
-        return SimpleNamespace(
-            server_args=SimpleNamespace(moe_a2a_backend=backend, deepep_mode=mode),
-            device="cuda",
-            gpu_id=0,
+        return _deepep_runner(
+            backend=backend,
+            mode=mode,
             req_to_token_pool=SimpleNamespace(size=pool_size),
         )
 
@@ -132,6 +155,48 @@ class TestDeepEPAutoTune(unittest.TestCase):
             self._run(self._runner(pool_size=64))
             self.assertFalse(_ENV.is_set())
             self.assertEqual(_ENV.get(), 128)
+
+
+@unittest.skipUnless(_HAS_MODEL_RUNNER, "model_runner not importable")
+class TestDeepEPConcurrencyClamp(unittest.TestCase):
+    """_clamp_deepep_low_latency_concurrency caps + EP-group-syncs concurrency."""
+
+    def _clamp(self, runner, max_num_reqs):
+        return ModelRunnerKVCacheMixin._clamp_deepep_low_latency_concurrency(
+            runner, max_num_reqs
+        )
+
+    def test_passthrough_for_non_deepep(self):
+        self.assertEqual(self._clamp(_deepep_runner(backend="none"), 2048), 2048)
+
+    def test_passthrough_for_normal_mode(self):
+        self.assertEqual(self._clamp(_deepep_runner(mode="normal"), 2048), 2048)
+
+    def test_caps_to_finished_sum_tag_single_rank(self):
+        with patch(
+            f"{_MIXIN_MODULE}.get_moe_ep_group",
+            return_value=SimpleNamespace(world_size=1, cpu_group=None),
+        ):
+            self.assertEqual(self._clamp(_deepep_runner(), 2048), 1024)
+
+    def test_below_cap_unchanged_single_rank(self):
+        with patch(
+            f"{_MIXIN_MODULE}.get_moe_ep_group",
+            return_value=SimpleNamespace(world_size=1, cpu_group=None),
+        ):
+            self.assertEqual(self._clamp(_deepep_runner(), 512), 512)
+
+    def test_takes_ep_group_minimum(self):
+        # Simulate a peer rank contributing a smaller concurrency: cap is 800,
+        # the group MIN drives it to 600.
+        def fake_all_reduce(tensor, op=None, group=None):
+            tensor.fill_(600)
+
+        with patch(
+            f"{_MIXIN_MODULE}.get_moe_ep_group",
+            return_value=SimpleNamespace(world_size=2, cpu_group=object()),
+        ), patch("torch.distributed.all_reduce", side_effect=fake_all_reduce):
+            self.assertEqual(self._clamp(_deepep_runner(), 800), 600)
 
 
 if __name__ == "__main__":

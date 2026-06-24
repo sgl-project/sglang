@@ -67,6 +67,12 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
+# DeepEP internode low_latency dispatch packs each rank's token count against a
+# 1024 "finished" sentinel (FINISHED_SUM_TAG); a per-rank dispatch above it
+# collides with the sentinel and asserts. Bounds num_max and the decode
+# concurrency that feeds it.
+DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS = 1024
+
 
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
@@ -364,8 +370,7 @@ class _DeepEPDispatcherImplBase:
     def num_max_dispatch_tokens_per_rank(self) -> int:
         if self._num_max_dispatch_tokens_per_rank is None:
             value = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-            # DeepEP internode_ll FINISHED_SUM_TAG=1024 bounds per-rank dispatch tokens.
-            assert value <= 1024
+            assert value <= DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
             self._num_max_dispatch_tokens_per_rank = value
         return self._num_max_dispatch_tokens_per_rank
 

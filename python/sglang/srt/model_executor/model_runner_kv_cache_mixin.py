@@ -11,7 +11,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import get_moe_ep_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -1015,7 +1015,53 @@ class ModelRunnerKVCacheMixin:
                 requested_per_worker,
                 max_num_reqs,
             )
-        return max_num_reqs
+
+        return self._clamp_deepep_low_latency_concurrency(max_num_reqs)
+
+    def _is_deepep_low_latency(self: ModelRunner) -> bool:
+        return (
+            self.server_args.moe_a2a_backend == "deepep"
+            and self.server_args.deepep_mode != "normal"
+        )
+
+    def _clamp_deepep_low_latency_concurrency(
+        self: ModelRunner, max_num_reqs: int
+    ) -> int:
+        """Cap per-rank decode concurrency for the DeepEP low_latency path.
+
+        num_max (the dispatch cap, sized from this concurrency) must hold every
+        rank's decode batch or DeepEP asserts, yet the all-to-all buffer is
+        collective so all EP ranks must size it identically. Clamp to the
+        FINISHED_SUM_TAG bound, then take the EP-group minimum: the result is
+        uniform and <= every rank's own concurrency, so the buffer fits and no
+        rank overruns it. The cap also lets the post-KV auto-tune read the
+        already-synced request-pool size without its own reduction.
+        """
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+        )
+
+        if not self._is_deepep_low_latency():
+            return max_num_reqs
+
+        capped = min(max_num_reqs, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS)
+        ep_group = get_moe_ep_group()
+        if ep_group.world_size > 1:
+            tensor = torch.tensor(capped, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MIN, group=ep_group.cpu_group
+            )
+            capped = int(tensor.item())
+
+        if capped < max_num_reqs:
+            logger.warning(
+                "DeepEP low_latency capped per-rank decode concurrency to %d "
+                "(from %d) to keep the all-to-all dispatch buffer within the "
+                "FINISHED_SUM_TAG bound and uniform across the EP group.",
+                capped,
+                max_num_reqs,
+            )
+        return capped
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
         """Apply a resolved MemoryPoolConfig and initialize pools."""
