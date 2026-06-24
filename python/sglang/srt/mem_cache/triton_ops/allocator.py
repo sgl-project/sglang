@@ -2,7 +2,17 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# free_page_ptr aliases self.free_pages, which the paged allocator re-slices
+# after every allocation (self.free_pages = self.free_pages[num_new_pages:]).
+# Slicing only advances data_ptr() by num_new_pages * 8 bytes, so the pointer
+# flips between 16-byte-aligned and unaligned across calls. Triton specializes
+# on pointer alignment by default and bakes it into the cache key, compiling two
+# kernel variants (one with tt.divisibility=16 on free_page_ptr, one without)
+# so the second prefill on a fresh DCP server hits the alternate alignment and
+# pays an extra ~100ms JIT for that kernel variant. do_not_specialize skips
+# that specialization so only one kernel is ever compiled; the perf cost is
+# negligible (this kernel runs in ~10us and only loads ~4KB through this ptr).
+@triton.jit(do_not_specialize=["free_page_ptr"])
 def alloc_extend_kernel(
     pre_lens_ptr,
     seq_lens_ptr,
@@ -88,7 +98,8 @@ def alloc_extend_kernel(
     )
 
 
-@triton.jit
+# Same free_page_ptr alignment rationale as alloc_extend_kernel above.
+@triton.jit(do_not_specialize=["free_page_ptr"])
 def alloc_decode_kernel(
     seq_lens_ptr,
     last_loc_ptr,
