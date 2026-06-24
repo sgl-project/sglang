@@ -1627,14 +1627,33 @@ def apply_fp8_linear(
                 qinput, weight, x_scale, weight_scale, input.dtype, bias
             )
         else:
-            output = fp8_scaled_mm(
-                qinput,
-                weight,
-                x_scale,
-                weight_scale,
-                out_dtype=input.dtype,
-                bias=bias,
-            )
+            output = None
+            # Native B200 M=1 FP8 GEMV fast path (decode regime). The SM100
+            # fp8_scaled_mm routes M==1 to SM89 CUTLASS GEMM kernels (a 64-row MMA
+            # tile on a single row); at M==1 the op is a memory-bound GEMV, so a
+            # native GEMV is faster. Any shape outside the supported contract
+            # falls back to fp8_scaled_mm below.
+            if qinput.shape[0] == 1 and bias is None:
+                from sglang.jit_kernel.fp8_gemv import (
+                    can_use_fp8_gemv,
+                    fp8_gemv,
+                )
+
+                if can_use_fp8_gemv(
+                    qinput, weight, x_scale, weight_scale, input.dtype, bias
+                ):
+                    output = fp8_gemv(
+                        qinput, weight, x_scale, weight_scale, input.dtype
+                    )
+            if output is None:
+                output = fp8_scaled_mm(
+                    qinput,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype=input.dtype,
+                    bias=bias,
+                )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only
