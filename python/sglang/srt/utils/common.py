@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import binascii
 import builtins
 import ctypes
 import functools
@@ -2386,6 +2387,39 @@ class MultiprocessingSerializer:
             data = pybase64.b64decode(data, validate=True)
 
         return SafeUnpickler(io.BytesIO(data)).load()
+
+
+SerializedTensorPayload = Union[str, bytes, bytearray, memoryview]
+
+
+def _looks_like_pickle_payload(data: bytes) -> bool:
+    return len(data) >= 2 and data[0] == 0x80 and data[1] <= pickle.HIGHEST_PROTOCOL
+
+
+def normalize_serialized_named_tensor_payload(data: SerializedTensorPayload) -> bytes:
+    """Normalize a serialized tensor payload to raw MultiprocessingSerializer bytes."""
+    if isinstance(data, str):
+        return pybase64.b64decode(data, validate=True)
+
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+        if _looks_like_pickle_payload(data):
+            return data
+        try:
+            return pybase64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return data
+
+    raise TypeError(
+        "serialized_named_tensors entries must be base64 strings or bytes-like "
+        f"payloads, got {type(data).__name__}"
+    )
+
+
+def normalize_serialized_named_tensor_payloads(
+    payloads: List[SerializedTensorPayload],
+) -> List[bytes]:
+    return [normalize_serialized_named_tensor_payload(data) for data in payloads]
 
 
 class SafeUnpickler(pickle.Unpickler):

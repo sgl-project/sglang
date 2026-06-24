@@ -1769,8 +1769,14 @@ class SetInternalStateReqOutput(BaseReq):
     server_args: Dict[str, Any]
 
 
+class ProfileReqType(Enum):
+    START_PROFILE = 1
+    STOP_PROFILE = 2
+
+
 @dataclass
-class ProfileReqInput(BaseReq):
+class ProfileReq(BaseReq):
+    req_type: ProfileReqType = ProfileReqType.START_PROFILE
     # The output directory
     output_dir: Optional[str] = None
     # Specify the steps to start the profiling
@@ -1787,32 +1793,12 @@ class ProfileReqInput(BaseReq):
     with_stack: Optional[bool] = None
     # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
     # The prefix of the profile filenames
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
-    profile_stages: Optional[List[str]] = None
-
-
-class ProfileReqType(Enum):
-    START_PROFILE = 1
-    STOP_PROFILE = 2
-
-
-@dataclass
-class ProfileReq(BaseReq):
-    type: ProfileReqType
-    output_dir: Optional[str] = None
-    start_step: Optional[int] = None
-    num_steps: Optional[int] = None
-    activities: Optional[List[str]] = None
-    profile_by_stage: bool = False
-    with_stack: Optional[bool] = None
-    record_shapes: Optional[bool] = None
-    profile_id: Optional[str] = None
-    merge_profiles: bool = False
-    profile_prefix: Optional[str] = None
     profile_stages: Optional[List[str]] = None
 
 
