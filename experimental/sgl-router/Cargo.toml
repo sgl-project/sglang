@@ -81,6 +81,9 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 [dev-dependencies]
 dirs = "5"
 http-body-util = "0.1"
+# HTTP/2-only mock server for the proxy h2c forwarding tests (tests/proxy/h2c_forward.rs).
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
