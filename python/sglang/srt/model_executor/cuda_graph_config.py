@@ -88,7 +88,7 @@ class CudaGraphConfig:
         default_factory=lambda: PhaseConfig(backend=Backend.FULL)
     )
     prefill: PhaseConfig = field(
-        default_factory=lambda: PhaseConfig(backend=Backend.TC_PIECEWISE)
+        default_factory=lambda: PhaseConfig(backend=Backend.BREAKABLE)
     )
 
     def __getitem__(self, phase: str) -> PhaseConfig:
