@@ -102,12 +102,9 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
 
 @dataclass
 class RelayPayload:
-    """One iteration's stash payload, indexed into the FutureMap bufs.
-
-    Non-spec fills only `bonus_tokens` (the sampled token -- a 0-draft verify's
-    bonus). Spec also carries the draft extras; which of them is actually
-    relayed is decided by `FutureMap.spec_algo`, not by this payload's shape.
-    """
+    """Per-iteration stash payload for the FutureMap bufs. Non-spec fills only
+    `bonus_tokens`; which spec extras get relayed is decided by
+    `FutureMap.spec_algo`, not by this payload's shape."""
 
     bonus_tokens: torch.Tensor
     topk_p: Optional[torch.Tensor] = None
@@ -169,8 +166,7 @@ class FutureMap:
         else:
             self.new_seq_lens_cpu_pinned = None
             self.fwd_prepare_d2h_stream = None
-        # Lazy-inited on the first non-empty stash (peeks tensor shapes). Set
-        # for spec and non-spec alike; non-spec's init is a cheap no-op.
+        # Lazy-inited on the first non-empty stash (peeks tensor shapes); non-spec's is a no-op.
         self._forward_buf_initialized = False
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
@@ -343,8 +339,6 @@ class FutureMap:
             return
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
-        # bonus_tokens is always relayed; spec extras are gated by spec_algo
-        # (see _lazy_init_forward_buf), so non-spec only writes this buf.
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
         )
