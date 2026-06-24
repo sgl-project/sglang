@@ -149,6 +149,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         Some(Arc::new(cfg)),
         None,
         None,
+        None,
     ));
 
     let id = WorkerId(url);

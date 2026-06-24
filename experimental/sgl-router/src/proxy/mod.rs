@@ -15,6 +15,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::{Client, Url};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
@@ -33,19 +34,35 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
 
 #[derive(Debug)]
 pub struct Proxy {
-    /// HTTP/1.1 client — used for every worker that did not self-report
-    /// `--enable-http2`, and for side-channel admin traffic (e.g. cache
-    /// flush). Always safe against any engine.
-    pub client: Client,
-    /// Cleartext HTTP/2 (h2c, prior-knowledge) client — used only for
-    /// workers that introspection resolved to [`WireProtocol::H2c`]. A
-    /// prior-knowledge client speaks *only* HTTP/2, so it must never be
-    /// pointed at an HTTP/1.1-only engine; selection is gated by the
-    /// worker's resolved protocol in [`Self::client_for`].
-    client_h2c: Client,
+    /// The single forwarding client, paired with the wire protocol it was
+    /// built for. Stored as one cell so the protocol the proxy reports and
+    /// the protocol the live client actually speaks can never drift: both
+    /// are read from this tuple. The fleet is homogeneous — every worker
+    /// speaks the same protocol — so one client suffices and a per-request
+    /// selector is unnecessary. Installed by [`Self::set_protocol`] when the
+    /// manager introspects a worker; if a forward somehow precedes
+    /// resolution, [`Self::client`] falls back to the always-safe HTTP/1.1
+    /// default.
+    client: OnceLock<(WireProtocol, Client)>,
     /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
     /// requests deliberately do not use this (long generations are valid).
     pub request_timeout: Duration,
+}
+
+/// Build a forwarding client for `protocol`, sharing pool/connect tuning
+/// across protocols. The h2c variant pins HTTP/2 prior knowledge so it
+/// speaks cleartext h2c to Granian engines (no ALPN on plaintext); the
+/// HTTP/1.1 variant is the reqwest default and is safe against any engine.
+fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
+    let builder = Client::builder()
+        .pool_max_idle_per_host(64)
+        .connect_timeout(Duration::from_secs(5));
+    match protocol {
+        WireProtocol::Http1 => builder,
+        WireProtocol::H2c => builder.http2_prior_knowledge(),
+    }
+    .build()
+    .context("build reqwest client")
 }
 
 impl Proxy {
@@ -53,35 +70,79 @@ impl Proxy {
     /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
     ///
-    /// Two clients are built sharing identical pool/timeout tuning; the h2c
-    /// client additionally pins HTTP/2 prior knowledge so it can talk
-    /// cleartext h2c to Granian engines (no ALPN on plaintext).
+    /// The forwarding client is not built here: its wire protocol is resolved
+    /// later from worker introspection (see [`Self::set_protocol`]) and the
+    /// client is built then.
     pub fn new(request_timeout: Duration) -> Result<Self, anyhow::Error> {
-        let base = || {
-            Client::builder()
-                .pool_max_idle_per_host(64)
-                .connect_timeout(Duration::from_secs(5))
-        };
-        let client = base().build().context("build reqwest client")?;
-        let client_h2c = base()
-            .http2_prior_knowledge()
-            .build()
-            .context("build h2c reqwest client")?;
         Ok(Self {
-            client,
-            client_h2c,
+            client: OnceLock::new(),
             request_timeout,
         })
     }
 
-    /// Pick the client matching the worker's resolved wire protocol: the
-    /// prior-knowledge HTTP/2 client for h2c workers, the HTTP/1.1 client for
-    /// everyone else.
-    fn client_for(&self, protocol: WireProtocol) -> &Client {
-        match protocol {
-            WireProtocol::Http1 => &self.client,
-            WireProtocol::H2c => &self.client_h2c,
+    /// Install the fleet's forwarding client, built for the wire protocol the
+    /// worker manager resolved from a worker's `/server_info`. The first call
+    /// wins: the fleet is assumed homogeneous, so later workers report the
+    /// same protocol and re-setting is a no-op. A later worker reporting a
+    /// *different* protocol is logged (it cannot be honored — there is one
+    /// client) but otherwise ignored. A client-construction failure is logged
+    /// here, at registration time, rather than panicking on the first forward.
+    ///
+    /// The manager calls this before the worker becomes routable, so the
+    /// client is in place before [`Self::client`] is first read.
+    pub fn set_protocol(&self, protocol: WireProtocol) {
+        if let Some((current, _)) = self.client.get() {
+            // Already resolved (the common case: every subsequent worker
+            // re-reports the fleet protocol). Only a genuine divergence is
+            // worth a log.
+            if *current != protocol {
+                tracing::warn!(
+                    fleet_protocol = ?current,
+                    reported = ?protocol,
+                    "worker reported a wire protocol that differs from the fleet's resolved \
+                     protocol; the router uses a single forwarding client and assumes a \
+                     homogeneous fleet, so the reported protocol is ignored",
+                );
+            }
+            return;
         }
+        match build_client(protocol) {
+            // `set` can still race a concurrent first registration; the loser's
+            // freshly built client is simply dropped (first-write-wins).
+            Ok(client) => {
+                let _ = self.client.set((protocol, client));
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                ?protocol,
+                "failed to build the forwarding client; will fall back to the HTTP/1.1 default",
+            ),
+        }
+    }
+
+    /// The fleet's resolved wire protocol, or the HTTP/1.1 default if no worker
+    /// has been introspected yet. Read from the same cell as [`Self::client`],
+    /// so it always reflects the protocol the live client actually speaks.
+    pub fn protocol(&self) -> WireProtocol {
+        self.client.get().map(|(p, _)| *p).unwrap_or_default()
+    }
+
+    /// The single forwarding client (built for the resolved fleet protocol, or
+    /// the always-safe HTTP/1.1 default if none was resolved). Also used for
+    /// side-channel admin traffic (e.g. `/flush_cache`): under the homogeneous
+    /// fleet assumption every engine accepts the resolved protocol, so one
+    /// client serves both the request hot path and admin traffic.
+    pub fn client(&self) -> &Client {
+        &self
+            .client
+            .get_or_init(|| {
+                (
+                    WireProtocol::Http1,
+                    build_client(WireProtocol::Http1)
+                        .expect("HTTP/1.1 reqwest client construction is infallible"),
+                )
+            })
+            .1
     }
 
     /// Classify a reqwest error into the right `ApiError` variant, given an
@@ -122,7 +183,6 @@ impl Proxy {
         &self,
         worker_url: &str,
         breaker: &CircuitBreaker,
-        protocol: WireProtocol,
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
@@ -136,7 +196,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client_for(protocol).post(url.clone()).body(body);
+        let mut req = self.client().post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -203,7 +263,6 @@ impl Proxy {
         &self,
         worker_url: &str,
         breaker: &Arc<CircuitBreaker>,
-        protocol: WireProtocol,
         path: &str,
         headers: &HeaderMap,
         body: Bytes,
@@ -219,7 +278,7 @@ impl Proxy {
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
         })?;
-        let mut req = self.client_for(protocol).post(url.clone()).body(body);
+        let mut req = self.client().post(url.clone()).body(body);
         for (k, v) in headers {
             if should_forward_request_header(k) {
                 req = req.header(k, v);
@@ -300,15 +359,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_for_selects_per_protocol() {
+    async fn protocol_defaults_to_http1_until_resolved() {
         let p = Proxy::new(Duration::from_secs(5)).unwrap();
-        // Http1 → the shared HTTP/1.1 client; H2c → the prior-knowledge
-        // client. They are distinct instances, and Http1 maps to the same
-        // client used for side-channel admin traffic (`p.client`).
-        assert!(std::ptr::eq(p.client_for(WireProtocol::Http1), &p.client));
-        assert!(!std::ptr::eq(
-            p.client_for(WireProtocol::Http1),
-            p.client_for(WireProtocol::H2c),
-        ));
+        assert_eq!(p.protocol(), WireProtocol::Http1);
+    }
+
+    #[tokio::test]
+    async fn set_protocol_is_first_write_wins() {
+        let p = Proxy::new(Duration::from_secs(5)).unwrap();
+        p.set_protocol(WireProtocol::H2c);
+        assert_eq!(p.protocol(), WireProtocol::H2c);
+        // Homogeneous-fleet assumption: a later, differing report is ignored
+        // (the single client is already committed to the first protocol). The
+        // h2c-on-the-wire behavior itself is covered by tests/proxy/h2c_forward.rs.
+        p.set_protocol(WireProtocol::Http1);
+        assert_eq!(p.protocol(), WireProtocol::H2c);
+    }
+
+    /// `protocol()` and `client()` read the same cell, so the reported
+    /// protocol can never drift from the client actually in use. In
+    /// particular, once a forward (or `/flush_cache`) builds the client via
+    /// `client()` ahead of resolution — which locks in the HTTP/1.1 default —
+    /// a later `set_protocol(H2c)` is a no-op AND `protocol()` keeps reporting
+    /// the truth (Http1), rather than claiming H2c while the live client
+    /// speaks HTTP/1.1. The manager orders `set_protocol` before a worker is
+    /// routable so this fallback never engages in production; this test pins
+    /// the invariant that the two can't disagree if it ever did.
+    #[tokio::test]
+    async fn client_built_before_resolution_keeps_protocol_consistent() {
+        let p = Proxy::new(Duration::from_secs(5)).unwrap();
+        // Force the client to build before any protocol is resolved.
+        let _ = p.client();
+        assert_eq!(p.protocol(), WireProtocol::Http1);
+        // A late resolution cannot rebuild the committed client, and crucially
+        // cannot make protocol() lie about it.
+        p.set_protocol(WireProtocol::H2c);
+        assert_eq!(p.protocol(), WireProtocol::Http1);
     }
 }

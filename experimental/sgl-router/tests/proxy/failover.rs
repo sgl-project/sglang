@@ -60,6 +60,7 @@ async fn failover_when_one_worker_dies() {
         Some(Arc::new(cfg.clone())),
         None,
         None,
+        None,
     ));
 
     // Poll for the registry to converge — `register_one` introspect is

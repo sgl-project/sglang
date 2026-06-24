@@ -4,6 +4,7 @@
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::proxy::Proxy;
 use sgl_router::workers::{manager, WireProtocol, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -135,8 +136,9 @@ async fn manager_handles_mode_changed() {
     h.await.unwrap();
 }
 
-/// A worker whose `/server_info` reports `enable_http2: true` is registered
-/// with [`WireProtocol::H2c`], so the proxy forwards over cleartext h2c.
+/// A worker whose `/server_info` reports `enable_http2: true` resolves the
+/// proxy's single forwarding client to [`WireProtocol::H2c`], so the proxy
+/// forwards over cleartext h2c.
 #[tokio::test]
 async fn manager_resolves_h2c_protocol_from_server_info() {
     let (url, _s) =
@@ -144,7 +146,15 @@ async fn manager_resolves_h2c_protocol_from_server_info() {
 
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
-    let h = tokio::spawn(manager::run(rx, registry.clone()));
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let h = tokio::spawn(manager::run_with_config(
+        rx,
+        registry.clone(),
+        None,
+        None,
+        None,
+        Some(proxy.clone()),
+    ));
 
     tx.send(DiscoveryEvent::Added(spec_for(
         "w1",
@@ -155,24 +165,33 @@ async fn manager_resolves_h2c_protocol_from_server_info() {
     .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let w = registry
-        .get(&WorkerId("w1".into()))
-        .expect("worker registered");
-    assert_eq!(w.protocol, WireProtocol::H2c);
+    assert!(
+        registry.get(&WorkerId("w1".into())).is_some(),
+        "worker registered",
+    );
+    assert_eq!(proxy.protocol(), WireProtocol::H2c);
 
     drop(tx);
     h.await.unwrap();
 }
 
-/// A worker that omits `enable_http2` (older SGLang) stays on the safe
-/// HTTP/1.1 default.
+/// A worker that omits `enable_http2` (older SGLang) leaves the proxy on the
+/// safe HTTP/1.1 default.
 #[tokio::test]
 async fn manager_defaults_http1_when_enable_http2_absent() {
     let (url, _s) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
 
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
-    let h = tokio::spawn(manager::run(rx, registry.clone()));
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let h = tokio::spawn(manager::run_with_config(
+        rx,
+        registry.clone(),
+        None,
+        None,
+        None,
+        Some(proxy.clone()),
+    ));
 
     tx.send(DiscoveryEvent::Added(spec_for(
         "w1",
@@ -183,10 +202,11 @@ async fn manager_defaults_http1_when_enable_http2_absent() {
     .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let w = registry
-        .get(&WorkerId("w1".into()))
-        .expect("worker registered");
-    assert_eq!(w.protocol, WireProtocol::Http1);
+    assert!(
+        registry.get(&WorkerId("w1".into())).is_some(),
+        "worker registered",
+    );
+    assert_eq!(proxy.protocol(), WireProtocol::Http1);
 
     drop(tx);
     h.await.unwrap();
@@ -530,6 +550,7 @@ async fn manager_emits_single_server_info_fetch_per_worker() {
         None,
         Some(kv_index.clone()),
         None,
+        None,
     ));
 
     tx.send(DiscoveryEvent::Added(spec_for(
@@ -615,6 +636,7 @@ async fn reconcile_recovers_worker_with_unresolved_model_ids() {
     let h = tokio::spawn(manager::run_with_introspector_and_reconcile(
         rx,
         registry.clone(),
+        None,
         None,
         None,
         None,

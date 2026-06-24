@@ -101,7 +101,7 @@ pub async fn flush_cache(State(ctx): State<Arc<AppContext>>) -> Response {
     }
 
     let (successful, failed) =
-        fan_out_flush(&workers, &ctx.proxy.client, ctx.proxy.request_timeout).await;
+        fan_out_flush(&workers, ctx.proxy.client(), ctx.proxy.request_timeout).await;
 
     // Partial failure is an operational event an operator needs to see at the
     // common production log level — match the rest of the router, which warns

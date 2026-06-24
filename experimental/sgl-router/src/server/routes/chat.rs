@@ -400,7 +400,6 @@ pub async fn chat_completions(
 
         let prefill_url = worker.url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
-        let prefill_protocol = worker.protocol;
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
@@ -417,7 +416,6 @@ pub async fn chat_completions(
                 .forward_json_to(
                     &prefill_url,
                     &prefill_breaker,
-                    prefill_protocol,
                     "/v1/chat/completions",
                     &prefill_headers,
                     prefill_body,
@@ -449,7 +447,6 @@ pub async fn chat_completions(
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
-                decode_worker.protocol,
                 "/v1/chat/completions",
                 &headers,
                 outgoing_body,
@@ -466,7 +463,6 @@ pub async fn chat_completions(
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
-                decode_worker.protocol,
                 "/v1/chat/completions",
                 &headers,
                 outgoing_body,
@@ -486,7 +482,6 @@ pub async fn chat_completions(
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
-            worker.protocol,
             "/v1/chat/completions",
             &headers,
             outgoing_body,
@@ -515,7 +510,6 @@ pub async fn chat_completions(
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             &worker.breaker,
-            worker.protocol,
             "/v1/chat/completions",
             &headers,
             outgoing_body,
