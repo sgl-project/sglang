@@ -171,6 +171,12 @@ class EagerRunner(BaseRunner):
         raw_bs = forward_batch.batch_size
         raw_num_tokens = forward_batch.input_ids.shape[0]
         registry = self._eager_registry
+        # The registry is sized to the scheduler's chunked-prefill ceiling.
+        # If a caller (e.g. a benchmark) bypasses the scheduler and submits a
+        # batch that exceeds the registry capacity, fall back to using the
+        # original tensors directly rather than crashing with a size mismatch.
+        if raw_num_tokens > registry.max_num_tokens or raw_bs > registry.max_bs:
+            return replace(forward_batch)
         registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
