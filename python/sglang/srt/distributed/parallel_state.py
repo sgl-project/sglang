@@ -758,8 +758,7 @@ class GroupCoordinator:
         # buffers). Plain eager falls through to custom_fused_ar_rms below, which
         # keeps the oversized-shape fallback callers/tests rely on.
         if hasattr(ca_comm, "fused_ar_rms") and (
-            is_in_tc_piecewise_cuda_graph()
-            or torch.cuda.is_current_stream_capturing()
+            is_in_tc_piecewise_cuda_graph() or torch.cuda.is_current_stream_capturing()
         ):
             return aiter_fused_allreduce_rmsnorm(
                 input_, residual_inp_, weight_, eps, self.unique_name
