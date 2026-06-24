@@ -109,7 +109,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
                     inner = NPUGeluAndMul()
 
             # 2. If the quant method (GGUF) needs TP all‑gather, wrap the activation
-            if getattr(config.layer, '_needs_tp_all_gather_activation', False):
+            if getattr(config, 'use_tp_all_gather_activation', False):
                 self.activation = AllGatherActivationWrapper(inner, dim=-1)
             else:
                 self.activation = inner
