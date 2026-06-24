@@ -86,10 +86,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_cache_utils import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.eviction import (
+    CacheFreeSpaceProvider,
+    evict_from_tree_cache,
+)
 from sglang.srt.mem_cache.owned_kv import (
     alloc_for_decode,
     alloc_for_extend,
-    evict_from_tree_cache,
     free_swa_out_of_window_slots,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -820,6 +823,7 @@ class Req(ReqDllmMixin):
         )
         # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
+        self.mamba_branching_seqlen_pending: Optional[int] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
@@ -1174,6 +1178,7 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    rid=self.rid,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -1186,7 +1191,6 @@ class Req(ReqDllmMixin):
                 self.host_hit_length,
                 self.swa_host_hit_length,
                 self.mamba_host_hit_length,
-                self.mamba.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
@@ -1195,8 +1199,10 @@ class Req(ReqDllmMixin):
                 match_result.host_hit_length,
                 match_result.swa_host_hit_length,
                 match_result.mamba_host_hit_length,
-                match_result.mamba_branching_seqlen,
             )
+            self.mamba_branching_seqlen_pending = match_result.mamba_branching_seqlen
+            if cow_mamba:
+                self.mamba_cow_src_index = match_result.mamba_cow_src
             if match_result.cache_protected_len is not None:
                 self.cache.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1465,6 +1471,7 @@ class Req(ReqDllmMixin):
         self.mamba.mamba_last_track_seqlen = None
         self.mamba.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
+        self.mamba_branching_seqlen_pending = None
         self.mamba_needs_clear = False
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"
@@ -2041,7 +2048,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
+            self,
+            space=CacheFreeSpaceProvider(self.tree_cache),
         )
 
         # Set fields
@@ -2641,7 +2649,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc = alloc_for_decode(
+            self,
+            token_per_req=1,
+            space=CacheFreeSpaceProvider(self.tree_cache),
+        )
 
         # Update req-level memory management fields
         for req in self.reqs:
