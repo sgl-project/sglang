@@ -543,7 +543,7 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped on the draft-extend path).
         # Triton extend kernel receives extend K/V as separate tensors, so
         # kv_indptr/kv_indices must cover only the prefix portion.
         # extend_seq_lens_tensor is only attached to spec_info at real

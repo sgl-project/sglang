@@ -9,7 +9,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -155,7 +154,7 @@ class EagleVerifyInput(SpecInput):
 
 
 @dataclass
-class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+class EagleDraftInput(SpecInput):
     # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
     # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
     # `bonus_tokens` unconditionally.
