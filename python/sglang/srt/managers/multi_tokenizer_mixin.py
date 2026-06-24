@@ -29,7 +29,7 @@ import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import psutil
 import setproctitle
@@ -46,9 +46,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
     FreezeGCReq,
-    PauseContinueBroadcast,
+    PauseContinueBroadcastReq,
     PauseGenerationReqInput,
-    TokenizerWorkerRegistration,
+    TokenizerWorkerRegistrationReq,
     async_sock_recv,
     async_sock_send,
     sock_recv,
@@ -437,7 +437,7 @@ class MultiTokenizerRouter:
         while True:
             recv_obj = await async_sock_recv(self.receive_from_worker)
 
-            if isinstance(recv_obj, TokenizerWorkerRegistration):
+            if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
                     self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
                     logger.info(
@@ -451,7 +451,7 @@ class MultiTokenizerRouter:
             ):
                 # Broadcast to ALL workers so every worker's is_pause is set
                 is_pause = isinstance(recv_obj, PauseGenerationReqInput)
-                broadcast = PauseContinueBroadcast(is_pause=is_pause)
+                broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
                 for ipc_name in self.all_worker_ipcs:
                     self.socket_mapping.send_output(ipc_name, broadcast)
                 # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
@@ -603,18 +603,18 @@ class TokenizerWorker(TokenizerManager):
         )
 
         # Register this worker with the router for pause/continue broadcasting
-        reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
-        sock_send(self.send_to_scheduler, reg)
+        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
+        self._dispatch_to_scheduler(reg)
 
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
 
-        # Register PauseContinueBroadcast in the result dispatcher so
+        # Register PauseContinueBroadcastReq in the result dispatcher so
         # handle_loop routes it to _handle_pause_continue_broadcast
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcast, self._handle_pause_continue_broadcast)]
+            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -622,7 +622,7 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
-        sock_send(self.send_to_scheduler, obj)
+        self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
 
         if obj.mode == "abort":
@@ -637,15 +637,15 @@ class TokenizerWorker(TokenizerManager):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        sock_send(self.send_to_scheduler, obj)
+        self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
 
-    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
+    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""
         loop = asyncio.get_event_loop()
         loop.create_task(self._apply_pause_continue_broadcast(obj))
 
-    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
+    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Apply pause/continue state under the condition lock."""
         async with self.is_pause_cond:
             if obj.is_pause:
@@ -658,15 +658,6 @@ class TokenizerWorker(TokenizerManager):
         if self._pause_continue_future and not self._pause_continue_future.done():
             self._pause_continue_future.set_result(True)
             self._pause_continue_future = None
-
-    def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
-
-        if isinstance(req, BaseReq):
-            req.http_worker_ipc = self.tokenizer_ipc_name
-        elif isinstance(req, BaseBatchReq):
-            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
-        else:
-            raise ValueError(f"Unknown req type: {type(req)}")
 
 
 async def print_exception_wrapper(func):

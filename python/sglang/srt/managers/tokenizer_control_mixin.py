@@ -71,8 +71,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    async_sock_send,
-    sock_send,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
@@ -134,7 +132,11 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
+            comm = FanOutCommunicator(
+                self._dispatch_to_scheduler,
+                server_args.dp_size,
+                mode,
+            )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
@@ -848,7 +850,7 @@ class TokenizerControlMixin:
 
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        sock_send(self.send_to_scheduler, obj)
+        self._dispatch_to_scheduler(obj)
 
         try:
             return await future
@@ -860,7 +862,7 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await async_sock_send(self.send_to_scheduler, obj)
+        await self._async_dispatch_to_scheduler(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]
