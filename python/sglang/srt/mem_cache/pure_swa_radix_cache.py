@@ -1,12 +1,4 @@
-"""Pure SWA Radix Cache for all-SWA models (no full attention layers).
-
-For models like UNLIMITED-OCR where every layer uses sliding window attention,
-this cache extends RadixCache with SWA-specific semantics:
-- Reports swa_evictable/protected sizes for memory accounting
-- Only caches the prefill portion [0, evict_floor) on request completion
-- Window-range KV is freed back to allocator (not cached)
-- No tombstone mechanism needed (unlike SWARadixCache)
-"""
+"""Radix cache for all-SWA models (every layer is sliding-window attention)."""
 
 from __future__ import annotations
 
@@ -47,7 +39,6 @@ class PureSWARadixCache(RadixCache):
         ), "sliding_window_size must be set for PureSWARadixCache"
         return True
 
-    # For all-SWA: all evictable/protected tokens are SWA tokens
     def swa_evictable_size(self):
         return self.evictable_size_
 
@@ -95,28 +86,18 @@ class PureSWARadixCache(RadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        # New-API RadixKey: raw token_ids + is_bigram flag, page-aligned via method.
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
-        keys_len = len(radix_key)  # logical-unit length (== aligned token count)
+        keys_len = len(radix_key)
 
         old_prefix_len = req.cache_protected_len
         swa_evict_floor = req.swa_evict_floor
         swa_evicted_seqlen = req.swa_evicted_seqlen
 
-        # Page-align evict_floor upward (no-op when page_size==1).
         if self.page_size > 1 and swa_evict_floor > 0:
             swa_evict_floor = -(-swa_evict_floor // self.page_size) * self.page_size
 
-        # Memory layout at request completion:
-        #   [0, old_prefix_len)                    — already in tree (protected)
-        #   [old_prefix_len, swa_evict_floor)      — alive, not in tree, not freed
-        #   [swa_evict_floor, swa_evicted_seqlen)  — already freed by _evict_swa
-        #   [swa_evicted_seqlen, keys_len)         — alive (window), not freed
-        #   [keys_len, kv_committed_len)           — unaligned tail
-        #
-        # Insert [0, insert_end) where insert_end = swa_evict_floor (cacheable prefix).
         if swa_evict_floor > 0:
             insert_end = min(swa_evict_floor, keys_len)
         else:
@@ -128,18 +109,14 @@ class PureSWARadixCache(RadixCache):
                 InsertParams(key=radix_key[:insert_end], value=insert_values)
             )
             new_prefix_len = result.prefix_len
-            # Free duplicates already in the tree
             if new_prefix_len > old_prefix_len:
                 self.token_to_kv_pool_allocator.free(
                     kv_indices[old_prefix_len:new_prefix_len]
                 )
-            # Free alive-but-not-cached window tokens [swa_evicted_seqlen, keys_len)
             alive_start = max(swa_evicted_seqlen, insert_end)
             if alive_start < keys_len:
                 self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
         else:
-            # No insert: free all alive tokens not freed by _evict_swa.
-            # [old_prefix_len, swa_evict_floor) — alive, never freed
             free_end = (
                 min(swa_evict_floor, keys_len) if swa_evict_floor > 0 else keys_len
             )
@@ -147,15 +124,12 @@ class PureSWARadixCache(RadixCache):
                 self.token_to_kv_pool_allocator.free(
                     kv_indices[old_prefix_len:free_end]
                 )
-            # [swa_evicted_seqlen, keys_len) — alive window tokens
             alive_start = max(swa_evicted_seqlen, old_prefix_len)
             if swa_evicted_seqlen > 0 and alive_start < keys_len:
                 self.token_to_kv_pool_allocator.free(kv_indices[alive_start:keys_len])
 
-        # Free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[keys_len:])
 
-        # Release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 

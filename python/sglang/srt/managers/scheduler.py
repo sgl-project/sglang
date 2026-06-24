@@ -2998,13 +2998,8 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
-        # Prefill-aware SWA models (e.g. UNLIMITED-OCR): protect all fresh prefill
-        # tokens from SWA eviction so decode can still attend to them.
-        # prefix_token_count micro-optimization deferred; protecting all prefill is correct.
         if getattr(self.tp_worker.model_runner, "prefill_aware_swa", False):
             for req in new_batch.reqs:
-                # req.fill_len is the prefill length (== decode-start position),
-                # equivalent to len(req.get_fill_ids()).
                 req.swa_evict_floor = req.fill_len
 
         return new_batch

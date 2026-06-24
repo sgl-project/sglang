@@ -15,7 +15,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 
-# image_mode -> (base_size, image_size, crop_mode)
 _IMAGE_MODE_PRESETS = {
     "tiny": (512, 512, False),
     "small": (640, 640, False),
@@ -94,7 +93,6 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
         )
         processor_kwargs = _resolve_mode(images_config, num_images=len(image_data))
 
-        # Extract prefix from images_config (tokenized separately to avoid merge)
         prefix = images_config.get("prefix", "") if images_config else ""
 
         base_output = await self.load_mm_data(
@@ -106,7 +104,6 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens, **processor_kwargs
         )
 
-        # Append prefix tokens separately so they don't merge with prompt tokens
         if prefix:
             prefix_ids = self._tokenizer.encode(prefix, add_special_tokens=False)
             input_ids = torch.cat(

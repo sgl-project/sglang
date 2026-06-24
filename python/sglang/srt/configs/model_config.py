@@ -1947,7 +1947,6 @@ def get_hybrid_layer_ids(
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
     elif "UnlimitedOCRForCausalLM" in model_architectures:
-        # All-SWA model: every layer is a sliding window attention layer.
         swa_attention_layer_ids = list(range(num_hidden_layers))
         full_attention_layer_ids = []
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:

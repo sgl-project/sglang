@@ -370,7 +370,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
                 else:
                     crop_ratio = [1, 1]
 
-            # Process the global view
             if image_size <= 640 and not cropping:
                 image = image.resize((image_size, image_size))
             if cropping:
@@ -392,7 +391,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
                 for i in range(len(images_crop_raw)):
                     images_crop_list.append(self.image_transform(images_crop_raw[i]))
 
-            # image tokens
             num_queries = math.ceil(
                 (image_size // self.patch_size) / self.downsample_ratio
             )
@@ -419,7 +417,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             images_seq_mask += [True] * len(tokenized_image)
             num_image_tokens.append(len(tokenized_image))
 
-        # Process the last text split
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
@@ -482,11 +479,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             num_image_tokens,
             image_shapes,
         )
-
-
-# ---------------------------------------------------------------------------
-# Config classes
-# ---------------------------------------------------------------------------
 
 
 class UnlimitedLanguageConfig(PretrainedConfig):
@@ -631,7 +623,6 @@ class UnlimitedVLConfig(PretrainedConfig):
 
 AutoProcessor.register(UnlimitedVLConfig, UnlimitedOCRHFProcessor)
 
-# Register the config so the server can load it without trust_remote_code.
 try:
     AutoConfig.register("unlimited-ocr", UnlimitedVLConfig)
 except ValueError:

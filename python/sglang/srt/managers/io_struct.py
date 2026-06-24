@@ -293,7 +293,6 @@ class GenerateReqInput(BaseReq):
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
 
-    # UNLIMITED-OCR image processing controls
     images_config: Optional[dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring.

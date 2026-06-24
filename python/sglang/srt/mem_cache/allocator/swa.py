@@ -388,19 +388,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
-    """Allocator for all-SWA models (every layer is sliding-window attention).
-
-    Such models (e.g. UNLIMITED-OCR) have no full-attention layers, so the
-    hybrid full+SWA dual-pool design does not apply: there is a single SWA pool
-    and the canonical KV indices stored in ``req_to_token`` ARE the SWA-pool
-    indices. The full->SWA index mapping is the identity, which makes the
-    existing SWA machinery (``set_kv_buffer``'s pre-translated ``swa_loc``, the
-    attention backend's ``translate_loc_from_full_to_swa`` / ``swa_page_table``)
-    a no-op. Subclasses ``SWATokenToKVPoolAllocator`` so the many
-    ``isinstance(..., SWATokenToKVPoolAllocator)`` checks across the scheduler /
-    radix cache continue to hold; only the dual-pool allocation logic is
-    replaced with single-pool logic.
-    """
+    """Single-pool allocator for models whose every layer is sliding-window attention."""
 
     def __init__(
         self,
@@ -411,44 +399,31 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kvcache: BaseSWAKVPool,
         need_sort: bool,
     ):
+        assert page_size == 1
         assert isinstance(kvcache, BaseSWAKVPool)
-        assert page_size == 1, "PureSWATokenToKVPoolAllocator requires page_size=1"
-        # Report the SWA pool size as the (sole) pool size so size / size_full /
-        # size_swa and the availability accessors are all consistent.
-        self._size_full = size_swa
-        self._size_swa = size_swa
+
+        self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        self.page_size = page_size
+        self.need_sort = need_sort
+        self._size_full = self._size_swa = size_swa
 
-        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
         self.swa_attn_allocator = TokenToKVPoolAllocator(
             size_swa,
             dtype,
             device,
-            swa_kv_pool,
+            kvcache.swa_kv_pool,
             need_sort,
         )
-        # Canonical indices ARE SWA indices: alias the "full" allocator to the
-        # single SWA pool so any code that reads ``full_attn_allocator`` for
-        # accounting sees the real pool. All alloc/free paths are overridden
-        # below to operate on the single pool exactly once.
         self.full_attn_allocator = self.swa_attn_allocator
 
-        # Identity full->swa mapping: index i -> i, with a trailing -1 sentinel
-        # (mirrors the parent so last_loc == -1 maps to -1). It is permanent --
-        # never zeroed on free -- so re-allocated indices keep mapping to
-        # themselves.
         self.full_to_swa_index_mapping = torch.cat(
             [
-                torch.arange(
-                    size_swa + self.page_size, dtype=torch.int64, device=device
-                ),
+                torch.arange(size_swa + page_size, dtype=torch.int64, device=device),
                 torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
 
-        self.need_sort = need_sort
         self.free_pages = None
         self.release_pages = None
         self.is_not_in_free_group = True
@@ -457,8 +432,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self._kvcache = kvcache
         self.swa_attn_allocator.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
-
-    # -- accounting: a single pool, so full == swa == total --------------------
 
     def available_size(self):
         return self.swa_attn_allocator.available_size()
@@ -469,7 +442,12 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.swa_attn_allocator.available_size()
 
-    # -- allocation: allocate once from the single SWA pool --------------------
+    def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
+        avail = self.swa_attn_allocator.available_size() // self.page_size
+        return num_full_pages <= avail and num_swa_pages <= avail
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        return kv_indices
 
     def alloc(self, need_size: int):
         assert self.page_size == 1
@@ -477,30 +455,18 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator only supports page_size=1 (alloc); "
-            "paged alloc_extend is not implemented for all-SWA models."
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
         )
 
     def alloc_decode(self, *args, **kwargs):
         raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator only supports page_size=1 (alloc); "
-            "paged alloc_decode is not implemented for all-SWA models."
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
         )
 
     def alloc_extend_swa_tail(self, *args, **kwargs):
         raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator does not support SWA-tail allocation."
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
         )
-
-    def new_pages_available(self, num_full_pages: int, num_swa_pages: int) -> bool:
-        avail = self.swa_attn_allocator.available_size() // self.page_size
-        return num_full_pages <= avail and num_swa_pages <= avail
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        # Identity: canonical indices already are SWA indices.
-        return kv_indices
-
-    # -- freeing: free once from the single SWA pool ---------------------------
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -514,8 +480,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        # The window-evicted range and the request-completion range are
-        # disjoint (see PureSWARadixCache), so this never double-frees.
         self.swa_attn_allocator.free(free_index[free_index > 0])
 
     def free_group_begin(self):
@@ -527,8 +491,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if self.free_group:
             self.free(torch.cat(self.free_group))
         self.free_group = []
-
-    # -- state -----------------------------------------------------------------
 
     def backup_state(self):
         return self.swa_attn_allocator.backup_state()

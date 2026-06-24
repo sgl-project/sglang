@@ -41,10 +41,6 @@ from sglang.jit_kernel.flash_attention import (
 )
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
-# ---------------------------------------------------------------------------
-# Prefill-aware SWA: triton kernel to build page_table directly
-# ---------------------------------------------------------------------------
-
 
 @triton.jit
 def _build_pa_page_table_kernel(
@@ -164,7 +160,6 @@ class FlashAttentionMetadata:
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
 
-    # Prefill-aware SWA metadata (decode only, page_size=1)
     pa_swa_page_table: torch.Tensor = None
     pa_swa_cache_seqlens: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
@@ -277,7 +272,6 @@ class FlashAttentionBackend(AttentionBackend):
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
-        # Prefill-aware sliding window: all prefill tokens are retained during decode
         self.is_prefill_aware_swa = getattr(model_runner, "prefill_aware_swa", False)
         if self.is_prefill_aware_swa:
             assert self.page_size == 1, (
@@ -288,7 +282,7 @@ class FlashAttentionBackend(AttentionBackend):
             self._pa_swa_prefill_lens = torch.zeros(
                 max_bs, dtype=torch.int32, device=model_runner.device
             )
-            self._pa_swa_max_prefill_len = 0  # CPU-side upper bound, updated at extend
+            self._pa_swa_max_prefill_len = 0
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
@@ -596,7 +590,6 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
 
-                # Prefill-aware SWA: build page_table with prefill + window tokens only
                 if self.is_prefill_aware_swa and self.has_swa:
                     pa_max_len = min(
                         self._pa_swa_max_prefill_len + self.sliding_window_size,
@@ -800,12 +793,10 @@ class FlashAttentionBackend(AttentionBackend):
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
-            # Record prefill_len = seq_lens at extend time
             if self.is_prefill_aware_swa:
                 self._pa_swa_prefill_lens[
                     forward_batch.req_pool_indices[:batch_size]
                 ] = forward_batch.seq_lens[:batch_size].to(torch.int32)
-                # Update CPU-side max_prefill (from CPU tensor, no sync)
                 max_pf = int(forward_batch.seq_lens_cpu[:batch_size].max().item())
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
@@ -1596,10 +1587,6 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
 
-                # Prefill-aware SWA: use custom page_table with only
-                # prefill + window tokens, disable FA3's own window_size.
-                # pa_swa_page_table is only built during decode for
-                # prefill-aware SWA models, so checking is not None suffices.
                 pa_swa_active = False
                 if self.is_prefill_aware_swa and metadata.pa_swa_page_table is not None:
                     page_table = metadata.pa_swa_page_table
@@ -1614,8 +1601,6 @@ class FlashAttentionBackend(AttentionBackend):
                 # Default: single-token self-attention
                 # Use precomputed scheduler_metadata when available and applicable.
                 # scheduler_metadata is only valid for non-SWA, non-cascade decode.
-                # It is precomputed against the full page_table's cache_seqlens, so
-                # it must NOT be reused when the prefill-aware SWA swap shortens them.
                 sched_meta = None
                 if (
                     metadata.scheduler_metadata is not None
@@ -2411,8 +2396,6 @@ class FlashAttentionBackend(AttentionBackend):
                     "FA3 decode page_table",
                 )
                 if self.is_prefill_aware_swa:
-                    # Prefill-aware SWA: single kernel reads req_to_token directly,
-                    # writes pa_swa entries into page_table + cache_seqlens in-place.
                     pa_max_len = min(
                         self._pa_swa_max_prefill_len + self.sliding_window_size,
                         max_len,

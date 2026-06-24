@@ -656,7 +656,7 @@ def generate_chat_conv(
                         conv.modalities.append(content.modalities)
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name not in ("qwen2-vl", "moss-vl")
+                    if conv.name not in ("qwen2-vl", "moss-vl", "unlimited-ocr")
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
@@ -669,7 +669,7 @@ def generate_chat_conv(
                 video_token = conv.video_token
                 for content in message.content:
                     if content.type == "text":
-                        if num_image_url > 16:
+                        if num_image_url > 16 and conv.name not in ("unlimited-ocr",):
                             real_content += "\n"  # for video
                         real_content += content.text
                     elif content.type == "image_url":

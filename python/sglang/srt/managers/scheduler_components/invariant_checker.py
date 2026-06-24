@@ -83,9 +83,6 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         if self.is_hybrid_swa and not self.full_tokens_per_layer:
-            # All-SWA model (e.g. UNLIMITED-OCR): no full-attention pool exists,
-            # so there is nothing to account for. The single SWA pool is checked
-            # by _check_swa_pool.
             return False, ""
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()

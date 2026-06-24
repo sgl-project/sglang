@@ -114,8 +114,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     if ctx.is_hybrid_swa:
         if ctx.full_tokens_per_layer == 0:
-            # All-SWA model (no full-attention layers): simpler PureSWARadixCache
-            # (no tombstone mechanism). Used by prefill-aware SWA OCR models.
             from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 
             return PureSWARadixCache(params=params)

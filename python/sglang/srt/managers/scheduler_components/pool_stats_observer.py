@@ -300,10 +300,6 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        # All-SWA models (e.g. UNLIMITED-OCR) have no full-attention layers. The
-        # allocator reports the SWA pool's availability under full_available_size
-        # (so the prefill budget works), but there is no full pool, so report
-        # zero full usage/availability instead of a bogus negative count.
         if not self.full_tokens_per_layer:
             full_num_used = 0
             full_available_size = 0

@@ -1,12 +1,4 @@
-"""
-UnlimitedOCRForCausalLM - Standalone UNLIMITED OCR model (OCR1 mode).
-
-Uses SAM ViT-B + CLIP-L vision encoders with DeepseekForCausalLM backbone.
-Includes prefill-aware sliding window attention:
-  Prefill phase: full causal attention (no sliding window).
-  Decode phase: attend to ALL prefill tokens + sliding_window of decode tokens.
-  KV cache eviction: only the gap between prefill and window regions is evicted.
-"""
+"""Standalone UNLIMITED-OCR model (SAM + CLIP vision encoders, Deepseek backbone)."""
 
 import logging
 from typing import Iterable, List, Optional, Set, Tuple, TypeAlias, Union
@@ -48,19 +40,8 @@ MultiModalEmbeddings: TypeAlias = list[Tensor] | Tensor | tuple[Tensor, ...]
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Main model class
-# ---------------------------------------------------------------------------
-
-
 class UnlimitedOCRForCausalLM(nn.Module):
-    """Standalone UNLIMITED OCR model (OCR1: SAM + CLIP ViT) with prefill-aware SWA.
-
-    - ``get_attention_sliding_window_size`` exposes the config value so that
-      SGLang enables SWA for this model.
-    - During extend (prefill), we set ``swa_evict_floor`` on each Req to protect
-      all prefill KV-cache slots from SWA eviction.
-    """
+    """Standalone UNLIMITED-OCR model (SAM + CLIP ViT) with prefill-aware SWA."""
 
     def __init__(
         self,
@@ -82,7 +63,6 @@ class UnlimitedOCRForCausalLM(nn.Module):
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos
 
-        # Special tokens for image token sequence format (OCR1: 2D)
         embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
         if self.tile_tag == "2D":
             self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
@@ -92,18 +72,15 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        # Language model: DeepseekForCausalLM (V1, non-MLA)
         self.model = DeepseekForCausalLM(
             config=config.text_config,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "language"),
         )
 
-        # Vision encoders: SAM ViT-B + CLIP-L
         self.sam_model = build_sam_vit_b()
         self.vision_model = build_clip_l()
 
-        # Projector
         self.projector = MlpProjector(
             projector_type=self.projector_config.projector_type,
             input_dim=self.projector_config.input_dim,
@@ -113,10 +90,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
             downsample_ratio=self.projector_config.downsample_ratio,
         )
 
-        # Image token id (set by processor)
         self.image_token_id = None
-
-    # -- Prefill-aware SWA interface ------------------------------------------
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Return the sliding window size from the model config, or None."""
@@ -125,8 +99,6 @@ class UnlimitedOCRForCausalLM(nn.Module):
     def is_prefill_aware_swa(self) -> bool:
         """Prefill tokens are always retained in KV cache during decode."""
         return True
-
-    # -- Vision encoding (OCR1 only) ------------------------------------------
 
     def _encode_ocr1_features(self, images: torch.Tensor) -> torch.Tensor:
         """Encode images through SAM and CLIP encoders, then project features."""
@@ -174,8 +146,6 @@ class UnlimitedOCRForCausalLM(nn.Module):
             dim=1,
         )
         return features.view(-1, n_dim2)
-
-    # -- Input parsing ---------------------------------------------------------
 
     @staticmethod
     def _collect_mm_flag(
@@ -314,8 +284,6 @@ class UnlimitedOCRForCausalLM(nn.Module):
         vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
         return vision_features
 
-    # -- SGLang model interface ------------------------------------------------
-
     def get_language_model(self) -> torch.nn.Module:
         """Return the underlying language model."""
         return self.model
@@ -369,8 +337,6 @@ class UnlimitedOCRForCausalLM(nn.Module):
             positions=positions,
         )
         return hidden_states
-
-    # -- Weight loading --------------------------------------------------------
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load and remap checkpoint weights into the model parameters."""

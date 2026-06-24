@@ -861,10 +861,6 @@ class ModelRunnerKVCacheMixin:
                     )
             else:
                 if self.is_hybrid_swa and self.full_max_total_num_tokens == 0:
-                    # All-SWA model (no full-attention layers, e.g. UNLIMITED-OCR):
-                    # a single SWA pool with canonical == SWA indices. The hybrid
-                    # full+SWA allocator cannot represent this (it requires a
-                    # non-empty full pool).
                     self.token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
                         self.swa_max_total_num_tokens,
                         page_size=self.page_size,

@@ -361,7 +361,6 @@ class CompletionRequest(BaseModel):
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
 
-    # UNLIMITED-OCR image processing controls
     images_config: Optional[Dict] = None
 
     # For PD disaggregation
@@ -739,7 +738,6 @@ class ChatCompletionRequest(BaseModel):
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
 
-    # UNLIMITED-OCR image processing controls
     images_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control

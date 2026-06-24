@@ -152,7 +152,6 @@ class PureSWAChunkCache(SWAChunkCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
-        # _evict_swa already freed [evict_floor, evicted_seqlen) — skip it
         evict_floor = req.swa_evict_floor
         evicted_seqlen = req.swa_evicted_seqlen
         if evicted_seqlen > evict_floor:

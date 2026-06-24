@@ -486,10 +486,6 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator,
             (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
-        # All-SWA models (e.g. UNLIMITED-OCR) have no full-attention layers and
-        # use a single SWA pool (PureSWATokenToKVPoolAllocator). Their token
-        # budget is the SWA pool; the hybrid path's full-pool accounting would
-        # otherwise reject every prefill request.
         self.is_all_swa = isinstance(
             self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
         )
