@@ -1710,64 +1710,6 @@ class DeepseekV4AscendAttnBackend(
             torch.gather(positions, 0, sorted_indices_c128)
         )
 
-    def _fill_verify_positions_cmp_padding_boundary_only(
-        self,
-        positions: torch.Tensor,
-        c4_positions: torch.Tensor,
-        c128_positions: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-    ) -> None:
-        c4_positions.fill_(0)
-        c128_positions.fill_(0)
-        if positions.numel() == 0:
-            return
-
-        n_draft = self.speculative_num_draft_tokens
-        request_num = positions.shape[0] // n_draft
-        if request_num == 0:
-            return
-
-        seq_lens_cpu = seq_lens_cpu[:request_num]
-        if seq_lens_cpu.device.type != "cpu":
-            seq_lens_cpu = seq_lens_cpu.cpu()
-        start_positions = seq_lens_cpu - n_draft + 1
-        abs_positions = start_positions.view(-1, 1) + torch.arange(
-            n_draft, dtype=start_positions.dtype
-        ).view(1, -1)
-
-        for ratio, dst in ((4, c4_positions), (128, c128_positions)):
-            if ratio not in self._dsv4_compress_ratios:
-                continue
-            boundary = (abs_positions % ratio) == 0
-            indices = torch.nonzero(boundary.flatten(), as_tuple=False).flatten()
-            if indices.numel() == 0:
-                continue
-            indices = (
-                indices[: dst.numel()]
-                .pin_memory()
-                .to(device=positions.device, non_blocking=True)
-            )
-            dst[: indices.numel()].copy_(torch.gather(positions, 0, indices))
-
-    def _fill_verify_positions_cmp_padding_legacy(
-        self,
-        positions: torch.Tensor,
-        c4_positions: torch.Tensor,
-        c128_positions: torch.Tensor,
-    ) -> None:
-        for ratio, dst in ((4, c4_positions), (128, c128_positions)):
-            dst.zero_()
-            if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
-                continue
-            should_compress = ((positions + 1) % ratio) == 0
-            vals = (positions[should_compress] - (ratio - 1)).to(torch.int64)
-            if vals.numel() > 0:
-                assert vals.numel() <= dst.numel(), (
-                    f"replay verify positions_cmp_c{ratio} overflow: "
-                    f"{vals.numel()} > {dst.numel()}"
-                )
-                dst[: vals.numel()].copy_(vals)
-
     def _fill_verify_positions_cmp_padding_one(
         self,
         positions: torch.Tensor,
