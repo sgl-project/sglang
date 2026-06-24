@@ -5,11 +5,11 @@ This script launches a server and uses the HTTP interface.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
 
 Usage:
-python3 -m sglang.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
+python3 -m sglang.benchmark.one_batch_server --model meta-llama/Meta-Llama-3.1-8B --batch-size 1 16 64 --input-len 1024 --output-len 8
 
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
-python3 -m sglang.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --result-filename results.jsonl --profile
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+python3 -m sglang.benchmark.one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --result-filename results.jsonl --profile
 """
 
 import argparse
@@ -309,7 +309,7 @@ class BenchArgs:
             default=BenchArgs.lora_request_distribution,
             choices=["uniform", "distinct", "skewed"],
             help="How to sample a LoRA adapter per prompt when more than one "
-            "is listed in --lora-name. Mirrors bench_serving.py. "
+            "is listed in --lora-name. Mirrors serving.py. "
             "'uniform' picks uniformly at random, 'distinct' round-robins so "
             "consecutive prompts get different adapters, 'skewed' samples "
             "from a Zipf distribution over --lora-name (alpha controls the "
@@ -507,7 +507,7 @@ def run_one_case(
     else:
         _flush_cache_with_retry(url, "/flush_cache")
 
-    # Load input token ids via bench_serving.get_dataset
+    # Load input token ids via benchmark.datasets.get_dataset
     supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
     if dataset_name not in supported_datasets:
         raise ValueError(
@@ -531,6 +531,10 @@ def run_one_case(
         gsp_system_prompt_len=gsp_system_prompt_len,
         gsp_question_len=gsp_question_len,
         gsp_output_len=gsp_output_len,
+        # The generated-shared-prefix dataset's from_args requires these; the
+        # batch-bench path only ever uses the uniform group distribution.
+        gsp_group_distribution="uniform",
+        gsp_zipf_alpha=None,
     )
     tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
     dataset_model_id = model_name or getattr(tok_inner, "name_or_path", None)
@@ -964,7 +968,7 @@ def run_benchmark_internal(
                     f"to actually exercise multi-batch."
                 )
 
-    # LoRA distribution args: mirror bench_serving.py semantics so multi-LoRA
+    # LoRA distribution args: mirror serving.py semantics so multi-LoRA
     # benchmarks behave consistently across harnesses.
     if bench_args.lora_request_distribution in ("distinct", "skewed"):
         assert bench_args.lora_name is not None and len(bench_args.lora_name) > 1, (
@@ -1148,7 +1152,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     return results, server_info
 
 
-def main():
+def cli_main():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
@@ -1161,4 +1165,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    cli_main()

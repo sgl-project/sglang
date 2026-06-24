@@ -192,6 +192,15 @@ class FutureMap:
                 device=self.device,
             )
 
+        self.draft_probs_buf = None
+        if getattr(draft_input, "draft_probs", None) is not None:
+            draft_probs0 = draft_input.draft_probs[0]
+            self.draft_probs_buf = torch.empty(
+                (self.req_pool_size, *draft_probs0.shape),
+                dtype=draft_probs0.dtype,
+                device=self.device,
+            )
+
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         if self.spec_algo.is_ngram():
             # FIXME: remove once precomputed draft is supported.
@@ -232,6 +241,8 @@ class FutureMap:
                 draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
+            if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
+                draft_input.draft_probs = self.draft_probs_buf[indices]
         elif self.need_bonus_tokens:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
@@ -352,3 +363,5 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
+        if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
+            self.draft_probs_buf[indices] = draft_input.draft_probs

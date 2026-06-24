@@ -38,10 +38,6 @@ from typing import (
     Union,
 )
 
-# Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
-
-
 import numpy as np
 import requests
 import uvicorn
