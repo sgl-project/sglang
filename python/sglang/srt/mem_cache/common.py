@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Optional
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
 )
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, CacheFinishParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheFinishParams,
+    CacheUnfinishParams,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.owned_kv import free_swa_out_of_window_slots
 from sglang.srt.server_args import get_global_server_args
@@ -30,7 +34,7 @@ def evict_swa_out_of_window_for_unfinished(
     if not tree_cache.supports_swa():
         return None
 
-    pre_len = tree_cache.unfinished_swa_evict_pre_len(req, chunked=chunked)
+    pre_len = _unfinished_swa_evict_pre_len(req, tree_cache, chunked=chunked)
     if pre_len is None:
         return None
     if req.kv is None:
@@ -55,14 +59,74 @@ def evict_swa_out_of_window_for_unfinished(
     return req.kv.swa_evicted_seqlen
 
 
+def _unfinished_swa_evict_pre_len(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    chunked: bool,
+) -> Optional[int]:
+    if not tree_cache.supports_unfinished_swa_evict():
+        return None
+    if tree_cache.would_short_circuit_unfinished(req, chunked=chunked):
+        return None
+    if tree_cache.disable:
+        return None
+
+    token_ids = req.get_fill_ids()
+    effective_cache_len = len(token_ids)
+    component_cache_len = tree_cache.aggregate_unfinished_effective_cache_len(
+        req, len(token_ids)
+    )
+    if component_cache_len is not None:
+        effective_cache_len = min(effective_cache_len, component_cache_len)
+    return effective_cache_len - 1
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
 
-    evict_swa_out_of_window_for_unfinished(
-        req, tree_cache, chunked=kwargs.get("chunked", False)
+    chunked = kwargs.get("chunked", False)
+    evict_swa_out_of_window_for_unfinished(req, tree_cache, chunked=chunked)
+    harvest_and_cache_unfinished_req(req, tree_cache, chunked=chunked)
+
+
+def harvest_and_cache_unfinished_req(
+    req: Req, tree_cache: BasePrefixCache, chunked: bool = False
+) -> None:
+    token_ids = req.get_fill_ids()
+    kv_indices = tree_cache.req_to_token_pool.req_to_token[
+        req.req_pool_idx, : len(token_ids)
+    ]
+    unfinish_params = CacheUnfinishParams(
+        token_ids=token_ids,
+        extra_key=req.extra_key,
+        kv_indices=kv_indices,
+        req_pool_idx=req.req_pool_idx,
+        prev_prefix_len=req.cache.cache_protected_len,
+        prefix_indices_len=len(req.prefix_indices),
+        swa_evicted_seqlen=req.kv.swa_evicted_seqlen if req.kv is not None else 0,
+        priority=getattr(req, "priority", 0) or 0,
+        chunked=chunked,
+        last_node=req.cache.last_node,
+        swa_uuid_for_lock=req.cache.swa_uuid_for_lock,
+        swa_prefix_lock_released=req.cache.swa_prefix_lock_released,
+        req=req,
     )
-    tree_cache.cache_unfinished_req(req, **kwargs)
+    unfinish_result = tree_cache.cache_unfinished_req(unfinish_params)
+
+    if unfinish_result is None:
+        return
+    if unfinish_result.prefix_indices is not None:
+        req.prefix_indices = unfinish_result.prefix_indices
+    if unfinish_result.cache_protected_len is not None:
+        req.cache.cache_protected_len = unfinish_result.cache_protected_len
+    if unfinish_result.lock_handover:
+        req.cache.last_node = unfinish_result.last_node
+        req.cache.swa_uuid_for_lock = unfinish_result.swa_uuid_for_lock
+        if unfinish_result.swa_prefix_lock_released is not None:
+            req.cache.swa_prefix_lock_released = (
+                unfinish_result.swa_prefix_lock_released
+            )
 
 
 def harvest_and_finish_req(

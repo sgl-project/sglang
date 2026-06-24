@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishParams,
+    CacheUnfinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -24,10 +25,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    UnfinishResult,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 
@@ -84,12 +85,14 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices)
         return None
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.fill_len
-        ]
+    def cache_unfinished_req(
+        self, params: CacheUnfinishParams
+    ) -> Optional[UnfinishResult]:
+        kv_indices = params.kv_indices[: len(params.token_ids)]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        return UnfinishResult(
+            prefix_indices=kv_indices.to(dtype=torch.int64, copy=True)
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

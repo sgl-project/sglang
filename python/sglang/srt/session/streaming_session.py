@@ -10,6 +10,7 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheFinishParams,
+    CacheUnfinishParams,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -19,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
+    UnfinishResult,
 )
 from sglang.srt.utils.common import ceil_align
 
@@ -357,24 +359,27 @@ class StreamingSession(BasePrefixCache):
         return req.session.session_id in self.slots
 
     def try_cache_unfinished_req(
-        self, req: Req, chunked: bool = False, **kwargs
-    ) -> bool:
+        self, req: Req, chunked: bool = False
+    ) -> Optional[UnfinishResult]:
         """Handles a streaming-session mid-flight cache op:
           - chunked prefill: snapshot current KV as prefix, skip radix
           - subsequent turn: skip radix (slot already holds KV)
-        Returns False for first-turn non-chunked (caller must run raw radix
-        insert to set up the initial tree lock)."""
+        Returns None for first-turn non-chunked (caller must run raw radix
+        insert to set up the initial tree lock). The returned UnfinishResult
+        carries the refreshed prefix_indices (return-not-mutate); an empty
+        UnfinishResult signals a handled no-op."""
         if not _is_streaming(req):
-            return False
+            return None
         if chunked:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.fill_len
             ]
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
-            return True
+            return UnfinishResult(
+                prefix_indices=kv_indices.to(dtype=torch.int64, copy=True)
+            )
         if req.session.session_id in self.slots:
-            return True
-        return False
+            return UnfinishResult()
+        return None
 
     # -- BasePrefixCache abstract methods: thin adapters over try_handle_* --
 
@@ -389,17 +394,21 @@ class StreamingSession(BasePrefixCache):
             return None
         return self.inner.cache_finished_req(params)
 
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        if self.try_cache_unfinished_req(req, **kwargs):
-            return
-        self.inner.cache_unfinished_req(req, **kwargs)
+    def cache_unfinished_req(
+        self, params: CacheUnfinishParams
+    ) -> Optional[UnfinishResult]:
+        result = self.try_cache_unfinished_req(params.req, chunked=params.chunked)
+        if result is not None:
+            return result
+        return self.inner.cache_unfinished_req(params)
 
-    def unfinished_swa_evict_pre_len(
-        self, req: Req, chunked: bool = False
+    def supports_unfinished_swa_evict(self) -> bool:
+        return self.inner.supports_unfinished_swa_evict()
+
+    def aggregate_unfinished_effective_cache_len(
+        self, req: Req, token_ids_len: int
     ) -> Optional[int]:
-        if self.would_short_circuit_unfinished(req, chunked=chunked):
-            return None
-        return self.inner.unfinished_swa_evict_pre_len(req, chunked=chunked)
+        return self.inner.aggregate_unfinished_effective_cache_len(req, token_ids_len)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)

@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqCacheInfo, ReqMambaInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
@@ -37,17 +37,32 @@ def _make_req(
     req.req_pool_idx = req_pool_idx
     req.extend_input_len = extend_input_len
     req.inflight_middle_chunks = 0
+    req.cache = ReqCacheInfo(
+        cache_protected_len=0,
+        last_node=None,
+        swa_uuid_for_lock=None,
+        swa_prefix_lock_released=False,
+    )
+    req.kv = None
+    req.mamba = ReqMambaInfo(
+        mamba_pool_idx=None,
+        mamba_ping_pong_track_buffer=None,
+        mamba_next_track_idx=None,
+        mamba_last_track_seqlen=None,
+        mamba_branching_seqlen=None,
+    )
     req.host_hit_length = 0
-    req.cache.cache_protected_len = 0
+    req.swa_host_hit_length = 0
+    req.mamba_host_hit_length = 0
+    req.num_matched_prefix_tokens = 0
+    req.last_host_node = None
+    req.best_match_node = None
     req.skip_radix_cache_insert = False
-    req.cache.last_node = None
-    req.cache.swa_uuid_for_lock = None
     req.session = None
     req.return_logprob = False
     req.logprob_start_len = -1
     req.positional_embed_overrides = None
     req.extra_key = None
-    req.mamba.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
 
