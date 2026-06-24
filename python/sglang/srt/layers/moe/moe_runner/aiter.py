@@ -145,6 +145,18 @@ class AiterRunnerCore(MoeRunnerCore):
                 )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
+        from sglang.srt.artemis_kernels.mi355x.dsr1_fp8.fused_moe.dispatcher import (
+            dispatch_fused_moe,
+        )
+
+        artemis_output = dispatch_fused_moe(
+            runner_input,
+            quant_info,
+            self.config,
+        )
+        if artemis_output is not None:
+            return AiterRunnerOutput(hidden_states=artemis_output)
+
         from aiter.fused_moe import fused_moe
 
         from sglang.srt.environ import envs

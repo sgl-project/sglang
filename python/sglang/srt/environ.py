@@ -741,6 +741,7 @@ class Envs:
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
 
     # Kernels
+    ARTEMIS_KERNELS = EnvBool(False)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch

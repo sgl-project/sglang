@@ -26,6 +26,16 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 del _platform
 del _sys
 
+# Triton 3.7 removed a few public compatibility names still referenced during
+# SGLang imports. Install only those missing names before runtime modules load.
+# This is a safe no-op when Triton is unavailable.
+from sglang.srt.artemis_kernels.compat import (
+    install_triton_compat_shims as _install_artemis_triton_compat_shims,
+)
+
+_install_artemis_triton_compat_shims()
+del _install_artemis_triton_compat_shims
+
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
 
 _apply_hf_patches()
