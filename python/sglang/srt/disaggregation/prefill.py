@@ -555,6 +555,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _get_pipeline_group_size(self: Scheduler, batch) -> int:
         """Return adaptive group_size, or 0 if pipelining should not be used."""
+        # group_size == 0 is the sentinel for "fall back to non-pipelined path".
         if not envs.SGLANG_ENABLE_PIPELINED_KV_TRANSFER.get():
             return 0
 
