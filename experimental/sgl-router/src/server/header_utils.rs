@@ -46,10 +46,7 @@ impl ExtraForwardHeaders {
 ///
 /// The built-in whitelist always applies.  When `extra` is non-empty the
 /// header is also forwarded if its lowercased name is in the set.
-pub fn should_forward_request_header(
-    name: &HeaderName,
-    extra: &ExtraForwardHeaders,
-) -> bool {
+pub fn should_forward_request_header(name: &HeaderName, extra: &ExtraForwardHeaders) -> bool {
     let n = name.as_str();
     matches!(
         n,
@@ -128,80 +125,49 @@ mod tests {
     fn whitelist_prefix_negatives() {
         let extra = empty();
         assert!(
-            should_forward_request_header(
-                &HeaderName::from_static("x-request-id"),
-                &extra
-            ),
+            should_forward_request_header(&HeaderName::from_static("x-request-id"), &extra),
             "x-request-id (exact match) must forward",
         );
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("x-request-id2"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("x-request-id2"), &extra),
             "x-request-id2 (no hyphen separator) must not forward",
         );
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("x-request-idfoo"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("x-request-idfoo"), &extra),
             "x-request-idfoo (no hyphen separator) must not forward",
         );
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("x-sg-foo"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("x-sg-foo"), &extra),
             "x-sg-foo (typo of x-sgl-) must not forward",
         );
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("xx-request-id-foo"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("xx-request-id-foo"), &extra),
             "xx-request-id-foo (extra leading char) must not forward",
         );
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("xx-sgl-foo"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("xx-sgl-foo"), &extra),
             "xx-sgl-foo (extra leading char) must not forward",
         );
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("foo-x-sgl-bar"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("foo-x-sgl-bar"), &extra),
             "foo-x-sgl-bar (substring, not prefix) must not forward",
         );
     }
 
     #[test]
     fn extra_headers_forwarded() {
-        let extra =
-            ExtraForwardHeaders::from_iter(["x-cloudwalk-info", "x-custom-label"]);
+        let extra = ExtraForwardHeaders::from_iter(["x-cloudwalk-info", "x-custom-label"]);
         assert!(
-            should_forward_request_header(
-                &HeaderName::from_static("x-cloudwalk-info"),
-                &extra
-            ),
+            should_forward_request_header(&HeaderName::from_static("x-cloudwalk-info"), &extra),
             "x-cloudwalk-info must forward when in extra set",
         );
         assert!(
-            should_forward_request_header(
-                &HeaderName::from_static("x-custom-label"),
-                &extra
-            ),
+            should_forward_request_header(&HeaderName::from_static("x-custom-label"), &extra),
             "x-custom-label must forward when in extra set",
         );
         // Not in extra set — must not forward
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("x-other-header"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("x-other-header"), &extra),
             "x-other-header must not forward when not in extra set",
         );
     }
@@ -210,10 +176,7 @@ mod tests {
     fn extra_headers_empty_preserves_default_behavior() {
         let extra = empty();
         assert!(
-            !should_forward_request_header(
-                &HeaderName::from_static("x-cloudwalk-info"),
-                &extra
-            ),
+            !should_forward_request_header(&HeaderName::from_static("x-cloudwalk-info"), &extra),
             "x-cloudwalk-info must not forward with empty extra set",
         );
     }
@@ -222,18 +185,14 @@ mod tests {
     fn extra_headers_case_insensitive() {
         let extra = ExtraForwardHeaders::from_iter(["X-Cloudwalk-Info"]);
         assert!(
-            should_forward_request_header(
-                &HeaderName::from_static("x-cloudwalk-info"),
-                &extra
-            ),
+            should_forward_request_header(&HeaderName::from_static("x-cloudwalk-info"), &extra),
             "case-insensitive match must work",
         );
     }
 
     #[test]
     fn extra_headers_invalid_names_skipped() {
-        let extra =
-            ExtraForwardHeaders::from_iter(["valid-header", "invalid header with spaces"]);
+        let extra = ExtraForwardHeaders::from_iter(["valid-header", "invalid header with spaces"]);
         assert!(extra.names.contains("valid-header"));
         assert!(!extra.names.contains("invalid header with spaces"));
     }
