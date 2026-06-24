@@ -7,18 +7,13 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed import (
-    get_attn_tensor_model_parallel_rank,
-    get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
     get_moe_ep_group,
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_rank,
-    get_moe_tensor_parallel_world_size,
     get_moe_tp_group,
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
@@ -40,16 +35,10 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
-_mnnvl_non_blackwell_fallback_logged = False
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
-    """Whether the mnnvl backend is usable on the current system.
-
-    mnnvl runs on Blackwell (SM10x) for both single- and multi-node, and on
-    SM90 for single-node only. Multi-node mnnvl on non-Blackwell is not
-    supported and must fall back to trtllm.
-    """
+    """Whether the mnnvl backend is usable on the current system."""
     if is_sm100_supported():
         return True
     return is_sm90_supported() and not is_multi_node
@@ -57,21 +46,31 @@ def _mnnvl_supported(is_multi_node: bool) -> bool:
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    global _mnnvl_non_blackwell_fallback_logged
+    if not (is_sm90_supported() or is_sm100_supported()):
+        raise ValueError(
+            "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
+        )
 
     if backend == "auto":
-        # Prefer mnnvl wherever it is supported (any Blackwell system, or SM90
-        # single-node); fall back to trtllm otherwise.
-        return "mnnvl" if _mnnvl_supported(is_multi_node) else "trtllm"
+        if is_multi_node:
+            if is_sm100_supported():
+                return "mnnvl"
+            raise ValueError(
+                "FlashInfer allreduce fusion does not support multi-node on "
+                "non-Blackwell systems."
+            )
+        return "trtllm"
+
+    if backend == "trtllm" and is_multi_node:
+        raise ValueError(
+            "FlashInfer allreduce fusion trtllm backend supports single-node only."
+        )
 
     if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
-        if not _mnnvl_non_blackwell_fallback_logged:
-            logger.info(
-                "FlashInfer allreduce fusion: forcing trtllm backend "
-                "(mnnvl requires a Blackwell system, or SM90 single-node)."
-            )
-            _mnnvl_non_blackwell_fallback_logged = True
-        return "trtllm"
+        raise ValueError(
+            "FlashInfer allreduce fusion mnnvl backend requires a Blackwell "
+            "system, or SM90 single-node."
+        )
     return backend
 
 
@@ -203,11 +202,10 @@ if is_flashinfer_available():
 #   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
 #   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
 #
-# mnnvl runs on any Blackwell GPU (SM10x) for both single- and multi-node, and
-# on SM90 for single-node only. auto resolves to mnnvl wherever it is supported
-# and to trtllm otherwise. An explicit mnnvl request on an unsupported
-# configuration (e.g. SM90 multi-node) falls back to trtllm (see
-# _resolve_backend).
+# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to trtllm
+# on single-node systems and to mnnvl on Blackwell multi-node systems.
+# Non-Blackwell multi-node allreduce fusion is rejected. Explicit mnnvl remains
+# available on SM90 single-node systems.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
@@ -637,17 +635,17 @@ def ensure_workspace_initialized(
         return False
 
     if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
-        rank = get_attn_tensor_model_parallel_rank()
+        world_size = get_parallel().attn_tp_size
+        rank = get_parallel().attn_tp_rank
         coordinator = get_attn_tp_group()
     else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
-            rank = get_moe_expert_parallel_rank()
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
+            rank = get_parallel().moe_ep_rank
             coordinator = get_moe_ep_group()
         else:
-            world_size = get_moe_tensor_parallel_world_size()
-            rank = get_moe_tensor_parallel_rank()
+            world_size = get_parallel().moe_tp_size
+            rank = get_parallel().moe_tp_rank
             coordinator = get_moe_tp_group()
 
     # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
@@ -757,12 +755,12 @@ def flashinfer_allreduce_residual_rmsnorm(
         return None, None
 
     if use_attn_tp_group:
-        world_size = get_attn_tensor_model_parallel_world_size()
+        world_size = get_parallel().attn_tp_size
     else:
-        if get_moe_expert_parallel_world_size() > 1:
-            world_size = get_moe_expert_parallel_world_size()
+        if get_parallel().moe_ep_size > 1:
+            world_size = get_parallel().moe_ep_size
         else:
-            world_size = get_moe_tensor_parallel_world_size()
+            world_size = get_parallel().moe_tp_size
 
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")

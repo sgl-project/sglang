@@ -196,13 +196,15 @@ export const KimiK25Deployment = () => {
       cmd += ' \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla';
     }
 
+    const usesTokenspeedMla = hardware === 'b300' || hardware === 'gb300';
+
     // Blackwell (B300/GB300): tokenspeed MLA attention backend
-    if (hardware === 'b300' || hardware === 'gb300') {
+    if (usesTokenspeedMla) {
       cmd += ' \\\n  --attention-backend tokenspeed_mla';
     }
 
-    // AMD: FP8 KV cache for memory efficiency
-    if (isAMD) {
+    // FP8 KV cache for AMD memory efficiency and tokenspeed MLA compatibility
+    if (isAMD || usesTokenspeedMla) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
     }
 
