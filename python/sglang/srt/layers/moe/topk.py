@@ -213,6 +213,9 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # Draft-side MoE blocks set this False so they never write the target's
+    # process-global routed-experts capture buffer.
+    allow_routed_experts_capture: bool = True
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -377,6 +380,7 @@ class TopK(MultiPlatformOp):
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
+        allow_routed_experts_capture: bool = True,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -417,6 +421,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
     def _apply_deepep_waterfill(
@@ -1466,6 +1471,25 @@ def _remap_topk_for_deepep(
     return topk_ids, topk_weights
 
 
+def capture_routed_experts_if_allowed(
+    topk_config: TopKConfig,
+    layer_id: Optional[int],
+    topk_ids: torch.Tensor,
+) -> None:
+    """Single capture site for every backend, gated by the per-config opt-out.
+
+    Routing all backends through here keeps the draft-side opt-out from being
+    bypassed by an inlined capturer call.
+    """
+    if not topk_config.allow_routed_experts_capture:
+        return
+    if (cap := get_global_experts_capturer()) is not None:
+        cap.capture(
+            layer_id=layer_id,
+            topk_indices=topk_ids,
+        )
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1479,11 +1503,7 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    if (cap := get_global_experts_capturer()) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
-        )
+    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
