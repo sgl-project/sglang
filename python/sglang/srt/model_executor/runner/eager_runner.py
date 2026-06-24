@@ -174,7 +174,10 @@ class EagerRunner(BaseRunner):
         elif forward_batch.input_embeds is not None:
             raw_num_tokens = forward_batch.input_embeds.shape[0]
         else:
-            raw_num_tokens = 0
+            raise ValueError(
+                "ForwardBatch has neither input_ids nor input_embeds; "
+                "cannot determine the token count for eager static buffers."
+            )
         registry = self._eager_registry
         registry.fill_from(
             forward_batch,
