@@ -10,7 +10,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(
+    est_time=900,
+    suite="nightly-4-gpu-b200",
+    nightly=True,
+    disabled="CI runner needs privileged for MNNVL",
+)
 
 DEEPSEEK_V3_FP4_MODEL = "nvidia/DeepSeek-V3-0324-FP4"
 QWEN3_FP8_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
