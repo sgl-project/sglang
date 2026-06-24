@@ -1637,21 +1637,10 @@ def compute_extend_logprob_start_len(
     extend_len: int,
     full_untruncated_fill_len: int,
 ) -> int:
-    """Relative position within an extend window where input-logprob computation starts.
-
-    Pure function of the extend forward inputs; it holds no Req state. Callers snapshot
-    the result at forward-assembly time into ScheduleBatch.extend_logprob_start_lens,
-    because the value is bound to one extend forward, not to live Req state (under
-    overlap scheduling the Req's prefix_indices/extend_range/logprob_start_len are
-    overwritten by the next round before the current forward's output is processed).
-
-    Key variables:
-    - logprob_start_len: absolute position in the full sequence where logprob starts
-      (-1 means "no input logprobs", i.e. start at the very end of the sequence).
-    - prefix_len: number of cached prefix tokens (extend window starts here).
-    - extend_len: number of tokens processed in this extend window.
-    - full_untruncated_fill_len: full sequence length, used to resolve the -1 sentinel.
-    """
+    # Key variables:
+    # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+    # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+    # - extend_input_len: Number of tokens that need to be processed in this extend batch
     if logprob_start_len == -1:
         resolved_start = full_untruncated_fill_len
     else:
@@ -2030,9 +2019,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_range.length for r in reqs]
-        # Snapshot the per-req input-logprob start (relative to the extend window).
-        # Encoder-decoder stripping adjusts this list in place in
-        # prepare_encoder_info_extend; do not recompute it afterwards.
         extend_logprob_start_lens = [
             compute_extend_logprob_start_len(
                 logprob_start_len=r.logprob_start_len,
@@ -2190,12 +2176,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                # We will need extend_len - extend_logprob_start_len number of
+                # We will need req.extend_range.length - extend_logprob_start_lens[i] number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
-                        extend_lens[i]
+                        req.extend_range.length
                         - extend_logprob_start_lens[i]
                         - len(logprob_token_ids)
                     )
