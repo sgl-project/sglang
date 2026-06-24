@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from sglang.srt.mem_cache._mem_cache_core import ComponentType
+from sglang.srt.mem_cache._mem_cache_core import ComponentType, RadixCacheRuntimePyError
 from sglang.srt.mem_cache.rust_unified_cache_components.rust_tree_component import (
     RustTreeComponent,
 )
@@ -33,6 +33,10 @@ class RustFullComponent(RustTreeComponent):
 
     def stage_insert_action(self, action):
         # (ComponentType.Full, "FullFree", full_to_free)
+        if action[1] != "FullFree":
+            raise RadixCacheRuntimePyError(
+                f"RustFullComponent: unknown insert action {action[1]!r}"
+            )
         self.cache.token_to_kv_pool_allocator.free(action[2])
 
     def evictable_size(self):

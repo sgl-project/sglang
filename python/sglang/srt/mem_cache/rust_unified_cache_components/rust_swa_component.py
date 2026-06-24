@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import torch
-from sglang.srt.mem_cache._mem_cache_core import ComponentType
+from sglang.srt.mem_cache._mem_cache_core import ComponentType, RadixCacheRuntimePyError
 from sglang.srt.mem_cache.rust_unified_cache_components.rust_tree_component import (
     RustTreeComponent,
 )
@@ -44,8 +44,12 @@ class RustSWAComponent(RustTreeComponent):
             _ct, _tag, node_idx, old_full_to_free, new_full_value = action
             alloc.free(old_full_to_free)
             full_value = new_full_value
-        else:  # SwaStamp
+        elif action[1] == "SwaStamp":
             _ct, _tag, node_idx, full_value = action
+        else:
+            raise RadixCacheRuntimePyError(
+                f"RustSWAComponent: unknown insert action {action[1]!r}"
+            )
         self._node_indices.append(node_idx)
         self._values.append(alloc.translate_loc_from_full_to_swa(full_value))
 
