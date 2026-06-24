@@ -149,6 +149,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
