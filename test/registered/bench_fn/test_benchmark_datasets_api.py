@@ -19,7 +19,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
-from sglang.benchmark.datasets.common import DatasetRow
+from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
@@ -36,7 +36,7 @@ from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class _DummyTokenTensor:
@@ -383,6 +383,38 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
+
+    def test_gen_mm_prompt_excludes_special_tokens(self):
+        tokenizer = create_lightweight_tokenizer()
+        multimodal_special_tokens = [
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|vision_pad|>",
+        ]
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": multimodal_special_tokens}
+        )
+        special_token_ids = set(
+            tokenizer.convert_tokens_to_ids(multimodal_special_tokens)
+        )
+        image_pad_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        captured_population = {}
+
+        def fake_choices(population, k):
+            captured_population["tokens"] = population
+            return population[:k]
+
+        with patch(
+            "sglang.benchmark.datasets.common.random.choices",
+            side_effect=fake_choices,
+        ):
+            gen_mm_prompt(tokenizer, image_pad_id, token_num=8)
+
+        sampled_pool = set(captured_population["tokens"])
+        self.assertFalse(special_token_ids & sampled_pool)
+        self.assertTrue(sampled_pool)
 
     def test_mmmu_sampler(self):
         fake_records = [
@@ -953,7 +985,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         # flags with the rank-based Zipf formula and the alpha constraint,
         # and argparse rejects an unknown distribution choice.
         help_res = subprocess.run(
-            [sys.executable, "-m", "sglang.bench_serving", "--help"],
+            [sys.executable, "-m", "sglang.benchmark.serving", "--help"],
             capture_output=True,
             text=True,
             timeout=90,
@@ -973,7 +1005,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.bench_serving",
+                "sglang.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",
@@ -994,7 +1026,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.bench_serving",
+                "sglang.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",
@@ -1029,7 +1061,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "sglang.bench_serving",
+                "sglang.benchmark.serving",
                 "--dataset-name",
                 "generated-shared-prefix",
                 "--gsp-group-distribution",

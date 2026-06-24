@@ -486,7 +486,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             **gemm_overlap_args_dict,
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
-        if meta_overlap_args is not None:
+        # Returns (block_m, threshold) only with down-gemm overlap, else None;
+        # meta_overlap_args may be set without overlap, so guard the unpack.
+        if meta_overlap_args is not None and deep_gemm_return_value is not None:
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
@@ -870,7 +872,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     )
 
     use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-    if N % 4 != 0 or G % 4 != 0:
+    if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
         use_jit_ep_activation = False
 
     if use_jit_ep_activation:

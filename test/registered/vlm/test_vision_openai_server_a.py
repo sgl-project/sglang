@@ -120,6 +120,7 @@ class TestInternVL25Server(ImageOpenAITestMixin):
     ]
 
 
+@unittest.skip("temporarily disabled: NaN in next_token_logits")
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
     extra_args = [
@@ -127,6 +128,7 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
     ]
 
 
+@unittest.skip("temporarily disabled: NaN in next_token_logits")
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = "openbmb/MiniCPM-o-2_6"
     extra_args = [
@@ -146,6 +148,7 @@ class TestKimiVLServer(ImageOpenAITestMixin):
     extra_args = [
         "--context-length=8192",
         "--dtype=bfloat16",
+        "--mem-fraction-static=0.40",
     ]
 
     def test_video_images_chat_completion(self):

@@ -85,8 +85,20 @@ class SessionSlot:
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
+        # Ownership has transferred to the slot. Null *all* of the req's
+        # references so any later alloc()/free path that inspects the req
+        # (e.g. the alloc-skip check on `req.mamba_ping_pong_track_buffer
+        # is None`, or the retract cleanup) sees no dangling pointers
+        # into slot-owned tensors. Without this the alloc path can decide
+        # the req still has a ping-pong buffer and skip alloc, causing
+        # the slot's tensor to be reused by a new req and leaked when
+        # the slot is later freed.
         req.req_pool_idx = None
         req.mamba_pool_idx = None
+        req.mamba_ping_pong_track_buffer = None
+        req.mamba_next_track_idx = None
+        req.mamba_last_track_seqlen = None
+        req.mamba_branching_seqlen = None
 
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
@@ -232,10 +244,10 @@ class StreamingSession(BasePrefixCache):
         req = params.req
         slot.restore_to_req(req)
 
-        # token_ids = fill_ids[:input_len-1] (1-token logit reserve already
-        # applied). min handles retract retry where committed_len can
-        # exceed len(token_ids) by 1.
-        prefix_len = min(req.kv_committed_len, len(params.key.token_ids))
+        # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
+        # already applied). min handles retract retry where committed_len
+        # can exceed len(token_ids) by 1.
+        prefix_len = min(req.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
         # ensures req_nodes always points to the last successful req).
@@ -288,14 +300,23 @@ class StreamingSession(BasePrefixCache):
                 # slot from req state so release_session handles cleanup.
                 # Include last_node/cache_protected_len from the req so
                 # release_session calls dec_lock_ref on the tree lock.
+                # Also carry the mamba refs over so _free_slot_mamba can
+                # return the (possibly extra_buffer ping-pong) slots to
+                # the mamba pool; otherwise the abort orphans them.
                 slot = SessionSlot(
                     req_pool_idx=req.req_pool_idx,
                     kv_allocated_len=req.kv_allocated_len,
                     last_node=req.last_node,
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
+                    mamba_pool_idx=req.mamba_pool_idx,
+                    mamba_ping_pong_track_buffer=req.mamba_ping_pong_track_buffer,
                 )
                 self.slots[session_id] = slot
+                # Slot now owns the mamba state — drop the req's refs so
+                # the abort fall-through doesn't double-free.
+                req.mamba_pool_idx = None
+                req.mamba_ping_pong_track_buffer = None
             slot.kv_allocated_len = max(slot.kv_allocated_len, req.kv_allocated_len)
             self.release_session(session_id)
             req.req_pool_idx = None
@@ -310,9 +331,15 @@ class StreamingSession(BasePrefixCache):
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
+        target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
         slot.save_from_req(req, is_first=is_first)
+        # Inherit the authoritative finished length on the slot, not the lagging
+        # req clock (under overlap + honest committed the clock lags the in-flight
+        # verify by ~1, which would short-change inheritance). Clamp to allocated
+        # to keep committed <= allocated for prepare_for_decode.
+        slot.kv_committed_len = min(target, slot.kv_allocated_len)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
@@ -332,7 +359,7 @@ class StreamingSession(BasePrefixCache):
             return False
         if chunked:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.fill_len
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
@@ -479,14 +506,14 @@ class StreamingSession(BasePrefixCache):
 
     def _free_slot_mamba(self, slot: SessionSlot) -> None:
         """Return a session slot's mamba pool state to the allocator."""
-        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
-        if mamba_pool is None:
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is None:
             return
         if slot.mamba_pool_idx is not None:
-            mamba_pool.free(slot.mamba_pool_idx.unsqueeze(0))
+            mamba_allocator.free(slot.mamba_pool_idx.unsqueeze(0))
             slot.mamba_pool_idx = None
         if slot.mamba_ping_pong_track_buffer is not None:
-            mamba_pool.free(slot.mamba_ping_pong_track_buffer)
+            mamba_allocator.free(slot.mamba_ping_pong_track_buffer)
             slot.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
