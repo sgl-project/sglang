@@ -3253,10 +3253,15 @@ class Scheduler(
                                 else batch_result.next_token_ids
                             )
                             self.future_map.stash(future_indices, stash_payload)
-                            batch_result.copy_to_cpu(
-                                return_logprob=batch.return_logprob,
-                                return_hidden_states=batch.return_hidden_states,
-                            )
+                            # Result D2H on copy_stream overlaps the next forward
+                            # instead of serializing on forward_stream; it's a leaf
+                            # gated by copy_done, so nothing on forward_stream waits.
+                            self.copy_stream.wait_stream(self.forward_stream)
+                            with self.copy_stream_ctx:
+                                batch_result.copy_to_cpu(
+                                    return_logprob=batch.return_logprob,
+                                    return_hidden_states=batch.return_hidden_states,
+                                )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3805,7 +3810,7 @@ class Scheduler(
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
         barrier()
-        return RpcReqOutput(success, "" if not exec else str(exec))
+        return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
@@ -4027,14 +4032,16 @@ class Scheduler(
         success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
             recv_req
         )
-        return InitWeightsSendGroupForRemoteInstanceReqOutput(success, message)
+        return InitWeightsSendGroupForRemoteInstanceReqOutput(
+            success=success, message=message
+        )
 
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
-        return SendWeightsToRemoteInstanceReqOutput(success, message)
+        return SendWeightsToRemoteInstanceReqOutput(success=success, message=message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
@@ -4060,7 +4067,9 @@ class Scheduler(
             # Radix-native: open is implicit; explicit open only permits id reuse.
             session_id = recv_req.session_id
             self.tree_cache.register_session(session_id)
-            output = OpenSessionReqOutput(session_id, session_id is not None)
+            output = OpenSessionReqOutput(
+                session_id=session_id, success=session_id is not None
+            )
         else:
             output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
