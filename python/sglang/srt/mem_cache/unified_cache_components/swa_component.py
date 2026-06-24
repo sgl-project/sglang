@@ -13,7 +13,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -567,20 +566,6 @@ class SWAComponent(TreeComponent):
         if is_finished:
             insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         return None
-
-    def free_out_of_window_slots(
-        self, req: Req, pre_len: int, insert_params: InsertParams
-    ) -> None:
-        if self.sliding_window_size is not None:
-            free_swa_out_of_window_slots(
-                req,
-                pre_len,
-                sliding_window_size=self.sliding_window_size,
-                page_size=self.cache.page_size,
-                req_to_token_pool=self.cache.req_to_token_pool,
-                token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
-            )
-        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
     # ---- HiCache Hooks ----
 

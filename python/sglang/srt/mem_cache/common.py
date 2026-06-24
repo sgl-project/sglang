@@ -119,10 +119,40 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def evict_swa_out_of_window_for_unfinished(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    chunked: bool,
+) -> Optional[int]:
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+        return None
+    if not tree_cache.supports_swa():
+        return None
+
+    pre_len = tree_cache.unfinished_swa_evict_pre_len(req, chunked=chunked)
+    if pre_len is None:
+        return None
+
+    free_swa_out_of_window_slots(
+        req,
+        pre_len,
+        sliding_window_size=tree_cache.sliding_window_size,
+        page_size=tree_cache.page_size,
+        req_to_token_pool=tree_cache.req_to_token_pool,
+        token_to_kv_pool_allocator=tree_cache.token_to_kv_pool_allocator,
+    )
+    return req.kv.swa_evicted_seqlen
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
 
+    evict_swa_out_of_window_for_unfinished(
+        req, tree_cache, chunked=kwargs.get("chunked", False)
+    )
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 

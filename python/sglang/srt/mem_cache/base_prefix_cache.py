@@ -283,6 +283,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def cache_unfinished_req(self, req: Req, **kwargs):
         pass
 
+    def unfinished_swa_evict_pre_len(
+        self, req: Req, chunked: bool = False
+    ) -> Optional[int]:
+        return None
+
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
         pass

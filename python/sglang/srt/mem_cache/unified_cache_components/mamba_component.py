@@ -294,6 +294,18 @@ class MambaComponent(TreeComponent):
             assert slot is not None, "Can not alloc mamba cache"
         return slot
 
+    def unfinished_effective_cache_len(
+        self, req: Req, token_ids_len: int
+    ) -> Optional[int]:
+        cache_len = (
+            req.mamba.mamba_last_track_seqlen
+            if self.enable_mamba_extra_buffer
+            else token_ids_len
+        )
+        if cache_len is None:
+            return 0
+        return cache_len
+
     def prepare_for_caching_req(
         self,
         req: Req,

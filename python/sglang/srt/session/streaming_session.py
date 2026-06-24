@@ -349,6 +349,13 @@ class StreamingSession(BasePrefixCache):
 
         return True
 
+    def would_short_circuit_unfinished(self, req: Req, chunked: bool = False) -> bool:
+        if not _is_streaming(req):
+            return False
+        if chunked:
+            return True
+        return req.session.session_id in self.slots
+
     def try_cache_unfinished_req(
         self, req: Req, chunked: bool = False, **kwargs
     ) -> bool:
@@ -386,6 +393,13 @@ class StreamingSession(BasePrefixCache):
         if self.try_cache_unfinished_req(req, **kwargs):
             return
         self.inner.cache_unfinished_req(req, **kwargs)
+
+    def unfinished_swa_evict_pre_len(
+        self, req: Req, chunked: bool = False
+    ) -> Optional[int]:
+        if self.would_short_circuit_unfinished(req, chunked=chunked):
+            return None
+        return self.inner.unfinished_swa_evict_pre_len(req, chunked=chunked)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
