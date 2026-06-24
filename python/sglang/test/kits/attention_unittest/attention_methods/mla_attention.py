@@ -306,6 +306,7 @@ class MockMLAModelRunner(ModelRunner):
         self.sliding_window_size = None
         self.use_mla_backend = True
         self.is_draft_worker = False
+        self._kernel_warmed_up = True
 
     @property
     def hybrid_gdn_config(self):
