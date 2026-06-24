@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -88,6 +89,25 @@ class SWAKVPool(BaseSWAKVPool):
         logger.info(
             f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
+        if os.environ.get("SGLANG_GEMMA_KV_GEOMETRY") == "1":
+            logger.info(
+                "SGLANG_GEMMA_KV_SWAKVPOOL dtype=%s page_size=%s "
+                "head_num=%s head_dim=%s full_layers=%s swa_layers=%s "
+                "full_pool=%s swa_pool=%s full_tokens=%s swa_tokens=%s "
+                "k_size_bytes=%s v_size_bytes=%s",
+                self.dtype,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+                full_attention_layer_ids,
+                swa_attention_layer_ids,
+                type(self.full_kv_pool).__name__,
+                type(self.swa_kv_pool).__name__,
+                self.size,
+                self.size_swa,
+                k_size,
+                v_size,
+            )
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping

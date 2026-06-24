@@ -28,6 +28,8 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -72,6 +74,33 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
+
+
+def _fp4_kv_radix_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_RADIX") == "1"
+
+
+def _trace_sequence_summary(value, *, limit: int = 8):
+    if value is None:
+        return None
+    dtype = None
+    shape = None
+    if isinstance(value, torch.Tensor):
+        dtype = str(value.dtype)
+        shape = list(value.shape)
+        data = value.detach().to("cpu").flatten().tolist()
+    else:
+        data = list(value)
+    encoded = ",".join(str(x) for x in data).encode("utf-8")
+    return {
+        "len": len(data),
+        "dtype": dtype,
+        "shape": shape,
+        "head": data[:limit],
+        "tail": data[-limit:] if len(data) > limit else data,
+        "hash": hashlib.blake2b(encoded, digest_size=8).hexdigest(),
+    }
 
 
 class ForwardMode(IntEnum):
@@ -512,6 +541,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
+    forward_pass_id: Optional[int] = None
 
     # kv-canary token-id validator snapshot
     req_all_ids_flat: Optional[torch.Tensor] = None
@@ -831,6 +861,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+
+            if _fp4_kv_radix_trace_enabled():
+                logger.warning(
+                    "FP4 KV ForwardBatch trace rids=%s mode=%s "
+                    "seq_lens_cpu=%s extend_prefix_lens_cpu=%s "
+                    "extend_seq_lens_cpu=%s input_ids=%s positions=%s "
+                    "out_cache_loc=%s req_pool_indices=%s",
+                    [str(rid) for rid in ret.rids],
+                    ret.forward_mode,
+                    _trace_sequence_summary(ret.seq_lens_cpu),
+                    _trace_sequence_summary(ret.extend_prefix_lens_cpu),
+                    _trace_sequence_summary(ret.extend_seq_lens_cpu),
+                    _trace_sequence_summary(ret.input_ids),
+                    _trace_sequence_summary(ret.positions),
+                    _trace_sequence_summary(ret.out_cache_loc),
+                    _trace_sequence_summary(ret.req_pool_indices),
+                )
 
         if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, device)

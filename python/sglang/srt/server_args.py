@@ -4132,12 +4132,20 @@ class ServerArgs:
             "Gemma3nForCausalLM",
             "Gemma3nForConditionalGeneration",
         ]:
-            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
-            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning(
-                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
-            )
-            self.disable_hybrid_swa_memory = True
+            if (
+                model_arch == "Gemma3ForConditionalGeneration"
+                and os.environ.get("SGLANG_GEMMA3_ENABLE_HYBRID_SWA") == "1"
+            ):
+                logger.warning(
+                    "Enable experimental hybrid SWA memory for Gemma3ForConditionalGeneration."
+                )
+            else:
+                # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+                # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+                logger.warning(
+                    f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
+                )
+                self.disable_hybrid_swa_memory = True
         elif model_arch in (
             "Gemma4ForConditionalGeneration",
             "Gemma4ForCausalLM",
@@ -4160,11 +4168,17 @@ class ServerArgs:
 
             prefill_backend, decode_backend = self.get_attention_backends()
             accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
+            if os.environ.get("SGLANG_FLASHINFER_VOSPLIT") == "1":
+                accepted_backends = accepted_backends + ("flashinfer",)
+                logger.warning(
+                    "Enable experimental FlashInfer attention backend for Gemma4 "
+                    "under SGLANG_FLASHINFER_VOSPLIT=1."
+                )
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
+                f"Gemma4 only supports {accepted_backends} attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 

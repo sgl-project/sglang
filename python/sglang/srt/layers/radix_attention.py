@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -38,6 +40,8 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 class AttentionType(Enum):
@@ -105,6 +109,19 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+
+        if os.environ.get("SGLANG_GEMMA_KV_GEOMETRY") == "1":
+            logger.info(
+                "SGLANG_GEMMA_KV_GEOMETRY layer=%s heads=%s kv_heads=%s "
+                "head_dim=%s v_head_dim=%s sliding_window=%s attn_type=%s",
+                self.layer_id,
+                self.tp_q_head_num,
+                self.tp_k_head_num,
+                self.qk_head_dim,
+                self.v_head_dim,
+                self.sliding_window_size,
+                self.attn_type.value,
+            )
 
     def forward(
         self,
