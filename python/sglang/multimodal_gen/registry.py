@@ -401,13 +401,9 @@ def _get_config_info(
             model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)
 
-    # 3. Use detectors. Non-diffusers models (raw safetensors, no model_index.json)
-    # have no _class_name to match, so fall back to matching on the model path alone.
-    try:
-        config = maybe_download_model_index(model_path)
-        pipeline_name = config.get("_class_name", "").lower()
-    except Exception:
-        pipeline_name = ""
+    # 3. Use detectors
+    config = maybe_download_model_index(model_path)
+    pipeline_name = config.get("_class_name", "").lower()
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
@@ -851,7 +847,7 @@ def _register_configs():
             lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
         ],
     )
-    # Krea-2 (K2) — non-diffusers MMDiT safetensors (see KNOWN_NON_DIFFUSERS pattern)
+    # Krea-2 (K2)
     register_configs(
         sampling_param_cls=Krea2SamplingParams,
         pipeline_config_cls=Krea2PipelineConfig,
