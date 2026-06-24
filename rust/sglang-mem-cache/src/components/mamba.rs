@@ -7,8 +7,8 @@ use super::{
     EvictRequest, EvictResult, Slot, dec_lock_ref_non_full, evict_non_full, inc_lock_ref_non_full,
 };
 use crate::component_type::ComponentType;
-use crate::error::RadixCacheInitError;
-use crate::radix_cache::MatchResult;
+use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
+use crate::radix_cache::{InsertResult, MatchResult};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNode, TreeNodePool};
 
 /// Mamba radix-tree component.
@@ -64,6 +64,31 @@ impl<K: ChildKeyType> Component<K> for MambaComponent {
         }
         result.mamba_value =
             MambaSlot::value(pool.get(last_matched_node_idx)).map(|t| t.shallow_clone());
+    }
+
+    /// Populate the Mamba SSM value on the inserted node; sets
+    /// `result.mamba_value_exists` when an existing node already held one (caller
+    /// keeps its slot).
+    fn commit_insert_value(
+        &self,
+        pool: &mut TreeNodePool<K>,
+        node_idx: NodeIdx,
+        new_leaf: bool,
+        value: Option<&Tensor>,
+        result: &mut InsertResult,
+    ) -> Result<(), RadixCacheRuntimeError> {
+        let Some(mv) = value else {
+            return Ok(());
+        };
+        if new_leaf || !MambaSlot::has_value(pool.get(node_idx)) {
+            MambaSlot::set_value(pool, node_idx, mv.shallow_clone())?;
+            let delta = MambaSlot::value_len(pool.get(node_idx));
+            MambaSlot::bump_mru(pool, node_idx);
+            MambaSlot::pool_state_mut(pool).unlocked_size += delta;
+        } else {
+            result.mamba_value_exists = true;
+        }
+        Ok(())
     }
 
     fn inc_lock_ref(

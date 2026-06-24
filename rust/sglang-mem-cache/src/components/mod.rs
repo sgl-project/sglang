@@ -12,7 +12,7 @@ use tch::Tensor;
 use crate::component_type::{ComponentType, NUM_COMPONENT_TYPES};
 use crate::deferred_action::DeferredAction;
 use crate::error::RadixCacheRuntimeError;
-use crate::radix_cache::MatchResult;
+use crate::radix_cache::{InsertResult, MatchResult};
 use crate::tree_node_pool::{ChildKeyType, ComponentNodeState, NodeIdx, TreeNode, TreeNodePool};
 
 /// Per-walk predicate gating the match-prefix boundary advance.
@@ -102,6 +102,20 @@ pub trait Component<K: ChildKeyType>: Send {
         _swa_evicted_seqlen: usize,
         _deferred: &mut Vec<DeferredAction>,
     ) {
+    }
+
+    /// Commit this component's insert-time aux value (e.g. Mamba SSM state) onto
+    /// the final inserted node, recording outcome on `result` (e.g. set
+    /// `mamba_value_exists` when the value was not consumed). Default: no-op.
+    fn commit_insert_value(
+        &self,
+        _pool: &mut TreeNodePool<K>,
+        _node_idx: NodeIdx,
+        _new_leaf: bool,
+        _value: Option<&Tensor>,
+        _result: &mut InsertResult,
+    ) -> Result<(), RadixCacheRuntimeError> {
+        Ok(())
     }
 
     /// Per-component LRU recency bump from `node_idx` up to MRU.

@@ -4,7 +4,7 @@ use tch::{Device, Kind, Tensor};
 
 use crate::component_type::ComponentType;
 use crate::components::{Component, FullComponent, IncLockRefResult, MambaComponent, SwaComponent};
-use crate::components::{EvictRequest, EvictResult, MambaSlot, Slot, SwaSlot};
+use crate::components::{EvictRequest, EvictResult, Slot, SwaSlot};
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
 use crate::tree_node_pool::{
@@ -546,33 +546,25 @@ impl<K: ChildKeyType> RadixCache<K> {
             }
         }
 
-        // ---- Populate mamba value ----
-        let mamba_value_exists = if let Some(mv) = mamba_value {
-            assert!(
-                !leaf_creation_skipped,
-                "leaf_creation_skipped is unreachable for Mamba",
-            );
-            if new_leaf_created || !MambaSlot::has_value(self.tree_node_pool.get(node_idx)) {
-                MambaSlot::set_value(&mut self.tree_node_pool, node_idx, mv)?;
-                let delta = MambaSlot::value_len(self.tree_node_pool.get(node_idx));
-                MambaSlot::bump_mru(&mut self.tree_node_pool, node_idx);
-                MambaSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += delta;
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        };
-
-        self.bump_mru_walk(node_idx);
-
-        Ok(InsertResult {
+        // ---- Per-component insert-value commit (e.g. Mamba aux SSM state) ----
+        let mut result = InsertResult {
             prefix_len: consumed,
             leaf_creation_skipped,
-            mamba_value_exists,
+            mamba_value_exists: false,
             deferred_actions: deferred,
-        })
+        };
+        for c in &self.components {
+            c.commit_insert_value(
+                &mut self.tree_node_pool,
+                node_idx,
+                new_leaf_created,
+                mamba_value.as_ref(),
+                &mut result,
+            )?;
+        }
+
+        self.bump_mru_walk(node_idx);
+        Ok(result)
     }
 
     /// Configured page size.
