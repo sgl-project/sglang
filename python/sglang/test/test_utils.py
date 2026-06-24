@@ -1564,7 +1564,7 @@ def run_bench_one_batch(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_one_batch",
+        "sglang.benchmark.one_batch",
         "--batch-size",
         "1",
         "--input",
@@ -1616,7 +1616,7 @@ def run_bench_offline_throughput(model, other_args):
     command = [
         "python3",
         "-m",
-        "sglang.bench_offline_throughput",
+        "sglang.benchmark.offline_throughput",
         "--num-prompts",
         "1",
         "--dataset-name",
