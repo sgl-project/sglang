@@ -309,7 +309,7 @@ class BenchArgs:
             default=BenchArgs.lora_request_distribution,
             choices=["uniform", "distinct", "skewed"],
             help="How to sample a LoRA adapter per prompt when more than one "
-            "is listed in --lora-name. Mirrors bench_serving.py. "
+            "is listed in --lora-name. Mirrors serving.py. "
             "'uniform' picks uniformly at random, 'distinct' round-robins so "
             "consecutive prompts get different adapters, 'skewed' samples "
             "from a Zipf distribution over --lora-name (alpha controls the "
@@ -507,7 +507,7 @@ def run_one_case(
     else:
         _flush_cache_with_retry(url, "/flush_cache")
 
-    # Load input token ids via bench_serving.get_dataset
+    # Load input token ids via benchmark.datasets.get_dataset
     supported_datasets = ("random", "random-ids", "mmmu", "generated-shared-prefix")
     if dataset_name not in supported_datasets:
         raise ValueError(
@@ -968,7 +968,7 @@ def run_benchmark_internal(
                     f"to actually exercise multi-batch."
                 )
 
-    # LoRA distribution args: mirror bench_serving.py semantics so multi-LoRA
+    # LoRA distribution args: mirror serving.py semantics so multi-LoRA
     # benchmarks behave consistently across harnesses.
     if bench_args.lora_request_distribution in ("distinct", "skewed"):
         assert bench_args.lora_name is not None and len(bench_args.lora_name) > 1, (

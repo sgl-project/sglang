@@ -1,6 +1,6 @@
 """
 Benchmark the throughput in the offline mode.
-It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
+It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as serving.py).
 
 # Usage
 ## Sharegpt dataset with default args
