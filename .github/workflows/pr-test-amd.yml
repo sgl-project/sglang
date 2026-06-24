@@ -1181,15 +1181,23 @@ jobs:
           mkdir -p /tmp/rdma_pre
           echo "Runner host: $(hostname)"
           [ -d "$IB" ] || { echo "No $IB on host"; exit 0; }
+          # ionic/RoCE NICs do NOT populate ports/1/counters; the real stats
+          # live in ports/1/hw_counters and in `ethtool -S <netdev>`.
           for d in "$IB"/*; do
-            dev=$(basename "$d"); p="$d/ports/1/counters"
-            for c in local_link_integrity_errors port_rcv_errors port_xmit_discards \
-                     symbol_error link_downed link_error_recovery \
-                     port_rcv_remote_physical_errors; do
-              cat "$p/$c" 2>/dev/null > "/tmp/rdma_pre/${dev}.${c}"
-            done
+            dev=$(basename "$d")
+            if [ -d "$d/ports/1/hw_counters" ]; then
+              for f in "$d/ports/1/hw_counters"/*; do
+                [ -f "$f" ] && printf "%s %s\n" "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+              done | sort > "/tmp/rdma_pre/${dev}.hw"
+            fi
+            nd=$(ls "$d/device/net" 2>/dev/null | head -1)
+            echo "$nd" > "/tmp/rdma_pre/${dev}.netdev"
+            if [ -n "$nd" ] && command -v ethtool >/dev/null 2>&1; then
+              ethtool -S "$nd" 2>/dev/null | sed 's/^ *//' > "/tmp/rdma_pre/${dev}.eth"
+            fi
           done
           echo "Baseline captured for: $(ls $IB | paste -sd, -)"
+          echo "Sample hw_counters keys (rdma5): $(cut -d' ' -f1 /tmp/rdma_pre/rdma5.hw 2>/dev/null | paste -sd, - | cut -c1-300)"
 
       - name: Run test_disaggregation
         timeout-minutes: 60
@@ -1206,53 +1214,63 @@ jobs:
           echo "===================================================================="
           echo "Runner host: $(hostname)   (failure peer IPs were 10.42.20.x)"
           echo "===================================================================="
+          [ -d "$IB" ] || { echo "No $IB on host"; exit 0; }
+
           echo ""
-          echo "### 1. Per-NIC ERROR-COUNTER DELTA during this disaggregation run ###"
-          echo "    (the NIC with large growth is the faulty link)"
-          printf "%-8s %-34s %12s %12s %12s\n" DEV COUNTER before after delta
-          if [ -d "$IB" ]; then
-            for d in "$IB"/*; do
-              dev=$(basename "$d"); p="$d/ports/1/counters"
-              for c in local_link_integrity_errors port_rcv_errors port_xmit_discards \
-                       symbol_error link_downed link_error_recovery \
-                       port_rcv_remote_physical_errors; do
-                after=$(cat "$p/$c" 2>/dev/null)
-                before=$(cat "/tmp/rdma_pre/${dev}.${c}" 2>/dev/null)
-                [ -z "$after" ] && continue
-                if [ -n "$before" ] && [ "$before" != "$after" ]; then
-                  printf "%-8s %-34s %12s %12s %12s\n" "$dev" "$c" "$before" "$after" "$((after-before))"
-                fi
-              done
+          echo "### 0. rdma<->netdev mapping ###"
+          for d in "$IB"/*; do
+            dev=$(basename "$d")
+            printf "  %-8s -> %s\n" "$dev" "$(cat /tmp/rdma_pre/${dev}.netdev 2>/dev/null)"
+          done
+
+          echo ""
+          echo "### 1. ionic hw_counters DELTA during this run (nonzero growth only) ###"
+          echo "    The NIC with large error/retry/drop growth is the faulty link."
+          printf "%-8s %-36s %14s %14s %14s\n" DEV COUNTER before after delta
+          for d in "$IB"/*; do
+            dev=$(basename "$d")
+            now="$d/ports/1/hw_counters"
+            [ -d "$now" ] || continue
+            for f in "$now"/*; do
+              [ -f "$f" ] || continue
+              key=$(basename "$f")
+              after=$(cat "$f" 2>/dev/null)
+              before=$(grep -E "^${key} " "/tmp/rdma_pre/${dev}.hw" 2>/dev/null | awk '{print $2}')
+              case "$after" in (''|*[!0-9]*) continue;; esac
+              case "$before" in (''|*[!0-9]*) before=0;; esac
+              delta=$((after-before))
+              [ "$delta" -ne 0 ] && printf "%-8s %-36s %14s %14s %14s\n" "$dev" "$key" "$before" "$after" "$delta"
             done
-            echo "(no rows above = no error counters changed during the test)"
-          else
-            echo "No $IB on host"
-          fi
+          done
+          echo "(no rows = no hw_counters changed; see section 2)"
+
           echo ""
-          echo "### 2. Absolute per-NIC error counters (cumulative since boot) ###"
-          printf "%-8s %8s %12s %12s %12s %12s %12s\n" DEV state lnk_integ rcv_err xmit_disc sym_err lnk_down
-          if [ -d "$IB" ]; then
-            for d in "$IB"/*; do
-              dev=$(basename "$d"); pp="$d/ports/1"; p="$pp/counters"
-              printf "%-8s %8s %12s %12s %12s %12s %12s\n" "$dev" \
-                "$(cat $pp/state 2>/dev/null | grep -oE '[A-Z_]+' | head -1)" \
-                "$(cat $p/local_link_integrity_errors 2>/dev/null)" \
-                "$(cat $p/port_rcv_errors 2>/dev/null)" \
-                "$(cat $p/port_xmit_discards 2>/dev/null)" \
-                "$(cat $p/symbol_error 2>/dev/null)" \
-                "$(cat $p/link_downed 2>/dev/null)"
-            done
-          fi
+          echo "### 2. ethtool -S DELTA, error/drop/retry/nak/seq/timeout counters ###"
+          printf "%-12s %-40s %14s\n" NETDEV COUNTER delta
+          for d in "$IB"/*; do
+            dev=$(basename "$d")
+            nd=$(cat /tmp/rdma_pre/${dev}.netdev 2>/dev/null)
+            [ -n "$nd" ] || continue
+            command -v ethtool >/dev/null 2>&1 || continue
+            ethtool -S "$nd" 2>/dev/null | sed 's/^ *//' > /tmp/${dev}.eth.now
+            while read -r line; do
+              key=$(echo "$line" | cut -d: -f1)
+              after=$(echo "$line" | cut -d: -f2 | tr -dc '0-9')
+              echo "$key" | grep -qiE "err|drop|nak|seq|timeout|retr|discard|miss|fail" || continue
+              before=$(grep -E "^${key}:" /tmp/rdma_pre/${dev}.eth 2>/dev/null | cut -d: -f2 | tr -dc '0-9')
+              [ -n "$after" ] || continue
+              [ -n "$before" ] || before=0
+              delta=$((after-before))
+              [ "$delta" -ne 0 ] && printf "%-12s %-40s %14s\n" "$nd" "$key" "$delta"
+            done < /tmp/${dev}.eth.now
+          done
+          echo "(no rows = no error/drop counters grew via ethtool)"
+
           echo ""
-          echo "### 3. Kernel ionic / RDMA errors (dmesg) ###"
-          (dmesg -T 2>/dev/null || dmesg 2>/dev/null || journalctl -k --no-pager 2>/dev/null) \
-            | grep -iE "ionic|cqe with error|retry counter|IBV_WC|qpid" | tail -120 \
-            || echo "no matching kernel lines / insufficient permission"
-          echo ""
-          echo "### 4. ibv_devinfo per device (port state/rate/link_layer) ###"
+          echo "### 3. ibv_devinfo per device (port state/rate/link_layer) ###"
           if docker ps --format '{{.Names}}' | grep -q '^ci_sglang$'; then
             docker exec -u root ci_sglang bash -c '
-              for dev in $(ibv_devinfo -list 2>/dev/null | grep -oE "rdma[0-9]+"); do
+              for dev in $(ibv_devinfo -list 2>/dev/null | grep -oE "rdma[0-9]+" | sort); do
                 echo "==== $dev ===="
                 ibv_devinfo -d "$dev" 2>&1 | grep -E "state|phys_state|rate|link_layer|fw_ver|active_width|active_speed"
               done'
