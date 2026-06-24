@@ -14,7 +14,7 @@ CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS = (
 
 
 def validate_cp_kv_layer_split_model_arch(
-    server_args: "ServerArgs", model_arch: str
+    server_args: ServerArgs, model_arch: str
 ) -> None:
     """Reject --enable-cp-kv-layer-split when the loaded model arch is not supported."""
     if not server_args.enable_cp_kv_layer_split:
@@ -33,7 +33,7 @@ def validate_cp_kv_layer_split_model_arch(
 CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS = ("file", "mooncake")
 
 
-def assert_cp_kv_layer_split_hicache_supported(server_args: "ServerArgs") -> None:
+def assert_cp_kv_layer_split_hicache_supported(server_args: ServerArgs) -> None:
     """Gate HiCache storage backends that scope keys per attention-CP rank."""
     if not server_args.enable_cp_kv_layer_split:
         return
@@ -49,7 +49,7 @@ def assert_cp_kv_layer_split_hicache_supported(server_args: "ServerArgs") -> Non
 
 
 def should_use_cp_kv_layer_split_pool(
-    server_args: Optional["ServerArgs"] = None,
+    server_args: Optional[ServerArgs] = None,
 ) -> bool:
     """True when prefill CP KV layer split is enabled (pool wiring follows the allowlist)."""
     from sglang.srt.server_args import get_global_server_args

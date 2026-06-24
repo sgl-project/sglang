@@ -57,10 +57,6 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_rank,
-    get_attention_cp_size,
-)
 from sglang.srt.mem_cache.cp_kv_layer_split import (
     maybe_reset_cp_kv_layer_split_active_pages,
 )

@@ -129,7 +129,7 @@ class KVArgsRegisterInfo:
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     # Keep optional fields after the stable registration prefix.
-    staging: Optional["StagingRegisterInfo"] = None
+    staging: Optional[StagingRegisterInfo] = None
     dst_kv_data_layout: Optional[list] = None
     dst_state_data_layouts: Optional[List[list]] = None
     dst_kv_item_lens: Optional[List[int]] = None
