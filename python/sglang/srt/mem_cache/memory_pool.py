@@ -352,6 +352,11 @@ class MambaPool:
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
 
+    @dataclass(frozen=True, kw_only=True)
+    class CulaSpeculativeState(State):
+        draft_k: torch.Tensor
+        draft_v: torch.Tensor
+
     def __init__(
         self,
         *,
@@ -366,6 +371,7 @@ class MambaPool:
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
+        linear_backend: str = "seg_la",
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -381,6 +387,7 @@ class MambaPool:
         self.debug_memory_pool = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self.enable_linear_replayssm = enable_linear_replayssm
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
+        self.linear_backend = linear_backend
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -489,107 +496,141 @@ class MambaPool:
                 )
 
             if speculative_num_draft_tokens is not None:
-                if _is_npu:
+                if self.linear_backend == "cula":
+                    temporal_state = temporal_state.transpose(-1, -2).contiguous()
+                    HV, Kd, Vd = temporal_state_shape
+                    T = speculative_num_draft_tokens
+                    H = HV
+                    # draft_k/draft_v are indexed by the global mamba cache slot id
+                    # (mamba_cache_indices), which ranges over the `size`-based mamba
+                    # pool — NOT the spec_state_size (== max_num_reqs) pool. They must
+                    # therefore match the `temporal` state pool's leading dim (size + 1);
+                    # using spec_state_size + 1 here under-sizes the buffer and lets a
+                    # cache slot id >= spec_state_size+1 index out of bounds.
+                    draft_k = torch.zeros(
+                        (num_mamba_layers, size + 1, T, H, Kd),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    draft_v = torch.zeros(
+                        (num_mamba_layers, size + 1, T, HV, Vd),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    self.mamba_cache = self.CulaSpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        draft_k=draft_k,
+                        draft_v=draft_v,
+                    )
+                    logger.info(
+                        f"Mamba Cache (cula) allocated. "
+                        f"temporal V-major {tuple(temporal_state.shape)}, "
+                        f"draft_kv size: {(get_tensor_size_bytes(draft_k) + get_tensor_size_bytes(draft_v)) / GB:.3f}GB"
+                    )
+                elif _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
                     temporal_state_shape = (
                         *temporal_state_shape[:-2],
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token
-                # during target verify.
-                #
-                # On CUDA (Triton conv kernel + Triton scatter) we use a
-                # *deduplicated sliding-window* layout: consecutive draft tokens'
-                # (K-1)-wide windows overlap by (K-2), so instead of D separate
-                # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
-                # (layer, slot) and expose an overlapping `as_strided` view of
-                # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
-                # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
-                # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
-                # with no numerical change: both the conv kernel write (idempotent
-                # overlapping stores) and `fused_conv_window_scatter_with_mask`
-                # consume the view through its strides.
-                #
-                # Dedup the sliding-window conv-intermediate only when it is safe:
-                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
-                # verify (topk > 1) keep the dense layout -- see
-                # `conv_window_dedup_enabled` for the full rationale. The
-                # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
-                # so the dense fallback reads correctly through the same code path.
-                dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
-                )
-                self._intermediate_conv_window_phys = []
-                if dedup_conv_window:
-                    intermediate_conv_window_cache = []
-                    for conv_shape in conv_state_shape:
-                        conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
-                        shared_win = (
-                            speculative_num_draft_tokens + win - 1
-                        )  # D + (K-1) - 1
-                        phys = torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                spec_state_size + 1,
-                                conv_dim,
-                                shared_win,
-                            ),
-                            dtype=conv_dtype,
-                            device="cuda",
+                if self.linear_backend != "cula":
+                    # Cache intermediate SSM states per draft token during target verify
+                    # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
+                    # Cache intermediate conv windows (last K-1 inputs) per draft token
+                    # during target verify.
+                    #
+                    # On CUDA (Triton conv kernel + Triton scatter) we use a
+                    # *deduplicated sliding-window* layout: consecutive draft tokens'
+                    # (K-1)-wide windows overlap by (K-2), so instead of D separate
+                    # [dim, K-1] windows we store one shared [dim, D+K-2] buffer per
+                    # (layer, slot) and expose an overlapping `as_strided` view of
+                    # logical shape [num_layers, size+1, draft_tokens, dim, K-1] where
+                    # step `t`'s window is the slice shared[..., :, t:t+K-1]. This
+                    # halves the conv-intermediate footprint (D*(K-1) -> D+K-2 columns)
+                    # with no numerical change: both the conv kernel write (idempotent
+                    # overlapping stores) and `fused_conv_window_scatter_with_mask`
+                    # consume the view through its strides.
+                    #
+                    # Dedup the sliding-window conv-intermediate only when it is safe:
+                    # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
+                    # verify (topk > 1) keep the dense layout -- see
+                    # `conv_window_dedup_enabled` for the full rationale. The
+                    # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
+                    # so the dense fallback reads correctly through the same code path.
+                    dedup_conv_window = conv_window_dedup_enabled(
+                        _is_npu, _is_cpu, speculative_eagle_topk
+                    )
+                    self._intermediate_conv_window_phys = []
+                    if dedup_conv_window:
+                        intermediate_conv_window_cache = []
+                        for conv_shape in conv_state_shape:
+                            conv_dim, win = conv_shape  # win == conv_kernel - 1 == K-1
+                            shared_win = (
+                                speculative_num_draft_tokens + win - 1
+                            )  # D + (K-1) - 1
+                            phys = torch.zeros(
+                                size=(
+                                    num_mamba_layers,
+                                    spec_state_size + 1,
+                                    conv_dim,
+                                    shared_win,
+                                ),
+                                dtype=conv_dtype,
+                                device="cuda",
+                            )
+                            # view[l, s, step, d, w] = phys[l, s, d, step + w]
+                            view = phys.as_strided(
+                                (
+                                    phys.shape[0],
+                                    phys.shape[1],
+                                    speculative_num_draft_tokens,
+                                    conv_dim,
+                                    win,
+                                ),
+                                (
+                                    phys.stride(0),
+                                    phys.stride(1),
+                                    phys.stride(3),  # step -> shared-win axis
+                                    phys.stride(2),  # dim
+                                    phys.stride(3),  # win -> shared-win axis
+                                ),
+                            )
+                            self._intermediate_conv_window_phys.append(phys)
+                            intermediate_conv_window_cache.append(view)
+                    else:
+                        # Original dense layout (NPU/CPU, or EAGLE tree verify): one
+                        # [dim, K-1] window per draft token.
+                        intermediate_conv_window_cache = [
+                            torch.zeros(
+                                size=(
+                                    num_mamba_layers,
+                                    spec_state_size + 1,
+                                    speculative_num_draft_tokens,
+                                    conv_shape[0],
+                                    conv_shape[1],
+                                ),
+                                dtype=conv_dtype,
+                                device="cuda",
+                            )
+                            for conv_shape in conv_state_shape
+                        ]
+                        self._intermediate_conv_window_phys = (
+                            intermediate_conv_window_cache
                         )
-                        # view[l, s, step, d, w] = phys[l, s, d, step + w]
-                        view = phys.as_strided(
-                            (
-                                phys.shape[0],
-                                phys.shape[1],
-                                speculative_num_draft_tokens,
-                                conv_dim,
-                                win,
-                            ),
-                            (
-                                phys.stride(0),
-                                phys.stride(1),
-                                phys.stride(3),  # step -> shared-win axis (stride 1)
-                                phys.stride(2),  # dim
-                                phys.stride(3),  # win -> shared-win axis (stride 1)
-                            ),
-                        )
-                        self._intermediate_conv_window_phys.append(phys)
-                        intermediate_conv_window_cache.append(view)
-                else:
-                    # Original dense layout (NPU/CPU, or EAGLE tree verify): one
-                    # [dim, K-1] window per draft token.
-                    # Shape: [num_layers, size+1, draft_tokens, dim, K-1]
-                    intermediate_conv_window_cache = [
-                        torch.zeros(
-                            size=(
-                                num_mamba_layers,
-                                spec_state_size + 1,
-                                speculative_num_draft_tokens,
-                                conv_shape[0],
-                                conv_shape[1],
-                            ),
-                            dtype=conv_dtype,
-                            device="cuda",
-                        )
-                        for conv_shape in conv_state_shape
-                    ]
-                    self._intermediate_conv_window_phys = intermediate_conv_window_cache
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
@@ -660,8 +701,10 @@ class MambaPool:
             self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
 
-    def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
-        assert isinstance(self.mamba_cache, self.SpeculativeState)
+    def get_speculative_mamba2_params_all_layers(self):
+        assert isinstance(
+            self.mamba_cache, (self.SpeculativeState, self.CulaSpeculativeState)
+        )
         return self.mamba_cache
 
     def mamba2_layer_cache(self, layer_id: int):
@@ -838,6 +881,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        linear_backend: str = "seg_la",
     ):
         super().__init__(
             size=size,
@@ -864,6 +908,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
+            linear_backend=linear_backend,
         )
 
     def _init_mamba_pool(
@@ -879,6 +924,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        linear_backend: str = "seg_la",
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -892,6 +938,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
+            linear_backend=linear_backend,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

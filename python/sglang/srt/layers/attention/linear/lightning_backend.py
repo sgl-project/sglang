@@ -39,6 +39,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self._server_args = model_runner.server_args
         # seg_la processes draft tokens as a chain -- it has no parent-indices
         # plumbing for tree-shaped drafts, so spec v2 tree verify (topk > 1) would
         # commit wrong mamba states silently. Fail fast instead of mis-decoding.
@@ -89,8 +90,139 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             self.linear_backend = (
                 "seg_la"  # reuse all existing seg_la branches unchanged
             )
+        elif self.linear_backend == "cula":
+            # cuLA's state pool is V-major [v,k]; prefill reuses the seg_la
+            # kernel family with the [v,k] layout so the state it writes is
+            # directly consumable by cuLA's decode/verify/commit kernels.
+            self.seg_la_state_layout = "vk"
         logger.info(
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
+        )
+
+        if self.linear_backend == "cula":
+            self.head_dim = (
+                model_runner.model_config.hf_config.head_dim
+                if hasattr(model_runner.model_config.hf_config, "head_dim")
+                else (
+                    model_runner.model_config.hf_config.hidden_size
+                    // model_runner.model_config.hf_config.num_attention_heads
+                )
+            )
+            self.num_heads = total_num_heads // (
+                model_runner.tp_size if hasattr(model_runner, "tp_size") else 1
+            )
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if self.linear_backend == "cula":
+            self._warmup_cula_kernels(max_bs, max_num_tokens)
+
+    def _warmup_cula_kernels(self, max_bs: int, max_num_tokens: int):
+        from sglang.srt.layers.attention.linear.cula_entry import (
+            cula_commit_fused,
+            cula_decode,
+            cula_verify,
+        )
+
+        draft_token_num = max_num_tokens // max_bs
+        decay = self.tp_slope[0]
+        scale = self.head_dim**-0.5
+        temporal = self.req_to_token_pool.mamba_pool.mamba_cache.temporal[0]
+        # Fused commit operates on the full per-layer state pool. Set up the
+        # layer-fused warmup tensors once (bs-independent): real temporal_full
+        # (3.8GB, not copyable) + small dummy draft buffers + stacked decay.
+        temporal_full = self.req_to_token_pool.mamba_pool.mamba_cache.temporal
+        num_layers = temporal_full.shape[0]
+        pool_size = temporal_full.shape[1]
+        mamba_layer_ids = list(self.req_to_token_pool.mamba_map.keys())
+        decay_all = torch.stack(
+            [self.tp_slope[lid].view(-1).contiguous() for lid in mamba_layer_ids]
+        )
+        dummy_dk_pool = torch.zeros(
+            (num_layers, pool_size, draft_token_num, self.num_heads, self.head_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        dummy_dv_pool = torch.zeros_like(dummy_dk_pool)
+        # decode and verify both take fp32 q/k/v natively (kernels compute in
+        # fp32/TF32). cute.compile bakes the dtype seen at first call, so warmup
+        # dtype MUST match runtime dtype (fp32 for both).
+        decode_dtype = torch.float32
+        verify_dtype = torch.float32
+        out_dtype = torch.bfloat16
+
+        # decode is CUDA-graphed -> sparse warmup suffices. verify + commit use
+        # sym_int() for B (one compile covers all B) -> sparse warmup is enough.
+        decode_warmup = sorted(
+            bs for bs in {1, 2, 4, 8, 16, 32, 33, 64, max_bs} if bs <= max_bs
+        )
+        eager_warmup = [1, 32]  # trigger the single compile for verify + commit
+
+        for bs in decode_warmup:
+            dummy_q = torch.zeros(
+                (bs, self.num_heads, self.head_dim),
+                device=self.device,
+                dtype=decode_dtype,
+            )
+            dummy_out = torch.zeros(
+                (bs, self.num_heads, self.head_dim), device=self.device, dtype=out_dtype
+            )
+            dummy_idx = torch.zeros(bs, dtype=torch.int32, device=self.device)
+            cula_decode(
+                dummy_q, dummy_q, dummy_q, temporal, dummy_idx, decay, scale, dummy_out
+            )
+        if draft_token_num > 1:
+            for bs in eager_warmup:
+                total = bs * draft_token_num
+                dummy_qv = torch.zeros(
+                    (total, self.num_heads, self.head_dim),
+                    device=self.device,
+                    dtype=verify_dtype,
+                )
+                dummy_outv = torch.zeros(
+                    (total, self.num_heads, self.head_dim),
+                    device=self.device,
+                    dtype=out_dtype,
+                )
+                dummy_idx = torch.zeros(bs, dtype=torch.int32, device=self.device)
+                # Warm the write_kv=True variant (runtime uses fused draft writes).
+                # k_buf/v_buf are per-layer pool-indexed [pool, T, H, K] fp32 slices.
+                cula_verify(
+                    dummy_qv,
+                    dummy_qv,
+                    dummy_qv,
+                    temporal,
+                    dummy_idx,
+                    decay,
+                    scale,
+                    draft_token_num,
+                    dummy_outv,
+                    k_buf=dummy_dk_pool[0],
+                    v_buf=dummy_dv_pool[0],
+                )
+                # Fused commit: one launch for ALL layers. draft_k/v dummies are
+                # pool-indexed (bs-independent, allocated once); only h0_indices/
+                # accepted_len vary with bs. Writes garbage into temporal_full slot
+                # 0, zeroed back after the loop.
+                dummy_acc = torch.full(
+                    (bs,), draft_token_num, dtype=torch.int32, device=self.device
+                )
+                cula_commit_fused(
+                    dummy_dk_pool,
+                    dummy_dv_pool,
+                    temporal_full,
+                    dummy_idx,
+                    dummy_acc,
+                    decay_all,
+                    draft_token_num,
+                )
+        # Restore the state pool to its initial zeros (fused-commit warmup wrote
+        # garbage into the active slots).
+        temporal_full.zero_()
+        torch.cuda.synchronize()
+        logger.info(
+            f"cuLA kernel warmup complete (decode={len(decode_warmup)} bs, "
+            f"eager verify+commit={len(eager_warmup)} bs)"
         )
 
     def init_forward_metadata_out_graph(
@@ -337,6 +469,43 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 ),
                 intermediate_state_indices=intermediate_state_indices,
             )
+        elif self.linear_backend == "cula":
+            from sglang.srt.layers.attention.linear.cula_entry import cula_verify
+
+            decay = self.tp_slope[layer_id]
+            scale = layer.head_dim**-0.5
+            if forward_batch.forward_mode.is_target_verify():
+                T = forward_batch.spec_info.draft_token_num
+                # cula_verify accepts fp32 q/k/v natively and fuses the draft_k/v
+                # writes (write_kv=True) -- no separate scatter kernels. draft_k/v
+                # are per-layer [pool, T, H, K] / [pool, T, HV, V] fp32 buffers.
+                out = torch.empty_like(v, dtype=torch.bfloat16)
+                o = cula_verify(
+                    q,
+                    k,
+                    v,
+                    ssm_states,
+                    cache_indices,
+                    decay,
+                    scale,
+                    T,
+                    out,
+                    k_buf=mamba_cache_params.draft_k,
+                    v_buf=mamba_cache_params.draft_v,
+                )
+            else:
+                # Prefill via the seg_la kernel family with [v,k] state layout
+                # (self.seg_la_state_layout == "vk" for cula), so the state
+                # written here matches cuLA's V-major state pool.
+                o = self._linear_attention_entry(
+                    q,
+                    k,
+                    v,
+                    ssm_states,
+                    cache_indices,
+                    metadata,
+                    layer,
+                )
         else:
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"
@@ -383,6 +552,15 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             o = self._linear_attention_entry(
                 q, k, v, ssm_states, cache_indices, metadata, layer
             )
+        elif self.linear_backend == "cula":
+            from sglang.srt.layers.attention.linear.cula_entry import cula_decode
+
+            decay = self.tp_slope[layer_id]
+            scale = layer.head_dim**-0.5
+            # Pass q/k/v through in native dtype (fp32); cula_decode computes in
+            # fp32 internally. Pre-allocated bf16 out so no graph re-alloc.
+            out = torch.empty_like(v, dtype=torch.bfloat16)
+            o = cula_decode(q, k, v, ssm_states, cache_indices, decay, scale, out)
         else:
             raise ValueError(
                 f"linear backend: {self.linear_backend} is not support for now"

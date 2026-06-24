@@ -672,6 +672,9 @@ class KVCacheConfigurator:
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
+            linear_backend=getattr(
+                self.model_config.hf_config, "linear_backend", "seg_la"
+            ),
         )
         return req_to_token_pool
 
