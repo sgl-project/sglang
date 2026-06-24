@@ -135,6 +135,7 @@ class TorchNpuRunnerCore(MoeRunnerCore):
             output_dtype=original_dtype,
             weight_prefix="w13",
             group_list_type=group_list_type,
+            split_item=2,
         )
 
         # --- Activation ---
