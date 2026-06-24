@@ -16,9 +16,10 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.free_space import FreeSpaceProvider
+    from sglang.srt.mem_cache.req_state import ReqKvInfo
     from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 logger = logging.getLogger(__name__)
