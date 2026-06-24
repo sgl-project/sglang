@@ -931,22 +931,33 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         if hasattr(layer, "w13_qweight"):
             del layer.w13_qweight
 
-        if hasattr(layer, 'tp_size') and layer.tp_size > 1:
+        # After stacking w2_full:
+        tp_size = getattr(layer, 'moe_tp_size', 1)
+        if tp_size > 1:
             tp_rank = layer.tp_rank
-            tp_size = layer.tp_size
-            # w13 shape: (E, 2*intermediate, hidden) – intermediate is already per-partition? Check.
-            # Actually create_weights set tensor_shape with intermediate_size_per_partition,
-            # so w13_full should already be per-rank. Ensure it is.
-            # w2 shape: (E, hidden, intermediate_full) – we need to split along dim=2
+            # w2_full shape: (E, hidden_size, intermediate_full?)
+            # If intermediate dimension is the last dimension, split it.
+            # We assume intermediate size is dim=2 of w2_full.
             inter_full = w2_full.shape[2]
-            assert inter_full % tp_size == 0
             inter_per_rank = inter_full // tp_size
             start = tp_rank * inter_per_rank
             end = start + inter_per_rank
-            w2_full = w2_full[..., start:end].contiguous()
+            w2_full = w2_full[:, :, start:end].contiguous()
         
-        layer.register_buffer('w13_dequant', w13_full, persistent=False)
-        layer.register_buffer('w2_dequant', w2_full, persistent=False)
+        # Do the same for w13_full if it also contains full intermediate.
+        # w13_full shape: (E, 2*intermediate_full?, hidden_size).
+        # If intermediate_full != intermediate_size_per_partition, split:
+        if tp_size > 1 and hasattr(layer, 'w13_qweight_type'):
+            # w13_full: (E, 2*inter_full?, hidden)
+            inter_full_13 = w13_full.shape[1] // 2  # gate+up combined
+            if inter_full_13 > intermediate_size_per_partition:  # need to split
+                inter_per_rank_13 = inter_full_13 // tp_size
+                # w13_full is (E, 2*inter_full, hidden)
+                gate_part = w13_full[:, :inter_full_13, :]
+                up_part   = w13_full[:, inter_full_13:, :]
+                gate_part = gate_part[:, start:end, :]
+                up_part   = up_part[:, start:end, :]
+                w13_full = torch.cat([gate_part, up_part], dim=1).contiguous()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
