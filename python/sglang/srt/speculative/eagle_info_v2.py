@@ -6,11 +6,13 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
+from sglang.srt.mem_cache.kv_cache_utils import (
     get_alloc_reserve_per_decode,
     get_last_loc,
+)
+from sglang.srt.mem_cache.owned_kv import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,

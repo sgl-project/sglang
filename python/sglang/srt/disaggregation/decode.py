@@ -67,12 +67,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
 )
-from sglang.srt.mem_cache.common import (
-    kv_to_page_indices,
-    page_align_floor,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kv_cache_utils import kv_to_page_indices, page_align_floor
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
