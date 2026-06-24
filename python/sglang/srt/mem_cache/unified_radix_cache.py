@@ -731,6 +731,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 prev_prefix_len=prev_prefix_len,
                 priority=params.priority,
             )
+            insert_params.swa_evicted_seqlen = params.swa_evicted_seqlen
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
