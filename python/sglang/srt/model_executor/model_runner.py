@@ -1488,6 +1488,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
 
+        # Prefill-aware SWA: model declares that all prefill tokens should be
+        # retained in KV cache during decode (e.g. OCR models).
+        self.prefill_aware_swa = (
+            hasattr(self.model, "is_prefill_aware_swa")
+            and self.model.is_prefill_aware_swa()
+        )
+
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)

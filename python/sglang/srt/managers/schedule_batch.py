@@ -748,6 +748,10 @@ class Req(ReqDllmMixin):
         #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
         # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
         self.swa_evicted_seqlen = 0
+        # Prefill-aware SWA (e.g. UNLIMITED-OCR): floor below which SWA KV must
+        # never be evicted, so decode can attend to all fresh prefill tokens.
+        # Set by the scheduler at extend time = prefill_len - prefix_token_count.
+        self.swa_evict_floor: int = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0

@@ -67,6 +67,7 @@ class SeparatorStyle(IntEnum):
     GEMMA3 = auto()
     MPT = auto()
     PADDLE_OCR = auto()
+    UNLIMITED_OCR = auto()
 
 
 @dataclasses.dataclass
@@ -397,6 +398,18 @@ class Conversation:
                         ret += message + self.sep
                 else:
                     ret += role + ": "  # must be end with a space
+            return ret
+        elif self.sep_style == SeparatorStyle.UNLIMITED_OCR:
+            seps = [self.sep, self.sep2]
+            if system_prompt == "" or system_prompt is None:
+                ret = ""
+            else:
+                ret = system_prompt + seps[0]
+            for i, (role, message) in enumerate(self.messages):
+                if message:
+                    ret += role + message + seps[i % 2]
+                else:
+                    ret += role
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -889,6 +902,22 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="unlimited-ocr",
+        system_template="{system_message}",
+        system_message="",
+        roles=("", ""),
+        messages=(),
+        offset=0,
+        sep_style=SeparatorStyle.UNLIMITED_OCR,
+        sep="",
+        sep2="",
+        image_token="<image>",
+        image_token_at_prefix=True,
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="paddle-ocr",
         system_message="",
         system_template="<|begin_of_sentence|>{system_message}",
@@ -1076,6 +1105,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "minicpmo": "minicpmo",
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
+    "unlimited-ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1180,6 +1210,17 @@ def match_deepseek_ocr(model_path: str):
         return "deepseek-ocr"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_unlimited_ocr(model_path: str):
+    """Match unlimited-ocr model by path or model type."""
+    if "unlimited" in model_path.lower():
+        return "unlimited-ocr"
+    model_type = get_model_type(model_path)
+    if model_type == "unlimited-ocr":
+        return "unlimited-ocr"
+    return None
 
 
 @register_conv_template_matching_function
