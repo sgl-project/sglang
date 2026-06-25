@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.utils.common import Range
 
 
 def _make_cache_with_pools(page_size=1):
@@ -67,7 +68,8 @@ class MockReq:
     """Minimal mock Req with fields needed by cache_unfinished/finished_req."""
 
     def __init__(self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
-        self.fill_ids = array("q", fill_ids)
+        self.full_untruncated_fill_ids = array("q", fill_ids)
+        self.extend_range = Range(0, len(self.full_untruncated_fill_ids))
         self.origin_input_ids = array(
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
@@ -81,6 +83,9 @@ class MockReq:
         self.kv_committed_len = len(fill_ids)
         self.kv_allocated_len = len(fill_ids)
         self.kv_committed_freed = False
+
+    def get_fill_ids(self):
+        return self.full_untruncated_fill_ids[: self.extend_range.end]
 
     def pop_committed_kv_cache(self):
         self.kv_committed_freed = True

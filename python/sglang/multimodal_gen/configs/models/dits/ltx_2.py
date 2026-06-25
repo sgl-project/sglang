@@ -186,3 +186,4 @@ class LTX2Config(DiTConfig):
     arch_config: LTX2ArchConfig = field(default_factory=LTX2ArchConfig)
 
     prefix: str = "ltx2"
+    torch_compile_mode: str = "default"

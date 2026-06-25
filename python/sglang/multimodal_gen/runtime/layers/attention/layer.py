@@ -40,7 +40,9 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
+    _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
+    _usp_output_all_to_all_varlen,
     ring_attn,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -70,7 +72,7 @@ def build_varlen_mask_meta(
     Returns ``cu_seqlens``, ``indices``, ``inv_indices``, ``max_seqlen``.
     Passing the result via ``joint_attention_kwargs`` opts the caller into
     ``USPAttention``'s varlen FA fast path, which zero-fills masked query
-    rows on output — only use when those rows are dropped or ignored
+    rows on output; only use when those rows are dropped or ignored
     downstream.
     """
     assert key_mask.dim() == 2, "key_mask must be [B, S]"
@@ -143,6 +145,7 @@ class UlyssesAttention(nn.Module):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
+        seq_lens: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass for distributed attention.
 
@@ -168,11 +171,21 @@ class UlyssesAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
+        if seq_lens is not None:
+            assert (
+                replicated_q is None and replicated_k is None and replicated_v is None
+            ), "Varlen Ulysses attention does not support replicated QKV"
+
         # Stack QKV
         qkv = torch.cat([q, k, v], dim=0)  # [3, seq_len, num_heads, head_dim]
 
         # Redistribute heads across sequence dimension
-        qkv = sequence_model_parallel_all_to_all_4D(qkv, scatter_dim=2, gather_dim=1)
+        if seq_lens is None:
+            qkv = sequence_model_parallel_all_to_all_4D(
+                qkv, scatter_dim=2, gather_dim=1
+            )
+        else:
+            qkv = _usp_input_all_to_all_varlen(qkv, seq_lens, head_dim=2)
         # Apply backend-specific preprocess_qkv
         qkv = self.attn_impl.preprocess_qkv(qkv, ctx_attn_metadata)
 
@@ -204,9 +217,12 @@ class UlyssesAttention(nn.Module):
         # Apply backend-specific postprocess_output
         output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
 
-        output = sequence_model_parallel_all_to_all_4D(
-            output, scatter_dim=1, gather_dim=2
-        )
+        if seq_lens is None:
+            output = sequence_model_parallel_all_to_all_4D(
+                output, scatter_dim=1, gather_dim=2
+            )
+        else:
+            output = _usp_output_all_to_all_varlen(output, seq_lens, head_dim=2)
         return output, replicated_output
 
 
@@ -359,20 +375,28 @@ class LocalAttention(nn.Module):
                     mask = mask[:, None, :, :]
                 mask = (mask - 1.0) * torch.finfo(q_.dtype).max
 
+            if q_.shape[1] != k_.shape[1]:
+                repeat_factor = q_.shape[1] // k_.shape[1]
+                k_ = k_.repeat_interleave(repeat_factor, dim=1)
+                v_ = v_.repeat_interleave(repeat_factor, dim=1)
+
             sdpa_context = (
                 sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
+            attn_kwargs = {
+                "attn_mask": mask,
+                "dropout_p": 0.0,
+                "is_causal": False,
+                "scale": self.softmax_scale,
+            }
             with sdpa_context:
                 return torch.nn.functional.scaled_dot_product_attention(
                     q_,
                     k_,
                     v_,
-                    attn_mask=mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.softmax_scale,
+                    **attn_kwargs,
                 ).transpose(1, 2)
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
@@ -435,7 +459,7 @@ class USPAttention(nn.Module):
                     f"but got {backend_enum.name}. "
                     f"Please ensure your platform supports these backends."
                 )
-        impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
+        impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,
@@ -492,10 +516,10 @@ class USPAttention(nn.Module):
                 conditioning prefix (e.g. cached text K/V) followed by a
                 sequence-sharded suffix (image tokens). Q has no replicated
                 portion and is fully sequence-sharded.
-            attn_mask_meta: optional varlen metadata from
-                ``build_varlen_mask_meta(attn_mask)``. Supplying this opts
-                into the varlen FA fast path, in which masked query rows
-                are zero-filled on output (differs from SDPA semantics).
+            attn_mask_meta: optional metadata for the varlen FA fast path.
+                Callers may pass ``build_varlen_mask_meta(attn_mask)`` or a
+                known contiguous padding gap. Masked query rows are zero-filled
+                on output (differs from SDPA semantics).
 
         Note: Replicated tensors are not supported in this implementation.
         When skip_sequence_parallel=True (set at construction time), all SP
@@ -611,6 +635,56 @@ class USPAttention(nn.Module):
                 k = _usp_input_all_to_all(k, head_dim=2)
                 v = _usp_input_all_to_all(v, head_dim=2)
 
+            gap_start = None
+            gap_end = None
+            if attn_mask_meta is not None:
+                gap_start = attn_mask_meta.get("gap_start")
+                gap_end = attn_mask_meta.get("gap_end")
+            if (
+                _VARLEN_FA_ENABLED
+                and self.backend == AttentionBackendEnum.FA
+                and gap_start is not None
+                and gap_end is not None
+                and gap_end > gap_start
+                and q.device.type == "cuda"
+                and q.dtype in (torch.float16, torch.bfloat16)
+            ):
+                bs, seq = q.shape[0], q.shape[1]
+                assert 0 <= gap_start < gap_end <= seq
+                valid_seq = seq - (gap_end - gap_start)
+                q_dense = torch.cat([q[:, :gap_start], q[:, gap_end:]], dim=1)
+                k_dense = torch.cat([k[:, :gap_start], k[:, gap_end:]], dim=1)
+                v_dense = torch.cat([v[:, :gap_start], v[:, gap_end:]], dim=1)
+                cu_seqlens = torch.arange(
+                    0,
+                    (bs + 1) * valid_seq,
+                    valid_seq,
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+                out_dense = flash_attn_varlen_func(
+                    q=q_dense.reshape(bs * valid_seq, *q.shape[2:]),
+                    k=k_dense.reshape(bs * valid_seq, *k.shape[2:]),
+                    v=v_dense.reshape(bs * valid_seq, *v.shape[2:]),
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=valid_seq,
+                    max_seqlen_k=valid_seq,
+                    softmax_scale=self.softmax_scale,
+                    causal=False,
+                    ver=_fa_backend.fa_ver,
+                ).reshape(bs, valid_seq, *q.shape[2:])
+                gap_out = out_dense.new_zeros(
+                    bs, gap_end - gap_start, out_dense.shape[2], out_dense.shape[3]
+                )
+                out = torch.cat(
+                    [out_dense[:, :gap_start], gap_out, out_dense[:, gap_start:]],
+                    dim=1,
+                )
+                if sp_size > 1:
+                    out = _usp_output_all_to_all(out, head_dim=2)
+                return out
+
             # If NCCL timeout/deadlock occurs here, check whether
             # attn_mask is inconsistent across SP ranks (None on some, Tensor on
             # others), which causes all_gather participant mismatch. Upstream
@@ -618,6 +692,42 @@ class USPAttention(nn.Module):
             gathered_mask = sequence_model_parallel_all_gather(
                 attn_mask.contiguous(), dim=1
             )
+            if (
+                _VARLEN_FA_ENABLED
+                and self.backend == AttentionBackendEnum.FA
+                and gathered_mask.dtype
+                in (torch.bool, torch.uint8, torch.int32, torch.int64)
+                and q.device.type == "cuda"
+                and gathered_mask.device == q.device
+                and q.dtype in (torch.float16, torch.bfloat16)
+                and q.shape[:2] == gathered_mask.shape == k.shape[:2] == v.shape[:2]
+            ):
+                bs, seq = q.shape[0], q.shape[1]
+                gathered_mask_meta = build_varlen_mask_meta(gathered_mask)
+                indices = gathered_mask_meta["indices"]
+                inv_indices = gathered_mask_meta["inv_indices"]
+                assert (
+                    inv_indices.shape[0] == bs * seq
+                ), "gathered attn_mask shape does not match q/k/v"
+                if indices.shape[0] > 0:
+                    q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
+                    out_unpad = flash_attn_varlen_func(
+                        q=q_unpad,
+                        k=k_unpad,
+                        v=v_unpad,
+                        cu_seqlens_q=gathered_mask_meta["cu_seqlens"],
+                        cu_seqlens_k=gathered_mask_meta["cu_seqlens"],
+                        max_seqlen_q=gathered_mask_meta["max_seqlen"],
+                        max_seqlen_k=gathered_mask_meta["max_seqlen"],
+                        softmax_scale=self.softmax_scale,
+                        causal=False,
+                        ver=_fa_backend.fa_ver,
+                    )
+                    out = fused_scatter_to_padded(out_unpad, inv_indices, bs, seq)
+                    if sp_size > 1:
+                        out = _usp_output_all_to_all(out, head_dim=2)
+                    return out
+
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
@@ -648,15 +758,9 @@ class USPAttention(nn.Module):
 
         sp_size = get_ulysses_parallel_world_size()
         if (
-            sum(
-                bool(n)
-                for n in (
-                    num_replicated_prefix,
-                    num_replicated_suffix,
-                    num_replicated_kv_prefix,
-                )
-            )
-            > 1
+            (num_replicated_prefix > 0 and num_replicated_suffix > 0)
+            or (num_replicated_prefix > 0 and num_replicated_kv_prefix > 0)
+            or (num_replicated_suffix > 0 and num_replicated_kv_prefix > 0)
         ):
             raise ValueError(
                 "USPAttention supports at most one replicated-token mode per call."

@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.utils.realtime_video import (
     JPEG_FRAME_CONTENT_TYPE,
     RAW_RGB_CONTENT_TYPE,
-    RAW_RGB_DELTA_GZIP_CONTENT_TYPE,
     WEBP_FRAME_CONTENT_TYPE,
     build_delta_gzip_raw_rgb_payload,
     build_raw_rgb_frame_batches,
@@ -27,10 +26,15 @@ from sglang.multimodal_gen.runtime.utils.realtime_video import (
 
 def _unpack_frame_batch_messages(payloads):
     messages = []
-    for payload in payloads:
+    payload_iter = iter(payloads)
+    for payload in payload_iter:
         message = msgspec.msgpack.decode(payload)
-        assert message.pop("type") == "frame_batch"
-        frame_payload = message.pop("payload")
+        message_type = message.pop("type")
+        if message_type == "frame_batch":
+            frame_payload = message.pop("payload")
+        else:
+            assert message_type == "frame_batch_header"
+            frame_payload = next(payload_iter)
         messages.append((message, frame_payload))
     return messages
 
@@ -152,7 +156,7 @@ def test_delta_gzip_raw_rgb_payload_roundtrips_exactly():
     assert restored == b"".join(frames)
 
 
-def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
+def test_raw_rgb_realtime_output_adapter_uses_lossless_raw_payload_by_default():
     class _WebSocket:
         def __init__(self):
             self.payloads = []
@@ -191,8 +195,8 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
     payloads, stats, expected_frames = asyncio.run(run())
 
     [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
-    assert first_header["content_type"] == RAW_RGB_DELTA_GZIP_CONTENT_TYPE
-    assert first_header["encoding"] == "delta-gzip"
+    assert first_header["content_type"] == RAW_RGB_CONTENT_TYPE
+    assert first_header["encoding"] == "raw"
     assert first_header["event_id"] == 3
     assert first_header["format"] == "rgb24"
     assert first_header["channels"] == 3
@@ -206,15 +210,10 @@ def test_raw_rgb_realtime_output_adapter_uses_lossless_compressed_payload():
     assert stats["raw_bytes"] == 6000
     assert stats["num_batches"] == 1
     assert stats["num_frames"] == 2
-    restored_frames = restore_delta_gzip_raw_rgb_payload(
-        first_payload,
-        bytes_per_frame=3000,
-        num_frames=2,
-    )
-    assert restored_frames == expected_frames
+    assert first_payload == expected_frames
 
 
-def test_raw_rgb_realtime_output_adapter_offloads_delta_payload_build(
+def test_raw_rgb_realtime_output_adapter_offloads_default_lossless_payload_build(
     monkeypatch,
 ):
     calls = []
@@ -243,7 +242,7 @@ def test_raw_rgb_realtime_output_adapter_offloads_delta_payload_build(
         frame1 = bytes([1, 2, 4]) * 1000
         batch = SimpleNamespace(
             block_idx=0,
-            request_id="req-offload-delta",
+            request_id="req-offload-raw",
             width=1000,
             height=1,
             enable_upscaling=False,
@@ -270,14 +269,9 @@ def test_raw_rgb_realtime_output_adapter_offloads_delta_payload_build(
         realtime_output_adapter._build_transport_payload,
     ]
     [(first_header, first_payload)] = _unpack_frame_batch_messages(payloads)
-    assert first_header["encoding"] == "delta-gzip"
+    assert first_header["encoding"] == "raw"
     assert "delta_reference" not in first_header
-    restored_frames = restore_delta_gzip_raw_rgb_payload(
-        first_payload,
-        bytes_per_frame=3000,
-        num_frames=2,
-    )
-    assert restored_frames == expected_frames
+    assert first_payload == expected_frames
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
@@ -334,7 +328,7 @@ def test_raw_rgb_realtime_output_adapter_can_send_uncompressed_raw_frames():
     assert stats["ws_payload_bytes"] == sum(len(payload) for payload in payloads)
 
 
-def test_raw_rgb_realtime_output_adapter_uses_previous_frame_reference():
+def test_raw_rgb_realtime_output_adapter_does_not_require_previous_frame_reference():
     class _WebSocket:
         def __init__(self):
             self.payloads = []
@@ -388,21 +382,12 @@ def test_raw_rgb_realtime_output_adapter_uses_previous_frame_reference():
     (first_header, first_payload), (second_header, second_payload) = (
         _unpack_frame_batch_messages(payloads)
     )
+    assert first_header["content_type"] == RAW_RGB_CONTENT_TYPE
+    assert second_header["content_type"] == RAW_RGB_CONTENT_TYPE
     assert "delta_reference" not in first_header
-    assert second_header["delta_reference"] == "previous-frame"
-    first_frame = restore_delta_gzip_raw_rgb_payload(
-        first_payload,
-        bytes_per_frame=6,
-        num_frames=1,
-    )
-    second_frame = restore_delta_gzip_raw_rgb_payload(
-        second_payload,
-        bytes_per_frame=6,
-        num_frames=1,
-        reference_frame=first_frame,
-    )
-    assert first_frame == bytes([1, 2, 3, 4, 5, 6])
-    assert second_frame == bytes([1, 2, 4, 4, 6, 6])
+    assert "delta_reference" not in second_header
+    assert first_payload == bytes([1, 2, 3, 4, 5, 6])
+    assert second_payload == bytes([1, 2, 4, 4, 6, 6])
 
 
 def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
@@ -450,9 +435,59 @@ def test_raw_rgb_realtime_output_adapter_splits_large_frame_batches():
     assert [header["num_frames"] for header in headers] == [16, 1]
     assert [header["is_final_frame_batch"] for header in headers] == [False, True]
     assert "delta_reference" not in headers[0]
-    assert headers[1]["delta_reference"] == "previous-frame"
+    assert "delta_reference" not in headers[1]
     assert stats["num_batches"] == 2
     assert stats["num_frames"] == 17
+
+
+def test_raw_rgb_realtime_output_adapter_sends_large_payload_separately():
+    class _WebSocket:
+        def __init__(self):
+            self.payloads = []
+
+        async def send_bytes(self, payload):
+            self.payloads.append(payload)
+
+    async def run():
+        ws = _WebSocket()
+        adapter = RawRGBRealtimeOutputAdapter()
+        frame = bytes([7]) * (72 * 1024)
+        batch = SimpleNamespace(
+            block_idx=0,
+            request_id="req-large",
+            width=len(frame) // 3,
+            height=1,
+            enable_upscaling=False,
+            realtime_event_id=3,
+        )
+        result = OutputBatch(
+            raw_frame_batches=[[frame]],
+            raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
+            raw_frame_metadata={
+                "format": "rgb24",
+                "width": len(frame) // 3,
+                "height": 1,
+                "channels": 3,
+                "bytes_per_frame": len(frame),
+            },
+        )
+
+        stats = await adapter.send(ws, SimpleNamespace(), result, batch)
+        return ws.payloads, stats
+
+    payloads, stats = asyncio.run(run())
+
+    assert len(payloads) == 2
+    header = msgspec.msgpack.decode(payloads[0])
+    assert header["type"] == "frame_batch_header"
+    assert "payload" not in header
+    assert header["content_type"] == RAW_RGB_CONTENT_TYPE
+    assert header["total_size"] == len(payloads[1])
+    assert payloads[1] == bytes([7]) * (72 * 1024)
+    assert stats["raw_bytes"] == len(payloads[1])
+    assert stats["ws_payload_bytes"] == len(payloads[0]) + len(payloads[1])
+    assert stats["num_batches"] == 1
+    assert stats["num_frames"] == 1
 
 
 def test_raw_rgb_realtime_output_adapter_can_send_webp_preview_frames():
@@ -527,6 +562,7 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
     async def run():
         ws = _WebSocket()
         adapter = RawRGBRealtimeOutputAdapter()
+        frame_count = realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE + 1
         batch = SimpleNamespace(
             block_idx=0,
             request_id="req-webp-offload",
@@ -540,8 +576,8 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
         result = OutputBatch(
             raw_frame_batches=[
                 [
-                    bytes([255, 0, 0, 0, 255, 0]),
-                    bytes([0, 0, 255, 255, 255, 0]),
+                    bytes([idx % 256, 0, 0, 0, 255, idx % 256])
+                    for idx in range(frame_count)
                 ]
             ],
             raw_frame_content_type=RAW_RGB_CONTENT_TYPE,
@@ -560,24 +596,29 @@ def test_raw_rgb_realtime_output_adapter_offloads_preview_encoding(monkeypatch):
     payloads = asyncio.run(run())
 
     assert [call[0] for call in calls] == [
-        realtime_output_adapter._build_transport_payload,
-        realtime_output_adapter._build_transport_payload,
-    ]
+        realtime_output_adapter._encode_rgb_frame_to_webp
+    ] * (realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE + 1)
     (first_header, first_payload), (second_header, second_payload) = (
         _unpack_frame_batch_messages(payloads)
     )
     assert first_header["content_type"] == WEBP_FRAME_CONTENT_TYPE
     assert first_header["encoding"] == "webp"
-    assert first_header["num_frames"] == 1
+    assert first_header["num_frames"] == (
+        realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE
+    )
     assert first_header["frame_batch_index"] == 0
     assert first_header["num_frame_batches"] == 2
     assert first_header["is_final_frame_batch"] is False
+    assert len(first_header["payload_lengths"]) == (
+        realtime_output_adapter.ENCODED_PREVIEW_FRAMES_PER_WS_MESSAGE
+    )
     assert second_header["content_type"] == WEBP_FRAME_CONTENT_TYPE
     assert second_header["encoding"] == "webp"
     assert second_header["num_frames"] == 1
     assert second_header["frame_batch_index"] == 1
     assert second_header["num_frame_batches"] == 2
     assert second_header["is_final_frame_batch"] is True
+    assert len(second_header["payload_lengths"]) == 1
     assert first_payload.startswith(b"RIFF")
     assert second_payload.startswith(b"RIFF")
 

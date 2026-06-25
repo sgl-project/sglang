@@ -4,7 +4,7 @@ metatags:
     description: "Load SGLang models directly from S3, Google Cloud Storage, Azure Blob, and S3-compatible object storage with runai_streamer."
 ---
 
-SGLang supports direct loading of models from object storage (S3 and Google Cloud Storage) without requiring a full local download. This feature uses the `runai_streamer` load format to stream model weights directly from cloud storage, significantly reducing startup time and local storage requirements.
+SGLang can load models directly from object storage without a full local download. It uses the `runai_streamer` load format to stream model weights from cloud storage, reducing startup time and local storage requirements.
 
 ## Overview
 
@@ -58,7 +58,7 @@ python -m sglang.launch_server \
 
 ### Load Format
 
-The `runai_streamer` load format is specifically designed for object storage, ssd and shared file systems
+The `runai_streamer` load format is designed for object storage, SSDs, and shared filesystems.
 
 ```bash
 python -m sglang.launch_server \
@@ -101,7 +101,7 @@ python -m sglang.launch_server \
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>distributed</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable distributed streaming for multi-GPU setups. Automatically set to <code>true</code> for object storage paths and cuda alike devices.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable distributed streaming for multi-GPU setups. Automatically set to <code>true</code> for object storage paths on CUDA-like devices.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Auto-detected</td>
     </tr>
     <tr>
@@ -123,7 +123,7 @@ python -m sglang.launch_server \
 
 ### Distributed Streaming
 
-For multi-GPU setups, enable distributed streaming to parallelize weight loading between the processes:
+For multi-GPU setups, enable distributed streaming to parallelize weight loading across processes:
 
 ```bash
 python -m sglang.launch_server \
@@ -134,8 +134,8 @@ python -m sglang.launch_server \
 
 ## Limitations
 
-- **Supported Formats**: Currently only supports `.safetensors` weight format (recommended format)
-- **Supported Device**: Distributed streaming is supported on cuda alike devices. Otherwise fallback to non distributed streaming
+- **Supported formats**: Only the `.safetensors` weight format is supported.
+- **Supported devices**: Distributed streaming is supported on CUDA-like devices; otherwise it falls back to non-distributed streaming.
 
 ## See Also
 

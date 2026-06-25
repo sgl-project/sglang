@@ -6,8 +6,8 @@ backend, env overrides). Pair it with the kits in
 ``sglang.test.kits.spec_server_kits`` to assemble test classes.
 
 The primary axis is ``disable_overlap``:
-  - ``False`` -> spec v2 (overlap scheduler)
-  - ``True``  -> spec v1 (overlap disabled)
+  - ``False`` -> overlap scheduler
+  - ``True``  -> synchronous (non-overlap) scheduling
 """
 
 import contextlib
@@ -56,14 +56,19 @@ class SpecEagleServerBase(CustomTestCase):
     # -- runtime config --
     page_size = 1
     attention_backend = "flashinfer"
-    # Primary axis: False -> spec v2 (overlap); True -> spec v1 (overlap off).
+    # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
-    mem_fraction_static = 0.75
+    mem_fraction_static = 0.85
     max_running_requests = 8
     chunked_prefill_size = 128
-    dtype = "float16"
+    # bf16 rather than fp16: fp16 activations can overflow (-> Inf -> NaN) on
+    # degenerate draft branches in verify and trip the CI NaN asserts.
+    dtype = "bfloat16"
     cuda_graph_max_bs = None
     trust_remote_code = True
+    # Launch with --enable-return-hidden-states so SpecHiddenStatesKit can probe
+    # per-request hidden states; per-request gated, so other requests don't pay.
+    enable_return_hidden_states = False
 
     # -- extras --
     # env_overrides: (env_var_obj, value) pairs applied only around launch.
@@ -102,6 +107,8 @@ class SpecEagleServerBase(CustomTestCase):
             args.append("--disable-overlap-schedule")
         if cls.trust_remote_code:
             args.append("--trust-remote-code")
+        if cls.enable_return_hidden_states:
+            args.append("--enable-return-hidden-states")
         if cls.cuda_graph_max_bs is not None:
             args += ["--cuda-graph-max-bs", str(cls.cuda_graph_max_bs)]
         args += [str(a) for a in cls.extra_args]
@@ -122,7 +129,6 @@ class SpecEagleServerBase(CustomTestCase):
         cls.target_model = cls.model
         cls._tokenizer = None
         with contextlib.ExitStack() as stack:
-            stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True))
             stack.enter_context(
                 envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True)
             )
@@ -219,7 +225,7 @@ class Eagle3Base(SpecEagleServerBase):
 
 
 class EagleLlama2Base(SpecEagleServerBase):
-    """EAGLE (Llama-2) config preset. topk=8 tree -> spec v1; gsm8k is low."""
+    """EAGLE (Llama-2) config preset. topk=8 tree -> synchronous path; gsm8k is low."""
 
     model = DEFAULT_TARGET_MODEL_EAGLE
     draft_model = DEFAULT_DRAFT_MODEL_EAGLE
@@ -233,5 +239,5 @@ class EagleLlama2Base(SpecEagleServerBase):
     gsm8k_score_thres = 0.20
     acc_length_thres = 3.0
     batch_accept_len_thres = 1.8
-    # EAGLE topk>1 already routes to v1; force it explicitly to preserve intent.
-    env_overrides = ((envs.SGLANG_ENABLE_SPEC_V2, False),)
+    # topk>1 tree verify runs on the synchronous (non-overlap) path.
+    disable_overlap = True

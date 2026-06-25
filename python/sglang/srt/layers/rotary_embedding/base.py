@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -24,6 +26,8 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
 
+logger = logging.getLogger(__name__)
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -39,7 +43,25 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+
+    # `fused_rope_qk_mqa` is an optional fast-path kernel shipped with
+    # `sgl_kernel_npu`. Older NPU CANN / sgl_kernel_npu builds may not include
+    # it. If we let the ImportError propagate, importing this module fails,
+    # which in turn causes `ModelRegistry` to silently skip every model that
+    # depends on it (and fall back to HF Transformers without quantisation
+    # awareness — see PR #22352). We tolerate the missing kernel so model
+    # loading still works; call sites must check for `None` and use the
+    # generic rope path. A warning is emitted so the missing kernel is
+    # visible in logs instead of being silently swallowed.
+    try:
+        from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+    except ImportError:
+        fused_rope_qk_mqa = None
+        logger.warning(
+            "sgl_kernel_npu.norm.fused_rope_qk_mqa is unavailable; "
+            "falling back to the generic rope implementation. Upgrade "
+            "sgl_kernel_npu to enable the fused kernel."
+        )
 
 if _is_hip:
     from sglang.srt.layers.attention.utils import (
@@ -82,6 +104,7 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_npu)
             and not (_is_musa)
             and not (_is_mps)
+            and not (current_platform.is_out_of_tree())
         ):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
@@ -105,9 +128,10 @@ class RotaryEmbedding(MultiPlatformOp):
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
         if get_global_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                apply_rotary_emb
-            )
+            self._apply_rotary_emb_wrapped = torch.compile(
+                dynamic=True,
+                disable=_is_npu,
+            )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
@@ -270,7 +294,7 @@ class RotaryEmbedding(MultiPlatformOp):
             else:
                 cos_sin = self.cos_sin_cache.index_select(0, positions)
 
-            if query.shape[0] * query.shape[1] < 65535:
+            if fused_rope_qk_mqa is not None and query.shape[0] < 65535:
                 return fused_rope_qk_mqa(
                     query,
                     key,
@@ -362,15 +386,20 @@ class RotaryEmbedding(MultiPlatformOp):
 
             if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
-
-                k_cache_shape = fused_set_kv_buffer_arg["key_cache"].shape
-                qk_head_dim = k_cache_shape[-1]
-                tp_k_head_num = k_cache_shape[-2]
+                k_cache = fused_set_kv_buffer_arg["key_cache"]
+                # 5D SHUFFLE pool feeds raw (N, H, D/x, page, x) K cache;
+                # NHD 3D pool feeds the legacy 4D paged view. Auto-detect.
+                is_shuffle_5d = k_cache.ndim == 5
+                if is_shuffle_5d:
+                    # K shape (num_blocks, H_kv, D//x, page, x): D = D//x * x
+                    qk_head_dim = k_cache.shape[2] * k_cache.shape[4]
+                    tp_k_head_num = k_cache.shape[1]
+                else:
+                    qk_head_dim = k_cache.shape[-1]
+                    tp_k_head_num = k_cache.shape[-2]
 
                 key = key.view(-1, tp_k_head_num, qk_head_dim)
-
                 tokens = key.shape[0]
-
                 query = query.view(tokens, -1, qk_head_dim)
 
                 query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
@@ -379,7 +408,7 @@ class RotaryEmbedding(MultiPlatformOp):
                     pos=positions,
                     cos_sin=self.cos_sin_cache,
                     is_neox=self.is_neox_style,
-                    flash_layout=True,
+                    flash_layout=not is_shuffle_5d,
                     offs=None,
                     q_out=query,
                     k_out=key,

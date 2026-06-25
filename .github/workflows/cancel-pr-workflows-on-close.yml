@@ -1,0 +1,104 @@
+name: Cancel PR Workflows on Close
+
+# Cancels every unfinished run on a PR's head branch when the PR closes
+# (merged or not). Runs are listed repo-wide by branch, not per workflow:
+# the previous styfle/cancel-workflow-action `workflow_id: all` fetched
+# only the first page (30) of repo workflows, so newer workflows (e.g.
+# pr-test-extra.yml) were never cancelled and kept occupying runners.
+
+on:
+  pull_request_target:
+    types:
+      - closed
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel unfinished runs of this PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "$HEAD_REPO_ID" ]; then
+            echo "Head repo no longer exists (fork deleted), nothing to match"
+            exit 0
+          fi
+
+          FAILURES=0
+
+          # `branch=` matches run.head_branch, shared with same-named
+          # branches of other forks -- filter by head repo id. Exclude this
+          # run itself: pull_request_target runs also carry the head branch.
+          # The status filter takes one value per request, so sweep every
+          # non-terminal state (pending/waiting/action_required runs would
+          # otherwise start after the PR is closed). Pass 2 catches runs
+          # still materializing during pass 1.
+          for pass in 1 2; do
+            run_ids=""
+            for status in queued in_progress waiting pending requested action_required; do
+              ids=""
+              for attempt in 1 2 3; do
+                if ids=$(gh api -X GET "repos/$REPO/actions/runs" \
+                  --paginate \
+                  -f branch="$HEAD_BRANCH" \
+                  -f status="$status" \
+                  -F per_page=100 \
+                  --jq ".workflow_runs[]
+                        | select(.head_repository.id == $HEAD_REPO_ID and .id != $GITHUB_RUN_ID)
+                        | .id"); then
+                  break
+                fi
+                ids=""
+                if [ "$attempt" -eq 3 ]; then
+                  echo "::error::Listing $status runs failed after 3 attempts"
+                  FAILURES=1
+                else
+                  sleep 5
+                fi
+              done
+              run_ids="$run_ids"$'\n'"$ids"
+            done
+            run_ids=$(echo "$run_ids" | sed '/^$/d' | sort -u)
+
+            if [ -z "$run_ids" ]; then
+              echo "Pass $pass: no unfinished runs found"
+              break
+            fi
+            echo "Pass $pass: cancelling $(echo "$run_ids" | wc -l | tr -d ' ') run(s)"
+
+            for run_id in $run_ids; do
+              echo "Cancelling https://github.com/$REPO/actions/runs/$run_id"
+              if gh run cancel "$run_id" --repo "$REPO" 2>/dev/null; then
+                continue
+              fi
+              # Plain cancel fails for runs stuck behind approval /
+              # deployment protection rules; force-cancel handles those.
+              if gh api -X POST "repos/$REPO/actions/runs/$run_id/force-cancel" >/dev/null 2>&1; then
+                echo "  force-cancelled"
+                continue
+              fi
+              # Finished between listing and cancelling is fine.
+              state=$(gh api "repos/$REPO/actions/runs/$run_id" --jq '.status' 2>/dev/null || echo "unknown")
+              if [ "$state" = "completed" ]; then
+                echo "  already finished, nothing to cancel"
+              else
+                echo "::error::Failed to cancel run $run_id (status: $state)"
+                FAILURES=1
+              fi
+            done
+
+            if [ "$pass" -eq 1 ]; then
+              sleep 20
+            fi
+          done
+
+          exit "$FAILURES"

@@ -125,9 +125,15 @@ impl WorkerIntrospector {
             None => None,
         };
 
+        // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
+        // token bigrams; the router must mirror that on the selection side.
+        let is_bigram = crate::policies::kv_events::classify_bigram(
+            parsed.speculative_algorithm.as_deref(),
+            worker_url,
+        );
         let event_config = parsed
             .kv_events
-            .map(|block| resolve_event_config(block, worker_url));
+            .map(|block| resolve_event_config(block, worker_url, is_bigram));
 
         let disaggregation_role = resolve_disaggregation_role(
             parsed.disaggregation_mode.as_deref(),
@@ -265,7 +271,11 @@ impl Default for WorkerIntrospector {
 /// unchanged: the subsequent ZMQ connect will fail visibly with the
 /// wildcard literal, which is the same observable failure mode that
 /// would occur today if the bind/connect were skipped.
-pub(crate) fn resolve_event_config(block: KvEventsBlock, worker_url: &str) -> EventConfig {
+pub(crate) fn resolve_event_config(
+    block: KvEventsBlock,
+    worker_url: &str,
+    is_bigram: bool,
+) -> EventConfig {
     let host = if matches!(
         block.endpoint_host.as_str(),
         "*" | "0.0.0.0" | "::" | "[::]"
@@ -292,6 +302,7 @@ pub(crate) fn resolve_event_config(block: KvEventsBlock, worker_url: &str) -> Ev
         topic: block.topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
+        is_bigram,
     }
 }
 
@@ -304,6 +315,11 @@ struct ServerInfoBody {
     served_model_name: Option<String>,
     #[serde(default)]
     kv_events: Option<KvEventsBlock>,
+    /// Top-level `speculative_algorithm`. EAGLE-family values
+    /// (EAGLE / EAGLE3 / FROZEN_KV_MTP) ⇒ the worker hashes KV blocks over
+    /// token bigrams. Absent on workers without speculative decoding.
+    #[serde(default)]
+    speculative_algorithm: Option<String>,
     /// Carries the value of `ServerArgs.disaggregation_mode`
     /// (`"null"` | `"prefill"` | `"decode"`). Absent on older SGLang
     /// versions that predate the field.
@@ -367,6 +383,59 @@ mod tests {
 
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    /// The PRIMARY `/server_info` path (the introspector, not the discovery.rs
+    /// fallback) must flag `is_bigram` for an EAGLE worker so the policy picks
+    /// the bigram hasher. Regression guard for the duplicated parse + the
+    /// `resolve_event_config(.., is_bigram)` threading.
+    #[tokio::test]
+    async fn fetch_sets_is_bigram_for_eagle_worker() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "speculative_algorithm": "EAGLE",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events present");
+        assert!(
+            cfg.is_bigram,
+            "EAGLE worker via the introspector must set is_bigram"
+        );
+    }
+
+    /// A non-speculative worker (no `speculative_algorithm`) must NOT be bigram.
+    #[tokio::test]
+    async fn fetch_no_bigram_without_speculative_algorithm() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events present");
+        assert!(!cfg.is_bigram, "non-speculative worker must not be bigram");
     }
 
     #[tokio::test]
