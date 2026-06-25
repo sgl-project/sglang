@@ -76,7 +76,14 @@ class TestMxfp4Tensor(unittest.TestCase):
         self.assertEqual(fp4_weight.quantized_data.dtype, torch.uint8)
         self.assertEqual(fp4_weight.quantized_data.shape, torch.Size([2, 32, 16]))
         self.assertEqual(fp4_scale.dtype, torch.uint8)
-        self.assertEqual(fp4_scale.shape, torch.Size([2, 32, 1]))
+        self.assertEqual(fp4_scale.shape, torch.Size([64, 1]))
+        dequant = MXFP4QuantizeUtil.dequantize(
+            fp4_weight.quantized_data,
+            torch.bfloat16,
+            fp4_scale,
+            block_sizes=[32],
+        )
+        self.assertEqual(dequant.shape, weight.shape)
 
 
 if __name__ == "__main__":
