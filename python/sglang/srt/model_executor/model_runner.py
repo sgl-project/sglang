@@ -935,7 +935,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if isinstance(pool, SWAKVPool):
             zero_pool(pool.full_kv_pool, loc)
             swa_loc = pool.translate_loc_from_full_to_swa(loc)
-            zero_pool(pool.swa_kv_pool, swa_loc[swa_loc > 0])
+            zero_pool(pool.swa_kv_pool, swa_loc[swa_loc >= 0])
         else:
             zero_pool(pool, loc)
 
