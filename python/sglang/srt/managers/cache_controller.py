@@ -16,7 +16,7 @@ limitations under the License.
 import logging
 import threading
 import time
-from queue import Empty, Full, Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.distributed import (
     get_pipeline_model_parallel_rank,
@@ -149,45 +149,6 @@ class HiCacheAck(NamedTuple):
     node_ids: List[int]
 
 
-class TransferBuffer:
-    """
-    Overlapping buffer preparation and transfer operations to improve throughput.
-    """
-
-    def __init__(self, stop_event, buffer_count: int = 3) -> None:
-        self.stop_event = stop_event
-        self.buffers = Queue(maxsize=buffer_count)
-
-    def full(self) -> bool:
-        return self.buffers.full()
-
-    def empty(self) -> bool:
-        return self.buffers.empty()
-
-    def put(self, item, block=True, timeout=1) -> None:
-        while not self.stop_event.is_set():
-            try:
-                self.buffers.put(item, block=block, timeout=timeout)
-                break
-            except Full:
-                if not block:
-                    break
-                continue
-            except Exception as e:
-                logger.error(e)
-
-    def get(self, block=True, timeout=1) -> Optional[CacheOperation]:
-        try:
-            return self.buffers.get(block=block, timeout=timeout)
-        except Empty:
-            return None
-        except Exception as e:
-            logger.error(e)
-
-    def clear(self):
-        self.buffers.queue.clear()
-
-
 class StorageOperation:
     counter = 0
 
@@ -298,9 +259,6 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
 
         # Dedicated stop event for storage background threads (prefetch/backup).
-        # NOTE: Do NOT reuse `self.stop_event` here since it also guards core HiCache
-        # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
-        # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
 
         self.device = self.mem_pool_device.device
@@ -320,10 +278,6 @@ class HiCacheController:
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
-
-        self.stop_event = threading.Event()
-        self.write_buffer = TransferBuffer(self.stop_event)
-        self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
@@ -419,7 +373,7 @@ class HiCacheController:
         # Always request stop. This is safe even when storage is already disabled,
         # and makes detach truly idempotent (previous partial detach may have left
         # threads alive).
-        # NOTE: do NOT clear stop_event unless threads have fully stopped; otherwise
+        # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
         # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
 
@@ -671,13 +625,10 @@ class HiCacheController:
         )
 
     def reset(self):
-        self.stop_event.set()
         self.storage_stop_event.set()
 
         self.write_queue.clear()
         self.load_queue.clear()
-        self.write_buffer.clear()
-        self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
@@ -690,7 +641,6 @@ class HiCacheController:
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
-        self.stop_event.clear()
         self.storage_stop_event.clear()
 
         if self.enable_storage:
@@ -726,9 +676,17 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        # Page-first write-back JIT kernels can keep destination host indices on CPU.
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            host_indices, device_indices = op.host_indices, op.device_indices
+        else:
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
         self.write_queue.clear()
 
         start_event = device_module.Event()

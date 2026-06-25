@@ -210,11 +210,6 @@ class RequestStage:
         level=2,
     )
 
-    SPEC_DRAFT_EXTEND = RequestStageConfig(
-        "spec_draft_extend",
-        level=3,
-    )
-
     # CPU-side run batch
     RUN_BATCH_CPU = RequestStageConfig(
         "run_batch_cpu",
@@ -613,7 +608,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # speculative decoding
     spec_draft_start_time: float = 0.0
     spec_verify_start_time: float = 0.0
-    spec_draft_extend_start_time: float = 0.0
 
     # other
     transfer_speed_gb_s: float = 0.0
@@ -678,17 +672,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     "accepted_tokens": num_correct_drafts,
                 },
             )
-
-    def set_spec_draft_extend_start_time(self, ts=None):
-        ts = ts or time.perf_counter()
-        self.spec_draft_extend_start_time = ts
-
-    def set_spec_draft_extend_end_time(self, ts=None):
-        ts = ts or time.perf_counter()
-
-        if self.trace_ctx.tracing_enable:
-            stage = RequestStage.SPEC_DRAFT_EXTEND
-            self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
 
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()

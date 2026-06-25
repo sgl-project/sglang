@@ -102,10 +102,19 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             if case_id:
                 self.factory_case_ids[stmt.name] = case_id
 
-        for stmt in node.body:
-            if isinstance(stmt, ast.Expr):
-                self._process_expr(stmt.value)
+        self.generic_visit(node)
 
+    def visit_Expr(self, node: ast.Expr):
+        """Handle ``LIST.append(...)`` mutations at any nesting level.
+
+        Previously only module-top-level ``ast.Expr`` statements were scanned for
+        ``.append()`` calls, so cases registered under a platform guard such as
+        ``if not current_platform.is_hip(): ONE_GPU_CASES.append(...)`` (used by
+        ``hunyuan3d_shape_gen`` and ``turbo_wan2_1_t2v_1.3b``) were invisible to
+        the partition planner and therefore never scheduled in CI. Visiting every
+        ``Expr`` lets ``generic_visit`` reach appends inside ``if``/``else`` blocks.
+        """
+        self._process_expr(node.value)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):

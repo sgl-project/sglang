@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -45,6 +45,7 @@ from sglang.srt.speculative.triton_ops.eagle import (
 )
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -69,6 +70,28 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def fast_sample(probs: torch.Tensor, num_samples: int = 1):
+    sample_index = torch.multinomial(probs, num_samples=num_samples)
+    sample_p = probs.gather(1, sample_index)
+    return sample_p, sample_index
+
+
+def renorm_draft_probs(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    use_rejection_sampling: bool,
+) -> torch.Tensor:
+    """Draft-side next-token distribution.
+
+    Plain softmax, except under rejection sampling where logits are
+    temperature-scaled so the draft proposal q tracks the target sampling
+    temperature (higher acceptance; correctness holds for any q).
+    """
+    if not use_rejection_sampling or not next_token_logits.size(0):
+        return torch.softmax(next_token_logits, dim=-1)
+    return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
 
 
 # Simulate acceptance length for benchmarking purposes
@@ -477,9 +500,7 @@ def spec_stage_span(name: str):
     """Profiler span for a coarse speculative-decoding stage (``draft`` /
     ``draft_extend`` / ``verify``).
     """
-    if torch.autograd._profiler_enabled():
-        return torch.profiler.record_function(name)
-    return nullcontext()
+    return profile_range(name)
 
 
 def move_accept_tokens_to_target_kvcache(
@@ -629,3 +650,15 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
+
+
+def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+    """eagle/ngram share a stateless free function; dflash keeps stateful
+    prep on its draft input -- the dispatcher routes.
+    """
+    if batch.spec_algorithm.is_dflash():
+        batch.spec_info.prepare_for_decode(batch)
+    else:
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+        eagle_prepare_for_decode(batch)

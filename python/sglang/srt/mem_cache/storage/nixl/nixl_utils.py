@@ -7,6 +7,13 @@ from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key
 
 logger = logging.getLogger(__name__)
 
+_SGLANG_NIXL_CONFIG_KEYS = {
+    "use_direct_io",
+    "l3_cleaner_enabled",
+    "l3_cleaner_high_watermark",
+    "l3_cleaner_low_watermark",
+}
+
 
 class NixlBackendConfig:
     """Handles NIXL backend configurations"""
@@ -34,6 +41,27 @@ class NixlBackendConfig:
         if "use_direct_io" in self.config:
             return bool(self.config["use_direct_io"])
         return envs.SGLANG_HICACHE_NIXL_USE_DIRECT_IO.get()
+
+    def get_l3_cleaner_config(self) -> dict:
+        """Return typed NIXL FILE L3 cleaner options from top-level config."""
+        config = {
+            "enabled": True,
+            "high_watermark": 80.0,
+            "low_watermark": 70.0,
+        }
+        if "l3_cleaner_enabled" in self.config:
+            enabled = self.config["l3_cleaner_enabled"]
+            if not isinstance(enabled, bool):
+                raise ValueError("l3_cleaner_enabled must be a boolean")
+            config["enabled"] = enabled
+        key_map = {
+            "l3_cleaner_high_watermark": ("high_watermark", float),
+            "l3_cleaner_low_watermark": ("low_watermark", float),
+        }
+        for raw_key, (cleaner_key, parser) in key_map.items():
+            if raw_key in self.config:
+                config[cleaner_key] = parser(self.config[raw_key])
+        return config
 
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
@@ -75,6 +103,9 @@ class NixlBackendConfig:
             config_data = self.config
 
         for key, value in config_data.items():
+            # These keys are consumed by SGLang itself, not by NIXL plugins.
+            if key in _SGLANG_NIXL_CONFIG_KEYS:
+                continue
             initparams[key] = str(value)
 
         return initparams
