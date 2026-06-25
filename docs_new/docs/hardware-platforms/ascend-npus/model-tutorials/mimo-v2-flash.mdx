@@ -105,6 +105,33 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 ```
 
   </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
+
+docker run -itd --shm-size=16g --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
+```
+
+  </Tab>
 </Tabs>
 
 <Tip>
@@ -120,7 +147,7 @@ quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving
 throughput for high-concurrency scenarios. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[MiMo-V2-Flash Best Practice — W8A8 24P PD Disaggregation On A3](/docs/hardware-platforms/ascend-npus/best_practice/mimo-v2-flash#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
+[MiMo-V2-Flash Best Practice — W8A8 24P PD Disaggregation On A3](/docs/hardware-platforms/ascend-npus/best_practice/mimo-v2-flash#pd-disaggregation).
 
 ## Functional verification
 
