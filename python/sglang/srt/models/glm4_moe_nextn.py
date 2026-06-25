@@ -103,7 +103,7 @@ class Glm4MoeModelNextN(nn.Module):
 
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
+            hidden_states, residual, _ = self.decoder(
                 positions, hidden_states, forward_batch, residual
             )
 
