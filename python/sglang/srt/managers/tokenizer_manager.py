@@ -863,7 +863,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
-                    if self.server_args.language_only:
+                    if self.server_args.language_only and obj.need_wait_for_mm_inputs:
                         logger.warning(
                             "Encoder embedding not available, "
                             "falling back to local mm processing"

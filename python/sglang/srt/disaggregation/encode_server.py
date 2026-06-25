@@ -97,6 +97,64 @@ rid_to_receive_count: Dict[str, int] = dict()
 rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
+# Publishes per-part metadata here under rid_lock for mooncake backend;
+rid_to_meta: Dict[str, dict] = dict()
+rid_to_send_done: Dict[str, int] = dict()
+_send_cleanup_tasks: Dict[str, asyncio.Task] = dict()
+
+
+async def _publish_meta(req_id, nbytes, embedding_len, embedding_dim, error=None):
+    """Publish per-part encode metadata and wake meta-data waiters."""
+    meta = (
+        {"error": error}
+        if error is not None
+        else {
+            "embedding_size": nbytes,
+            "embedding_len": embedding_len,
+            "embedding_dim": embedding_dim,
+        }
+    )
+    async with rid_lock:
+        rid_to_meta[req_id] = meta
+    cond = await get_condition(req_id)
+    async with cond:
+        cond.notify_all()
+
+
+async def _cleanup_meta_state(req_id):
+    """Drop module-level meta rendezvous entries for req_id."""
+    async with rid_lock:
+        rid_to_meta.pop(req_id, None)
+        rid_to_send_done.pop(req_id, None)
+    async with cond_dict_lock:
+        rid_to_cond.pop(req_id, None)
+    task = _send_cleanup_tasks.pop(req_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def _note_send_done(req_id, receive_count):
+    """Count a completed /send; clean meta state at receive_count."""
+    async with rid_lock:
+        count = rid_to_send_done.get(req_id, 0) + 1
+        rid_to_send_done[req_id] = count
+    if count >= receive_count:
+        await _cleanup_meta_state(req_id)
+
+
+def _schedule_meta_cleanup(req_id, timeout):
+    """Arm a timeout fallback sweep for meta state."""
+
+    async def _cleanup_later():
+        await asyncio.sleep(timeout)
+        await _cleanup_meta_state(req_id)
+
+    old_task = _send_cleanup_tasks.pop(req_id, None)
+    if old_task is not None and not old_task.done():
+        old_task.cancel()
+    task = asyncio.create_task(_cleanup_later())
+    _send_cleanup_tasks[req_id] = task
+
 
 use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
 
@@ -371,13 +429,6 @@ class MMEncoder:
             if self.server_args.encoder_transfer_backend == "mooncake":
                 self._forward_ready_events: Dict[str, asyncio.Event] = {}
                 self._forward_results: Dict[str, dict] = {}
-                # when multiple decoder TP ranks call
-                # POST /encode with the same req_id, only the first triggers
-                # _run_forward(); subsequent callers wait on the event and
-                # return the cached metadata.
-                self._inflight_encode_lock = asyncio.Lock()
-                self._inflight_encode_events: Dict[str, asyncio.Event] = {}
-                self._inflight_encode_meta: Dict[str, Tuple] = {}
                 self._inflight_encode_cleanup_tasks: Dict[str, asyncio.Task] = {}
 
         # Bind unified encode entry point based on backend and cache config
@@ -1645,14 +1696,7 @@ class MMEncoder:
                     if "error" in result:
                         raise InternalError(f"VIT forward failed: {result['error']}")
                     embedding = result["embedding"]
-                    # Cache the embedding on mm_data so subsequent /send calls
-                    # from other decoder TP ranks can reuse it.
-                    mm_data.cached_embedding = embedding
 
-            # Retrieve cached embedding for duplicate /send calls from other
-            # decoder TP ranks.
-            if embedding is None:
-                embedding = mm_data.cached_embedding
             if embedding is None:
                 raise InternalError(
                     f"No embedding available for Mooncake GPU-direct transfer: {req_id}"
@@ -1836,18 +1880,7 @@ class MMEncoder:
         return task
 
     async def _cleanup_inflight_encode_state(self, req_id: str):
-        if not hasattr(self, "_inflight_encode_events"):
-            return
-        async with self._inflight_encode_lock:
-            self._inflight_encode_events.pop(req_id, None)
-            self._inflight_encode_meta.pop(req_id, None)
-            task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
-            if task is not None and not task.done():
-                task.cancel()
-        # Also clean up embedding data and forward state
-        mm_data = self.embedding_to_send.pop(req_id, None)
-        if mm_data is not None:
-            mm_data.cached_embedding = None
+        self.embedding_to_send.pop(req_id, None)
         # Release the rkey after all /send calls have completed.
         forward_state = self._forward_results.pop(req_id, None)
         if forward_state is not None:
@@ -1860,10 +1893,14 @@ class MMEncoder:
                         f"Shared-MR deregister failed for {req_id}: {dereg_err}"
                     )
         self._forward_ready_events.pop(req_id, None)
+        await _cleanup_meta_state(req_id)
+        task = self._inflight_encode_cleanup_tasks.pop(req_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     def _schedule_inflight_encode_cleanup(self, req_id: str):
-        if not hasattr(self, "_inflight_encode_events"):
-            return
+        """Arm a send_timeout fallback sweep so a part whose /send calls never
+        all arrive (aborted request, dead rank) is still released."""
 
         async def _cleanup_later():
             await asyncio.sleep(self.send_timeout)
@@ -2081,7 +2118,12 @@ class MMEncoder:
     async def send(
         self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
     ):
-        mm_data: EmbeddingData = self.embedding_to_send[req_id]
+        mm_data: EmbeddingData = self.embedding_to_send.get(req_id)
+        if mm_data is None:
+            # State already released (all receive_count /send done, or the
+            # send_timeout sweep fired). A late/duplicate /send is a no-op.
+            logger.warning(f"/send for {req_id} after release; skipping")
+            return
         await self._send(
             mm_data.embedding,
             mm_data,
@@ -3517,6 +3559,9 @@ async def handle_encode_request(request: dict):
                 else HTTPStatus.INTERNAL_SERVER_ERROR
             )
             logger.error(f"DP worker error for req_id={req_id}: {result['_error']}")
+            # Publish error so decoder's /scheduler_receive_meta_data unblocks.
+            await _publish_meta(req_id, 0, 0, 0, error=result["_error"])
+            _schedule_meta_cleanup(req_id, ENCODER_REQ_TIMEOUT)
             return ORJSONResponse(
                 status_code=status_code,
                 content={
@@ -3530,45 +3575,23 @@ async def handle_encode_request(request: dict):
             f"[{req_id}] /encode completed in {elapsed:.3f}s, "
             f"modality={request.get('modality', 'image')}"
         )
-        return ORJSONResponse(content=result.get("content"))
+        content = result.get("content")
+        # Mooncake: worker returned metadata dict; publish it in the main
+        # process (where /scheduler_receive_meta_data reads rid_to_meta)
+        # and return None so master's encode() stops at its gate.
+        if isinstance(content, dict) and "embedding_size" in content:
+            await _publish_meta(
+                req_id,
+                content["embedding_size"],
+                content["embedding_len"],
+                content["embedding_dim"],
+            )
+            _schedule_meta_cleanup(
+                req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
+            )
+            return ORJSONResponse(content=None)
+        return ORJSONResponse(content=content)
     try:
-        # when multiple decoder TP ranks POST /encode
-        # with the same req_id, only the first triggers the VIT forward;
-        # subsequent callers wait and return the same metadata.
-        if encoder.server_args.encoder_transfer_backend == "mooncake":
-            async with encoder._inflight_encode_lock:
-                if req_id in encoder._inflight_encode_events:
-                    event = encoder._inflight_encode_events[req_id]
-                    is_duplicate = True
-                else:
-                    event = asyncio.Event()
-                    encoder._inflight_encode_events[req_id] = event
-                    is_duplicate = False
-
-            if is_duplicate:
-                await event.wait()
-                meta = encoder._inflight_encode_meta.get(req_id)
-                if meta is None:
-                    return ORJSONResponse(
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        content={
-                            "status": "error",
-                            "message": "Encode failed on the first request",
-                            "req_id": req_id,
-                        },
-                    )
-                nbytes, embedding_len, embedding_dim = meta
-                # Build the same metadata response as the first request
-                resp = dict(request)
-                del resp["mm_items"]
-                resp.update(
-                    {
-                        "embedding_size": nbytes,
-                        "embedding_len": embedding_len,
-                        "embedding_dim": embedding_dim,
-                    }
-                )
-                return ORJSONResponse(content=resp)
 
         def start_background_send(req_id):
             task = asyncio.create_task(encoder.send_with_url(req_id=req_id))
@@ -3624,37 +3647,24 @@ async def handle_encode_request(request: dict):
                             prefill_host=request["prefill_host"],
                             embedding_port=port,
                         )
-            # Signal waiters on failure for mooncake
+            # Publish the error to meta-data waiters and arm the cleanup sweep.
             if encoder.server_args.encoder_transfer_backend == "mooncake":
-                encoder._inflight_encode_meta.pop(req_id, None)
-                evt = encoder._inflight_encode_events.pop(req_id, None)
-                if evt:
-                    evt.set()
-                await encoder._cleanup_inflight_encode_state(req_id)
+                await _publish_meta(req_id, 0, 0, 0, error=error_msg)
+                _schedule_meta_cleanup(
+                    req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
+                )
             return ORJSONResponse(
                 status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
         if encoder.server_args.encoder_transfer_backend == "mooncake":
-            # Store metadata for duplicate callers and signal them
-            encoder._inflight_encode_meta[req_id] = (
-                nbytes,
-                embedding_len,
-                embedding_dim,
+            # Publish metadata for decoder ranks pulling via
+            # /scheduler_receive_meta_data, and arm the lifetime sweep.
+            await _publish_meta(req_id, nbytes, embedding_len, embedding_dim)
+            _schedule_meta_cleanup(
+                req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
             )
-            evt = encoder._inflight_encode_events.get(req_id)
-            if evt:
-                evt.set()
-            encoder._schedule_inflight_encode_cleanup(req_id)
-            del request["mm_items"]
-            request.update(
-                {
-                    "embedding_size": nbytes,
-                    "embedding_len": embedding_len,
-                    "embedding_dim": embedding_dim,
-                }
-            )
-            return ORJSONResponse(content=request)
+            return ORJSONResponse(content=None)
         elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
             logger.info(f"{request['embedding_port'] = }")
             if request["embedding_port"] is None:
@@ -3692,13 +3702,12 @@ async def handle_encode_request(request: dict):
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         rid_to_err_msg[req_id] = error_msg
-        # Ensure inflight waiters are unblocked on unexpected errors
+        # Ensure meta-data waiters are unblocked on unexpected errors.
         if encoder.server_args.encoder_transfer_backend == "mooncake":
-            encoder._inflight_encode_meta.pop(req_id, None)
-            evt = encoder._inflight_encode_events.pop(req_id, None)
-            if evt:
-                evt.set()
-            await encoder._cleanup_inflight_encode_state(req_id)
+            await _publish_meta(req_id, 0, 0, 0, error=error_msg)
+            _schedule_meta_cleanup(
+                req_id, encoder.send_timeout if encoder else ENCODER_REQ_TIMEOUT
+            )
         return ORJSONResponse(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             content={
@@ -3734,6 +3743,10 @@ async def handle_send_request(request: dict):
                 content=f"Encoder DP worker send error: {result['_error']}",
                 status_code=status_code,
             )
+        # Worker did the RDMA transfer + its own embedding cleanup.
+        # Count in main process for rid_to_meta release.
+        if encoder is not None:
+            await _note_send_done(request["req_id"], request.get("receive_count", 1))
         return ORJSONResponse(content=result.get("content"))
     await encoder.send(
         req_id=request["req_id"],
@@ -3742,11 +3755,45 @@ async def handle_send_request(request: dict):
         session_id=request["session_id"],
         buffer_address=request["buffer_address"],
     )
-    req_id = request["req_id"]
-    # Don't pop embedding_to_send here — other decoder TP ranks may still
-    # need it for their /send calls. Cleanup is handled by the scheduled
-    # timeout task or _cleanup_inflight_encode_state.
+    await _note_send_done(request["req_id"], request.get("receive_count", 1))
     return ORJSONResponse(content=None)
+
+
+@app.post("/scheduler_receive_meta_data")
+async def handle_scheduler_receive_meta_data(request: dict):
+    rid = request["req_id"]
+    cond = await get_condition(rid)
+    async with cond:
+        try:
+            await asyncio.wait_for(
+                cond.wait_for(lambda: rid in rid_to_meta),
+                timeout=encoder.send_timeout,
+            )
+        except asyncio.TimeoutError:
+            return ORJSONResponse(
+                status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                content={
+                    "status": "error",
+                    "message": "encode metadata not ready",
+                    "req_id": rid,
+                },
+            )
+    meta = rid_to_meta.get(rid)
+    if meta is None or meta.get("error") is not None:
+        msg = meta.get("error") if meta else "encode metadata missing"
+        return ORJSONResponse(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": msg, "req_id": rid},
+        )
+    return ORJSONResponse(
+        content={
+            "req_id": rid,
+            "part_idx": request["part_idx"],
+            "embedding_size": meta["embedding_size"],
+            "embedding_len": meta["embedding_len"],
+            "embedding_dim": meta["embedding_dim"],
+        }
+    )
 
 
 @app.post("/scheduler_receive_url")
