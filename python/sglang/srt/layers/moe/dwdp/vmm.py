@@ -7,7 +7,6 @@ creation from VA pointers.  Ported from TensorRT-LLM's DWDP VMM layer.
 
 from __future__ import annotations
 
-import ctypes
 import functools
 import logging
 import platform
@@ -259,20 +258,18 @@ def tensor_from_ptr(
     element_size = torch.tensor([], dtype=dtype).element_size()
     total_bytes = numel * element_size
 
-    # Create a CUDA untyped storage wrapping the raw pointer (zero-copy).
-    # torch.UntypedStorage has _new_shared_cuda on recent PyTorch builds;
-    # we fall back to the ctypes trick if unavailable.
     device = torch.device(f"cuda:{device_id}")
+
+    # Allocate a storage and copy from the VA pointer into it.
+    # Not zero-copy but safe across all PyTorch versions and CUDA bindings.
     storage = torch.UntypedStorage(total_bytes, device=device)
-    # Overwrite the data pointer to point at our VA
-    ctypes.cast(ptr, ctypes.c_void_p)
-    storage_data_ptr = storage.data_ptr()
-    if storage_data_ptr != ptr:
-        # Need to use cudaMemcpy to copy the data into the storage
-        # This is NOT zero-copy — but safe. For true zero-copy, we'd need
-        # torch.Storage.from_file or DLPack. In practice on GB200, the
-        # tensor is used as param.data which is then replaced by setup().
-        check_cu_result(cuda.cuMemcpyDtoD(storage_data_ptr, ptr, total_bytes))
+    check_cu_result(
+        cuda.cuMemcpyDtoD(
+            _to_devptr(storage.data_ptr()),
+            _to_devptr(ptr),
+            total_bytes,
+        )
+    )
 
     tensor = torch.empty([], dtype=dtype, device=device)
     tensor.set_(storage, 0, shape)
