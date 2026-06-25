@@ -120,7 +120,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -2436,7 +2435,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
-        """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
+        """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
@@ -2613,7 +2612,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
-        bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2623,10 +2621,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.attn_cp_metadata = None
 
         if not self.spec_algorithm.is_none():
-            # Spec decoding: the draft input owns decode preparation
-            # (allocation, pre-claim, seq-lens bookkeeping).
-            draft_input: EagleDraftInput = self.spec_info
-            draft_input.prepare_for_decode(self)
+            # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
+            from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+
+            spec_prepare_for_decode(self)
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
