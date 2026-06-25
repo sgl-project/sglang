@@ -3250,13 +3250,7 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            # ngram precomputes its draft and does not relay
-                            # through the FutureMap (stash() no-ops for it); its
-                            # verify input also has no bonus_tokens to project.
-                            if not batch.spec_algorithm.is_ngram():
-                                self._relay_forward_payload(
-                                    future_indices, batch_result
-                                )
+                            self._relay_forward_payload(future_indices, batch_result)
                             # Result D2H on copy_stream overlaps the next forward
                             # instead of serializing on forward_stream; it's a leaf
                             # gated by copy_done, so nothing on forward_stream waits.
@@ -3377,8 +3371,12 @@ class Scheduler(
     ) -> None:
         """Stash this iter's relay payload for the next iter's resolve_forward_inputs.
         Keys on next_draft_input (not spec_algorithm) so split-prefill relays bonus
-        even under a spec server; callers must skip ngram (no bonus_tokens to project).
+        even under a spec server. ngram is skipped: it precomputes its draft and
+        relays it via batch.spec_info, not the FutureMap (stash() and
+        _resolve_spec_extras() no-op for it too).
         """
+        if self.spec_algorithm.is_ngram():
+            return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
         elif batch_result.has_sampled_token_ids:
