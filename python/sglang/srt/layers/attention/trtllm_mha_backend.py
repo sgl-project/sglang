@@ -158,15 +158,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
-        # The fused dynamic-Q-quant + KV-write kernel is gated to models that
-        # actually need a per-step dynamic Q scale on the fp8 KV path. Gemma4 is
-        # the one such model here: its checkpoint carries no static/calibrated q
-        # scale (attention is unquantized bf16), so trtllm-gen must quantize Q
-        # dynamically. Other fp8 models keep the standard path.
-        self._fused_q_kv_arch = (
-            "Gemma4ForConditionalGeneration" in config.hf_config.architectures
-        )
-
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
@@ -587,57 +578,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Check if we should use the fused FP8 KV cache write path."""
         return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
 
-    def _should_use_fused_q_kv_path(
-        self,
-        save_kv_cache: bool,
-        k: torch.Tensor,
-        forward_mode: ForwardMode,
-        num_tokens: int,
-    ) -> bool:
-        return (
-            self.data_type == torch.float8_e4m3fn
-            and self._fused_q_kv_arch
-            and not self.is_xqa_impl
-            and save_kv_cache
-            and k is not None
-            and num_tokens > 0
-            and getattr(self.token_to_kv_pool, "kv_cache_layout", "nhd") == "nhd"
-            and (
-                forward_mode.is_decode_or_idle()
-                or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend_v2()
-            )
-        )
-
-    def _fused_q_quant_kv_write(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        from sglang.jit_kernel.fused_q_quant_kv_write import fused_q_quant_kv_write
-
-        cache_loc = self._get_layer_cache_loc(layer, forward_batch)
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
-        v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
-
-        q_fp8, bmm1_scale = fused_q_quant_kv_write(
-            q=q,
-            k=k,
-            v=v,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            cache_loc=cache_loc,
-            inv_k_scale=1.0 / k_scale,
-            inv_v_scale=1.0 / v_scale,
-            bmm1_extra=k_scale * layer.scaling,
-        )
-        return q_fp8, bmm1_scale, v_scale
-
     def _fused_fp8_set_kv_buffer(
         self,
         q: torch.Tensor,
@@ -822,41 +762,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        if self._should_use_fused_q_kv_path(
-            save_kv_cache, k, forward_batch.forward_mode, q.shape[0]
-        ):
-            q, bmm1_scale, bmm2_scale = self._fused_q_quant_kv_write(
-                q, k, v, layer, forward_batch
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+
+        if use_fused_fp8_path:
+            # Use fused FP8 quantization + KV cache write path
+            self._fused_fp8_set_kv_buffer(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
             )
             k = None
             v = None
         else:
-            use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
-
-            if use_fused_fp8_path:
-                self._fused_fp8_set_kv_buffer(
-                    q=q,
-                    k=k,
-                    v=v,
-                    layer=layer,
-                    forward_batch=forward_batch,
+            # Use original set_kv_buffer path
+            if save_kv_cache and k is not None:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
-                k = None
-                v = None
-            else:
-                if save_kv_cache and k is not None:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
 
-            q, q_scale = self._maybe_quantize_q(q)
-            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
-
+        # For XQA, q_dtype should be bf16. TRT-LLM-GEN uses FP8 Q; dynamically
+        # quantize it and pass the descale into BMM1 instead of unscaled casting.
+        q, q_scale = self._maybe_quantize_q(q)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -875,6 +808,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_cache = (k_cache, v_cache)
 
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -911,43 +845,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         cache_loc = forward_batch.out_cache_loc
 
-        if self._should_use_fused_q_kv_path(
-            save_kv_cache, k, forward_batch.forward_mode, q.shape[0]
-        ):
-            q, bmm1_scale, bmm2_scale = self._fused_q_quant_kv_write(
-                q, k, v, layer, forward_batch
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
+
+        if use_fused_fp8_path:
+            # Use fused FP8 quantization + KV cache write path
+            self._fused_fp8_set_kv_buffer(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
             )
             k = None
             v = None
         else:
-            use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
-
-            if use_fused_fp8_path:
-                self._fused_fp8_set_kv_buffer(
-                    q=q,
-                    k=k,
-                    v=v,
-                    layer=layer,
-                    forward_batch=forward_batch,
+            # Use original set_kv_buffer path
+            if save_kv_cache and k is not None:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
-                k = None
-                v = None
-            else:
-                if save_kv_cache and k is not None:
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                        k,
-                        v,
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
 
-            q, q_scale = self._maybe_quantize_q(
-                q, force_fp8=not forward_batch.forward_mode.is_target_verify()
-            )
-            bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
-
+        q, q_scale = self._maybe_quantize_q(
+            q, force_fp8=not forward_batch.forward_mode.is_target_verify()
+        )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -967,6 +892,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
