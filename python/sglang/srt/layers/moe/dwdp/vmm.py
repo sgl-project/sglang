@@ -176,8 +176,7 @@ def reserve_va(size: int, granularity: int) -> int:
 def free_va(va: int, size: int) -> None:
     """Free reserved virtual address space."""
     if va != 0:
-        device_ptr = cuda.CUdeviceptr(va)
-        check_cu_result(cuda.cuMemAddressFree(device_ptr, size))
+        check_cu_result(cuda.cuMemAddressFree(va, size))
 
 
 def map_handle(va: int, size: int, handle: int, offset: int = 0) -> None:
