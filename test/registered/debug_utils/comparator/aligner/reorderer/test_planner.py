@@ -20,11 +20,14 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import AxisInfo
 from sglang.srt.debug_utils.comparator.dims_spec import (
     DimSpec,
     ParallelAxis,
+    apply_dim_names,
     parse_dims,
+    without_dim_names,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 class TestComputeReordererPlans:
@@ -159,7 +162,9 @@ class TestCpZigzagTpE2E:
         assert len(unsharder_plans) == 2
         assert len(reorderer_plans) == 1
 
-        current: list[torch.Tensor] = [t.refine_names(*dim_names) for t in tensors]
+        current: list[torch.Tensor] = [
+            apply_dim_names(t, list(dim_names)) for t in tensors
+        ]
         for plan in all_plans:
             if isinstance(plan, ReordererPlan):
                 current = execute_reorderer_plan(plan, current)
@@ -167,7 +172,7 @@ class TestCpZigzagTpE2E:
                 current = execute_unsharder_plan(plan, current).tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
 
 class TestCpZigzagSpSameDimE2E:
@@ -237,7 +242,9 @@ class TestCpZigzagSpSameDimE2E:
         assert unsharder_plans[1].axis == ParallelAxis.CP
         assert len(reorderer_plans) == 1  # zigzag reorder
 
-        current: list[torch.Tensor] = [t.refine_names(*dim_names) for t in tensors]
+        current: list[torch.Tensor] = [
+            apply_dim_names(t, list(dim_names)) for t in tensors
+        ]
         for plan in all_plans:
             if isinstance(plan, ReordererPlan):
                 current = execute_reorderer_plan(plan, current)
@@ -245,7 +252,7 @@ class TestCpZigzagSpSameDimE2E:
                 current = execute_unsharder_plan(plan, current).tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
 
 if __name__ == "__main__":

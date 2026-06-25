@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from array import array
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -36,7 +37,7 @@ class SessionReqNode:
     def __init__(
         self,
         req: Req,
-        parent: Optional["SessionReqNode"] = None,
+        parent: Optional[SessionReqNode] = None,
         children=None,
     ):
         self.req = req
@@ -94,11 +95,110 @@ class Session:
         self.req_nodes: Dict[str, SessionReqNode] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
+        # Token-array lengths of last_req as of its finish_req. The share path
+        # appends speculatively beyond these; only finish_req confirms them, so
+        # _share_token_arrays trims back first (heals aborted turns).
+        self.committed_origin_len: Optional[int] = None
+        self.committed_unpadded_len: Optional[int] = None
+        self.committed_fill_len: Optional[int] = None
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
             return False
         return time.monotonic() - self.last_active_time > self.timeout
+
+    @staticmethod
+    def _strip_bos_token(req: TokenizedGenerateReqInput, tokenizer) -> None:
+        """Trim a leading BOS on an appended turn; shift mm offsets to match."""
+        if not (
+            tokenizer is not None
+            and req.input_ids
+            and req.input_ids[0] == tokenizer.bos_token_id
+        ):
+            return
+        req.input_ids = req.input_ids[1:]
+        if req.mm_inputs:
+            for item in req.mm_inputs.mm_items:
+                if item.offsets:
+                    if any(s == 0 for s, _ in item.offsets):
+                        logging.warning(
+                            "mm_item offset starts at 0 (BOS position), "
+                            "clamping to 0 after BOS strip"
+                        )
+                    item.offsets = [
+                        (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
+                    ]
+
+    def _share_token_arrays(self, last_req: Req, new_input_ids):
+        """Plain streaming append: reuse last_req's token arrays in place.
+
+        Trims each array back to its committed length first — an earlier turn
+        may have appended its tokens and then aborted before finish_req, and
+        req_nodes still points at last_req, so anything beyond the committed
+        lengths is unconfirmed. Then extends with last turn's output and the
+        new input. Returns (input_ids, input_ids_unpadded, carry_fill);
+        carry_fill (== the new origin) spares the first fill_ids rebuild.
+        """
+        out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+
+        input_ids = last_req.origin_input_ids
+        del input_ids[self.committed_origin_len :]
+        if last_req.origin_input_ids_unpadded is input_ids:
+            input_ids_unpadded = input_ids
+        else:
+            input_ids_unpadded = last_req.origin_input_ids_unpadded
+            del input_ids_unpadded[self.committed_unpadded_len :]
+
+        carry_fill = last_req.full_untruncated_fill_ids
+        if (
+            not isinstance(carry_fill, array)
+            or carry_fill is input_ids
+            or carry_fill is input_ids_unpadded
+        ):
+            # Unexpected type or aliased with an origin array (extending it
+            # below would double-append): let _refresh_fill_ids rebuild.
+            carry_fill = None
+        else:
+            del carry_fill[self.committed_fill_len :]
+            baked = len(carry_fill) - len(input_ids)
+            if 0 <= baked <= len(out_tail):
+                carry_fill.extend(out_tail[baked:])
+                carry_fill.extend(new_input_ids)
+            else:
+                carry_fill = None
+
+        input_ids.extend(out_tail)
+        input_ids.extend(new_input_ids)
+        if input_ids_unpadded is not input_ids:
+            input_ids_unpadded.extend(out_tail)
+            input_ids_unpadded.extend(new_input_ids)
+        return input_ids, input_ids_unpadded, carry_fill
+
+    @staticmethod
+    def _concat_token_arrays(
+        last_req: Req, req: TokenizedGenerateReqInput, session_params
+    ):
+        """Copy-based assembly for replace/offset/drop_previous_output turns."""
+        out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+
+        input_ids = last_req.origin_input_ids + out_tail
+        if session_params.drop_previous_output:
+            input_ids = last_req.origin_input_ids[:]
+        if session_params.offset and session_params.offset != 0:
+            input_ids = input_ids[: session_params.offset] + req.input_ids
+        else:
+            input_ids += req.input_ids
+
+        input_ids_unpadded = last_req.origin_input_ids_unpadded + out_tail
+        if session_params.drop_previous_output:
+            input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
+        if session_params.offset and session_params.offset != 0:
+            input_ids_unpadded = (
+                input_ids_unpadded[: session_params.offset] + req.input_ids
+            )
+        else:
+            input_ids_unpadded += req.input_ids
+        return input_ids, input_ids_unpadded
 
     def create_req(
         self,
@@ -163,54 +263,28 @@ class Session:
                         abort_message = "Session request is appending to a request that hasn't finished."
                         logging.warning(abort_message)
 
+        carry_fill = None
         if last_req is not None:
-            # trim bos token if it is an append
-            if (
-                tokenizer is not None
-                and req.input_ids
-                and req.input_ids[0] == tokenizer.bos_token_id
-            ):
-                req.input_ids = req.input_ids[1:]
-                # Adjust mm_item offsets since they were computed on
-                # the pre-strip sequence (with BOS at position 0)
-                if req.mm_inputs:
-                    for item in req.mm_inputs.mm_items:
-                        if item.offsets:
-                            if any(s == 0 for s, _ in item.offsets):
-                                logging.warning(
-                                    "mm_item offset starts at 0 (BOS position), "
-                                    "clamping to 0 after BOS strip"
-                                )
-                            item.offsets = [
-                                (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
-                            ]
-
-            input_ids = (
-                last_req.origin_input_ids
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
+            self._strip_bos_token(req, tokenizer)
+            # In-place sharing is only safe for the plain streaming append:
+            # streaming sessions allow a single inflight request, last_req has
+            # finished, and the committed_* lengths recorded by finish_req let
+            # _share_token_arrays trim away tokens appended by an aborted turn.
+            # offset / drop_previous_output rewrite history and must copy.
+            can_share_token_arrays = (
+                self.streaming
+                and self.committed_origin_len is not None
+                and not session_params.drop_previous_output
+                and not (session_params.offset and session_params.offset != 0)
             )
-
-            if session_params.drop_previous_output:
-                input_ids = last_req.origin_input_ids[:]
-
-            if session_params.offset and session_params.offset != 0:
-                input_ids = input_ids[: session_params.offset] + req.input_ids
-            else:
-                input_ids += req.input_ids
-
-            input_ids_unpadded = (
-                last_req.origin_input_ids_unpadded
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
-            if session_params.drop_previous_output:
-                input_ids_unpadded = last_req.origin_input_ids_unpadded[:]
-
-            if session_params.offset and session_params.offset != 0:
-                input_ids_unpadded = (
-                    input_ids_unpadded[: session_params.offset] + req.input_ids
+            if can_share_token_arrays:
+                input_ids, input_ids_unpadded, carry_fill = self._share_token_arrays(
+                    last_req, req.input_ids
                 )
             else:
-                input_ids_unpadded += req.input_ids
+                input_ids, input_ids_unpadded = self._concat_token_arrays(
+                    last_req, req, session_params
+                )
         else:
             input_ids = req.input_ids
             input_ids_unpadded = req.input_ids
@@ -243,6 +317,8 @@ class Session:
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
         new_req.tokenizer = tokenizer
+        if carry_fill is not None:
+            new_req.full_untruncated_fill_ids = carry_fill
 
         if abort:
             new_req.set_finish_with_abort(abort_message)
@@ -263,6 +339,10 @@ class Session:
             prev_node.req.session = None
             self.req_nodes.clear()
         self.req_nodes[req.rid] = SessionReqNode(req)
+        # Confirm this req's token arrays as the session's rollback point.
+        self.committed_origin_len = len(req.origin_input_ids)
+        self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
+        self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
     def abort_req(self):
         """Clear inflight flag on abort (req_nodes stays unchanged)."""
@@ -285,10 +365,10 @@ class SessionController:
         session_id = recv_req.session_id
         if session_id in self.sessions:
             logger.warning(f"session id {session_id} already exist, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
+            return OpenSessionReqOutput(session_id=session_id, success=False)
         elif session_id is None:
             logger.warning("session id is None, cannot open.")
-            return OpenSessionReqOutput(session_id, False)
+            return OpenSessionReqOutput(session_id=session_id, success=False)
         else:
             self.sessions[session_id] = Session(
                 recv_req.capacity_of_str_len,
@@ -299,7 +379,7 @@ class SessionController:
             log_info_on_rank0(
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"
             )
-            return OpenSessionReqOutput(session_id, True)
+            return OpenSessionReqOutput(session_id=session_id, success=True)
 
     def close(self, recv_req: CloseSessionReqInput):
         session_id = recv_req.session_id

@@ -22,19 +22,23 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
 from sglang.srt.debug_utils.comparator.dims_spec import (
     DimSpec,
     ParallelAxis,
+    apply_dim_names,
+    get_dim_names,
     parse_dims,
+    without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.output_types import ReplicatedCheckResult
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 def _name_tensors(
     tensors: list[torch.Tensor], dim_specs: list[DimSpec]
 ) -> list[torch.Tensor]:
     names: list[str] = [s.sanitized_name for s in dim_specs]
-    return [t.refine_names(*names) for t in tensors]
+    return [apply_dim_names(t, names) for t in tensors]
 
 
 class TestExecuteUnsharderPlan:
@@ -54,7 +58,9 @@ class TestExecuteUnsharderPlan:
             plans[0], named_shards
         )
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
         assert unsharder_result.replicated_checks == []
 
     def test_scrambled_world_ranks_correct_result(self) -> None:
@@ -85,7 +91,9 @@ class TestExecuteUnsharderPlan:
             plans[0], tensors_ordered_by_world_rank
         )
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
         assert unsharder_result.replicated_checks == []
 
     def test_single_step_reduces_tensor_count(self) -> None:
@@ -155,7 +163,7 @@ class TestExecuteUnsharderPlan:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
     def test_cp_tp_scrambled(self) -> None:
         """Scrambled world_ranks for CP=2 + TP=2 still reconstruct correctly."""
@@ -197,7 +205,7 @@ class TestExecuteUnsharderPlan:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
     def test_unsupported_params_type_raises(self) -> None:
         """_apply_unshard raises ValueError for unknown params type."""
@@ -251,7 +259,7 @@ class TestExecuteUnsharderPlan:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
     def test_cp_tp_ep_scrambled_three_axis(self) -> None:
         """Scrambled ranks for CP=2 + TP=2 + EP=2 still reconstruct correctly."""
@@ -300,7 +308,7 @@ class TestExecuteUnsharderPlan:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
 
 class TestPickOperation:
@@ -324,7 +332,7 @@ class TestPickOperation:
             plans[0], [tensor, tensor.clone()]
         )
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), tensor)
+        assert torch.allclose(without_dim_names(unsharder_result.tensors[0]), tensor)
         assert all(c.passed for c in unsharder_result.replicated_checks)
 
     def test_pick_multiple_groups(self) -> None:
@@ -397,7 +405,7 @@ class TestPickOperation:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
     def test_fully_replicated_e2e(self) -> None:
         """CP2 TP2, dims='b h d # cp:replicated tp:replicated': fully replicated -> 2 pick steps -> 1 tensor."""
@@ -430,7 +438,7 @@ class TestPickOperation:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
 
 class TestVerifyReplicatedGroup:
@@ -503,7 +511,7 @@ class TestVerifyReplicatedGroup:
         assert len(unsharder_result.tensors) == 1
         assert len(unsharder_result.replicated_checks) == 1
         assert not unsharder_result.replicated_checks[0].passed
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), tensor_a)
+        assert torch.allclose(without_dim_names(unsharder_result.tensors[0]), tensor_a)
 
     def test_atol_boundary_within(self) -> None:
         """Difference exactly at atol (1e-6) -> passed."""
@@ -554,8 +562,8 @@ class TestVerifyReplicatedGroup:
 class TestThdCpConcat:
     def test_single_seq(self) -> None:
         """Single seq THD unshard: 2 ranks → per-seq concat."""
-        rank0 = torch.tensor([1, 2, 3]).refine_names("t")
-        rank1 = torch.tensor([4, 5, 6]).refine_names("t")
+        rank0 = apply_dim_names(torch.tensor([1, 2, 3]), ["t"])
+        rank1 = apply_dim_names(torch.tensor([4, 5, 6]), ["t"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -566,7 +574,7 @@ class TestThdCpConcat:
 
         assert len(unsharder_result.tensors) == 1
         expected = torch.tensor([1, 2, 3, 4, 5, 6])
-        assert torch.equal(unsharder_result.tensors[0].rename(None), expected)
+        assert torch.equal(without_dim_names(unsharder_result.tensors[0]), expected)
 
     def test_multi_seq(self) -> None:
         """Multi-seq THD unshard: 2 ranks, seq_lens=[50, 32, 46]."""
@@ -575,12 +583,12 @@ class TestThdCpConcat:
         seq_a_r0 = torch.arange(0, 50)
         seq_b_r0 = torch.arange(100, 132)
         pad_r0 = torch.full((46,), -1)
-        rank0 = torch.cat([seq_a_r0, seq_b_r0, pad_r0]).refine_names("t")
+        rank0 = apply_dim_names(torch.cat([seq_a_r0, seq_b_r0, pad_r0]), ["t"])
 
         seq_a_r1 = torch.arange(50, 100)
         seq_b_r1 = torch.arange(132, 164)
         pad_r1 = torch.full((46,), -2)
-        rank1 = torch.cat([seq_a_r1, seq_b_r1, pad_r1]).refine_names("t")
+        rank1 = apply_dim_names(torch.cat([seq_a_r1, seq_b_r1, pad_r1]), ["t"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -590,7 +598,7 @@ class TestThdCpConcat:
         unsharder_result: UnsharderResult = execute_unsharder_plan(plan, [rank0, rank1])
 
         assert len(unsharder_result.tensors) == 1
-        unsharded: torch.Tensor = unsharder_result.tensors[0].rename(None)
+        unsharded: torch.Tensor = without_dim_names(unsharder_result.tensors[0])
 
         # seqA: r0(50) + r1(50) = 100 tokens, values 0..99
         assert torch.equal(unsharded[:100], torch.cat([seq_a_r0, seq_a_r1]))
@@ -607,11 +615,11 @@ class TestThdCpConcat:
         # rank1: [seqA_r1(3, 4) | seqB_r1(2, 4)]
         seq_a_r0 = torch.randn(3, hidden)
         seq_b_r0 = torch.randn(2, hidden)
-        rank0 = torch.cat([seq_a_r0, seq_b_r0]).refine_names("t", "h")
+        rank0 = apply_dim_names(torch.cat([seq_a_r0, seq_b_r0]), ["t", "h"])
 
         seq_a_r1 = torch.randn(3, hidden)
         seq_b_r1 = torch.randn(2, hidden)
-        rank1 = torch.cat([seq_a_r1, seq_b_r1]).refine_names("t", "h")
+        rank1 = apply_dim_names(torch.cat([seq_a_r1, seq_b_r1]), ["t", "h"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -621,7 +629,7 @@ class TestThdCpConcat:
         unsharder_result: UnsharderResult = execute_unsharder_plan(plan, [rank0, rank1])
 
         assert len(unsharder_result.tensors) == 1
-        unsharded: torch.Tensor = unsharder_result.tensors[0].rename(None)
+        unsharded: torch.Tensor = without_dim_names(unsharder_result.tensors[0])
 
         assert unsharded.shape == (10, hidden)
         assert torch.equal(unsharded[:6], torch.cat([seq_a_r0, seq_a_r1]))
@@ -636,11 +644,11 @@ class TestThdCpConcat:
         # rank1: [seqA_r1(3) | seqB_r1(2)] per batch item
         seq_a_r0 = torch.randn(batch, 3, hidden)
         seq_b_r0 = torch.randn(batch, 2, hidden)
-        rank0 = torch.cat([seq_a_r0, seq_b_r0], dim=1).refine_names("b", "t", "h")
+        rank0 = apply_dim_names(torch.cat([seq_a_r0, seq_b_r0], dim=1), ["b", "t", "h"])
 
         seq_a_r1 = torch.randn(batch, 3, hidden)
         seq_b_r1 = torch.randn(batch, 2, hidden)
-        rank1 = torch.cat([seq_a_r1, seq_b_r1], dim=1).refine_names("b", "t", "h")
+        rank1 = apply_dim_names(torch.cat([seq_a_r1, seq_b_r1], dim=1), ["b", "t", "h"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -650,7 +658,7 @@ class TestThdCpConcat:
         unsharder_result: UnsharderResult = execute_unsharder_plan(plan, [rank0, rank1])
 
         assert len(unsharder_result.tensors) == 1
-        unsharded: torch.Tensor = unsharder_result.tensors[0].rename(None)
+        unsharded: torch.Tensor = without_dim_names(unsharder_result.tensors[0])
 
         assert unsharded.shape == (batch, 10, hidden)
         # seqA: r0(3) + r1(3) = 6 tokens per batch
@@ -683,7 +691,9 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
 
     def test_tp4_reduce(self) -> None:
         """4 partial tensors sum to full tensor."""
@@ -704,7 +714,9 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
 
     def test_multi_axis_concat_then_reduce(self) -> None:
         """CP concat + TP reduce end-to-end."""
@@ -735,7 +747,7 @@ class TestReduceSum:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
     def test_reduce_scrambled_ranks(self) -> None:
         """Scrambled rank order — sum is commutative so result is the same."""
@@ -763,13 +775,15 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
 
     def test_reduce_preserves_named_dims(self) -> None:
         """Named tensor dimensions are preserved through reduce_sum."""
         dim_specs = parse_dims("h[tp:partial] d").dims
-        part_a = torch.randn(4, 8).refine_names("h", "d")
-        part_b = torch.randn(4, 8).refine_names("h", "d")
+        part_a = apply_dim_names(torch.randn(4, 8), ["h", "d"])
+        part_b = apply_dim_names(torch.randn(4, 8), ["h", "d"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.TP,
@@ -781,10 +795,12 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert unsharder_result.tensors[0].names == ("h", "d")
-        expected = (part_a.rename(None) + part_b.rename(None)).refine_names("h", "d")
+        assert get_dim_names(unsharder_result.tensors[0]) == ("h", "d")
+        expected = apply_dim_names(
+            without_dim_names(part_a) + without_dim_names(part_b), ["h", "d"]
+        )
         assert torch.allclose(
-            unsharder_result.tensors[0].rename(None), expected.rename(None)
+            without_dim_names(unsharder_result.tensors[0]), without_dim_names(expected)
         )
 
     def test_recompute_pseudo_mismatch(self) -> None:
@@ -809,8 +825,8 @@ class TestReduceSum:
 class TestThdCpConcat:
     def test_single_seq(self) -> None:
         """Single seq THD unshard: 2 ranks → per-seq concat."""
-        rank0 = torch.tensor([1, 2, 3]).refine_names("t")
-        rank1 = torch.tensor([4, 5, 6]).refine_names("t")
+        rank0 = apply_dim_names(torch.tensor([1, 2, 3]), ["t"])
+        rank1 = apply_dim_names(torch.tensor([4, 5, 6]), ["t"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -821,7 +837,7 @@ class TestThdCpConcat:
 
         assert len(unsharder_result.tensors) == 1
         expected = torch.tensor([1, 2, 3, 4, 5, 6])
-        assert torch.equal(unsharder_result.tensors[0].rename(None), expected)
+        assert torch.equal(without_dim_names(unsharder_result.tensors[0]), expected)
 
     def test_multi_seq(self) -> None:
         """Multi-seq THD unshard: 2 ranks, seq_lens=[50, 32, 46]."""
@@ -830,12 +846,12 @@ class TestThdCpConcat:
         seq_a_r0 = torch.arange(0, 50)
         seq_b_r0 = torch.arange(100, 132)
         pad_r0 = torch.full((46,), -1)
-        rank0 = torch.cat([seq_a_r0, seq_b_r0, pad_r0]).refine_names("t")
+        rank0 = apply_dim_names(torch.cat([seq_a_r0, seq_b_r0, pad_r0]), ["t"])
 
         seq_a_r1 = torch.arange(50, 100)
         seq_b_r1 = torch.arange(132, 164)
         pad_r1 = torch.full((46,), -2)
-        rank1 = torch.cat([seq_a_r1, seq_b_r1, pad_r1]).refine_names("t")
+        rank1 = apply_dim_names(torch.cat([seq_a_r1, seq_b_r1, pad_r1]), ["t"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -845,7 +861,7 @@ class TestThdCpConcat:
         unsharder_result: UnsharderResult = execute_unsharder_plan(plan, [rank0, rank1])
 
         assert len(unsharder_result.tensors) == 1
-        unsharded: torch.Tensor = unsharder_result.tensors[0].rename(None)
+        unsharded: torch.Tensor = without_dim_names(unsharder_result.tensors[0])
 
         # seqA: r0(50) + r1(50) = 100 tokens, values 0..99
         assert torch.equal(unsharded[:100], torch.cat([seq_a_r0, seq_a_r1]))
@@ -862,11 +878,11 @@ class TestThdCpConcat:
         # rank1: [seqA_r1(3, 4) | seqB_r1(2, 4)]
         seq_a_r0 = torch.randn(3, hidden)
         seq_b_r0 = torch.randn(2, hidden)
-        rank0 = torch.cat([seq_a_r0, seq_b_r0]).refine_names("t", "h")
+        rank0 = apply_dim_names(torch.cat([seq_a_r0, seq_b_r0]), ["t", "h"])
 
         seq_a_r1 = torch.randn(3, hidden)
         seq_b_r1 = torch.randn(2, hidden)
-        rank1 = torch.cat([seq_a_r1, seq_b_r1]).refine_names("t", "h")
+        rank1 = apply_dim_names(torch.cat([seq_a_r1, seq_b_r1]), ["t", "h"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -876,7 +892,7 @@ class TestThdCpConcat:
         unsharder_result: UnsharderResult = execute_unsharder_plan(plan, [rank0, rank1])
 
         assert len(unsharder_result.tensors) == 1
-        unsharded: torch.Tensor = unsharder_result.tensors[0].rename(None)
+        unsharded: torch.Tensor = without_dim_names(unsharder_result.tensors[0])
 
         assert unsharded.shape == (10, hidden)
         assert torch.equal(unsharded[:6], torch.cat([seq_a_r0, seq_a_r1]))
@@ -891,11 +907,11 @@ class TestThdCpConcat:
         # rank1: [seqA_r1(3) | seqB_r1(2)] per batch item
         seq_a_r0 = torch.randn(batch, 3, hidden)
         seq_b_r0 = torch.randn(batch, 2, hidden)
-        rank0 = torch.cat([seq_a_r0, seq_b_r0], dim=1).refine_names("b", "t", "h")
+        rank0 = apply_dim_names(torch.cat([seq_a_r0, seq_b_r0], dim=1), ["b", "t", "h"])
 
         seq_a_r1 = torch.randn(batch, 3, hidden)
         seq_b_r1 = torch.randn(batch, 2, hidden)
-        rank1 = torch.cat([seq_a_r1, seq_b_r1], dim=1).refine_names("b", "t", "h")
+        rank1 = apply_dim_names(torch.cat([seq_a_r1, seq_b_r1], dim=1), ["b", "t", "h"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.CP,
@@ -905,7 +921,7 @@ class TestThdCpConcat:
         unsharder_result: UnsharderResult = execute_unsharder_plan(plan, [rank0, rank1])
 
         assert len(unsharder_result.tensors) == 1
-        unsharded: torch.Tensor = unsharder_result.tensors[0].rename(None)
+        unsharded: torch.Tensor = without_dim_names(unsharder_result.tensors[0])
 
         assert unsharded.shape == (batch, 10, hidden)
         # seqA: r0(3) + r1(3) = 6 tokens per batch
@@ -938,7 +954,9 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
 
     def test_tp4_reduce(self) -> None:
         """4 partial tensors sum to full tensor."""
@@ -959,7 +977,9 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
 
     def test_multi_axis_concat_then_reduce(self) -> None:
         """CP concat + TP reduce end-to-end."""
@@ -990,7 +1010,7 @@ class TestReduceSum:
             current = unsharder_result.tensors
 
         assert len(current) == 1
-        assert torch.allclose(current[0].rename(None), full_tensor)
+        assert torch.allclose(without_dim_names(current[0]), full_tensor)
 
     def test_reduce_scrambled_ranks(self) -> None:
         """Scrambled rank order — sum is commutative so result is the same."""
@@ -1018,13 +1038,15 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
 
     def test_reduce_preserves_named_dims(self) -> None:
         """Named tensor dimensions are preserved through reduce_sum."""
         dim_specs = parse_dims("h[tp:partial] d").dims
-        part_a = torch.randn(4, 8).refine_names("h", "d")
-        part_b = torch.randn(4, 8).refine_names("h", "d")
+        part_a = apply_dim_names(torch.randn(4, 8), ["h", "d"])
+        part_b = apply_dim_names(torch.randn(4, 8), ["h", "d"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.TP,
@@ -1036,10 +1058,12 @@ class TestReduceSum:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert unsharder_result.tensors[0].names == ("h", "d")
-        expected = (part_a.rename(None) + part_b.rename(None)).refine_names("h", "d")
+        assert get_dim_names(unsharder_result.tensors[0]) == ("h", "d")
+        expected = apply_dim_names(
+            without_dim_names(part_a) + without_dim_names(part_b), ["h", "d"]
+        )
         assert torch.allclose(
-            unsharder_result.tensors[0].rename(None), expected.rename(None)
+            without_dim_names(unsharder_result.tensors[0]), without_dim_names(expected)
         )
 
 
@@ -1064,7 +1088,9 @@ class TestFusedDimExecutor:
         )
 
         assert len(unsharder_result.tensors) == 1
-        assert torch.allclose(unsharder_result.tensors[0].rename(None), full_tensor)
+        assert torch.allclose(
+            without_dim_names(unsharder_result.tensors[0]), full_tensor
+        )
 
 
 if __name__ == "__main__":

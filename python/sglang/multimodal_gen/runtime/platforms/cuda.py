@@ -124,7 +124,7 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "cudnn" if cls.is_blackwell() else "auto"
+        default_backend = "trtllm"
         if backend is None:
             return default_backend
 
@@ -151,35 +151,23 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
         requested_backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        prefer_flashinfer = requested_backend is not None
-
-        # TODO: Remove this explicit FlashInfer preference once the sm100 CUTLASS
-        # LargeM dispatch grows a validated fallback for Blackwell NVFP4 shapes
-        # such as Wan2.2's large-M attention projections.
-        if prefer_flashinfer:
-            try:
-                from flashinfer import mm_fp4 as flashinfer_mm_fp4
-
-                return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
-            except ImportError:
-                logger.warning(
-                    "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
-                    "but flashinfer.mm_fp4 is unavailable. Falling back to "
-                    "cutlass.",
-                    requested_backend,
-                )
-
-        try:
-            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
-
-            return cutlass_fp4_gemm, None
-        except ImportError:
-            pass
 
         try:
             from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
             return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+        except ImportError:
+            logger.warning(
+                "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
+                "but flashinfer.mm_fp4 is unavailable. Falling back to "
+                "cutlass.",
+                requested_backend or "flashinfer_trtllm (default)",
+            )
+
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
         except ImportError:
             return None, None
 
@@ -201,7 +189,7 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -209,8 +197,8 @@ class CudaPlatformBase(Platform):
         if empty_cache:
             torch.cuda.empty_cache()
 
-        if torch.distributed.is_initialized():
-            device_id = torch.distributed.get_rank()
+        if device_id is None:
+            device_id = torch.cuda.current_device()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -245,8 +233,6 @@ class CudaPlatformBase(Platform):
                     SlidingTileAttentionBackend,
                 )
 
-                logger.info("Using Sliding Tile Attention backend")
-
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn.SlidingTileAttentionBackend"
             except ImportError as e:
                 logger.error(
@@ -263,8 +249,6 @@ class CudaPlatformBase(Platform):
                     SageAttentionBackend,
                 )
 
-                logger.info("Using Sage Attention backend")
-
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
             except ImportError as e:
                 logger.info(e)
@@ -278,7 +262,6 @@ class CudaPlatformBase(Platform):
                     SageAttention3Backend,
                 )
 
-                logger.info("Using Sage Attention 3 backend")
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
             except ImportError as e:
                 logger.info(e)
@@ -293,8 +276,6 @@ class CudaPlatformBase(Platform):
                 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (  # noqa: F401
                     VideoSparseAttentionBackend,
                 )
-
-                logger.info("Using Video Sparse Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
             except ImportError as e:
@@ -321,7 +302,6 @@ class CudaPlatformBase(Platform):
                     SparseVideoGen2AttentionBackend,
                 )
 
-                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
             except ImportError as e:
                 logger.error(
@@ -340,8 +320,6 @@ class CudaPlatformBase(Platform):
                 from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
                     VMOBAAttentionBackend,
                 )
-
-                logger.info("Using Video MOBA Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
             except ImportError as e:
@@ -387,23 +365,18 @@ class CudaPlatformBase(Platform):
                     "flashinfer.prefill.trtllm_ragged_attention_deepseek."
                 ) from e
         elif selected_backend == AttentionBackendEnum.AITER:
-            logger.info("Using AITer backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
         elif selected_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         elif selected_backend == AttentionBackendEnum.SLA_ATTN:
-            logger.info("Using Sparse Linear Attention backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
         elif selected_backend == AttentionBackendEnum.SAGE_SLA_ATTN:
-            logger.info("Using Sage Sparse Linear Attention backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
         elif selected_backend == AttentionBackendEnum.FA2:
             from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
                 FlashAttention2Backend,
             )
 
-            logger.info("Using FlashAttention2 backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
         elif selected_backend in [
             AttentionBackendEnum.FA,
@@ -485,11 +458,7 @@ class CudaPlatformBase(Platform):
                 target_backend = AttentionBackendEnum.TORCH_SDPA
 
         if target_backend == AttentionBackendEnum.TORCH_SDPA:
-            logger.info("Using Torch SDPA backend")
-
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-
-        logger.info("Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend")
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 

@@ -5,7 +5,7 @@ from torch import nn
 from transformers.models.granitemoeshared import GraniteMoeSharedConfig
 
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import make_layers
 
 from .granitemoe import GraniteMoeMoE
@@ -112,7 +113,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_tensor_model_parallel_world_size(),
+                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 
@@ -148,6 +149,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
             layer_id=self.layer_idx,
             hidden_states=hidden_states,
             output=output,
+            forward_batch=forward_batch,
             use_triton_causal_conv=True,
         )
 
@@ -191,7 +193,7 @@ class GraniteMoeHybridAttention(nn.Module):
         self.total_num_kv_heads = config.num_key_value_heads
 
         # TensorParallel logic
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
         if self.total_num_kv_heads >= tp_size:
@@ -298,7 +300,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
                 quant_config=quant_config,
-                tp_size=get_tensor_model_parallel_world_size(),
+                tp_size=get_parallel().tp_size,
                 prefix=f"{prefix}.block_sparse_moe",
             )
 

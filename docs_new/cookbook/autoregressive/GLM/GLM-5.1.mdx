@@ -1,8 +1,7 @@
 ---
 title: GLM-5.1
 metatags:
-    description: "Deploy GLM-5.1 with SGLang on NVIDIA H100/H200/B200/GB300 and AMD MI300X/MI325X/MI355X."
-tag: NEW
+    description: "Deploy GLM-5.1 with SGLang on NVIDIA H100/H200/B300/GB300 and AMD MI300X/MI325X/MI355X."
 ---
 
 ## 1. Model Introduction
@@ -11,6 +10,7 @@ tag: NEW
 
 - **BF16 (Full precision)**: [zai-org/GLM-5.1](https://huggingface.co/zai-org/GLM-5.1)
 - **FP8 (8-bit quantized)**: [zai-org/GLM-5.1-FP8](https://huggingface.co/zai-org/GLM-5.1-FP8)
+- **NVFP4 (4-bit quantized)**: [nvidia/GLM-5.1-NVFP4](https://huggingface.co/nvidia/GLM-5.1-NVFP4)
 
 **License:** MIT
 
@@ -24,7 +24,7 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities. SGLang supports serving GLM-5.1 on NVIDIA H100, H200, B200, GB300, and AMD MI300X/MI325X/MI355X GPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities. SGLang supports serving GLM-5.1 on NVIDIA H100, H200, B300, GB300, and AMD MI300X/MI325X/MI355X GPUs.
 
 import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.jsx'
 
@@ -35,61 +35,68 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
 - **DP Attention**: Enables data parallel attention for higher throughput under high concurrency. Note that DP attention trades off low-concurrency latency for high-concurrency throughput — disable it if your workload is latency-sensitive with few concurrent requests.
 - The `--mem-fraction-static` flag is recommended for optimal memory utilization, adjust it based on your hardware and workload.
-- BF16 model always requires **2x GPUs** compared to FP8 on NVIDIA hardware.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>FP8</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>BF16</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>NVFP4</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H100</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=16</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=32</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB300</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI300X/MI325X</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MI355X</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
     </tr>
   </tbody>
 </table>
 
+- **H100 and H200**: FP8 is the recommended deployment path.
+- **B300 and GB300**: NVFP4 is the recommended deployment path. Use `nvidia/GLM-5.1-NVFP4` with `--quantization modelopt_fp4`. Use `tp=8` on B300 and `tp=4` on GB300. The CUDA 13 image variant is required for B300 and GB300.
 - **AMD GPUs**: Both BF16 and FP8 checkpoints are supported on MI300X/MI325X/MI355X at tp=8. Use `--dsa-prefill-backend tilelang --dsa-decode-backend tilelang` for the DSA attention backend. Add `--chunked-prefill-size 131072` and `--watchdog-timeout 1200` (20 minutes for weight loading). FP8 uses approximately half the memory of BF16 (~89 GB/GPU vs ~175 GB/GPU). EAGLE speculative decoding is not currently supported on AMD for GLM-5.1.
-- **GB300**: Only the FP8 checkpoint is recommended on GB300, with `tp=4`. For high-throughput DP attention on GB300, use `--dp 4`.
-- For other configuration tips, please refer to [DeepSeek V3.2 documentation](../../../docs/basic_usage/deepseek_v32). GLM-5.1 and DeepSeek V3.2 share the same model structure, so the optimization techniques between these two models are also common (MTP, DSA kernel, Context Parallel...).
-- Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` for GLM-5.1-FP8 if you want to enable the [IndexCache](https://github.com/THUDM/IndexCache) method. This feature is supported through [this PR](https://github.com/sgl-project/sglang/pull/21405) and introduces only a small accuracy loss. However, if you are running rigorous accuracy evaluations, it is not recommended to enable this feature.
+- For other configuration tips (MTP, DSA kernel, Context Parallel, HiSparse, NVFP4, Index Cache), see the [DeepSeek-V3.2 cookbook page](../DeepSeek/DeepSeek-V3_2). GLM-5.1 and DeepSeek-V3.2 share the same model structure, so the optimization techniques are common.
+- Use `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to enable the [IndexCache](https://github.com/THUDM/IndexCache) method for GLM-5.1. This can improve serving efficiency with only a small accuracy loss. If you are running rigorous accuracy evaluations, do not enable this feature.
 
 ## 4. Model Invocation
 
 Deploy GLM-5.1 with the following command (FP8 on H200, all features enabled):
 
 ```shell Command
-SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+sglang serve \
   --model-path zai-org/GLM-5.1-FP8 \
   --tp 8 \
   --tool-call-parser glm47 \
@@ -103,7 +110,47 @@ SGLANG_ENABLE_SPEC_V2=1 sglang serve \
   --port 30000
 ```
 
-### 4.1 MI300X/MI325X/MI355X (ROCm) Server Command
+### 4.1 B300/GB300 (NVFP4) Server Command
+
+#### B300
+
+```shell Command
+sglang serve \
+  --model-path nvidia/GLM-5.1-NVFP4 \
+  --tp 8 \
+  --quantization modelopt_fp4 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --trust-remote-code \
+  --mem-fraction-static 0.80 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+#### GB300
+
+```shell Command
+sglang serve \
+  --model-path nvidia/GLM-5.1-NVFP4 \
+  --tp 4 \
+  --quantization modelopt_fp4 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --trust-remote-code \
+  --mem-fraction-static 0.80 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 4.2 MI300X/MI325X/MI355X (ROCm) Server Command
 
 The following ROCm commands are additional options for AMD GPUs and do not replace the NVIDIA instructions above.
 
@@ -141,15 +188,15 @@ sglang serve \
   --port 30000
 ```
 
-### 4.2 Basic Usage
+### 4.3 Basic Usage
 
 For basic API usage and request examples, please refer to:
 
 - [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
 
-### 4.3 Advanced Usage
+### 4.4 Advanced Usage
 
-#### 4.3.1 Reasoning Parser
+#### 4.4.1 Reasoning Parser
 
 GLM-5.1 supports Thinking mode **by default**. Enable the reasoning parser during deployment to separate the thinking and content sections. The thinking process is returned via `reasoning_content` in the streaming response.
 
@@ -312,7 +359,7 @@ Here is how to calculate it:
 2. Multiply the decimal by the number: 0.15 × 240 = 36
 ```
 
-#### 4.3.2 Tool Calling
+#### 4.4.2 Tool Calling
 
 GLM-5.1 supports tool calling capabilities. Enable the tool call parser during deployment. Thinking mode is on by default; to disable it for tool calling requests, pass `extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
 
@@ -537,6 +584,10 @@ Max ITL (ms):                            1307.02
 ```
 
 ### 5.2 Accuracy Benchmark
+
+<Note>
+The accuracy benchmark results below are shared with GLM-5, as GLM-5.1 was not independently benchmarked at the time of this writing. A separate benchmark run is planned.
+</Note>
 
 #### 5.2.1 GSM8K Benchmark
 

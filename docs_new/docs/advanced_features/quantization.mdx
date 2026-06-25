@@ -14,7 +14,7 @@ on-the-fly to convert high-precision weights into a lower-precision format.
 
 **Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
 
-If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
+If you use a pre-quantized model, **do not add `--quantization` to enable online quantization at the same time**.
 For popular pre-quantized models, please visit [Unsloth](https://huggingface.co/unsloth), [NVIDIA ModelOpt](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer)
 or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on HF for some
 popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
@@ -30,7 +30,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <th>Method</th>
       <th>NVIDIA GPUs</th>
       <th>AMD GPUs (MI300X/MI325X/MI350X)</th>
-      <th>Ascend NPUs (A2/A3)</th>
+      <th>Ascend NPUs (A2/A3/A5)</th>
       <th>Notes</th>
     </tr>
   </thead>
@@ -48,6 +48,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>WIP</td>
       <td>Requires CDNA3/CDNA4 with MXFP support; uses Aiter</td>
+    </tr>
+    <tr>
+      <td><code>mxfp8</code></td>
+      <td>No</td>
+      <td>No</td>
+      <td>Yes (A5 for Diffusion and LLM Dense Linear)</td>
+      <td>Ascend NPU only; online MXFP8 quantization for Diffusion models (e.g., Wan2.2) and LLM Dense Linear on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
     </tr>
     <tr>
       <td><code>blockwise_int8</code></td>
@@ -142,10 +149,17 @@ The following table summarizes quantization method support across NVIDIA and AMD
     </tr>
     <tr>
       <td><code>modelopt_fp4</code></td>
-      <td>Yes (Blackwell/SM100+)</td>
+      <td>Yes (SM80-SM90 via Marlin; SM100+ native FP4)</td>
       <td>No</td>
       <td>No</td>
-      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; native FP4 on Blackwell (B200, GB200)</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
+    </tr>
+    <tr>
+      <td><code>nvfp4_online</code></td>
+      <td>Yes (Blackwell/SM100 or SM103)</td>
+      <td>No</td>
+      <td>No</td>
+      <td>Online MoE-only NVFP4 weight quantization with runtime per-token activation scaling for BF16/FP16/FP8 checkpoints; requires <code>flashinfer_trtllm</code> or <code>flashinfer_trtllm_routed</code></td>
     </tr>
     <tr>
       <td><code>petit_nvfp4</code></td>
@@ -175,6 +189,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>Ascend quantization; Uses CANN kernels</td>
     </tr>
+
   </tbody>
 </table>
 
@@ -185,7 +200,7 @@ On Ascend, various layers quantization configurations are supported, see [Ascend
 ## GEMM Backends for FP4/FP8 Quantization
 
 <Note>
-Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. When running FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **NVFP4** GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
 </Note>
 
 ### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
@@ -244,6 +259,8 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 
 **`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
 
+**MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
+
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 
 <table>
@@ -257,8 +274,8 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
   <tbody>
     <tr>
       <td><code>auto</code></td>
-      <td>SM100/120</td>
-      <td>Auto-selects: <code>flashinfer_cudnn</code> on SM120; <code>flashinfer_cutlass</code> on SM100</td>
+      <td>SM80+</td>
+      <td>Auto-selects: <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>flashinfer_cutlass</code> otherwise (including SM120)</td>
     </tr>
     <tr>
       <td><code>cutlass</code></td>
@@ -273,17 +290,27 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
     <tr>
       <td><code>flashinfer_cudnn</code></td>
       <td>SM100/120 (CUDA 13+, cuDNN 9.15+)</td>
-      <td>FlashInfer cuDNN backend; used on SM120 for performance</td>
+      <td>FlashInfer cuDNN backend</td>
+    </tr>
+    <tr>
+      <td><code>flashinfer_cutedsl</code></td>
+      <td>SM100</td>
+      <td>FlashInfer CuTe DSL backend</td>
     </tr>
     <tr>
       <td><code>flashinfer_trtllm</code></td>
       <td>SM100</td>
       <td>FlashInfer TensorRT-LLM backend</td>
     </tr>
+    <tr>
+      <td><code>marlin</code></td>
+      <td>SM80-SM90</td>
+      <td>Weight-only W4A16 fallback for NVFP4 checkpoints</td>
+    </tr>
   </tbody>
 </table>
 
-When FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback.
+On Blackwell, when FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback. On SM80-SM90, `auto` selects Marlin for NVFP4.
 
 ## Offline Quantization
 
@@ -788,11 +815,77 @@ python3 -m sglang.launch_server \
     --port 30000 --host 0.0.0.0
 ```
 
+### `nvfp4_online` online quantization method
+
+Use `--quantization nvfp4_online` when you have a BF16, FP16, or FP8 MoE checkpoint and want SGLang to convert eligible MoE expert weights to NVFP4 while loading the model. This mode is for online conversion from higher-precision or FP8 checkpoints. It is not the serving path for already serialized NVFP4 checkpoints; use the existing ModelOpt FP4 path for those checkpoints.
+
+The design separates weight quantization from activation scaling:
+
+- **Weights:** SGLang quantizes each eligible MoE expert weight tensor as it is loaded, using standard 2D NVFP4 weight quantization. The generated NVFP4 weights use static E4M3 block scales plus static per-tensor FP32 scales derived from the weight amax. For gated MoE experts, the w1/w3 pair shares one per-tensor FP32 scale.
+- **Activations:** FlashInfer computes activation FP32 scales dynamically per token at runtime. Because activations are scaled per token, this mode does not need calibrated static activation FP32 scales from the checkpoint.
+- **FP8 checkpoints:** If an eligible expert weight is stored as FP8, SGLang first dequantizes that tensor with the checkpoint scale and then requantizes it to NVFP4 during loading.
+- **Other layers:** Dense linear layers stay in their source checkpoint precision or checkpoint quantization path.
+
+Only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed` are supported. If `--moe-runner-backend` is omitted, SGLang selects `flashinfer_trtllm`. Tensor parallelism is supported; activation per-token scales are computed locally on each TP rank, while online weight quantization still uses the loaded expert tensor's per-tensor amax-derived FP32 scale.
+
+FlashInfer TRTLLM MoE backends disable shared-expert fusion, so online quantization applies to routed MoE experts while shared experts stay in the checkpoint precision. To keep specific routed MoE layers out of online FP4 conversion, include their module path in `SGLANG_FP4_IGNORED_LAYERS`; FP8 checkpoints keep those ignored experts in FP8 checkpoint precision.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --tp-size 2 \
+    --ep-size 2 \
+    --quantization nvfp4_online \
+    --port 30000 --host 0.0.0.0
+```
+
 ### `quark_int4fp8_moe` online quantization method
 
 SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will replace [MoE layers](https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/layers/moe/fused_moe_triton/layer.py#L271) originally in high precision (bfloat16, float16 or float32) to use weights dynamically quantized to int4, that are upcasted to float8 during inference to run compute in float8 precision with activations dynamically quantized on the fly to float8.
 
 Other layers (e.g. projections in the attention layers) have their weights quantized online to float8 directly.
+
+### `quark_mxfp4` online quantization method
+
+SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
+
+Example:
+
+```bash
+sglang serve --model-path Qwen/Qwen3-30B-A3B \
+    --tensor-parallel-size 1 \
+    --quantization quark_mxfp4
+```
+
+## Diffusion Model Quantization on Ascend NPU
+
+SGLang-Diffusion supports MXFP8 quantization for diffusion models (such as Wan2.2) on Ascend A5 NPUs, in both online and offline (ModelSlim) modes. This is separate from the LLM serving path and uses the `sglang serve` / `sglang generate` CLI.
+
+**Requirements:** Ascend A5, CANN ≥ 8.0.RC3
+
+### Online MXFP8
+
+Pass `--quantization mxfp8` to dynamically quantize FP16/BF16 transformer weights to MXFP8 at load time:
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --num-gpus 4
+```
+
+### Offline MXFP8 (ModelSlim)
+
+Pre-quantize with [msModelSlim](https://gitcode.com/Ascend/msmodelslim) and load the checkpoint directly — the quantization scheme is auto-detected from `quant_model_description.json`:
+
+```bash
+sglang generate \
+  --model-path /path/to/wan2_2_mxfp8_diffusers \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+For the full quantization + format conversion workflow and a complete list of supported schemes, see [Diffusion Quantization on Ascend NPU](../hardware-platforms/ascend-npus/ascend_npu_quantization#diffusion-model-quantization-on-ascend-npu) and [SGLang-Diffusion Quantization](../sglang-diffusion/quantization#modelslim).
 
 ## Reference
 

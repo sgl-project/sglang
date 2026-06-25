@@ -51,7 +51,6 @@ class TestGlm51Fp8(unittest.TestCase):
                 tp_size=8,
                 extra_args=COMMON_ARGS + dp_args + MTP_ARGS,
                 variant="TP8+DP8+MTP",
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 

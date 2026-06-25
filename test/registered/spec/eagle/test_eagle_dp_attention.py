@@ -60,10 +60,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "--cuda-graph-max-bs",
             "64",
         ]
-        with (
-            envs.SGLANG_SPEC_NAN_DETECTION.override(True),
-            envs.SGLANG_SPEC_OOB_DETECTION.override(True),
-        ):
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
@@ -141,6 +142,60 @@ class TestRadixKey(unittest.TestCase):
         repr_str = repr(key)
         self.assertIn("...", repr_str)  # Should be truncated
 
+    def _assert_match(self, a, b, page_size, expected, is_bigram=False):
+        key_a = RadixKey(array("q", a), is_bigram=is_bigram)
+        key_b = RadixKey(array("q", b), is_bigram=is_bigram)
+        self.assertEqual(key_a.match(key_b, page_size=page_size), expected)
+
+    def test_match_page_size_1(self):
+        """match() with page_size=1: full, partial, none, prefix, and empty keys."""
+        self._assert_match([1, 2, 3, 4], [1, 2, 3, 4], 1, 4)  # identical
+        self._assert_match([1, 2, 3, 4], [1, 2, 9, 9], 1, 2)  # diverge at index 2
+        self._assert_match([9, 2, 3], [1, 2, 3], 1, 0)  # diverge at index 0
+        self._assert_match([1, 2, 3, 4], [1, 2, 3], 1, 3)  # other is a prefix
+        self._assert_match([], [1, 2], 1, 0)  # empty self
+        self._assert_match([1, 2], [], 1, 0)  # empty other
+        self._assert_match([], [], 1, 0)  # both empty
+
+    def test_match_page_size_gt_1_rounds_down(self):
+        """match() with page_size>1 rounds the shared length down to a page."""
+        self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 9, 8], 4, 4)
+        self._assert_match(
+            [1, 2, 3, 4], [1, 9, 3, 4], 4, 0
+        )  # diverge inside first page
+        self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 9, 6, 7, 8], 4, 4)
+        self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8], 4, 8)
+        self._assert_match([1, 2, 3], [1, 2, 3], 4, 0)  # shorter than one page
+
+    def test_match_long_keys_exponential_search(self):
+        """Deep divergences exercise the doubling gallop windows + binary search.
+
+        ``base`` has distinct values, so flipping one position diverges the prefix
+        exactly there; the shared length is that index rounded down to the page.
+        """
+        base = list(range(2000))
+        for div in (1, 2, 63, 64, 65, 127, 128, 511, 512, 513, 1234, 1999):
+            b = base[:]
+            b[div] = -1
+            for page_size in (1, 4, 64):
+                with self.subTest(div=div, page_size=page_size):
+                    self._assert_match(
+                        base, b, page_size, (div // page_size) * page_size
+                    )
+        # Full match of a long key: the gallop must reach the end.
+        self._assert_match(base, base[:], 64, (2000 // 64) * 64)
+
+    def test_match_bigram(self):
+        """is_bigram: L matching raw tokens imply L-1 matching bigrams."""
+        self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 9, 5], 1, 2, is_bigram=True)
+        self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 4, 5], 1, 4, is_bigram=True)
+        self._assert_match([1, 2], [1, 2], 1, 1, is_bigram=True)
+        # Raw diverge at token 70 -> 69 matching bigrams -> rounded down to 64.
+        long_a = list(range(130))
+        long_b = list(range(130))
+        long_b[70] = -1
+        self._assert_match(long_a, long_b, 64, 64, is_bigram=True)
+
 
 class TestTreeNode(unittest.TestCase):
     """Test cases for TreeNode class."""
@@ -225,6 +280,38 @@ class TestTreeNode(unittest.TestCase):
 
         node.hash_value = ["hash1", "hash2", "hash3"]
         self.assertEqual(node.get_last_hash_value(), "hash3")
+
+    def test_get_prefix_hash_values_not_shared_across_calls(self):
+        """Regression guard for cached mutable prefix hash lists."""
+        for node_cls in (TreeNode, MambaTreeNode):
+            with self.subTest(node_cls=node_cls.__module__):
+                root = node_cls()
+                n1 = node_cls()
+                n1.parent = root
+                n1.hash_value = ["h1"]
+                n2 = node_cls()
+                n2.parent = n1
+                n2.hash_value = ["h2"]
+                n3 = node_cls()
+                n3.parent = n2
+                n3.hash_value = ["h3"]
+
+                first = n3.get_prefix_hash_values(n2)
+                self.assertEqual(first, ["h1", "h2"])
+
+                # Downstream storage code extends prefix_keys in place while
+                # processing pages. A cached list must not be observable by a
+                # later call.
+                first += ["h3"]
+
+                second = n3.get_prefix_hash_values(n2)
+                self.assertEqual(second, ["h1", "h2"])
+                self.assertIsNot(second, first)
+
+                n4 = node_cls()
+                n4.parent = n3
+                n4.hash_value = ["h4"]
+                self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
     def test_lt_comparison(self):
         """Test less than comparison based on last_access_time."""
@@ -776,9 +863,11 @@ class TestRadixCache(unittest.TestCase):
         torch_allocated_before = torch.cuda.memory_allocated()
 
         # build dataset with common prefix
-        common_prefix = [random.randint(1, vocab_size) for _ in range(base_prefix_len)]
+        common_prefix = [
+            random.randint(1, vocab_size - 1) for _ in range(base_prefix_len)
+        ]
         for _ in range(num_seqs):
-            suffix = [random.randint(1, vocab_size) for _ in range(suffix_len)]
+            suffix = [random.randint(1, vocab_size - 1) for _ in range(suffix_len)]
             seq = common_prefix + suffix
             keys.append(seq)
             values.append(torch.zeros(len(seq), device="cuda", dtype=torch.int32))

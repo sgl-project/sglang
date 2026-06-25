@@ -19,117 +19,52 @@ from pathlib import Path
 
 import tabulate
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.partitioning import (
     PartitionItem,
     partition_items_by_lpt,
-)
-from sglang.multimodal_gen.test.server.gpu_cases import (
-    ONE_GPU_CASES,
-    TWO_GPU_CASES,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
     DiffusionTestCase,
 )
 
-logger = init_logger(__name__)
-
-DEFAULT_EST_TIME_SECONDS = 300.0
-STARTUP_OVERHEAD_SECONDS = 120.0
-DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
-
-_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
-_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
-_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
-    "FLUX.2-klein-base-4B",
-    "Qwen-Image",
-)
-
-
-def _discover_unit_tests() -> list[str]:
-    unit_dir = Path(__file__).resolve().parent / "unit"
-    if not unit_dir.is_dir():
-        return []
-    return sorted(
-        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
+# TODO: remove duplicated code
+if current_platform.is_npu():
+    from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
+        _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
+        COMPONENT_ACCURACY_SUITES,
+        DEFAULT_EST_TIME_SECONDS,
+        DEFAULT_STANDALONE_EST_TIME_SECONDS,
+        FILE_SUITES,
+        PARAMETRIZED_CASE_GROUPS,
+        STANDALONE_FILES,
+        STARTUP_OVERHEAD_SECONDS,
+        SUITES,
+    )
+else:
+    from sglang.multimodal_gen.test.server.gpu_cases import (  # noqa: F401 It is used by ci scripts
+        _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
+        _UPDATE_WEIGHTS_MODEL_PAIR_ENV,
+        _UPDATE_WEIGHTS_MODEL_PAIR_IDS,
+        COMPONENT_ACCURACY_FILE_NUM_GPUS,
+        COMPONENT_ACCURACY_SUITES,
+        DEFAULT_EST_TIME_SECONDS,
+        DEFAULT_STANDALONE_EST_TIME_SECONDS,
+        FILE_SUITES,
+        ONE_GPU_CASES,
+        PARAMETRIZED_CASE_GROUPS,
+        STANDALONE_FILE_EST_TIMES,
+        STANDALONE_FILES,
+        STARTUP_OVERHEAD_SECONDS,
+        STRICT_SUITES,
+        SUITES,
+        TWO_GPU_CASES,
     )
 
 
-FILE_SUITES = {
-    "unit": _discover_unit_tests(),
-    "component-accuracy": [
-        "test_component_accuracy_1_gpu.py",
-        "test_component_accuracy_2_gpu.py",
-    ],
-    "component-accuracy-1-gpu": [
-        "test_component_accuracy_1_gpu.py",
-    ],
-    "component-accuracy-2-gpu": [
-        "test_component_accuracy_2_gpu.py",
-    ],
-    "1-gpu-b200": [
-        "test_server_b200.py",
-    ],
-}
-
-PARAMETRIZED_CASE_GROUPS = {
-    "1-gpu": [
-        ("test_server_1_gpu.py", ONE_GPU_CASES),
-    ],
-    "2-gpu": [
-        ("test_server_2_gpu.py", TWO_GPU_CASES),
-    ],
-}
-
-STANDALONE_FILES = {
-    "1-gpu": [
-        "../cli/test_generate_t2i_perf.py",
-        # Temporarily disabled: 24 timeout failures since 2026-04-09 across
-        # multimodal-gen-test-1-gpu. Re-enable after the flakiness is fixed.
-        # "test_update_weights_from_disk.py",
-    ],
-    "2-gpu": [
-        "test_disagg_server.py",
-    ],
-}
-
-# New standalone files may omit an estimate once to learn the real CI runtime.
-# CI will use a fallback estimate for sharding, run the test, then print a
-# measured value that must be copied into STANDALONE_FILE_EST_TIMES.
-STANDALONE_FILE_EST_TIMES = {
-    "1-gpu": {
-        "../cli/test_generate_t2i_perf.py": 240.0,
-        # See STANDALONE_FILES note above — temporarily disabled.
-        # "test_update_weights_from_disk.py": 480.0,
-    },
-    "2-gpu": {
-        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
-        # Raise if CI reports a higher measured time.
-        "test_disagg_server.py": 600.0,
-    },
-}
-
-# Backward-compatible suite view for scripts that still operate on file lists.
-SUITES = {
-    **FILE_SUITES,
-    **{
-        suite: [filename for filename, _ in case_groups]
-        + STANDALONE_FILES.get(suite, [])
-        for suite, case_groups in PARAMETRIZED_CASE_GROUPS.items()
-    },
-}
-
-STRICT_SUITES = {"unit"}
-COMPONENT_ACCURACY_SUITES = {
-    "component-accuracy",
-    "component-accuracy-1-gpu",
-    "component-accuracy-2-gpu",
-}
-COMPONENT_ACCURACY_FILE_NUM_GPUS = {
-    "test_component_accuracy_1_gpu.py": 1,
-    "test_component_accuracy_2_gpu.py": 2,
-}
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
