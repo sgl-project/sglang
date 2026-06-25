@@ -83,6 +83,8 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
         f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
+
+
 def _fp4_kv_mixed_kv_enabled() -> bool:
     return os.environ.get("SGLANG_FP4_KV_MIXED_KV") == "1"
 
