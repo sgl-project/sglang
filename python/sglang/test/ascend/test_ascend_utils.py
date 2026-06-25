@@ -14,18 +14,23 @@ Please remember to sort by variable name within each section.
 import asyncio
 import copy
 import os
+import random
 import subprocess
+import tempfile
+import threading
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NamedTuple, Optional
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     auto_config_device,
     is_in_ci,
     popen_launch_server,
+    read_output,
     write_github_step_summary,
 )
 
@@ -175,6 +180,7 @@ MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-B
 # VLM model weights path
 DEEPSEEK_VL2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-vl2")
 GLM_4_5V_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.5V")
+GLM_5_W4A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/GLM-5-w4a8")
 JANUS_PRO_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-1B")
 JANUS_PRO_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-7B")
 KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
@@ -614,3 +620,113 @@ def write_github_step_summary_once(summary: str):
         return
     write_github_step_summary_once.has_written = True
     write_github_step_summary(summary)
+
+
+def run_and_check_memory_leak(
+    workload_func,
+    disable_radix_cache,
+    enable_mixed_chunk,
+    disable_overlap,
+    chunked_prefill_size,
+    assert_has_abort,
+    api_key: Optional[str] = None,
+):
+    other_args = [
+        "--chunked-prefill-size",
+        str(chunked_prefill_size),
+        "--log-level",
+        "debug",
+    ]
+    if disable_radix_cache:
+        other_args += ["--disable-radix-cache"]
+    if enable_mixed_chunk:
+        other_args += ["--enable-mixed-chunk"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
+
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    port = random.randint(4000, 5000)
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Create temp files and launch the server
+    stdout_file = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, suffix=".stdout.txt"
+    )
+    stderr_file = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, suffix=".stderr.txt"
+    )
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        return_stdout_stderr=(stdout_file, stderr_file),
+        api_key=api_key,
+    )
+
+    # Launch a thread to stream the output
+    output_lines = []
+    t = threading.Thread(target=read_output, args=(output_lines, stderr_file.name))
+    t.start()
+
+    try:
+        # Run the workload
+        workload_func(base_url, model)
+    finally:
+        # Clean up everything
+        kill_process_tree(process.pid)
+        stdout_file.close()
+        stderr_file.close()
+        os.remove(stdout_file.name)
+        os.remove(stderr_file.name)
+        kill_process_tree(process.pid)
+        t.join()
+
+    # Assert success
+    has_new_server = False
+    has_leak = False
+    has_abort = False
+    for line in output_lines:
+        if "Uvicorn running" in line:
+            has_new_server = True
+        if "leak" in line:
+            has_leak = True
+        if "Abort" in line:
+            has_abort = True
+
+    assert has_new_server
+    assert not has_leak
+    if assert_has_abort:
+        assert has_abort
+
+
+def run_mmlu_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    disable_overlap=False,
+    chunked_prefill_size=32,
+):
+    def workload_func(base_url, model):
+        # Run the eval
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=128,
+            num_threads=128,
+        )
+
+        try:
+            metrics = run_eval(args)
+            assert metrics["score"] >= 0.65, f"{metrics=}"
+        finally:
+            pass
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        disable_overlap,
+        chunked_prefill_size,
+        assert_has_abort=False,
+    )
