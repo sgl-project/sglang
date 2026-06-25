@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVIDIA symmetric-memory multimem all-gather along the hidden (last) dim.
+"""Symmetric-memory ``multimem.st`` all-gather along the hidden (last) dim.
 
-A ``multimem.st`` Triton kernel that gathers per-rank hidden-dim shards
-``[T, H/TP]`` into the replicated ``[T, H]`` tensor: each rank stores its shard
-once into a symmetric multicast buffer with a single 128-bit ``multimem.st``
-(which lands the bytes on every peer at once), so the gather costs one NVLink
-store pass rather than an NCCL ring.
-
-Only the concat-along-hidden path is implemented (no token-dim / reduce-scatter
-variants). Buffers are allocated and rendezvous'd once in ``create_state`` (a
-collective), so the steady-state ``all_gather_inner`` launch is CUDA-graph
-capturable.
+Each rank stores its ``[T, H/TP]`` shard into a multicast buffer in one NVLink
+pass instead of an NCCL ring; ``create_state`` rendezvous once so launches are
+CUDA-graph capturable.
 """
 
 import logging
@@ -25,10 +18,8 @@ import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
-# A CTA runs _BLOCK_THREADS threads; each thread moves _NUMEL_PER_THREAD bf16
-# elements with one 128-bit multimem op (16 bytes / 2 bytes per bf16). The
-# kernel grid-strides, so the block count is a free tuning knob bounded by
-# [_MIN_BLOCKS, _MAX_BLOCKS]; the signal pad is sized for _MAX_BLOCKS.
+# Each thread moves _NUMEL_PER_THREAD bf16 via one 128-bit multimem op; the
+# grid-strided block count is tunable in [_MIN_BLOCKS, _MAX_BLOCKS].
 _BLOCK_THREADS = 1024
 _NUMEL_PER_THREAD = 8
 _MIN_BLOCKS = 4
@@ -310,9 +301,7 @@ class MultimemAllGatherState:
     max_token_num: int
     hidden_dim: int
     comm_buff: torch.Tensor
-    # Cached rendezvous handle: its multicast_ptr / signal_pad are stable for
-    # the buffer's lifetime, so we resolve it once and reuse on every launch
-    # (a fresh rendezvous() per call is wasteful and noisy under graph capture).
+    # Rendezvous handle; stable for the buffer's lifetime, resolved once.
     symm_mem_hdl: Any
 
 
@@ -323,11 +312,8 @@ def create_state(
     hidden_size: int,
     device: torch.device | None = None,
 ) -> MultimemAllGatherState:
-    """Allocate and rendezvous the symmetric-memory output buffer.
-
-    This is a collective (every rank in ``group`` must call it with identical
-    ``max_tokens``/``hidden_size``). Call it once, outside CUDA-graph capture.
-    """
+    """Allocate and rendezvous the symmetric-memory buffer. Collective: call
+    once outside CUDA-graph capture with identical args on every rank."""
     assert type(group) is dist.ProcessGroup, f"Expected ProcessGroup, got {type(group)}"
     assert hidden_size % _NUMEL_PER_THREAD == 0, (
         f"hidden_size={hidden_size} must be a multiple of {_NUMEL_PER_THREAD} "
@@ -335,9 +321,7 @@ def create_state(
     )
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
 
-    # blockwise_barrier indexes the pad at block_id * world_size + rank, so a
-    # _MAX_BLOCKS-CTA grid needs _MAX_BLOCKS * world_size uint32 slots. max()
-    # only grows the pad so we never shrink one another module enlarged.
+    # Pad holds _MAX_BLOCKS * world_size uint32 slots; max() never shrinks it.
     pad_bytes = _MAX_BLOCKS * group.size() * 4
     symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
     with torch.inference_mode(False), torch.no_grad():
@@ -373,14 +357,10 @@ def all_gather_inner(
     skip_entry_sync: bool = False,
     safe: bool = True,
 ) -> torch.Tensor:
-    """All-gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim.
+    """Gather ``[T, H/TP]`` shards into ``[T, H]`` along the hidden dim.
 
-    ``tp_hidden_dim`` is the full (gathered) hidden width ``H``; it must be an
-    even multiple of ``world_size`` and each per-rank shard a multiple of 8 bf16
-    (16-byte ``multimem.st`` alignment). Returns a clone when ``safe`` (default),
-    or a view into the symmetric buffer when ``safe=False`` (valid only until the
-    next collective overwrites the buffer).
-    """
+    ``tp_hidden_dim`` is the gathered width ``H``. Returns a clone when ``safe``,
+    else a view into the symmetric buffer (valid until the next collective)."""
     world_size = state.world_size
     assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported"
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
@@ -434,58 +414,40 @@ def all_gather_inner(
 
 
 # ------------------------------------------------------------------------------
-# Guarded wrapper: single all-gather path for every caller (fc, LM-head logits, …)
+# Guarded wrapper
 # ------------------------------------------------------------------------------
 
 
 def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
-    """Size a comm buffer from server args: the steady spec-decode token count
-    (``max_running_requests * max(num_draft_tokens, eagle_topk)``), optionally
-    grown to also cover a prefill chunk. The per-call guard still falls back to
-    NCCL when a batch overflows the buffer, so this only needs to cover the case
-    we want on the fast path. Returns ``floor`` if server args are unavailable.
-    """
-
-    def _pos(v):
-        return v if isinstance(v, int) and v > 0 else 0
-
+    """Largest batch (tokens) to keep on the fast path; bigger falls back to
+    NCCL. Covers the spec-decode batch plus, if ``include_prefill``, a prefill
+    chunk. Returns ``floor`` if server args are unavailable."""
     try:
         from sglang.srt.server_args import get_global_server_args
 
         sa = get_global_server_args()
-        decode = _pos(getattr(sa, "max_running_requests", 0)) * max(
-            _pos(getattr(sa, "speculative_num_draft_tokens", 0)),
-            _pos(getattr(sa, "speculative_eagle_topk", 0)),
-            1,
+
+        def g(name: str) -> int:
+            v = getattr(sa, name, 0)
+            return v if isinstance(v, int) and v > 0 else 0
+
+        tokens = g("max_running_requests") * max(
+            g("speculative_num_draft_tokens"), g("speculative_eagle_topk"), 1
         )
-        prefill = 0
         if include_prefill:
-            prefill = max(
-                _pos(getattr(sa, "chunked_prefill_size", 0)),
-                _pos(getattr(sa, "max_prefill_tokens", 0)),
-            )
-        return max(decode, prefill, floor)
+            tokens = max(tokens, g("chunked_prefill_size"), g("max_prefill_tokens"))
+        return max(tokens, floor)
     except Exception:
         return floor
 
 
 class MultimemAllGatherer:
-    """Guarded multimem all-gather along the last dim, with an NCCL fallback.
-
-    This is the single entry point every caller uses (the draft ``fc`` gather,
-    the vocab-parallel LM-head logits gather, …) so the kernel, guards, and
-    fallback live in exactly one place. It owns one symmetric-memory buffer,
-    built lazily on the first eager call (``create_state`` is a TP-group
-    collective + allocation, illegal under CUDA-graph capture) once the gathered
-    width ``x.shape[-1] * world_size`` is known. On each call it uses the
-    multimem kernel when the input meets the kernel's dtype/shape/alignment
-    contract and fits the buffer, else the standard NCCL all-gather. Every guard
-    depends only on TP-replicated quantities, so all ranks pick the same path.
-
-    ``skip_entry_sync`` drops the kernel's entry barrier; pass ``True`` only when
-    a cross-rank sync (e.g. a TP all-reduce in the surrounding layer) is
-    guaranteed between consecutive calls — see ``all_gather_inner``.
-    """
+    """Guarded multimem all-gather (last dim) with NCCL fallback; the single
+    entry point for every caller. Owns one symmetric buffer built lazily on the
+    first eager call, and uses the kernel only when the input fits its
+    dtype/shape/alignment contract. Guards use TP-replicated quantities so all
+    ranks pick the same path. ``skip_entry_sync=True`` drops the entry barrier;
+    only safe when a cross-rank sync sits between consecutive calls."""
 
     _UNINIT = object()
 
@@ -498,15 +460,14 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
-        # None => permanently disabled (always NCCL); _UNINIT => build on the
-        # first eager call; a MultimemAllGatherState => fast path available.
+        # None => always NCCL; _UNINIT => build on first eager call.
         self._state = self._UNINIT if enabled else None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         state = self._state
         if state is self._UNINIT:
             state = self._build(x)
-            if state is not self._UNINIT:  # cache real state / permanent disable
+            if state is not self._UNINIT:
                 self._state = state
         if (
             state is not None
@@ -525,8 +486,7 @@ class MultimemAllGatherer:
                 skip_entry_sync=self._skip_entry_sync,
                 safe=False,
             )
-        # Lazy import keeps this device communicator from depending on the
-        # high-level distributed facade at module load.
+        # Lazy import avoids a module-load dependency on the distributed facade.
         from sglang.srt.distributed import tensor_model_parallel_all_gather
 
         return tensor_model_parallel_all_gather(x, dim=-1)
@@ -535,7 +495,7 @@ class MultimemAllGatherer:
         if x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            # Can't allocate / rendezvous under capture; retry on a later call.
+            # Can't allocate under capture; retry later.
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
             return None

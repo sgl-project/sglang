@@ -208,14 +208,6 @@ class Eagle3MLAModel(nn.Module):
             getattr(config, "target_hidden_size", None) or config.hidden_size
         )
         self.num_aux_hidden_states = _get_eagle_aux_layer_count(config)
-        # The fc projection over concatenated aux hidden states is the single
-        # largest draft weight (target_hidden * num_aux x hidden ~= 300 MB at
-        # bf16 for Kimi-K2.x). Shard it column-wise across TP so each rank reads
-        # only its 1/TP slice of the weight. The partial outputs are then gathered
-        # back to the replicated hidden via the shared multimem all-gather;
-        # gather_output stays False so we own the gather. At decode token counts
-        # this is HBM-bandwidth bound, so the gather is far cheaper than every
-        # rank re-reading the full weight.
         self.fc = ColumnParallelLinear(
             target_hidden_size * self.num_aux_hidden_states,
             config.hidden_size,
@@ -224,10 +216,7 @@ class Eagle3MLAModel(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
         )
-        # Shared guarded multimem all-gather for the fc output. skip_entry_sync
-        # stays False (the kernel's entry barrier guards buffer reuse between
-        # consecutive draft steps); the buffer also covers prefill (draft extend)
-        # so the fast path is used there too.
+        # Guarded multimem all-gather for the fc output; buffer covers prefill.
         self._fc_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=True, floor=512

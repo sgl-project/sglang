@@ -294,13 +294,6 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_global_server_args().enable_mis
 
-        # Replace the NCCL all-gather on the plain TP logits-gather branch with
-        # the shared guarded multimem all-gather. skip_entry_sync=True elides the
-        # kernel's entry barrier: a TP all-reduce in the surrounding decode/verify
-        # step syncs ranks between consecutive gathers. The attn-tp / dp-attn
-        # branches keep their own collectives. The buffer covers only the
-        # decode/verify token range (vocab-wide rows are large), so larger
-        # batches (prefill) fall back to NCCL.
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
