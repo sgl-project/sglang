@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
 
 
 _PREFILL_NPU_SCORE_BLOCK_SIZE_N = 64
+_PREFILL_NPU_SPARSE_BLOCK_SIZE_N = 64
 
 
 @triton.heuristics(
@@ -257,7 +258,7 @@ def _prefill_npu_topk_kernel(
             16, triton.next_power_of_2(args["gqa_group_size"])
         ),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_N": lambda args: triton.next_power_of_2(args["block_size"]),
+        "BLOCK_SIZE_N": lambda args: _PREFILL_NPU_SPARSE_BLOCK_SIZE_N,
     }
 )
 @triton.jit
@@ -299,6 +300,8 @@ def _prefill_npu_sparse_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
+    tl.static_assert(block_size % BLOCK_SIZE_N == 0)
+
     pid_q = tl.program_id(0)
     pid_kh = tl.program_id(1)
     pid_h = pid_kh * gqa_group_size
@@ -347,44 +350,45 @@ def _prefill_npu_sparse_kernel(
             + topk_pos * stride_t_k
         ).to(tl.int32)
         valid_block = logical_block >= 0
-        pos = logical_block * block_size + off_n
-        pos_mask = valid_block & (pos < seq_len)
-        slots = tl.load(
-            req_to_token_ptr + req_idx * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
+        for inner_start in tl.static_range(0, block_size, BLOCK_SIZE_N):
+            pos = logical_block * block_size + inner_start + off_n
+            pos_mask = valid_block & (pos < seq_len)
+            slots = tl.load(
+                req_to_token_ptr + req_idx * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
 
-        k = tl.load(
-            k_cache_ptr
-            + slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        v = tl.load(
-            v_cache_ptr
-            + slots[:, None] * stride_v_s
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d,
-            mask=pos_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
+            k = tl.load(
+                k_cache_ptr
+                + slots[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+            v = tl.load(
+                v_cache_ptr
+                + slots[:, None] * stride_v_s
+                + pid_kh * stride_v_h
+                + off_d[None, :] * stride_v_d,
+                mask=pos_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
 
-        qk = tl.dot(q, k) * sm_scale
-        qk = tl.where(pos_mask[None, :], qk, -1.0e30)
-        block_m = tl.max(qk, axis=1)
-        m_new = tl.maximum(m_i, block_m)
-        p = tl.where(pos_mask[None, :], tl.exp(qk - m_new[:, None]), 0.0)
-        l_new = tl.sum(p, axis=1)
-        acc_scale = tl.where(m_i > float("-inf"), tl.exp(m_i - m_new), 0.0)
-        acc_new = acc * acc_scale[:, None] + tl.dot(p.to(v.dtype), v)
-        l_i_new = l_i * acc_scale + l_new
+            qk = tl.dot(q, k) * sm_scale
+            qk = tl.where(pos_mask[None, :], qk, -1.0e30)
+            block_m = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, block_m)
+            p = tl.where(pos_mask[None, :], tl.exp(qk - m_new[:, None]), 0.0)
+            l_new = tl.sum(p, axis=1)
+            acc_scale = tl.where(m_i > float("-inf"), tl.exp(m_i - m_new), 0.0)
+            acc_new = acc * acc_scale[:, None] + tl.dot(p.to(v.dtype), v)
+            l_i_new = l_i * acc_scale + l_new
 
-        acc = tl.where(valid_block, acc_new, acc)
-        l_i = tl.where(valid_block, l_i_new, l_i)
-        m_i = tl.where(valid_block, m_new, m_i)
+            acc = tl.where(valid_block, acc_new, acc)
+            l_i = tl.where(valid_block, l_i_new, l_i)
+            m_i = tl.where(valid_block, m_new, m_i)
 
     out = tl.where(l_i[:, None] > 0.0, acc / l_i[:, None], acc)
     tl.store(
