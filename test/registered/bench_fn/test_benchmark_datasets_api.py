@@ -1089,5 +1089,130 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             self.assertNotIn(forbidden, stderr)
 
 
+class TestDatasetSpecificResultArgs(unittest.TestCase):
+    """`_dataset_specific_args` should only surface args for the active dataset."""
+
+    def _args(self, dataset_name: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            dataset_name=dataset_name,
+            sharegpt_output_len=None,
+            random_input_len=1024,
+            random_output_len=1024,
+            random_range_ratio=0.0,
+            gsp_num_groups=64,
+            gsp_prompts_per_group=16,
+            gsp_system_prompt_len=2048,
+            gsp_question_len=128,
+            gsp_output_len=256,
+            gsp_range_ratio=1.0,
+            gsp_group_distribution="uniform",
+            gsp_zipf_alpha=None,
+        )
+
+    def _partial_args(self, dataset_name: str) -> SimpleNamespace:
+        return SimpleNamespace(dataset_name=dataset_name)
+
+    def test_random_dataset_omits_gsp_and_sharegpt(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("random"))
+        self.assertEqual(
+            result,
+            {
+                "random_input_len": 1024,
+                "random_output_len": 1024,
+                "random_range_ratio": 0.0,
+            },
+        )
+
+    def test_mmmu_dataset_reports_only_output_len(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("mmmu"))
+        self.assertEqual(result, {"random_output_len": 1024})
+
+    def test_gsp_dataset_omits_random_and_sharegpt(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._args("generated-shared-prefix"))
+        self.assertNotIn("random_input_len", result)
+        self.assertNotIn("sharegpt_output_len", result)
+        self.assertEqual(result["gsp_system_prompt_len"], 2048)
+        self.assertEqual(result["gsp_output_len"], 256)
+        self.assertEqual(result["gsp_group_distribution"], "uniform")
+        self.assertIsNone(result["gsp_zipf_alpha"])
+
+    def test_sharegpt_like_datasets_report_only_sharegpt_output_len(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in (
+            "sharegpt",
+            "custom",
+            "autobench",
+            "openai",
+            "longbench_v2",
+        ):
+            result = _dataset_specific_args(self._args(dataset_name))
+            self.assertEqual(result, {"sharegpt_output_len": None}, dataset_name)
+
+    def test_other_dataset_returns_empty(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in ("mooncake", "speed-bench"):
+            self.assertEqual(
+                _dataset_specific_args(self._args(dataset_name)), {}, dataset_name
+            )
+
+    def test_manual_random_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("random"))
+        self.assertEqual(
+            result,
+            {
+                "random_input_len": None,
+                "random_output_len": None,
+                "random_range_ratio": None,
+            },
+        )
+
+    def test_manual_mmmu_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("mmmu"))
+        self.assertEqual(result, {"random_output_len": None})
+
+    def test_manual_gsp_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        result = _dataset_specific_args(self._partial_args("generated-shared-prefix"))
+        self.assertEqual(
+            result,
+            {
+                "gsp_num_groups": None,
+                "gsp_prompts_per_group": None,
+                "gsp_system_prompt_len": None,
+                "gsp_question_len": None,
+                "gsp_output_len": None,
+                "gsp_range_ratio": None,
+                "gsp_group_distribution": None,
+                "gsp_zipf_alpha": None,
+            },
+        )
+
+    def test_manual_sharegpt_like_namespace_missing_fields_returns_none(self):
+        from sglang.benchmark.serving import _dataset_specific_args
+
+        for dataset_name in (
+            "sharegpt",
+            "custom",
+            "autobench",
+            "openai",
+            "longbench_v2",
+        ):
+            result = _dataset_specific_args(self._partial_args(dataset_name))
+            self.assertEqual(result, {"sharegpt_output_len": None}, dataset_name)
+
+
 if __name__ == "__main__":
     unittest.main()
