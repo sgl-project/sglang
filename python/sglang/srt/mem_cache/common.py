@@ -245,7 +245,7 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
     """KV length reserved per request at each decode step.
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_info_v2.prepare_for_decode.
+    mode; see eagle_utils.eagle_prepare_for_decode.
     """
     return 2 * get_alloc_len_per_decode(server_args)
 

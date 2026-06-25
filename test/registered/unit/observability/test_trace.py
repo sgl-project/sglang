@@ -227,7 +227,7 @@ class TestTraceReqContextDisabled(unittest.TestCase):
         self.assertEqual(state, {"tracing_enable": False})
 
     def test_setstate_disabled(self):
-        ctx = TraceReqContext.__new__(TraceReqContext)
+        ctx = TraceReqContext(rid="req-1")
         ctx.__setstate__({"tracing_enable": True, "is_copy": False})
         # opentelemetry_initialized is False → tracing forced off
         self.assertFalse(ctx.tracing_enable)
@@ -539,7 +539,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         state = ctx.__getstate__()
         ctx.trace_req_finish(ts=2000)
 
-        ctx2 = TraceReqContext.__new__(TraceReqContext)
+        ctx2 = TraceReqContext(rid="req-2")
         ctx2.__setstate__(state)
         self.assertTrue(ctx2.tracing_enable)
         self.assertTrue(ctx2.is_copy)
@@ -567,7 +567,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.trace_req_finish(ts=3000)
 
         self.assertIsNotNone(state.get("last_span_context"))
-        ctx2 = TraceReqContext.__new__(TraceReqContext)
+        ctx2 = TraceReqContext(rid="req-2")
         ctx2.__setstate__(state)
         self.assertIsNotNone(ctx2.last_span_context)
 
