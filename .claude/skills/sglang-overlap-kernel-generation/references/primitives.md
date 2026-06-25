@@ -1,6 +1,6 @@
 # Shared Primitives Library
 
-This file is the **single source of truth** for all low-level synchronization helpers used by `inter-sm` and `intra-sm` overlap kernels — thread/block ID helpers, PTX inline-asm atomics, signals, and the three-level barrier hierarchy.
+This file is the **single source of truth** for all low-level synchronization helpers used by `inter-sm`, `intra-sm`, and `without-sm` overlap kernels — thread/block ID helpers, PTX inline-asm atomics, signals, system-scope load/store, and the three-level barrier hierarchy.
 
 Read this file whenever you are about to emit any of these helpers into a generated kernel, regardless of which mode you picked. The mode files (`inter_sm.md`, `intra_sm.md`) reference primitives by name and only describe *how* they are composed.
 
@@ -10,13 +10,14 @@ Read this file whenever you are about to emit any of these helpers into a genera
 2. [Thread/Block ID helpers](#2-threadblock-id-helpers)
 3. [GPU-scope memory ordering atomics](#3-gpu-scope-memory-ordering-atomics)
 4. [System-scope CAS (cross-rank)](#4-system-scope-cas-cross-rank)
-5. [Three-level barrier hierarchy](#5-three-level-barrier-hierarchy)
-   - 5.1 Thread-level (intra-CTA)
-   - 5.2 CTA-Grid level: `barrier_on_this_grid`
-   - 5.3 Rank level: `barrier_all_intra_node_atomic_cas_block`
-6. [Per-tile signal pattern (inter-sm only)](#6-per-tile-signal-pattern-inter-sm-only)
-7. [Memory order rules — when to use release / acquire / relaxed](#7-memory-order-rules)
-8. [Which primitives each mode needs (quick reference)](#8-which-primitives-each-mode-needs)
+5. [System-scope load/store (without-sm)](#5-system-scope-loadstore-without-sm)
+6. [Three-level barrier hierarchy](#6-three-level-barrier-hierarchy)
+   - 6.1 Thread-level (intra-CTA)
+   - 6.2 CTA-Grid level: `barrier_on_this_grid`
+   - 6.3 Rank level: `barrier_all_intra_node_atomic_cas_block`
+7. [Per-tile signal pattern (inter-sm only)](#7-per-tile-signal-pattern-inter-sm-only)
+8. [Memory order rules — when to use release / acquire / relaxed](#8-memory-order-rules)
+9. [Which primitives each mode needs (quick reference)](#9-which-primitives-each-mode-needs)
 
 ---
 
@@ -56,6 +57,61 @@ def _get_flat_bid():
         tl.program_id(2) * tl.num_programs(1) * tl.num_programs(0)
         + tl.program_id(1) * tl.num_programs(0)
         + tl.program_id(0)
+    )
+```
+
+### `tid`
+
+Lightweight per-axis thread index accessor. Used in without-sm mode where only a single axis tid is needed (e.g., `tid(0) == 0` to gate signal polling to one thread).
+
+```python
+@triton.jit
+def tid(axis: tl.constexpr = 0):
+    """PTX threadIdx.x/y/z."""
+    if axis == 0:
+        return tl.inline_asm_elementwise(
+            asm="mov.u32 $0, %tid.x;",
+            constraints=("=r"),
+            args=[],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+    elif axis == 1:
+        return tl.inline_asm_elementwise(
+            asm="mov.u32 $0, %tid.y;",
+            constraints=("=r"),
+            args=[],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            asm="mov.u32 $0, %tid.z;",
+            constraints=("=r"),
+            args=[],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+```
+
+### `__syncthreads`
+
+PTX `bar.sync` — block-level `__syncthreads`. Used in without-sm mode to broadcast a signal poll result from one thread to all threads in the CTA.
+
+```python
+@triton.jit
+def __syncthreads():
+    """PTX bar.sync (block-level __syncthreads)."""
+    tl.inline_asm_elementwise(
+        asm="bar.sync 0;",
+        constraints="=r",
+        args=[],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
     )
 ```
 
@@ -202,11 +258,70 @@ while old != 0:
 
 ---
 
-## 5. Three-level barrier hierarchy
+## 5. System-scope load/store (without-sm)
+
+These helpers are used by without-sm (copy engine) overlap kernels. The compute kernel needs `ld_sys` to poll signals written by the CE (cross-GPU PtoP copy or `cuStreamWriteValue32`), and `st_sys` to write per-tile completion signals that the CE waits on via `cuStreamWaitValue32`.
+
+Plain `tl.load` / `tl.store` lack cross-device visibility guarantees — the L2 cache may return stale data when the writer is on a different GPU. System-scope acquire/release is required.
+
+### `ld_sys`
+
+```python
+@triton.jit
+def ld_sys(ptr):
+    """ld.global.acquire.sys.b32 — system-scope acquire load.
+
+    Required for reading signals written by the CE (cross-GPU PtoP copy or
+    cuStreamWriteValue32). Plain tl.load does NOT guarantee visibility of
+    writes that arrived over NVLink — the L2 cache may return stale data.
+    """
+    return tl.inline_asm_elementwise(
+        asm="ld.global.acquire.sys.b32 $0, [$1];",
+        constraints="=r,l",
+        args=[ptr],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+```
+
+### `st_sys`
+
+```python
+@triton.jit
+def st_sys(ptr, val):
+    """st.global.release.sys.b32 — system-scope release store.
+
+    Used by the compute kernel (comp-first path) to write a per-tile signal
+    that the CE waits on via cuStreamWaitValue32. Release semantics ensure
+    all prior tl.store (tile data) are visible before the signal write.
+    """
+    tl.inline_asm_elementwise(
+        asm="""
+        st.global.release.sys.b32 [$1], $2;
+        mov.u32 $0, 0;
+        """,
+        constraints="=r,l,r",
+        args=[ptr, val],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+```
+
+**Memory ordering rationale:**
+- `ld_sys` → `ld.global.acquire.sys`: the CE's `stream_write_value32` or PtoP `copy_()` is a release operation; the compute kernel's acquire load ensures it sees the data that was copied before the signal was written.
+- `st_sys` → `st.global.release.sys`: the compute kernel's release store ensures all prior tile data stores are visible before the signal `1` becomes observable by the CE's `cuStreamWaitValue32`.
+
+**Why `st_sys` instead of `_send_signal` (CAS)?** In without-sm comp-first mode, each tile has exactly one writer (the CTA that computed it), and the signal tensor is reset to 0 before each launch. So there is no contention — a simple store suffices. The CAS spin-loop in `_send_signal` is overkill and adds latency.
+
+---
+
+## 6. Three-level barrier hierarchy
 
 A kernel that synchronizes "everyone" must say *which* "everyone": threads in this CTA, CTAs on this device, or ranks across devices. Pick the smallest scope that covers your data dependency.
 
-### 5.1 Thread-level (intra-CTA)
+### 6.1 Thread-level (intra-CTA)
 
 Built-in. Use `tl.debug_barrier()` to re-converge threads after warp-divergent control flow, or to broadcast a value written by `if flat_tid == 0` to the rest of the CTA. No custom helper needed.
 
@@ -216,7 +331,7 @@ if flat_tid == 0:
 tl.debug_barrier()  # broadcast readiness to all threads in CTA
 ```
 
-### 5.2 CTA-Grid level: `barrier_on_this_grid`
+### 6.2 CTA-Grid level: `barrier_on_this_grid`
 
 Synchronizes all CTAs in a single kernel launch **without** requiring `cooperative_groups`. Uses a split-counter pattern: each CTA atomically increments a global counter; the master CTA (`bid == 0`) spins until all arrive, then flips the high bit to release everyone.
 
@@ -252,7 +367,7 @@ num_ctas = min(total_tiles, num_sm)  # conservative: assume 1 CTA/SM
 # or query actual occupancy and use: min(total_tiles, num_sm * occupancy)
 ```
 
-### 5.3 Rank level: `barrier_all_intra_node_atomic_cas_block`
+### 6.3 Rank level: `barrier_all_intra_node_atomic_cas_block`
 
 The single canonical cross-rank barrier used by both `inter-sm` and `intra-sm` kernels. Each CTA independently participates: thread `i` (where `i < local_world_size`) signals peer `i` by CAS(0→1) on the peer's barrier slot for our rank, then waits for the peer to signal us back by CAS(1→0) on our own slot.
 
@@ -327,7 +442,7 @@ if flat_tid == 0:
 
 > **Note on naming**: an older variant `barrier_all_intra_node_atomic_cas_block_symm_mem` (with `(rank, num_ranks, symm_flag_ptr, peer_barrier_ptrs)` signature, using Python-level `while atomic_cas(...) != 0` spin-loops) appeared in earlier drafts. It is superseded by the function above — same semantics, faster spin-loop, fewer arguments. Always emit the canonical form.
 
-### 5.4 Host-side cross-rank barrier: `symm_mem_hdl.barrier()`
+### 6.4 Host-side cross-rank barrier: `symm_mem_hdl.barrier()`
 
 When a kernel does **not** have a subsequent in-kernel phase after communication (i.e., the kernel exits once the communication phase is done), use **host-side** `symm_mem_hdl.barrier()` instead of the in-kernel `barrier_all_intra_node_atomic_cas_block`. This is the standard PyTorch symmetric memory barrier and is the correct choice for **inter-sm** and **without-sm** modes.
 
@@ -414,7 +529,7 @@ For overlap kernels, `channel=0` is typically sufficient. The number of channels
 
 ---
 
-## 6. Per-tile signal pattern (inter-sm only)
+## 7. Per-tile signal pattern (inter-sm only)
 
 The inter-sm mode uses an additional **per-tile** signal protocol on top of the rank barrier: the producer kernel stores 1 to a signal slot as each tile completes, the consumer kernel spins on it before consuming. This is what enables fine-grained pipelining between two kernels on different streams.
 
@@ -495,7 +610,7 @@ The signal tensor is reset by the host via `.zero_()` before each launch. `_send
 
 ---
 
-## 7. Memory order rules
+## 8. Memory order rules
 
 | Operation | Order | Why |
 |---|---|---|
@@ -510,25 +625,22 @@ Rule of thumb: any flag whose **point** is to advertise "data is ready" pairs **
 
 ---
 
-## 8. Which primitives each mode needs
+## 9. Which primitives each mode needs
 
 | Primitive | inter-sm | intra-sm | without-sm |
 |---|:---:|:---:|:---:|
 | `_get_flat_tid` | ✅ | ✅ | — |
 | `_get_flat_bid` | (optional) | ✅ | — |
+| `tid` | — | — | ✅ (single-axis thread index for signal gating) |
+| `__syncthreads` | — | — | ✅ (broadcast signal poll to CTA) |
 | `_atomic_add_release` / `_load_acquire` / `_store_release_with_highbit` | (only if you add a grid barrier) | ✅ | — |
 | `_cas_sys_release` / `_cas_sys_acquire` | — | ✅ (backs rank barrier) | — |
+| `ld_sys` / `st_sys` | — | — | ✅ (signal polling & writing for CE sync) |
 | `_send_signal` / `_wait_signal` | ✅ (core mechanism) | — | — |
 | `barrier_on_this_grid` | usually ❌ (per-tile signal replaces it) | ✅ (separates compute/push from reduce) | — |
 | `barrier_all_intra_node_atomic_cas_block` | ❌ (use host-side `symm_mem_hdl.barrier()`) | ✅ (after grid barrier) | — |
 | `symm_mem_hdl.barrier()` (host-side) | ✅ (around `signal.zero_()`) | ❌ (use in-kernel rank barrier) | ✅ (between iterations) |
 | `tl.debug_barrier()` | ✅ | ✅ | — |
-| `ld_sys` / `st_sys` / `__syncthreads` | — | — | ✅ (signal polling & writing) |
 | `stream_write_value32` / `cuStreamWaitValue32` | — | — | ✅ (CE-side signal ops) |
 
-Without-sm does NOT pull from the inter-sm/intra-sm primitives in this catalog. Instead, it uses:
-- **Kernel-side**: `ld_sys` (`ld.global.acquire.sys.b32`) for signal polling, `st_sys` (`st.global.release.sys.b32`) for signal writing, and `__syncthreads` / `tid` helpers — all defined directly in `references/without_sm.md`.
-- **CE-side (host)**: `symm_mem_hdl.stream_write_value32` (comm-first) or `cuda.bindings.driver.cuStreamWaitValue32` (comp-first) for CPU-side CE signal operations.
-- **Cross-rank sync**: `symm_mem_hdl.barrier()` (host-side) around `signal.zero_()` / `progress.fill_(0)` between iterations.
-
-Both inter-sm and without-sm use host-side `symm_mem_hdl.barrier()` (around `signal.zero_()`) for cross-rank synchronization between iterations, since neither has a subsequent in-kernel phase after communication completes.
+Without-sm uses: **kernel-side** `ld_sys`/`st_sys`/`tid`/`__syncthreads` from this catalog for signal polling and writing; **CE-side (host)** `symm_mem_hdl.stream_write_value32` (comm-first) or `cuda.bindings.driver.cuStreamWaitValue32` (comp-first) for CPU-side CE signal operations; and **cross-rank sync** `symm_mem_hdl.barrier()` (host-side) around `progress.fill_(0)` between iterations.

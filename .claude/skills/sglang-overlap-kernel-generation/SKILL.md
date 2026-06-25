@@ -55,7 +55,7 @@ Read `references/intra_sm.md` for barrier primitives, A2A push pattern, kernel s
 
 ### Without-SM — copy engine (DMA)
 
-Communication is offloaded to the **copy engine**, consuming zero SM resources. A background stream performs `copy_()` on symmetric memory (routed through DMA). A **signal tensor** (written either via PtoP signal pull or `cuStreamWriteValue32`) lets the compute kernel poll and process data as it arrives — local data first (no wait), then remote chunks as they become ready. The signal tensor shape is `[world_size * splits_per_rank]`, where `splits_per_rank=1` gives per-rank granularity and `splits_per_rank>1` gives finer per-chunk granularity. Both signaling approaches support any granularity.
+Communication is offloaded to the **copy engine**, consuming zero SM resources. A background stream performs `copy_()` on symmetric memory (routed through DMA). A **signal tensor** (written via `cuStreamWriteValue32` / polled via `ld_sys`) lets the compute kernel poll and process data as it arrives — local data first (no wait), then remote chunks as they become ready. The signal tensor shape is `[world_size * splits_per_rank]`, where `splits_per_rank=1` gives per-rank granularity and `splits_per_rank>1` gives finer per-chunk granularity.
 
 Read `references/without_sm.md` for copy engine setup, progress tracking, compute kernel polling pattern, and full implementation guide.
 
@@ -211,9 +211,9 @@ These checks prevent `CUDA error: an illegal memory access was encountered`. Thi
 | **tl.constexpr strides** | Stride parameters are declared as `tl.constexpr` so the compiler can optimize address calculations at compile time |
 | **Incremental pointer update** | topk/reduction loops use `tl.static_range` + `ptr + j * stride` instead of recomputing full addresses each iteration |
 | **Input layout flattening** | 3D inputs like `[M, topk, N]` are flattened to `[M*topk, N]` for contiguous memory access in the topk dimension |
-| **Master CTA barrier** | `barrier_on_this_grid` uses the master CTA pattern (bid==0 spins, others wait for high bit) with a single `tl.debug_barrier()`, not the naive 3-barrier pattern (see `primitives.md` §5.2) |
-| **Multi-threaded CAS barrier** | `barrier_all_intra_node_atomic_cas_block` uses `flat_tid < world_size` for parallel peer signaling, not single-threaded serial iteration (see `primitives.md` §5.3) |
-| **Cross-rank barrier placement** | In-kernel `barrier_all_intra_node_atomic_cas_block` is only needed when the kernel has a subsequent phase after communication (intra-sm). For inter-sm and without-sm, use host-side `symm_mem_hdl.barrier()` around `signal.zero_()` instead — the comm kernel exits once communication is done, so no in-kernel cross-rank sync is required. See `primitives.md` §5.3 for the in-kernel barrier and §5.4 for the host-side barrier |
+| **Master CTA barrier** | `barrier_on_this_grid` uses the master CTA pattern (bid==0 spins, others wait for high bit) with a single `tl.debug_barrier()`, not the naive 3-barrier pattern (see `primitives.md` §6.2) |
+| **Multi-threaded CAS barrier** | `barrier_all_intra_node_atomic_cas_block` uses `flat_tid < world_size` for parallel peer signaling, not single-threaded serial iteration (see `primitives.md` §6.3) |
+| **Cross-rank barrier placement** | In-kernel `barrier_all_intra_node_atomic_cas_block` is only needed when the kernel has a subsequent phase after communication (intra-sm). For inter-sm and without-sm, use host-side `symm_mem_hdl.barrier()` around `signal.zero_()` instead — the comm kernel exits once communication is done, so no in-kernel cross-rank sync is required. See `primitives.md` §6.3 for the in-kernel barrier and §6.4 for the host-side barrier |
 | **PTX-level CAS spin-loop** | `_cas_sys_release`/`_cas_sys_acquire` have the spin-loop inside PTX (`@!%p0 bra cas_loop`), not in Python-level `while` loops (see `primitives.md` §4) |
 | **Auto block size** | `BLOCK_M`/`BLOCK_N` default to `None` and are auto-computed based on problem size: `BLOCK_N = next_power_of_2(N_per_chunk)`, `BLOCK_M = next_power_of_2(16K / BLOCK_N / element_size)` |
 
