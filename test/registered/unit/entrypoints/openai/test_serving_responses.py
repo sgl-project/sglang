@@ -16,7 +16,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     RequestResponseMetadata,
     ResponsesRequest,
 )
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.entrypoints.openai.serving_responses import (
+    OpenAIServingResponses,
+    _build_output_text_logprobs,
+    _should_emit_normal_text_as_message,
+)
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -523,6 +527,85 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         ]
         msg = get_developer_message(instructions="be helpful", tools=tools)
         self.assertIsNotNone(msg)
+
+
+class StatusFromFinishReasonTestCase(unittest.TestCase):
+    def test_only_length_maps_to_incomplete(self):
+        fn = OpenAIServingResponses._status_from_finish_reason
+        self.assertEqual(fn({"type": "length"}), "incomplete")
+        self.assertEqual(fn("length"), "incomplete")
+        for other in ({"type": "stop"}, {"type": "tool_calls"}, "stop", None):
+            self.assertEqual(fn(other), "completed", other)
+
+
+class BuildOutputTextLogprobsTestCase(unittest.TestCase):
+    def test_tokens_and_top_logprobs_are_converted(self):
+        meta_info = {
+            "output_token_logprobs": [(-0.1, 10, "Hello"), (-0.2, 11, " world")],
+            "output_top_logprobs": [
+                [(-0.1, 10, "Hello"), (-2.0, 12, "Hi")],
+                [(-0.2, 11, " world"), (-3.0, 13, " earth")],
+            ],
+        }
+        out = _build_output_text_logprobs(meta_info)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0].token, "Hello")
+        self.assertEqual(out[0].logprob, -0.1)
+        self.assertEqual(out[0].bytes, list("Hello".encode("utf-8")))
+        self.assertEqual(len(out[0].top_logprobs), 2)
+        self.assertEqual(out[0].top_logprobs[0].token, "Hello")
+        self.assertEqual(out[1].token, " world")
+
+    def test_no_top_logprobs_yields_empty_lists(self):
+        meta_info = {
+            "output_token_logprobs": [(-0.5, 7, "hi")],
+            "output_top_logprobs": None,
+        }
+        out = _build_output_text_logprobs(meta_info)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].top_logprobs, [])
+
+
+class ChatToolChoiceConversionTestCase(unittest.TestCase):
+    def test_conversion(self):
+        fn = OpenAIServingResponses._chat_tool_choice
+        for s in ("auto", "required", "none"):
+            self.assertEqual(fn(s), s)
+        self.assertEqual(
+            fn({"type": "function", "name": "get_weather"}),
+            {"type": "function", "function": {"name": "get_weather"}},
+        )
+        self.assertEqual(fn({"type": "web_search"}), "auto")  # non-function -> auto
+
+
+class ShouldEmitNormalTextTestCase(unittest.TestCase):
+    def test_whitespace_suppressed_only_while_a_tool_is_open(self):
+        emit = _should_emit_normal_text_as_message
+        self.assertFalse(emit("", any_tool_call_in_progress=False))
+        # whitespace between tool blocks is an inter-call separator, not content
+        self.assertFalse(emit("\n", any_tool_call_in_progress=True))
+        self.assertTrue(emit("\n", any_tool_call_in_progress=False))
+        self.assertTrue(emit("hello", any_tool_call_in_progress=True))
+
+
+class CancelIdempotencyTestCase(unittest.TestCase):
+    def test_cancel_terminal_response_returns_it_not_error(self):
+        from sglang.srt.entrypoints.openai.protocol import ResponsesResponse
+
+        serving = make_serving()
+        resp = ResponsesResponse.from_request(
+            ResponsesRequest(model="x", input="hi", store=False),
+            sampling_params={},
+            model_name="x",
+            created_time=0,
+            output=[],
+            status="cancelled",
+            usage=None,
+        )
+        serving.response_store[resp.id] = resp
+        out = asyncio.run(serving.cancel_responses(resp.id))
+        self.assertIs(out, resp)
+        self.assertEqual(out.status, "cancelled")
 
 
 if __name__ == "__main__":

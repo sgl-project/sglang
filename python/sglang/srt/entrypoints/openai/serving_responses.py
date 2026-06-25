@@ -23,6 +23,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
@@ -67,6 +68,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -78,6 +80,61 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
+    """Convert SGLang ``meta_info`` logprob arrays into OpenAI Responses
+    ``Logprob`` items (token, logprob, bytes, top_logprobs).
+
+    Pure: reuses ``to_openai_style_logprobs`` (the shared meta_info decoder) and
+    reshapes its output into the Responses logprob type, which carries the same
+    fields as the chat one. Covers all generated tokens (matching vLLM).
+    """
+    decoded = to_openai_style_logprobs(
+        output_token_logprobs=meta_info.get("output_token_logprobs"),
+        output_top_logprobs=meta_info.get("output_top_logprobs"),
+    )
+    top_lists = decoded.top_logprobs or []
+    logprobs: list[Logprob] = []
+    for index, (token, logprob) in enumerate(
+        zip(decoded.tokens, decoded.token_logprobs)
+    ):
+        top_entry = top_lists[index] if index < len(top_lists) else None
+        top_logprobs = [
+            LogprobTopLogprob(
+                token=top_token,
+                logprob=top_logprob,
+                bytes=list(top_token.encode("utf-8")),
+            )
+            for top_token, top_logprob in (top_entry or {}).items()
+        ]
+        logprobs.append(
+            Logprob(
+                token=token,
+                logprob=logprob,
+                bytes=list(token.encode("utf-8")),
+                top_logprobs=top_logprobs,
+            )
+        )
+    return logprobs
+
+
+def _should_emit_normal_text_as_message(
+    text: str, *, any_tool_call_in_progress: bool
+) -> bool:
+    """Whether ``text`` should open / extend a user-visible message item.
+
+    The qwen3-coder tool-call grammar emits ``\\n`` separators between adjacent
+    ``<tool_call>...</tool_call>`` blocks. The streaming detector cannot tell
+    those whitespace bytes apart from genuine message content, so while a tool
+    call is still open the serving layer treats whitespace-only ``normal_text``
+    fragments as inter-call separators and does not open a message item.
+    """
+    if not text:
+        return False
+    if any_tool_call_in_progress and not text.strip():
+        return False
+    return True
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -194,6 +251,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 'type="function"; other built-in tool types cannot be forced.'
             )
 
+        # gpt-oss/harmony emits raw token output; per-token logprobs aren't wired.
+        if self.use_harmony and request.is_include_output_logprobs():
+            return self.create_error_response(
+                "logprobs are not supported with gpt-oss models", param="logprobs"
+            )
+
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
         if prev_response_id is not None:
@@ -304,6 +367,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                         ),
                     )
 
+                    # Honor the skip_special_tokens decision _process_messages
+                    # made (gpt-oss / gemma4 / tools): the chat_request it set it
+                    # on is discarded, so re-apply it to the engine sampling dict.
+                    # Harmony has no processed_messages and keeps the default.
+                    if processed_messages is not None and (
+                        not processed_messages.skip_special_tokens
+                    ):
+                        sampling_params["skip_special_tokens"] = False
+
                     context: ConversationContext
                     if self.use_harmony:
                         if request.stream:
@@ -319,8 +391,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         prompt_kwargs = {"input_ids": engine_prompt}
 
+                    # Engine logprobs only when opted in via include.
+                    logprob_kwargs = (
+                        {
+                            "return_logprob": True,
+                            "logprob_start_len": -1,
+                            "top_logprobs_num": request.top_logprobs or 0,
+                            "return_text_in_logprobs": True,
+                        }
+                        if request.is_include_output_logprobs()
+                        else {}
+                    )
+
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
+                        **logprob_kwargs,
                         image_data=(
                             processed_messages.image_data
                             if processed_messages
@@ -345,7 +430,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         stream=request.stream,
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
-                        background=request.background,
+                        # background+stream streams on the initial connection
+                        # (handled below), so don't detach the engine request.
+                        background=request.background and not request.stream,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -368,7 +455,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             if request.store:
                 self.msg_store[request.request_id] = messages
 
-            if request.background:
+            # background+stream streams events on the initial connection (the
+            # stream path below also stores the result for later GET); only the
+            # non-streaming background case returns immediately as "queued".
+            if request.background and not request.stream:
                 created_time = int(time.time())
                 response = ResponsesResponse.from_request(
                     request,
@@ -454,17 +544,24 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages=messages,
             stream=request.stream,
             tools=chat_tools or None,
-            tool_choice=request.tool_choice if chat_tools else "none",
+            tool_choice=(
+                self._chat_tool_choice(request.tool_choice) if chat_tools else "none"
+            ),
             parallel_tool_calls=(
                 request.parallel_tool_calls
                 if request.parallel_tool_calls is not None
                 else True
             ),
             stop=request.stop,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
+        # _process_messages owns the skip_special_tokens decision (gpt-oss /
+        # gemma4 / tools present); carry it so create_responses can apply the
+        # same value the chat path uses instead of re-deriving a subset of it.
+        processed_messages.skip_special_tokens = chat_request.skip_special_tokens
 
         if is_multimodal:
             request_prompts = [processed_messages.prompt]
@@ -511,6 +608,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         except ValueError as e:
             return self.create_error_response(str(e))
 
+        # Default to completed; the non-harmony path refines from finish_reason.
+        status = "completed"
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
@@ -524,11 +623,6 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
-            output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
-            )
-
-            # Calculate usage from actual output
             num_reasoning_tokens = 0
             meta_info = None
             if isinstance(final_res, dict) and isinstance(
@@ -538,11 +632,25 @@ class OpenAIServingResponses(OpenAIServingChat):
             elif hasattr(final_res, "meta_info"):
                 meta_info = final_res.meta_info
 
+            output_logprobs = (
+                _build_output_text_logprobs(meta_info)
+                if request.is_include_output_logprobs() and isinstance(meta_info, dict)
+                else None
+            )
+            output = self._make_response_output_items(
+                request,
+                final_res["text"],
+                tokenizer,
+                output_logprobs=output_logprobs,
+            )
+
+            # Calculate usage from actual output
             if meta_info is not None:
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
+                status = self._status_from_finish_reason(meta_info.get("finish_reason"))
             elif isinstance(final_res, dict) and (
                 final_res.get("prompt_token_ids") is not None
                 or final_res.get("output_ids") is not None
@@ -590,7 +698,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name=model_name,
             created_time=created_time,
             output=output,
-            status="completed",
+            status=status,
             usage=usage,
         )
 
@@ -607,10 +715,34 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
         return request.reasoning is not None and request.reasoning.summary is not None
 
+    @staticmethod
+    def _status_from_finish_reason(finish_reason: Any) -> str:
+        """Map an engine finish_reason to a Responses status.
+
+        OpenAI reports a length-capped generation as ``incomplete`` (with
+        ``incomplete_details.reason == "max_output_tokens"``); everything else
+        that reached here finished normally. ``finish_reason`` is a dict
+        (``{"type": "length"|"stop"|...}``) in SGLang, but tolerate a bare str.
+        """
+        reason = None
+        if isinstance(finish_reason, dict):
+            reason = finish_reason.get("type")
+        elif isinstance(finish_reason, str):
+            reason = finish_reason
+        return "incomplete" if reason == "length" else "completed"
+
     def _is_thinking_enabled_for_request(self, request: ResponsesRequest) -> bool:
         """Whether to start the reasoning detector in thinking mode."""
         if not self.reasoning_parser:
             return False
+        # An explicit chat_template_kwargs thinking toggle wins (keys differ by
+        # family: enable_thinking for qwen3/glm, thinking for deepseek/kimi).
+        ctk = request.chat_template_kwargs or {}
+        thinking_toggles = (ctk.get("enable_thinking"), ctk.get("thinking"))
+        if any(toggle is False for toggle in thinking_toggles):
+            return False
+        if any(toggle is True for toggle in thinking_toggles):
+            return True
         effort = request.reasoning.effort if request.reasoning is not None else None
         if self.reasoning_parser == "hunyuan":
             return effort not in (None, "none", "no_think")
@@ -646,6 +778,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         final_output: Any,
         tokenizer: Any,
+        output_logprobs: Optional[list] = None,
     ):
         if self.reasoning_parser:
             # Templates that prefill ``<think>`` only emit the close tag, so
@@ -750,7 +883,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 text=content,
                 annotations=[],  # TODO
                 type="output_text",
-                logprobs=None,  # TODO
+                # Logprobs cover all generated tokens (matching vLLM); they are
+                # not re-sliced to the reasoning/tool-stripped content.
+                logprobs=output_logprobs,
             )
             message = ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",
@@ -776,6 +911,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         if last_items:
             output_items.extend(last_items)
         return output_items
+
+    @staticmethod
+    def _chat_tool_choice(tool_choice: Any) -> Any:
+        """Convert a Responses tool_choice to the chat-completions shape.
+
+        Responses uses the flat object form ``{"type":"function","name":X}``;
+        chat expects ``{"type":"function","function":{"name":X}}``. String forms
+        ("auto"/"required"/"none") pass through. Non-function object forms
+        (web_search, mcp, ...) can't be forced via the chat tool parser, so
+        they degrade to "auto".
+        """
+        if not isinstance(tool_choice, dict):
+            return tool_choice
+        if tool_choice.get("type") == "function":
+            name = tool_choice.get("name") or (tool_choice.get("function") or {}).get(
+                "name"
+            )
+            if name:
+                return {"type": "function", "function": {"name": name}}
+        return "auto"
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
@@ -1231,10 +1386,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             prev_status = response.status
             if prev_status not in ("queued", "in_progress"):
-                return self.create_error_response(
-                    err_type="invalid_request_error",
-                    message="Cannot cancel a synchronous response.",
-                )
+                # Idempotent: a response already in a terminal state
+                # (cancelled / completed / failed) can't be cancelled again;
+                # return it as-is rather than erroring (e.g. a second cancel).
+                return response
 
             # Update the status to "cancelled"
             response.status = "cancelled"
@@ -1329,7 +1484,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         async for ctx in result_generator:
-
             # Only process context objects that implement the `is_expecting_start()` method,
             # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
             # Contexts without this method are skipped, as they do not represent a new turn
@@ -1685,25 +1839,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time=created_time,
         )
-        # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
         # OpenAI SDK's Tool union may not know extended types; drop echo.
         response_dict["tools"] = []
-
-        # Convert UsageInfo to ResponseUsage format
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
@@ -2109,68 +2247,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                # Close any open tool-call item before opening a message so
-                # ``output_item.done`` lands before the next ``added``.
-                if normal_text:
+                # Drain tool-call deltas before normal_text: the detector returns
+                # (normal_text, calls) as a flat pair, so on a tool-call boundary
+                # the closing "}" lands in calls while the separator "\n" lands in
+                # normal_text — handling text first truncates the tool's arguments.
+                if tool_calls:
                     if reasoning_state["open"]:
                         for ev in _close_reasoning_item():
                             yield ev
-                    for tool_index in list(tool_call_states):
-                        for ev in _close_tool_call_state(tool_index):
+                    if message_state["open"]:
+                        for ev in _close_message_item():
                             yield ev
-                    if not message_state["open"]:
-                        item_id = _open_message_item()
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=message_state["output_index"],
-                                item=ResponseOutputMessage(
-                                    id=item_id,
-                                    type="message",
-                                    role="assistant",
-                                    content=[],
-                                    status="in_progress",
-                                ),
-                            )
-                        )
-                        yield _send_event(
-                            openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
-                                sequence_number=-1,
-                                output_index=message_state["output_index"],
-                                item_id=message_state["item_id"],
-                                content_index=0,
-                                part=openai_responses_types.ResponseOutputText(
-                                    type="output_text",
-                                    text="",
-                                    annotations=[],
-                                    logprobs=None,
-                                ),
-                            )
-                        )
-                    message_state["text"] += normal_text
-                    yield _send_event(
-                        openai_responses_types.ResponseTextDeltaEvent(
-                            type="response.output_text.delta",
-                            sequence_number=-1,
-                            content_index=0,
-                            output_index=message_state["output_index"],
-                            item_id=message_state["item_id"],
-                            delta=normal_text,
-                            logprobs=[],
-                        )
-                    )
-
-                if not tool_calls:
-                    continue
-
-                if reasoning_state["open"]:
-                    for ev in _close_reasoning_item():
-                        yield ev
-                if message_state["open"]:
-                    for ev in _close_message_item():
-                        yield ev
 
                 for call in tool_calls:
                     tool_index = call.tool_index
@@ -2221,6 +2308,67 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 delta=call.parameters,
                             )
                         )
+
+                # Whitespace-only normal_text while a tool call is still open is
+                # an inter-call separator (e.g. the ``\n`` between qwen3-coder
+                # tool blocks), not user-visible content. The leading
+                # ``normal_text and`` keeps the tool-state scan lazy on the
+                # common empty-delta chunks.
+                if normal_text and _should_emit_normal_text_as_message(
+                    normal_text,
+                    any_tool_call_in_progress=any(
+                        not s.get("done") for s in tool_call_states.values()
+                    ),
+                ):
+                    if reasoning_state["open"]:
+                        for ev in _close_reasoning_item():
+                            yield ev
+                    for tool_index in list(tool_call_states):
+                        for ev in _close_tool_call_state(tool_index):
+                            yield ev
+                    if not message_state["open"]:
+                        item_id = _open_message_item()
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=message_state["output_index"],
+                                item=ResponseOutputMessage(
+                                    id=item_id,
+                                    type="message",
+                                    role="assistant",
+                                    content=[],
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseContentPartAddedEvent(
+                                type="response.content_part.added",
+                                sequence_number=-1,
+                                output_index=message_state["output_index"],
+                                item_id=message_state["item_id"],
+                                content_index=0,
+                                part=openai_responses_types.ResponseOutputText(
+                                    type="output_text",
+                                    text="",
+                                    annotations=[],
+                                    logprobs=None,
+                                ),
+                            )
+                        )
+                    message_state["text"] += normal_text
+                    yield _send_event(
+                        openai_responses_types.ResponseTextDeltaEvent(
+                            type="response.output_text.delta",
+                            sequence_number=-1,
+                            content_index=0,
+                            output_index=message_state["output_index"],
+                            item_id=message_state["item_id"],
+                            delta=normal_text,
+                            logprobs=[],
+                        )
+                    )
         except Exception:
             logger.exception("Error while streaming /v1/responses")
             failed = _sanitize_response_dict(
@@ -2271,7 +2419,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name=model_name,
             created_time=created_time,
             output=final_output_items,
-            status="completed",
+            status=self._status_from_finish_reason(finish_reason),
             usage=usage,
         )
         if request.store:
@@ -2281,19 +2429,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                     self.response_store[final_response.id] = final_response
 
         response_dict = _sanitize_response_dict(final_response.model_dump())
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": cached_tokens,
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": reasoning_tokens_meta,
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
