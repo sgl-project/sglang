@@ -2635,18 +2635,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Skip prefill CG for EAGLE target on tc_piecewise: that backend
         # captures CaptureHiddenMode.NULL while runtime requests FULL, so
         # the captured graph is dead, and capturing it perturbs FP4 /
-        # TRTLLM-MoE state and corrupts decode replay (see #28386). BCG
-        # captures FULL for EAGLE target in PrefillCudaGraphRunner.__init__
-        # (restored from #25795), so it does NOT need this skip.
+        # TRTLLM-MoE state and corrupts decode replay (see #28386).
+        #
+        # Breakable captures FULL for EAGLE target, so it can still be used
+        # for most target prefill graphs. However, ModelOpt FP4 with the
+        # FlashInfer TRTLLM MoE runner has the same state-safety issue: after
+        # target prefill BCG capture, speculative target/draft decode graph
+        # capture can fail in cuBLAS or DSA KV-buffer kernels. Route only this
+        # FP4/MoE combination through eager target prefill and leave other BCG
+        # EAGLE target cases enabled.
+        is_prefill_bcg = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+        is_prefill_bcg_fp4_moe = (
+            is_prefill_bcg
+            and self.server_args.quantization == "modelopt_fp4"
+            and self.server_args.moe_runner_backend == "flashinfer_trtllm"
+        )
         if (
             self.spec_algorithm.is_eagle()
             and not self.is_draft_worker
             and not self.server_args.enable_return_hidden_states
-            and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            and (not is_prefill_bcg or is_prefill_bcg_fp4_moe)
         ):
             logger.info(
-                "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
-                "to avoid FP4/MoE decode-replay corruption (#28386)."
+                "Disable prefill CUDA graph for EAGLE target to avoid FP4/MoE "
+                "decode graph capture/replay corruption."
             )
             self.prefill_cuda_graph_runner = self.eager_runner
             return
