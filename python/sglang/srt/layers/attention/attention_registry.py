@@ -56,6 +56,31 @@ def create_flashinfer_backend(runner):
         return FlashInferMLAAttnBackend(runner)
 
 
+@register_attention_backend("flashinfer-cascade")
+def create_flashinfer_cascade_backend(runner):
+    """FlashInfer backend with a cross-request shared-prefix decode path.
+
+    Uses ``MultiLevelCascadeAttentionWrapper`` to batch the leading shared-
+    prefix portion of the running batch into a single matmul. Stock
+    ``flashinfer`` runs ``BatchDecodeWithPagedKVCacheWrapper`` per-request
+    even when prefixes are deduped at the storage layer; this backend wires
+    the cascade wrapper into SGLang's decode path. Decode-only and eager-
+    plus-CG; extend (prefill) defers to the parent ``flashinfer`` path.
+    """
+    assert (
+        not runner.model_config.is_encoder_decoder
+    ), "Cross attention is not supported in the flashinfer-cascade backend."
+    assert not runner.use_mla_backend, (
+        "flashinfer-cascade backend currently supports MHA/GQA only; MLA is "
+        "out of scope."
+    )
+    from sglang.srt.layers.attention.flashinfer_cascade_backend import (
+        FlashInferCascadeAttnBackend,
+    )
+
+    return FlashInferCascadeAttnBackend(runner)
+
+
 @register_attention_backend("trtllm_mla")
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
