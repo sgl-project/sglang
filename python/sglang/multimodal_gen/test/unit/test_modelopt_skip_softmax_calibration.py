@@ -21,8 +21,8 @@ from pathlib import Path
 
 from sglang.multimodal_gen.runtime.layers.attention.backends._modelopt_skip_softmax_calib import (
     DEFAULT_TARGET_SPARSE_RATIO,
-    compute_threshold,
     component_key_from_prefix,
+    compute_threshold,
     entry_from_flat_ab,
     entry_from_modelopt_canonical,
     load_calibration_file,
@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends._modelopt_skip_soft
     pick_calibration_entry,
     resolve_target_sparsity,
 )
+
 
 # ====================================================================== #
 #  normalize_target_sparse_ratio                                         #
@@ -116,43 +117,52 @@ def test_normalize_flat_one_model():
 
 
 def test_normalize_flat_per_component():
-    cal = normalize_calibration({
-        "transformer": {"a": 10.0, "b": 5.0},
-        "transformer_2": {"a": 9.0, "b": 4.5},
-    })
+    cal = normalize_calibration(
+        {
+            "transformer": {"a": 10.0, "b": 5.0},
+            "transformer_2": {"a": 9.0, "b": 4.5},
+        }
+    )
     assert set(cal) == {"transformer", "transformer_2"}
     assert cal["transformer"]["phases"]["prefill"] == (10.0, 5.0)
     assert cal["transformer_2"]["phases"]["decode"] == (9.0, 4.5)
 
 
 def test_normalize_modelopt_canonical_per_component():
-    cal = normalize_calibration({
-        "transformer": {
-            "threshold_scale_factor": {
-                "prefill": {"a": 8.0, "b": 7.0},
-                "decode": {"a": 8.0, "b": 7.0},
+    cal = normalize_calibration(
+        {
+            "transformer": {
+                "threshold_scale_factor": {
+                    "prefill": {"a": 8.0, "b": 7.0},
+                    "decode": {"a": 8.0, "b": 7.0},
+                },
+                "target_sparse_ratio": 0.55,
             },
-            "target_sparse_ratio": 0.55,
-        },
-        "transformer_2": {
-            "threshold_scale_factor": {
-                "prefill": {"a": 7.5, "b": 6.5},
-                "decode": {"a": 7.5, "b": 6.5},
+            "transformer_2": {
+                "threshold_scale_factor": {
+                    "prefill": {"a": 7.5, "b": 6.5},
+                    "decode": {"a": 7.5, "b": 6.5},
+                },
             },
-        },
-    })
-    assert cal["transformer"]["target_sparse_ratio"] == {"prefill": 0.55, "decode": 0.55}
+        }
+    )
+    assert cal["transformer"]["target_sparse_ratio"] == {
+        "prefill": 0.55,
+        "decode": 0.55,
+    }
     assert cal["transformer_2"]["target_sparse_ratio"] == DEFAULT_TARGET_SPARSE_RATIO
     assert cal["transformer"]["phases"]["prefill"] == (8.0, 7.0)
 
 
 def test_normalize_mixed_schemas_in_one_file():
-    cal = normalize_calibration({
-        "transformer": {"a": 10.0, "b": 5.0},
-        "transformer_2": {
-            "threshold_scale_factor": {"prefill": {"a": 9.0, "b": 4.5}},
-        },
-    })
+    cal = normalize_calibration(
+        {
+            "transformer": {"a": 10.0, "b": 5.0},
+            "transformer_2": {
+                "threshold_scale_factor": {"prefill": {"a": 9.0, "b": 4.5}},
+            },
+        }
+    )
     assert cal["transformer"]["phases"]["prefill"] == (10.0, 5.0)
     assert cal["transformer_2"]["phases"]["prefill"] == (9.0, 4.5)
 
@@ -169,11 +179,13 @@ def test_normalize_bad_inputs_return_empty():
 def test_normalize_entries_with_no_recognisable_schema_skipped():
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        cal = normalize_calibration({
-            "good": {"a": 10.0, "b": 5.0},
-            "junk": {"random_field": 42},
-            "bad_payload": "this should be a dict",
-        })
+        cal = normalize_calibration(
+            {
+                "good": {"a": 10.0, "b": 5.0},
+                "junk": {"random_field": 42},
+                "bad_payload": "this should be a dict",
+            }
+        )
         assert set(cal) == {"good"}
         assert any("no recognised" in str(x.message) for x in w)
         assert any("is not a dict" in str(x.message) for x in w)
@@ -247,25 +259,38 @@ def test_component_key_from_prefix():
 # ====================================================================== #
 def test_resolve_target_sparsity_override_wins():
     entry = entry_from_flat_ab(10, 5)  # default ratio 0.5
-    assert resolve_target_sparsity(override=0.7, calib_entry=entry, phase="prefill") == 0.7
+    assert (
+        resolve_target_sparsity(override=0.7, calib_entry=entry, phase="prefill") == 0.7
+    )
 
 
 def test_resolve_target_sparsity_falls_back_to_calib():
-    entry = entry_from_modelopt_canonical({
-        "threshold_scale_factor": {"prefill": {"a": 10.0, "b": 5.0}},
-        "target_sparse_ratio": {"prefill": 0.4},
-    })
-    assert resolve_target_sparsity(override=0.0, calib_entry=entry, phase="prefill") == 0.4
+    entry = entry_from_modelopt_canonical(
+        {
+            "threshold_scale_factor": {"prefill": {"a": 10.0, "b": 5.0}},
+            "target_sparse_ratio": {"prefill": 0.4},
+        }
+    )
+    assert (
+        resolve_target_sparsity(override=0.0, calib_entry=entry, phase="prefill") == 0.4
+    )
 
 
 def test_resolve_target_sparsity_falls_back_to_default_without_entry():
-    assert resolve_target_sparsity(override=0.0, calib_entry=None, phase="prefill") == 0.5
-    assert resolve_target_sparsity(override=0.0, calib_entry=None, phase="decode") == 0.5
+    assert (
+        resolve_target_sparsity(override=0.0, calib_entry=None, phase="prefill") == 0.5
+    )
+    assert (
+        resolve_target_sparsity(override=0.0, calib_entry=None, phase="decode") == 0.5
+    )
 
 
 def test_resolve_target_sparsity_negative_override_treated_as_unset():
     entry = entry_from_flat_ab(10, 5)
-    assert resolve_target_sparsity(override=-1.0, calib_entry=entry, phase="prefill") == 0.5
+    assert (
+        resolve_target_sparsity(override=-1.0, calib_entry=entry, phase="prefill")
+        == 0.5
+    )
 
 
 # ====================================================================== #
@@ -286,7 +311,10 @@ def test_load_calibration_file_round_trip():
         cal = load_calibration_file(path)
         assert cal["transformer"]["phases"]["prefill"] == (12.34, 5.67)
         assert cal["transformer_2"]["phases"]["prefill"] == (11.0, 6.0)
-        assert cal["transformer_2"]["target_sparse_ratio"] == {"prefill": 0.6, "decode": 0.6}
+        assert cal["transformer_2"]["target_sparse_ratio"] == {
+            "prefill": 0.6,
+            "decode": 0.6,
+        }
     finally:
         Path(path).unlink(missing_ok=True)
 
@@ -298,16 +326,20 @@ def test_end_to_end_resolve_prefill_default_sparsity():
     """Mirror what ``ModelOptSkipSoftmaxImpl._resolve_threshold`` does, but
     with the impl class removed -- proves the pure-helper composition is
     sufficient and correct."""
-    cal = normalize_calibration({
-        "transformer": {
-            "threshold_scale_factor": {
-                "prefill": {"a": 6.0, "b": 8.0},
-                "decode": {"a": 6.0, "b": 8.0},
-            },
-            "target_sparse_ratio": {"prefill": 0.5, "decode": 0.5},
+    cal = normalize_calibration(
+        {
+            "transformer": {
+                "threshold_scale_factor": {
+                    "prefill": {"a": 6.0, "b": 8.0},
+                    "decode": {"a": 6.0, "b": 8.0},
+                },
+                "target_sparse_ratio": {"prefill": 0.5, "decode": 0.5},
+            }
         }
-    })
-    entry = pick_calibration_entry(cal, component_key_from_prefix("transformer.blocks.0"))
+    )
+    entry = pick_calibration_entry(
+        cal, component_key_from_prefix("transformer.blocks.0")
+    )
     assert entry is not None
     target = resolve_target_sparsity(override=0.0, calib_entry=entry, phase="prefill")
     a, b = entry["phases"]["prefill"]

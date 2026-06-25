@@ -42,7 +42,9 @@ def normalize_target_sparse_ratio(value: Any) -> dict[str, float]:
         return {"prefill": r, "decode": r}
     if isinstance(value, Mapping):
         return {
-            "prefill": float(value.get("prefill", DEFAULT_TARGET_SPARSE_RATIO["prefill"])),
+            "prefill": float(
+                value.get("prefill", DEFAULT_TARGET_SPARSE_RATIO["prefill"])
+            ),
             "decode": float(value.get("decode", DEFAULT_TARGET_SPARSE_RATIO["decode"])),
         }
     return dict(DEFAULT_TARGET_SPARSE_RATIO)
@@ -91,7 +93,9 @@ def entry_from_modelopt_canonical(raw: Mapping[str, Any]) -> CalibEntry | None:
         phases["decode"] = phases["prefill"]
     return {
         "phases": phases,
-        "target_sparse_ratio": normalize_target_sparse_ratio(raw.get("target_sparse_ratio")),
+        "target_sparse_ratio": normalize_target_sparse_ratio(
+            raw.get("target_sparse_ratio")
+        ),
     }
 
 
@@ -162,7 +166,11 @@ def pick_calibration_entry(
 
 
 def compute_threshold(
-    *, a: float, b: float, target_sparsity: float, seq_len_k: int,
+    *,
+    a: float,
+    b: float,
+    target_sparsity: float,
+    seq_len_k: int,
 ) -> float | None:
     """Apply ``threshold = a * exp(b * target_sparsity) / seq_len_k``.
 
@@ -219,9 +227,11 @@ def resolve_target_sparsity(
     if override > 0.0:
         return override
     if calib_entry is not None:
-        return float(calib_entry["target_sparse_ratio"].get(
-            phase, DEFAULT_TARGET_SPARSE_RATIO[phase]
-        ))
+        return float(
+            calib_entry["target_sparse_ratio"].get(
+                phase, DEFAULT_TARGET_SPARSE_RATIO[phase]
+            )
+        )
     return DEFAULT_TARGET_SPARSE_RATIO[phase]
 
 

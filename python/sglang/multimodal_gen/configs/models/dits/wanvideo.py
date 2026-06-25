@@ -7,7 +7,6 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
-
 # Wan-specific attention backend whitelist. Mirrors DiTArchConfig's default set
 # but adds FLASHINFER_TRTLLM_SKIP_SOFTMAX so users can opt-in via
 # ``--attention-backend flashinfer_trtllm_skip_softmax`` on Wan2.2 (SM10.x).
