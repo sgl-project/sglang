@@ -204,10 +204,11 @@ if is_flashinfer_available():
 #   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
 #   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
 #
-# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to trtllm
-# on single-node systems and to mnnvl on Blackwell multi-node systems.
-# Non-Blackwell multi-node allreduce fusion is rejected. Explicit mnnvl remains
-# available on SM90 single-node systems.
+# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to mnnvl
+# on Blackwell (SM100/SM103) systems (single- and multi-node) and to trtllm on
+# SM90 single-node systems. SM90 multi-node and non-SM90/SM10X configurations
+# are rejected. Either mnnvl or trtllm can be requested explicitly on
+# single-node systems, and mnnvl additionally on Blackwell multi-node.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
