@@ -259,6 +259,7 @@ class TinyDSAModelConfig:
             index_topk=index_topk,
             num_hidden_layers=1,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
 
 

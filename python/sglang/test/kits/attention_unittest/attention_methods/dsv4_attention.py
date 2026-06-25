@@ -282,6 +282,7 @@ class TinyDSV4ModelConfig:
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
 
 
