@@ -599,8 +599,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         ) and getattr(layer, "prefix", "").startswith(
             ("transformer_blocks.", "single_transformer_blocks.")
         )
-        if flashinfer_backend is None or uses_flux1_scale_layout:
-            # CUTLASS and FLUX.1 CUDNN paths need the TMA scale layout.
+        # The trtllm backend already returned above with its own scale shuffle,
+        # so every GEMM consumer that reaches this point expects the TMA
+        # blockscale layout: the sgl_kernel CUTLASS fallback (flashinfer_backend
+        # is None), the FLUX.1 cutlass/cudnn path (uses_flux1_scale_layout), and
+        # also flashinfer cutlass/cudnn/auto for packed-qkv checkpoints such as
+        # FLUX.2 (which CI only ever exercised via trtllm on B200, so this case
+        # was previously missed and produced a corrupted latent on sm_120).
+        needs_tma_scale_layout = (
+            flashinfer_backend is None
+            or uses_flux1_scale_layout
+            or flashinfer_backend in ("cutlass", "cudnn", "auto")
+        )
+        if needs_tma_scale_layout:
+            # CUTLASS / CUDNN / auto paths need the TMA scale layout.
             padded_scales = padded_scales.reshape(
                 B, M_padded // 128, 4, 32, K_padded // 4, 4
             )
