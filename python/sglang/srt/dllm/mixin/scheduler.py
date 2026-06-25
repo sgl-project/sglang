@@ -81,7 +81,7 @@ class SchedulerDllmMixin:
                     continue
 
                 req.full_untruncated_fill_ids[
-                    req.fill_len - new_tokens : req.fill_len
+                    req.extend_range.end - new_tokens : req.extend_range.end
                 ] = array("q", next_token_ids)
                 self.metrics_reporter.num_generated_tokens += new_tokens
 
