@@ -53,12 +53,12 @@ class TestMxfp4Tensor(unittest.TestCase):
 
         fp4_weight, fp4_scale = MXFP4QuantizeUtil.quantize(weight, block_size=32)
 
-        self.assertEqual(fp4_weight.quantized_data.dtype, torch.uint8)
-        self.assertEqual(fp4_weight.quantized_data.shape, torch.Size([32, 16]))
+        self.assertEqual(fp4_weight.dtype, torch.uint8)
+        self.assertEqual(fp4_weight.shape, torch.Size([32, 16]))
         self.assertEqual(fp4_scale.dtype, torch.uint8)
         self.assertEqual(fp4_scale.shape, torch.Size([32, 1]))
         dequant = MXFP4QuantizeUtil.dequantize(
-            fp4_weight.quantized_data,
+            fp4_weight,
             torch.bfloat16,
             fp4_scale,
             block_sizes=[32],
@@ -73,12 +73,12 @@ class TestMxfp4Tensor(unittest.TestCase):
 
         fp4_weight, fp4_scale = MXFP4QuantizeUtil.quantize(weight, block_size=32)
 
-        self.assertEqual(fp4_weight.quantized_data.dtype, torch.uint8)
-        self.assertEqual(fp4_weight.quantized_data.shape, torch.Size([2, 32, 16]))
+        self.assertEqual(fp4_weight.dtype, torch.uint8)
+        self.assertEqual(fp4_weight.shape, torch.Size([2, 32, 16]))
         self.assertEqual(fp4_scale.dtype, torch.uint8)
         self.assertEqual(fp4_scale.shape, torch.Size([64, 1]))
         dequant = MXFP4QuantizeUtil.dequantize(
-            fp4_weight.quantized_data,
+            fp4_weight,
             torch.bfloat16,
             fp4_scale,
             block_sizes=[32],

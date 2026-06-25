@@ -25,16 +25,6 @@ class MXFP4QuantizeUtil:
     E2M1_values = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
     E2M1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
 
-    def __init__(
-        self,
-        original_shape: torch.Size,
-        original_dtype: torch.dtype,
-        quantized_data: torch.Tensor,
-    ):
-        self.original_shape = original_shape
-        self.original_dtype = original_dtype
-        self.quantized_data = quantized_data
-
     @classmethod
     def quantize(cls, input: torch.Tensor, block_size: Optional[int]) -> tuple:
         """Converting a tensor to a quantized format based on MXFP4 quantization. Only E4M3 is supported.
@@ -81,7 +71,7 @@ class MXFP4QuantizeUtil:
         input_q = cast_fp4(input)
         input_q = fuse_uint4_to_uint8(input_q)
         e8m0_scale = (e8m0_scale + 127).to(torch.uint8)
-        return cls(original_shape, original_dtype, input_q), e8m0_scale
+        return input_q, e8m0_scale
 
     @classmethod
     def dequantize(cls, quantized_data, dtype: torch.dtype, scale, block_sizes):

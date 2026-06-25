@@ -1277,10 +1277,10 @@ def quantize_block_fp8_weight_to_mxfp4(
         weight_block_size,
         torch.bfloat16,
     )
-    fp4_quantized, fp4_scale = MXFP4QuantizeUtil.quantize(
+    fp4_weight, fp4_scale = MXFP4QuantizeUtil.quantize(
         fp8_weight_dequant, block_size=mxfp4_block_size
     )
-    fp4_weight = fp4_quantized.quantized_data.contiguous().view(torch.int8)
+    fp4_weight = fp4_weight.contiguous().view(torch.int8)
     fp4_scale = fp4_scale.view(
         *fp8_weight_dequant.shape[:-1],
         fp8_weight_dequant.shape[-1] // mxfp4_block_size,

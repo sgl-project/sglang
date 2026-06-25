@@ -228,15 +228,11 @@ class HashTopK(nn.Module):
             if lplb_solver is not None:
                 log2phy_prob = lplb_solver.solve(topk_ids)
 
-        if log2phy_prob is not None:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
-            )
-        elif use_per_rank_shared_slots:
+        if use_per_rank_shared_slots:
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = topk_ids_logical_to_physical(
-                routed_cols, expert_location_dispatch_info
+                routed_cols, expert_location_dispatch_info, log2phy_prob
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
 
@@ -258,7 +254,7 @@ class HashTopK(nn.Module):
             )
         else:
             topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
+                topk_ids, expert_location_dispatch_info, log2phy_prob
             )
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
