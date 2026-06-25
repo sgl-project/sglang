@@ -152,12 +152,7 @@ def compare_weights(
 
 
 def select_comparable_weight(quant_method) -> Optional[type]:
-    """Map a module's quant_method to its ComparableWeight subclass; None means raw
-    (bit-exact) compare. fp8 block quant -> Fp8BlockComparable: load-time ue8m0
-    requant yields two valid fp8 encodings, so compare in dequant space with ULP
-    tolerance. nvfp4 -> raise (non-bit-exact, unsupported). int4/mxfp8/mxfp4 and
-    unquantized -> None.
-    """
+    """Map a module's quant_method to its ComparableWeight. None means raw (bitwise equal) compare."""
     if (
         isinstance(quant_method, (Fp8LinearMethod, Fp8MoEMethod))
         and quant_method.block_quant
