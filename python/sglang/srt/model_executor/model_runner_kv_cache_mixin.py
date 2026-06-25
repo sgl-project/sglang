@@ -5,10 +5,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.hybrid_arch import (
-    hybrid_gdn_config,
-    mambaish_config,
-)
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     is_deepseek_dsa,
@@ -109,21 +105,19 @@ class ModelRunnerKVCacheMixin:
         unsupported_pool_family = None
         if is_dsv4_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
-        elif current_platform.is_out_of_tree() and not mambaish_config(
-            self.model_config
-        ):
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
-        elif self.server_args.attention_backend == "ascend" and not mambaish_config(
-            self.model_config
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
         elif self.use_mla_backend and is_dsa_model:
             unsupported_pool_family = "DSA/MLA KV pool"
-        elif self.use_mla_backend and not mambaish_config(self.model_config):
+        elif self.use_mla_backend and not self.mambaish_config:
             unsupported_pool_family = "MLA KV pool"
         elif self.is_hybrid_swa:
             unsupported_pool_family = "SWA KV pool"
-        elif mambaish_config(self.model_config):
+        elif self.mambaish_config:
             unsupported_pool_family = "hybrid linear/Mamba KV pool"
         elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
             unsupported_pool_family = "FP4 MHA KV pool"
@@ -137,12 +131,28 @@ class ModelRunnerKVCacheMixin:
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
 
-    def _init_pools(self: ModelRunner):
+    def _init_pools(
+        self: ModelRunner,
+        *,
+        max_total_num_tokens: int,
+        max_running_requests: int,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+        c4_max_total_num_tokens: int,
+        c128_max_total_num_tokens: int,
+        c4_state_pool_size: int,
+        c128_state_pool_size: int,
+        c4_state_dtype: Optional[torch.dtype],
+        c128_state_dtype: Optional[torch.dtype],
+        req_to_token_pool: Optional[ReqToTokenPool],
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
+    ) -> tuple[ReqToTokenPool, KVCache, BaseTokenToKVPoolAllocator]:
         """Initialize the memory pools."""
-        max_num_reqs = self.max_running_requests
+        token_to_kv_pool = None
+        max_num_reqs = max_running_requests
 
         # Initialize req_to_token_pool
-        if self.req_to_token_pool is None:
+        if req_to_token_pool is None:
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
             extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
@@ -154,8 +164,8 @@ class ModelRunnerKVCacheMixin:
 
                 # Extra slots for pre-allocated requests
                 pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
-                if config := mambaish_config(self.model_config):
-                    self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
+                if config := self.mambaish_config:
+                    req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
@@ -178,7 +188,7 @@ class ModelRunnerKVCacheMixin:
                         start_layer=self.start_layer,
                     )
                 else:
-                    self.req_to_token_pool = DecodeReqToTokenPool(
+                    req_to_token_pool = DecodeReqToTokenPool(
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
@@ -186,8 +196,8 @@ class ModelRunnerKVCacheMixin:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         pre_alloc_size=pre_alloc_size,
                     )
-            elif config := mambaish_config(self.model_config):
-                self.req_to_token_pool = HybridReqToTokenPool(
+            elif config := self.mambaish_config:
+                req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
                     mamba_spec_state_size=max_num_reqs,
@@ -223,7 +233,7 @@ class ModelRunnerKVCacheMixin:
 
                     req_to_token_pool_cls = DSV4NPUReqToTokenPool
 
-                self.req_to_token_pool = req_to_token_pool_cls(
+                req_to_token_pool = req_to_token_pool_cls(
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -243,7 +253,7 @@ class ModelRunnerKVCacheMixin:
         )
 
         if is_dsv4_model:
-            swa_page_size = self.page_size
+            swa_page_size = self.server_args.page_size
             if not _is_npu:
                 assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
@@ -277,35 +287,35 @@ class ModelRunnerKVCacheMixin:
                 # sliding eviction in ``ScheduleBatch._evict_swa``.
                 c4_state_pool_size = npu_state_pool_size(
                     ratio=4,
-                    page_size=self.page_size,
-                    max_num_reqs=self.max_running_requests,
+                    page_size=self.server_args.page_size,
+                    max_num_reqs=max_running_requests,
                 )
                 c128_state_pool_size = npu_state_pool_size(
                     ratio=128,
-                    page_size=self.page_size,
-                    max_num_reqs=self.max_running_requests,
+                    page_size=self.server_args.page_size,
+                    max_num_reqs=max_running_requests,
                 )
             else:
                 pool_cls = DeepSeekV4TokenToKVPool
-                c4_state_pool_size = self.c4_state_pool_size
-                c128_state_pool_size = self.c128_state_pool_size
+                c4_state_pool_size = c4_state_pool_size
+                c128_state_pool_size = c128_state_pool_size
 
-            self.token_to_kv_pool = pool_cls(
-                max_num_reqs=self.max_running_requests,
+            token_to_kv_pool = pool_cls(
+                max_num_reqs=max_running_requests,
                 # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
                 # past max_running_requests (pre-alloc), so size to the real capacity.
-                num_req_slots=self.req_to_token_pool.req_to_token.shape[0],
-                swa_size=self.swa_max_total_num_tokens,
-                c4_size=self.c4_max_total_num_tokens,
-                c128_size=self.c128_max_total_num_tokens,
+                num_req_slots=req_to_token_pool.req_to_token.shape[0],
+                swa_size=swa_max_total_num_tokens,
+                c4_size=c4_max_total_num_tokens,
+                c128_size=c128_max_total_num_tokens,
                 c4_state_pool_size=c4_state_pool_size,
                 c128_state_pool_size=c128_state_pool_size,
-                page_size=self.page_size,
+                page_size=self.server_args.page_size,
                 swa_page_size=swa_page_size,
                 sliding_window=self.model_config.window_size,
                 dtype=self.kv_cache_dtype,
-                c4_state_dtype=self.c4_state_dtype,
-                c128_state_dtype=self.c128_state_dtype,
+                c4_state_dtype=c4_state_dtype,
+                c128_state_dtype=c128_state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 indexer_head_dim=self.model_config.index_head_dim,
@@ -315,19 +325,17 @@ class ModelRunnerKVCacheMixin:
                 compression_ratios=compression_ratios,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                enable_hisparse=self.enable_hisparse,
+                enable_hisparse=self.server_args.enable_hisparse,
                 online_mtp_max_draft_tokens=(
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
             )
-        elif current_platform.is_out_of_tree() and not mambaish_config(
-            self.model_config
-        ):
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()
-                self.token_to_kv_pool = PoolCls(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = PoolCls(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -345,9 +353,9 @@ class ModelRunnerKVCacheMixin:
                 )
             elif self.use_mla_backend:
                 PoolCls = current_platform.get_mla_kv_pool_cls()
-                self.token_to_kv_pool = PoolCls(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = PoolCls(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -362,9 +370,9 @@ class ModelRunnerKVCacheMixin:
                 )
             else:
                 PoolCls = current_platform.get_mha_kv_pool_cls()
-                self.token_to_kv_pool = PoolCls(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = PoolCls(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -376,8 +384,8 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.server_args.attention_backend == "ascend" and not mambaish_config(
-            self.model_config
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -396,10 +404,10 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.v_head_dim,
                     }
-                self.token_to_kv_pool = SWAKVPool(
-                    size=self.full_max_total_num_tokens,
-                    size_swa=self.swa_max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = SWAKVPool(
+                    size=full_max_total_num_tokens,
+                    size_swa=swa_max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -417,9 +425,9 @@ class ModelRunnerKVCacheMixin:
                     NPUMLATokenToKVPool,
                 )
 
-                self.token_to_kv_pool = NPUMLATokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = NPUMLATokenToKVPool(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -437,9 +445,9 @@ class ModelRunnerKVCacheMixin:
                     NPUMHATokenToKVPool,
                 )
 
-                self.token_to_kv_pool = NPUMHATokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = NPUMHATokenToKVPool(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -453,18 +461,20 @@ class ModelRunnerKVCacheMixin:
                 )
         elif self.use_mla_backend and is_dsa_model:
             PoolCls = (
-                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
+                HiSparseDSATokenToKVPool
+                if self.server_args.enable_hisparse
+                else DSATokenToKVPool
             )
             pool_kwargs = {}
-            if self.enable_hisparse:
+            if self.server_args.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
-            self.token_to_kv_pool = PoolCls(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
+            token_to_kv_pool = PoolCls(
+                max_total_num_tokens,
+                page_size=self.server_args.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -481,12 +491,12 @@ class ModelRunnerKVCacheMixin:
                 index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 **pool_kwargs,
             )
-        elif self.use_mla_backend and not mambaish_config(self.model_config):
+        elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                self.token_to_kv_pool = MLATokenToKVPoolFP4(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = MLATokenToKVPoolFP4(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -497,9 +507,9 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = MLATokenToKVPool(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = MLATokenToKVPool(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -523,10 +533,10 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.v_head_dim,
                     }
-                self.token_to_kv_pool = SWAKVPool(
-                    size=self.full_max_total_num_tokens,
-                    size_swa=self.swa_max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool = SWAKVPool(
+                    size=full_max_total_num_tokens,
+                    size_swa=swa_max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -541,16 +551,16 @@ class ModelRunnerKVCacheMixin:
                     ),
                     **kwargs,
                 )
-            elif config := mambaish_config(self.model_config):
+            elif config := self.mambaish_config:
                 extra_args = {}
                 if self.use_mla_backend:
                     extra_args = {
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
-                self.token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.page_size,
-                    size=self.max_total_num_tokens,
+                token_to_kv_pool = HybridLinearKVPool(
+                    page_size=self.server_args.page_size,
+                    size=max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -568,7 +578,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     enable_kvcache_transpose=False,
                     device=self.device,
-                    mamba_pool=self.req_to_token_pool.mamba_pool,
+                    mamba_pool=req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
@@ -579,9 +589,9 @@ class ModelRunnerKVCacheMixin:
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    self.token_to_kv_pool = MHATokenToKVPoolFP4(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
+                    token_to_kv_pool = MHATokenToKVPoolFP4(
+                        max_total_num_tokens,
+                        page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         head_num=self.model_config.get_num_kv_heads(
                             get_attention_tp_size()
@@ -604,9 +614,9 @@ class ModelRunnerKVCacheMixin:
                         if self.server_args.prefill_only_disable_kv_cache
                         else MHATokenToKVPool
                     )
-                    self.token_to_kv_pool = pool_cls(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
+                    token_to_kv_pool = pool_cls(
+                        max_total_num_tokens,
+                        page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         head_num=self.model_config.get_num_kv_heads(
                             get_attention_tp_size()
@@ -626,21 +636,21 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
-        if self.token_to_kv_pool_allocator is None:
+        if token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
-                self.token_to_kv_pool_allocator = AllocatorCls(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
+                token_to_kv_pool_allocator = AllocatorCls(
+                    max_total_num_tokens,
+                    page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     device=self.device,
-                    kvcache=self.token_to_kv_pool,
+                    kvcache=token_to_kv_pool,
                     need_sort=need_sort,
                 )
             elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
                 or is_dsv4_model
-                or hybrid_gdn_config(self.model_config) is not None
+                or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
@@ -653,13 +663,13 @@ class ModelRunnerKVCacheMixin:
                         swa_allocator_cls = DSV4NPUTokenToKVPoolAllocator
                     else:
                         swa_allocator_cls = SWATokenToKVPoolAllocator
-                    self.token_to_kv_pool_allocator = swa_allocator_cls(
-                        self.full_max_total_num_tokens,
-                        self.swa_max_total_num_tokens,
-                        page_size=self.page_size,
+                    token_to_kv_pool_allocator = swa_allocator_cls(
+                        full_max_total_num_tokens,
+                        swa_max_total_num_tokens,
+                        page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
-                        kvcache=self.token_to_kv_pool,
+                        kvcache=token_to_kv_pool,
                         need_sort=need_sort,
                     )
                 else:
@@ -667,86 +677,84 @@ class ModelRunnerKVCacheMixin:
                         NPUPagedTokenToKVPoolAllocator,
                     )
 
-                    self.token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
+                    token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
+                        max_total_num_tokens,
+                        page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
-                        kvcache=self.token_to_kv_pool,
+                        kvcache=token_to_kv_pool,
                         need_sort=need_sort,
                     )
             else:
                 if self.is_hybrid_swa:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        self.full_max_total_num_tokens,
-                        self.swa_max_total_num_tokens,
-                        page_size=self.page_size,
+                    token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        full_max_total_num_tokens,
+                        swa_max_total_num_tokens,
+                        page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
-                        kvcache=self.token_to_kv_pool,
+                        kvcache=token_to_kv_pool,
                         need_sort=need_sort,
                     )
                 else:
-                    if self.enable_hisparse:
+                    if self.server_args.enable_hisparse:
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
-                        self.token_to_kv_pool_allocator = (
-                            HiSparseTokenToKVPoolAllocator(
-                                self.max_total_num_tokens,
-                                page_size=self.page_size,
-                                dtype=self.kv_cache_dtype,
-                                device=self.device,
-                                kvcache=self.token_to_kv_pool,
-                                need_sort=need_sort,
-                                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-                            )
-                        )
-                    elif self.page_size == 1 and self.dcp_size == 1:
-                        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
+                        token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
+                            max_total_num_tokens,
+                            page_size=self.server_args.page_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
-                            kvcache=self.token_to_kv_pool,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                            host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                        )
+                    elif (
+                        self.server_args.page_size == 1
+                        and self.server_args.dcp_size == 1
+                    ):
+                        token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                            max_total_num_tokens,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                         )
                     else:
-                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens * self.dcp_size,
-                            page_size=self.page_size * self.dcp_size,
+                        token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            max_total_num_tokens * self.server_args.dcp_size,
+                            page_size=self.server_args.page_size
+                            * self.server_args.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
-                            kvcache=self.token_to_kv_pool,
+                            kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                         )
 
-            if self.enable_hisparse and is_dsv4_model:
+            if self.server_args.enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
-                self.token_to_kv_pool_allocator = (
-                    DeepSeekV4HiSparseTokenToKVPoolAllocator(
-                        self.token_to_kv_pool_allocator
-                    )
+                token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
+                    token_to_kv_pool_allocator
                 )
 
             # DSV4-NPU: wire allocator back-ref into req_to_token_pool so its
             # free(req) can release c4/c128 pool pages alongside the slot.
-            if hasattr(self.req_to_token_pool, "register_dsv4_allocator"):
-                self.req_to_token_pool.register_dsv4_allocator(
-                    self.token_to_kv_pool_allocator
-                )
+            if hasattr(req_to_token_pool, "register_dsv4_allocator"):
+                req_to_token_pool.register_dsv4_allocator(token_to_kv_pool_allocator)
 
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
                 swa_allocator = getattr(
-                    self.token_to_kv_pool_allocator,
+                    token_to_kv_pool_allocator,
                     "logical_attn_allocator",
-                    self.token_to_kv_pool_allocator,
+                    token_to_kv_pool_allocator,
                 )
                 assert swa_allocator.__class__ == SWATokenToKVPoolAllocator
-                self.token_to_kv_pool.full_to_swa_index_mapping = (
+                token_to_kv_pool.full_to_swa_index_mapping = (
                     swa_allocator.full_to_swa_index_mapping
                 )
 
@@ -756,17 +764,18 @@ class ModelRunnerKVCacheMixin:
         if (
             self.server_args.prefill_only_disable_kv_cache
             and not self.is_draft_worker
-            and not isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool)
+            and not isinstance(token_to_kv_pool, NoOpMHATokenToKVPool)
         ):
             raise RuntimeError(
                 "--prefill-only-disable-kv-cache expected NoOpMHATokenToKVPool but the "
-                f"runtime pool is {type(self.token_to_kv_pool).__name__}. This pool "
+                f"runtime pool is {type(token_to_kv_pool).__name__}. This pool "
                 "family is not yet supported by --prefill-only-disable-kv-cache. "
                 "Supported configurations today: plain MHA models on CUDA with the FA "
                 "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
                 "and --kv-cache-dtype != fp4_e2m1."
             )
+        return req_to_token_pool, token_to_kv_pool, token_to_kv_pool_allocator
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         return self.kv_cache_configurator._apply_token_constraints(token_capacity)
@@ -803,7 +812,24 @@ class ModelRunnerKVCacheMixin:
                 _get_dsv4_compress_state_dtypes()
             )
 
-        self._init_pools()
+        (
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.token_to_kv_pool_allocator,
+        ) = self.kv_cache_configurator._init_pools(
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_running_requests=self.max_running_requests,
+            full_max_total_num_tokens=getattr(self, "full_max_total_num_tokens", None),
+            swa_max_total_num_tokens=getattr(self, "swa_max_total_num_tokens", None),
+            c4_max_total_num_tokens=self.c4_max_total_num_tokens,
+            c128_max_total_num_tokens=self.c128_max_total_num_tokens,
+            c4_state_pool_size=self.c4_state_pool_size,
+            c128_state_pool_size=self.c128_state_pool_size,
+            c4_state_dtype=getattr(self, "c4_state_dtype", None),
+            c128_state_dtype=getattr(self, "c128_state_dtype", None),
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
 
     def _resolve_memory_pool_config(
         self: ModelRunner, pre_model_load_memory: int

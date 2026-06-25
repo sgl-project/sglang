@@ -11,8 +11,32 @@ from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.utils.common import is_hip
 
 _is_hip = is_hip()
+import logging
+import math
+
+from sglang.srt.configs.model_config import (
+    is_deepseek_dsa,
+)
+from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import (
+    get_available_gpu_memory,
+    is_npu,
+)
+
+logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
+
+# the ratio of mamba cache pool size to max_running_requests
+MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
+MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner_components.pool_configurator import (
