@@ -133,14 +133,22 @@ class DWDPTransport:
                 map_handle(temp_va, phys_size, handle)
                 set_access(temp_va, phys_size, device_id)
 
-                # Copy local param into the fabric handle via tensor view
-                handle_tensor = tensor_from_ptr(
-                    ptr=temp_va + data_offset,
-                    shape=tuple(param.shape),
-                    dtype=param.dtype,
-                    device_id=device_id,
+                # Copy local param into the fabric handle via cuMemcpyDtoD
+                from sglang.srt.layers.moe.dwdp.vmm import _to_devptr, check_cu_result
+
+                try:
+                    from cuda.bindings import driver as _cuda_drv
+                except ImportError:
+                    from cuda import cuda as _cuda_drv
+
+                nbytes = param.numel() * param.element_size()
+                check_cu_result(
+                    _cuda_drv.cuMemcpyDtoD(
+                        _to_devptr(temp_va + data_offset),
+                        _to_devptr(param.data_ptr()),
+                        nbytes,
+                    )
                 )
-                handle_tensor.copy_(param)
                 torch.cuda.synchronize()
 
                 # Unmap temp VA

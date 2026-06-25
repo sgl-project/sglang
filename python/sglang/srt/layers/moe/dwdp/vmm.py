@@ -260,8 +260,33 @@ def tensor_from_ptr(
 
     device = torch.device(f"cuda:{device_id}")
 
-    # Allocate a storage and copy from the VA pointer into it.
-    # Not zero-copy but safe across all PyTorch versions and CUDA bindings.
+    # Zero-copy: wrap the raw CUDA pointer as a PyTorch tensor using
+    # torch.UntypedStorage constructed from an external CUDA allocation.
+    #
+    # PyTorch provides torch.Storage._new_shared_cuda() which creates
+    # a storage backed by shared CUDA memory. We can then swap its
+    # data_ptr to our VA pointer using torch internals.
+    #
+    # Approach: Use torch.from_blob (PyTorch >= 2.2) which creates
+    # a tensor from a raw pointer without copying.
+    try:
+        # torch.from_blob creates a zero-copy tensor from a raw pointer.
+        # Available in PyTorch >= 2.2.
+        tensor = torch.from_blob(
+            ctypes.c_void_p(ptr),
+            shape,
+            dtype=dtype,
+            device=device,
+        )
+        return tensor
+    except (TypeError, AttributeError):
+        pass
+
+    # Fallback for older PyTorch: allocate + copy (NOT zero-copy)
+    logger.warning(
+        "[DWDP vmm] torch.from_blob not available for CUDA, "
+        "falling back to allocate + cuMemcpyDtoD (not zero-copy)"
+    )
     storage = torch.UntypedStorage(total_bytes, device=device)
     check_cu_result(
         cuda.cuMemcpyDtoD(
@@ -270,7 +295,6 @@ def tensor_from_ptr(
             total_bytes,
         )
     )
-
     tensor = torch.empty([], dtype=dtype, device=device)
     tensor.set_(storage, 0, shape)
     return tensor
