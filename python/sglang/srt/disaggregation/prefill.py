@@ -469,8 +469,6 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -502,7 +500,6 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -957,13 +954,11 @@ class SchedulerDisaggregationPrefillMixin:
                 self.running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
-        # Only bootstrap-finalized requests; staging excluded. Mooncake registers
-        # an RDMA MR per transfer, so the extra early chunk exhausts MRs -> skip it.
+        # Only bootstrap-finalized requests; staging excluded.
         if (
             not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
             or self.enable_staging
             or req.pending_bootstrap
-            or self.transfer_backend == TransferBackend.MOONCAKE
         ):
             return
 
