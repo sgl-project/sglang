@@ -1165,6 +1165,13 @@
                     "pages": [
                       "cookbook/diffusion/LingBot-World/LingBot-World"
                     ]
+                  },
+                  {
+                    "group": "OmniDreams",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/OmniDreams/OmniDreams"
+                    ]
                   }
                 ]
               },
