@@ -25,6 +25,8 @@ def _install_fake_modules():
         "sglang.srt.model_executor.forward_batch_info",
         "sglang.srt.utils",
         "sglang.srt.utils.async_probe",
+        "triton",
+        "triton.language",
     ):
         sys.modules.setdefault(name, types.ModuleType(name))
 
@@ -55,6 +57,15 @@ def _install_fake_modules():
     async_probe = sys.modules["sglang.srt.utils.async_probe"]
     async_probe.maybe_detect_oob = lambda *args, **kwargs: None
 
+    triton_mod = sys.modules["triton"]
+    triton_mod.jit = lambda fn=None, **_kwargs: (lambda f: f) if fn is None else fn
+    triton_mod.heuristics = lambda _values: (lambda fn: fn)
+    triton_mod.next_power_of_2 = lambda x: 1 << (int(x) - 1).bit_length()
+    triton_mod.language = sys.modules["triton.language"]
+
+    tl_mod = sys.modules["triton.language"]
+    tl_mod.constexpr = int
+
 
 def _load_minimax_sparse_backend_module():
     _install_fake_modules()
@@ -73,21 +84,10 @@ def _load_minimax_sparse_backend_module():
 
 def _load_npu_triton_prefill_module():
     _install_fake_modules()
-    for name in (
+    sys.modules.setdefault(
         "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton",
-        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode",
-        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode",
-    ):
-        sys.modules.setdefault(name, types.ModuleType(name))
-
-    flash_decode = sys.modules[
-        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode"
-    ]
-    flash_decode.flash_decode_bnsd_with_topk_idx = lambda *args, **kwargs: None
-    topk_decode = sys.modules[
-        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode"
-    ]
-    topk_decode.flash_decode_bnsd_with_gqa_share_sparse = lambda *args, **kwargs: None
+        types.ModuleType("sglang.srt.layers.attention.minimax_sparse_ops.npu_triton"),
+    )
 
     module_path = (
         Path(__file__).resolve().parents[2]
@@ -200,6 +200,26 @@ def test_npu_triton_forward_metadata_reuses_block_table():
     assert meta.actual_num_tokens == 3
 
 
+def test_npu_prefill_debug_diff_location_formats_request_context():
+    module = _load_minimax_sparse_backend_module()
+    diff = torch.zeros((3, 2, 4), dtype=torch.float32)
+    diff[2, 1, 3] = 2.0
+
+    location = module._format_prefill_diff_location(
+        diff,
+        cu_seqlens=torch.tensor([0, 1, 3], dtype=torch.int32),
+        prefix_lens=torch.tensor([4, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([5, 10], dtype=torch.int32),
+        req_pool_indices=torch.tensor([7, 9], dtype=torch.int64),
+        block_size_k=2,
+    )
+
+    assert location == (
+        "token=2,head=1,dim=3,batch=1,req=9,q_offset=1,"
+        "prefix_len=8,eff_seq_len=10,seq_len=10,block=4"
+    )
+
+
 def test_npu_forward_extend_has_triton_prefill_gate():
     source = (
         Path(__file__).resolve().parents[2]
@@ -211,16 +231,18 @@ def test_npu_forward_extend_has_triton_prefill_gate():
     assert "self._forward_npu_triton_prefill(" in source
 
 
-def test_npu_triton_prefill_uses_bnsd_decode_kernels():
+def test_npu_triton_prefill_uses_dedicated_prefill_kernels():
     source = (
         Path(__file__).resolve().parents[2]
         / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
     ).read_text()
 
-    assert "flash_decode_bnsd_with_topk_idx" in source
-    assert "flash_decode_bnsd_with_gqa_share_sparse" in source
+    assert "flash_prefill_npu_with_topk_index" in source
+    assert "flash_prefill_npu_with_gqa_share_sparse" in source
     assert "minimax_sparse_ops.prefill.flash_with_topk_idx" not in source
     assert "minimax_sparse_ops.prefill.topk_sparse" not in source
+    assert "flash_decode_bnsd_with_topk_idx" not in source
+    assert "flash_decode_bnsd_with_gqa_share_sparse" not in source
 
 
 def test_npu_triton_prefill_appends_forced_blocks_after_pure_topk():
@@ -234,6 +256,64 @@ def test_npu_triton_prefill_appends_forced_blocks_after_pure_topk():
     assert "local_blocks=0" in source
 
 
+def test_npu_triton_prefill_calls_prefill_kernels_with_appended_forced_blocks():
+    module = _load_npu_triton_prefill_module()
+    calls = {}
+
+    def fake_index_kernel(**kwargs):
+        calls["index"] = kwargs
+        topk_idx = torch.tensor([[[0], [1]]], dtype=torch.int32)
+        return None, topk_idx
+
+    def fake_main_kernel(**kwargs):
+        calls["main"] = kwargs
+        return kwargs["q"].new_full(kwargs["q"].shape, 7)
+
+    module.flash_prefill_npu_with_topk_index = fake_index_kernel
+    module.flash_prefill_npu_with_gqa_share_sparse = fake_main_kernel
+
+    q = torch.zeros((2, 1, 1), dtype=torch.bfloat16)
+    idx_q = torch.zeros((2, 1, 1), dtype=torch.bfloat16)
+    cache = torch.zeros((4, 1, 1), dtype=torch.bfloat16)
+    req_to_token = torch.arange(4, dtype=torch.int32).view(1, 4)
+    slot_ids = torch.tensor([0], dtype=torch.int64)
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    seq_lens = torch.tensor([4], dtype=torch.int32)
+    prefix_lens = torch.tensor([2], dtype=torch.int32)
+
+    idx_o, o = module.minimax_sparse_prefill_npu_triton(
+        q=q,
+        k_cache=cache,
+        v_cache=cache,
+        sink=None,
+        idx_q=idx_q,
+        idx_k_cache=cache,
+        idx_v_cache=None,
+        idx_sink=None,
+        req_to_token=req_to_token,
+        slot_ids=slot_ids,
+        cu_seqlens=cu_seqlens,
+        seq_lens=seq_lens,
+        prefix_lens=prefix_lens,
+        max_seqlen_q=2,
+        max_seqlen_k=4,
+        block_size_q=1,
+        block_size_k=2,
+        topk=1,
+        init_blocks=0,
+        local_blocks=1,
+        disable_index_value=True,
+    )
+
+    assert idx_o is None
+    torch.testing.assert_close(o, torch.full_like(q, 7))
+    assert calls["index"]["init_blocks"] == 0
+    assert calls["index"]["local_blocks"] == 0
+    assert "block_table" not in calls["main"]
+    expected_topk = torch.tensor([[[0, 1], [1, -1]]], dtype=torch.int32)
+    torch.testing.assert_close(calls["main"]["topk_idx"], expected_topk)
+
+
 def test_npu_triton_prefill_debug_logs_every_call():
     source = (
         Path(__file__).resolve().parents[2]
@@ -245,6 +325,18 @@ def test_npu_triton_prefill_debug_logs_every_call():
     assert "_dbg_prefill_index_skip_count" not in source
     assert "index diff skipped" in source
     assert "disable_index_value=%s" in source
+    assert "max_diff_at=%s" in source
+    assert "eff_seq_len" in source
+
+
+def test_npu_triton_prefill_does_not_keep_decode_topk_debug_switch():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+
+    assert "MINIMAX_NPU_TRITON_PREFILL_TORCH_TOPK" not in source
+    assert "use_triton_topk=not _use_torch_topk" not in source
 
 
 def test_npu_triton_prefill_merge_matches_decode_local_only_semantics():

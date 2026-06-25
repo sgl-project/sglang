@@ -59,6 +59,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _format_prefill_diff_location(
+    diff: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    block_size_k: int,
+) -> str:
+    if diff.numel() == 0:
+        return "empty"
+
+    flat = int(diff.reshape(-1).argmax().item())
+    if diff.dim() >= 3:
+        token_stride = diff.shape[1] * diff.shape[2]
+        token_id = flat // token_stride
+        rem = flat % token_stride
+        head_id = rem // diff.shape[2]
+        dim_id = rem % diff.shape[2]
+    elif diff.dim() == 2:
+        token_id = flat // diff.shape[1]
+        head_id = flat % diff.shape[1]
+        dim_id = -1
+    else:
+        token_id = flat
+        head_id = -1
+        dim_id = -1
+
+    cu = [int(x) for x in cu_seqlens.detach().cpu().tolist()]
+    batch_id = 0
+    while batch_id + 1 < len(cu) and token_id >= cu[batch_id + 1]:
+        batch_id += 1
+
+    q_offset = token_id - cu[batch_id] if batch_id < len(cu) else token_id
+    prefix_len = int(prefix_lens[batch_id].item())
+    eff_seq_len = prefix_len + q_offset + 1
+    seq_len = int(seq_lens[batch_id].item())
+    req_id = int(req_pool_indices[batch_id].item())
+    block_id = (eff_seq_len - 1) // block_size_k if eff_seq_len > 0 else -1
+
+    return (
+        f"token={token_id},head={head_id},dim={dim_id},batch={batch_id},"
+        f"req={req_id},q_offset={q_offset},prefix_len={prefix_len},"
+        f"eff_seq_len={eff_seq_len},seq_len={seq_len},block={block_id}"
+    )
+
+
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
@@ -884,23 +930,43 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     seq_lens,
                     prefix_lens,
                 )
-                _d = (o.float() - _o_ref.float()).abs().max().item()
+                _diff = (o.float() - _o_ref.float()).abs()
+                _d = _diff.max().item()
                 _r = _d / max(_o_ref.float().abs().max().item(), 1e-6)
+                _loc = _format_prefill_diff_location(
+                    _diff,
+                    cu_seqlens,
+                    prefix_lens,
+                    seq_lens,
+                    forward_batch.req_pool_indices,
+                    self.block_size_k,
+                )
                 logger.warning(
                     "[MiniMax/NPU triton-prefill-vs-pytorch] "
-                    "main max_abs_diff=%.6f rel=%.5f (q=%s)",
+                    "main max_abs_diff=%.6f rel=%.5f (q=%s) max_diff_at=%s",
                     _d,
                     _r,
                     tuple(q.shape),
+                    _loc,
                 )
                 if idx_o is not None and _idx_o_ref is not None:
-                    _idx_d = (idx_o.float() - _idx_o_ref.float()).abs().max().item()
+                    _idx_diff = (idx_o.float() - _idx_o_ref.float()).abs()
+                    _idx_d = _idx_diff.max().item()
                     _idx_r = _idx_d / max(_idx_o_ref.float().abs().max().item(), 1e-6)
+                    _idx_loc = _format_prefill_diff_location(
+                        _idx_diff,
+                        cu_seqlens,
+                        prefix_lens,
+                        seq_lens,
+                        forward_batch.req_pool_indices,
+                        self.block_size_k,
+                    )
                     logger.warning(
                         "[MiniMax/NPU triton-prefill-vs-pytorch] "
-                        "index max_abs_diff=%.6f rel=%.5f",
+                        "index max_abs_diff=%.6f rel=%.5f max_diff_at=%s",
                         _idx_d,
                         _idx_r,
+                        _idx_loc,
                     )
                 else:
                     logger.warning(
