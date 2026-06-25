@@ -91,13 +91,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     if f"c{ratio}_loc" not in result:
                         setattr(fm, f"c{ratio}_loc", None)
 
-        if (
-            forward_batch.forward_mode.is_prefill()
-            and not forward_batch.forward_mode.is_target_verify()
-            and self._dsv4_compress_ratios
-        ):
-            self._build_npu_compress_metadata_prefill(forward_batch)
-
         if _verify_compress:
             self._build_npu_compress_metadata_verify(forward_batch)
 
@@ -303,6 +296,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
+        if (
+            forward_batch.forward_mode.is_prefill()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            return self._forward_compress_native(compressor, x, forward_batch)
+
         from sglang.srt.layers.deepseek_v4_rope import (
             get_fused_compressor_rope_cos_sin,
         )
@@ -999,11 +998,12 @@ class DeepseekV4AscendAttnBackend(
         self.graph_metadata["c128_page_table"] = torch.full(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
-        self.graph_metadata["c4_state_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        # state_block_table uses 0 as the skip sentinel; real pages start at 1.
+        self.graph_metadata["c4_state_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
-        self.graph_metadata["c128_state_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
+        self.graph_metadata["c128_state_page_table"] = torch.zeros(
+            (max_bs, max_pages), dtype=torch.int32, device=device
         )
 
         for key in (
@@ -1178,7 +1178,7 @@ class DeepseekV4AscendAttnBackend(
             "c128_state_page_table",
         ):
             if key in result:
-                _copy_2d(getattr(fm, key), result[key], -1)
+                _copy_2d(getattr(fm, key), result[key], 0 if "state" in key else -1)
         for key in ("c4_loc", "c128_loc", "c4_state_loc", "c128_state_loc"):
             if key in result:
                 _copy_1d(getattr(fm, key), result[key])
