@@ -517,7 +517,10 @@ class MultimemAllGatherer:
     def _build(self, x: torch.Tensor):
         if x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        # This optimization emits CUDA PTX and cannot run on other accelerators.
+        if x.device.type != "cuda":
+            return None
+        if torch.cuda.is_current_stream_capturing():
             # Can't allocate under capture; retry later.
             return self._UNINIT
         if x.shape[-1] % _NUMEL_PER_THREAD != 0:
