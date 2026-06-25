@@ -126,6 +126,15 @@ def _make_model_runner(
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
+    mr.layer_info = SimpleNamespace(
+        start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
+    )
+    mr.ps = SimpleNamespace(dp_size=1, pp_size=1)
+    mr.pp_group = SimpleNamespace(rank_in_group=0)
+    mr.spec_aux_config = SimpleNamespace(
+        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+    )
+
     return mr
 
 
@@ -517,7 +526,7 @@ class TestEagleConfigurator(unittest.TestCase):
         mr.spec_algorithm.is_eagle.return_value = True
         mr.spec_algorithm.is_standalone.return_value = False
         mr.spec_algorithm.is_none.return_value = False
-        mr.eagle_draft_num_layers = eagle_draft_num_layers
+        mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
 
         with mock_cpu_env():
             from sglang.srt.model_executor.model_runner_components.pool_configurator import (
