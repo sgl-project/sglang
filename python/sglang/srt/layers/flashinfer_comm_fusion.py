@@ -708,7 +708,10 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     eps: float = 1e-6,
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
-    trigger_completion_at_end: bool = False,
+    # End the PDL dependency chain before later FlashInfer TRTLLM MoE kernels.
+    # Otherwise decode CUDA graph capture can start TMA-heavy work before the
+    # fused allreduce has published its completion signal.
+    trigger_completion_at_end: bool = True,
     fp32_acc: bool = False,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -728,7 +731,10 @@ def flashinfer_allreduce_residual_rmsnorm(
     eps: float = 1e-6,
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
-    trigger_completion_at_end: bool = False,
+    # End the PDL dependency chain before later FlashInfer TRTLLM MoE kernels.
+    # Otherwise decode CUDA graph capture can start TMA-heavy work before the
+    # fused allreduce has published its completion signal.
+    trigger_completion_at_end: bool = True,
     fp32_acc: bool = False,
     use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -43,8 +43,9 @@ class _FakeFlashInferComm:
         residual_in,
         rms_gamma,
         rms_eps,
-        **_kwargs,
+        **kwargs,
     ):
+        self.calls.append(kwargs)
         allreduced = input * workspace.world_size
         expected_residual = allreduced + residual_in
         variance = expected_residual.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
@@ -176,12 +177,16 @@ class TestFlashInferCommFusion(unittest.TestCase):
         original_create = fusion._create_allreduce_fusion_workspace
         original_manager = fusion._attn_tp_workspace_manager
         original_unavailable = fusion._flashinfer_allreduce_unavailable
+        original_supports_trigger_completion = (
+            fusion._flashinfer_allreduce_supports_trigger_completion
+        )
         try:
             fusion._flashinfer_comm = fake_comm
             fusion._create_allreduce_fusion_workspace = (
                 fake_comm.create_allreduce_fusion_workspace
             )
             fusion._flashinfer_allreduce_unavailable = False
+            fusion._flashinfer_allreduce_supports_trigger_completion = True
 
             for backend in ("trtllm", "mnnvl"):
                 with self.subTest(backend=backend):
@@ -226,11 +231,15 @@ class TestFlashInferCommFusion(unittest.TestCase):
 
                     torch.testing.assert_close(norm_out, expected_norm)
                     torch.testing.assert_close(residual_out, expected_residual)
+                    self.assertTrue(fake_comm.calls[-1]["trigger_completion_at_end"])
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create
             fusion._attn_tp_workspace_manager = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+            fusion._flashinfer_allreduce_supports_trigger_completion = (
+                original_supports_trigger_completion
+            )
 
 
 if __name__ == "__main__":
