@@ -815,6 +815,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
+        self._dwdp_enabled = get_global_server_args().dwdp_size > 1
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
@@ -873,6 +874,10 @@ class DeepseekV2MoE(nn.Module):
                 forward_batch,
                 input_ids_global=input_ids_global,
             )
+
+        # DWDP: weight prefetch path (prefill-only, before a2a check)
+        if self._dwdp_enabled:
+            return self.forward_dwdp(hidden_states, gemm_output_zero_allocator)
 
         if not self._enable_a2a_moe:
             server_args = get_global_server_args()
@@ -1140,6 +1145,50 @@ class DeepseekV2MoE(nn.Module):
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
+        return final_hidden_states
+
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+        gemm_output_zero_allocator=None,
+    ) -> torch.Tensor:
+        """DWDP forward: all tokens stay on-rank, use VA-mapped weights."""
+        from sglang.srt.layers.moe.dwdp import get_global_dwdp_manager
+
+        dwdp_manager = get_global_dwdp_manager()
+
+        # Shared experts (same as forward_normal)
+        shared_output = self._forward_shared_experts(
+            hidden_states, gemm_output_zero_allocator
+        )
+
+        # Wait for prefetch (event sync only)
+        dwdp_manager.wait_prefetch(self.layer_id)
+
+        # Router + top-k (standard)
+        if hidden_states.shape[0] > 0:
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
+
+        # Standard FusedMoE forward — kernel sees [num_experts, ...] via composite VA
+        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        # Signal compute done + trigger next layer prefetch
+        dwdp_manager.record_compute_and_prefetch_next(self.layer_id)
+
+        # Accumulate shared experts + routed scaling
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            self.experts,
+            final_hidden_states,
+            shared_output,
+            self.routed_scaling_factor,
+        )
+
+        # NO tensor_model_parallel_all_reduce — fully independent
         return final_hidden_states
 
     def forward_cpu(

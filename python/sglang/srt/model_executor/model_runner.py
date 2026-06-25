@@ -700,6 +700,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
+        # DWDP setup: after weight loading, build composite VA and prefetch infra
+        if self.server_args.dwdp_size > 1:
+            self._setup_dwdp()
+
         # Must run before backend/graph init so no draft graph records a
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
@@ -1575,6 +1579,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+    def _setup_dwdp(self):
+        """Set up DWDP after weight loading."""
+        from sglang.srt.layers.moe.dwdp import (
+            DwdpManager,
+            set_global_dwdp_manager,
+        )
+
+        manager = DwdpManager(self.server_args)
+        set_global_dwdp_manager(manager)
+        manager.setup(self.model)
+        logger.info("[ModelRunner] DWDP setup complete.")
 
     def _prepare_moe_topk(self):
         balancer_cls = None
@@ -3052,6 +3068,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # global_dp_buffer_len / padded token counts that graph eligibility
             # and the collectives depend on.
             self._prepare_eager_forward_batch(forward_batch)
+
+            # DWDP: trigger first-layer weight prefetch for extend batches
+            if (
+                self.server_args.dwdp_size > 1
+                and forward_batch.forward_mode.is_extend()
+            ):
+                from sglang.srt.layers.moe.dwdp import get_global_dwdp_manager
+
+                dwdp_mgr = get_global_dwdp_manager()
+                if dwdp_mgr is not None:
+                    dwdp_mgr.prefetch_first_layers()
 
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
