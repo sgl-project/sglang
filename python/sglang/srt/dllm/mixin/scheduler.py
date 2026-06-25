@@ -91,7 +91,7 @@ class SchedulerDllmMixin:
                         continue
 
                     req.full_untruncated_fill_ids[
-                        req.fill_len - new_tokens : req.fill_len
+                        req.extend_range.end - new_tokens : req.extend_range.end
                     ] = array("q", next_token_ids)
                     self.metrics_reporter.num_generated_tokens += new_tokens
 
@@ -115,7 +115,7 @@ class SchedulerDllmMixin:
                         algo_states[idx] if algo_states is not None else None
                     )
                     old_prefix_len = len(req.prefix_indices)
-                    new_fill_len = req.fill_len
+                    new_fill_len = req.extend_range.end
                     if new_fill_len > old_prefix_len:
                         kv_indices_to_free = self.req_to_token_pool.req_to_token[
                             req.req_pool_idx, old_prefix_len:new_fill_len
@@ -128,15 +128,16 @@ class SchedulerDllmMixin:
 
                 # Mirror the resolved block into the committed fill ids so the
                 # prefix cache keys on the real tokens, not the mask block, next
-                # round. Index relative to fill_len (the truncated/committed
-                # length), which can be shorter than full_untruncated_fill_ids
-                # when the staging adder truncates the block to the KV budget.
+                # round. Index relative to extend_range.end (the truncated/
+                # committed length), which can be shorter than
+                # full_untruncated_fill_ids when the staging adder truncates the
+                # block to the KV budget.
                 req.full_untruncated_fill_ids[
-                    req.fill_len - block_size : req.fill_len
+                    req.extend_range.end - block_size : req.extend_range.end
                 ] = array("q", next_token_ids)
 
                 len_input = len(req.origin_input_ids)
-                len_fill = req.fill_len
+                len_fill = req.extend_range.end
                 if len_fill <= len_input:
                     continue
 

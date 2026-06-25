@@ -72,7 +72,7 @@ class ReqDllmMixin:
 
         self.dllm_block_offset = (
             0
-            if self.fill_len == 0
+            if not self.dllm_initialized
             else self.dllm_block_offset + self.dllm_config.block_size
         )
         self.full_untruncated_fill_ids = (
@@ -80,7 +80,7 @@ class ReqDllmMixin:
             + self.output_ids
             + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
         )
-        self.fill_len = len(self.full_untruncated_fill_ids)
+        self.dllm_initialized = True
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
