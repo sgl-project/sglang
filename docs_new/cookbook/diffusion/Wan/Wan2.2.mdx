@@ -39,7 +39,7 @@ The Wan2.2 series offers models in various sizes, architectures and input types,
 
 ### 3.2 Configuration Tips
 
-Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+Current supported optimization all listed [here](/docs/sglang-diffusion/compatibility_matrix).
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
@@ -53,7 +53,7 @@ Current supported optimization all listed [here](https://github.com/sgl-project/
 ### 4.1 Basic Usage
 
 For more API usage and request examples, please refer to:
-[SGLang Diffusion OpenAI API](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/openai_api.md)
+[SGLang Diffusion OpenAI API](/docs/sglang-diffusion/api/openai_api)
 
 #### 4.1.1 Launch a server and then send requests
 
@@ -100,7 +100,7 @@ sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 
 #### 4.2.1 Cache-DiT Acceleration
 
-SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cache/cache_dit.md).
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).
 
 **Basic Usage**
 
