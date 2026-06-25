@@ -1022,6 +1022,13 @@ class XPUAttentionBackend(AttentionBackend):
                 0, self.max_context_len, self.page_size, device=self.device
             ),
         }
+        if self.use_sliding_window_kv_pool:
+            self.decode_cuda_graph_metadata["swa_page_table"] = torch.zeros(
+                max_bs, max_num_pages, dtype=torch.int32, device=self.device
+            )
+            self.decode_cuda_graph_metadata["swa_out_cache_loc"] = torch.zeros(
+                max_num_tokens, dtype=torch.int64, device=self.device
+            )
         if self.is_encoder_decoder:
             self.encoder_metadata = {
                 "encoder_page_table": torch.zeros(
@@ -1047,7 +1054,7 @@ class XPUAttentionBackend(AttentionBackend):
         init_forward_metadata_replay_cuda_graph pair).
 
         Called by DecodeCudaGraphRunner:
-          - capture: in_capture=True  → bind static metadata buffers
+          - capture: in_capture=True  → bind static metadata buffer slices, then fill
           - replay:  in_capture=False → update pre-allocated buffers in-place
           - eager:   via init_forward_metadata() default wrapper
         """
@@ -1066,7 +1073,8 @@ class XPUAttentionBackend(AttentionBackend):
         ), "XPUAttentionBackend XPU graph only supports decode mode"
 
         if in_capture:
-            # Bind static-shape slices of the pre-allocated buffers.
+            # Bind static-shape slices of the pre-allocated buffers so the
+            # captured graph always reads from the same storage addresses.
             metadata = FlashAttentionMetadata()
             metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                 "cache_seqlens"
@@ -1078,7 +1086,11 @@ class XPUAttentionBackend(AttentionBackend):
                 : bs + 1
             ]
             metadata.page_table = self.decode_cuda_graph_metadata["page_table"][:bs, :]
-            metadata.max_seq_len_k = seq_lens.max().item()
+            if self.use_sliding_window_kv_pool:
+                # Bind SWA page table slice so the graph captures the right tensor.
+                metadata.swa_page_table = self.decode_cuda_graph_metadata[
+                    "swa_page_table"
+                ][:bs, :]
             if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
                 encoder_bs = forward_batch.encoder_lens.numel()
                 metadata.encoder_lens_int32 = self.encoder_metadata[
@@ -1090,93 +1102,105 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.encoder_page_table = self.encoder_metadata[
                     "encoder_page_table"
                 ][:bs, :]
-            # For hybrid SWA models, initialize swa_out_cache_loc
-            if self.use_sliding_window_kv_pool:
-                if forward_batch.out_cache_loc is None:
-                    raise ValueError(
-                        f"out_cache_loc is None for hybrid SWA model in graph capture "
-                        f"(forward_mode={forward_batch.forward_mode}). This should not happen."
-                    )
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
-                )
-
             self.decode_cuda_graph_metadata[bs] = metadata
-            self.forward_metadata = metadata
+
+        # Both capture and replay: fill data into the pre-allocated buffers.
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
+        req_pool_indices = req_pool_indices[:bs]
+
+        metadata = self.decode_cuda_graph_metadata[bs]
+        max_len = (
+            seq_lens_cpu.max().item()
+            if seq_lens_cpu is not None
+            else seq_lens.max().item()
+        )
+        metadata.max_seq_len_k = max_len
+
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+        metadata.cu_seqlens_k[0] = 0
+        metadata.cu_seqlens_k[1 : bs + 1].copy_(
+            torch.cumsum(seq_lens.to(torch.int32), dim=0)
+        )
+
+        if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
+            encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)
+            metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
+            metadata.encoder_lens_int32.copy_(encoder_lens)
+            metadata.encoder_cu_seqlens_k[0] = 0
+            metadata.encoder_cu_seqlens_k[1 : bs + 1].copy_(
+                torch.cumsum(encoder_lens, dim=0, dtype=torch.int32)
+            )
+            metadata.encoder_page_table[:bs, : metadata.encoder_max_seq_len_k].copy_(
+                self.req_to_token[
+                    req_pool_indices, : metadata.encoder_max_seq_len_k
+                ].to(torch.int32)
+            )
+            # Self-attention (text) page_table: decoder tokens start after encoder tokens.
+            text_max = metadata.max_seq_len_k
+            arange_text = torch.arange(text_max, device=req_pool_indices.device)
+            text_col = encoder_lens[:bs].long().unsqueeze(1) + arange_text.unsqueeze(0)
+            text_row = req_pool_indices.unsqueeze(1).expand(-1, text_max)
+            metadata.page_table[:bs, :text_max].copy_(
+                self.req_to_token[text_row, text_col].to(torch.int32)
+            )
+            metadata.page_table[:bs, text_max:].zero_()
         else:
-            # Update pre-allocated metadata tensors in-place before replay.
-            seq_lens = seq_lens[:bs]
-            seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
-            req_pool_indices = req_pool_indices[:bs]
-
-            metadata = self.decode_cuda_graph_metadata[bs]
-            max_len = (
-                seq_lens_cpu.max().item()
-                if seq_lens_cpu is not None
-                else seq_lens.max().item()
+            raw_page = self.req_to_token[
+                req_pool_indices[:, None],
+                self.decode_cuda_graph_metadata["strided_indices"][
+                    : ((metadata.max_seq_len_k + self.page_size - 1) // self.page_size)
+                ][None, :],
+            ]
+            if self.page_size > 1:
+                raw_page = raw_page // self.page_size
+            metadata.page_table[:bs, : raw_page.shape[1]].copy_(
+                raw_page.to(torch.int32)
             )
-            metadata.max_seq_len_k = max_len
-            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            metadata.page_table[:bs, raw_page.shape[1] :].zero_()
 
-            metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
-
-            metadata.cu_seqlens_k[0] = 0
-            metadata.cu_seqlens_k[1 : bs + 1].copy_(
-                torch.cumsum(seq_lens.to(torch.int32), dim=0)
+        if self.use_sliding_window_kv_pool:
+            if forward_batch.out_cache_loc is None:
+                raise ValueError(
+                    f"out_cache_loc is None for hybrid SWA model in graph "
+                    f"{'capture' if in_capture else 'replay'} "
+                    f"(forward_mode={forward_batch.forward_mode}). This should not happen."
+                )
+            swa_out_cache_loc = self.decode_cuda_graph_metadata["swa_out_cache_loc"]
+            n = forward_batch.out_cache_loc.shape[0]
+            swa_out_cache_loc[n:].zero_()
+            swa_out_cache_loc[:n].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
             )
+            metadata.swa_out_cache_loc = swa_out_cache_loc[:n]
 
-            if self.is_encoder_decoder and forward_batch.encoder_lens is not None:
-                encoder_lens = forward_batch.encoder_lens[:bs].to(torch.int32)
-                metadata.encoder_max_seq_len_k = int(encoder_lens.max().item())
-                metadata.encoder_lens_int32.copy_(encoder_lens)
-                metadata.encoder_cu_seqlens_k[0] = 0
-                metadata.encoder_cu_seqlens_k[1 : bs + 1].copy_(
-                    torch.cumsum(encoder_lens, dim=0, dtype=torch.int32)
+            if not (self.is_encoder_decoder and forward_batch.encoder_lens is not None):
+                max_seq_pages = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                swa_page_table = self.decode_cuda_graph_metadata["swa_page_table"]
+                swa_page_table[:bs, max_seq_pages:].zero_()
+                swa_page_table[:bs, :max_seq_pages].copy_(
+                    (
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_page)
+                        if self.page_size == 1
+                        else self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            self.req_to_token[
+                                req_pool_indices[:, None],
+                                self.decode_cuda_graph_metadata["strided_indices"][
+                                    :max_seq_pages
+                                ][None, :],
+                            ]
+                        )
+                        // self.page_size
+                    ).to(torch.int32)
                 )
-                metadata.encoder_page_table[
-                    :bs, : metadata.encoder_max_seq_len_k
-                ].copy_(
-                    self.req_to_token[
-                        req_pool_indices, : metadata.encoder_max_seq_len_k
-                    ].to(torch.int32)
-                )
-                # Self-attention (text) page_table: decoder tokens start after encoder tokens.
-                text_max = metadata.max_seq_len_k
-                arange_text = torch.arange(text_max, device=req_pool_indices.device)
-                text_col = encoder_lens[:bs].long().unsqueeze(
-                    1
-                ) + arange_text.unsqueeze(0)
-                text_row = req_pool_indices.unsqueeze(1).expand(-1, text_max)
-                metadata.page_table[:bs, :text_max].copy_(
-                    self.req_to_token[text_row, text_col].to(torch.int32)
-                )
-            else:
-                raw_page = self.req_to_token[
-                    req_pool_indices[:, None],
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
-                        None, :
-                    ],
-                ]
-                if self.page_size > 1:
-                    raw_page = raw_page // self.page_size
-                metadata.page_table[:bs, :max_seq_pages].copy_(raw_page.to(torch.int32))
+                metadata.swa_page_table = swa_page_table[:bs, :]
 
-            # For hybrid SWA models, update swa_out_cache_loc during replay
-            if self.use_sliding_window_kv_pool:
-                if forward_batch.out_cache_loc is None:
-                    raise ValueError(
-                        f"out_cache_loc is None for hybrid SWA model in graph replay "
-                        f"(forward_mode={forward_batch.forward_mode}). This should not happen."
-                    )
-                metadata.swa_out_cache_loc = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
-                )
-
-            self.forward_metadata = metadata
+        self.forward_metadata = metadata
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """Graph-recordable ops for XPU graph (no-op: all metadata setup is
