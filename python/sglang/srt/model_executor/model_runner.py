@@ -25,31 +25,13 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from sglang.srt.configs import (
-    BailingHybridConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    InternS2PreviewConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    Lfm2Config,
-    Lfm2MoeConfig,
-    Lfm2VlConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    ZayaConfig,
-)
+from sglang.srt.configs import hybrid_arch
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -254,8 +236,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
-
-_UNSET: Any = object()
 
 
 @dataclass
@@ -534,8 +514,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
-
-        self._linear_attn_registry_cache: Any = _UNSET
 
         # Load model weights and configure
         self.initialize()
@@ -1798,66 +1776,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def qwen3_next_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, Qwen3NextConfig):
-            return config
-        return None
+        return hybrid_arch.qwen3_next_config(self.model_config)
 
     @property
     def hybrid_lightning_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, BailingHybridConfig):
-            return config
-        return None
+        return hybrid_arch.hybrid_lightning_config(self.model_config)
 
     @property
     def hybrid_gdn_config(self):
-        config = self.model_config.hf_config.get_text_config()
-        if isinstance(
-            config,
-            Qwen3NextConfig
-            | Qwen3_5Config
-            | Qwen3_5MoeConfig
-            | InternS2PreviewConfig
-            | JetNemotronConfig
-            | JetVLMConfig,
-        ):
-            return config
-        return None
+        return hybrid_arch.hybrid_gdn_config(self.model_config)
 
     @property
     def mamba2_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
-            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
-            # so they shouldn't use HybridLinearAttnBackend
-            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
-            if pattern is not None and "M" not in pattern:
-                return None
-        if isinstance(
-            config,
-            FalconH1Config
-            | NemotronHConfig
-            | Lfm2Config
-            | Lfm2MoeConfig
-            | Lfm2VlConfig
-            | ZayaConfig,
-        ):
-            return config
-        if isinstance(config, NemotronH_Nano_VL_V2_Config):
-            return config.llm_config
-
-        if isinstance(config, GraniteMoeHybridConfig):
-            has_mamba = any(
-                layer_type == "mamba"
-                for layer_type in getattr(config, "layer_types", [])
-            )
-            if not has_mamba:
-                return None
-            else:
-                return config
-
-        return None
+        return hybrid_arch.mamba2_config(self.model_config)
 
     @property
     def effective_max_total_num_tokens(self):
@@ -1869,35 +1800,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def kimi_linear_config(self):
-        config = self.model_config.hf_config
-        if isinstance(config, KimiLinearConfig):
-            return config
-        return None
-
-    def _get_linear_attn_registry_result(self):
-        if self._linear_attn_registry_cache is _UNSET:
-            self._linear_attn_registry_cache = get_linear_attn_config(
-                self.model_config.hf_config
-            )
-        return self._linear_attn_registry_cache
+        return hybrid_arch.kimi_linear_config(self.model_config)
 
     @property
     def linear_attn_model_spec(self):
-        result = self._get_linear_attn_registry_result()
-        return result[0] if result else None
+        return hybrid_arch.linear_attn_model_spec(self.model_config)
 
     @property
     def mambaish_config(self):
-        existing = (
-            self.mamba2_config
-            or self.hybrid_gdn_config
-            or self.kimi_linear_config
-            or self.hybrid_lightning_config
-        )
-        if existing:
-            return existing
-        result = self._get_linear_attn_registry_result()
-        return result[1] if result else None
+        return hybrid_arch.mambaish_config(self.model_config)
 
     def _record_kv_cache_dtype(self, resolved: str) -> None:
         # Load-time resolution transition: the weight-resolved kv-cache dtype
@@ -2786,3 +2697,117 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=load_format,
         )
         self.load_config = load_config
+
+
+from typing import Any
+
+from sglang.srt.configs import (
+    BailingHybridConfig,
+    FalconH1Config,
+    GraniteMoeHybridConfig,
+    InternS2PreviewConfig,
+    JetNemotronConfig,
+    JetVLMConfig,
+    KimiLinearConfig,
+    Lfm2Config,
+    Lfm2MoeConfig,
+    Lfm2VlConfig,
+    NemotronH_Nano_VL_V2_Config,
+    NemotronHConfig,
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3NextConfig,
+    ZayaConfig,
+)
+from sglang.srt.configs.model_config import ModelConfig
+
+
+def _get_linear_attn_registry_result(model_config: ModelConfig) -> Any:
+    return model_config.linear_attn_registry_result
+
+
+def qwen3_next_config(model_config: ModelConfig):
+    config = model_config.hf_config
+    if isinstance(config, Qwen3NextConfig):
+        return config
+    return None
+
+
+def hybrid_lightning_config(model_config: ModelConfig):
+    config = model_config.hf_config
+    if isinstance(config, BailingHybridConfig):
+        return config
+    return None
+
+
+def hybrid_gdn_config(model_config: ModelConfig):
+    config = model_config.hf_config.get_text_config()
+    if isinstance(
+        config,
+        Qwen3NextConfig
+        | Qwen3_5Config
+        | Qwen3_5MoeConfig
+        | InternS2PreviewConfig
+        | JetNemotronConfig
+        | JetVLMConfig,
+    ):
+        return config
+    return None
+
+
+def mamba2_config(model_config: ModelConfig):
+    config = model_config.hf_config
+    if isinstance(config, NemotronHConfig) and model_config.is_draft_model:
+        # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
+        # so they shouldn't use HybridLinearAttnBackend
+        pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+        if pattern is not None and "M" not in pattern:
+            return None
+    if isinstance(
+        config,
+        FalconH1Config
+        | NemotronHConfig
+        | Lfm2Config
+        | Lfm2MoeConfig
+        | Lfm2VlConfig
+        | ZayaConfig,
+    ):
+        return config
+    if isinstance(config, NemotronH_Nano_VL_V2_Config):
+        return config.llm_config
+
+    if isinstance(config, GraniteMoeHybridConfig):
+        has_mamba = any(
+            layer_type == "mamba" for layer_type in getattr(config, "layer_types", [])
+        )
+        if not has_mamba:
+            return None
+        else:
+            return config
+
+    return None
+
+
+def kimi_linear_config(model_config: ModelConfig):
+    config = model_config.hf_config
+    if isinstance(config, KimiLinearConfig):
+        return config
+    return None
+
+
+def linear_attn_model_spec(model_config: ModelConfig):
+    result = _get_linear_attn_registry_result(model_config)
+    return result[0] if result else None
+
+
+def mambaish_config(model_config: ModelConfig):
+    existing = (
+        mamba2_config(model_config)
+        or hybrid_gdn_config(model_config)
+        or kimi_linear_config(model_config)
+        or hybrid_lightning_config(model_config)
+    )
+    if existing:
+        return existing
+    result = _get_linear_attn_registry_result(model_config)
+    return result[1] if result else None
