@@ -518,6 +518,37 @@ def test_move_symbol_leave_delegate_keeps_forwarding_stub(tmp_path: Path) -> Non
     assert "return n + self.cfg.base" in dst_out
 
 
+def test_move_symbol_leave_delegate_does_not_absorb_leading_comments(
+    tmp_path: Path,
+) -> None:
+    """A leading comment before the first statement is not an AST node, so it must not be
+    pulled into the forwarding stub -- the delegate is just the header plus the return.
+    """
+    (tmp_path / "src.py").write_text(
+        "class Mixin:\n"
+        "    def compute(self, n: int) -> int:\n"
+        "        # explain the maths\n"
+        "        # second comment line\n"
+        "        return n + self.cfg.base\n"
+    )
+    (tmp_path / "dst.py").write_text(
+        "class Cfg:\n    def existing(self):\n        return 0\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "compute", src="src.py", dst="dst.py", into_class="Cfg", leave_delegate="cfg"
+    )
+    _apply(r, tmp_path)
+    src_out = (tmp_path / "src.py").read_text()
+    dst_out = (tmp_path / "dst.py").read_text()
+    assert "# explain the maths" not in src_out
+    assert (
+        src_out == "class Mixin:\n"
+        "    def compute(self, n: int) -> int:\n"
+        "        return self.cfg.compute(n)\n"
+    )
+    assert "# explain the maths" in dst_out
+
+
 # --- Repro.run end-to-end ------------------------------------------------------
 
 

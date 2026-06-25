@@ -421,8 +421,20 @@ class Repro:
                 parts += [f"{k.arg}={k.arg}" for k in args.kwonlyargs]
                 if args.kwarg is not None:
                     parts.append(f"**{args.kwarg.arg}")
-                body_start = node.body[0].lineno
-                signature = src_lines[start - 1 : body_start - 1]
+                # The signature spans the def header only (def line through the line whose
+                # colon opens the body). node.body[0].lineno would skip over any leading
+                # comment/blank lines (not AST nodes), wrongly absorbing them into the
+                # delegate, so the header end is found by a bracket-balanced scan instead.
+                depth = 0
+                header_end = start
+                for offset in range(start - 1, node.body[0].lineno - 1):
+                    line = src_lines[offset]
+                    depth += line.count("(") - line.count(")")
+                    depth += line.count("[") - line.count("]")
+                    if depth <= 0 and line.rstrip().endswith(":"):
+                        header_end = offset + 1
+                        break
+                signature = src_lines[start - 1 : header_end]
                 body_indent = " " * node.body[0].col_offset
                 forward = (
                     f"{body_indent}return self.{leave_delegate}."
