@@ -21,10 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_tp_group,
-    tensor_model_parallel_all_gather,
-)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -260,15 +256,6 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
-
-    # Symmetric-memory multimem all-gather for the vocab-parallel logits gather.
-    # Only engaged for token counts <= this cap (the decode / spec-verify hot
-    # path); larger batches (prefill) fall back to the NCCL all-gather.
-    _LOGITS_AG_MAX_TOKENS = 128
-    # Sentinel meaning "state not built yet". Distinct from None, which means
-    # "fast path permanently disabled (use NCCL)".
-    _LOGITS_AG_UNINIT = object()
-
     def __init__(
         self,
         config,
@@ -307,16 +294,20 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_global_server_args().enable_mis
 
-        # Replace the NCCL all-gather on the plain TP logits-gather branch with a
-        # symmetric-memory multimem all-gather (ported in triton_symm_mem_ag).
-        # The attn-tp / dp-attn branches keep their existing collectives. The
-        # symm-mem buffer is built lazily on the first eager forward (a collective
-        # + allocation, illegal under CUDA-graph capture) once the per-rank vocab
-        # shard width is known; see _logits_all_gather.
-        self._logits_ag_enabled = (
-            self.do_tensor_parallel_all_gather and not self.use_attn_tp_group
+        # Replace the NCCL all-gather on the plain TP logits-gather branch with
+        # the shared guarded multimem all-gather. skip_entry_sync=True elides the
+        # kernel's entry barrier: a TP all-reduce in the surrounding decode/verify
+        # step syncs ranks between consecutive gathers (matching tokenspeed). The
+        # attn-tp / dp-attn branches keep their own collectives. The buffer covers
+        # only the decode/verify token range (vocab-wide rows are large), so
+        # larger batches (prefill) fall back to NCCL.
+        self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=False, floor=128
+            ),
+            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            skip_entry_sync=True,
         )
-        self._logits_ag_state = self._LOGITS_AG_UNINIT
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
@@ -849,85 +840,6 @@ class LogitsProcessor(nn.Module):
             sampled_logits,
         )
 
-    def _build_logits_all_gather_state(self, logits: torch.Tensor):
-        """Lazily allocate the symmetric-memory buffer for the logits all-gather.
-
-        ``create_state`` is a TP-group collective + allocation, so it must run in
-        eager mode (sglang warms up an eager forward before CUDA-graph capture).
-        Returns None to permanently disable the fast path (fall back to NCCL) when
-        unsupported, or the ``_LOGITS_AG_UNINIT`` sentinel to retry later when the
-        first call happens to land under graph capture.
-        """
-        if not self._logits_ag_enabled:
-            return None
-        if logits.dim() != 2 or logits.dtype != torch.bfloat16:
-            return None
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            return self._LOGITS_AG_UNINIT
-
-        def _pos(v):
-            return v if isinstance(v, int) and v > 0 else 0
-
-        try:
-            tp_group = get_tp_group()
-            world_size = tp_group.world_size
-            if world_size <= 1:
-                return None
-            local_vocab = logits.shape[1]
-            gathered_vocab = local_vocab * world_size
-            # 16-byte multimem.st alignment needs each per-rank shard (and thus
-            # the gathered width) to be a multiple of 8 bf16 elements.
-            if local_vocab % 8 != 0 or gathered_vocab % 8 != 0:
-                return None
-            sa = get_global_server_args()
-            decode_cap = _pos(getattr(sa, "max_running_requests", 0)) * max(
-                _pos(getattr(sa, "speculative_num_draft_tokens", 0)),
-                _pos(getattr(sa, "speculative_eagle_topk", 0)),
-                1,
-            )
-            max_tokens = max(self._LOGITS_AG_MAX_TOKENS, decode_cap)
-            return triton_symm_mem_ag.create_state(
-                group=tp_group.device_group,
-                rank_in_group=tp_group.rank_in_group,
-                max_tokens=max_tokens,
-                hidden_size=gathered_vocab,
-            )
-        except Exception as e:
-            logger.warning("LM-head multimem all-gather disabled (%s)", e)
-            return None
-
-    def _logits_all_gather(self, logits: torch.Tensor) -> torch.Tensor:
-        """All-gather the vocab-parallel logits ``[T, V/TP] -> [T, V]``.
-
-        Uses the symmetric-memory multimem kernel on the decode / spec-verify hot
-        path (small token counts, bf16, aligned), else the standard NCCL
-        all-gather. The path decision uses only TP-replicated quantities (token
-        count, dtype, allocator alignment) so every rank picks the same path.
-        """
-        state = self._logits_ag_state
-        if state is self._LOGITS_AG_UNINIT:
-            state = self._build_logits_all_gather_state(logits)
-            # Cache real state / permanent disable, but not the retry sentinel.
-            if state is not self._LOGITS_AG_UNINIT:
-                self._logits_ag_state = state
-        if (
-            state is not None
-            and state is not self._LOGITS_AG_UNINIT
-            and logits.dtype == torch.bfloat16
-            and logits.dim() == 2
-            and logits.is_contiguous()
-            and 0 < logits.shape[0] <= state.max_token_num
-            and logits.data_ptr() % 16 == 0
-            and logits.shape[1] * state.world_size <= state.hidden_dim
-        ):
-            return triton_symm_mem_ag.all_gather_inner(
-                state,
-                logits,
-                tp_hidden_dim=logits.shape[1] * state.world_size,
-                safe=True,
-            )
-        return tensor_model_parallel_all_gather(logits)
-
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -954,7 +866,7 @@ class LogitsProcessor(nn.Module):
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
-                logits = self._logits_all_gather(logits)
+                logits = self._logits_gatherer(logits)
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata

@@ -433,3 +433,126 @@ def all_gather_inner(
     )
     output = state.comm_buff[:total_tokens, :tp_hidden_dim]
     return output.clone() if safe else output
+
+
+# ------------------------------------------------------------------------------
+# Guarded wrapper: single all-gather path for every caller (fc, LM-head logits, …)
+# ------------------------------------------------------------------------------
+
+
+def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
+    """Size a comm buffer from server args: the steady spec-decode token count
+    (``max_running_requests * max(num_draft_tokens, eagle_topk)``), optionally
+    grown to also cover a prefill chunk. The per-call guard still falls back to
+    NCCL when a batch overflows the buffer, so this only needs to cover the case
+    we want on the fast path. Returns ``floor`` if server args are unavailable.
+    """
+
+    def _pos(v):
+        return v if isinstance(v, int) and v > 0 else 0
+
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = get_global_server_args()
+        decode = _pos(getattr(sa, "max_running_requests", 0)) * max(
+            _pos(getattr(sa, "speculative_num_draft_tokens", 0)),
+            _pos(getattr(sa, "speculative_eagle_topk", 0)),
+            1,
+        )
+        prefill = 0
+        if include_prefill:
+            prefill = max(
+                _pos(getattr(sa, "chunked_prefill_size", 0)),
+                _pos(getattr(sa, "max_prefill_tokens", 0)),
+            )
+        return max(decode, prefill, floor)
+    except Exception:
+        return floor
+
+
+class MultimemAllGatherer:
+    """Guarded multimem all-gather along the last dim, with an NCCL fallback.
+
+    This is the single entry point every caller uses (the draft ``fc`` gather,
+    the vocab-parallel LM-head logits gather, …) so the kernel, guards, and
+    fallback live in exactly one place. It owns one symmetric-memory buffer,
+    built lazily on the first eager call (``create_state`` is a TP-group
+    collective + allocation, illegal under CUDA-graph capture) once the gathered
+    width ``x.shape[-1] * world_size`` is known. On each call it uses the
+    multimem kernel when the input meets the kernel's dtype/shape/alignment
+    contract and fits the buffer, else the standard NCCL all-gather. Every guard
+    depends only on TP-replicated quantities, so all ranks pick the same path.
+
+    ``skip_entry_sync`` drops the kernel's entry barrier; pass ``True`` only when
+    a cross-rank sync (e.g. a TP all-reduce in the surrounding layer) is
+    guaranteed between consecutive calls — see ``all_gather_inner``.
+    """
+
+    _UNINIT = object()
+
+    def __init__(
+        self,
+        max_tokens: int,
+        *,
+        enabled: bool = True,
+        skip_entry_sync: bool = False,
+    ):
+        self._max_tokens = int(max_tokens)
+        self._skip_entry_sync = skip_entry_sync
+        # None => permanently disabled (always NCCL); _UNINIT => build on the
+        # first eager call; a MultimemAllGatherState => fast path available.
+        self._state = self._UNINIT if enabled else None
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        state = self._state
+        if state is self._UNINIT:
+            state = self._build(x)
+            if state is not self._UNINIT:  # cache real state / permanent disable
+                self._state = state
+        if (
+            state is not None
+            and state is not self._UNINIT
+            and x.dtype == torch.bfloat16
+            and x.dim() == 2
+            and x.is_contiguous()
+            and 0 < x.shape[0] <= state.max_token_num
+            and x.data_ptr() % 16 == 0
+            and x.shape[-1] * state.world_size <= state.hidden_dim
+        ):
+            return all_gather_inner(
+                state,
+                x,
+                tp_hidden_dim=x.shape[-1] * state.world_size,
+                skip_entry_sync=self._skip_entry_sync,
+                safe=False,
+            )
+        # Lazy import keeps this device communicator from depending on the
+        # high-level distributed facade at module load.
+        from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+        return tensor_model_parallel_all_gather(x, dim=-1)
+
+    def _build(self, x: torch.Tensor):
+        if x.dim() != 2 or x.dtype != torch.bfloat16:
+            return None
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            # Can't allocate / rendezvous under capture; retry on a later call.
+            return self._UNINIT
+        if x.shape[-1] % _NUMEL_PER_THREAD != 0:
+            return None
+        try:
+            from sglang.srt.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+            if tp_group.world_size <= 1:
+                return None
+            return create_state(
+                group=tp_group.device_group,
+                rank_in_group=tp_group.rank_in_group,
+                max_tokens=self._max_tokens,
+                hidden_size=x.shape[-1] * tp_group.world_size,
+            )
+        except Exception as e:
+            logger.warning("multimem all-gather disabled (%s)", e)
+            return None

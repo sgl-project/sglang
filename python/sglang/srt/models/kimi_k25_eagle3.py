@@ -24,11 +24,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tp_group,
-    tensor_model_parallel_all_gather,
-)
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
@@ -43,7 +39,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix
 
 logger = logging.getLogger(__name__)
@@ -217,10 +212,10 @@ class Eagle3MLAModel(nn.Module):
         # largest draft weight (target_hidden * num_aux x hidden ~= 300 MB at
         # bf16 for Kimi-K2.x). Shard it column-wise across TP so each rank reads
         # only its 1/TP slice of the weight. The partial outputs are then gathered
-        # back to the replicated hidden via a custom symmetric-memory multimem
-        # all-gather (see _fc_all_gather); gather_output stays False so we own the
-        # gather. At decode token counts this is HBM-bandwidth bound, so the gather
-        # is far cheaper than every rank re-reading the full weight.
+        # back to the replicated hidden via the shared multimem all-gather;
+        # gather_output stays False so we own the gather. At decode token counts
+        # this is HBM-bandwidth bound, so the gather is far cheaper than every
+        # rank re-reading the full weight.
         self.fc = ColumnParallelLinear(
             target_hidden_size * self.num_aux_hidden_states,
             config.hidden_size,
@@ -229,10 +224,16 @@ class Eagle3MLAModel(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
         )
-        # Symmetric-memory state for the fc all-gather; built once here (a
-        # collective, before any CUDA-graph capture). None disables the fast path
-        # and falls back to the standard NCCL all-gather.
-        self._fc_all_gather_state = self._init_fc_all_gather_state()
+        # Shared guarded multimem all-gather for the fc output. skip_entry_sync
+        # stays False (the kernel's entry barrier guards buffer reuse between
+        # consecutive draft steps); the buffer also covers prefill (draft extend)
+        # so the fast path is used there too.
+        self._fc_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=True, floor=512
+            ),
+            skip_entry_sync=False,
+        )
 
         # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy
         # `use_aux_norm` flag. Matches the eagle3.1 layout.
@@ -262,66 +263,6 @@ class Eagle3MLAModel(nn.Module):
         # Draft decode captures pre-norm hidden by default; eagle3.1 opts for
         # post-norm via `norm_output: true`.
         self.norm_output = getattr(config, "norm_output", False)
-
-    def _init_fc_all_gather_state(self):
-        """Allocate the symmetric-memory buffer for the multimem fc all-gather.
-
-        This is a collective over the TP group and must run before CUDA-graph
-        capture, so we do it at construction time. Returns None (falling back to
-        the standard all-gather) when TP is off, the hidden dim is not evenly
-        shardable, or symmetric memory is unavailable.
-        """
-
-        def _pos(v):
-            return v if isinstance(v, int) and v > 0 else 0
-
-        try:
-            tp_group = get_tp_group()
-            if tp_group.world_size <= 1:
-                return None
-            hidden = self.config.hidden_size
-            if hidden % tp_group.world_size != 0:
-                return None
-            sa = get_global_server_args()
-            prefill_cap = max(
-                _pos(getattr(sa, "chunked_prefill_size", 0)),
-                _pos(getattr(sa, "max_prefill_tokens", 0)),
-            )
-            decode_cap = _pos(getattr(sa, "max_running_requests", 0)) * _pos(
-                getattr(sa, "speculative_num_draft_tokens", 0)
-            )
-            max_tokens = max(prefill_cap, decode_cap, 512)
-            return triton_symm_mem_ag.create_state(
-                group=tp_group.device_group,
-                rank_in_group=tp_group.rank_in_group,
-                max_tokens=max_tokens,
-                hidden_size=hidden,
-            )
-        except Exception as e:
-            logger.warning("Eagle3 MLA: multimem fc all-gather disabled (%s)", e)
-            return None
-
-    def _fc_all_gather(self, x: torch.Tensor) -> torch.Tensor:
-        """Gather the column-sharded fc output [T, H/TP] back to [T, H].
-
-        Uses the symmetric-memory multimem kernel when the input satisfies its
-        alignment/shape contract (the common decode case), else the standard
-        NCCL all-gather. The decision depends only on TP-replicated quantities
-        (T, dtype, allocator alignment), so every rank picks the same path.
-        """
-        state = self._fc_all_gather_state
-        if (
-            state is not None
-            and x.dtype == torch.bfloat16
-            and x.dim() == 2
-            and x.is_contiguous()
-            and 0 < x.shape[0] <= state.max_token_num
-            and x.data_ptr() % 16 == 0
-        ):
-            return triton_symm_mem_ag.all_gather_inner(
-                state, x, tp_hidden_dim=self.config.hidden_size, safe=True
-            )
-        return tensor_model_parallel_all_gather(x, dim=-1)
 
     def forward(
         self,
@@ -360,7 +301,7 @@ class Eagle3MLAModel(nn.Module):
                     dim=-1,
                 )
             hidden_states, _ = self.fc(hidden_states)
-            hidden_states = self._fc_all_gather(hidden_states)
+            hidden_states = self._fc_gatherer(hidden_states)
 
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
