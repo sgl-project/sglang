@@ -263,6 +263,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
 
+    def prepare_swa_compute_lock(self, node: Any) -> None:
+        """Prepare cache topology for an SWA request compute lock. Default no-op."""
+        pass
+
     @abstractmethod
     def dec_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None
