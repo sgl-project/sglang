@@ -158,6 +158,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+        # The fused dynamic-Q-quant + KV-write kernel is gated to models that
+        # actually need a per-step dynamic Q scale on the fp8 KV path. Gemma4 is
+        # the one such model here: its checkpoint carries no static/calibrated q
+        # scale (attention is unquantized bf16), so trtllm-gen must quantize Q
+        # dynamically. Other fp8 models keep the standard path.
+        self._fused_q_kv_arch = (
+            "Gemma4ForConditionalGeneration" in config.hf_config.architectures
+        )
+
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
         """Return the SWAKVPool to translate against, or None for non-SWA models.
@@ -587,6 +596,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> bool:
         return (
             self.data_type == torch.float8_e4m3fn
+            and self._fused_q_kv_arch
             and not self.is_xqa_impl
             and save_kv_cache
             and k is not None
