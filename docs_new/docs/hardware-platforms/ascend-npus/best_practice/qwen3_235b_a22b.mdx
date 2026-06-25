@@ -6,6 +6,8 @@ metatags:
 
 This guide describes the best practice data for Qwen3-235B-A22B on the Ascend NPU.
 
+For the full deployment guide and feature overview, see the [Qwen3-235B-A22B tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b).
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
@@ -192,7 +194,6 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 458880 \
     --sampling-backend ascend \
     --ep-dispatch-algorithm static \
-    --init-expert-location /root/.cache/modelscope/hub/models/hot_map/235B_3_5k_decode.pt \
     --disable-radix-cache \
     --moe-a2a-backend ascend_fuseep \
     --speculative-algorithm EAGLE3 \

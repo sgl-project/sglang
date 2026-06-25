@@ -6,6 +6,8 @@ metatags:
 
 This guide describes the best practice data for Qwen3-30B-A3B on the Ascend NPU.
 
+For the full deployment guide and feature overview, see the [Qwen3-30B-A3B tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b).
+
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
@@ -71,7 +73,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export ASCEND_LAUNCH_BLOCKING=0
 export DP_ROUND_ROBIN=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_ALGO=level0:NA;level1:ring
+export HCCL_ALGO="level0:NA;level1:ring"
 export HCCL_SOCKET_IFNAME=<network-interface>
 export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
