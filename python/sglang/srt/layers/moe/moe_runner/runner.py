@@ -42,7 +42,7 @@ class MoeRunner:
 
         if runner_backend.is_triton():
             self.runner_core = TritonRunnerCore(config)
-        elif runner_backend.is_torch_npu():
+        elif runner_backend.is_ascend():
             self.runner_core = AscendRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
