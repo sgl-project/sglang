@@ -2832,6 +2832,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
+        # The Eagle pre-planner may have called init_forward_metadata with the
+        # unpadded batch and then marked metadata as ready.  If batch_size
+        # changed (DP-attention padding etc.), force a re-init so the attention
+        # backend creates metadata for the final padded batch size.
+        if (
+            forward_batch.forward_metadata_ready
+            and not forward_batch.forward_metadata_replan_equivalent
+            and forward_batch.batch_size != forward_batch.forward_metadata_planned_bs
+        ):
+            forward_batch.forward_metadata_ready = False
+
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
         # flavors already feed a zigzag-split rank-local layout whose token count
