@@ -69,20 +69,6 @@ except ImportError:
     flashinfer_cutlass_fused_moe = None
 
 
-def swiglustep_and_mul(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
-    """Out-variant of swiglustep activation.
-
-    Writes into `out`:
-      silu(x[:d]).clamp(max=limit) * x[d:].clamp(-limit, limit)
-    """
-    gate, up = x.chunk(2, dim=-1)
-    gate = F.silu(gate)
-    gate = gate.clamp(max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    out = gate * up
-    return out
-
-
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -252,8 +238,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _should_use_aiter_moe = _use_aiter and (
-            get_moe_runner_backend().is_auto() or get_moe_runner_backend().is_aiter()
+        _should_use_aiter_moe = (
+            _use_aiter
+            and (
+                get_moe_runner_backend().is_auto()
+                or get_moe_runner_backend().is_aiter()
+            )
+            and self._aiter_ck_moe_supported(layer)
         )
         if _should_use_aiter_moe:
             copy_or_rebind_param(
@@ -406,6 +397,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         param.data = param.data.reshape(expected_shape)
 
+    def _aiter_ck_moe_supported(self, layer) -> bool:
+        # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
+        # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
+        return layer.intermediate_size_per_partition % 128 == 0
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -424,7 +420,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
-        # Separate runner so CK-shape errors fall back to self.runner on every call.
+        # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
             _use_aiter
@@ -434,7 +430,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             and get_moe_a2a_backend().supports_aiter()
         ):
-            self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+            if self._aiter_ck_moe_supported(layer):
+                self._aiter_runner = MoeRunner(
+                    MoeRunnerBackend.AITER, moe_runner_config
+                )
+            elif get_moe_runner_backend().is_aiter():
+                raise ValueError(
+                    "moe_runner_backend=aiter is not supported for "
+                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    "use --moe-runner-backend triton."
+                )
+            else:
+                logger.warning_once(
+                    "aiter CK fused-MoE does not support "
+                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
+                    "using triton MoE runner."
+                )
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -536,20 +547,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     AiterMoeQuantInfo,
                 )
 
-                try:
-                    quant_info = AiterMoeQuantInfo(
-                        w13_weight=layer.w13_weight,
-                        w2_weight=layer.w2_weight,
-                        expert_mask=layer.dispatcher.expert_mask_gpu,
-                    )
-                    return self._aiter_runner.run(dispatch_output, quant_info)
-                except RuntimeError as e:
-                    # AITER CK fused_moe may not support all GEMM dimensions
-                    # (e.g. Gemma4 MoE with 128 experts x 704 intermediate size)
-                    logger.warning_once(
-                        f"AITER CK fused_moe failed ({e}), "
-                        "falling back to Triton MoE runner."
-                    )
+                quant_info = AiterMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
+                )
+                return self._aiter_runner.run(dispatch_output, quant_info)
 
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -673,7 +676,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -729,8 +732,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
             if self.moe_runner_config.gemm1_clamp_limit is not None:
-                hidden_states = swiglustep_and_mul(
-                    hidden_states, self.moe_runner_config.gemm1_clamp_limit
+                from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+                hidden_states, _ = swiglu_quant(
+                    hidden_states,
+                    group_list=expert_tokens,
+                    group_list_type=1,
+                    need_quant=False,
+                    do_limit=True,
+                    limit=self.moe_runner_config.gemm1_clamp_limit,
                 )
             else:
                 hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
@@ -767,7 +777,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def _forward_npu_deepep(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
         from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
             npu_fused_moe_without_routing_weights_bf16,

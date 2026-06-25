@@ -5,11 +5,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Patch DP-attention globals before importing backends
-_dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+_parallel_override = get_parallel().override(attn_tp_size=1)
+_parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.dsa.dsa_indexer import (

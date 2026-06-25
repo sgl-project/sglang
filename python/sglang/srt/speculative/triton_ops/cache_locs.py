@@ -13,33 +13,6 @@ _is_musa = is_musa()
 
 
 @triton.jit
-def create_extend_after_decode_spec_info(
-    accept_tokens,
-    seq_lens,
-    accept_lens,
-    positions,
-    bonus_tokens_ptr,
-    bs_upper: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    offsets = tl.arange(0, bs_upper)
-    seq_length = tl.load(seq_lens + pid)
-    # `accept_lens` includes the bonus token; load this req's value.
-    accept_len = tl.load(accept_lens + pid)
-
-    accept_len_cumsum = tl.sum(
-        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
-    )
-    positions_ptr = positions + accept_len_cumsum
-    mask = offsets < accept_len
-    tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
-
-    accept_len_cumsum += accept_len - 1
-    bonus_token = tl.load(accept_tokens + accept_len_cumsum)
-    tl.store(bonus_tokens_ptr + pid, bonus_token)
-
-
-@triton.jit
 def assign_req_to_token_pool(
     req_pool_indices,
     req_to_token,

@@ -53,7 +53,7 @@ class PlanInput:
         *,
         bs_capacity: int,
         device: torch.device,
-    ) -> "PlanInput":
+    ) -> PlanInput:
         return cls(
             req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
@@ -63,7 +63,7 @@ class PlanInput:
             ),
         )
 
-    def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> None:
+    def fill_from_forward_batch(self, *, forward_batch: ForwardBatch) -> None:
         req_pool_indices = forward_batch.req_pool_indices
         bs = int(req_pool_indices.shape[0])
         capacity = int(self.req_pool_indices.shape[0])
@@ -92,7 +92,7 @@ class PlanInput:
 
 def _extract_prefix_lens_and_extend_seq_lens(
     *,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     out_prefix_lens: torch.Tensor,
     out_extend_seq_lens: torch.Tensor,
     bs: int,
@@ -111,14 +111,14 @@ def _extract_prefix_lens_and_extend_seq_lens(
         out_prefix_lens[: positions.shape[0]].copy_(positions.to(torch.int64))
         out_extend_seq_lens.fill_(1)
     elif forward_mode.is_target_verify():
-        # Evidence: EagleVerifyInputV2Mixin.prepare_for_v2_verify assigns out_cache_loc in
+        # Evidence: EagleVerifyInputV2Mixin.prepare_for_verify assigns out_cache_loc in
         # [seq_lens, seq_lens + draft_token_num) without bumping seq_lens. The target-verify
         # branch in TRTLLMHAAttnBackend.init_forward_metadata uses seq_lens as the prefix and
         # tokens_per_req as the query length, so mirror that as seq_lens plus draft_token_num.
         out_prefix_lens.copy_(forward_batch.seq_lens[:bs].to(torch.int64))
         out_extend_seq_lens.fill_(int(spec_info.draft_token_num))
     elif forward_mode.is_draft_extend_v2():
-        # Evidence: EagleDraftInputV2Mixin.prepare_for_extend_to_fill_draft_kvcache bumps
+        # Evidence: EagleDraftWorkerBase.prepare_for_draft_extend bumps
         # seq_lens by num_draft_tokens. FlashAttentionBackend.init_forward_metadata reads the
         # draft-extend-v2 query length from spec_info.extend_seq_lens_tensor when available.
         # CUDA-graph replay passes extend_seq_lens but omits extend_prefix_lens, so derive the
