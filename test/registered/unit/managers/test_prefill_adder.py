@@ -79,7 +79,6 @@ class TestPrefillAdder(CustomTestCase):
         req.priority = priority
         req.prefix_indices = []
         req.full_untruncated_fill_ids = []
-        req.extend_logprob_start_len = 0
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)

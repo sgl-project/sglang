@@ -3340,9 +3340,9 @@ class Scheduler(
                     req.extend_range.length if req.extend_range is not None else 0
                     for req in batch.reqs
                 ]
-                batch_result.extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
+                batch_result.extend_logprob_start_len_per_req = (
+                    batch.extend_logprob_start_lens
+                )
             else:
                 batch_result.extend_input_len_per_req = None
                 batch_result.extend_logprob_start_len_per_req = None
