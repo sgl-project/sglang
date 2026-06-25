@@ -10,8 +10,6 @@ from sglang.jit_kernel.dsv4 import (
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
-from sglang.jit_kernel.dsv4.fused_norm_rope_v2_torch import _fwht128
-from sglang.jit_kernel.hadamard import hadamard_transform
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     precompute_freqs_cis,
@@ -20,12 +18,16 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
-from sglang.srt.utils import get_device, is_cuda
+from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-_is_cuda = is_cuda()
+_is_xpu = is_xpu()
+if _is_xpu:
+    from sgl_kernel import hadamard_transform
+else:
+    from sglang.jit_kernel.hadamard import hadamard_transform
 
 HEAD_DIM = 128
 FP4_DIM = HEAD_DIM // 2
@@ -34,17 +36,6 @@ SCALE_GROUPS = HEAD_DIM // GROUP_SIZE
 SCALE_BYTES = 4
 PAGE_SIZE = 64
 E2M1_MAX = 6.0
-
-
-def _hadamard_ref(x: torch.Tensor, scale: float) -> torch.Tensor:
-    """Device-agnostic Hadamard reference.
-
-    On CUDA use the JIT kernel; elsewhere (e.g. XPU) use the torch-native 128-pt
-    WHT the fallback itself uses, scaled to match the kernel's ``scale`` arg.
-    """
-    if _is_cuda:
-        return hadamard_transform(x.contiguous(), scale=scale)
-    return _fwht128(x.float().contiguous()) * scale
 
 
 def _ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
@@ -197,7 +188,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     rope_out[..., 0] = rope[..., 0] * freqs[..., 0] - rope[..., 1] * freqs[..., 1]
     rope_out[..., 1] = rope[..., 0] * freqs[..., 1] + rope[..., 1] * freqs[..., 0]
     ref[:, 64:] = rope_out.reshape(num_tokens, 64)
-    ref = _hadamard_ref(ref, scale=HEAD_DIM**-0.5)
+    ref = hadamard_transform(ref.contiguous(), scale=HEAD_DIM**-0.5)
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(ref)
 
     expected = _ref_store_fp4_index_cache(
@@ -210,8 +201,8 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
 
 
 @pytest.mark.skipif(
-    not _is_cuda,
-    reason="fused_q_indexer_rope_hadamard_fp4_quant is JIT-CUDA-only (no torch fallback)",
+    _is_xpu,
+    reason="fused_q_indexer_rope_hadamard_fp4_quant is not supported by Intel GPU",
 )
 @pytest.mark.parametrize("batch_size", [1, 5, 17])
 def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
@@ -236,7 +227,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
 
     ref = q.clone()
     apply_rotary_emb_triton(ref[..., -rope_dim:], freqs_cis, positions=positions)
-    ref = _hadamard_ref(ref, scale=HEAD_DIM**-0.5)
+    ref = hadamard_transform(ref.contiguous(), scale=HEAD_DIM**-0.5)
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(ref.view(-1, HEAD_DIM))
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
     ref_sf = ref_sf.view(batch_size, num_heads)
