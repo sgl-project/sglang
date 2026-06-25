@@ -97,6 +97,14 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
     def get_default_attention_backend(self) -> str:
         return "mlu"
 
+    def support_cuda_graph(self) -> bool:
+        return True
+
+    def get_graph_runner_cls(self) -> type:
+        from sglang.srt.hardware_backend.mlu.graph_runner import MLUGraphRunner
+
+        return MLUGraphRunner
+
     def get_mha_kv_pool_cls(self) -> type:
         from sglang.srt.hardware_backend.mlu.memory_pool import MLUMHATokenToKVPool
 

@@ -74,6 +74,10 @@ _skip_attn_backend_init_warned = False
 _is_npu = is_npu()
 
 
+def _position_dtype_for_device(device: Union[str, torch.device]) -> torch.dtype:
+    return torch.int32 if torch.device(device).type == "mlu" else torch.int64
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -783,7 +787,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
-            ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            ret.positions = torch.empty(
+                (0,), dtype=_position_dtype_for_device(device), device=device
+            )
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -1528,10 +1534,14 @@ def compute_position(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    positions_dtype = _position_dtype_for_device(extend_prefix_lens.device)
     positions = torch.cat(
         [
             torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
+                prefix_len,
+                prefix_len + extend_len,
+                device=extend_prefix_lens.device,
+                dtype=positions_dtype,
             )
             for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
         ],
@@ -1539,11 +1549,13 @@ def compute_position_torch(
     )
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-    return positions.to(torch.int64), extend_start_loc
+    return positions, extend_start_loc
 
 
 def _clamp_position_native(seq_lens):
-    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+    return torch.clamp((seq_lens - 1), min=0).to(
+        _position_dtype_for_device(seq_lens.device)
+    )
 
 
 if is_cuda() or is_hip():

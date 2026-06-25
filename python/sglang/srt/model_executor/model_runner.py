@@ -245,7 +245,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_out_of_tree():
+elif (current_platform.is_out_of_tree() or current_platform.is_mlu()):
     current_platform.init_backend()
 
 MLA_ATTENTION_BACKENDS = [
@@ -924,9 +924,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device in ("cuda", "musa", "cpu", "npu"):
                 self.init_decode_cuda_graph()
             elif (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            ):
+                current_platform.is_out_of_tree() or current_platform.is_mlu()
+            ) and current_platform.support_cuda_graph():
                 self.init_decode_cuda_graph()
         else:
             self.decode_cuda_graph_runner = self.eager_runner
@@ -1827,7 +1826,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.device == "cuda"
             or self.device == "musa"
             or (
-                current_platform.is_out_of_tree()
+                (current_platform.is_out_of_tree() or current_platform.is_mlu())
                 and current_platform.support_cuda_graph()
             )
         ):
@@ -2562,6 +2561,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "musa": "CUDA graph",
                 "cpu": "CPU graph",
                 "npu": "NPU graph",
+                "mlu": "MLU graph",
             },
         )
         role = "draft" if self.is_draft_worker else "target"
@@ -2583,8 +2583,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"backend={decode_backend}, num_tokens_per_bs={num_tokens_per_bs}, "
             f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
         )
-
-        if current_platform.is_out_of_tree():
+        if (current_platform.is_out_of_tree() or current_platform.is_mlu()):
             GraphRunnerCls = current_platform.get_graph_runner_cls()
             self.decode_cuda_graph_runner = GraphRunnerCls(self)
         else:

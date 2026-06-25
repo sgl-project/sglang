@@ -468,7 +468,7 @@ class TestMluSRTPlatform(CustomTestCase):
         self.assertEqual(base.get_dispatch_key_name(), "mlu")
         self.assertEqual(base.get_default_attention_backend(), "mlu")
         self.assertEqual(base.get_torch_distributed_backend_str(), "cncl")
-        self.assertFalse(base.support_cuda_graph())
+        self.assertTrue(base.support_cuda_graph())
         self.assertFalse(base.support_piecewise_cuda_graph())
 
     def test_mlu_apply_server_args_defaults(self):
