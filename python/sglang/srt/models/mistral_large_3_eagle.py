@@ -18,6 +18,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV2Model
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -34,13 +35,20 @@ class MistralLarge3EagleModel(DeepseekV2Model):
         nn.Module.__init__(self)
 
         self.config = config
+        self.use_dsa = is_deepseek_dsa(config)
+        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.first_k_dense_replace = config.first_k_dense_replace
         assert get_pp_group().world_size == 1
         self.pp_group = get_pp_group()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not is_deepseek_dsa(config)
+            is_prefill_context_parallel_enabled() and not self.use_dsa
         )
+        if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_size = None
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -75,6 +83,7 @@ class MistralLarge3EagleModel(DeepseekV2Model):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
+        self.gemm_output_zero_allocator_size = 0
 
     def forward(
         self,

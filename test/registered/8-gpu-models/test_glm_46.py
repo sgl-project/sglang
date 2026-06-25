@@ -27,6 +27,7 @@ class TestGLM46(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--trust-remote-code",
+            "--flashinfer-allreduce-fusion-backend=trtllm",
         ]
 
         variants = [
