@@ -95,9 +95,13 @@ class FwdOccupancyMixin:
             )
 
     def _fwd_occupancy_fire(self, prompt: str, max_new_tokens: int):
-        """Fire one /generate, return (completion_tokens, wall_time).
-        Must not be called concurrently -- that would break the
-        single-batch invariant."""
+        """Fire one /generate, return (meta_info, wall_time).
+
+        ``meta_info`` is the full response meta_info dict (None on
+        failure), carrying prompt/completion tokens and -- with
+        ``--enable-metrics`` (mandatory here) -- ``decode_throughput``
+        (decode-stage tok/s). Must not be called concurrently -- that
+        would break the single-batch invariant."""
         t0 = time.perf_counter()
         try:
             resp = requests.post(
@@ -115,13 +119,13 @@ class FwdOccupancyMixin:
         except requests.RequestException:
             # Final stats-vs-threshold is the signal; individual fire
             # failure isn't.
-            return 0, 0.0
+            return None, 0.0
         elapsed = time.perf_counter() - t0
         try:
-            tokens = resp.json().get("meta_info", {}).get("completion_tokens", 0)
+            meta_info = resp.json().get("meta_info", {})
         except ValueError:  # non-JSON body
-            tokens = 0
-        return tokens, elapsed
+            meta_info = {}
+        return meta_info, elapsed
 
     def _fwd_occupancy_warmup(self):
         """Fill cuda graphs + step the device-timer past its first NaN
@@ -134,19 +138,20 @@ class FwdOccupancyMixin:
 
     def _fwd_occupancy_measure(self):
         """Background-fire one long single-batch request, scrape
-        /metrics on the foreground; return (non-NaN samples,
-        token_tps)."""
+        /metrics on the foreground; return (non-NaN samples, perf).
+
+        ``perf`` aggregates the single request's reported token counts
+        and throughputs for the perf table (decoupled from the
+        occupancy gauge)."""
         samples = []
         request_done = threading.Event()
-        result = {"completion_tokens": 0, "elapsed": 0.0}
+        result = {"meta_info": None, "elapsed": 0.0}
 
         def fire_one():
             try:
-                result["completion_tokens"], result["elapsed"] = (
-                    self._fwd_occupancy_fire(
-                        self.fwd_occupancy_prompt,
-                        self.fwd_occupancy_max_new_tokens,
-                    )
+                result["meta_info"], result["elapsed"] = self._fwd_occupancy_fire(
+                    self.fwd_occupancy_prompt,
+                    self.fwd_occupancy_max_new_tokens,
                 )
             finally:
                 request_done.set()
@@ -161,56 +166,26 @@ class FwdOccupancyMixin:
             time.sleep(self.fwd_occupancy_scrape_interval)
 
         firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
-        token_tps = (
-            result["completion_tokens"] / result["elapsed"]
-            if result["elapsed"] > 0
-            else 0.0
-        )
-        return samples, token_tps
+
+        meta = result["meta_info"] or {}
+        elapsed = result["elapsed"]
+        completion_tokens = meta.get("completion_tokens", 0) or 0
+        decode_throughput = meta.get("decode_throughput", 0.0) or 0.0
+        perf = {
+            "input_tokens": meta.get("prompt_tokens", 0) or 0,
+            "output_tokens": completion_tokens,
+            "decode_throughput": decode_throughput,
+            "mean_itl_ms": (
+                (1000.0 / decode_throughput) if decode_throughput > 0 else 0.0
+            ),
+            "wall_throughput": (completion_tokens / elapsed if elapsed > 0 else 0.0),
+        }
+        return samples, perf
 
     def test_fwd_occupancy(self):
         self._assert_metrics_device_timer_enabled()
         self._fwd_occupancy_warmup()
-        samples, token_tps = self._fwd_occupancy_measure()
-
-        self.assertGreaterEqual(
-            len(samples),
-            self.fwd_occupancy_min_samples,
-            f"only {len(samples)} non-NaN occupancy samples collected "
-            f"(need >= {self.fwd_occupancy_min_samples}); the measurement "
-            "window may be too short or the gauge stuck at NaN",
-        )
-
-        # Median is the steady-state signal; peak / p10 included in the
-        # assertion message for triage.
-        samples_sorted = sorted(samples)
-        median = statistics.median(samples_sorted)
-        peak = samples_sorted[-1]
-        p10_idx = min(len(samples_sorted) - 1, max(0, len(samples_sorted) // 10))
-        p10 = samples_sorted[p10_idx]
-        print(
-            "\n"
-            + tabulate.tabulate(
-                [
-                    ["samples (n)", len(samples)],
-                    ["median", f"{median:.2f}"],
-                    ["peak", f"{peak:.2f}"],
-                    ["p10", f"{p10:.2f}"],
-                    ["threshold", f"{self.fwd_occupancy_threshold:.2f}"],
-                    ["token tps", f"{token_tps:.2f}"],
-                ],
-                headers=["fwd_occupancy", "value"],
-                tablefmt="github",
-            )
-        )
-
-        self.assertGreater(
-            median,
-            self.fwd_occupancy_threshold,
-            f"sglang:fwd_occupancy median={median:.2f} did not exceed "
-            f"threshold {self.fwd_occupancy_threshold} "
-            f"(peak={peak:.2f}, p10={p10:.2f}, n={len(samples)})",
-        )
+        samples, perf = self._fwd_occupancy_measure()
 
         # The 2048-token decode above populates the spec running average
         # if a spec algorithm is enabled; absent otherwise (vanilla
@@ -222,8 +197,80 @@ class FwdOccupancyMixin:
             avg_accept = info["internal_states"][0].get("avg_spec_accept_length")
         except (requests.RequestException, KeyError, IndexError):
             avg_accept = None
+
+        # Compute occupancy stats up front so both tables can be printed
+        # together, before any assertion. Reporting must never be skipped
+        # by an early assertion failure -- the numbers are exactly what's
+        # needed to triage that failure.
+        samples_sorted = sorted(samples)
+        if samples_sorted:
+            median = statistics.median(samples_sorted)
+            peak = samples_sorted[-1]
+            p10_idx = min(len(samples_sorted) - 1, max(0, len(samples_sorted) // 10))
+            p10 = samples_sorted[p10_idx]
+        else:
+            median = peak = p10 = float("nan")
+
+        # --- Perf table ------------------------------------------------
+        # Request-level metrics (not the occupancy gauge), in their own
+        # table: token counts, decode-stage throughput from meta_info,
+        # mean inter-token latency, wall-clock throughput, and -- when a
+        # spec algorithm ran -- the spec accept length.
+        perf_rows = [
+            ["input tokens", perf["input_tokens"]],
+            ["output tokens", perf["output_tokens"]],
+            ["decode tps", f"{perf['decode_throughput']:.2f}"],
+            ["mean itl (ms)", f"{perf['mean_itl_ms']:.2f}"],
+            ["wall tps", f"{perf['wall_throughput']:.2f}"],
+        ]
         if avg_accept is not None:
-            print(f"avg_spec_accept_length = {avg_accept:.3f}")
+            perf_rows.append(["avg spec accept", f"{avg_accept:.3f}"])
+        print(
+            "\n"
+            + tabulate.tabulate(
+                perf_rows,
+                headers=["perf metric", "value"],
+                tablefmt="github",
+            )
+        )
+
+        # --- Occupancy table ------------------------------------------
+        # The occupancy gauge; median is the steady-state signal, peak /
+        # p10 are triage context. Printed unconditionally so a failing
+        # assertion still surfaces what was actually measured.
+        print(
+            "\n"
+            + tabulate.tabulate(
+                [
+                    ["samples (n)", len(samples)],
+                    ["median", f"{median:.2f}"],
+                    ["peak", f"{peak:.2f}"],
+                    ["p10", f"{p10:.2f}"],
+                    ["threshold", f"{self.fwd_occupancy_threshold:.2f}"],
+                ],
+                headers=["fwd_occupancy", "value"],
+                tablefmt="github",
+            )
+        )
+
+        # --- Assertions (all reporting done above) --------------------
+        self.assertGreaterEqual(
+            len(samples),
+            self.fwd_occupancy_min_samples,
+            f"only {len(samples)} non-NaN occupancy samples collected "
+            f"(need >= {self.fwd_occupancy_min_samples}); the measurement "
+            "window may be too short or the gauge stuck at NaN",
+        )
+
+        self.assertGreater(
+            median,
+            self.fwd_occupancy_threshold,
+            f"sglang:fwd_occupancy median={median:.2f} did not exceed "
+            f"threshold {self.fwd_occupancy_threshold} "
+            f"(peak={peak:.2f}, p10={p10:.2f}, n={len(samples)})",
+        )
+
+        if avg_accept is not None:
             self.assertGreater(
                 avg_accept,
                 self.fwd_occupancy_acc_length_threshold,
