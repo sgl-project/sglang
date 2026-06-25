@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import sgl_kernel_npu  # noqa: F401
 from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
     fused_gdn_gating_npu,
@@ -9,7 +10,6 @@ from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
     causal_conv1d_update_npu,
 )
-import sgl_kernel_npu
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
@@ -231,7 +231,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
                 conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
+            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
             mixed_qkv = torch.ops.npu.causal_conv1d(
                 mixed_qkv,
                 layer.conv_weights.transpose(0, 1).contiguous(),
