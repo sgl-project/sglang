@@ -158,14 +158,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
-        # The fused dynamic-Q-quant + KV-write kernel is gated to models that
-        # actually need a per-step dynamic Q scale on the fp8 KV path. Gemma4 is
-        # the one such model here: its checkpoint carries no static/calibrated q
-        # scale (attention is unquantized bf16), so trtllm-gen must quantize Q
-        # dynamically. Other fp8 models keep the standard path.
-        self._fused_q_kv_arch = (
-            "Gemma4ForConditionalGeneration" in config.hf_config.architectures
-        )
+        # Persistent scratch for the fused dynamic-Q-quant + KV-write kernel: a
+        # single amax accumulator + a last-block counter, both kept at zero by
+        # the kernel itself (so no per-call fill). Reused across all layers since
+        # the kernel resets them before returning.
+        self._fused_amax_buf = torch.zeros(1, dtype=torch.float32, device=self.device)
+        self._fused_done_counter = torch.zeros(1, dtype=torch.int32, device=self.device)
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
@@ -596,7 +594,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> bool:
         return (
             self.data_type == torch.float8_e4m3fn
-            and self._fused_q_kv_arch
             and not self.is_xqa_impl
             and save_kv_cache
             and k is not None
@@ -635,6 +632,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             inv_k_scale=1.0 / k_scale,
             inv_v_scale=1.0 / v_scale,
             bmm1_extra=k_scale * layer.scaling,
+            amax_buf=self._fused_amax_buf,
+            done_counter=self._fused_done_counter,
         )
         return q_fp8, bmm1_scale, v_scale
 
