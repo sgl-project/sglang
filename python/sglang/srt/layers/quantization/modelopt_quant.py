@@ -47,6 +47,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
     cutlass_fp8_supported,
+    dispatch_w8a8_mxfp8_linear,
+    get_fp8_gemm_runner_backend,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -2575,12 +2577,13 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     uint8 E8M0 biased exponent, bias=127, [out, in/32]). Activations are dynamic
     microscaling, so there is no stored input_scale.
 
-    The layer will be loaded into torchao's MXTensor, and use dynamic mxfp8
-    quantization for activations. F.linear() will then dispatch to torchao's
-    mx_linear, which in turn will dispatch to mx_mm (aka torch._scaled_mm).
-    E8M0 produced by ModelOpt is identical to torch.float8_e8m0fnu, so it is
-    simply reinterpreted, and then swizzled into the block layout as per the
-    expectations of the kernel (MXDynamicActivationMXWeightConfig).
+    The GEMM is dispatched through ``dispatch_w8a8_mxfp8_linear()`` -- the same
+    fused MXFP8 W8A8 path the stock ``Fp8LinearMethod`` uses (``fp8.py``). By
+    default this is the Triton block-scaled kernel; ``--fp8-gemm-backend
+    flashinfer_trtllm`` (or ``flashinfer_cutlass``) routes to the fused FlashInfer
+    CUTLASS/TRT-LLM kernel on Blackwell. These kernels consume the raw fp8 weight
+    + uint8 E8M0 scale directly and dynamically quantize activations to MXFP8, so
+    no torchao MXTensor wrapper / runtime scale re-blocking is needed.
     """
 
     BLOCK = 32
@@ -2588,6 +2591,10 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config=None):
         super().__init__()
         self.quant_config = quant_config
+        # Same fused dispatch the stock Fp8LinearMethod uses (fp8.py). Selected at
+        # construction time from --fp8-gemm-backend: Triton (default) or FlashInfer
+        # TRT-LLM/CUTLASS. Replaces the old torchao MXTensor + torch._scaled_mm path.
+        self.mxfp8_linear = dispatch_w8a8_mxfp8_linear()
 
     def create_weights(
         self,
@@ -2641,49 +2648,70 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
             ),
         )
 
+    # Fused MXFP8 GEMMs (Triton / FlashInfer) tile the GEMM and require the
+    # per-shard N and K to be multiples of 128 (Triton asserts k%128 and
+    # n%block_n with block_n in {128,256}). Small linears that don't meet this --
+    # notably Qwen3.5's fused in_proj_ba (b+a gates, N=64 -> 16 per TP=4 shard) --
+    # are dequantized to bf16 and run through a plain GEMM. These are tiny
+    # (e.g. 2048x16), so the cost is negligible and bf16 is numerically safer for
+    # the decay/gate projections. vLLM solved the same constraint by padding.
+    ALIGN = 128
+
+    def _kernel_aligned(self, layer) -> bool:
+        return (
+            layer.input_size_per_partition % self.ALIGN == 0
+            and layer.output_size_per_partition % self.ALIGN == 0
+        )
+
     def process_weights_after_loading(self, layer) -> None:
-        # Wrap the pre-quantized fp8 weight + E8M0 scale as a torchao MXTensor carrying
-        # the dynamic-MXFP8 activation recipe. No bf16 dequant: the weight stays fp8.
-        from torchao.prototype.mx_formats.config import ScaleCalculationMode
-        from torchao.prototype.mx_formats.mx_tensor import (
-            MXTensor,
-            QuantizeTensorToMXKwargs,
-        )
-        from torchao.quantization.quantize_.common.kernel_preference import (
-            KernelPreference,
-        )
+        if self._kernel_aligned(layer):
+            layer.use_fused_mxfp8 = True
+            weight = layer.weight.data.contiguous()
+            scale_u8 = layer.weight_scale.data.contiguous().view(torch.uint8)
 
-        weight = layer.weight.data  # float8_e4m3fn [out, in]
-        # ModelOpt's biased-exponent uint8 E8M0 is bit-identical to float8_e8m0fnu.
-        scale = layer.weight_scale.data.view(torch.float8_e8m0fnu)  # [out, in/BLOCK]
+            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+                # CUTLASS mm_mxfp8 needs the UE8M0 block scale interleaved into its
+                # swizzled layout (mirrors Fp8LinearMethod._process_mxfp8_linear_weight_scale).
+                # The weight itself is consumed as-is.
+                from flashinfer import block_scale_interleave
 
-        # Use plain (un-swizzled) scales: torchao's mm dispatch blocks both the weight
-        # scale and the runtime activation scale internally (the is_swizzled_scales=False
-        # branch does `maybe_dtensor_to_blocked(scale)`), so we pass the [out, in/BLOCK]
-        # scale as-is. This avoids replicating torchao's exact swizzled-scale layout
-        # (to_blocked().flatten().view(scale_M, scale_K)), which is easy to get wrong.
-        act_quant_kwargs = QuantizeTensorToMXKwargs(
-            elem_dtype=torch.float8_e4m3fn,
-            block_size=self.BLOCK,
-            kernel_preference=KernelPreference.AUTO,
-            is_swizzled_scales=False,
-            scaling_mode=ScaleCalculationMode.RCEIL,
-        )
-        weight_mx = MXTensor(
-            qdata=weight,
-            scale=scale,
-            elem_dtype=torch.float8_e4m3fn,
-            block_size=self.BLOCK,
-            orig_dtype=torch.bfloat16,
-            kernel_preference=KernelPreference.AUTO,
-            act_quant_kwargs=act_quant_kwargs,
-            is_swizzled_scales=False,
-        )
-        layer.weight = Parameter(weight_mx, requires_grad=False)
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale = Parameter(
+                    block_scale_interleave(scale_u8.contiguous()).contiguous(),
+                    requires_grad=False,
+                )
+            else:
+                # Triton (default): canonical 2D UE8M0 scale + raw fp8 weight.
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale = Parameter(scale_u8, requires_grad=False)
+            return
+
+        # Fallback: reconstruct the bf16 weight from the stored MX block scales
+        # (w_bf16 = fp8_weight * 2^(E8M0-127), per BLOCK along K) and drop the scale.
+        layer.use_fused_mxfp8 = False
+        w = layer.weight.data  # float8_e4m3fn [out, in]
+        out_f, in_f = w.shape
+        # uint8 E8M0 (bias 127) reinterpreted as float8_e8m0fnu casts to the 2^k value.
+        scale = layer.weight_scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+        w_bf16 = (
+            w.to(torch.float32).view(out_f, in_f // self.BLOCK, self.BLOCK)
+            * scale.unsqueeze(-1)
+        ).view(out_f, in_f).to(torch.bfloat16)
+        layer.weight = Parameter(w_bf16, requires_grad=False)
         del layer.weight_scale
 
     def apply(self, layer, x, bias=None):
-        # F.linear dispatches on the MXTensor weight -> torchao mx_linear, which
-        # dynamically quantizes x to MXFP8 (per act_quant_kwargs) and runs the
-        # block-scaled FP8 GEMM (torch._scaled_mm) -> bf16 output.
-        return torch.nn.functional.linear(x, layer.weight, bias)
+        if getattr(layer, "use_fused_mxfp8", True):
+            # Dynamic-activation MXFP8 W8A8 GEMM via the shared dispatch (Triton by
+            # default, FlashInfer TRT-LLM/CUTLASS when --fp8-gemm-backend selects it).
+            # input_scale=None -> the kernel quantizes x to MXFP8 on the fly.
+            return self.mxfp8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=None,
+                bias=bias,
+                output_dtype=x.dtype,
+            )
+        # bf16 fallback for kernel-unaligned small linears.
+        return torch.nn.functional.linear(x, layer.weight.to(x.dtype), bias)
