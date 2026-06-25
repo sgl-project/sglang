@@ -6181,16 +6181,33 @@ class ServerArgs:
         if self.dllm_algorithm is None:
             return
         # DiffusionGemma: head_dim 512 exceeds the flashinfer/fa3 cap, and the
-        # bidirectional canvas needs eager triton with unchunked prefill.
+        # bidirectional canvas needs eager mode with unchunked prefill.
         if self.dllm_algorithm == "Gemma4Renoise":
-            if (
+            # Triton-retirement allowance: our asymmetric VO-split (FlashInfer #3684,
+            # qk=512/vo=256) handles the 512-wide full-attention head, so when the
+            # VO-split knob is on we route DiffusionGemma through FlashInfer instead
+            # of forcing Triton — unlocking native NVFP4 KV for the canvas. The
+            # bidirectional canvas still requires eager mode + unchunked prefill, so
+            # cuda graph stays DISABLED and chunked_prefill_size stays -1 regardless.
+            vosplit_on = os.environ.get("SGLANG_FLASHINFER_VOSPLIT", "0") == "1"
+            if vosplit_on:
+                if self.attention_backend not in (None, "flashinfer"):
+                    logger.warning(
+                        "DiffusionGemma: VO-split knob on — routing through FlashInfer "
+                        "(NVFP4 KV path) instead of forced Triton."
+                    )
+                self.attention_backend = "flashinfer"
+                self.prefill_attention_backend = None
+                self.decode_attention_backend = None
+            elif (
                 self.attention_backend != "triton"
                 or self.prefill_attention_backend not in (None, "triton")
                 or self.decode_attention_backend not in (None, "triton")
             ):
                 logger.warning(
                     "Attention backend forced to triton for DiffusionGemma "
-                    "(head_dim 512 exceeds the flashinfer/fa3 cap)."
+                    "(head_dim 512 exceeds the flashinfer/fa3 cap; set "
+                    "SGLANG_FLASHINFER_VOSPLIT=1 to use the FlashInfer VO-split path)."
                 )
                 self.attention_backend = "triton"
                 self.prefill_attention_backend = None
