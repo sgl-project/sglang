@@ -17,6 +17,7 @@ class PerformanceTestParams:
     dataset_name: str = "mmmu"  # For VLM perf test
     # MTP/EAGLE speculative decoding: minimum accept length threshold (None = no validation)
     spec_accept_length_threshold: Optional[float] = None
+    extra_bench_args: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -49,6 +50,7 @@ def run_performance_test(
     is_vlm: bool = False,
     dataset_name: str = "mmmu",
     spec_accept_length_threshold: Optional[float] = None,
+    extra_bench_args: Optional[List[str]] = None,
 ) -> PerformanceTestResult:
 
     # Set default for mutable argument
@@ -66,9 +68,11 @@ def run_performance_test(
     print(f"{'='*60}\n")
 
     # Build extra args for benchmarks
-    extra_bench_args = ["--trust-remote-code"]
+    bench_args = ["--trust-remote-code"]
     if is_vlm:
-        extra_bench_args.append(f"--dataset-name={dataset_name}")
+        bench_args.append(f"--dataset-name={dataset_name}")
+    if extra_bench_args:
+        bench_args.extend(extra_bench_args)
 
     try:
         results, success, avg_spec_accept_length = perf_runner.run_benchmark_for_model(
@@ -78,7 +82,7 @@ def run_performance_test(
             output_lens=output_lens,
             other_args=model.extra_args,
             variant=model.variant or "",
-            extra_bench_args=extra_bench_args,
+            extra_bench_args=bench_args,
             env=model.env,
         )
 
@@ -91,7 +95,9 @@ def run_performance_test(
             passed = True
             if spec_accept_length_threshold is not None:
                 if avg_spec_accept_length is None:
-                    error_msg = f"Spec accept length threshold set but no accept length reported"
+                    error_msg = (
+                        "Spec accept length threshold set but no accept length reported"
+                    )
                     passed = False
                     print(f"✗ {error_msg}")
                 elif avg_spec_accept_length < spec_accept_length_threshold:

@@ -11,12 +11,14 @@ import json
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-DEFAULT_DSV4_FLASH_HARD_IDS: tuple[str, ...] = (
+DEFAULT_DSV4_PRO_HARD_IDS: tuple[str, ...] = (
     "aime25-13",
     "aime25-14",
     "aime25-27",
     "aime25-29",
 )
+
+DEFAULT_DSV4_FLASH_HARD_IDS = DEFAULT_DSV4_PRO_HARD_IDS
 
 DSV4_FLASH_BISECT_IDS: tuple[str, ...] = (
     "aime25-13",
@@ -27,6 +29,7 @@ DSV4_FLASH_BISECT_IDS: tuple[str, ...] = (
 PRESET_IDS: dict[str, tuple[str, ...]] = {
     "dsv4-flash": DEFAULT_DSV4_FLASH_HARD_IDS,
     "dsv4-flash-bisect": DSV4_FLASH_BISECT_IDS,
+    "dsv4-pro": DEFAULT_DSV4_PRO_HARD_IDS,
 }
 
 
@@ -87,3 +90,30 @@ def write_jsonl(rows: Iterable[Mapping[str, object]], path: str | Path) -> Path:
         for row in rows:
             f.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
     return out_path
+
+
+def load_aime25_rows_from_huggingface() -> list[dict[str, str]]:
+    from datasets import load_dataset
+
+    rows = []
+    for config in ("AIME2025-I", "AIME2025-II"):
+        rows.extend(load_dataset("opencompass/AIME2025", config, split="test"))
+    return normalize_aime25_rows(
+        {
+            "id": f"aime25-{idx}",
+            "problem": row["question"],
+            "expected_answer": str(row["answer"]),
+        }
+        for idx, row in enumerate(rows)
+    )
+
+
+def build_aime25_hard_subset(
+    path: str | Path,
+    *,
+    rows: Iterable[Mapping[str, object]] | None = None,
+    problem_ids: Sequence[str] | str | None = None,
+) -> Path:
+    source_rows = rows if rows is not None else load_aime25_rows_from_huggingface()
+    selected = select_aime25_rows(source_rows, parse_problem_ids(problem_ids))
+    return write_jsonl(selected, path)

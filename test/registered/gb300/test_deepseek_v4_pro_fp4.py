@@ -1,6 +1,8 @@
 import unittest
+from pathlib import Path
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
+from sglang.test.aime25_hard_subset import build_aime25_hard_subset
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
@@ -84,10 +86,16 @@ HIGH_THROUGHPUT_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
 }
 
+AIME25_HARD_SUBSET_PATH = Path("/tmp/deepseek_v4_pro_aime25_hard_subset.jsonl")
+
 PERFORMANCE_BATCH_SIZES = {
     "low-latency": [1, 4, 16],
     "balanced": [64],
     "high-throughput": [128],
+}
+
+PERFORMANCE_EXTRA_BENCH_ARGS = {
+    "high-throughput": ["--request-timeout", "1800"],
 }
 
 
@@ -122,9 +130,13 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
         ]
 
         failures = []
+        aime25_data_path = build_aime25_hard_subset(AIME25_HARD_SUBSET_PATH)
         accuracy_params = AccuracyTestParams(
-            dataset="gsm8k",
-            baseline_accuracy=0.935,
+            dataset="aime25",
+            baseline_accuracy=0.70,
+            aime25_data_path=str(aime25_data_path),
+            max_tokens=65536,
+            num_threads=16,
             temperature=1.0,
             top_p=1.0,
         )
@@ -137,6 +149,9 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
                     performance_params=PerformanceTestParams(
                         batch_sizes=PERFORMANCE_BATCH_SIZES[variant.variant],
                         profile_dir="performance_profiles_gb300",
+                        extra_bench_args=PERFORMANCE_EXTRA_BENCH_ARGS.get(
+                            variant.variant, []
+                        ),
                     ),
                 )
             except AssertionError as e:

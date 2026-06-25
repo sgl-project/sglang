@@ -20,8 +20,9 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
-from sglang.test.aime25_hard_subset import (
+from sglang.test.aime25_hard_subset import (  # noqa: E402
     PRESET_IDS,
+    load_aime25_rows_from_huggingface,
     parse_problem_ids,
     select_aime25_rows,
     write_jsonl,
@@ -57,19 +58,7 @@ def _load_from_sgl_eval() -> list[dict]:
 
 
 def _load_from_huggingface() -> list[dict]:
-    from datasets import load_dataset
-
-    rows = []
-    for config in ("AIME2025-I", "AIME2025-II"):
-        rows.extend(load_dataset("opencompass/AIME2025", config, split="test"))
-    return [
-        {
-            "id": f"aime25-{idx}",
-            "problem": row["question"],
-            "expected_answer": str(row["answer"]),
-        }
-        for idx, row in enumerate(rows)
-    ]
+    return load_aime25_rows_from_huggingface()
 
 
 def load_aime25_rows(source_jsonl: str | None) -> list[dict]:

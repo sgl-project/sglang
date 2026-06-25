@@ -5,6 +5,7 @@ from pathlib import Path
 
 from sglang.test.aime25_hard_subset import (
     DEFAULT_DSV4_FLASH_HARD_IDS,
+    build_aime25_hard_subset,
     parse_problem_ids,
     select_aime25_rows,
     write_jsonl,
@@ -55,6 +56,23 @@ class TestAime25HardSubset(CustomTestCase):
             path = write_jsonl(rows, Path(tmpdir) / "subset.jsonl")
             loaded = [json.loads(line) for line in path.read_text().splitlines()]
         self.assertEqual(loaded, rows)
+
+    def test_build_aime25_hard_subset(self):
+        rows = [
+            {"id": "aime25-13", "problem": "q13", "expected_answer": "60"},
+            {"id": "aime25-29", "question": "q29", "answer": "240"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = build_aime25_hard_subset(
+                Path(tmpdir) / "subset.jsonl",
+                rows=rows,
+                problem_ids=("aime25-29",),
+            )
+            loaded = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(
+            loaded,
+            [{"id": "aime25-29", "problem": "q29", "expected_answer": "240"}],
+        )
 
 
 if __name__ == "__main__":
