@@ -387,6 +387,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 causal=True,
             )
             o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            # TODO uniform output for forward_decode and forward_extend to
+            # return tuple instead of single output
             # decode context parallel needs lse to correct attn_output via online softmax
             if dcp_enabled():
                 return o, lse
