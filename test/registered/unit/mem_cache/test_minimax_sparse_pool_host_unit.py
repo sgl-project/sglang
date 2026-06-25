@@ -10,10 +10,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
-    ALLOC_MEMORY_FUNCS,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
