@@ -73,7 +73,7 @@ class DFlashDraftInputV2(SpecInput):
         pin_memory = is_pin_memory_available(device)
 
         def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or buf.is_pinned() != pin_memory
+            return buf is None or buf.numel() < bs
 
         def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
             return buf is None or buf.numel() < bs or str(buf.device) != str(device)
@@ -82,8 +82,10 @@ class DFlashDraftInputV2(SpecInput):
             current = 0 if buf is None else int(buf.numel())
             return max(bs, 32, current * 2 if current > 0 else 0)
 
-        if needs_cpu_alloc(self._prepare_cur_kv_lens_cpu_buf):
-            capacity = grown_capacity(self._prepare_cur_kv_lens_cpu_buf)
+        # The three CPU scratch buffers grow together; capacity is the only
+        # invariant (batch is int64 non-pinned, cur/nxt are int32 pinned).
+        if needs_cpu_alloc(self._prepare_batch_seq_lens_cpu_buf):
+            capacity = grown_capacity(self._prepare_batch_seq_lens_cpu_buf)
             self._prepare_batch_seq_lens_cpu_buf = torch.empty(
                 (capacity,), dtype=torch.int64, device="cpu"
             )
