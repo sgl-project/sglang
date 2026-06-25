@@ -128,6 +128,18 @@ impl ServerArgs {
             .or_else(|| self.data.get("context_length").and_then(|v| v.as_u64()))
     }
 
+    /// `skip_tokenizer_init`: when set the server neither tokenizes input nor
+    /// detokenizes output — clients send token ids and receive token ids back.
+    /// Drives the detok backend (`SkipDetok`, raw `output_ids` frames) and the
+    /// ingress branch (already-tokenized only). Read from the dumped blob so it
+    /// stays a single source of truth with the rest of `server_args`.
+    pub fn skip_tokenizer_init(&self) -> bool {
+        self.data
+            .get("skip_tokenizer_init")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     fn str_field(&self, key: &str) -> Option<&str> {
         self.data.get(key).and_then(|v| v.as_str())
     }
@@ -246,9 +258,17 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
     };
     let id_gen = Arc::new(RequestIdGen::default());
 
+    // `skip_tokenizer_init`: clients send token ids and receive token ids — no
+    // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
+    let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init();
+
     // Load the tokenizer once; the same Arc-backed instance is shared by both
     // the tokenizer pool (encode) and the detokenizer shards (decode_stream).
-    let dyn_tokenizer: Option<dynamo_tokenizers::Tokenizer> =
+    // Skipped entirely in `skip_tokenizer_init` mode.
+    let dyn_tokenizer: Option<dynamo_tokenizers::Tokenizer> = if skip_tokenizer_init {
+        tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
+        None
+    } else {
         cfg.tokenizer_path.as_deref().and_then(|path| {
             match tokenizer::load_tokenizer(path, cfg.tokenizer_revision.as_deref()) {
                 Ok(t) => {
@@ -260,16 +280,21 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
                     None
                 }
             }
-        });
-    if dyn_tokenizer.is_none() && cfg.tokenizer_path.is_none() {
+        })
+    };
+    if !skip_tokenizer_init && dyn_tokenizer.is_none() && cfg.tokenizer_path.is_none() {
         tracing::warn!("no tokenizer_path configured; using byte stub");
     }
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
-        let backend = match &dyn_tokenizer {
-            Some(t) => detokenizer::DetokBackend::Dynamo(t.clone()),
-            None => detokenizer::DetokBackend::Stub,
+        let backend = if skip_tokenizer_init {
+            detokenizer::DetokBackend::SkipDetok
+        } else {
+            match &dyn_tokenizer {
+                Some(t) => detokenizer::DetokBackend::Dynamo(t.clone()),
+                None => detokenizer::DetokBackend::Stub,
+            }
         };
         let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         let rxs = Arc::new(std::sync::Mutex::new(detok_rx)); // drained once at spawn
@@ -317,7 +342,9 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
         let ingress_tx = ingress_tx.clone();
         let handle = std::thread::Builder::new()
             .name("tm-ingress".into())
-            .spawn(move || tokenizer_manager::run_ingress(tm_rx, senders, ingress_tx))
+            .spawn(move || {
+                tokenizer_manager::run_ingress(tm_rx, senders, ingress_tx, skip_tokenizer_init)
+            })
             .expect("spawn tm ingress");
         threads.push(handle);
     }

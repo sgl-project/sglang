@@ -22,17 +22,27 @@ use crate::message::{EgressItem, Request, RequestKind, TokenizedReqPayload, cont
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
 use crate::runtime::ring::IngressProducer;
 
-pub fn run_ingress(rx: flume::Receiver<TmEvent>, senders: Senders, ingress: IngressProducer) {
+pub fn run_ingress(
+    rx: flume::Receiver<TmEvent>,
+    senders: Senders,
+    ingress: IngressProducer,
+    skip_tokenizer_init: bool,
+) {
     while let Ok(ev) = rx.recv() {
         match ev {
-            TmEvent::Ingress(req) => on_ingress(req, &senders, &ingress),
+            TmEvent::Ingress(req) => on_ingress(req, &senders, &ingress, skip_tokenizer_init),
             TmEvent::Tokenized(req) => on_tokenized(req, &ingress),
         }
     }
 }
 
 /// Validate a fresh request and route it onto the correct ingress branch.
-fn on_ingress(mut req: Request, senders: &Senders, ingress: &IngressProducer) {
+fn on_ingress(
+    mut req: Request,
+    senders: &Senders,
+    ingress: &IngressProducer,
+    skip_tokenizer_init: bool,
+) {
     // Received → Validating
     let _ = req.state.apply(Event::Validated(ValidationOutcome::NeedsTokenize));
 
@@ -57,6 +67,26 @@ fn on_ingress(mut req: Request, senders: &Senders, ingress: &IngressProducer) {
     if let RequestKind::Control(tag) = req.kind {
         let _ = req.state.apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
         push_control_to_ring(req, ingress, tag);
+        return;
+    }
+
+    // skip_tokenizer_init: there is no tokenizer — the client must send token
+    // ids. Treat every generate request as already-tokenized (no tokenize hop);
+    // a missing/empty `input_ids` is a client error rather than a silent
+    // byte-encode by the stub tokenizer.
+    if skip_tokenizer_init {
+        if !req.payload.already_tokenized() {
+            fail(
+                &mut req,
+                Error::Tokenize("skip_tokenizer_init is set: request must provide input_ids".into()),
+            );
+            return;
+        }
+        req.input_ids = req.payload.input_ids.clone();
+        let _ = req
+            .state
+            .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
+        push_to_ring(req, ingress);
         return;
     }
 

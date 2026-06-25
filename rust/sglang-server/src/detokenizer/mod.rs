@@ -73,19 +73,25 @@ impl StreamDecoder for StubDecoder {
 pub enum DetokBackend {
     Dynamo(dynamo_tokenizers::Tokenizer),
     Stub,
+    /// `skip_tokenizer_init`: no decoding at all — the shard accumulates raw
+    /// output token ids and emits them as `output_ids` (no `DecodeStream`).
+    SkipDetok,
 }
 
 impl DetokBackend {
-    fn new_stream(&self) -> Box<dyn StreamDecoder> {
+    /// Mint a per-request decoder, or `None` in skip-detok mode (the shard
+    /// passes token ids through untouched instead of decoding text).
+    fn new_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
         match self {
             // NOTE: the stream is seeded with an empty prompt context, which is
             // correct for the common case. Seeding with the prompt's trailing
             // tokens (for perfect first-token spacing) would require Register to
             // carry input_ids — deferred.
-            DetokBackend::Dynamo(t) => Box::new(DynamoDecoder {
+            DetokBackend::Dynamo(t) => Some(Box::new(DynamoDecoder {
                 stream: t.decode_stream(&[], SKIP_SPECIAL_TOKENS),
-            }),
-            DetokBackend::Stub => Box::new(StubDecoder),
+            })),
+            DetokBackend::Stub => Some(Box::new(StubDecoder)),
+            DetokBackend::SkipDetok => None,
         }
     }
 }
@@ -95,10 +101,14 @@ struct DetokState {
     stream: bool,
     /// Cumulative decoded text (SGLang stream frames carry cumulative text).
     text: String,
+    /// Cumulative output token ids, emitted as `output_ids` in
+    /// `skip_tokenizer_init` mode; stays empty when a decoder is present.
+    output_ids: Vec<i32>,
     /// Cumulative output token count, reported as `meta_info.completion_tokens`
     /// (clients like bench_serving diff successive frames to get per-step tokens).
     completion_tokens: u64,
-    decoder: Box<dyn StreamDecoder>,
+    /// Per-request incremental decoder; `None` in `skip_tokenizer_init` mode.
+    decoder: Option<Box<dyn StreamDecoder>>,
     /// Egress half of the lifecycle FSM. Lives here because the ingress
     /// `Request` (and its FSM) was handed to the scheduler when queued; the
     /// shard is the sole owner of the request's egress state, so no lock.
@@ -118,8 +128,9 @@ pub fn run_shard(shard: usize, rx: flume::Receiver<DetokMsg>, backend: DetokBack
                         sink,
                         stream,
                         text: String::new(),
+                        output_ids: Vec::new(),
                         completion_tokens: 0,
-                        decoder: backend.new_stream(),
+                        decoder: backend.new_decoder(),
                         // Registered == handed to the scheduler == Queued.
                         fsm: RequestState::Queued,
                     },
@@ -162,14 +173,19 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
     }
 
     st.completion_tokens += ev.token_ids.len() as u64;
-    match st.decoder.step(&ev.token_ids) {
-        Ok(delta) => st.text.push_str(&delta),
-        Err(e) => {
-            let _ = st.fsm.apply(Event::Error(e.clone()));
-            let _ = st.sink.try_send(EgressItem::Error(e));
-            table.remove(&id);
-            return;
-        }
+    match &mut st.decoder {
+        // Normal path: incrementally decode to cumulative text.
+        Some(decoder) => match decoder.step(&ev.token_ids) {
+            Ok(delta) => st.text.push_str(&delta),
+            Err(e) => {
+                let _ = st.fsm.apply(Event::Error(e.clone()));
+                let _ = st.sink.try_send(EgressItem::Error(e));
+                table.remove(&id);
+                return;
+            }
+        },
+        // skip_tokenizer_init: pass token ids through, no decode.
+        None => st.output_ids.extend_from_slice(&ev.token_ids),
     }
 
     let finished = ev.finish_reason.is_some();
@@ -178,6 +194,7 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
     let frame = build_frame(
         &ev.rid,
         &st.text,
+        &st.output_ids,
         st.completion_tokens,
         ev.finish_reason.as_deref(),
     );
@@ -202,14 +219,17 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
     }
 }
 
-/// Serialize one SGLang-style `/generate` output frame.
+/// Serialize one SGLang-style `/generate` output frame. `output_ids` is the
+/// cumulative token-id list emitted in `skip_tokenizer_init` mode (empty
+/// otherwise, in which case the field is omitted and only `text` is sent).
 fn build_frame(
     rid: &str,
     text: &str,
+    output_ids: &[i32],
     completion_tokens: u64,
     finish_reason: Option<&str>,
 ) -> Bytes {
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "text": text,
         "meta_info": {
             "id": rid,
@@ -217,6 +237,11 @@ fn build_frame(
             "finish_reason": finish_reason.map(|r| serde_json::json!({ "type": r })),
         },
     });
+    // skip_tokenizer_init: surface raw token ids alongside the (empty) text,
+    // mirroring SGLang's `/generate` output shape.
+    if !output_ids.is_empty() {
+        v["output_ids"] = serde_json::json!(output_ids);
+    }
     // to_vec never fails for this shape.
     Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
 }
