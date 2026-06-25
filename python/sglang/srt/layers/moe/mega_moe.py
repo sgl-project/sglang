@@ -161,6 +161,8 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
+    _apply_mega_moe_dg_env()
+
     import deep_gemm
 
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
@@ -274,6 +276,8 @@ def _run_mega_routed(
 
 
 def build_mega_moe_experts_weights(experts) -> None:
+    _apply_mega_moe_dg_env()
+
     from deep_gemm import (
         transform_sf_into_required_layout,
         transform_weights_for_mega_moe,
