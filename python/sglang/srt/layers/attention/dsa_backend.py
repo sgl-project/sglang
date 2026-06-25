@@ -628,6 +628,27 @@ class DeepseekSparseAttnBackend(
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
+        if (
+            not in_capture
+            and envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get()
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.batch_size
+            in getattr(self, "decode_cuda_graph_metadata", {})
+        ):
+            precomputed = self._precompute_replay_metadata(
+                bs=forward_batch.batch_size,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                forward_mode=forward_batch.forward_mode,
+            )
+            self.init_forward_metadata_replay_cuda_graph_from_precomputed(
+                bs=forward_batch.batch_size,
+                precomputed=precomputed,
+                forward_mode=forward_batch.forward_mode,
+            )
+            return
+
         self._apply_cuda_graph_metadata(
             bs=forward_batch.batch_size,
             req_pool_indices=forward_batch.req_pool_indices,
