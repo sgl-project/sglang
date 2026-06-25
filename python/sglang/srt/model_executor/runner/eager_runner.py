@@ -100,11 +100,7 @@ class EagerRunner(BaseRunner):
 
             max_bs = ceil_align(max_bs, self.attn_tp_size)
             max_bs = ceil_align(max_bs, get_cp_padding_align_size())
-        prefill_ceiling = (
-            sa.max_prefill_buffer_tokens()
-            if sa.chunked_prefill_size and sa.chunked_prefill_size > 0
-            else mr.max_total_num_tokens
-        )
+        prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
         max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
         if require_mlp_sync(sa):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
@@ -282,8 +278,13 @@ class EagerRunner(BaseRunner):
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
 
+        category = (
+            "target_verify"
+            if forward_batch.forward_mode.is_target_verify()
+            else "extend"
+        )
         ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "extend"})
+            model_runner.device_timer.wrap(metadata={"category": category})
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
