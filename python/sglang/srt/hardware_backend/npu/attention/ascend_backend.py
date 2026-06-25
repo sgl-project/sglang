@@ -2783,22 +2783,10 @@ class AscendAttnMultiStepDraftBackend:
     ):
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-
-        from sglang.srt.configs.model_config import is_deepseek_v4
-
-        if is_deepseek_v4(model_runner.model_config.hf_config):
-            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-                DeepseekV4AscendAttnBackend,
-            )
-
-            backend_cls = DeepseekV4AscendAttnBackend
-        else:
-            backend_cls = AscendAttnBackend
-
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(
-                backend_cls(model_runner, speculative_step_id=step_id)
+                AscendAttnBackend(model_runner, speculative_step_id=step_id)
             )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
