@@ -102,7 +102,7 @@ def init_torch_distributed(
             tp_size=ps.tp_size,
             pp_rank=ps.pp_rank,
             pp_size=ps.pp_size,
-            dp_size=ps.dp_size,
+            attn_dp_size=ps.attn_dp_size,
             attn_cp_size=ps.attn_cp_size,
             moe_ep_size=ps.moe_ep_size,
             moe_dp_size=ps.moe_dp_size,
@@ -224,7 +224,7 @@ def _init_parallel_groups(
     tp_size: int,
     pp_rank: int,
     pp_size: int,
-    dp_size: int,
+    attn_dp_size: int,
     attn_cp_size: int,
     moe_ep_size: int,
     moe_dp_size: int,
@@ -242,7 +242,7 @@ def _init_parallel_groups(
     )
     initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
-        attention_data_parallel_size=dp_size,
+        attention_data_parallel_size=attn_dp_size,
         pipeline_model_parallel_size=pp_size,
         expert_model_parallel_size=moe_ep_size,
         attention_context_model_parallel_size=attn_cp_size,

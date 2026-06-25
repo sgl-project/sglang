@@ -1075,7 +1075,7 @@ class ModelRunner:
         if self.msprobe_debugger is not None:
             rank_id = (
                 self.gpu_id
-                if self.ps.dp_size is not None and self.ps.dp_size > 1
+                if self.ps.attn_dp_size is not None and self.ps.attn_dp_size > 1
                 else None
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
