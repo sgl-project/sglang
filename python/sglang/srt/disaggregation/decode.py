@@ -387,7 +387,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
 
     def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
-        allocated_kv_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        allocated_kv_len = self._pre_alloc_fill_len(req)
         if self._uses_swa_tail_prealloc():
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
@@ -641,9 +641,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             except queue.Empty:
                 return
             if not getattr(req, "finished_output", False):
-                self.scheduler.output_streamer.stream_output(
-                    [req], req.return_logprob
-                )
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
 
     def _get_rebootstrap_prefill_session(self) -> requests.Session:
         session = getattr(self._rebootstrap_prefill_sessions, "session", None)
