@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel. Command A+ support landed recently (PR [#26106](https://github.com/sgl-project/sglang/pull/26106)), so use a current build (a nightly `lmsysorg/sglang:dev` image or an SGLang release that includes it).
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel. Command A+ support is included in current SGLang releases (PR [#26106](https://github.com/sgl-project/sglang/pull/26106)); the `lmsysorg/sglang:latest` Docker image ships it.
 
 <Tabs>
 
@@ -29,7 +29,7 @@ Then run the **Python** output of the command panel below in that environment.
 <Tab title="Docker">
 
 ```bash Command
-docker pull lmsysorg/sglang:dev
+docker pull lmsysorg/sglang:latest
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.

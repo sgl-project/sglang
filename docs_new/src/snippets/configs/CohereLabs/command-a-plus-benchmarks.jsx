@@ -2,7 +2,7 @@
 // command-a-plus.jsx cells. See _deployment.jsx for the speed/accuracy schema.
 //
 // Source: SGLang SOTA benchmark campaign on NVIDIA B300 (SM103, ~275 GB), stock
-// `main`, image lmsysorg/sglang:dev. Text via sglang.bench_serving (random dataset,
+// upstream `main` (commit pinned per entry's sglang_version). Text via sglang.bench_serving (random dataset,
 // random-range-ratio 1.0, greedy, ignore_eos, request-rate inf); warm, GPU-idle,
 // medians of multiple reps. `tokens_per_sec_per_gpu` = measured total output tok/s
 // divided by the cell's TP degree (BF16 TP=4, FP8 TP=2, W4A4 TP=1). GSM8K = 5-shot
@@ -33,8 +33,6 @@ export const benchmarks = [
         ttft_ms: 181, tpot_ms: 19.57, tokens_per_sec_per_gpu: 2026 },
       { workload: { dataset: "random", isl: 8000, osl: 1000, max_concurrency: 80, num_prompts: 80 },
         ttft_ms: 870, tpot_ms: 22.34, tokens_per_sec_per_gpu: 1724 },
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 256, num_prompts: 256 },
-        ttft_ms: 570, tpot_ms: 27.24, tokens_per_sec_per_gpu: 4592 },
     ],
     accuracy: { gsm8k_pct: 91.0 },
   },
@@ -49,8 +47,6 @@ export const benchmarks = [
         ttft_ms: 375, tpot_ms: 21.9, tokens_per_sec_per_gpu: 3600 },
       { workload: { dataset: "random", isl: 8000, osl: 1000, max_concurrency: 80, num_prompts: 80 },
         ttft_ms: 810, tpot_ms: 27.3, tokens_per_sec_per_gpu: 2840 },
-      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 256, num_prompts: 256 },
-        ttft_ms: null, tpot_ms: 32.4, tokens_per_sec_per_gpu: 7650 },
     ],
     accuracy: { gsm8k_pct: 87.6 },
   },

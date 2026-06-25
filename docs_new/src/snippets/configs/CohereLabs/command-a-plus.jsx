@@ -74,8 +74,8 @@ sgl-eval run gsm8k \\
   ],
 
   dockerImages: {
-    b300: "lmsysorg/sglang:dev",
-    h200: "lmsysorg/sglang:dev",
+    b300: "lmsysorg/sglang:latest",
+    h200: "lmsysorg/sglang:latest",
   },
 
   github: {
