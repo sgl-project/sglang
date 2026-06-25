@@ -298,6 +298,25 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
+        # Pinned host buffers for the fast prefill-path plan (target-verify and
+        # eager draft-extend). Passing host-resident indptr/len arrays into
+        # flashinfer's MLA plan() makes its .to("cpu") (mla/_core.py:839-841) a
+        # no-op, removing the 3 blocking DtoH that otherwise stall the host and
+        # break overlap scheduling. Pinned so the in-plan buffer copies stay
+        # async. Allocated here (not init_cuda_graph_state) because the eager
+        # draft-extend backend never calls init_cuda_graph_state. Only
+        # prefill-capable backends use these (draft multistep is skip_prefill).
+        if not skip_prefill:
+            self.fast_plan_qo_indptr_cpu = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            self.fast_plan_kv_indptr_cpu = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            self.fast_plan_kv_len_arr_cpu = torch.zeros(
+                (max_bs,), dtype=torch.int32, device="cpu", pin_memory=True
+            )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -403,6 +422,34 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 and not is_in_tc_piecewise_cuda_graph()
             )
 
+            # Fast plan for eager DRAFT_EXTEND_V2 (flashinfer-MLA has no draft-
+            # extend cuda graph, so this path runs every decode iteration): build
+            # host indptr/len arrays so the paged plan skips its 3 blocking DtoH
+            # (mla/_core.py:839-841). For V2 every req extends by num_tokens_per_req
+            # (= num_draft_tokens, fixed), so qo_indptr is that cumsum; kv from
+            # seq_lens_cpu, which matches the GPU seq_lens (both +num_draft_tokens,
+            # see eagle_info_v2.prepare_for_extend_to_fill_draft_kvcache). kv_indices
+            # stays on GPU. Only the paged path needs it; ragged uses begin_forward.
+            qo_indptr_cpu = kv_indptr_cpu = kv_len_arr_cpu = None
+            ndt = getattr(forward_batch.spec_info, "num_tokens_per_req", None)
+            if (
+                not use_ragged
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and forward_batch.seq_lens_cpu is not None
+                and ndt is not None
+            ):
+                bs = forward_batch.batch_size
+                self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
+                    0, (bs + 1) * ndt, ndt, dtype=torch.int32
+                )
+                self.fast_plan_kv_len_arr_cpu[:bs] = forward_batch.seq_lens_cpu[:bs]
+                self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    self.fast_plan_kv_len_arr_cpu[:bs], dim=0
+                )
+                qo_indptr_cpu = self.fast_plan_qo_indptr_cpu[: bs + 1]
+                kv_indptr_cpu = self.fast_plan_kv_indptr_cpu[: bs + 1]
+                kv_len_arr_cpu = self.fast_plan_kv_len_arr_cpu[:bs]
+
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -410,6 +457,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefix_lens,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 use_ragged=use_ragged,
+                qo_indptr_cpu=qo_indptr_cpu,
+                kv_indptr_cpu=kv_indptr_cpu,
+                kv_len_arr_cpu=kv_len_arr_cpu,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -484,6 +534,35 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 **self.fast_decode_kwargs,
             )
         elif forward_mode.is_target_verify():
+            fast_verify_kwargs = {}
+            # Fast verify plan (target-verify cuda-graph replay): derive host-side
+            # indptr/len arrays from seq_lens_cpu (already resident) + the
+            # constant draft_token_num, so flashinfer's MLA plan() skips the 3
+            # blocking DtoH copies at mla/_core.py:839-841. qo_indptr is the
+            # fixed tree shape; kv_indptr/kv_len_arr come from seq_lens; both
+            # match what the GPU path produces. kv_indices stays on GPU (plan()
+            # never copies it to host). Eager DRAFT_EXTEND_V2 gets the same
+            # treatment in init_forward_metadata (flashinfer-MLA has no draft-
+            # extend cuda graph, so that path is eager).
+            if (
+                forward_mode.is_target_verify()
+                and seq_lens_cpu is not None
+                and spec_info is not None
+                and getattr(spec_info, "draft_token_num", None) is not None
+            ):
+                ndt = spec_info.draft_token_num
+                self.fast_plan_qo_indptr_cpu[: bs + 1] = torch.arange(
+                    0, (bs + 1) * ndt, ndt, dtype=torch.int32
+                )
+                self.fast_plan_kv_len_arr_cpu[:bs] = seq_lens_cpu[:bs] + ndt
+                self.fast_plan_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                    self.fast_plan_kv_len_arr_cpu[:bs], dim=0
+                )
+                fast_verify_kwargs = {
+                    "qo_indptr_cpu": self.fast_plan_qo_indptr_cpu[: bs + 1],
+                    "kv_indptr_cpu": self.fast_plan_kv_indptr_cpu[: bs + 1],
+                    "kv_len_arr_cpu": self.fast_plan_kv_len_arr_cpu[:bs],
+                }
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -492,6 +571,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 spec_info=spec_info,
+                **fast_verify_kwargs,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -768,13 +848,16 @@ class FlashInferMLAIndicesUpdaterPrefill:
 
     def update(
         self,
-        req_pool_indices: torch.Tnesor,
+        req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        qo_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_len_arr_cpu: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -795,6 +878,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
             self.qo_indptr,
             use_ragged,
             spec_info,
+            qo_indptr_cpu=qo_indptr_cpu,
+            kv_indptr_cpu=kv_indptr_cpu,
+            kv_len_arr_cpu=kv_len_arr_cpu,
         )
 
     def call_begin_forward(
@@ -810,6 +896,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        qo_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_len_arr_cpu: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -860,13 +949,23 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 causal=True,
             )
         else:
-            # mla paged prefill
-            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
+            # mla paged prefill. When host-side arrays are supplied (fast verify
+            # plan for target-verify cuda-graph replay), pass them so flashinfer's
+            # plan() skips the 3 blocking DtoH copies at mla/_core.py:839-841.
+            # kv_indices stays on GPU (plan() keeps it on device); only
+            # qo_indptr/kv_indptr/kv_len_arr move to host.
+            plan_qo_indptr = qo_indptr if qo_indptr_cpu is None else qo_indptr_cpu
+            plan_kv_indptr = kv_indptr if kv_indptr_cpu is None else kv_indptr_cpu
+            plan_kv_len_arr = (
+                kv_indptr[1:] - kv_indptr[:-1]
+                if kv_len_arr_cpu is None
+                else kv_len_arr_cpu
+            )
             wrapper_paged.plan(
-                qo_indptr,
-                kv_indptr,
+                plan_qo_indptr,
+                plan_kv_indptr,
                 kv_indices,
-                kv_len_arr,
+                plan_kv_len_arr,
                 self.num_local_heads,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
