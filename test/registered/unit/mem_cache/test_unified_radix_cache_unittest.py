@@ -1098,6 +1098,54 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(node.component_data[ComponentType.SWA].value)
         tree.sanity_check()
 
+    def test_swa_overlap_recovery_preserves_locked_full_value(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 4)
+        self._insert(tree, allocator, req_to_token_pool, tokens)
+        self._insert(tree, allocator, req_to_token_pool, tokens + self._make_seq(100, 1))
+
+        node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        old_full_value = node.component_data[ComponentType.FULL].value.clone()
+        swa_component = tree.components[ComponentType.SWA]
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_component_and_detach_lru(node, swa_component, tracker=tracker)
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
+
+        lock_result = tree.inc_lock_ref(node)
+        fresh_value = self._alloc(allocator, len(tokens))
+        full_available_before_insert = allocator.full_attn_allocator.available_size()
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=fresh_value,
+                prev_prefix_len=0,
+                swa_evicted_seqlen=0,
+            )
+        )
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available_before_insert + len(tokens),
+        )
+        self.assertTrue(
+            torch.equal(
+                node.component_data[ComponentType.FULL].value,
+                old_full_value,
+            )
+        )
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
+
+        tree.dec_lock_ref(node, lock_result.to_dec_params())
+        tree.sanity_check()
+
     def test_diagnostics(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(tree, allocator, req_to_token_pool, self._make_seq(1, 2))
