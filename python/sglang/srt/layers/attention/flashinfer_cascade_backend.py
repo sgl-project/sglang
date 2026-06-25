@@ -51,9 +51,9 @@ if is_flashinfer_available():
 
 class _CascadePlanState(msgspec.Struct):
     """Per-step cascade plan state. Set by ``init_forward_metadata`` (eager)
-    or ``init_forward_metadata_replay_cuda_graph`` (CG) when the cascade
-    arms; consumed by ``forward_decode``. ``None`` means cascade did not
-    fire for this step (parent's per-request path runs instead).
+    or ``init_forward_metadata_out_graph`` (CG) when the cascade arms;
+    consumed by ``forward_decode``. ``None`` means cascade did not fire for
+    this step (parent's per-request path runs instead).
     """
 
     common_prefix_tokens: int
@@ -142,7 +142,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
 
         # ---- CG-mode state ----
         # Per-bs wrappers + pre-allocated buffers. Filled lazily during
-        # init_forward_metadata_capture_cuda_graph (called once per
+        # init_forward_metadata_out_graph(in_capture=True) (called once per
         # cuda_graph_bs by the runner). Each entry holds a wrapper sized
         # to one specific captured batch size; FlashInfer's CG-mode
         # contract enforces fixed batch_size across plan() calls.
@@ -237,15 +237,16 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         if min_seq <= 1:
             return 0
         scan_n = min(min_seq, self._cascade_scan_cap)
-        # Single sync to materialize the [bs, scan_n] slice on host.
-        leading = self.req_to_token[req_pool_indices[:bs].long(), :scan_n].cpu().numpy()
-        first_row = leading[0]
-        match_mask = (leading == first_row[None, :]).all(axis=0)
-        false_positions = (~match_mask).nonzero()[0]
-        if false_positions.size == 0:
-            common = scan_n
-        else:
-            common = int(false_positions[0])
+        # Compare/reduce entirely on-device and sync only a single scalar
+        # back to host (instead of copying the whole [bs, scan_n] slice).
+        leading = self.req_to_token[req_pool_indices[:bs].long(), :scan_n]
+        # mismatch[j] is True if any request's slot j differs from request 0's.
+        mismatch = (leading != leading[0:1]).any(dim=0)
+        # Append a True sentinel at index scan_n so argmax always resolves to
+        # the first divergence -- or to scan_n itself when fully shared. This
+        # keeps the whole reduction on-device with one scalar sync.
+        sentinel = torch.ones(1, dtype=torch.bool, device=mismatch.device)
+        common = int(torch.cat([mismatch, sentinel]).to(torch.uint8).argmax().item())
         common = min(common, min_seq - 1)
         return max(0, common)
 
@@ -286,7 +287,11 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             [0, common_prefix_tokens], dtype=torch.int32, device=device
         )
         rpi = forward_batch.req_pool_indices
-        first_rpi = int(rpi[0].item())
+        # Materialize the pool indices to host once; the per-request loop below
+        # then indexes a Python list instead of issuing bs separate .item()
+        # device syncs per decode step.
+        rpi_list = rpi[:bs].cpu().tolist()
+        first_rpi = int(rpi_list[0])
         kv_indices_l0 = self.req_to_token[first_rpi, :common_prefix_tokens].to(
             torch.int32
         )
@@ -312,7 +317,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             kv_indices_l1 = torch.empty(total_unique, dtype=torch.int32, device=device)
             offset = 0
             for i in range(bs):
-                rpi_i = int(rpi[i].item())
+                rpi_i = int(rpi_list[i])
                 ul = unique_lens[i]
                 if ul > 0:
                     kv_indices_l1[offset : offset + ul] = self.req_to_token[
@@ -369,8 +374,13 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             return
         d = self._device
 
-        qo_indptr_l0 = torch.zeros(2, dtype=torch.int32, device=d)
-        qo_indptr_l1 = torch.zeros(bs + 1, dtype=torch.int32, device=d)
+        # qo_indptr_l0 = [0, bs] and qo_indptr_l1 = [0, 1, ..., bs] are static
+        # for a given captured bs (one query per request, every replay). Set
+        # them once here -- the buffer addresses stay stable for the captured
+        # graph and the values never change, so the per-replay copies in
+        # _fill_cg_cascade_plan are unnecessary.
+        qo_indptr_l0 = torch.tensor([0, bs], dtype=torch.int32, device=d)
+        qo_indptr_l1 = torch.arange(bs + 1, dtype=torch.int32, device=d)
         kv_indptr_l0 = torch.zeros(2, dtype=torch.int32, device=d)
         kv_indptr_l1 = torch.zeros(bs + 1, dtype=torch.int32, device=d)
         kv_indices_l0 = torch.zeros(
@@ -430,7 +440,9 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
 
         # Read seq_lens host-side once (small sync, bs values).
         if seq_lens_cpu is None:
-            seq_lens_cpu = self.kv_indptr[0].new_zeros(bs)  # safe placeholder
+            # Build the placeholder on CPU directly -- a device tensor here
+            # would force an extra GPU->CPU sync via the .tolist() below.
+            seq_lens_cpu = torch.zeros(bs, dtype=torch.int32, device="cpu")
         seq_lens_list = seq_lens_cpu[:bs].tolist()
         rpi_list = req_pool_indices[:bs].cpu().tolist()
 
@@ -438,10 +450,7 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         # shared slots. With page_size=1 the "last page" is always full
         # (single token per slot), and last_page_len = 1 if there is at
         # least one shared slot, else 0 to indicate level 0 is empty.
-        bufs["qo_indptr_l0"].copy_(
-            torch.tensor([0, bs], dtype=torch.int32),
-            non_blocking=True,
-        )
+        # qo_indptr_l0 ([0, bs]) is static and pre-initialized at allocation.
         bufs["kv_indptr_l0"].copy_(
             torch.tensor([0, common_prefix_tokens], dtype=torch.int32),
             non_blocking=True,
@@ -463,12 +472,8 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
             bufs["last_page_l0"].fill_(0)
 
         # Level 1: bs unique tails of length (seq_len - common_prefix).
-        # qo_indptr_l1 = [0, 1, 2, ..., bs] (one query per request).
-        qo_l1_cpu = list(range(bs + 1))
-        bufs["qo_indptr_l1"].copy_(
-            torch.tensor(qo_l1_cpu, dtype=torch.int32),
-            non_blocking=True,
-        )
+        # qo_indptr_l1 = [0, 1, 2, ..., bs] (one query per request) is static and
+        # pre-initialized at allocation.
         unique_lens = [max(0, int(s) - common_prefix_tokens) for s in seq_lens_list]
         kv_indptr_l1_cpu = [0]
         cum = 0
@@ -570,9 +575,14 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         if self._dbg_enabled:
             logger.info("Cascade fires: bs=%d, common_prefix_tokens=%d", bs, common)
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
+    ):
         # Parent allocates cuda_graph_kv_indices etc. for its decode wrappers.
-        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
 
         # Size cascade buffers for the worst case in the captured set. We
         # don't know the full cuda_graph_bs list here -- only max_bs. Each
@@ -584,162 +594,111 @@ class FlashInferCascadeAttnBackend(FlashInferAttnBackend):
         # Worst-case per-request tail length: same context window.
         self._cg_max_pages_per_req = int(self.max_context_len)
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
         self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode,
-        spec_info,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ):
-        # Parent captures its per-request decode wrappers for this bs.
-        super().init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
+        """CUDA-graph metadata hook (current out-of-graph API).
+
+        Replaces the deprecated ``init_forward_metadata_{capture,replay}_cuda_graph``
+        pair. The decode CUDA-graph runner calls this once per captured batch
+        size with ``in_capture=True`` (before recording the graph), and again
+        before every ``graph.replay()`` with ``in_capture=False``. Eager decode
+        does not reach here -- it uses ``init_forward_metadata`` above.
+
+          * Capture (``in_capture=True``): allocate the per-bs cascade wrapper,
+            prime it with a synthetic plan, and arm ``_cg_cascade_plan`` so the
+            ``forward_decode`` recorded into the graph invokes the cascade
+            wrapper's ``run()`` for this bs.
+          * Replay (``in_capture=False``): detect the actual shared prefix and
+            refill the pre-allocated buffers in place so the recorded ``run()``
+            reads the current step's metadata.
+        """
+        # Parent sets up its per-request decode wrappers for this bs -- our
+        # fallback path, and required for non-decode capture modes.
+        super().init_forward_metadata_out_graph(forward_batch, in_capture)
 
         self._in_cuda_graph = True
         self._cascade_plan = None
         self._cg_cascade_plan = None
 
-        # Cascade-CG path is decode-only. Other modes (target_verify, etc.)
-        # use the parent's per-request prefill wrapper and bypass us.
-        if not forward_mode.is_decode_or_idle():
-            return
-        if self._cg_disabled:
-            return
-        if not is_flashinfer_available():
-            return
-        if bs < self.cascade_min_batch_size:
-            # bs too small to ever fire cascade; don't waste a wrapper here.
-            return
-
-        # Allocate per-bs cascade wrapper + buffers lazily.
-        self._allocate_cg_cascade_for_bs(bs)
-
-        # Prime the wrapper with a synthetic plan so the captured run() has
-        # valid scheduler state. We use common_prefix=1 + bs unique tails
-        # of length (seq_lens[i]-1) -- this exercises both levels at the
-        # max shape that will be seen at replay. The actual slot ids written
-        # here are placeholders; replay overwrites them in-place.
-        seq_lens_cpu = seq_lens.cpu()
-        synthetic_common = 1
-        # Capture-time req_pool_indices may point at slots whose req_to_token
-        # rows are zero-filled. That's fine: cascade reads slot ids and
-        # treats them as kv-cache offsets; the captured kernel just records
-        # the launch, it does not validate slot contents.
-        ok = self._fill_cg_cascade_plan(
-            bs,
-            req_pool_indices,
-            seq_lens_cpu,
-            synthetic_common,
-        )
-        if ok:
-            self._cg_cascade_plan_state_capture = _CascadePlanState(
-                common_prefix_tokens=synthetic_common, bs=bs
-            )
-            # Stash a "fired at capture" plan so forward_decode takes the
-            # cascade path during the capture run. The captured graph will
-            # then permanently invoke wrapper.run(...) for this bs.
-            self._cg_cascade_plan = self._cg_cascade_plan_state_capture
-        else:
-            # Capture-time plan failure: leave cascade off for this bs;
-            # forward_decode will fall through to parent for this bs's
-            # captured graph. Safe -- we just lose CG cascade for this bs.
-            self._cg_cascade_wrappers.pop(bs, None)
-            self._cg_cascade_buffers.pop(bs, None)
-            if self._dbg_enabled:
-                logger.warning(
-                    "CG cascade capture-plan failed at bs=%d; falling back "
-                    "to parent's per-request decode for this bs.",
-                    bs,
-                )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode,
-        spec_info,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
-    ):
-        # Parent fills its per-request decode wrappers' indptr/indices for
-        # this bs. We always run super so the parent's path works even if
-        # cascade capture failed for this bs.
-        super().init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu=seq_lens_cpu,
-        )
-
-        self._in_cuda_graph = True
-        self._cascade_plan = None
-        self._cg_cascade_plan = None
-
+        forward_mode = forward_batch.forward_mode
         if forward_mode is not None and not forward_mode.is_decode_or_idle():
             return
         if self._cg_disabled:
             self._dbg_skip_in_cg += 1
             return
-        if bs not in self._cg_cascade_wrappers:
-            # Cascade not allocated for this bs (e.g., bs < min_batch_size at
-            # capture time). Captured graph for this bs has parent's path,
-            # not ours, so just return.
+        if not is_flashinfer_available():
+            return
+
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+
+        if bs < self.cascade_min_batch_size:
+            # bs too small to ever fire cascade; the parent's per-request
+            # decode handles this captured graph.
             self._dbg_skip_in_cg += 1
             return
 
-        # Detect actual common prefix using only the replay-hook inputs
-        # (forward_batch is not threaded through this hook by SGLang's runner).
-        common = self._detect_common_prefix_from_rpi(
-            bs,
-            req_pool_indices,
-            seq_lens_cpu,
-        )
-        # Plan cascade with the actual detected common prefix. We always
-        # plan (even if common < threshold) because the captured graph for
-        # this bs has cascade run() recorded at capture time -- there is no
-        # mid-graph fallback to parent's per-request path. Cascade with
-        # common=0 is mathematically equivalent to per-request decode plus
-        # a no-op level-0 launch, so always arm under CG.
-        ok = self._fill_cg_cascade_plan(
-            bs,
-            req_pool_indices,
-            seq_lens_cpu,
-            common,
-        )
+        if in_capture:
+            # Allocate the per-bs cascade wrapper + buffers lazily, then prime
+            # it with a synthetic plan (common_prefix=1 + bs unique tails) so
+            # the captured run() has valid scheduler state. Capture-time slot
+            # ids may point at zero-filled req_to_token rows; that is fine --
+            # the captured kernel only records the launch, and replay overwrites
+            # the buffers in place.
+            self._allocate_cg_cascade_for_bs(bs)
+            synth_seq_lens_cpu = (
+                seq_lens_cpu
+                if seq_lens_cpu is not None
+                else forward_batch.seq_lens.cpu()
+            )
+            ok = self._fill_cg_cascade_plan(bs, req_pool_indices, synth_seq_lens_cpu, 1)
+            if ok:
+                # Arm so forward_decode takes the cascade path during the
+                # capture run; the captured graph then permanently invokes
+                # wrapper.run(...) for this bs.
+                self._cg_cascade_plan = _CascadePlanState(common_prefix_tokens=1, bs=bs)
+            else:
+                # Capture-time plan failure: drop cascade for this bs and let
+                # the captured graph use the parent's per-request decode.
+                self._cg_cascade_wrappers.pop(bs, None)
+                self._cg_cascade_buffers.pop(bs, None)
+                if self._dbg_enabled:
+                    logger.warning(
+                        "CG cascade capture-plan failed at bs=%d; falling back "
+                        "to parent's per-request decode for this bs.",
+                        bs,
+                    )
+            return
+
+        # ---- Replay: detect actual common prefix + refill buffers in place ----
+        if bs not in self._cg_cascade_wrappers:
+            # Cascade not captured for this bs (capture-plan failed, or
+            # bs < min_batch_size at capture); the parent's path runs.
+            self._dbg_skip_in_cg += 1
+            return
+
+        common = self._detect_common_prefix_from_rpi(bs, req_pool_indices, seq_lens_cpu)
+        # Always plan (even below threshold): the captured graph for this bs has
+        # cascade run() recorded, with no mid-graph fallback. Cascade with
+        # common=0 is mathematically equivalent to per-request decode plus a
+        # no-op level-0 launch, so always arm under CG.
+        ok = self._fill_cg_cascade_plan(bs, req_pool_indices, seq_lens_cpu, common)
         if not ok:
-            # Replay-time plan failure is fatal for this step's correctness
-            # -- the captured graph will read stale buffers. Best we can do
-            # is log and let it run; the test harness will catch it.
             if self._dbg_enabled:
                 logger.warning(
                     "CG cascade replay-plan failed at bs=%d, common=%d "
-                    "(captured graph may produce incorrect output for "
-                    "this step).",
+                    "(captured graph may produce incorrect output for this "
+                    "step).",
                     bs,
                     common,
                 )
             return
 
-        self._cg_cascade_plan = _CascadePlanState(
-            common_prefix_tokens=common,
-            bs=bs,
-        )
+        self._cg_cascade_plan = _CascadePlanState(common_prefix_tokens=common, bs=bs)
         self._dbg_cascade_run_cg += 1
         if common >= self.cascade_min_prefix_tokens:
             self._dbg_cascade_fired_cg += 1
