@@ -48,7 +48,6 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
@@ -66,6 +65,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     select_top_k_tokens,
 )
+from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
