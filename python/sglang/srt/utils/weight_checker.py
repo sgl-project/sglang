@@ -108,10 +108,10 @@ class WeightChecker:
             if getattr(param, "_skip_weight_check", False)
         }
         _check_tensors(
-            expect_tensors=_build_entries(
+            expect_tensors=_build_check_entries(
                 self._snapshot_tensors, skip_compare_names, quantized_set
             ),
-            actual_tensors=_build_entries(
+            actual_tensors=_build_check_entries(
                 dict(self._model_state()), skip_compare_names, quantized_set
             ),
             allow_quant_error=allow_quant_error,
@@ -131,7 +131,7 @@ class WeightChecker:
         # Hash the dequantized weight so two (qweight, scale) pairs with the same
         # bf16 hash equal.
         checksums = {}
-        for name, should_compare, comparable in _build_entries(
+        for name, should_compare, comparable in _build_check_entries(
             dict(self._model_state()), skip_compare_names, quantized_set
         ):
             if should_compare:
@@ -272,7 +272,7 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
     return quantized_set
 
 
-def _build_entries(
+def _build_check_entries(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
     quantized_set: Optional[Dict[str, QuantizedWeight]] = None,

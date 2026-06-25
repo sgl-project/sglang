@@ -30,7 +30,7 @@ from sglang.srt.utils.weight_checker import (
     ParallelismInfo,
     QuantizedWeight,
     WeightChecker,
-    _build_entries,
+    _build_check_entries,
     _build_quantized_set,
     _check_tensors,
     _hash_tensor,
@@ -84,7 +84,7 @@ def _build_fp8_quant_pair(device: str = "cuda"):
     """Construct a real fp8-quantized weight + matching fp32 + ue8m0-packed scales.
 
     Returns (qweight, sf_fp32, sf_packed_int32) so callers can pick which scale dtype
-    drives the _build_entries branch under test.
+    drives the _build_check_entries branch under test.
     """
     weight_bf16 = torch.randn((256, 128), dtype=torch.bfloat16, device=device)
     block_size = [128, 128]
@@ -101,7 +101,7 @@ def _build_fp8_quant_pair(device: str = "cuda"):
 
 
 class _TinyModel(nn.Module):
-    """Mimics the buffer naming patterns _reset_tensors / _build_entries care about."""
+    """Mimics the buffer naming patterns _reset_tensors / _build_check_entries care about."""
 
     def __init__(self):
         super().__init__()
@@ -199,7 +199,7 @@ class TestRandomLike(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _build_entries
+# _build_check_entries
 # ---------------------------------------------------------------------------
 
 
@@ -212,7 +212,7 @@ class TestPostprocessTensors(CustomTestCase):
         b = torch.randn(4)
         raw = {"a.weight": a, "b.bias": b}
         _assert_entries_close(
-            _build_entries(raw, set()),
+            _build_check_entries(raw, set()),
             [("a.weight", True, RawComparable(a)), ("b.bias", True, RawComparable(b))],
         )
 
@@ -220,7 +220,7 @@ class TestPostprocessTensors(CustomTestCase):
         w = torch.randn(4)
         raw = {"x.weight": w}
         _assert_entries_close(
-            _build_entries(raw, set()), [("x.weight", True, RawComparable(w))]
+            _build_check_entries(raw, set()), [("x.weight", True, RawComparable(w))]
         )
 
     # --- non-persistent buffer skip ---
@@ -233,7 +233,7 @@ class TestPostprocessTensors(CustomTestCase):
             "model.layers.0.weight": plain,
         }
         _assert_entries_close(
-            _build_entries(raw, set()),
+            _build_check_entries(raw, set()),
             [
                 ("model.rotary_emb.cos_sin_cache", False, RawComparable(cache)),
                 ("model.layers.0.weight", True, RawComparable(plain)),
@@ -243,14 +243,14 @@ class TestPostprocessTensors(CustomTestCase):
     def test_skips_inv_freq_substring(self):
         t = torch.randn(4)
         _assert_entries_close(
-            _build_entries({"model.rotary_emb.inv_freq": t}, set()),
+            _build_check_entries({"model.rotary_emb.inv_freq": t}, set()),
             [("model.rotary_emb.inv_freq", False, RawComparable(t))],
         )
 
     def test_skips_weight_fp32_substring(self):
         t = torch.randn(4)
         _assert_entries_close(
-            _build_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
+            _build_check_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
             [("model.layers.0.mlp.gate._weight_fp32", False, RawComparable(t))],
         )
 
@@ -258,7 +258,7 @@ class TestPostprocessTensors(CustomTestCase):
         # Pattern can appear anywhere in the name, not just at the end.
         t = torch.randn(4)
         _assert_entries_close(
-            _build_entries({"weird.cos_sin_cache.foo.bar": t}, set()),
+            _build_check_entries({"weird.cos_sin_cache.foo.bar": t}, set()),
             [("weird.cos_sin_cache.foo.bar", False, RawComparable(t))],
         )
 
@@ -273,7 +273,7 @@ class TestPostprocessTensors(CustomTestCase):
             "x.weight": QuantizedWeight(Fp8BlockComparable, "x.weight_scale_inv")
         }
         _assert_entries_close(
-            _build_entries(raw, set(), quantized_set),
+            _build_check_entries(raw, set(), quantized_set),
             [("x.weight", True, ref)],
         )
 
@@ -291,7 +291,7 @@ class TestPostprocessTensors(CustomTestCase):
             "x.weight": QuantizedWeight(Fp8BlockComparable, "x.weight_scale_inv")
         }
         _assert_entries_close(
-            _build_entries(raw, set(), quantized_set),
+            _build_check_entries(raw, set(), quantized_set),
             [
                 ("x.weight", True, ref),
                 ("y.bias", True, RawComparable(bias)),
@@ -303,7 +303,7 @@ class TestPostprocessTensors(CustomTestCase):
         # through as a normal entry with should_compare=True.
         s = torch.zeros(1, 1, dtype=torch.int32)
         _assert_entries_close(
-            _build_entries({"x.weight_scale_inv": s}, set()),
+            _build_check_entries({"x.weight_scale_inv": s}, set()),
             [("x.weight_scale_inv", True, RawComparable(s))],
         )
 
@@ -406,8 +406,8 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
             "x.weight": QuantizedWeight(Fp8BlockComparable, "x.weight_scale_inv")
         }
         _check_tensors(
-            expect_tensors=_build_entries(expect_raw, set(), quantized_set),
-            actual_tensors=_build_entries(actual_raw, set(), quantized_set),
+            expect_tensors=_build_check_entries(expect_raw, set(), quantized_set),
+            actual_tensors=_build_check_entries(actual_raw, set(), quantized_set),
             **kwargs,
         )
 
