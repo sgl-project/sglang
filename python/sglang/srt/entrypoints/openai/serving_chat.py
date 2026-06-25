@@ -360,6 +360,11 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
+        # Attach logprobs to the first chunk emitted this step (reasoning,
+        # tool-call, or content) so they aren't dropped when a parser is active
+        # nor duplicated across chunks; flush any leftover at the end.
+        remaining_logprobs = choice_logprobs
+
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
@@ -380,8 +385,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
 
         # Handle tool calls
         if request.tool_choice != "none" and request.tools and self.tool_call_parser:
@@ -423,9 +430,35 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=choice_logprobs,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
+
+        # Flush logprobs still unattached this step — only when a parser is
+        # active, since _process_tool_call_stream may consume the delta and emit
+        # no content chunk. On the plain path an empty-delta step has no chunk
+        # to attach to either way, and a standalone empty-delta logprobs chunk
+        # is not a shape clients expect.
+        if remaining_logprobs is not None and (
+            self.reasoning_parser or self.tool_call_parser
+        ):
+            usage = None
+            if continuous_usage_stats:
+                usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens.get(index, 0),
+                    reasoning_tokens=reasoning_tokens.get(index, 0),
+                    completion_tokens=completion_tokens.get(index, 0),
+                ).model_dump()
+
+            yield build_sse_content(
+                chunk_id=content["meta_info"]["id"],
+                created=int(time.time()),
+                model=request.model,
+                index=index,
+                logprobs=remaining_logprobs,
+                usage=usage,
+            )
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""

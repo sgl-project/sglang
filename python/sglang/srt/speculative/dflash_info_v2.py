@@ -41,11 +41,11 @@ class DFlashDraftInputV2(SpecInput):
     """Draft-side state carried across overlap iterations (spec-v2)."""
 
     # Legacy Eagle-shaped fields kept only for dataclass compatibility. DFLASH
-    # overlap carries new_seq_lens / verified_id directly in the common
+    # overlap carries new_seq_lens / bonus_tokens directly in the common
     # no-shape-change path; FutureMap remains the fallback for filter/merge.
     topk_p: torch.Tensor
     topk_index: torch.Tensor
-    verified_id: torch.Tensor
+    bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
     hidden_states: torch.Tensor
     verify_done: Optional[torch.cuda.Event] = None
@@ -122,7 +122,7 @@ class DFlashDraftInputV2(SpecInput):
         return cls(
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
-            verified_id=torch.empty((0,), device=device, dtype=torch.int32),
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int64),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
             verify_done=None,
@@ -298,7 +298,7 @@ class DFlashDraftInputV2(SpecInput):
 
         self.topk_p = self.topk_p[new_indices]
         self.topk_index = self.topk_index[new_indices]
-        self.verified_id = self.verified_id[new_indices]
+        self.bonus_tokens = self.bonus_tokens[new_indices]
         self.new_seq_lens = self.new_seq_lens[new_indices]
         self.hidden_states = self.hidden_states[new_indices]
 
@@ -341,7 +341,9 @@ class DFlashDraftInputV2(SpecInput):
 
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
+        self.bonus_tokens = torch.cat(
+            [self.bonus_tokens, spec_info.bonus_tokens], dim=0
+        )
         self.new_seq_lens = torch.cat(
             [self.new_seq_lens, spec_info.new_seq_lens], dim=0
         )

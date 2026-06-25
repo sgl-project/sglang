@@ -1,0 +1,181 @@
+---
+title: Krea-2
+metatags:
+    description: "Deploy Krea-2 with SGLang - fast, high-quality text-to-image generation."
+---
+
+## 1. Model Introduction
+
+[Krea-2](https://huggingface.co/krea/Krea-2-Turbo) is a high-quality text-to-image diffusion model from [Krea](https://www.krea.ai/). It ships in two variants that share the same backbone and differ only in their sampling recipe:
+
+- **[Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo)** - a distilled, few-step model that produces photorealistic images in only **8 inference steps** with no classifier-free guidance (`guidance_scale = 1.0`), ideal for fast and interactive generation.
+- **[Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw)** - the base (non-distilled) model that trades speed for maximum fidelity, using a longer schedule (~52 steps) with classifier-free guidance (`guidance_scale ≈ 4.5`).
+
+Both variants are built on a single-stream MMDiT with a Qwen3-VL text encoder and the Qwen-Image VAE, and are distributed in the standard diffusers layout (a `model_index.json` plus sharded `transformer/`, `text_encoder/`, `vae/`, `tokenizer/`, and `scheduler/` folders). SGLang loads them **natively** - just point `--model-path` at the repo, no conversion step required.
+
+**Key Features:**
+
+- **Two variants, one pipeline**: switch between fast (Turbo) and high-fidelity (Raw) by changing only the model path and the sampling settings.
+- **Photorealistic generation** at 1024x1024 and other resolutions.
+- **Native diffusers loading**: components (DiT, text encoder, VAE, scheduler) are read straight from the repo's `model_index.json`.
+
+For more details, see the [Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) and [Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) HuggingFace pages.
+
+## 2. SGLang-diffusion Installation
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
+
+## 3. Model Deployment
+
+This section covers deploying Krea-2-Turbo for fast, high-quality image generation.
+
+### 3.1 Basic Configuration
+
+Krea-2-Turbo generates high-quality images in only 8 inference steps. Launch the server with:
+
+```bash Command
+sglang serve \
+  --model-path krea/Krea-2-Turbo \
+  --num-gpus 1 \
+  --port 30000
+```
+
+The step count and guidance scale are **request-time** settings (see [API Usage](#4-api-usage)); Krea-2-Turbo defaults to 8 steps with `guidance_scale = 1.0`.
+
+### 3.2 Configuration Tips
+
+Currently supported optimizations are listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+
+- `--num-gpus`: Number of GPUs to use.
+- `--tp-size`: Tensor parallelism size (the recommended multi-GPU path for Krea-2). Its attention heads (48, with 12 KV heads) and text heads (20) are divisible by a tensor-parallel size of 1, 2, or 4.
+
+## 4. API Usage
+
+For complete API documentation, please refer to the [official API usage guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/openai_api.md).
+
+### 4.1 Generate an Image
+
+Generate an image with the OpenAI-compatible images API:
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="krea/Krea-2-Turbo",
+    prompt="a red fox sitting in fresh snow, golden hour, photorealistic",
+    n=1,
+    response_format="b64_json",
+)
+
+# Save the generated image
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+You can also generate a single image from the command line:
+
+```bash Command
+sglang generate --model-path krea/Krea-2-Turbo \
+    --prompt "a red fox sitting in fresh snow, golden hour, photorealistic" \
+    --num-inference-steps 8 --height 1024 --width 1024 --save-output
+```
+
+### 4.2 Advanced Usage
+
+Krea-2's DiT is ~24 GB in bf16 (the bulk of the model). On memory-constrained GPUs you can keep less of it resident:
+
+- `--dit-layerwise-offload`: stream the DiT's transformer blocks layer-by-layer with async host-to-device prefetch overlap, so only a small working set stays on the GPU. This is the primary way to fit Krea-2 on a single consumer / 32 GB-class card, at a modest latency cost. Tune the memory/latency trade-off with `--dit-offload-prefetch-size` (`0.0` prefetches one layer for the lowest memory; larger values prefetch more layers -- faster but more memory).
+- `--dit-cpu-offload`: keep the whole DiT in host memory. Combine it with `--dit-layerwise-offload` for the lowest peak GPU memory (weights stay on host and only the layers needed for the current step are brought on-device).
+- `--text-encoder-cpu-offload`: offload the Qwen3-VL text encoder (it is idle during the denoise loop).
+- `--vae-cpu-offload`: offload the VAE.
+- `--pin-cpu-memory`: pin host memory for offload. Add only as a temporary workaround if you hit `CUDA error: invalid argument`.
+
+On large-VRAM GPUs (e.g. H200), keep everything resident (offloads off) for the fastest latency.
+
+## 5. Benchmark
+
+Test Environment:
+
+- Hardware: NVIDIA H200 GPU (1x)
+- Model: krea/Krea-2-Turbo (8 inference steps)
+- sglang diffusion version: 0.5.13
+
+**Server Command** (used for both benchmarks below):
+
+```shell Command
+sglang serve --model-path krea/Krea-2-Turbo --port 30000
+```
+
+### 5.1 Generate an image
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --model krea/Krea-2-Turbo --dataset vbench --task text-to-image \
+    --num-prompts 1 --max-concurrency 1
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   krea/Krea-2-Turbo
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  1.56
+Request rate:                            inf
+Max request concurrency:                 1
+Successful requests:                     1/1
+--------------------------------------------------
+Request throughput (req/s):              0.64
+Latency Mean (s):                        1.5600
+Latency Median (s):                      1.5600
+Latency P99 (s):                         1.5600
+--------------------------------------------------
+Peak Memory Max (MB):                    37466.00
+Peak Memory Mean (MB):                   37466.00
+Peak Memory Median (MB):                 37466.00
+============================================================
+```
+
+### 5.2 Generate images with high concurrency
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --model krea/Krea-2-Turbo --dataset vbench --task text-to-image \
+    --num-prompts 20 --max-concurrency 20
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Task:                                    text-to-image
+Model:                                   krea/Krea-2-Turbo
+Dataset:                                 vbench
+--------------------------------------------------
+Benchmark duration (s):                  31.47
+Request rate:                            inf
+Max request concurrency:                 20
+Successful requests:                     20/20
+--------------------------------------------------
+Request throughput (req/s):              0.64
+Latency Mean (s):                        16.5000
+Latency Median (s):                      16.5200
+Latency P99 (s):                         31.1300
+--------------------------------------------------
+Peak Memory Max (MB):                    37468.00
+Peak Memory Mean (MB):                   37466.40
+Peak Memory Median (MB):                 37466.00
+============================================================
+```

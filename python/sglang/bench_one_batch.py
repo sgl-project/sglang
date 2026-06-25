@@ -1,73 +1,21 @@
-"""
-Benchmark the latency of running a single static batch without a server.
+"""Deprecated import path for ``sglang.benchmark.one_batch``.
 
-This script does not launch a server and uses the low-level APIs.
-It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
-
-# Usage (latency test)
-## with dummy weights:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
-## sweep through multiple data points and store (append) the results in a jsonl file:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
-## run with profiling:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 12 14 --input-len 256 512 --profile
-## run with profiling to custom directory:
-export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 --input-len 256 --profile
-## run with CUDA profiler (nsys):
-nsys profile --force-overwrite=true -o bench_one_batch python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch-size 1 --input-len 256 --profile --profile-activities CUDA_PROFILER
-# Usage (correctness test):
-python -m sglang.bench_one_batch --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
-
-## Reference output (of the correctness test above, can be gpu dependent):
-input_ids=[[1, 450, 7483, 310, 3444, 338], [1, 450, 7483, 310, 278, 3303, 13187, 290, 338], [1, 20628, 338, 263, 6575, 1460, 2462, 322, 306, 763]]
-
-prefill logits (first half): tensor([[-10.0312,  -9.5000,   0.8931,  ...,  -4.9414,  -3.2422,  -3.3633],
-        [-10.0312,  -9.5000,   0.8931,  ...,  -4.9414,  -3.2422,  -3.3633],
-        [ -9.1875, -10.2500,   2.7129,  ...,  -4.3359,  -4.0664,  -4.1328]],
-       device='cuda:0')
-
-prefill logits (final): tensor([[-8.3125, -7.1172,  3.3457,  ..., -4.9570, -4.1328, -3.4141],
-        [-8.9141, -9.0156,  4.1445,  ..., -4.9922, -4.4961, -4.0781],
-        [-9.6328, -9.0547,  4.0195,  ..., -5.3047, -4.7148, -4.4570]],
-       device='cuda:0')
-
-========== Prompt 0 ==========
-<s> The capital of France is Paris.
-The capital of the United States is Washington, D.C.
-
-
-========== Prompt 1 ==========
-<s> The capital of the United Kindom is London.
-The capital of the United Kingdom is London.
-The capital of the
-
-========== Prompt 2 ==========
-<s> Today is a sunny day and I like to go for a walk in the park.
-I'm going to the park
+``python -m sglang.bench_one_batch`` and ``from sglang.bench_one_batch import ...``
+still work, but the implementation now lives in ``sglang.benchmark.one_batch``.
+Update references to the new path.
 """
 
-import argparse
-import copy
-import dataclasses
-import itertools
-import json
-import logging
-import multiprocessing
-import os
-import time
-from array import array
-from types import SimpleNamespace
-from typing import Optional, Tuple
+import warnings
 
-import numpy as np
-import torch
-import torch.distributed as dist
+from sglang.benchmark.one_batch import *  # noqa: F401,F403
+from sglang.benchmark.one_batch import cli_main
 
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import (
-    destroy_distributed_environment,
-    destroy_model_parallel,
+warnings.warn(
+    "`sglang.bench_one_batch` is deprecated and will be removed in a future "
+    "release; use `sglang.benchmark.one_batch` instead "
+    "(e.g. `python -m sglang.benchmark.one_batch`).",
+    FutureWarning,
+    stacklevel=1,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -1000,20 +948,4 @@ def main(server_args, bench_args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-    BenchArgs.add_cli_args(parser)
-    args = parser.parse_args()
-    server_args = ServerArgs.from_cli_args(args)
-    bench_args = BenchArgs.from_cli_args(args)
-
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format="%(message)s",
-    )
-
-    try:
-        main(server_args, bench_args)
-    finally:
-        if server_args.tp_size != 1:
-            kill_process_tree(os.getpid(), include_parent=False)
+    cli_main()
