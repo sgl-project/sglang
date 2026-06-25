@@ -67,39 +67,67 @@ def has_xgrammar_unsupported_json_features(schema: dict) -> bool:
     supports is version-dependent, so flagging it risks false positives.)
     """
 
-    def check(obj) -> bool:
+    schema_array_keywords = (
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "prefixItems",
+    )
+    schema_keywords = (
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    )
+    schema_map_keywords = (
+        "$defs",
+        "dependentSchemas",
+        "definitions",
+        "patternProperties",
+        "properties",
+    )
+    unsupported_keywords = (
+        "contains",
+        "maxContains",
+        "minContains",
+        "multipleOf",
+        "patternProperties",
+        "propertyNames",
+        "uniqueItems",
+    )
+
+    def check_schema(obj) -> bool:
         if not isinstance(obj, dict):
             return False
 
-        # "type" may be a single string or a list (e.g. ["integer", "null"] for a
-        # nullable field); normalize to a set before testing membership.
-        raw_type = obj.get("type")
-        types = (
-            {raw_type}
-            if isinstance(raw_type, str)
-            else set(raw_type) if isinstance(raw_type, list) else set()
-        )
-        if types & {"integer", "number"} and "multipleOf" in obj:
-            return True
-        if "array" in types and any(
-            key in obj for key in ("uniqueItems", "contains", "maxContains")
-        ):
-            return True
-        if "object" in types and any(
-            key in obj for key in ("patternProperties", "propertyNames")
-        ):
+        if any(key in obj for key in unsupported_keywords):
             return True
 
-        for value in obj.values():
+        for key in schema_keywords:
+            if check_schema(obj.get(key)):
+                return True
+
+        for key in schema_array_keywords:
+            value = obj.get(key)
+            if isinstance(value, list) and any(check_schema(item) for item in value):
+                return True
+
+        for key in schema_map_keywords:
+            value = obj.get(key)
             if isinstance(value, dict):
-                if check(value):
+                if any(check_schema(item) for item in value.values()):
                     return True
-            elif isinstance(value, list):
-                if any(isinstance(item, dict) and check(item) for item in value):
-                    return True
+
         return False
 
-    return check(schema)
+    return check_schema(schema)
 
 
 class XGrammarGrammar(BaseGrammarObject):
