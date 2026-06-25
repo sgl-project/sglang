@@ -79,6 +79,7 @@ chmod +x *.run && \
 ./cann-ops-transformer-custom_linux-aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
 ${PIP_INSTALL} custom_ops-1.0-cp311-cp311-linux_aarch64.whl && \
 rm -rf *.{run,whl})
+rm -rf custom_ops
 
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml

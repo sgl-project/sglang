@@ -107,8 +107,8 @@ RUN wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/CA
     wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/cann-ops-transformer-custom_linux-aarch64.run && \
     wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/custom_ops-1.0-cp311-cp311-linux_aarch64.whl && \
     chmod +x *.run && \
-    ./CANN-custom_ops-none-linux.aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
-    ./cann-ops-transformer-custom_linux-aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
+    ./CANN-custom_ops-none-linux.aarch64.run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+    ./cann-ops-transformer-custom_linux-aarch64.run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
     ${PIP_INSTALL} custom_ops-1.0-cp311-cp311-linux_aarch64.whl && \
     rm -rf *.{run,whl}
 
