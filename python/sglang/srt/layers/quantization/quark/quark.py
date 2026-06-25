@@ -77,7 +77,11 @@ def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"
     quant_method = config.get("quant_method", "")
     quant_algo = (config.get("quant_algo") or "").upper()
 
-    if quant_method in ("modelopt", "modelopt_fp4", "nvfp4") and quant_algo in ("", "NVFP4", "FP4"):
+    if quant_method in ("modelopt", "modelopt_fp4", "nvfp4") and quant_algo in (
+        "",
+        "NVFP4",
+        "FP4",
+    ):
         return Nvfp4SourceConfig()
     if quant_method == "quark":
         gqc = config.get("global_quant_config", {})
