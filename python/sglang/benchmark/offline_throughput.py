@@ -1,13 +1,13 @@
 """
 Benchmark the throughput in the offline mode.
-It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
+It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as serving.py).
 
 # Usage
 ## Sharegpt dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
+python -m sglang.benchmark.offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
 
 ## Random dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024
+python -m sglang.benchmark.offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024
 """
 
 import argparse
