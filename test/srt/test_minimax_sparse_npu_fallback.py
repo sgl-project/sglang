@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -126,3 +127,90 @@ def test_npu_sparse_seq_matches_dense_attention_when_all_blocks_are_selected():
     expected = torch.einsum("qhk,khd->qhd", probs.to(v_seq.dtype), v_seq)
 
     torch.testing.assert_close(out.float(), expected.float(), rtol=1e-3, atol=1e-3)
+
+
+def test_npu_triton_forward_metadata_reuses_block_table():
+    module = _load_minimax_sparse_backend_module()
+    backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
+    backend.page_size = 2
+    backend.block_size_q = 1
+    backend.block_size_k = 2
+    backend._max_seqlen_q = 2
+    backend._max_seqlen_k = 4
+    backend.req_to_token = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+        ],
+        dtype=torch.int32,
+    )
+    backend._npu_triton_forward_meta = None
+
+    forward_batch = SimpleNamespace(
+        req_pool_indices=torch.tensor([1, 0], dtype=torch.int64),
+        seq_lens=torch.tensor([4, 3], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([2, 2], dtype=torch.int32),
+        extend_seq_lens_cpu=[2, 1],
+    )
+
+    backend._prepare_npu_triton_forward_meta(forward_batch)
+
+    meta = backend._npu_triton_forward_meta
+    assert meta is not None
+    torch.testing.assert_close(
+        meta.block_table,
+        torch.tensor([[2, 3], [0, 1]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        meta.cu_seqlens,
+        torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+    assert meta.actual_num_tokens == 3
+
+
+def test_npu_forward_extend_has_triton_prefill_gate():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_backend.py"
+    ).read_text()
+
+    assert "def _forward_npu_triton_prefill(" in source
+    assert "if _npu_use_triton_sparse():" in source
+    assert "self._forward_npu_triton_prefill(" in source
+
+
+def test_npu_triton_prefill_uses_bnsd_decode_kernels():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+
+    assert "flash_decode_bnsd_with_topk_idx" in source
+    assert "flash_decode_bnsd_with_gqa_share_sparse" in source
+    assert "minimax_sparse_ops.prefill.flash_with_topk_idx" not in source
+    assert "minimax_sparse_ops.prefill.topk_sparse" not in source
+
+
+def test_npu_triton_prefill_appends_forced_blocks_after_pure_topk():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+
+    assert "_merge_prefill_sparse_blocks(" in source
+    assert "init_blocks=0" in source
+    assert "local_blocks=0" in source
+
+
+def test_minimax_sparse_triton_allocator_calls_are_guarded():
+    ops_dir = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops"
+    )
+    offenders = []
+    for path in ops_dir.rglob("*.py"):
+        if "triton.set_allocator(" in path.read_text():
+            offenders.append(str(path.relative_to(ops_dir)))
+
+    assert offenders == []
