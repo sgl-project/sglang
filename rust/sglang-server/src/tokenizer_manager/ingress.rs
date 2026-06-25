@@ -18,7 +18,9 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::fsm::{Event, ValidationOutcome};
-use crate::message::{EgressItem, Request, RequestKind, TokenizedReqPayload, control_req_msgpack};
+use crate::message::{
+    EgressItem, GenerateRequest, Request, RequestKind, TokenizedReqPayload, control_req_msgpack,
+};
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
 use crate::runtime::ring::IngressProducer;
 
@@ -43,10 +45,11 @@ fn on_ingress(
     ingress: &IngressProducer,
     skip_tokenizer_init: bool,
 ) {
-    // Received → Validating
-    let _ = req
-        .state
-        .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
+    // Received → Validating, plus payload validation; reject invalid requests.
+    if let Err(e) = validate(&mut req, skip_tokenizer_init) {
+        fail(&mut req, e);
+        return;
+    }
 
     // Register the egress sink with the owning detok shard *before* the request
     // leaves Rust, so the response (generate chunks or a control result) has a
@@ -56,7 +59,7 @@ fn on_ingress(
         .send(DetokMsg::Register {
             id: req.id,
             sink: req.sink.clone(),
-            stream: req.stream,
+            stream: req.kind.is_stream(),
         })
         .is_err()
     {
@@ -64,9 +67,15 @@ fn on_ingress(
         return;
     }
 
-    // Control requests reuse this FSM but skip tokenization entirely: validate
-    // straight to Queued and push the bare `[tag, rid, nil]` control message.
-    if let RequestKind::Control(tag) = req.kind {
+    // Branch by kind. Copy the control tag out so the borrow of `req.kind` ends
+    // before we move `req` downstream.
+    let control_tag = match &req.kind {
+        RequestKind::Control(c) => Some(c.tag),
+        RequestKind::Generate(_) => None,
+    };
+    if let Some(tag) = control_tag {
+        // Control requests skip tokenization entirely: validate straight to
+        // Queued and push the bare `[tag, rid, nil]` control message.
         let _ = req
             .state
             .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
@@ -74,37 +83,29 @@ fn on_ingress(
         return;
     }
 
-    // skip_tokenizer_init: there is no tokenizer — the client must send token
-    // ids. Treat every generate request as already-tokenized (no tokenize hop);
-    // a missing/empty `input_ids` is a client error rather than a silent
-    // byte-encode by the stub tokenizer.
-    if skip_tokenizer_init {
-        if !req.payload.already_tokenized() {
-            fail(
-                &mut req,
-                Error::Tokenize(
-                    "skip_tokenizer_init is set: request must provide input_ids".into(),
-                ),
-            );
-            return;
-        }
-        req.input_ids = req.payload.input_ids.clone();
-        let _ = req
-            .state
-            .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
-        push_to_ring(req, ingress);
-        return;
-    }
+    route_generate(req, senders, ingress);
+}
 
-    let outcome = classify(&req);
-    match outcome {
+/// Route a validated generate request: queue directly when it already carries
+/// token ids, else hand it to the tokenizer pool.
+fn route_generate(mut req: Request, senders: &Senders, ingress: &IngressProducer) {
+    let RequestKind::Generate(g) = &req.kind else {
+        return; // unreachable: control is handled by the caller
+    };
+    match classify(g) {
         ValidationOutcome::AlreadyTokenized => {
-            req.input_ids = req.payload.input_ids.clone();
-            let _ = req.state.apply(Event::Validated(outcome)); // → Queued
+            if let RequestKind::Generate(g) = &mut req.kind {
+                g.input_ids = g.payload.input_ids.clone();
+            }
+            let _ = req
+                .state
+                .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
             push_to_ring(req, ingress); // no tokenize hop
         }
         ValidationOutcome::NeedsTokenize => {
-            let _ = req.state.apply(Event::Validated(outcome)); // → Tokenizing
+            let _ = req
+                .state
+                .apply(Event::Validated(ValidationOutcome::NeedsTokenize)); // → Tokenizing
             if senders.tok.send(req).is_err() {
                 tracing::error!("tokenizer pool gone");
             }
@@ -147,7 +148,22 @@ fn on_tokenized(mut req: Request, ingress: &IngressProducer) {
 /// Build the msgpack `TokenizedGenerateReqInput` and push it onto the ingress
 /// ring for the scheduler. On backpressure, fail the request.
 fn push_to_ring(mut req: Request, ingress: &IngressProducer) {
-    let input_ids = match req.input_ids.take() {
+    // Only generate requests reach here (control uses `push_control_to_ring`).
+    let RequestKind::Generate(g) = &mut req.kind else {
+        fail(
+            &mut req,
+            Error::Internal("non-generate request reached push_to_ring".into()),
+        );
+        return;
+    };
+    // Move (not clone) the generate fields out; `take` leaves valid empties so
+    // the borrow of `req.kind` ends and `req` is free for the `fail` path.
+    let input_ids = g.input_ids.take();
+    let input_text = g.payload.text.take();
+    let sampling_params = g.payload.sampling_params.take();
+    let stream = g.stream;
+
+    let input_ids = match input_ids {
         Some(ids) if !ids.is_empty() => ids,
         _ => {
             fail(&mut req, Error::Tokenize("empty input_ids".into()));
@@ -155,15 +171,12 @@ fn push_to_ring(mut req: Request, ingress: &IngressProducer) {
         }
     };
 
-    // Move (not clone) out of the owned request: we never read `req.payload`
-    // again — the only later use of `req` is the `fail` error path, which
-    // touches `req.state` / `req.sink`. `take` leaves valid empties behind.
     let payload = TokenizedReqPayload {
         rid: req.id.0.to_string(),
-        input_text: req.payload.text.take(),
+        input_text,
         input_ids,
-        sampling_params: req.payload.sampling_params.take(),
-        stream: req.stream,
+        sampling_params,
+        stream,
     };
 
     let bytes: Bytes = match payload.to_msgpack() {
@@ -182,10 +195,41 @@ fn push_to_ring(mut req: Request, ingress: &IngressProducer) {
     // detok shard holds the sink.
 }
 
-fn classify(req: &Request) -> ValidationOutcome {
-    if req.payload.has_multimodal() {
+/// Validating phase: drive `Received → Validating` and check the payload is
+/// admissible. `Err` rejects the request (it never reaches a branch).
+///
+/// `skip_tokenizer_init` means no tokenizer is loaded, so a generate request
+/// *must* already carry token ids; a text-only request is rejected here rather
+/// than being silently byte-encoded by the stub tokenizer. Control requests
+/// carry no token ids and are exempt.
+fn validate(req: &mut Request, skip_tokenizer_init: bool) -> Result<(), Error> {
+    // Received → Validating
+    let _ = req
+        .state
+        .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
+    // The skip check is generate-only: control requests carry no token ids, so
+    // matching `Generate` naturally exempts them.
+    if skip_tokenizer_init {
+        match &req.kind {
+            RequestKind::Generate(g) => {
+                if !g.payload.already_tokenized() {
+                    return Err(Error::Tokenize(
+                        "skip_tokenizer_init is set: request must provide input_ids".into(),
+                    ));
+                }
+            }
+            _ => {} // exempt
+        }
+    }
+
+    Ok(())
+}
+
+/// Pick the ingress branch for a validated generate request.
+fn classify(g: &GenerateRequest) -> ValidationOutcome {
+    if g.payload.has_multimodal() {
         ValidationOutcome::HasMultimodal
-    } else if req.payload.already_tokenized() {
+    } else if g.payload.already_tokenized() {
         ValidationOutcome::AlreadyTokenized
     } else {
         ValidationOutcome::NeedsTokenize

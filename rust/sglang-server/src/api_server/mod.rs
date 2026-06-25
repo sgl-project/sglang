@@ -25,7 +25,9 @@ use tokio::sync::mpsc;
 
 use crate::fsm::RequestState;
 use crate::ids::RequestIdGen;
-use crate::message::{EgressItem, GeneratePayload, Request, RequestKind};
+use crate::message::{
+    ControlRequest, EgressItem, GeneratePayload, GenerateRequest, Request, RequestKind,
+};
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
 
@@ -107,23 +109,16 @@ async fn available_models(State(state): State<AppState>) -> Response {
 }
 
 /// Submit a request into the ingress pipeline. Returns the per-request egress
-/// receiver to read the result(s) from.
-async fn submit(
-    state: &AppState,
-    kind: RequestKind,
-    payload: GeneratePayload,
-) -> Result<mpsc::Receiver<EgressItem>, ()> {
+/// receiver to read the result(s) from. The `kind` carries the variant body
+/// (generate payload / control tag), so this stays generic over both.
+async fn submit(state: &AppState, kind: RequestKind) -> Result<mpsc::Receiver<EgressItem>, ()> {
     let (tx, rx) = mpsc::channel::<EgressItem>(state.egress_buf);
     let id = state.id_gen.next();
-    let stream = payload.stream;
     let req = Request {
         id,
-        kind,
         state: RequestState::Received,
-        payload,
-        input_ids: None,
         sink: tx,
-        stream,
+        kind,
     };
     // Async-aware send from this tokio task: under a full TM inbox it yields
     // (backpressure) instead of parking a worker thread, which flume's sync
@@ -145,7 +140,7 @@ async fn await_control_result(
     state: &AppState,
     tag: &'static str,
 ) -> Result<bytes::Bytes, Response> {
-    let mut rx = submit(state, RequestKind::Control(tag), GeneratePayload::default())
+    let mut rx = submit(state, RequestKind::Control(ControlRequest { tag }))
         .await
         .map_err(|()| (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())?;
     match rx.recv().await {
@@ -235,7 +230,12 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePayload>) -> Response {
     let stream = payload.stream;
-    let mut rx = match submit(&state, RequestKind::Generate, payload).await {
+    let kind = RequestKind::Generate(GenerateRequest {
+        payload,
+        input_ids: None,
+        stream,
+    });
+    let mut rx = match submit(&state, kind).await {
         Ok(rx) => rx,
         Err(()) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::fsm::Event;
-use crate::message::{EgressItem, Request};
+use crate::message::{EgressItem, Request, RequestKind};
 use crate::runtime::channels::TmEvent;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -121,9 +121,15 @@ pub fn run_worker(
     tokenizer: Arc<dyn TextTokenizer>,
 ) {
     while let Ok(mut req) = rx.recv() {
-        match tokenizer.encode(req.payload.text.as_deref().unwrap_or("")) {
+        // The tokenizer pool only ever receives generate requests (control
+        // requests skip tokenization in the ingress `classify`).
+        let RequestKind::Generate(g) = &mut req.kind else {
+            tracing::error!("tokenizer pool received a non-generate request");
+            continue;
+        };
+        match tokenizer.encode(g.payload.text.as_deref().unwrap_or("")) {
             Ok(ids) => {
-                req.input_ids = Some(ids);
+                g.input_ids = Some(ids);
                 if tm.send(TmEvent::Tokenized(req)).is_err() {
                     tracing::error!("tm inbox closed; dropping tokenized request");
                     break;

@@ -30,37 +30,62 @@ pub enum EgressItem {
     Error(Error),
 }
 
-/// What kind of request this is — selects the ingress branch and the wire
-/// message pushed to the scheduler. Control requests reuse the same ingress
-/// FSM as generate (validate → queue → ring) but skip tokenization, and their
-/// egress is a single non-streamed JSON result rather than detokenized chunks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What kind of request this is — selects the ingress branch, the wire message
+/// pushed to the scheduler, and the egress shape. Each variant owns its own
+/// body, so the type system keeps generate fields off control requests (and
+/// vice versa); a control endpoint migrated with parameters grows
+/// `ControlRequest` rather than abusing the generate payload.
+#[derive(Debug)]
 pub enum RequestKind {
-    /// `/generate`: tokenize then push a `TokenizedGenerateReqInput`.
-    Generate,
-    /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization.
-    /// The payload is the scheduler request-struct tag (msgspec class name,
-    /// e.g. `"GetInternalStateReq"`) pushed as a bare `[tag, rid, nil]`; the
-    /// scheduler replies with a single JSON result via the egress ring.
-    Control(&'static str),
+    /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
+    Generate(GenerateRequest),
+    /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
+    /// the egress is a single non-streamed JSON result.
+    Control(ControlRequest),
 }
 
-/// The owned request as it travels ingress stages. Single owner at all times,
-/// so the embedded `state` FSM is mutated without any lock.
+impl RequestKind {
+    /// Whether the client asked for SSE streaming. Always false for control
+    /// requests (their response is a single result, never streamed).
+    pub fn is_stream(&self) -> bool {
+        match self {
+            RequestKind::Generate(g) => g.stream,
+            RequestKind::Control(_) => false,
+        }
+    }
+}
+
+/// Body of a `/generate` request.
 #[derive(Debug)]
-pub struct Request {
-    pub id: RequestId,
-    pub kind: RequestKind,
-    pub state: RequestState,
+pub struct GenerateRequest {
     /// Decoded HTTP body (the `GenerateReqInput` view we need for tokenization).
     pub payload: GeneratePayload,
     /// Token ids, populated by the Tokenizer stage (or already present from the
-    /// client). `Bytes` so handing it to the ring is copy-free.
+    /// client).
     pub input_ids: Option<Vec<i32>>,
-    /// Back-channel to the client connection for egress frames.
-    pub sink: EgressSink,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
+}
+
+/// Body of a control request. `tag` is the scheduler request-struct name
+/// (msgspec class, e.g. `"GetInternalStateReq"`) pushed as a bare
+/// `[tag, rid, nil]`. Typed params for migrated control endpoints land here.
+#[derive(Debug)]
+pub struct ControlRequest {
+    pub tag: &'static str,
+}
+
+/// The owned request as it travels ingress stages. Single owner at all times,
+/// so the embedded `state` FSM is mutated without any lock. Fields common to
+/// every request live here; variant-specific data lives in [`RequestKind`].
+#[derive(Debug)]
+pub struct Request {
+    pub id: RequestId,
+    pub state: RequestState,
+    /// Back-channel to the client connection for egress frames.
+    pub sink: EgressSink,
+    /// Discriminant + variant body (generate vs control).
+    pub kind: RequestKind,
 }
 
 /// Encode a bare `BaseReq` control message (just `rid` + `http_worker_ipc`) as
