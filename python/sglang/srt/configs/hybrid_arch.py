@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -20,7 +20,9 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
     ZayaConfig,
 )
-from sglang.srt.configs.model_config import ModelConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
 
 
 def _get_linear_attn_registry_result(model_config: ModelConfig) -> Any:
