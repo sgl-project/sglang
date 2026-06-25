@@ -178,3 +178,16 @@ def test_npu_forward_extend_has_triton_prefill_gate():
     assert "def _forward_npu_triton_prefill(" in source
     assert "if _npu_use_triton_sparse():" in source
     assert "self._forward_npu_triton_prefill(" in source
+
+
+def test_minimax_sparse_triton_allocator_calls_are_guarded():
+    ops_dir = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops"
+    )
+    offenders = []
+    for path in ops_dir.rglob("*.py"):
+        if "triton.set_allocator(" in path.read_text():
+            offenders.append(str(path.relative_to(ops_dir)))
+
+    assert offenders == []
