@@ -371,6 +371,54 @@ class ModelRunner:
         self.init_weight_updater()
         self.init_weight_exporter()
 
+    @property
+    def tp_rank(self) -> int:
+        return self.ps.tp_rank
+
+    @property
+    def tp_size(self) -> int:
+        return self.ps.tp_size
+
+    @property
+    def pp_rank(self) -> int:
+        return self.ps.pp_rank
+
+    @property
+    def pp_size(self) -> int:
+        return self.ps.pp_size
+
+    @property
+    def dp_rank(self) -> Optional[int]:
+        return self.ps.dp_rank
+
+    @property
+    def attn_dp_size(self) -> int:
+        return self.ps.attn_dp_size
+
+    @property
+    def moe_ep_rank(self) -> int:
+        return self.ps.moe_ep_rank
+
+    @property
+    def moe_ep_size(self) -> int:
+        return self.ps.moe_ep_size
+
+    @property
+    def moe_dp_rank(self) -> Optional[int]:
+        return self.ps.moe_dp_rank
+
+    @property
+    def moe_dp_size(self) -> int:
+        return self.ps.moe_dp_size
+
+    @property
+    def attn_cp_rank(self) -> int:
+        return self.ps.attn_cp_rank
+
+    @property
+    def attn_cp_size(self) -> int:
+        return self.ps.attn_cp_size
+
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
 
