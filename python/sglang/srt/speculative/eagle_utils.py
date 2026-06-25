@@ -354,6 +354,29 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+# Grow-only cache for draft_probs in eagle_sample (non-rejection-sampling path).
+# Avoids re-allocating a large [bs, draft_token_num, vocab_size] tensor each step.
+_draft_probs_buf: Optional[torch.Tensor] = None
+
+
+def _get_draft_probs_buf(target_probs: torch.Tensor) -> torch.Tensor:
+    """Return a zeroed buffer with the same shape as *target_probs*.
+
+    Reuses a module-level flat buffer that only grows, never shrinks.  The
+    ``zero_()`` is unavoidable (the kernel reads the full vocab row), but the
+    allocation is amortised to the first call / whenever batch size grows.
+    """
+    global _draft_probs_buf
+    n = target_probs.numel()
+    if _draft_probs_buf is None or _draft_probs_buf.numel() < n:
+        _draft_probs_buf = torch.empty(
+            n, dtype=torch.float32, device=target_probs.device
+        )
+    buf = _draft_probs_buf[:n].view_as(target_probs)
+    buf.zero_()
+    return buf
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -479,7 +502,11 @@ def eagle_sample(
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = torch.zeros_like(target_probs)
+        # Reuse a grow-only cached buffer for draft_probs instead of
+        # allocating a [bs, draft_token_num, vocab_size] tensor of zeros
+        # every decode step.  The kernel writes/reads draft_probs at the
+        # last-accepted row; all entries must start at zero for correctness.
+        draft_probs = _get_draft_probs_buf(target_probs)
 
         # coins for rejection sampling
         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
