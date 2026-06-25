@@ -103,9 +103,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(
-                "HiRadixCache only supports MHA, MLA, DSA, and MiniMax M3 sparse models"
-            )
+            raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
