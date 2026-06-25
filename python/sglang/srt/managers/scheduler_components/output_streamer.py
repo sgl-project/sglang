@@ -203,20 +203,27 @@ class SchedulerOutputStreamer:
                 if phs is not None:
                     has_phs = True
 
-        # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
-        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
-        # *every* entry is non-None (homogeneous batch); mixed batches
-        # (some requests want PHS, others don't) keep the raw list so
-        # positional indexing on the receiver side stays correct.
+        # Optimize pooled hidden states (PHS) for IPC serialization.
+        # Two formats, disambiguated on the receiver side by length:
+        #   Stacked:     [stacked_tensor(N, ...)] — len 1, N > 1 requests
+        #   Non-stacked: [tensor_0, tensor_1, ...] — len == N
+        # Stacking reduces N pickle/__reduce_ex__ calls to 1.
+        # Only possible when all entries are non-None and same shape.
+        # See paired receiver logic in tokenizer_manager.py.
         stacked_phs = None
         if has_phs:
             all_have_phs = all(t is not None for t in phs_list)
             if all_have_phs:
-                if all(t.shape == phs_list[0].shape for t in phs_list):
-                    stacked_phs = torch.stack(phs_list)
+                if len(phs_list) > 1 and all(
+                    t.shape == phs_list[0].shape for t in phs_list
+                ):
+                    # Stacked: single tensor, wrapped in a list.
+                    stacked_phs = [torch.stack(phs_list)]
                 else:
+                    # Non-stacked: 1 request, mixed shapes, or mixed None.
                     stacked_phs = phs_list
             else:
+                # Non-stacked: some requests don't have PHS (None entries).
                 stacked_phs = phs_list
 
         self.send_to_detokenizer.send_output(
