@@ -1284,39 +1284,81 @@ class DeepseekSparseAttnBackend(
         elif forward_mode.is_target_verify():
             max_seqlen_k = metadata.page_table_1.shape[1]
 
-            cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
-                torch.int32
-            )
-            metadata.cache_seqlens_int32.copy_(cache_seqlens)
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
-            )
-            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            page_indices = torch.repeat_interleave(
-                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
-            )
-            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
+            if _USE_FUSED_METADATA_GENERATION and is_cuda():
+                try:
+                    from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                        fused_dsa_target_verify_metadata,
+                    )
 
-            # Fill the constant per-req qo lengths (num_draft_tokens) on-device;
-            # torch.tensor(list, device=cuda) does a pageable H2D copy that
-            # blocks the host on the whole queued stream.
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seqlens_expanded = seqlens_expand_triton(
-                extend_seq_lens,
-                cache_seqlens,
-                self.speculative_num_draft_tokens * bs,
-                self.speculative_num_draft_tokens,
-            )
-            metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
-            dsa_cache_seqlens = compute_dsa_seqlens(
-                seqlens_expanded, self.dsa_index_topk
-            )
-            metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
+                    fused_dsa_target_verify_metadata(
+                        seq_lens=seq_lens,
+                        req_pool_indices=req_pool_indices,
+                        req_to_token=self.req_to_token,
+                        cache_seqlens=metadata.cache_seqlens_int32,
+                        cu_seqlens_k=metadata.cu_seqlens_k,
+                        page_table_1=metadata.page_table_1,
+                        seqlens_expanded=metadata.dsa_seqlens_expanded,
+                        dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                        dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                        real_page_table=metadata.real_page_table,
+                        bs=bs,
+                        max_seqlen_k=max_seqlen_k,
+                        dsa_index_topk=self.dsa_index_topk,
+                        real_page_size=self.real_page_size,
+                        next_n=self.speculative_num_draft_tokens,
+                    )
+                    cache_seqlens = metadata.cache_seqlens_int32
+                    seqlens_expanded = metadata.dsa_seqlens_expanded[
+                        : self.speculative_num_draft_tokens * bs
+                    ]
+                    dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[
+                        : self.speculative_num_draft_tokens * bs
+                    ]
+                    page_indices = None
+                    fused_metadata_generation_succeeded = True
+                except Exception as e:
+                    if not _warned_fused_metadata_generation_failure:
+                        logger.warning(
+                            "Fused DSA target-verify metadata generation failed; "
+                            "falling back to eager metadata ops. Error: %s",
+                            e,
+                        )
+                        _warned_fused_metadata_generation_failure = True
+                    _USE_FUSED_METADATA_GENERATION = False
+
+            if not fused_metadata_generation_succeeded:
+                cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
+                    torch.int32
+                )
+                metadata.cache_seqlens_int32.copy_(cache_seqlens)
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+                )
+                page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                page_indices = torch.repeat_interleave(
+                    page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+                )
+                metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
+
+                # Fill the constant per-req qo lengths on-device; torch.tensor(list,
+                # device=cuda) does a pageable H2D copy that blocks the host.
+                extend_seq_lens = torch.full(
+                    (bs,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seqlens_expanded = seqlens_expand_triton(
+                    extend_seq_lens,
+                    cache_seqlens,
+                    self.speculative_num_draft_tokens * bs,
+                    self.speculative_num_draft_tokens,
+                )
+                metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
+                dsa_cache_seqlens = compute_dsa_seqlens(
+                    seqlens_expanded, self.dsa_index_topk
+                )
+                metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
         elif forward_mode.is_draft_extend_v2():
             # V2 draft-extend processes the full padded tree width
             # (speculative_num_draft_tokens) per req -- a static shape, like
