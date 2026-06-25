@@ -113,3 +113,7 @@ class TestMmapAllocator(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             allocator.allocate((2, 2), torch.float32, device="cuda")
         self.assertIn("only supports CPU allocations", str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
