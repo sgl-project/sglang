@@ -287,6 +287,7 @@ class TinyModelConfig:
             num_key_value_heads=num_kv_heads,
             head_dim=head_dim,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
 
     def get_num_attention_heads(self, tp_size: int) -> int:
