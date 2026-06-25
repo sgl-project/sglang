@@ -25,7 +25,7 @@ from sglang.srt.layers.moe.utils import (
 )
 
 
-class TorchNpuDispatchOutput(NamedTuple):
+class AscendTPDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_weights: torch.Tensor
@@ -36,23 +36,23 @@ class TorchNpuDispatchOutput(NamedTuple):
 
     @property
     def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.TORCH_NPU
+        return DispatchOutputFormat.ASCEND_TP
 
 
-class TorchNpuCombineInput(NamedTuple):
+class AscendTPCombineInput(NamedTuple):
     hidden_states: torch.Tensor
 
     @property
     def format(self) -> CombineInputFormat:
-        return CombineInputFormat.TORCH_NPU
+        return CombineInputFormat.ASCEND_TP
 
 
-class TorchNpuDispatcher(BaseDispatcher):
+class AscendTPDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.num_experts = moe_runner_config.num_experts
         self.top_k = moe_runner_config.top_k
-        self._dispatch_output: Optional[TorchNpuDispatchOutput] = None
+        self._dispatch_output: Optional[AscendTPDispatchOutput] = None
 
         self.quant_config: Optional[dict] = None
 
@@ -91,7 +91,7 @@ class TorchNpuDispatcher(BaseDispatcher):
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
-    ) -> TorchNpuDispatchOutput:
+    ) -> AscendTPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
@@ -108,7 +108,7 @@ class TorchNpuDispatcher(BaseDispatcher):
             self.top_k,
         )
 
-        self._dispatch_output = TorchNpuDispatchOutput(
+        self._dispatch_output = AscendTPDispatchOutput(
             hidden_states=permuted_hidden_states,
             hidden_states_scale=hidden_states_scale,
             topk_weights=topk_weights,
@@ -119,7 +119,7 @@ class TorchNpuDispatcher(BaseDispatcher):
         )
         return self._dispatch_output
 
-    def combine(self, combine_input: TorchNpuCombineInput) -> torch.Tensor:
+    def combine(self, combine_input: AscendTPCombineInput) -> torch.Tensor:
         if self._dispatch_output is None:
             raise RuntimeError("combine() called before dispatch()")
 

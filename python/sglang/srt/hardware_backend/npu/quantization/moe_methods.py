@@ -9,7 +9,7 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
-    from sglang.srt.layers.moe.moe_runner.torch_npu import TorchNpuQuantInfo
+    from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
 import logging
 
@@ -104,8 +104,8 @@ def fused_moe_npu(
     return final_hidden_states
 
 
-class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
-    """Base class for NPU fused MoE methods with common helpers."""
+class _NPUMoEMethodBase(FusedMoEMethodBase):
+    """Base class for NPU MoE methods with common helpers."""
 
     def __init__(
         self,
@@ -135,7 +135,7 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 # ---------------------------------------------------------------------------
 #  NPUW4A4Int4DynamicMoEMethod
 # ---------------------------------------------------------------------------
-class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
+class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
     """W4A4 dynamic MoE – weights are int4, activations are int4."""
 
     def __init__(self):
@@ -230,7 +230,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: "TorchNpuQuantInfo",
+        quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,
@@ -261,7 +261,7 @@ class NPUW4A4Int4MoEMethod(_NPUFusedMoEMethodBase):
 # ---------------------------------------------------------------------------
 #  NPUW8A8Int8MoEMethod
 # ---------------------------------------------------------------------------
-class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
+class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
     """W8A8 MoE – weights are int8, activations in int8."""
 
     def __init__(self):
@@ -334,7 +334,7 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: "TorchNpuQuantInfo",
+        quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,
@@ -365,7 +365,7 @@ class NPUW8A8Int8MoEMethod(_NPUFusedMoEMethodBase):
 # ---------------------------------------------------------------------------
 #  NPUW4A8Int8MoEMethod
 # ---------------------------------------------------------------------------
-class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
+class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
     """W4A8 MoE – weights are int4, activations quantized to int8."""
 
     def __init__(
@@ -481,7 +481,7 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: "TorchNpuQuantInfo",
+        quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,
@@ -517,9 +517,9 @@ class NPUW4A8Int8MoEMethod(_NPUFusedMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
-#  NPUW4A16Int4MoEMethod
+#  NPUWNA16Int4MoEMethod
 # ---------------------------------------------------------------------------
-class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
+class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
     """W4A16 MoE – weights are int4, activations stay in BF16."""
 
     def __init__(self):
@@ -640,7 +640,7 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: "TorchNpuQuantInfo",
+        quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,  # not used, but kept for interface consistency
@@ -668,7 +668,7 @@ class NPUW4A16Int4MoEMethod(_NPUFusedMoEMethodBase):
 # ---------------------------------------------------------------------------
 #  NPUWUnquantMoEMethod
 # ---------------------------------------------------------------------------
-class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
+class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     """Unquant MoE – all computations in BF16, no quantization."""
 
     def __init__(self):
@@ -693,7 +693,7 @@ class NPUUnquantMoEMethod(_NPUFusedMoEMethodBase):
 
     def apply(
         self,
-        quant_info: "TorchNpuQuantInfo",
+        quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
         pertoken_scale: torch.Tensor,  # ignored

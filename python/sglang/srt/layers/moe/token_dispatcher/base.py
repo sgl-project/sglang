@@ -29,8 +29,8 @@ if TYPE_CHECKING:
         FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
-        TorchNpuCombineInput,
-        TorchNpuDispatchOutput,
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -138,7 +138,7 @@ class DispatchOutputChecker:
     @staticmethod
     def format_is_torch_npu(
         dispatch_output: DispatchOutput,
-    ) -> TypeGuard[TorchNpuDispatchOutput]:
+    ) -> TypeGuard[AscendTPDispatchOutput]:
         return dispatch_output.format.is_torch_npu()
 
     @staticmethod
@@ -178,7 +178,7 @@ class DispatchOutputFormat(Enum):
         return self == DispatchOutputFormat.STANDARD
 
     def is_torch_npu(self) -> bool:
-        return self == DispatchOutputFormat.TORCH_NPU
+        return self == DispatchOutputFormat.ASCEND_TP
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
@@ -219,8 +219,8 @@ class CombineInputChecker:
     @staticmethod
     def format_is_torch_npu(
         combine_input: CombineInput,
-    ) -> TypeGuard[TorchNpuCombineInput]:
-        return combine_input.format == CombineInputFormat.TORCH_NPU
+    ) -> TypeGuard[AscendTPCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_TP
 
     @staticmethod
     def format_is_deepep_normal(

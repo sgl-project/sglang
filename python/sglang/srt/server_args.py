@@ -254,7 +254,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
-    "torch_npu",
+    "ascend_tp",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -1670,7 +1670,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
-            "torch_npu",
+            "ascend_tp",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -5422,8 +5422,8 @@ class ServerArgs:
 
         if (
             self.moe_a2a_backend == "none" and is_npu()
-        ) or self.moe_a2a_backend == "torch_npu":
-            # FIXME (OrangeRedeng): for some reasons if pass "torch_npu" accuracy drops to zero
+        ) or self.moe_a2a_backend == "ascend_tp":
+            # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
             self.moe_a2a_backend = "none"
 
         if self.moe_a2a_backend == "ascend_fuseep":

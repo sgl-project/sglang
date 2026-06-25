@@ -6,7 +6,7 @@ from typing import Any, Dict
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A4Int4MoEMethod,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme

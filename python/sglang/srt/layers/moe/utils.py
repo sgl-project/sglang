@@ -114,7 +114,7 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.TRITON
 
     def is_torch_npu(self):
-        return self == MoeRunnerBackend.TORCH_NPU
+        return self == MoeRunnerBackend.ASCEND
 
     def is_triton_kernels(self):
         return self == MoeRunnerBackend.TRITON_KERNELS

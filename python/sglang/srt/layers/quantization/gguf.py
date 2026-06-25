@@ -12,7 +12,7 @@ import torch
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
 )
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
@@ -23,8 +23,8 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.moe_runner.torch_npu import (
-    TorchNpuQuantInfo,
+from sglang.srt.layers.moe.moe_runner.ascend import (
+    AscendQuantInfo,
 )
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -951,7 +951,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
         if backend.is_auto():
-            backend = MoeRunnerBackend.TORCH_NPU
+            backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
@@ -959,7 +959,7 @@ class GGUFMoEAscendMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        quant_info = TorchNpuQuantInfo(
+        quant_info = AscendQuantInfo(
             w13_weight=layer.w13_dequant,
             w2_weight=layer.w2_dequant,
         )

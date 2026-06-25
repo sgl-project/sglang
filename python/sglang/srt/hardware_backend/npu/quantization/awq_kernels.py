@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4MoEMethod,
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUWNA16Int4MoEMethod,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 
@@ -174,8 +174,8 @@ class AWQAscendLinearKernel:
 class AWQAscendMoEKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
-        self.w13_kernel = NPUW4A16Int4MoEMethod()
-        self.w2_kernel = NPUW4A16Int4MoEMethod()
+        self.w13_kernel = NPUWNA16Int4MoEMethod()
+        self.w2_kernel = NPUWNA16Int4MoEMethod()
 
     @staticmethod
     def _register_or_replace_parameter(

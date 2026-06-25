@@ -11,8 +11,8 @@ from compressed_tensors import CompressionFormat
 from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
     gptq_marlin_moe_repack,
 )
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4MoEMethod,
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUWNA16Int4MoEMethod,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
@@ -42,8 +42,8 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.moe_runner.torch_npu import (
-    TorchNpuQuantInfo,
+from sglang.srt.layers.moe.moe_runner.ascend import (
+    AscendQuantInfo,
 )
 
 __all__ = [
@@ -578,8 +578,8 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         else:
             self.group_size = 128
 
-        self.w13_kernel = NPUW4A16Int4MoEMethod()
-        self.w2_kernel = NPUW4A16Int4MoEMethod()
+        self.w13_kernel = NPUWNA16Int4MoEMethod()
+        self.w2_kernel = NPUWNA16Int4MoEMethod()
 
     # TODO: See if we can merge this method's logic
     # with CompressedTensorsWNA16MoE. Need more models and tests.
@@ -706,7 +706,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
         if backend.is_auto():
-            backend = MoeRunnerBackend.TORCH_NPU
+            backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply_weights(
@@ -715,7 +715,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         backend = self.runner.runner_backend
-        quant_info = TorchNpuQuantInfo(
+        quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale,

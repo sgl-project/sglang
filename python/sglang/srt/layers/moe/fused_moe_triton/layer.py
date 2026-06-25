@@ -38,8 +38,8 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatch
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
-from sglang.srt.layers.moe.token_dispatcher.torch_npu import (
-    TorchNpuDispatcher,
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendTPDispatcher,
 )
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
@@ -87,7 +87,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
-        return TorchNpuDispatcher(moe_runner_config)
+        return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()

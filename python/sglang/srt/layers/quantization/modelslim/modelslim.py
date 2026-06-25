@@ -10,8 +10,8 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.torch_npu import (
-    TorchNpuQuantInfo,
+from sglang.srt.layers.moe.moe_runner.ascend import (
+    AscendQuantInfo,
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
@@ -411,7 +411,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
         if backend.is_auto():
-            backend = MoeRunnerBackend.TORCH_NPU
+            backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
 
     # ------------------------------------------------------------------
@@ -423,7 +423,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         backend = self.runner.runner_backend
-        quant_info = TorchNpuQuantInfo(
+        quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,

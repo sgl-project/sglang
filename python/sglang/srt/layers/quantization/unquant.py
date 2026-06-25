@@ -48,7 +48,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
 )
 
@@ -427,7 +427,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w13_kernel = NPUUnquantMoEMethod()
             layer.w2_kernel = NPUUnquantMoEMethod()
             moe_runner_config.layer = layer
-            backend = MoeRunnerBackend.TORCH_NPU
+            backend = MoeRunnerBackend.ASCEND
         else:
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)

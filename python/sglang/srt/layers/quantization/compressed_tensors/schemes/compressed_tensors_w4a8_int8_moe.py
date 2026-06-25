@@ -5,12 +5,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8Int8MoEMethod,
 )
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.torch_npu import (
-    TorchNpuQuantInfo,
+from sglang.srt.layers.moe.moe_runner.ascend import (
+    AscendQuantInfo,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -284,7 +284,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         self.moe_runner_config = moe_runner_config
         backend = get_moe_runner_backend()
         if backend.is_auto():
-            backend = MoeRunnerBackend.TORCH_NPU
+            backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply_weights(
@@ -293,7 +293,7 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         backend = self.runner.runner_backend
-        quant_info = TorchNpuQuantInfo(
+        quant_info = AscendQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale,
