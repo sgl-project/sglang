@@ -6,7 +6,6 @@ import torch.cuda
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.eplb.expert_location_updater import update_expert_location_with_recovery
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
