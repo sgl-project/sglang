@@ -168,12 +168,6 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
-def disable_compile_on_xpu(fn):
-    if is_xpu():
-        return torch.compiler.disable(fn)
-    return fn
-
-
 def register_xpu_device_properties_for_dynamo() -> None:
     if not is_xpu():
         return

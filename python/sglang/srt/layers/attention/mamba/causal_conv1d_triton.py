@@ -11,7 +11,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.utils import disable_compile_on_xpu as _disable_compile_on_xpu
 
 PAD_SLOT_ID = -1
 
@@ -989,7 +988,6 @@ def _causal_conv1d_update_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@_disable_compile_on_xpu
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,

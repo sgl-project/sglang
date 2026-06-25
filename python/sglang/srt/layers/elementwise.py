@@ -6,7 +6,6 @@ import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.triton_ops.softcap import softcap_out as fused_softcap
-from sglang.srt.utils import disable_compile_on_xpu as _disable_compile_on_xpu
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -656,7 +655,6 @@ def _fused_gate_sigmoid_mul_add_kernel(
     tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
 
 
-@_disable_compile_on_xpu
 def fused_gate_sigmoid_mul_add(
     hidden_states: torch.Tensor,
     gate_weight: torch.Tensor,
