@@ -585,6 +585,14 @@ class KVCacheConfigurator:
         unsupported_pool_family = None
         if is_dsv4_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
+        elif (
+            not current_platform.is_out_of_tree()
+            and current_platform.get_mha_kv_pool_cls() is not None
+            and not self.mambaish_config
+        ):
+            unsupported_pool_family = (
+                f"{current_platform.device_name.upper()} KV pool"
+            )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
         elif (
@@ -798,9 +806,21 @@ class KVCacheConfigurator:
                     is_dsa_model=is_dsa_model,
                 )
             else:
-                token_to_kv_pool = self._build_oot_mha_kv_pool(
+                token_to_kv_pool = self._build_platform_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
+        elif (
+            current_platform.get_mha_kv_pool_cls() is not None
+            and not self.mambaish_config
+        ):
+            if self.use_mla_backend:
+                raise RuntimeError(
+                    f"{current_platform.device_name.upper()} backend currently supports "
+                    "MHA/GQA models only; MLA models are not supported."
+                )
+            token_to_kv_pool = self._build_platform_mha_kv_pool(
+                max_total_num_tokens=sizes.max_total_num_tokens,
+            )
         elif (
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
@@ -998,7 +1018,7 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def _build_oot_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+    def _build_platform_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         PoolCls = current_platform.get_mha_kv_pool_cls()
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
@@ -1377,8 +1397,8 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
-            if current_platform.is_out_of_tree():
-                AllocatorCls = current_platform.get_paged_allocator_cls()
+            AllocatorCls = current_platform.get_paged_allocator_cls()
+            if AllocatorCls is not None:
                 token_to_kv_pool_allocator = AllocatorCls(
                     sizes.max_total_num_tokens,
                     page_size=self.server_args.page_size,
