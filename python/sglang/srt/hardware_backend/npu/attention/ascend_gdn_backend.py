@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import (
@@ -15,10 +15,15 @@ from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend
     AscendMambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
+from sglang.srt.layers.attention.linear.gdn_chunk_meta import (
+    GDNChunkedPrefillMetadata,
+    build_gdn_chunked_prefill_meta,
+)
 from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -28,6 +33,21 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 fused_gdn_gating = fused_gdn_gating_npu
 causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
+
+
+def _cu_seqlens_cpu_from_seq_lens(seq_lens_cpu) -> torch.Tensor:
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens = seq_lens_cpu.detach()
+        if seq_lens.device.type != "cpu":
+            seq_lens = seq_lens.cpu()
+        seq_lens = seq_lens.to(dtype=torch.int32)
+    else:
+        seq_lens = torch.tensor(seq_lens_cpu, dtype=torch.int32)
+
+    cu_seqlens = torch.empty(seq_lens.numel() + 1, dtype=torch.int32)
+    cu_seqlens[0] = 0
+    cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
+    return cu_seqlens
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
@@ -46,6 +66,51 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        self.graph_mode = False
+        # Derive num_v_heads for GDN layers directly from model config so that
+        # init_forward_metadata can always pre-build metadata without waiting for
+        # a layer call.  Mirrors the model layer: num_v_heads = linear_num_value_heads
+        # // attn_tp_size.  Falls back to None for non-GDN configs; in that case
+        # _get_non_spec_chunked_prefill_meta will set it lazily on first use.
+        hf_cfg = model_runner.model_config.hf_config
+        raw_v_heads = getattr(hf_cfg, "linear_num_value_heads", None)
+        self._gdn_num_heads: Optional[int] = (
+            raw_v_heads // get_attention_tp_size() if raw_v_heads is not None else None
+        )
+        # Per-step cache: {num_heads -> GDNChunkedPrefillMetadata}, cleared each step.
+        self._gdn_meta_per_step: Dict[int, GDNChunkedPrefillMetadata] = {}
+
+    def _get_non_spec_chunked_prefill_meta(
+        self,
+        forward_batch: ForwardBatch,
+        num_heads: int,
+        device: torch.device,
+    ):
+        if (
+            self.graph_mode
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.extend_seq_lens_cpu is None
+        ):
+            return None, None
+
+        cu_seqlens_cpu = getattr(self.forward_metadata, "cu_seqlens_cpu", None)
+        if cu_seqlens_cpu is None:
+            return None, None
+
+        # Per-step cache keyed by num_heads: pre-built in init_forward_metadata for
+        # known num_heads, or built lazily on first layer call and reused thereafter.
+        meta = self._gdn_meta_per_step.get(num_heads)
+        if meta is None:
+            meta = build_gdn_chunked_prefill_meta(
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                num_heads=num_heads,
+                device=device,
+            )
+            self._gdn_meta_per_step[num_heads] = meta
+            # Remember num_heads so init_forward_metadata can pre-build next step.
+            self._gdn_num_heads = num_heads
+
+        return cu_seqlens_cpu, meta
 
     def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
         if self.forward_metadata.has_mamba_track_mask:
@@ -108,6 +173,32 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         )
         self._prepare_mamba_track_metadata(forward_batch)
         self.graph_mode = False
+
+        # Reset per-step cache and pre-build GDN chunked prefill metadata.
+        # Building here (before model forward) ensures the H2D copy is issued
+        # before NPU compute starts. After the first step where _gdn_num_heads is
+        # learned from a layer call, all subsequent steps pre-build without any
+        # build inside the per-layer forward_extend hot path.
+        self._gdn_meta_per_step = {}
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            cu_seqlens_cpu = _cu_seqlens_cpu_from_seq_lens(
+                forward_batch.extend_seq_lens_cpu
+            )
+            self.forward_metadata.cu_seqlens_cpu = cu_seqlens_cpu
+
+            if self._gdn_num_heads is not None:
+                self._gdn_meta_per_step[self._gdn_num_heads] = (
+                    build_gdn_chunked_prefill_meta(
+                        cu_seqlens_cpu=cu_seqlens_cpu,
+                        num_heads=self._gdn_num_heads,
+                        device=self.device,
+                    )
+                )
+        else:
+            self.forward_metadata.cu_seqlens_cpu = None
 
     def forward_decode(
         self,
@@ -308,6 +399,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            cu_seqlens_cpu, prebuilt_meta = self._get_non_spec_chunked_prefill_meta(
+                forward_batch,
+                layer.num_v_heads,
+                mixed_qkv.device,
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -317,6 +413,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                prebuilt_meta=prebuilt_meta,
             )
             if last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
