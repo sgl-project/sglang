@@ -14,7 +14,7 @@ Follow the architecture proposed in [Quantization Modifications](https://github.
 
 - **Config**: parses model and runtime quantization parameters, validates supported options, and selects the proper scheme.
 - **Scheme**: owns quantized weight creation, weight loading, post-processing, and quantized layer wiring for Linear, MoE, embedding, or other module types.
-- **Backend kernel**: wraps hardware-specific execution, layout conversion, kernel selection, and kernel calls for CUDA, NPU, AMD, or other backends.
+- **Backend kernel**: wraps hardware-specific execution, layout conversion, kernel selection, and kernel calls for GPU (CUDA/HIP/XPU), NPU, or other backends.
 
 Avoid putting config parsing, weight loading, and backend kernel calls in a single monolithic file. If a method needs multiple formats or backends, add a package under `python/sglang/srt/layers/quantization/<method>/` and split schemes into `schemes/`.
 
@@ -48,7 +48,7 @@ Keep shared method selection in the quantization package and keep backend import
 1. Define the config entry point and register it through `python/sglang/srt/layers/quantization/__init__.py` when needed.
 2. Add explicit scheme selection helpers such as `get_linear_scheme` and `get_moe_scheme`.
 3. Move layer-specific weight creation and weight loading into scheme classes.
-4. Move CUDA, NPU, AMD, or other hardware kernel calls into backend kernel modules.
+4. Move GPU (CUDA/HIP/XPU), NPU, or other hardware kernel calls into backend kernel modules.
 5. Keep Linear, MoE, embedding, and non-linear module handling explicit. Do not assign a Linear quantization method to a module type that needs different semantics.
 6. Preserve compatibility for existing quantized checkpoints and runtime flags.
 7. Add tests that cover both config parsing and execution paths touched by the change.
@@ -65,7 +65,7 @@ Quantization changes can affect both accuracy and performance. Include validatio
 For Python-only structure changes:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m py_compile <changed-python-files>
+ruff check <changed-python-files>
 git diff --check
 ```
 
@@ -78,7 +78,7 @@ For quantized model behavior:
 
 For backend-specific changes:
 
-- Validate CUDA changes on a supported NVIDIA GPU.
+- Validate GPU changes on a supported GPU environment (NVIDIA, AMD, or Intel).
 - Validate NPU changes on a supported Ascend environment.
 - Include the exact model, quantization flag, backend flag, hardware, and command used in the PR description.
 
