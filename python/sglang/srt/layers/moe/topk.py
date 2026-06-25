@@ -1641,7 +1641,7 @@ def _remap_topk_for_deepep(
 
     Routed IDs:  e -> e + e // num_local_routed
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
-    Shared weight: 1 / routed_scaling_factor (compensates post-MoE scaling)
+    Shared weight: 1.0 on the aiter path, else 1/routed_scaling_factor (see below).
     """
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
@@ -1665,9 +1665,33 @@ def _remap_topk_for_deepep(
         + torch.arange(num_fused_shared_experts, device=topk_ids.device)
     )
 
-    # Override shared weight: 1/routed_scaling_factor so net contribution = 1.0
+    # Override the fused shared expert's weight so its net contribution is 1.0x.
+    #
+    # The correct value depends on whether routed_scaling_factor is applied to
+    # the MoE output AFTER the experts run, or already folded into the routed
+    # topk weights BEFORE dispatch:
+    #
+    #   * Post-MoE scaling path (default): DeepseekV2MoE.forward_deepep later
+    #     multiplies the whole MoE output by routed_scaling_factor, so the shared
+    #     weight must be 1/routed_scaling_factor for (1/rsf) * rsf = 1.0.
+    #   * aiter (HIP) path: aiter_biased_grouped_topk folds routed_scaling_factor
+    #     into each routed topk weight, and forward_deepep SKIPS the post-MoE
+    #     multiply for _use_aiter (see its `not (... or _use_aiter)` guard). The
+    #     shared weight must therefore be 1.0 -- applying 1/rsf here would
+    #     under-weight the always-on shared expert by routed_scaling_factor and
+    #     corrupt every MoE layer.
+    #
+    # NOTE: forward_deepep also skips the post-MoE multiply for the non-aiter
+    # families where routed_scaling_factor is pre-folded in topk
+    # (should_fuse_routed_scaling_factor_in_topk / apply_routed_scaling_factor_on_output:
+    # ModelOpt NVFP4, cutlass/trtllm-routed fp8), so those would likewise need a
+    # 1.0 shared weight. This fix is deliberately scoped to the aiter path (the
+    # one validated on AMD MI355X); those other backends are left at their
+    # existing behavior and can be addressed by their maintainers.
     routed_scaling_factor = topk_config.routed_scaling_factor
-    if routed_scaling_factor is not None and routed_scaling_factor != 0:
+    if _use_aiter:
+        topk_weights[:, -num_fused_shared_experts:] = 1.0
+    elif routed_scaling_factor is not None and routed_scaling_factor != 0:
         topk_weights[:, -num_fused_shared_experts:] = 1.0 / routed_scaling_factor
 
     return topk_ids, topk_weights

@@ -158,7 +158,6 @@ class SchedulerOutputStreamer:
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
-            has_reqs=bool(reqs),
         )
         if payload is not None:
             self.send_to_detokenizer.send_output(payload)
@@ -499,9 +498,9 @@ class _GenerationStreamAccumulator:
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
     def to_payload(
-        self, *, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
-        if not (has_reqs or is_idle_batch):
+        if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
