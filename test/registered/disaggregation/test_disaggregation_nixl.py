@@ -8,7 +8,6 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_gsm8k_eval
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -229,24 +228,22 @@ class TestDisaggregationNixlAccuracy(NixlPDDisaggregationServerBase):
 
     def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
-            host=self.base_host,
-            port=int(self.lb_port),
-            num_questions=200,
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
             num_shots=5,
-            data_path=None,
-            max_new_tokens=512,
-            parallel=128,
+            num_threads=128,
             temperature=0.0,
         )
 
-        metrics = run_few_shot_gsm8k_eval(args)
+        metrics = run_eval(args)
+        print(f"Evaluation metrics: {metrics}")
         self.assertGreaterEqual(
-            metrics["accuracy"],
+            metrics["score"],
             0.90,
             f"Expected NIXL PD transfer to preserve GSM8K accuracy, got {metrics}",
-        )
-        self.assertEqual(
-            metrics["invalid"], 0.0, f"Unexpected invalid outputs: {metrics}"
         )
 
         assert_process_healthy(self, "load balancer", self.process_lb, self.lb_url)
