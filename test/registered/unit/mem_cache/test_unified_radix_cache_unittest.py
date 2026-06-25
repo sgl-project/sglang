@@ -1892,6 +1892,192 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
+    def test_unfinished_req_frees_matched_overlap_after_deferred_insert(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 8)
+        self._insert(tree, allocator, req_to_token_pool, tokens)
+        cached = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(cached.device_indices), len(tokens))
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        fresh_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, len(tokens))), fresh_indices
+        )
+        req.kv_committed_len = len(tokens)
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = 0
+
+        full_available_before = allocator.full_attn_allocator.available_size()
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            tree.cache_unfinished_req(req)
+
+        self.assertTrue(torch.equal(req.prefix_indices, cached.device_indices))
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available_before + len(tokens),
+            "fresh duplicate full KV should be freed after match_prefix replaces it",
+        )
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
+    def test_swa_unfinished_req_keeps_unmatched_tombstone_overlap_tail(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 30)
+        self._insert(tree, allocator, req_to_token_pool, tokens)
+
+        def node_at_prefix(prefix_len: int):
+            node = tree.root_node
+            pos = 0
+            while pos < prefix_len:
+                suffix = RadixKey(array("q", tokens[pos:]))
+                child = node.children[suffix.child_key(tree.page_size)]
+                child_end = pos + len(child.key)
+                if child_end > prefix_len:
+                    child = tree._split_node(child.key, child, prefix_len - pos)
+                    child_end = prefix_len
+                node = child
+                pos = child_end
+            return node
+
+        node_at_prefix(20)
+        tombstone_node = node_at_prefix(23)
+        self.assertGreater(len(tombstone_node.children), 0)
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_component_and_detach_lru(
+            tombstone_node,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+            tracker=tracker,
+        )
+        tree._update_evictable_leaf_sets(tombstone_node)
+
+        prefix_tokens = tokens[:23]
+        matched = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix_tokens)))
+        )
+        self.assertEqual(len(matched.device_indices), 20)
+        lock_result = tree.inc_lock_ref(matched.last_device_node)
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = prefix_tokens
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", prefix_tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        tail_indices = self._alloc(allocator, 3)
+        req_indices = torch.cat([matched.device_indices, tail_indices])
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, len(prefix_tokens))), req_indices
+        )
+        req.kv_committed_len = len(prefix_tokens)
+        req.last_node = matched.last_device_node
+        req.cache_protected_len = len(matched.device_indices)
+        req.prefix_indices = matched.device_indices
+        req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.extra_key = None
+        req.swa_evicted_seqlen = len(prefix_tokens)
+
+        full_available_before = allocator.full_attn_allocator.available_size()
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            tree.cache_unfinished_req(req)
+
+        self.assertEqual(len(req.prefix_indices), len(prefix_tokens))
+        self.assertTrue(torch.equal(req.prefix_indices[:20], matched.device_indices))
+        self.assertTrue(torch.equal(req.prefix_indices[20:], tail_indices))
+        self.assertEqual(req.cache_protected_len, len(matched.device_indices))
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available_before,
+            "unmatched out-of-window overlap must remain request-owned",
+        )
+
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        tree.sanity_check()
+
+    def test_swa_skipped_leaf_preserves_unfinished_full_value(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        tree, allocator, _ = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 3)
+        value = self._alloc(allocator, len(tokens))
+        self.assertIsNotNone(value)
+
+        allocator.free_swa(value)
+        full_available_after_alloc = allocator.full_attn_allocator.available_size()
+
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                swa_evicted_seqlen=len(tokens),
+                free_skipped_leaf_value=False,
+            )
+        )
+
+        self.assertEqual(result.prefix_len, 0)
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available_after_alloc,
+            "unfinished insert must keep skipped full KV owned by the request",
+        )
+
+        allocator.full_attn_allocator.free(value)
+        tree.sanity_check()
+
+    def test_swa_skipped_leaf_frees_finished_value(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        tree, allocator, _ = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 3)
+        value = self._alloc(allocator, len(tokens))
+        self.assertIsNotNone(value)
+        full_available_after_alloc = allocator.full_attn_allocator.available_size()
+
+        allocator.free_swa(value)
+
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                swa_evicted_seqlen=len(tokens),
+                free_skipped_leaf_value=True,
+            )
+        )
+
+        self.assertEqual(result.prefix_len, 0)
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available_after_alloc + len(tokens),
+            "finished insert should still release skipped full KV",
+        )
+        tree.sanity_check()
+
     def test_swa_sanity_check_passes_after_deep_match(self):
         if not self._swa_pinning_cfg_supported():
             self.skipTest("requires SWA-only config with node size >= cushion")

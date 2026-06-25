@@ -728,6 +728,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                free_skipped_leaf_value=True,
             )
 
             # components prepare insert data + return effective cache_len
@@ -798,6 +799,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            free_skipped_leaf_value=False,
+            free_insert_overlap_value=False,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -842,13 +845,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
-        new_prefix_len = result.prefix_len
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
         ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        if req.cache_protected_len < len(new_indices):
+            old_indices = kv_indices_orig[
+                req.cache_protected_len : len(new_indices)
+            ].to(device=new_indices.device)
+            replacement_indices = new_indices[req.cache_protected_len :]
+            duplicate_indices = old_indices[old_indices != replacement_indices]
+            if duplicate_indices.numel() > 0:
+                self.token_to_kv_pool_allocator.free(duplicate_indices)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -1146,7 +1153,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     consumed_from = min(consumed_from, comp_consumed_from)
 
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
-                if dup_start < consumed_from:
+                if params.free_insert_overlap_value and dup_start < consumed_from:
                     self.token_to_kv_pool_allocator.free(
                         value_slice[dup_start:consumed_from]
                     )
@@ -1169,10 +1176,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
                 for comp in self._components_tuple
             ):
-                # TODO: When leaf creation is skipped, We should release all component
-                # resources here or propagate a flag so that
-                # cleanup_after_caching_req can free them properly.
-                self.token_to_kv_pool_allocator.free(value)
+                if params.free_skipped_leaf_value:
+                    self.token_to_kv_pool_allocator.free(value)
                 return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True

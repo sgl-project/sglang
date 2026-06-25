@@ -67,6 +67,14 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    # Skipped leaf values are usually owned by the cache insert. Unfinished
+    # requests still own their full KV through ReqToTokenPool, so they opt out.
+    free_skipped_leaf_value: bool = True
+    # Existing-node overlaps are normally duplicate request KV and can be freed
+    # during insert. Unfinished SWA requests defer that decision until after
+    # match_prefix, because out-of-window full nodes can overlap without being a
+    # valid device prefix to lock.
+    free_insert_overlap_value: bool = True
 
 
 @dataclasses.dataclass
