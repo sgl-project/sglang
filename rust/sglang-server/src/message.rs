@@ -69,9 +69,9 @@ pub struct Request {
 pub fn control_req_msgpack(tag: &str, rid: &str) -> Result<Bytes, Error> {
     use rmpv::Value;
     let arr = Value::Array(vec![
-        Value::from(tag),       // struct tag
-        Value::from(rid),       // rid
-        Value::Nil,             // http_worker_ipc
+        Value::from(tag), // struct tag
+        Value::from(rid), // rid
+        Value::Nil,       // http_worker_ipc
     ]);
     let mut buf = Vec::new();
     rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;

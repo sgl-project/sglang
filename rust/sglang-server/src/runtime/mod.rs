@@ -368,12 +368,18 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
         };
         let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         let rxs = Arc::new(std::sync::Mutex::new(detok_rx)); // drained once at spawn
-        spawn_pinned_pool("detok", cfg.detokenizer_worker_num, detok_cores, &mut threads, {
-            move |i| {
-                let rx = rxs.lock().unwrap()[i].clone();
-                detokenizer::run_shard(i, rx, backend.clone());
-            }
-        });
+        spawn_pinned_pool(
+            "detok",
+            cfg.detokenizer_worker_num,
+            detok_cores,
+            &mut threads,
+            {
+                move |i| {
+                    let rx = rxs.lock().unwrap()[i].clone();
+                    detokenizer::run_shard(i, rx, backend.clone());
+                }
+            },
+        );
     }
 
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---

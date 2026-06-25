@@ -44,7 +44,9 @@ fn on_ingress(
     skip_tokenizer_init: bool,
 ) {
     // Received → Validating
-    let _ = req.state.apply(Event::Validated(ValidationOutcome::NeedsTokenize));
+    let _ = req
+        .state
+        .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
 
     // Register the egress sink with the owning detok shard *before* the request
     // leaves Rust, so the response (generate chunks or a control result) has a
@@ -65,7 +67,9 @@ fn on_ingress(
     // Control requests reuse this FSM but skip tokenization entirely: validate
     // straight to Queued and push the bare `[tag, rid, nil]` control message.
     if let RequestKind::Control(tag) = req.kind {
-        let _ = req.state.apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
+        let _ = req
+            .state
+            .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
         push_control_to_ring(req, ingress, tag);
         return;
     }
@@ -78,7 +82,9 @@ fn on_ingress(
         if !req.payload.already_tokenized() {
             fail(
                 &mut req,
-                Error::Tokenize("skip_tokenizer_init is set: request must provide input_ids".into()),
+                Error::Tokenize(
+                    "skip_tokenizer_init is set: request must provide input_ids".into(),
+                ),
             );
             return;
         }

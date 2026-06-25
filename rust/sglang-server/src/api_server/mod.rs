@@ -141,7 +141,10 @@ async fn submit(
 /// (minus tokenization) and await the scheduler's single msgpack `Result`. The
 /// scheduler pushes a *named map* (`structs.asdict` of the response struct).
 /// Returns the raw msgpack bytes, or an error `Response` to return as-is.
-async fn await_control_result(state: &AppState, tag: &'static str) -> Result<bytes::Bytes, Response> {
+async fn await_control_result(
+    state: &AppState,
+    tag: &'static str,
+) -> Result<bytes::Bytes, Response> {
     let mut rx = submit(state, RequestKind::Control(tag), GeneratePayload::default())
         .await
         .map_err(|()| (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())?;
@@ -193,7 +196,11 @@ async fn server_info(State(state): State<AppState>) -> Response {
         Ok(json) => (StatusCode::OK, [("content-type", "application/json")], json).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "server_info: shaping failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "bad server_info response").into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bad server_info response",
+            )
+                .into_response()
         }
     }
 }
@@ -226,10 +233,7 @@ fn msgpack_to_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&val).map_err(|e| e.to_string())
 }
 
-async fn generate(
-    State(state): State<AppState>,
-    Json(payload): Json<GeneratePayload>,
-) -> Response {
+async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePayload>) -> Response {
     let stream = payload.stream;
     let mut rx = match submit(&state, RequestKind::Generate, payload).await {
         Ok(rx) => rx,

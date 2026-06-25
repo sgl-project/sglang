@@ -6,6 +6,7 @@
 //! only GIL crossings are the two boundary methods on [`Server`]:
 //!   * `recv_requests` — Python scheduler thread drains the ingress ring.
 //!   * `push_chunk`    — Python scheduler thread pushes one output chunk.
+//!
 //! Both are non-blocking, so the GIL is never held across a wait.
 
 mod api_server;
@@ -51,6 +52,9 @@ impl Server {
         revision = None,
         server_args_json = "{}",
     ))]
+    // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
+    // surface (all optional overrides), not a call-site ergonomics problem.
+    #[allow(clippy::too_many_arguments)]
     fn start(
         bind: Option<String>,
         api_worker_num: Option<usize>,
@@ -94,15 +98,8 @@ impl Server {
             tokenizer_worker_num.unwrap_or_else(|| server_args.tokenizer_worker_num());
         let detokenizer_worker_num =
             detokenizer_worker_num.unwrap_or_else(|| server_args.detokenizer_worker_num());
-        let api_worker_num = api_worker_num.unwrap_or_else(|| {
-            max(
-                4,
-                max(
-                    (tokenizer_worker_num / 2) as usize,
-                    (detokenizer_worker_num / 2) as usize,
-                ),
-            )
-        });
+        let api_worker_num = api_worker_num
+            .unwrap_or_else(|| max(4, max(tokenizer_worker_num / 2, detokenizer_worker_num / 2)));
 
         let tokenizer_path = tokenizer_path.or_else(|| server_args.tokenizer_path());
         let revision = revision.or_else(|| server_args.revision());
