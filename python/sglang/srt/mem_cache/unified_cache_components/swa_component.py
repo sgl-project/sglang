@@ -169,6 +169,9 @@ class SWAComponent(TreeComponent):
         if not is_tombstone:
             return prefix_len
 
+        if params.defer_overlap_free:
+            return prefix_len
+
         swa_evicted_seqlen = params.swa_evicted_seqlen
         assert (
             node.component_data[self.component_type].lock_ref == 0

@@ -843,13 +843,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
-        new_prefix_len = result.prefix_len
+        self._rollback_unaccepted_unfinished_insert(
+            insert_params=insert_params,
+            result=result,
+            accepted_len=len(new_indices),
+            accepted_node=new_last_node,
+        )
+        if len(new_indices) < req.cache_protected_len:
+            result.insert_skipped = True
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req,
+                    is_finished=False,
+                    insert_result=result,
+                    insert_params=insert_params,
+                )
+            return
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
         ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
         for start, overlap_value in insert_params.deferred_overlap_values:
             matched_len = min(len(overlap_value), max(0, len(new_indices) - start))
             if matched_len > 0:
@@ -875,6 +888,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.swa_prefix_lock_released = False
 
         # cleanup
         for comp in self._components_tuple:
@@ -1123,6 +1137,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.priority = max(node.priority, priority)
 
             if node.evicted:
+                if params.defer_overlap_free:
+                    return InsertResult(
+                        prefix_len=total_prefix_length,
+                        mamba_exist=True,
+                        insert_skipped=True,
+                    )
                 self._unevict_node_on_insert(node, value[:prefix_len])
                 # FULL was restored from the request's fresh KV. Aux
                 # components (e.g. SWA) may still hold tombstones and need
@@ -1183,6 +1203,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # cleanup_after_caching_req can free them properly.
                 self.token_to_kv_pool_allocator.free(value)
                 return InsertResult(prefix_len=total_prefix_length)
+            params.created_node_records.append(
+                (total_prefix_length, node, key.child_key(self.page_size))
+            )
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
@@ -1260,6 +1283,97 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         result.inserted_host_node = new_node
         return result
+
+    def _forget_unfinished_component_value(
+        self, node: UnifiedTreeNode, component_type: ComponentType
+    ) -> None:
+        cd = node.component_data[component_type]
+        if cd.value is None:
+            return
+        assert cd.lock_ref == 0
+        lru = self.lru_lists[component_type]
+        if lru.in_list(node):
+            lru.remove_node(node)
+        self.component_evictable_size_[component_type] -= len(cd.value)
+        cd.value = None
+
+    def _forget_unfinished_subtree_values(self, node: UnifiedTreeNode) -> None:
+        for child in list(node.children.values()):
+            self._forget_unfinished_subtree_values(child)
+
+        for component_type in self.tree_components:
+            self._forget_unfinished_component_value(node, component_type)
+            host_cd = node.component_data[component_type]
+            if host_cd.host_value is not None:
+                host_lru = self.host_lru_lists[component_type]
+                if host_lru.in_list(node):
+                    host_lru.remove_node(node)
+                host_cd.host_value = None
+        self.evictable_device_leaves.discard(node)
+        self.evictable_host_leaves.discard(node)
+        node.children.clear()
+        node.parent = None
+
+    def _single_path_subtree_len(self, node: UnifiedTreeNode) -> int:
+        total_len = len(node.key)
+        while len(node.children) == 1:
+            node = next(iter(node.children.values()))
+            total_len += len(node.key)
+        return total_len
+
+    def _detach_unfinished_subtree(self, node: UnifiedTreeNode) -> None:
+        parent = node.parent
+        assert parent is not None
+        key = node.key.child_key(self.page_size)
+        assert parent.children.get(key) is node
+        parent.children.pop(key)
+        self._forget_unfinished_subtree_values(node)
+        self._update_evictable_leaf_sets(parent)
+
+    def _detach_unaccepted_created_suffix(
+        self,
+        root: UnifiedTreeNode,
+        start_len: int,
+        accepted_len: int,
+    ) -> None:
+        if accepted_len <= start_len:
+            self._detach_unfinished_subtree(root)
+            return
+
+        node = root
+        node_start = start_len
+        while node_start + len(node.key) < accepted_len:
+            assert len(node.children) == 1
+            node_start += len(node.key)
+            node = next(iter(node.children.values()))
+
+        node_end = node_start + len(node.key)
+        if node_end == accepted_len:
+            for child in list(node.children.values()):
+                self._detach_unfinished_subtree(child)
+            self._update_evictable_leaf_sets(node)
+            return
+
+        keep_node = self._split_node(node.key, node, accepted_len - node_start)
+        self._detach_unfinished_subtree(node)
+        self._update_evictable_leaf_sets(keep_node)
+
+    def _rollback_unaccepted_unfinished_insert(
+        self,
+        insert_params: InsertParams,
+        result: InsertResult,
+        accepted_len: int,
+        accepted_node: UnifiedTreeNode,
+    ) -> None:
+        for start_len, parent, child_key in reversed(insert_params.created_node_records):
+            root = parent.children.get(child_key)
+            if root is None:
+                continue
+            created_end = start_len + self._single_path_subtree_len(root)
+            if accepted_len >= created_end:
+                continue
+            self._detach_unaccepted_created_suffix(root, start_len, accepted_len)
+            result.insert_skipped = True
 
     # ---- Evict Helpers ----
 
