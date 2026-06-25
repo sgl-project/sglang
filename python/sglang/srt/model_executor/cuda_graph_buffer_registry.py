@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt import platforms
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
@@ -513,6 +514,7 @@ def build_decode_registry(
     max_num_token: int,
     seq_len_fill_value: int,
     cache_loc_dtype: torch.dtype,
+    position_dtype: Optional[torch.dtype] = None,
     enable_mamba_track: bool = False,
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
@@ -562,12 +564,18 @@ def build_decode_registry(
     def _bs(bs: int, _mt: int) -> Tuple[int, ...]:
         return (bs,)
 
+    positions_dtype = position_dtype
+    if positions_dtype is None and source is not None:
+        positions_dtype = source.positions.dtype
+    if positions_dtype is None:
+        positions_dtype = platforms.current_platform.get_position_dtype()
+
     slots = [
         GraphSlot("input_ids", _tokens, torch.int64, axis="tokens"),
         GraphSlot(
             "positions",
             _tokens,
-            torch.int64,
+            positions_dtype,
             axis="tokens",
             padding_policy=PaddingPolicy.ZERO,
         ),

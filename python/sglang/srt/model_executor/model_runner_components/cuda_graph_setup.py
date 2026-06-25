@@ -242,6 +242,16 @@ def refresh_deep_gemm_layout_memory_budget(
     )
 
 
+def _should_capture_decode_graph(model_runner: ModelRunner) -> bool:
+    return model_runner.device in (
+        "cuda",
+        "musa",
+        "cpu",
+        "npu",
+        "xpu",
+    ) or current_platform.support_cuda_graph()
+
+
 def capture_cuda_graphs(
     *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
 ) -> CudaGraphsCapture:
@@ -280,13 +290,8 @@ def capture_cuda_graphs(
         memory_usage_gb=0,
         capture_time=0,
     )
-    if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
-            decode = capture_decode_graph(model_runner=model_runner)
+    if capture_decode_cuda_graph and _should_capture_decode_graph(model_runner):
+        decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -572,6 +577,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
             "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
+            "mlu": "MLU graph",
         },
     )
     role = "draft" if model_runner.is_draft_worker else "target"
@@ -591,17 +597,19 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
 
     if current_platform.is_out_of_tree():
         GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(model_runner)
     else:
-        graph_runners = defaultdict(
-            model_runner._decode_cuda_graph_runner_cls,
-            {
-                "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
-                "xpu": XPUGraphRunner,
-            },
-        )
-        runner = graph_runners[model_runner.device](model_runner)
+        graph_runners = {
+            "cpu": CPUGraphRunner,
+            "npu": NPUGraphRunner,
+            "xpu": XPUGraphRunner,
+        }
+        GraphRunnerCls = graph_runners.get(model_runner.device)
+        if GraphRunnerCls is None:
+            # Platform-declared runner (e.g. MLU) wins over the default.
+            GraphRunnerCls = current_platform.get_graph_runner_cls()
+        if GraphRunnerCls is None:
+            GraphRunnerCls = model_runner._decode_cuda_graph_runner_cls
+    runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem
