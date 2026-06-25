@@ -1,13 +1,13 @@
 #pragma once
 
-#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/cta.cuh>      // For cta::reduce_max
-#include <sgl_kernel/math.cuh>     // For math::max/min/abs, FP8_E4M3_MAX
-#include <sgl_kernel/runtime.cuh>  // For runtime::get_blocks_per_sm / get_sm_count
-#include <sgl_kernel/utils.cuh>    // For LaunchKernel, fp8_e4m3_t, type aliases
-#include <sgl_kernel/vec.cuh>      // For AlignedVector
+#include <sgl_kernel/cta.cuh>
+#include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
 
 #include <cooperative_groups.h>
 #include <cstdint>

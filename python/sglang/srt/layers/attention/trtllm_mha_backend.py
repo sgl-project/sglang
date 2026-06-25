@@ -824,7 +824,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
             if use_fused_fp8_path:
-                # Use fused FP8 quantization + KV cache write path
                 self._fused_fp8_set_kv_buffer(
                     q=q,
                     k=k,
@@ -835,7 +834,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 k = None
                 v = None
             else:
-                # Use original set_kv_buffer path
                 if save_kv_cache and k is not None:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -846,8 +844,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         layer.v_scale,
                     )
 
-            # For XQA, q_dtype should be bf16. TRT-LLM-GEN uses FP8 Q; dynamically
-            # quantize it and pass the descale into BMM1 instead of unscaled casting.
             q, q_scale = self._maybe_quantize_q(q)
             bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
@@ -917,7 +913,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
             if use_fused_fp8_path:
-                # Use fused FP8 quantization + KV cache write path
                 self._fused_fp8_set_kv_buffer(
                     q=q,
                     k=k,
@@ -928,7 +923,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 k = None
                 v = None
             else:
-                # Use original set_kv_buffer path
                 if save_kv_cache and k is not None:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
