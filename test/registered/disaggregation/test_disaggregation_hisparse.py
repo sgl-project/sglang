@@ -142,7 +142,6 @@ class TestDisaggregationDSV4HiSparseNixl(TestDisaggregationDSV4HiSparseBase):
         PDDisaggregationServerBase.setUpClass.__func__(cls)
 
         cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-        cls.rdma_devices = []
         cls.model = try_cached_model(DSV4_FLASH_MODEL)
 
         cls.start_prefill()
