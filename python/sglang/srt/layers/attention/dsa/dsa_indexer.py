@@ -1022,6 +1022,37 @@ class Indexer(MultiPlatformOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
+        if (
+            _is_cuda
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not metadata.force_unfused_topk
+        ):
+            from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+                TopkTransformMethod,
+            )
+            from sglang.srt.layers.attention.dsa.transform_index import (
+                write_dsa_only_k_topk_paged,
+            )
+
+            if metadata.topk_transform_method == TopkTransformMethod.PAGED:
+                token_to_batch_idx = metadata.get_token_to_batch_idx()
+                if token_to_batch_idx is not None:
+                    should_return = topk_result is None
+                    if should_return:
+                        topk_result = torch.empty(
+                            (seq_lens_expanded.shape[0], self.index_topk),
+                            dtype=torch.int32,
+                            device=x_meta.device,
+                        )
+                    write_dsa_only_k_topk_paged(
+                        page_table=metadata.get_page_table_1(),
+                        lengths=seq_lens_expanded,
+                        token_to_batch_idx=token_to_batch_idx,
+                        output=topk_result,
+                        topk=self.index_topk,
+                    )
+                    return topk_result if should_return else None
+
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
             self.index_topk,
@@ -1032,6 +1063,7 @@ class Indexer(MultiPlatformOp):
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.
+            topk_result.fill_(-1)
             topk_result[: raw_topk_result.shape[0]] = raw_topk_result
             return None
         return raw_topk_result
@@ -1448,16 +1480,28 @@ class Indexer(MultiPlatformOp):
             # instead of capturing it piecemeal in the graph.
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
+            graph_k_only = return_indices and (
+                self._should_skip_logits_computation(forward_batch)
+                and not self.dsa_enable_prefill_cp
+            )
             if return_indices:
-                topk_result = torch.full(
-                    (x.shape[0], self.index_topk),
-                    -1,
-                    device=x.device,
-                    dtype=torch.int32,
+                topk_result = (
+                    torch.empty(
+                        (x_meta.shape[0], self.index_topk),
+                        device=x_meta.device,
+                        dtype=torch.int32,
+                    )
+                    if graph_k_only
+                    else torch.full(
+                        (x_meta.shape[0], self.index_topk),
+                        -1,
+                        device=x_meta.device,
+                        dtype=torch.int32,
+                    )
                 )
             else:
                 topk_result = torch.empty(
-                    (0, self.index_topk), device=x.device, dtype=torch.int32
+                    (0, self.index_topk), device=x_meta.device, dtype=torch.int32
                 )
             graph_dispatch_fn = (
                 bcg_dsa_indexer_prefill_split
