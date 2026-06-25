@@ -1,12 +1,23 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
+
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+_is_hip = is_hip()
+
+
+class AttentionAndMoeLayers(NamedTuple):
+    attention_layers: list[Any]
+    moe_layers: list[Any]
+    moe_fusions: list[Any]
+    dsa_indexers: list[Any]
 
 
 class _PPLayerRange(msgspec.Struct, frozen=True, kw_only=True):
