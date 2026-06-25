@@ -482,6 +482,7 @@ class DeepseekV4AttnBackend(
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
+        self.swa_page_size = 128
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
         self.page_size = model_runner.page_size
@@ -489,7 +490,6 @@ class DeepseekV4AttnBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
-        self.swa_page_size = self.token_to_kv_pool.swa_page_size
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
@@ -1677,7 +1677,7 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         is_prefill: bool = False,
     ) -> DSV4AttnMetadata:
-        assert self.swa_page_size % SWA_WINDOW == 0
+        assert self.swa_page_size == SWA_WINDOW
 
         seq_lens_casual = seq_lens_casual.to(torch.int32)
 

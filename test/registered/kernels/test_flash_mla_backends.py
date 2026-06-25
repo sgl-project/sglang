@@ -53,6 +53,8 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 # Per-token byte layout
 _BYTES_PER_TOKEN = _NOPE_ROPE_STRIDE + _SCALE_STRIDE  # 576 + 8 = 584
 
+_IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
+
 
 def _build_kvcache(
     num_pages: int,
@@ -179,6 +181,7 @@ def _build_q_indices(
     return q, indices
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestGatherAndDequant(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -228,6 +231,7 @@ class TestGatherAndDequant(CustomTestCase):
         )
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestSparseDecodeTritonVsTorch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -340,6 +344,7 @@ class TestSparseDecodeTritonVsTorch(CustomTestCase):
         )
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestApplyAttnSink(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -382,6 +387,7 @@ class TestApplyAttnSink(CustomTestCase):
         )
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestMergePartialAttn(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -423,6 +429,7 @@ class TestMergePartialAttn(CustomTestCase):
         torch.testing.assert_close(merged_lse, lse1, atol=1e-5, rtol=1e-5)
 
 
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestEntryPointDispatch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
