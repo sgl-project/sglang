@@ -26,11 +26,12 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
-    """Sync fixed-size HiCache token capacity across distributed ranks.
+    """Sync fixed-size HiCache token capacity across PP ranks.
 
     A fixed --hicache-size is specified in GB, but each PP stage may have a
     different bytes/token because it owns different layers. Use the global
-    minimum token capacity so all stages expose the same host-cache capacity.
+    minimum token capacity within the PP group so all stages expose the same
+    host-cache capacity.
     Ratio-based sizing already derives from the synced device pool size.
     """
     if host_size <= 0 or not torch.distributed.is_available():
@@ -40,20 +41,20 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.distributed.parallel_state import get_world_group
+        from sglang.srt.distributed.parallel_state import get_pp_group
 
-        world_group = get_world_group()
+        pp_group = get_pp_group()
     except AssertionError:
         return size
 
-    if world_group.world_size <= 1:
+    if pp_group.world_size <= 1:
         return size
 
     tensor = torch.tensor(size, dtype=torch.int64)
     torch.distributed.all_reduce(
         tensor,
         op=torch.distributed.ReduceOp.MIN,
-        group=world_group.cpu_group,
+        group=pp_group.cpu_group,
     )
     synced_size = int(tensor.item())
 
