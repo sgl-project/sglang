@@ -4327,7 +4327,7 @@ class ServerArgs:
                 ):
                     self.quantization = quant_method
                 if (
-                    self.quantization == "modelopt_fp4"
+                    self.quantization in {"modelopt_fp4", None}
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):

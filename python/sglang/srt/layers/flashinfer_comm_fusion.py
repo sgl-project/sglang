@@ -59,6 +59,8 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
                 "FlashInfer allreduce fusion does not support multi-node on "
                 "non-Blackwell systems."
             )
+        if is_sm100_supported():
+            return "mnnvl"
         return "trtllm"
 
     if backend == "trtllm" and is_multi_node:
