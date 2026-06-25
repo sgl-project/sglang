@@ -39,13 +39,13 @@ class WeightExporter:
 
         ports_list = ports.split(",")
         assert (
-            len(ports_list) == self._model_runner.tp_size
-        ), f"Expected {self._model_runner.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self._model_runner.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self._model_runner.tp_rank}"
+            len(ports_list) == self._model_runner.ps.tp_size
+        ), f"Expected {self._model_runner.ps.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self._model_runner.ps.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self._model_runner.ps.tp_rank}"
 
         logger.info(
-            f"init custom process group: tp_rank={self._model_runner.tp_rank}, gpu_id={self._model_runner.gpu_id}, master_address={master_address}, master_port={group_port}, "
+            f"init custom process group: tp_rank={self._model_runner.ps.tp_rank}, gpu_id={self._model_runner.gpu_id}, master_address={master_address}, master_port={group_port}, "
             f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
@@ -85,10 +85,10 @@ class WeightExporter:
 
         ports_list = ports.split(",")
         assert (
-            len(ports_list) == self._model_runner.tp_size
-        ), f"Expected {self._model_runner.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self._model_runner.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self._model_runner.tp_rank}"
+            len(ports_list) == self._model_runner.ps.tp_size
+        ), f"Expected {self._model_runner.ps.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self._model_runner.ps.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self._model_runner.ps.tp_rank}"
 
         if self._weights_send_group[group_name] is not None:
             send_group = self._weights_send_group[group_name]
@@ -152,7 +152,7 @@ class WeightExporter:
         # TODO: (chenyang) Add support for Qwen models.
         try:
             return self._model_runner.model.get_weights_by_name(
-                name, truncate_size, tp_size=self._model_runner.tp_size
+                name, truncate_size, tp_size=self._model_runner.ps.tp_size
             )
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")

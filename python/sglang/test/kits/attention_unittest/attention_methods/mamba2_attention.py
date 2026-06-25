@@ -286,6 +286,7 @@ class TinyMamba2ModelConfig:
             architectures=["TinyMamba2ForCausalLM"],
             mamba_chunk_size=case.mamba_chunk_size,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
 
     def get_num_kv_heads(self, tp_size: int) -> int:
@@ -311,6 +312,9 @@ class MockMamba2ModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.ps = SimpleNamespace(
+            tp_size=1, dp_size=1, pp_size=1, tp_rank=0, pp_rank=0, dp_rank=0, gpu_id=0
+        )
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
