@@ -7,6 +7,7 @@ export const DeepSeekR1BasicDeployment = () => {
         { id: 'h100', label: 'H100', default: false },
         { id: 'h200', label: 'H200', default: false },
         { id: 'b200', label: 'B200', default: true },
+        { id: 'b300', label: 'B300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
@@ -136,6 +137,18 @@ export const DeepSeekR1BasicDeployment = () => {
     if (hardware === 'b200' || (hardware === 'mi355x' && quantization === 'fp8')) {
       command +=
         ' \\\n  --kv-cache-dtype fp8_e4m3 # Optional: enables fp8 kv cache and fp8 attention kernels to improve performance';
+    }
+
+    if (hardware === 'b300') {
+      command += ' \\\n  --kv-cache-dtype fp8_e4m3';
+      command += ' \\\n  --attention-backend flashinfer';
+      command += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+      if (quantization === 'fp4') {
+        command += ' \\\n  --moe-runner-backend flashinfer_cutlass';
+      }
+      if (quantization === 'fp4' || strategyValues.includes('mtp')) {
+        command += ' \\\n  --mem-fraction-static 0.85';
+      }
     }
 
     if (isXeon) {

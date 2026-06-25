@@ -127,9 +127,77 @@ def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     return config.index_head_dim
 
 
+def is_minimax_sparse(config: PretrainedConfig) -> bool:
+    arch = (config.architectures or [None])[0]
+    return arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    )
+
+
+def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
+    text_cfg = getattr(config, "text_config", None)
+    cfg = (
+        getattr(text_cfg, "sparse_attention_config", None)
+        if text_cfg is not None
+        else None
+    )
+    if cfg is None:
+        cfg = getattr(config, "sparse_attention_config", None)
+    if cfg is None:
+        raise ValueError("Could not find sparse config. Is it MiniMax M3 Sparse model?")
+    return cfg
+
+
+def get_minimax_sparse_layer_ids(sparse_cfg: dict) -> tuple[list[int], list[int]]:
+    sparse_freq = sparse_cfg["sparse_attention_freq"]
+    dense_layer_ids = [i for i, f in enumerate(sparse_freq) if f == 0]
+    sparse_layer_ids = [i for i, f in enumerate(sparse_freq) if f != 0]
+    return dense_layer_ids, sparse_layer_ids
+
+
+def get_minimax_sparse_disable_value_layer_ids(sparse_cfg: dict) -> list[int]:
+    flags = sparse_cfg.get("sparse_disable_index_value")
+    if flags is None:
+        return []
+    return [i for i, f in enumerate(flags) if f != 0]
+
+
+def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
+    score_type = sparse_cfg.get("sparse_score_type", "max")
+    assert score_type in (
+        "max",
+        "lse",
+    ), f"sparse_score_type must be 'max' or 'lse', got {score_type!r}"
+    return score_type
+
+
 def get_dsa_index_topk(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_topk
+
+
+def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer reuses the previous layer's top-k indices."""
+    assert is_deepseek_dsa(config)
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", 1)
+    if freq is None:
+        freq = 1
+    assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        assert offset > 0, (
+            "index_skip_topk_offset must be positive; offset <= 0 "
+            "marks layer 0 as skip_topk with no prior topk to reuse"
+        )
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
@@ -279,6 +347,28 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
+        # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
+        self.nvfp4_moe_meta: Optional[dict] = None
+        hybrid_quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if hybrid_quant_cfg is not None and not isinstance(hybrid_quant_cfg, dict):
+            hybrid_quant_cfg = hybrid_quant_cfg.to_dict()
+        if (
+            hybrid_quant_cfg is not None
+            and str(hybrid_quant_cfg.get("quant_algo", "")).upper() == "MIXED_PRECISION"
+            and str(hybrid_quant_cfg.get("moe_quant_algo", "")).upper() == "NVFP4"
+            and hybrid_quant_cfg.get("group_size") is not None
+        ):
+            self.nvfp4_moe_meta = {
+                "group_size": int(hybrid_quant_cfg["group_size"]),
+                "exclude_modules": list(hybrid_quant_cfg.get("ignore") or []),
+            }
+            logger.info(
+                "Auto-detected hybrid FP8+NVFP4 checkpoint "
+                "(NVFP4 MoE group_size=%d, %d exclude_modules)",
+                self.nvfp4_moe_meta["group_size"],
+                len(self.nvfp4_moe_meta["exclude_modules"]),
+            )
+
         # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -333,8 +423,23 @@ class ModelConfig:
             self.hf_config.architectures
         )
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or (
+                self.is_multimodal
+                and not is_multimodal_piecewise_cuda_graph_supported(
+                    self.hf_config.architectures
+                )
+            )
+        )
+        # Multimodal archs whose language-model prefill is verified safe to capture
+        # under piecewise CUDA graph. ServerArgs otherwise disables prefill piecewise
+        # CG for every multimodal model; this opt-in re-enables it for listed archs
+        # (the vision encoder still runs eagerly via general_mm_embed_routine, only the
+        # LM forward is captured).
+        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1162,6 +1267,7 @@ class ModelConfig:
             "petit_nvfp4",
             "quark",
             "mxfp4",
+            "mxfp8",
             "auto-round",
             "quark_int4fp8_moe",
             "quark_mxfp4",
@@ -1268,11 +1374,16 @@ class ModelConfig:
                         f"({self.quantization})."
                     )
 
-            # Check if the scale_fmt is ue8m0, and warn user if deepgemm is enabled for non-ue8m0 models on blackwell
+            # Warn if DeepGemm is enabled for a non-ue8m0 checkpoint on Blackwell.
+            # MXFP8 stores E8M0 block scales that DeepGemm consumes losslessly, so skip the warning there.
             self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
             from sglang.srt.layers import deep_gemm_wrapper
 
-            if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if (
+                not self.use_scale_ue8m0
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and self.quantization != "mxfp8"
+            ):
                 logger.warning(
                     "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
                 )
@@ -1536,6 +1647,7 @@ multimodal_model_archs = [
     "Cohere2VisionForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
+    "MiniMaxM3SparseForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
@@ -1606,6 +1718,14 @@ piecewise_cuda_graph_disabled_model_archs = [
     "LLaDAModelLM",
 ]
 
+# Multimodal archs allowed to keep prefill piecewise CUDA graph enabled. The
+# generic "multimodal model" rule in ServerArgs disables prefill piecewise CG for
+# all multimodal models; archs here opt back in because their LM prefill captures
+# cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
+multimodal_piecewise_cuda_graph_supported_model_archs = [
+    "Cohere2VisionForConditionalGeneration",
+]
+
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)
 
@@ -1660,6 +1780,22 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
 def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
     return any(
         arch in piecewise_cuda_graph_disabled_model_archs
+        for arch in model_architectures
+    )
+
+
+# Multimodal archs whose LM-decoder prefill is validated under piecewise CUDA
+# graph (capture wraps only the decoder; the image encoder runs eager).
+multimodal_piecewise_cuda_graph_supported_archs = [
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+]
+
+
+def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
+    return any(
+        arch in multimodal_piecewise_cuda_graph_supported_model_archs
         for arch in model_architectures
     )
 
@@ -1724,6 +1860,13 @@ def is_hybrid_swa_model(
         "LagunaForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
+        # Only treat Laguna as hybrid SWA when it actually has a sliding window.
+        if (
+            "LagunaForCausalLM" in model_architectures
+            and hf_text_config is not None
+            and not getattr(hf_text_config, "sliding_window", 0)
+        ):
+            return False
         return True
     # Also recognize models that explicitly opt-in via their HF text config,
     # so custom hybrid-SWA architectures don't need to be added to the allowlist.

@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.triton_ops.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
+from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -812,18 +814,26 @@ class FlashAttentionBackend(AttentionBackend):
                 elif is_cp_mode:
                     # Dense-MHA CP: k, v are still rank-local; backend
                     # all-gathers and writes to the per-rank pool.
-                    cp_allgather_and_save_kv_cache(
-                        forward_batch,
-                        layer,
-                        k,
-                        v,
-                        self.attn_cp_size,
-                        swa_loc=(
-                            self.forward_metadata.swa_out_cache_loc
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
+                    swa_loc = (
+                        self.forward_metadata.swa_out_cache_loc
+                        if self.use_sliding_window_kv_pool
+                        else None
                     )
+                    if is_cp_v2_active(forward_batch):
+                        cp_strategy = get_cp_strategy()
+                        assert cp_strategy is not None
+                        cp_strategy.materialize_full_kv(
+                            forward_batch, layer, k, v, swa_loc=swa_loc
+                        )
+                    else:
+                        cp_allgather_and_save_kv_cache(
+                            forward_batch,
+                            layer,
+                            k,
+                            v,
+                            self.attn_cp_size,
+                            swa_loc=swa_loc,
+                        )
                 else:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
@@ -968,12 +978,24 @@ class FlashAttentionBackend(AttentionBackend):
                         **kwargs,
                     )
 
-                result = cp_attn_forward_extend(
-                    forward_batch,
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.device,
-                    _fa_cp_attn,
-                )
+                q_cp = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                if is_cp_v2_active(forward_batch):
+                    cp_strategy = get_cp_strategy()
+                    assert cp_strategy is not None
+                    result = cp_strategy.run_attention(
+                        q_cp,
+                        forward_batch,
+                        self.device,
+                        _fa_cp_attn,
+                        attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
+                    )
+                else:
+                    result = cp_attn_forward_extend(
+                        forward_batch,
+                        q_cp,
+                        self.device,
+                        _fa_cp_attn,
+                    )
             elif self.fa_skip_kv_cache:
                 # Embedding mode: skip KV cache read and use raw K/V tensors
                 # directly via flash_attn_varlen_func. The KV cache write is
