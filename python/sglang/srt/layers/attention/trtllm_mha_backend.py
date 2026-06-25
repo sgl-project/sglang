@@ -730,7 +730,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else 1.0
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        v_scale = (
+            layer.v_scale_float
+            if getattr(layer, "v_scale_float", None) is not None
+            else 1.0
+        )
+        # bmm2_scale is applied to the PV matmul, so FP8 V cache reads need the V descale.
+        bmm2_scale = v_scale
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -815,7 +821,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else 1.0
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        v_scale = (
+            layer.v_scale_float
+            if getattr(layer, "v_scale_float", None) is not None
+            else 1.0
+        )
+        # bmm2_scale is applied to the PV matmul, so FP8 V cache reads need the V descale.
+        bmm2_scale = v_scale
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
