@@ -14,7 +14,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from http import HTTPStatus
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Annotated, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -23,7 +23,7 @@ import torch
 import uvicorn
 import zmq
 import zmq.asyncio
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoProcessor
 
@@ -3856,7 +3856,7 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReq] = None):
+async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     if dp_dispatcher is not None:
         if obj is not None:
             obj.req_type = ProfileReqType.START_PROFILE

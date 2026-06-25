@@ -2448,8 +2448,8 @@ class Scheduler(
         req.tokenizer = self.tokenizer
 
         # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.image_inputs)
+        if recv_req.mm_inputs is not None:
+            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.
@@ -3793,9 +3793,13 @@ class Scheduler(
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
+
+        server_args = dict(vars(get_global_server_args()))
+        # This field is not serializable.
+        server_args.pop("model_config", None)
         return SetInternalStateReqOutput(
-            updated=True,
-            server_args=vars(get_global_server_args()),
+            updated=if_success,
+            server_args=server_args,
         )
 
     def save_remote_model(self, **kwargs):
