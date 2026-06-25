@@ -10,7 +10,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
 )
 from sglang.srt.layers.attention.minimax_sparse_ops.common.utils import (
     get_cu_seqblocks,
-    robust_allocator,
+    set_triton_allocator_if_available,
 )
 from sglang.srt.layers.attention.minimax_sparse_ops.prefill.flash_with_topk_idx import (
     _flash_attn_fwd_with_block_score_kernel,
@@ -55,7 +55,7 @@ def _flash_prefill_with_topk_index_npu(
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
-    triton.set_allocator(robust_allocator)
+    set_triton_allocator_if_available()
     assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
     assert k_cache.dtype == q.dtype
     assert cu_seqlens.dtype == torch.int32
