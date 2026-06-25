@@ -16,6 +16,7 @@ import copy
 import os
 import random
 import subprocess
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -30,11 +31,9 @@ from sglang.test.test_utils import (
     auto_config_device,
     is_in_ci,
     popen_launch_server,
+    read_output,
     write_github_step_summary,
 )
-
-STDERR_FILENAME = "/tmp/stderr.txt"
-STDOUT_FILENAME = "/tmp/stdout.txt"
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
@@ -622,26 +621,6 @@ def write_github_step_summary_once(summary: str):
     write_github_step_summary_once.has_written = True
     write_github_step_summary(summary)
 
-def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
-    """Print the output in real time with another thread."""
-    while not os.path.exists(filename):
-        time.sleep(0.01)
-
-    pt = 0
-    while pt >= 0:
-        if pt > 0 and not os.path.exists(filename):
-            break
-        try:
-            lines = open(filename).readlines()
-        except FileNotFoundError:
-            print(f"{pt=}, {os.path.exists(filename)=}")
-            raise
-        for line in lines[pt:]:
-            print(line, end="", flush=True)
-            output_lines.append(line)
-            pt += 1
-        time.sleep(0.1)
-
 def run_and_check_memory_leak(
     workload_func,
     disable_radix_cache,
@@ -668,36 +647,39 @@ def run_and_check_memory_leak(
     port = random.randint(4000, 5000)
     base_url = f"http://127.0.0.1:{port}"
 
-    # Create files and launch the server
-    stdout = open(STDOUT_FILENAME, "w")
-    stderr = open(STDERR_FILENAME, "w")
+    # Create temp files and launch the server
+    stdout_file = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, suffix=".stdout.txt"
+    )
+    stderr_file = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, suffix=".stderr.txt"
+    )
     process = popen_launch_server(
         model,
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
-        return_stdout_stderr=(stdout, stderr),
+        return_stdout_stderr=(stdout_file, stderr_file),
         api_key=api_key,
     )
 
     # Launch a thread to stream the output
     output_lines = []
-    t = threading.Thread(target=read_output, args=(output_lines,))
+    t = threading.Thread(target=read_output, args=(output_lines, stderr_file.name))
     t.start()
 
     # Run the workload
-    workload_func(base_url, model)
-
-    # Clean up everything
-    kill_process_tree(process.pid)
-    stdout.close()
-    stderr.close()
-    if os.path.exists(STDOUT_FILENAME):
-        os.remove(STDOUT_FILENAME)
-    if os.path.exists(STDERR_FILENAME):
-        os.remove(STDERR_FILENAME)
-    kill_process_tree(process.pid)
-    t.join()
+    try:
+        workload_func(base_url, model)
+    finally:
+        # Clean up everything
+        kill_process_tree(process.pid)
+        stdout_file.close()
+        stderr_file.close()
+        os.remove(stdout_file.name)
+        os.remove(stderr_file.name)
+        kill_process_tree(process.pid)
+        t.join()
 
     # Assert success
     has_new_server = False
