@@ -325,7 +325,24 @@ class MockModelRunner(ModelRunner):
         self.dp_size = 1
         self.pp_size = 1
         self.ps = SimpleNamespace(
-            tp_size=1, dp_size=1, pp_size=1, tp_rank=0, pp_rank=0, dp_rank=0, gpu_id=0
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=0,
+            dp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            attn_dp_rank=0,
+            attn_dp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            moe_dp_rank=0,
+            moe_dp_size=1,
+            dcp_size=1,
+            gpu_id=0,
         )
         self.is_draft_worker = False
         self.spec_algorithm = SpeculativeAlgorithm.NONE
