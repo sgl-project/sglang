@@ -1219,6 +1219,13 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
+        # Enable final norm fusion for the last layer: defer its MLP allreduce
+        # to be fused with the final model norm in one kernel call.
+        if self.pp_group.is_last_rank:
+            last_layer = self.layers[self._end_layer - 1]
+            if hasattr(last_layer, "layer_communicator"):
+                last_layer.layer_communicator._fuse_final_norm = True
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -1296,9 +1303,17 @@ class Qwen3_5ForCausalLM(nn.Module):
                 }
             )
 
-        # Apply final normalization
+        # Apply final normalization, fusing with deferred allreduce when possible
         if hidden_states.shape[0] != 0:
-            if residual is None:
+            if (
+                residual is not None
+                and getattr(hidden_states, "_sglang_needs_allreduce_fusion", False)
+                and hasattr(self.norm, "forward_with_allreduce_fusion")
+            ):
+                hidden_states, _ = self.norm.forward_with_allreduce_fusion(
+                    hidden_states, residual, use_attn_tp_group=True
+                )
+            elif residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)

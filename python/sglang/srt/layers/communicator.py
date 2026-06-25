@@ -776,7 +776,7 @@ class LayerCommunicator:
                     and get_global_server_args().enable_aiter_allreduce_fusion
                 )
             )
-            and (not self.is_last_layer)
+            and (not self.is_last_layer or self._fuse_final_norm)
             and (self._context.tp_size > 1)
         )
 
