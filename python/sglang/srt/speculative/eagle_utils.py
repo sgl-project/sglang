@@ -523,10 +523,17 @@ def eagle_sample(
             tree_speculative_sampling_target_only,
         )
 
-        # Apply temperature and get target probs
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
+        from sglang.srt.speculative.triton_ops.expand_sampling_params import (
+            expand_sampling_params,
+        )
+
+        # Fuse 3 repeat_interleave calls into a single Triton kernel launch
+        expanded_temperature, expanded_top_ks, expanded_top_ps = expand_sampling_params(
+            sampling_info.temperatures,
+            sampling_info.top_ks,
+            sampling_info.top_ps,
+            verify_input.draft_token_num,
+        )  # (bs * num_draft_tokens, 1), (bs * num_draft_tokens,), ...
 
         target_probs = F.softmax(
             next_token_logits / expanded_temperature, dim=-1
@@ -534,16 +541,12 @@ def eagle_sample(
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         target_probs = top_k_renorm_prob(
             target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
-            ),
+            expanded_top_ks,
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
         target_probs = top_p_renorm_prob(
             target_probs,
-            torch.repeat_interleave(
-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
-            ),
+            expanded_top_ps,
         )
         maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
