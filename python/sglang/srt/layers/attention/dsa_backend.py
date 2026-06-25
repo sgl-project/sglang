@@ -592,6 +592,37 @@ class DeepseekSparseAttnBackend(
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
+    def _refresh_paged_mqa_schedule_metadata(
+        self,
+        metadata: DSAMetadata,
+        seqlens_32_2d: torch.Tensor,
+    ) -> None:
+        schedule_metadata_out = getattr(
+            deep_gemm, "get_paged_mqa_logits_metadata_out", None
+        )
+        if (
+            metadata.paged_mqa_schedule_metadata is not None
+            and schedule_metadata_out is not None
+        ):
+            try:
+                schedule_metadata_out(
+                    seqlens_32_2d,
+                    metadata.paged_mqa_schedule_metadata,
+                    64,
+                    deep_gemm.get_num_sms(),
+                )
+                return
+            except (AttributeError, RuntimeError):
+                pass
+
+        new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            seqlens_32_2d, 64, deep_gemm.get_num_sms()
+        )
+        if metadata.paged_mqa_schedule_metadata is None:
+            object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
+        else:
+            metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
@@ -1472,15 +1503,7 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded,
                 bs,
             )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
-            )
-            if metadata.paged_mqa_schedule_metadata is None:
-                object.__setattr__(
-                    metadata, "paged_mqa_schedule_metadata", new_schedule
-                )
-            else:
-                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
@@ -1674,15 +1697,7 @@ class DeepseekSparseAttnBackend(
                     metadata.dsa_seqlens_expanded,
                     bs,
                 )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
-            )
-            if metadata.paged_mqa_schedule_metadata is None:
-                object.__setattr__(
-                    metadata, "paged_mqa_schedule_metadata", new_schedule
-                )
-            else:
-                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:

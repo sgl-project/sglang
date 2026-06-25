@@ -518,6 +518,117 @@ def test_apply_cuda_graph_metadata_decode_fused_wiring(monkeypatch):
     assert torch.equal(metadata.paged_mqa_schedule_metadata, ref_cache.view(-1, 1))
 
 
+def test_refresh_paged_mqa_schedule_metadata_uses_deepgemm_out(monkeypatch):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    schedule = torch.full((5, 2), -1, dtype=torch.int32, device=device)
+    seqlens_2d = torch.tensor([[4, 5], [6, 7]], dtype=torch.int32, device=device)
+    metadata = DSAMetadata(
+        page_size=1,
+        cache_seqlens_int32=torch.empty(2, dtype=torch.int32, device=device),
+        max_seq_len_q=1,
+        max_seq_len_k=8,
+        cu_seqlens_q=torch.empty(3, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.empty(3, dtype=torch.int32, device=device),
+        page_table_1=torch.empty((2, 8), dtype=torch.int32, device=device),
+        real_page_table=torch.empty((2, 8), dtype=torch.int32, device=device),
+        dsa_cache_seqlens_int32=torch.empty(2, dtype=torch.int32, device=device),
+        dsa_cu_seqlens_q=torch.empty(3, dtype=torch.int32, device=device),
+        dsa_cu_seqlens_k=torch.empty(3, dtype=torch.int32, device=device),
+        dsa_extend_seq_lens_list=[],
+        dsa_seqlens_expanded=torch.empty(2, dtype=torch.int32, device=device),
+        paged_mqa_schedule_metadata=schedule,
+    )
+    calls = []
+
+    class _FakeDeepGemm:
+        @staticmethod
+        def get_num_sms():
+            return 4
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata_out(
+            context_lens, schedule_metadata, block_kv, num_sms, indices=None
+        ):
+            calls.append((context_lens, block_kv, num_sms, indices))
+            schedule_metadata.copy_(
+                torch.arange(
+                    schedule_metadata.numel(),
+                    dtype=schedule_metadata.dtype,
+                    device=schedule_metadata.device,
+                ).view_as(schedule_metadata)
+            )
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata(*_args, **_kwargs):
+            raise AssertionError("allocating DeepGEMM metadata path should not run")
+
+    monkeypatch.setattr(dsa_backend_module, "deep_gemm", _FakeDeepGemm)
+
+    DeepseekSparseAttnBackend._refresh_paged_mqa_schedule_metadata(
+        DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend),
+        metadata,
+        seqlens_2d,
+    )
+
+    assert calls == [(seqlens_2d, 64, 4, None)]
+    assert torch.equal(
+        schedule,
+        torch.arange(schedule.numel(), dtype=schedule.dtype, device=device).view_as(
+            schedule
+        ),
+    )
+
+
+def test_refresh_paged_mqa_schedule_metadata_copies_without_deepgemm_out(monkeypatch):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    schedule = torch.full((5, 2), -1, dtype=torch.int32, device=device)
+    new_schedule = torch.arange(
+        schedule.numel(), dtype=schedule.dtype, device=device
+    ).view_as(schedule)
+    seqlens_2d = torch.tensor([[4, 5], [6, 7]], dtype=torch.int32, device=device)
+    metadata = DSAMetadata(
+        page_size=1,
+        cache_seqlens_int32=torch.empty(2, dtype=torch.int32, device=device),
+        max_seq_len_q=1,
+        max_seq_len_k=8,
+        cu_seqlens_q=torch.empty(3, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.empty(3, dtype=torch.int32, device=device),
+        page_table_1=torch.empty((2, 8), dtype=torch.int32, device=device),
+        real_page_table=torch.empty((2, 8), dtype=torch.int32, device=device),
+        dsa_cache_seqlens_int32=torch.empty(2, dtype=torch.int32, device=device),
+        dsa_cu_seqlens_q=torch.empty(3, dtype=torch.int32, device=device),
+        dsa_cu_seqlens_k=torch.empty(3, dtype=torch.int32, device=device),
+        dsa_extend_seq_lens_list=[],
+        dsa_seqlens_expanded=torch.empty(2, dtype=torch.int32, device=device),
+        paged_mqa_schedule_metadata=schedule,
+    )
+    calls = []
+
+    class _FakeDeepGemm:
+        @staticmethod
+        def get_num_sms():
+            return 4
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata(
+            context_lens, block_kv, num_sms, indices=None
+        ):
+            calls.append((context_lens, block_kv, num_sms, indices))
+            return new_schedule
+
+    monkeypatch.setattr(dsa_backend_module, "deep_gemm", _FakeDeepGemm)
+
+    DeepseekSparseAttnBackend._refresh_paged_mqa_schedule_metadata(
+        DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend),
+        metadata,
+        seqlens_2d,
+    )
+
+    assert calls == [(seqlens_2d, 64, 4, None)]
+    assert metadata.paged_mqa_schedule_metadata is schedule
+    assert torch.equal(schedule, new_schedule)
+
+
 def test_fused_metadata_runtime_lengths_do_not_recompile():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
