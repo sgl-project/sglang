@@ -136,10 +136,10 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
-    def format_is_torch_npu(
+    def format_is_ascend_tp(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[AscendTPDispatchOutput]:
-        return dispatch_output.format.is_torch_npu()
+        return dispatch_output.format.is_ascend_tp()
 
     @staticmethod
     def format_is_deepep_normal(
@@ -172,12 +172,12 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
-    TORCH_NPU = "torch_npu"
+    ASCEND_TP = "ascend_tp"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
 
-    def is_torch_npu(self) -> bool:
+    def is_ascend_tp(self) -> bool:
         return self == DispatchOutputFormat.ASCEND_TP
 
     def is_deepep_normal(self) -> bool:
