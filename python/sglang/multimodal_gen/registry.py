@@ -11,7 +11,6 @@ import dataclasses
 import importlib
 import os
 import pkgutil
-import sys
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -64,7 +63,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -77,6 +80,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -84,6 +88,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
     TurboWanI2V720Config,
+    TurboWanT2V1_3B480PConfig,
     TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
@@ -112,6 +117,9 @@ from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParam
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.krea2 import (
+    Krea2SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
@@ -131,6 +139,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -448,6 +457,7 @@ def _get_diffusers_model_info(
     works correctly even under the diffusers backend.
     """
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+        DIFFUSERS_TASK_TYPE_TO_CONFIG,
         DiffusersGenericPipelineConfig,
     )
     from sglang.multimodal_gen.configs.sample.diffusers_generic import (
@@ -460,36 +470,17 @@ def _get_diffusers_model_info(
     sampling_param_cls = DiffusersGenericSamplingParams
     pipeline_config_cls = DiffusersGenericPipelineConfig
 
-    # If there is a registered native config for this model, inherit its task_type
+    # If there is a registered native config for this model, inherit its task_type.
+    # We use pre-defined static subclasses instead of make_dataclass so the config
+    # class is pickle-safe for multiprocessing spawn (fixes #21453).
     if model_path is not None:
         config_info = _get_config_info(model_path, model_id=model_id)
         if config_info is not None:
             sampling_param_cls = config_info.sampling_param_cls
             native_task_type = config_info.pipeline_config_cls.task_type
             if native_task_type != DiffusersGenericPipelineConfig.task_type:
-                pipeline_config_cls = dataclasses.make_dataclass(
-                    "DiffusersGenericPipelineConfig",
-                    [
-                        (
-                            "task_type",
-                            type(native_task_type),
-                            dataclasses.field(default=native_task_type),
-                        )
-                    ],
-                    bases=(DiffusersGenericPipelineConfig,),
-                )
-                # make_dataclass sets __module__="types"; fix for pickle.
-                pipeline_config_cls.__module__ = (
-                    DiffusersGenericPipelineConfig.__module__
-                )
-                pipeline_config_cls.__qualname__ = (
-                    DiffusersGenericPipelineConfig.__qualname__
-                )
-                parent_module = sys.modules[DiffusersGenericPipelineConfig.__module__]
-                setattr(
-                    parent_module,
-                    DiffusersGenericPipelineConfig.__name__,
-                    pipeline_config_cls,
+                pipeline_config_cls = DIFFUSERS_TASK_TYPE_TO_CONFIG.get(
+                    native_task_type, DiffusersGenericPipelineConfig
                 )
                 logger.debug(
                     "Inherited task_type=%s from native config for diffusers backend",
@@ -645,7 +636,7 @@ def _register_configs():
     )
     register_configs(
         sampling_param_cls=LTX23SamplingParams,
-        pipeline_config_cls=LTX2PipelineConfig,
+        pipeline_config_cls=LTX23PipelineConfig,
         hf_model_paths=["Lightricks/LTX-2.3"],
         model_detectors=[
             lambda path: "ltx-2.3" in path.lower(),
@@ -684,7 +675,7 @@ def _register_configs():
     )
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
-        pipeline_config_cls=TurboWanT2V480PConfig,
+        pipeline_config_cls=TurboWanT2V1_3B480PConfig,
         hf_model_paths=[
             "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
         ],
@@ -857,6 +848,13 @@ def _register_configs():
             lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
         ],
     )
+    # Krea-2 (K2)
+    register_configs(
+        sampling_param_cls=Krea2SamplingParams,
+        pipeline_config_cls=Krea2PipelineConfig,
+        hf_model_paths=["krea/Krea-2"],
+        model_detectors=[lambda hf_id: "krea-2" in hf_id.lower()],
+    )
     # Qwen-Image
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
@@ -977,6 +975,20 @@ def _register_configs():
         ],
     )
 
+    # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
+    register_configs(
+        sampling_param_cls=SanaWMSamplingParams,
+        pipeline_config_cls=SanaWMPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-WM_bidirectional",
+            "Efficient-Large-Model/SANA-WM_streaming",
+        ],
+        model_detectors=[
+            # Match "sana-wm" or "sana_wm" but NOT plain T2I "sana" checkpoints.
+            lambda hf_id: ("sana-wm" in hf_id.lower() or "sana_wm" in hf_id.lower()),
+        ],
+    )
+
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
     # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
@@ -1005,7 +1017,13 @@ def _register_configs():
             "Efficient-Large-Model/Sana_1600M_512px_diffusers",
             "Efficient-Large-Model/Sana_600M_512px_diffusers",
         ],
-        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: (
+                "sana" in hf_id.lower()
+                and "sana-wm" not in hf_id.lower()
+                and "sana_wm" not in hf_id.lower()
+            )
+        ],
     )
 
     # FireRed-Image-Edit
