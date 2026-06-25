@@ -455,6 +455,7 @@ class LayerCommunicator:
         self.post_attention_layernorm = post_attention_layernorm
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
+        self._fuse_final_norm = False
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
 
