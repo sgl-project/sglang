@@ -821,8 +821,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
         select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
+            torch.arange(
+                0,
+                len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                device=self.device,
+            )
             + batch_result.accept_lens
             - 1
         )
