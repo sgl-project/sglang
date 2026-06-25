@@ -2122,8 +2122,8 @@ class ServerArgs:
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
                 "Defaults to auto. "
-                "'auto': choose trtllm on single-node systems and mnnvl on "
-                "SM100/SM103 multi-node systems. "
+                "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
+                "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
@@ -3578,8 +3578,7 @@ class ServerArgs:
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
-        model_config = self.get_model_config()
-        hf_config = model_config.hf_config
+        hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
@@ -4144,17 +4143,8 @@ class ServerArgs:
             "Gemma4ForCausalLM",
             "Gemma4UnifiedForConditionalGeneration",
         ):
-            is_gemma4_modelopt_fp4 = model_config.quantization == "modelopt_fp4"
-            is_gemma4_moe = getattr(
-                model_config.hf_text_config, "enable_moe_block", False
-            )
-            is_gemma4_modelopt_fp4_moe = is_gemma4_modelopt_fp4 and is_gemma4_moe
-            # TODO: switch Gemma4 modelopt_fp4 MoE back to trtllm_mha by default
-            # after the SM10X trtllm_mha accuracy issue is fixed.
             default_attention_backend = (
-                "trtllm_mha"
-                if is_sm100_supported() and not is_gemma4_modelopt_fp4_moe
-                else "triton"
+                "trtllm_mha" if is_sm100_supported() else "triton"
             )
             if self.is_attention_backend_not_set():
                 self.attention_backend = default_attention_backend
@@ -4179,7 +4169,7 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-                if is_gemma4_modelopt_fp4:
+                if self.get_model_config().quantization == "modelopt_fp4":
                     self.quantization = "modelopt_fp4"
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
@@ -4397,8 +4387,8 @@ class ServerArgs:
 
         # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to trtllm on
-        # single-node systems and mnnvl on Blackwell multi-node systems.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to mnnvl on
+        # Blackwell (single- and multi-node) and trtllm on SM90 single-node systems.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
