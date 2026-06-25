@@ -19,12 +19,20 @@ class TestCohere2MoeConfig(CustomTestCase):
         cfg = Cohere2MoeConfig()
         self.assertEqual(cfg.model_type, "cohere2_moe")
 
-    def test_post_init_defaults_num_key_value_heads(self):
-        """``__post_init__`` must still run and default kv heads to attn heads."""
+    def test_config_sets_derived_defaults(self):
         from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 
         cfg = Cohere2MoeConfig()
         self.assertEqual(cfg.num_key_value_heads, cfg.num_attention_heads)
+        self.assertEqual(len(cfg.layer_types), cfg.num_hidden_layers)
+
+    def test_config_supports_pretrained_config_serialization(self):
+        from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
+
+        cfg = Cohere2MoeConfig(foo="bar")
+        cfg_dict = cfg.to_dict()
+        self.assertEqual(cfg_dict["model_type"], "cohere2_moe")
+        self.assertEqual(cfg_dict["foo"], "bar")
 
 
 if __name__ == "__main__":
