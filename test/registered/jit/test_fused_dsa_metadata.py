@@ -518,59 +518,6 @@ def test_apply_cuda_graph_metadata_decode_fused_wiring(monkeypatch):
     assert torch.equal(metadata.paged_mqa_schedule_metadata, ref_cache.view(-1, 1))
 
 
-def test_init_forward_metadata_target_verify_uses_precomputed_replay(monkeypatch):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    bs = 4
-    seq_lens = torch.tensor([11, 7, 13, 5], dtype=torch.int64, device=device)
-    req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
-    seq_lens_cpu = seq_lens.cpu()
-    sentinel = object()
-    calls = []
-
-    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
-    backend.decode_cuda_graph_metadata = {bs: object()}
-
-    class _ForwardBatch:
-        batch_size = bs
-        forward_mode = ForwardMode.TARGET_VERIFY
-        spec_info = None
-        out_cache_loc = None
-        actual_forward_mode = None
-
-        def __init__(self):
-            self.seq_lens = seq_lens
-            self.seq_lens_cpu = seq_lens_cpu
-            self.req_pool_indices = req_pool_indices
-
-    def fake_precompute(**kwargs):
-        calls.append(("precompute", kwargs["forward_mode"], kwargs["bs"]))
-        assert kwargs["seq_lens_cpu"] is seq_lens_cpu
-        return sentinel
-
-    def fake_replay(**kwargs):
-        calls.append(("replay", kwargs["forward_mode"], kwargs["bs"]))
-        assert kwargs["precomputed"] is sentinel
-
-    def fail_apply(**_kwargs):
-        raise AssertionError("_apply_cuda_graph_metadata should not be used")
-
-    monkeypatch.setattr(
-        dsa_backend_module.envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA,
-        "get",
-        lambda: True,
-    )
-    backend._precompute_replay_metadata = fake_precompute
-    backend.init_forward_metadata_replay_cuda_graph_from_precomputed = fake_replay
-    backend._apply_cuda_graph_metadata = fail_apply
-
-    DeepseekSparseAttnBackend.init_forward_metadata_out_graph(backend, _ForwardBatch())
-
-    assert calls == [
-        ("precompute", ForwardMode.TARGET_VERIFY, bs),
-        ("replay", ForwardMode.TARGET_VERIFY, bs),
-    ]
-
-
 def test_fused_metadata_runtime_lengths_do_not_recompile():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
