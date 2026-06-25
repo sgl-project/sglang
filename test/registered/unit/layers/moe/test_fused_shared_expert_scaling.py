@@ -1,7 +1,7 @@
 """Unit tests for fused shared-expert weight scaling on the DeepEP layout.
 
-These tests pin the contract of ``_remap_topk_for_deepep`` for the fused shared
-expert's topk weight on the two paths this fix covers:
+These tests pin the contract of ``remap_topk_for_per_rank_shared_slots`` for
+the fused shared expert's topk weight on the two paths this fix covers:
 
   * aiter (HIP) path: routed_scaling_factor is folded into the routed weights and
     forward_deepep skips the post-MoE multiply, so the shared weight must be 1.0
@@ -56,7 +56,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                 ),
             ),
         ):
-            _out_ids, out_weights = topk_module._remap_topk_for_deepep(
+            _out_ids, out_weights = topk_module.remap_topk_for_per_rank_shared_slots(
                 topk_ids.clone(),
                 topk_weights.clone(),
                 num_fused_shared_experts=1,
@@ -100,7 +100,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                 ),
             ),
         ):
-            out_ids, _ = topk_module._remap_topk_for_deepep(
+            out_ids, _ = topk_module.remap_topk_for_per_rank_shared_slots(
                 topk_ids.clone(),
                 topk_weights.clone(),
                 num_fused_shared_experts=1,
