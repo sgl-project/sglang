@@ -25,6 +25,47 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 
+def sync_fixed_hicache_size(size: int, host_size: int) -> int:
+    """Sync fixed-size HiCache token capacity across distributed ranks.
+
+    A fixed --hicache-size is specified in GB, but each PP stage may have a
+    different bytes/token because it owns different layers. Use the global
+    minimum token capacity so all stages expose the same host-cache capacity.
+    Ratio-based sizing already derives from the synced device pool size.
+    """
+    if host_size <= 0 or not torch.distributed.is_available():
+        return size
+
+    if not torch.distributed.is_initialized():
+        return size
+
+    try:
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        world_group = get_world_group()
+    except AssertionError:
+        return size
+
+    if world_group.world_size <= 1:
+        return size
+
+    tensor = torch.tensor(size, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        tensor,
+        op=torch.distributed.ReduceOp.MIN,
+        group=world_group.cpu_group,
+    )
+    synced_size = int(tensor.item())
+
+    if synced_size != size:
+        logger.info(
+            "Sync fixed-size HiCache host token capacity from %d to %d.",
+            size,
+            synced_size,
+        )
+    return synced_size
+
+
 def synchronized(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -58,7 +99,9 @@ class HostKVCache(abc.ABC):
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
