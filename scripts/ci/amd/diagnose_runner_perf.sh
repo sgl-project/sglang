@@ -161,6 +161,22 @@ sample_out=$(timeout 30 curl -sSL -o /dev/null \
     "$sample_url" 2>&1 || echo "curl_err")
 kv "http_sample" "$sample_out"
 
+section "model download throughput (HF LFS, 1 GiB range, time-capped)"
+# Sustained large-transfer probe. The ~10 MiB sample above is too small to
+# expose the single-flow high-BDP throughput ceiling (cubic vs bbr) that
+# dominates multi-GB safetensors loads: DeepSeek-V3 load_weight measured
+# ~3650s on this MI300 pool vs ~646s on MI325 (~5.6x). This pulls a range
+# from the same public DeepSeek-V3-0324 shard the stage-c suite loads, so
+# the number is directly comparable to the real model-fetch path. Range-
+# capped to 1 GiB and curl --max-time capped so it can never run long;
+# speed_Bps is the sustained bytes/sec regardless of whether the cap is hit.
+model_url="https://huggingface.co/deepseek-ai/DeepSeek-V3-0324/resolve/main/model-00001-of-000163.safetensors"
+model_out=$(timeout 150 curl -sSL --max-time 120 -r 0-1073741823 -o /dev/null \
+    -w "http=%{http_code} ttfb=%{time_starttransfer}s total=%{time_total}s size=%{size_download}B speed_Bps=%{speed_download}\n" \
+    "$model_url" 2>&1) || true
+[ -z "$model_out" ] && model_out="curl_err"
+kv "model_download_sample" "$model_out"
+
 section "rocm gpu state"
 # Clocks + thermal + perf level. If MI300 GPUs are clock-locked or thermally
 # throttled (vs MI325), this will show it directly. -1 timeout safety because
