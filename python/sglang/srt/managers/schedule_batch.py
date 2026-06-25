@@ -2526,25 +2526,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
-            from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
-
-            if isinstance(self.tree_cache, RefAwareCacheMixin):
-                sorted_indices.sort(
-                    key=lambda i: (
-                        self.tree_cache.is_high_priority(self.reqs[i].priority or 0),
-                        len(self.reqs[i].output_ids),
-                        -len(self.reqs[i].origin_input_ids),
-                    ),
-                    reverse=True,
-                )
-            else:
-                sorted_indices.sort(
-                    key=lambda i: (
-                        len(self.reqs[i].output_ids),
-                        -len(self.reqs[i].origin_input_ids),
-                    ),
-                    reverse=True,
-                )
+            sorted_indices.sort(
+                key=lambda i: (
+                    len(self.reqs[i].output_ids),
+                    -len(self.reqs[i].origin_input_ids),
+                ),
+                reverse=True,
+            )
 
         retracted_reqs = []
         first_iter = True

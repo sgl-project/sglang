@@ -546,60 +546,7 @@ class PrefillAdder:
         ref_aware_budget = self._rem_total_tokens_ref_aware(req_is_high)
         if total_tokens < ref_aware_budget:
             return True
-        if not req_is_high:
-            return False
-        return self._kick_low_priority_for_high(req, total_tokens)
-
-    def _kick_low_priority_for_high(self, req: Req, total_tokens_needed: int) -> bool:
-        from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
-
-        cache = self.tree_cache
-        if not isinstance(cache, RefAwareCacheMixin):
-            return False
-
-        threshold = self.high_priority_threshold
-        low_priority_reqs = []
-        for r in self.running_batch.reqs:
-            if r in self.preempt_list or r.finished():
-                continue
-            if (r.priority or 0) < threshold:
-                total_tokens = len(r.origin_input_ids) + len(r.output_ids)
-                low_priority_reqs.append((total_tokens, r))
-
-        low_priority_reqs.sort(key=lambda x: x[0], reverse=True)
-
-        kicked_reqs = []
-        for _total_tokens, running_req in low_priority_reqs:
-            kicked_reqs.append(running_req)
-            self.rem_total_token_offset -= self._get_running_request_total_token_offset(
-                running_req
-            )
-            ref_aware_budget = self._rem_total_tokens_ref_aware(is_high=True)
-            if total_tokens_needed < ref_aware_budget:
-                break
-
-        if total_tokens_needed >= self._rem_total_tokens_ref_aware(is_high=True):
-            for running_req in kicked_reqs:
-                self.rem_total_token_offset += (
-                    self._get_running_request_total_token_offset(running_req)
-                )
-            return False
-
-        kicked_set = set(kicked_reqs)
-        keep_indices = []
-        release_counter = 0
-        server_args = get_global_server_args()
-        for i, running_req in enumerate(self.running_batch.reqs):
-            if running_req in kicked_set:
-                release_counter += 1
-                self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
-                )
-            else:
-                keep_indices.append(i)
-        self.running_batch.filter_batch(keep_indices=keep_indices)
-        self.preempt_list.extend(kicked_reqs)
-        return True
+        return False
 
     @property
     def rem_total_tokens(self):
