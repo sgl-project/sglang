@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
     device_context,
+    disable_compile_on_xpu,
     is_cpu,
     is_npu,
     next_power_of_2,
@@ -32,6 +33,9 @@ from sglang.srt.utils import (
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
+# Keep the XPU device context enter/exit out of the compiled region; torch.xpu.device
+# is still skiplisted under Dynamo during prefill capture.
+_device_context = disable_compile_on_xpu(device_context)
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
@@ -254,7 +258,7 @@ def _layer_norm_fwd(
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-    with device_context(x.device):
+    with _device_context(x.device):
         _layer_norm_fwd_1pass_kernel[grid](
             x,
             out,

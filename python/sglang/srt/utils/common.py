@@ -168,6 +168,23 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def disable_compile_on_xpu(fn):
+    if is_xpu():
+        return torch.compiler.disable(fn)
+    return fn
+
+
+def register_xpu_device_properties_for_dynamo() -> None:
+    if not is_xpu():
+        return
+
+    import torch._dynamo.utils as dynamo_utils
+
+    xpu_props_type = getattr(torch.xpu, "_XpuDeviceProperties", None)
+    if xpu_props_type is not None:
+        dynamo_utils.common_constant_types.add(xpu_props_type)
+
+
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
     if not hasattr(torch, "npu"):

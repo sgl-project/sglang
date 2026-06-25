@@ -23,6 +23,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import register_xpu_device_properties_for_dynamo
 
 logger = logging.getLogger(__name__)
 
@@ -122,29 +123,10 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
 
         torch._dynamo.config.suppress_errors = True
 
-    @staticmethod
-    def _register_xpu_device_properties_for_dynamo() -> None:
-        """Teach Dynamo to treat ``_XpuDeviceProperties`` as a constant type.
-
-        Dynamo already special-cases ``torch.cuda._CudaDeviceProperties`` by
-        listing it in ``torch._dynamo.utils.common_constant_types``, so code like
-        ``torch.cuda.get_device_properties(dev).multi_processor_count`` can be
-        folded into a constant during tracing.  The XPU counterpart
-        ``torch.xpu._XpuDeviceProperties`` is not registered, so the equivalent
-        ``torch.xpu.get_device_properties(dev).gpu_subslice_count`` fails with
-        "SourcelessBuilder.create does not know how to wrap _XpuDeviceProperties".
-        Add the XPU type to the same set so it is wrapped as a ConstantVariable.
-        """
-        import torch._dynamo.utils as dynamo_utils
-
-        xpu_props_type = getattr(torch.xpu, "_XpuDeviceProperties", None)
-        if xpu_props_type is not None:
-            dynamo_utils.common_constant_types.add(xpu_props_type)
-
     def __init__(self, model_runner: ModelRunner):
         register_fake_ops()
         self._apply_xpu_compile_config()
-        self._register_xpu_device_properties_for_dynamo()
+        register_xpu_device_properties_for_dynamo()
         super().__init__(model_runner)
 
         assert (
