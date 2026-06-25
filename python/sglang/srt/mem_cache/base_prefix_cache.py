@@ -67,6 +67,10 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    defer_overlap_free: bool = False
+    deferred_overlap_values: list[tuple[int, torch.Tensor]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass

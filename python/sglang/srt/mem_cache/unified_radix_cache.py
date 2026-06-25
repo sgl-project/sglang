@@ -798,6 +798,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            defer_overlap_free=True,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -849,6 +850,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
+        for start, overlap_value in insert_params.deferred_overlap_values:
+            matched_len = min(len(overlap_value), max(0, len(new_indices) - start))
+            if matched_len > 0:
+                self.token_to_kv_pool_allocator.free(overlap_value[:matched_len])
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -1147,9 +1152,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
                 if dup_start < consumed_from:
-                    self.token_to_kv_pool_allocator.free(
-                        value_slice[dup_start:consumed_from]
-                    )
+                    duplicate_value = value_slice[dup_start:consumed_from]
+                    if params.defer_overlap_free:
+                        params.deferred_overlap_values.append(
+                            (total_prefix_length + dup_start, duplicate_value.clone())
+                        )
+                    else:
+                        self.token_to_kv_pool_allocator.free(duplicate_value)
 
             self._inc_hit_count(node, params.chunked)
             total_prefix_length += prefix_len
