@@ -1271,6 +1271,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result.inserted_host_node = new_node
         return result
 
+    def _node_is_on_matched_path(
+        self, node: UnifiedTreeNode, accepted_node: UnifiedTreeNode
+    ) -> bool:
+        cur = accepted_node
+        while cur is not None:
+            if cur is node:
+                return True
+            cur = cur.parent
+        return False
+
     def _forget_unfinished_component_value(
         self, node: UnifiedTreeNode, component_type: ComponentType
     ) -> None:
@@ -1283,6 +1293,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             lru.remove_node(node)
         self.component_evictable_size_[component_type] -= len(cd.value)
         cd.value = None
+        if (
+            component_type != BASE_COMPONENT_TYPE
+            and cd.host_value is not None
+            and cd.host_lock_ref == 0
+        ):
+            host_lru = self.host_lru_lists[component_type]
+            if not host_lru.in_list(node):
+                host_lru.insert_mru(node)
 
     def _forget_unfinished_subtree_values(self, node: UnifiedTreeNode) -> None:
         for child in list(node.children.values()):
@@ -1360,6 +1378,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if accepted_len >= created_end:
                 continue
             self._detach_unaccepted_created_suffix(root, start_len, accepted_len)
+            result.insert_skipped = True
+
+        mamba_node = result.mamba_inserted_node
+        if mamba_node is not None and not self._node_is_on_matched_path(
+            mamba_node, accepted_node
+        ):
+            self._forget_unfinished_component_value(mamba_node, ComponentType.MAMBA)
             result.insert_skipped = True
 
     # ---- Evict Helpers ----

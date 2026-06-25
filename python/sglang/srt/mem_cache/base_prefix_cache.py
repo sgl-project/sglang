@@ -86,6 +86,7 @@ class InsertResult:
     mamba_exist: bool = False
     inserted_host_node: Any = None
     insert_skipped: bool = False
+    mamba_inserted_node: Any = None
 
 
 @dataclasses.dataclass

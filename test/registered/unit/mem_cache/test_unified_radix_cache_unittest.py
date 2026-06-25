@@ -85,6 +85,7 @@ class CacheConfig:
 
     # Mamba
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
     mamba_cache_size: int = 20
     mamba_intermediate_size: int = 256
     mamba_n_groups: int = 1
@@ -130,6 +131,8 @@ class CacheConfig:
             parts.append(f"h{self.head_num}l{self.num_layers}")
         if self.is_eagle:
             parts.append("eagle")
+        if self.enable_mamba_extra_buffer_lazy:
+            parts.append("mamba_lazy")
         return "_".join(parts)
 
 
@@ -248,6 +251,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
             cache_params=mamba2_cache_params,
             mamba_layer_ids=cfg.non_full_layer_ids,
             enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
+            enable_mamba_extra_buffer_lazy=cfg.enable_mamba_extra_buffer_lazy,
             speculative_num_draft_tokens=3,
         )
     else:
@@ -327,6 +331,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         sliding_window_size=cfg.sliding_window_size,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=cfg.enable_mamba_extra_buffer_lazy,
         enable_kv_cache_events=enable_kv_cache_events,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
@@ -335,6 +340,85 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     tree.cache_init_params = cache_init_params
 
     return tree, allocator, req_to_token_pool
+
+
+class TestUnifiedRadixCacheLazyMambaRollback(CustomTestCase):
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        sliding_window_size=128,
+        enable_mamba_extra_buffer=True,
+        enable_mamba_extra_buffer_lazy=True,
+        mamba_cache_size=60,
+        head_num=8,
+        num_layers=32,
+        full_attention_layer_ids=(7, 15, 23, 31),
+        kv_size=1024,
+        max_context_len=1024,
+    )
+    _rid = 0
+
+    def _make_req(self, req_to_token_pool):
+        sp = SamplingParams(temperature=0, max_new_tokens=1)
+        req = Req(
+            rid=self._rid,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=sp,
+        )
+        self._rid += 1
+        req_to_token_pool.alloc([req])
+        return req
+
+    def _fill_mamba_state(self, req_to_token_pool, indices, marker):
+        mamba_indices = indices.reshape(-1)
+        mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
+        mamba_cache.temporal[:, mamba_indices] = marker
+        for offset, conv_buf in enumerate(mamba_cache.conv, start=1):
+            conv_buf[:, mamba_indices] = marker + offset
+
+    def _snapshot_mamba_state(self, req_to_token_pool, indices):
+        mamba_indices = indices.reshape(-1)
+        mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
+        return (
+            mamba_cache.temporal[:, mamba_indices].float().cpu().clone(),
+            [conv[:, mamba_indices].float().cpu().clone() for conv in mamba_cache.conv],
+        )
+
+    def test_lazy_copy_back_uses_keep_slot(self):
+        tree, _, req_to_token_pool = build_fixture(self.cfg)
+        req = self._make_req(req_to_token_pool)
+
+        keep_idx = req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+        other_idx = req_to_token_pool.get_mamba_ping_pong_other_idx(
+            req.mamba_next_track_idx
+        )
+        keep_slot = req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(0)
+        self.assertNotEqual(keep_idx, other_idx)
+        self.assertEqual(int(req.mamba_ping_pong_track_buffer[other_idx].item()), -1)
+
+        source_slot = req_to_token_pool.mamba_allocator.alloc(1)
+        self.assertIsNotNone(source_slot)
+        self._fill_mamba_state(req_to_token_pool, keep_slot, marker=7)
+        self._fill_mamba_state(req_to_token_pool, source_slot, marker=41)
+        expected_temporal, expected_conv = self._snapshot_mamba_state(
+            req_to_token_pool, source_slot
+        )
+
+        mamba_component = tree.components[ComponentType.MAMBA]
+        self.assertEqual(
+            int(mamba_component._request_mamba_slot(req).item()),
+            int(keep_slot.item()),
+        )
+        mamba_component._copy_mamba_state_to_request(req, source_slot)
+
+        actual_temporal, actual_conv = self._snapshot_mamba_state(
+            req_to_token_pool, keep_slot
+        )
+        self.assertTrue(torch.equal(actual_temporal, expected_temporal))
+        for actual, expected in zip(actual_conv, expected_conv):
+            self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(int(req.mamba_ping_pong_track_buffer[other_idx].item()), -1)
 
 
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
@@ -1204,10 +1288,10 @@ class UnifiedRadixCacheSuite:
     def test_swa_unfinished_insert_rolls_back_unaccepted_suffix_after_tombstone(
         self,
     ):
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            self.skipTest("requires SWA without Mamba")
-        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
-            self.skipTest("requires page_size=1, sliding_window_size=4")
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.page_size != 1:
+            self.skipTest("requires page_size=1")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         prefix = self._make_seq(1, 4)
@@ -1242,6 +1326,20 @@ class UnifiedRadixCacheSuite:
         req.extra_key = None
         req.swa_evicted_seqlen = 0
 
+        if self.cfg.has_mamba:
+            req.mamba_last_track_seqlen = len(tokens)
+            if self.cfg.enable_mamba_extra_buffer:
+                keep_idx = req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+                original_mamba_slot = req.mamba_ping_pong_track_buffer[
+                    keep_idx
+                ].unsqueeze(0)
+            else:
+                original_mamba_slot = req.mamba_pool_idx.unsqueeze(0)
+            self._fill_mamba_state(req_to_token_pool, original_mamba_slot, marker=41)
+            expected_temporal, expected_conv = self._snapshot_mamba_state(
+                req_to_token_pool, original_mamba_slot
+            )
+
         full_available_before = allocator.full_attn_allocator.available_size()
 
         tree.cache_unfinished_req(req)
@@ -1257,6 +1355,21 @@ class UnifiedRadixCacheSuite:
             prefix_node.children,
         )
         self.assertIsNone(prefix_node.component_data[ComponentType.SWA].value)
+
+        if self.cfg.has_mamba:
+            if self.cfg.enable_mamba_extra_buffer:
+                keep_idx = req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+                current_mamba_slot = req.mamba_ping_pong_track_buffer[
+                    keep_idx
+                ].unsqueeze(0)
+            else:
+                current_mamba_slot = req.mamba_pool_idx.unsqueeze(0)
+            actual_temporal, actual_conv = self._snapshot_mamba_state(
+                req_to_token_pool, current_mamba_slot
+            )
+            self.assertTrue(torch.equal(actual_temporal, expected_temporal))
+            for actual, expected in zip(actual_conv, expected_conv):
+                self.assertTrue(torch.equal(actual, expected))
 
         tree.sanity_check()
 
@@ -1445,10 +1558,20 @@ class UnifiedRadixCacheSuite:
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        mamba_pool = req_to_token_pool.mamba_pool
 
         seq = self._make_seq(1, 2)
         self._insert(tree, allocator, req_to_token_pool, seq)
+        source = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        src_value = source.component_data[ComponentType.MAMBA].value
+        self._fill_mamba_state(req_to_token_pool, src_value, marker=11)
+        expected_temporal, expected_conv = self._snapshot_mamba_state(
+            req_to_token_pool, src_value
+        )
+        full_protected_before = tree.full_protected_size()
+        swa_protected_before = tree.swa_protected_size()
+        mamba_protected_before = tree.mamba_protected_size()
 
         req2 = self._make_req(req_to_token_pool)
         m = tree.match_prefix(
@@ -1456,14 +1579,17 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(len(m.device_indices), len(seq))
         self.assertIsNotNone(req2.mamba_pool_idx)
-
-        src_value = m.last_device_node.component_data[ComponentType.MAMBA].value
-        self.assertTrue(
-            torch.all(
-                mamba_pool.mamba_cache.conv[0][:, req2.mamba_pool_idx]
-                == mamba_pool.mamba_cache.conv[0][:, src_value]
-            )
+        self.assertTrue(torch.equal(req2.mamba_cow_src_index, src_value))
+        self.assertFalse(req2.mamba_needs_clear)
+        self.assertEqual(tree.full_protected_size(), full_protected_before)
+        self.assertEqual(tree.swa_protected_size(), swa_protected_before)
+        self.assertEqual(tree.mamba_protected_size(), mamba_protected_before)
+        actual_temporal, actual_conv = self._snapshot_mamba_state(
+            req_to_token_pool, src_value
         )
+        self.assertTrue(torch.equal(actual_temporal, expected_temporal))
+        for actual, expected in zip(actual_conv, expected_conv):
+            self.assertTrue(torch.equal(actual, expected))
         tree.sanity_check()
 
     def test_swa_insert_and_match(self):
@@ -3051,9 +3177,9 @@ class UnifiedRadixCacheSuite:
             return
         mamba_indices = indices.reshape(-1)
         mamba_cache = req_to_token_pool.mamba_pool.mamba_cache
-        mamba_cache.temporal[:, mamba_indices].fill_(marker)
+        mamba_cache.temporal[:, mamba_indices] = marker
         for offset, conv_buf in enumerate(mamba_cache.conv, start=1):
-            conv_buf[:, mamba_indices].fill_(marker + offset)
+            conv_buf[:, mamba_indices] = marker + offset
 
     def _snapshot_mamba_state(self, req_to_token_pool, indices):
         mamba_indices = indices.reshape(-1)
