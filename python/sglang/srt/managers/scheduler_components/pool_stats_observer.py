@@ -247,8 +247,19 @@ class SchedulerPoolStatsObserver:
             self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
         mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
+        # `mamba_usage`/`mamba_num_used` track the ACTIVE bf16 pool occupancy (running
+        # requests) -- this feeds throttle decisions (get_max_pool_usage) which asserts
+        # usage >= 0. With int8 checkpoints the radix-cached states live in a SEPARATE
+        # int8 pool, so they own ZERO active slots: report evictable=0 against the active
+        # pool (otherwise active.size - (available + radix_cached) goes negative). The
+        # int8 cache pool's own occupancy is validated separately in the invariant check.
+        has_int8_ckpt = (
+            getattr(self.req_to_token_pool, "mamba_ckpt_pool", None) is not None
+        )
         mamba_evictable_size = (
-            self.tree_cache.mamba_evictable_size() if is_mamba_radix_cache else 0
+            self.tree_cache.mamba_evictable_size()
+            if (is_mamba_radix_cache and not has_int8_ckpt)
+            else 0
         )
         full_num_used = self.token_to_kv_pool_allocator.size - (
             full_available_size + full_evictable_size

@@ -28,7 +28,6 @@ def _build_page_table_reference(
     req_pool_indices: torch.Tensor,
     cache_seqlens: torch.Tensor,
     page_size: int,
-    max_num_pages: int,
     full_to_swa: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Reference impl: host-side strided gather, then // page_size.
@@ -113,7 +112,6 @@ class TestTrtllmMhaPageTable(CustomTestCase):
             req_pool_indices,
             cache_seqlens,
             page_size,
-            max_num_pages,
             full_to_swa=full_to_swa,
         )
 
@@ -133,7 +131,7 @@ class TestTrtllmMhaPageTable(CustomTestCase):
 
     def test_matches_reference_gather(self):
         for max_ctx in (2048, 4096, 131072):
-            for page_size in (1, 32, 64, 128):
+            for page_size in (1, 32, 64, 128, 256):
                 for bs in (1, 7, 32):
                     self._run_case(max_ctx, page_size, num_reqs=max(64, bs), bs=bs)
 

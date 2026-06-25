@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
+from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -54,8 +55,6 @@ class TRTLLMMHAMetadata:
     cache_seqlens_int32: torch.Tensor = None
     # Maximum sequence length for query
     max_seq_len_q: int = 1
-    # Maximum sequence length for key
-    max_seq_len_k: int = 0
     # Cumulative sequence lengths for `query
     cu_seqlens_q: torch.Tensor = None
     # Cumulative sequence lengths for key
@@ -250,6 +249,56 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return swa_pt
         return self.forward_metadata.page_table
 
+    @staticmethod
+    def _get_scalar_scale(
+        layer: RadixAttention,
+        float_attr: str,
+        scale_attr: str,
+    ) -> float:
+        scale = getattr(layer, float_attr, None)
+        if scale is None:
+            scale = getattr(layer, scale_attr, None)
+        if scale is None:
+            return 1.0
+        if isinstance(scale, torch.Tensor):
+            logger.warning_once(
+                "Ignoring tensor %s for TRT-LLM MHA FP8 KV cache scale. "
+                "Expected %s to be populated with a Python scalar.",
+                scale_attr,
+                float_attr,
+            )
+            return 1.0
+        scale = float(scale)
+        return scale if scale > 0.0 else 1.0
+
+    def _get_bmm_scales(
+        self, layer: RadixAttention, q_scale: float | torch.Tensor = 1.0
+    ) -> tuple[float | torch.Tensor, float]:
+        """Return FlashInfer TRT-LLM MHA BMM scales.
+
+        The FP8 paths store Q/K/V as values divided by their per-tensor scales.
+        FlashInfer applies bmm1_scale to QK and bmm2_scale to PV, so FP8 reads
+        need Q and K descales in BMM1 and V descale in BMM2. Non-FP8 KV cache
+        entries are already in model dtype.
+        """
+        if self.data_type != torch.float8_e4m3fn:
+            return layer.scaling, 1.0
+
+        k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
+        v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
+        return q_scale * k_scale * layer.scaling, v_scale
+
+    def _maybe_quantize_q(
+        self, q: torch.Tensor, *, force_fp8: bool = False
+    ) -> tuple[torch.Tensor, float | torch.Tensor]:
+        if self.data_type != torch.float8_e4m3fn:
+            return q, 1.0
+        if self.is_xqa_impl and not force_fp8:
+            return q, 1.0
+
+        q_2d, q_scale = scaled_fp8_quant(q.reshape(-1, q.shape[-1]).contiguous(), None)
+        return q_2d.reshape(q.shape), q_scale
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -257,7 +306,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "page_table": torch.zeros(
@@ -454,9 +503,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        # max_seq_len_k is the page-table width upper bound; the device-side build
-        # (_fill_page_table_device) sizes to the static max_num_pages and bounds
-        # the actual writes by cache_seqlens, so no runtime host max is needed.
+        # The device-side build (_fill_page_table_device) sizes to the static
+        # max_num_pages and bounds the actual writes by cache_seqlens, so no
+        # runtime host max is needed.
         metadata = None
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -474,7 +523,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata = self.decode_cuda_graph_metadata[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -485,7 +533,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
-            metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -495,39 +542,24 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
-            metadata.max_seq_len_k = self.max_context_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            if forward_mode.is_draft_extend_v2():
-                num_tokens_per_bs = spec_info.num_tokens_per_req
-                if num_tokens_per_bs <= 0:
-                    # Capture uses a synthetic EagleDraftExtendInput; infer the
-                    # fixed V2 stride from the capture buffer when it is unset.
-                    num_tokens_per_bs = int(
-                        spec_info.num_accept_tokens[:bs].max().item()
-                    )
-                metadata.max_seq_len_q = num_tokens_per_bs
-                metadata.cu_seqlens_q[1:].copy_(
-                    torch.arange(
-                        num_tokens_per_bs,
-                        bs * num_tokens_per_bs + 1,
-                        num_tokens_per_bs,
-                        dtype=torch.int32,
-                        device=metadata.cu_seqlens_q.device,
-                    )
+            num_tokens_per_bs = spec_info.num_tokens_per_req
+            if num_tokens_per_bs <= 0:
+                # Capture uses a synthetic EagleDraftExtendInput; infer the
+                # fixed V2 stride from the capture buffer when it is unset.
+                num_tokens_per_bs = int(spec_info.num_accept_tokens[:bs].max().item())
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.cu_seqlens_q[1:].copy_(
+                torch.arange(
+                    num_tokens_per_bs,
+                    bs * num_tokens_per_bs + 1,
+                    num_tokens_per_bs,
+                    dtype=torch.int32,
+                    device=metadata.cu_seqlens_q.device,
                 )
-            else:
-                extend_lens = spec_info.num_accept_tokens[:bs]
-                if spec_info.num_accept_tokens_cpu:
-                    metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
-                else:
-                    metadata.max_seq_len_q = 1
-
-                metadata.cu_seqlens_q[1:].copy_(
-                    torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
-                )
-
+            )
             self._fill_page_table_device(
                 metadata, req_pool_indices, metadata.cache_seqlens_int32
             )
@@ -692,7 +724,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        metadata.max_seq_len_k = self.max_context_len
         has_swa = self._swa_kv_pool is not None
         metadata.page_table = torch.empty(
             (batch_size, self.max_num_pages), dtype=torch.int32, device=device
@@ -756,9 +787,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        # For XQA, q_dtype should be bf16
-        if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
-            q = q.to(torch.float8_e4m3fn)
+        # For XQA, q_dtype should be bf16. TRT-LLM-GEN uses FP8 Q; dynamically
+        # quantize it and pass the descale into BMM1 instead of unscaled casting.
+        q, q_scale = self._maybe_quantize_q(q)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -777,15 +808,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -847,8 +870,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
+        q, q_scale = self._maybe_quantize_q(
+            q, force_fp8=not forward_batch.forward_mode.is_target_verify()
+        )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -868,15 +892,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
