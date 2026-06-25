@@ -55,4 +55,15 @@ export const benchmarks = [
   // ====================================================================
   { match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
   { match: { hw: "h200", variant: "default", quant: "fp8",  strategy: "balanced", nodes: "single" } },
+  // ====================================================================
+  // B200 (Blackwell) — same recipe as B300, not yet benchmarked on B200 (pending).
+  // ====================================================================
+  { match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b200", variant: "default", quant: "fp8",  strategy: "balanced", nodes: "single" } },
+  { match: { hw: "b200", variant: "default", quant: "w4a4", strategy: "balanced", nodes: "single" } },
+  // ====================================================================
+  // H100 (Hopper) — same recipe as H200, not yet benchmarked (pending).
+  // ====================================================================
+  { match: { hw: "h100", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "h100", variant: "default", quant: "fp8",  strategy: "balanced", nodes: "single" } },
 ];

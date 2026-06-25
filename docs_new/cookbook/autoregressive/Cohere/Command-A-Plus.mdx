@@ -105,7 +105,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
-**MoE runner backend per precision (Blackwell).** On B300 the verified recipes pick the MoE runner that fits each checkpoint's quantization, and the Deploy panel bakes it in:
+**MoE runner backend per precision (Blackwell).** On Blackwell (B200 / B300) the recipes pick the MoE runner that fits each checkpoint's quantization (verified on B300), and the Deploy panel bakes it in:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -152,7 +152,7 @@ sglang serve --model-path CohereLabs/command-a-plus-05-2026-w4a4 \
 
 **Memory fraction.** Recipes were verified at the default memory fraction; raising `--mem-fraction-static` to `0.9` changed throughput by `<0.5%` at the tested concurrencies (these workloads are MoE-compute-bound, not KV-bound).
 
-**Hardware footprint.** On **B300** (verified): BF16 4× (TP=4), FP8 2× (TP=2), W4A4 1× (TP=1). On **H200** (Hopper) the Deploy panel also offers plain-TP recipes sized from Cohere's official guidance — **BF16 TP=8, FP8 TP=4** on the default Triton FusedMoE runner; these are **sanity-checked, not yet benchmarked** (shown as *Not Verified*, no measured numbers). **W4A4 (NVFP4) is Blackwell-only** — the Hopper dequant path isn't validated, so the Deploy panel greys out W4A4 on H200.
+**Hardware footprint — two recipe families.** **Blackwell (B200 / B300):** BF16 `cutlass` TP=4, FP8 Triton TP=2, W4A4 `flashinfer_trtllm` TP=1 — **B300 is benchmark-verified**; B200 runs the same commands but is **not yet benchmarked** (shown *Not Verified*). **Hopper (H100 / H200):** plain tensor parallelism on the default Triton FusedMoE runner, sized from Cohere's official guidance — **BF16 TP=8, FP8 TP=4** — sanity-checked, **not yet benchmarked**. **W4A4 (NVFP4) is Blackwell-only** — the Hopper dequant path isn't validated, so the Deploy panel greys out W4A4 on H100/H200.
 
 **Hierarchical KV cache.** For a 218B model, host-tier KV offload can extend effective cache capacity — toggle it in the **Hierarchical KV Cache** card of the [Playground above](#playground).
 

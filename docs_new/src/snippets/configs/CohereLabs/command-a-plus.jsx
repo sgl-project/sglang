@@ -4,9 +4,10 @@
 export const config = {
   modelName: "Command A+",
 
-  // B300 is benchmark-verified. H200 (Hopper) cells are sanity-checked per Cohere's
-  // sizing (not yet benchmarked → unverified badge). Other hw auto-greys-out.
-  supportedHardware: ["b300", "h200"],
+  // B300 is benchmark-verified. B200 (Blackwell — same recipe as B300) and H100/H200
+  // (Hopper — Cohere's plain-TP sizing) are sanity-checked → unverified badge until
+  // re-run. Other hw auto-greys-out.
+  supportedHardware: ["b300", "b200", "h200", "h100"],
 
   // No size variants — the three HF repos differ only by precision (see quantizations).
   variants: [
@@ -75,7 +76,9 @@ sgl-eval run gsm8k \\
 
   dockerImages: {
     b300: "lmsysorg/sglang:latest",
+    b200: "lmsysorg/sglang:latest",
     h200: "lmsysorg/sglang:latest",
+    h100: "lmsysorg/sglang:latest",
   },
 
   github: {
@@ -232,6 +235,48 @@ sgl-eval run gsm8k \\
       ],
     },
     // ====================================================================
+    // B200 (Blackwell) — same recipe as B300 (B200's 192 GB fits all three
+    // precisions at these TPs). Not yet benchmarked on B200 → verified: false.
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend cutlass",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "w4a4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
     // H200 (Hopper) — plain TP, default Triton FusedMoE (no Blackwell CUTLASS
     // path). Sizes follow Cohere's official per-quant GPU guidance (BF16 TP=8,
     // FP8 TP=4). Sanity-checked, NOT yet benchmarked → verified: false. W4A4
@@ -252,6 +297,34 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // H100 (Hopper) — same plain-TP recipe as H200 (default Triton MoE). Not yet
+    // benchmarked → verified: false. W4A4 (NVFP4) is Blackwell-only (no H100 cell).
+    // ====================================================================
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: false,
       env: [],
       flags: [
