@@ -1068,6 +1068,36 @@ class UnifiedRadixCacheSuite:
         )
         tree.sanity_check()
 
+    def test_swa_insert_keeps_full_leaf_when_entire_span_is_outside_window(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, _ = build_fixture(self.cfg)
+
+        tokens = self._make_seq(1, 4)
+        value = self._alloc(allocator, len(tokens))
+        full_available_before = allocator.full_attn_allocator.available_size()
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=value,
+                prev_prefix_len=0,
+                swa_evicted_seqlen=len(tokens),
+            )
+        )
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        node = next(iter(tree.root_node.children.values()))
+        self.assertTrue(
+            torch.equal(node.component_data[ComponentType.FULL].value, value)
+        )
+        self.assertIsNone(node.component_data[ComponentType.SWA].value)
+        tree.sanity_check()
+
     def test_diagnostics(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(tree, allocator, req_to_token_pool, self._make_seq(1, 2))
