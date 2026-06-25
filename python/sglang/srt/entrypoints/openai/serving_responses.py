@@ -448,10 +448,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # the Anthropic and transcription streaming paths.
                 background = None
                 if adapted_request is not None:
-                    background = (
-                        self.tokenizer_manager.create_abort_task(
-                            adapted_request
-                        )
+                    background = self.tokenizer_manager.create_abort_task(
+                        adapted_request
                     )
                 return StreamingResponse(
                     stream_gen,
@@ -522,7 +520,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Harmony models route tools through a recipient channel and cannot
         # honor a forced / required tool_choice. Raise ValueError so the
         # caller in ``create_responses`` surfaces it as a 400 rather than a
-            # 500 (NotImplementedError is not in the caught exception tuple).
+        # 500 (NotImplementedError is not in the caught exception tuple).
         if request.tool_choice != "auto":
             raise ValueError(
                 "Only 'auto' tool_choice is supported for harmony models on "
@@ -2087,9 +2085,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         try:
             async for ctx in result_generator:
                 if raw_request is not None and await raw_request.is_disconnected():
-                    logger.info(
-                        "[/v1/responses stream] client disconnected, stopping"
-                    )
+                    logger.info("[/v1/responses stream] client disconnected, stopping")
                     break
                 if isinstance(ctx, dict):
                     chunk = ctx
