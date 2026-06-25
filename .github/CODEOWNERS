@@ -31,7 +31,7 @@
 /python/sglang/srt/hardware_backend/musa @yeahdongcn
 /python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname @whybeyoung
 /python/sglang/srt/hardware_backend/gpu/quantization @Alisehen
-/python/sglang/srt/hardware_backend/npu/quantization @OrangeRedeng @TamirBaydasov @iforgetmyname @Alisehen
+/python/sglang/srt/hardware_backend/npu/quantization @OrangeRedeng @TamirBaydasov @Alisehen
 /python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
 /python/sglang/srt/layers/attention @merrymercy @Fridge003 @ispobock @Qiaolin-Yu @hebiao064 @HaiShaw
 /python/sglang/srt/layers/attention/fla @yizhang2077 @hebiao064 @yuan-luo
@@ -39,7 +39,7 @@
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/dsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @YAMY1234 @rainj-me
 /python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
-/python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @Alisehen
+/python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @TamirBaydasov @Alisehen
 /python/sglang/srt/layers/quantization/quark @kkHuang-amd @yichiche @hubertlu-tw @1am9trash @BowenBao
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
