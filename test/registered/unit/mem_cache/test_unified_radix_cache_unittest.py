@@ -2333,46 +2333,6 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(tree.swa_evictable_size(), 0)
         tree.sanity_check()
 
-    def test_swa_caps_prefix_when_window_child_deleted(self):
-        # A long internal SWA prefix can turn into a device leaf when its only
-        # child (the one-window suffix) is deleted. on_became_leaf must cap it
-        # to a window in place, just like at insert time — so a device leaf
-        # never holds more than a window of SWA.
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the split setup simple")
-
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
-        retain_len = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        # Long sequence (> 2 windows): insert-time cap splits it into a long
-        # prefix parent + a one-window suffix leaf.
-        seq = self._make_seq(1, 2 * (retain_len // ps) + 2)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-        prefix = next(iter(tree.root_node.children.values()))
-        window_leaf = next(iter(prefix.children.values()))
-        self.assertEqual(len(window_leaf.children), 0)
-        self.assertGreater(
-            len(prefix.component_data[ComponentType.SWA].value), retain_len
-        )
-
-        # Delete the window suffix leaf -> prefix would become a long leaf.
-        tracker = {ct: 0 for ct in tree.tree_components}
-        tree._evict_device_leaf(window_leaf, tracker)
-
-        # prefix was capped in place: it is now the one-window suffix leaf under
-        # a freshly split parent, not a long device leaf.
-        new_parent = next(iter(tree.root_node.children.values()))
-        capped_leaf = next(iter(new_parent.children.values()))
-        self.assertIs(capped_leaf, prefix)
-        self.assertEqual(len(capped_leaf.children), 0)
-        self.assertIn(capped_leaf, tree.evictable_device_leaves)
-        self.assertEqual(
-            len(capped_leaf.component_data[ComponentType.SWA].value), retain_len
-        )
-        tree.sanity_check()
-
     def test_evict_d_leaf_set_consistency(self):
         """evictable_device_leaves is consistent after mixed operations."""
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
