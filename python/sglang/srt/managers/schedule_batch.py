@@ -2822,6 +2822,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # merge_batch) on the original don't corrupt this snapshot.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            # Per-request extend/prefix lens, snapshotted (sliced like reqs) so the
+            # deferred prefill-stats report reads them after the original batch has
+            # moved on. prepare_for_extend sets these; mix_with_running mutates them
+            # in place. None for decode batches (no extend), which the reader skips.
+            extend_lens=self.extend_lens[:] if self.extend_lens is not None else None,
+            prefix_lens=self.prefix_lens[:] if self.prefix_lens is not None else None,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,

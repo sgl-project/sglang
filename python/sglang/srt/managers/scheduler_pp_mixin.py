@@ -23,6 +23,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -1109,7 +1110,9 @@ class SchedulerPPMixin:
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(batch.req_pool_indices, batch.input_ids)
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
+        )
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
