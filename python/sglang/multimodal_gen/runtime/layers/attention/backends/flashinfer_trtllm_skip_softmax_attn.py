@@ -86,11 +86,9 @@ _ABC_KEY_FIXED_SCALE_FACTOR = "fixed_scale_factor"
 
 # Workspace buffer size for the trtllm-gen kernel. 256 MiB matches the LLM
 # trtllm backends; bump via env if a very long sequence underruns.
-_WORKSPACE_BYTES = (
-    int(os.environ.get("SGLANG_DIFFUSION_SKIP_SOFTMAX_WORKSPACE_MB", "256"))
-    * 1024
-    * 1024
-)
+_WORKSPACE_BYTES = int(
+    os.environ.get("SGLANG_DIFFUSION_SKIP_SOFTMAX_WORKSPACE_MB", "256")
+) * 1024 * 1024
 
 
 def _read_float_env(name: str, *, default: float) -> float:
@@ -174,7 +172,7 @@ class FlashInferTrtllmSkipSoftmaxBackend(AttentionBackend):
         return AttentionBackendEnum.FLASHINFER_TRTLLM_SKIP_SOFTMAX
 
     @staticmethod
-    def get_impl_cls() -> type["FlashInferTrtllmSkipSoftmaxImpl"]:
+    def get_impl_cls() -> type[FlashInferTrtllmSkipSoftmaxImpl]:
         return FlashInferTrtllmSkipSoftmaxImpl
 
     @staticmethod
@@ -210,17 +208,12 @@ class FlashInferTrtllmSkipSoftmaxImpl(AttentionImpl):
         # ----- resolve config: server_args > env > defaults --------------
         sa_cfg = _resolve_settings_from_server_args()
         self.fixed_threshold = float(
-            sa_cfg.get(
-                _ABC_KEY_FIXED_THRESHOLD, _read_float_env(_ENV_THRESHOLD, default=0.0)
-            )
+            sa_cfg.get(_ABC_KEY_FIXED_THRESHOLD, _read_float_env(_ENV_THRESHOLD, default=0.0))
         )
         # Direct FlashInfer-native scale_factor (skips calibration math). 0 = off.
         self.fixed_scale_factor = float(sa_cfg.get(_ABC_KEY_FIXED_SCALE_FACTOR, 0.0))
         self._target_sparsity_override = float(
-            sa_cfg.get(
-                _ABC_KEY_TARGET_SPARSITY,
-                _read_float_env(_ENV_TARGET_SPARSITY, default=0.0),
-            )
+            sa_cfg.get(_ABC_KEY_TARGET_SPARSITY, _read_float_env(_ENV_TARGET_SPARSITY, default=0.0))
         )
         self.calib_path: str | None = (
             sa_cfg.get(_ABC_KEY_CALIB_PATH) or os.environ.get(_ENV_CALIB_PATH) or None
@@ -237,13 +230,7 @@ class FlashInferTrtllmSkipSoftmaxImpl(AttentionImpl):
                         f"[skip_softmax/trtllm] loaded calibration from "
                         f"{self.calib_path} ({len(cache[self.calib_path])} entries)"
                     )
-                except (
-                    OSError,
-                    json.JSONDecodeError,
-                    KeyError,
-                    TypeError,
-                    ValueError,
-                ) as e:
+                except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
                     cache[self.calib_path] = {}
                     warnings.warn(
                         f"[skip_softmax/trtllm] failed to load calibration "
@@ -291,9 +278,7 @@ class FlashInferTrtllmSkipSoftmaxImpl(AttentionImpl):
     # ------------------------------------------------------------------ #
     #  scale_factor resolution                                           #
     # ------------------------------------------------------------------ #
-    def _resolve_scale_factor(
-        self, seq_len_k: int, *, is_prefill: bool = True
-    ) -> float:
+    def _resolve_scale_factor(self, seq_len_k: int, *, is_prefill: bool = True) -> float:
         """Resolve the FlashInfer ``skip_softmax_threshold_scale_factor``.
 
         Returns ``0.0`` to mean "fall back to dense SDPA for this launch".
@@ -311,11 +296,8 @@ class FlashInferTrtllmSkipSoftmaxImpl(AttentionImpl):
 
         if self.fixed_scale_factor > 0.0:
             self._log_resolution_once(
-                component=component,
-                phase=phase,
-                seq_len_k=seq_len_k,
-                scale_factor=self.fixed_scale_factor,
-                reason="fixed_scale_factor",
+                component=component, phase=phase, seq_len_k=seq_len_k,
+                scale_factor=self.fixed_scale_factor, reason="fixed_scale_factor",
             )
             return self.fixed_scale_factor
 
@@ -330,48 +312,30 @@ class FlashInferTrtllmSkipSoftmaxImpl(AttentionImpl):
                     phase=phase,
                 )
                 lam = compute_threshold(
-                    a=a,
-                    b=b,
-                    target_sparsity=target,
-                    seq_len_k=seq_len_k,
+                    a=a, b=b, target_sparsity=target, seq_len_k=seq_len_k,
                 )
                 if lam is not None and lam > 0.0:
                     scale_factor = lam * seq_len_k
                     self._log_resolution_once(
-                        component=component,
-                        phase=phase,
-                        seq_len_k=seq_len_k,
-                        scale_factor=scale_factor,
-                        reason="calibration",
-                        a=a,
-                        b=b,
-                        target=target,
-                        lam=lam,
+                        component=component, phase=phase, seq_len_k=seq_len_k,
+                        scale_factor=scale_factor, reason="calibration",
+                        a=a, b=b, target=target, lam=lam,
                     )
                     return scale_factor
 
         if 0.0 < self.fixed_threshold < 1.0:
             scale_factor = self.fixed_threshold * seq_len_k
             self._log_resolution_once(
-                component=component,
-                phase=phase,
-                seq_len_k=seq_len_k,
-                scale_factor=scale_factor,
-                reason="fixed_threshold",
+                component=component, phase=phase, seq_len_k=seq_len_k,
+                scale_factor=scale_factor, reason="fixed_threshold",
                 lam=self.fixed_threshold,
             )
             return scale_factor
 
         self._log_resolution_once(
-            component=component,
-            phase=phase,
-            seq_len_k=seq_len_k,
+            component=component, phase=phase, seq_len_k=seq_len_k,
             scale_factor=0.0,
-            reason=(
-                "no calibration entry"
-                if entry is None
-                else f"no entry for phase={phase}"
-            ),
+            reason="no calibration entry" if entry is None else f"no entry for phase={phase}",
         )
         return 0.0
 
@@ -443,12 +407,8 @@ class FlashInferTrtllmSkipSoftmaxImpl(AttentionImpl):
         v_flat = value.reshape(B * S_k, H_kv, D).contiguous()
 
         seq_lens = torch.full((B,), S_k, dtype=torch.int32, device=query.device)
-        cum_q = torch.arange(
-            0, (B + 1) * S_q, S_q, dtype=torch.int32, device=query.device
-        )
-        cum_kv = torch.arange(
-            0, (B + 1) * S_k, S_k, dtype=torch.int32, device=query.device
-        )
+        cum_q = torch.arange(0, (B + 1) * S_q, S_q, dtype=torch.int32, device=query.device)
+        cum_kv = torch.arange(0, (B + 1) * S_k, S_k, dtype=torch.int32, device=query.device)
         workspace = _get_workspace(query.device)
 
         try:
