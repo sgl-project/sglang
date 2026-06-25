@@ -24,7 +24,7 @@ class CompareResult(NamedTuple):
 
 
 class ComparableWeight:
-    """Base class: a weight in comparable (dequantized) form, for all precisions."""
+    """Base comparable-weight class; one subclass per precision or raw tensor."""
 
     @staticmethod
     def _quant_ulp(w_q: torch.Tensor) -> torch.Tensor:
@@ -121,7 +121,7 @@ class RawComparable(ComparableWeight):
 def compare_weights(
     expect: ComparableWeight, actual: ComparableWeight
 ) -> CompareResult:
-    """Chunked element-wise compare in dequantized space."""
+    """Chunked element-wise compare in ComparableWeight space."""
     equal = True
     max_abs_err = torch.zeros((), dtype=torch.float32)
     sum_abs_err = 0.0
