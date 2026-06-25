@@ -60,16 +60,12 @@ def _create_device_stream(device):
     """Create a device stream for the given device type."""
     if not isinstance(device, torch.device):
         device = torch.device(device)
-    if device.type == "xpu":
-        return torch.xpu.Stream(device=device)
-    return torch.cuda.Stream(device=device)
+    return torch.get_device_module(device).Stream(device=device)
 
 
 def _device_stream_context(stream):
-    """Return the appropriate stream context manager."""
-    if hasattr(torch, "xpu") and isinstance(stream, torch.xpu.Stream):
-        return torch.xpu.stream(stream)
-    return torch.cuda.stream(stream)
+    """Return the appropriate stream context manager for ``stream``."""
+    return torch.get_device_module(stream.device).stream(stream)
 
 
 class LayerTransferCounter:
@@ -367,14 +363,9 @@ class LMCRadixCache(RadixCache):
         slot_mapping[:value_numel].fill_(-1)
         slot_mapping[value_numel:].copy_(token_slots)
 
-        with _device_stream_context(self.load_stream):
-            num_retrieved = self.lmcache_connector.start_load_kv(
-                LoadMetadata(
-                    token_ids=key.token_ids,  # full page-aligned key
-                    slot_mapping=slot_mapping,
-                    offset=value_numel - prefix_pad,  # LMCache offset convention
-                )
-            )
+        # Dispatch to the mode-specific loader (IP: start_load_kv, MP:
+        # retrieve_kv). Each loader manages its own load_stream context.
+        num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
         if num_retrieved > 0:
@@ -415,7 +406,7 @@ class LMCRadixCache(RadixCache):
         """MP non-layerwise loader: fire ``retrieve_kv`` and wait for the
         load_stream so the compute stream observes the writes.
         """
-        current_stream = torch.current_stream(device=self.device)
+        current_stream = torch.get_device_module(self.device).current_stream()
         self.load_stream.wait_stream(current_stream)
         with _device_stream_context(self.load_stream):
             n = self.lmcache_connector.retrieve_kv(
