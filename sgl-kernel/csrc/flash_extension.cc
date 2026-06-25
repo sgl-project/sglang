@@ -58,8 +58,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
       "    Tensor?  sinks,"
-      "    bool     batch_invariant = False,"
-      "    Tensor?  sparse_mask_fine = None"
+      "    bool     batch_invariant,"
+      "    Tensor?  sparse_mask_fine,"  // [total_q, max_k_blocks, num_int32_per_block]
+      "    bool     only_qv"
       ") -> (Tensor(a!), Tensor, Tensor, Tensor)");  // first return aliases out
 
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));

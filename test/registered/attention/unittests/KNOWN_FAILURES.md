@@ -6,7 +6,7 @@ unit-test suite, **organized by the action needed to address it**.
 
 Anything failing that is not listed here should be treated as a regression.
 
-Last updated: 2026-05-29
+Last updated: 2026-06-05
 
 ## Reference runs
 
@@ -182,8 +182,6 @@ moment production is fixed; no test method invokes them today.
 
 | Citation | Symptom | Trigger | Status |
 |---|---|---|---|
-| `dual_chunk_flashattention_backend.py:1110-1132` | `RuntimeError: The size of tensor a (4) must match the size of tensor b (5)` at `vertical_buffer.copy_()` | `vertical_size ≤ 5`: fallback `torch.arange(0, intra_K_size, max(1, intra_K_size/5))` returns up to 5 elements into `vertical_size=4` buffer when `intra_vertical_indices.nelement() == 0` | `[no test]` (`dual_chunk/README.md`); smoke helper `run_dual_chunk_sparse_sub_window_case` wired but not invoked |
-| `_vertical_slash_sparse_attention` (`convert_vertical_slash_indexes` block math) | `cudaErrorIllegalAddress` deep inside the kernel | `vertical_size=8` with `seq_len ≥ 128`: unstated invariant that `vertical_size + slash_size >= chunk_len_blocks` | `[no test]` (same smoke helper) |
 | Triton dense `DRAFT_EXTEND` (non-V2) | Eager fixture/reference mismatch on narrow accepted-token layouts | Test omitted | `[no test]` (`dense/README.md`) |
 
 ## C.6. DSA-specific structural gaps

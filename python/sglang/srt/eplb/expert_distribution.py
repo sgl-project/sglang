@@ -52,8 +52,10 @@ _OutputMode = Literal["file", "object"]
 class ExpertDistributionMetrics:
     eplb_balancedness: torch.Tensor
 
-    def copy_to_cpu(self):
-        self.eplb_balancedness = self.eplb_balancedness.to("cpu", non_blocking=True)
+    def map_device_tensors(self, fn):
+        # Device-tensor fields only; caller injects the copy+safety primitive
+        # (see GenerationBatchResult.copy_to_cpu).
+        self.eplb_balancedness = fn(self.eplb_balancedness)
 
 
 class ExpertDistributionRecorder(ABC):
@@ -305,11 +307,14 @@ class _SinglePassGatherer(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-    ) -> "_SinglePassGatherer":
+    ) -> _SinglePassGatherer:
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
             )
+
+        if server_args.moe_a2a_backend == "mori":
+            return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
             if server_args.moe_a2a_backend != "none" and (
@@ -624,13 +629,13 @@ class _Accumulator(ABC):
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
-    ) -> "_Accumulator":
+    ) -> _Accumulator:
         return _Accumulator.get_class(server_args)(
             server_args, expert_location_metadata, rank
         )
 
     @staticmethod
-    def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
+    def get_class(server_args: ServerArgs) -> Type[_Accumulator]:
         return {
             "stat": _StatAccumulator,
             "stat_approx": _StatAccumulator,

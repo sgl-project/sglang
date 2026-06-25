@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
+    unwrap_write_loc,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
@@ -54,6 +55,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        v_head_dim: Optional[int] = None,
+        swa_head_num: Optional[int] = None,
+        swa_head_dim: Optional[int] = None,
+        swa_v_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
@@ -69,6 +74,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_num=layer_num,
             device=device,
             enable_memory_saver=enable_memory_saver,
+            v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
             start_layer=start_layer,
             end_layer=end_layer,
             enable_alt_stream=enable_alt_stream,
@@ -81,9 +90,8 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             # Continuous memory improves the efficiency of Ascend`s transmission backend,
             # while other backends remain unchanged.
-            self.kv_buffer = torch.zeros(
+            self.k_buffer = torch.zeros(
                 (
-                    2,
                     self.layer_num,
                     self.size // self.page_size + 1,
                     self.page_size,
@@ -93,21 +101,36 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 dtype=self.store_dtype,
                 device=self.device,
             )
-            self.k_buffer = self.kv_buffer[0]
-            self.v_buffer = self.kv_buffer[1]
+            self.v_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.v_head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
             if self.use_fia:
-                self.k_buffer = []
-                self.v_buffer = []
-                for i in range(self.layer_num):
-                    k_buffer_layer = self.kv_buffer[0][i].view(
-                        -1, 1, self.head_num, self.head_dim
-                    )
-                    v_buffer_layer = self.kv_buffer[1][i].view(
-                        -1, 1, self.head_num, self.head_dim
-                    )
-                    self.k_buffer.append(k_buffer_layer)
-                    self.v_buffer.append(v_buffer_layer)
+                # Use per-layer Python lists to avoid torch.compile capturing
+                # the entire multi-layer tensor (OOM during graph capture).
+                # Each layer view: [P*ps, 1, H, D], sharing the contiguous
+                # storage allocated above.
+                self.k_buffer = [
+                    self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
+                    for i in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    self.v_buffer[i].view(-1, 1, self.head_num, self.v_head_dim)
+                    for i in range(self.layer_num)
+                ]
+
+    def _init_kv_copy_and_warmup(self):
+        # implementation relies on self.data_strides / self.data_ptrs, which the
+        # NPU paged buffer layout never builds.
+        self._kv_copy_config = None
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -148,13 +171,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
+        loc, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
@@ -183,7 +208,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             torch_npu.npu_scatter_nd_update_(
                 v_buffer_layer,
                 loc.view(-1, 1),
-                cache_v.view(-1, 1, self.head_num, self.head_dim),
+                cache_v.view(-1, 1, self.head_num, self.v_head_dim),
             )
         else:
             loc = loc.to(torch.int32)
@@ -194,7 +219,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     -1, self.page_size, self.head_num, self.head_dim
                 ),
                 value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                    -1, self.page_size, self.head_num, self.head_dim
+                    -1, self.page_size, self.head_num, self.v_head_dim
                 ),
                 slot_indices=loc,
             )
@@ -221,7 +246,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
     # NPUMHATokenToKVPool stores buffers as
     #   (num_pages, page_size, head_num, head_dim)            # use_fia=False
     #   (num_pages*page_size, 1, head_num, head_dim)          # use_fia=True
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         torch.npu.synchronize()
         buf_of_layers = []
         for local_layer_id in range(self.layer_num):
@@ -236,7 +261,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
@@ -412,10 +437,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)

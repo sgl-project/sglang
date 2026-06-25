@@ -44,7 +44,7 @@ struct FusedNormRopeStoreParams {
   const void* __restrict__ handle;  // plan decode / compress
   const void* __restrict__ weight;
   const float* __restrict__ freqs_cis;
-  const int32_t* __restrict__ out_loc;
+  const int64_t* __restrict__ out_loc;
   uint8_t* __restrict__ kvcache;
   float eps;
   uint32_t compress_ratio;
@@ -90,7 +90,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
 
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
   int32_t position;
-  int32_t out_loc;
+  int64_t out_loc;
   if constexpr (kMode == CompressExtend) {
     const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
     if (plan.is_invalid()) return;
@@ -202,10 +202,10 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
       local_max = math::max(local_max, math::abs(data[i]));
     }
     const auto abs_max = warp::reduce_max(local_max);
-    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
     const auto inv_scale = 1.0f / scale;
-    const int32_t page = out_loc >> kPageBits;
-    const int32_t offset = out_loc & ((1 << kPageBits) - 1);
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
     const auto page_ptr = params.kvcache + page * kPageBytes;
     const auto value_ptr = page_ptr + offset * 128;
     const auto scale_ptr = page_ptr + (128 << kPageBits) + offset * 4;
@@ -244,7 +244,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
   int32_t position;
-  int32_t out_loc;
+  int64_t out_loc;
   if constexpr (kMode == CompressExtend) {
     const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
     if (plan.is_invalid()) return;
@@ -321,7 +321,11 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+#ifndef USE_ROCM
+        const float other = __shfl_xor_sync(kFullMask, data[i], mask, kWarpThreads);
+#else
+        const float other = __shfl_xor(data[i], mask, kWarpThreads);
+#endif
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }
@@ -347,8 +351,8 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
     const uint8_t packed1 = quant_fp4_e2m1(data[2] * inv_scale) | (quant_fp4_e2m1(data[3] * inv_scale) << 4);
     const uint16_t packed = static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
 
-    const int32_t page = out_loc >> kPageBits;
-    const int32_t offset = out_loc & ((1 << kPageBits) - 1);
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
     const auto page_ptr = params.kvcache + page * kPageBytes;
     const auto value_ptr = page_ptr + offset * 64;
     const auto scale_ptr = page_ptr + (64 << kPageBits) + offset * 4;
@@ -364,7 +368,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 // Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
 // Cache layout: 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale.
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, bool kBf16Store = false>
 FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -375,7 +379,10 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   // Last warp owns the rope tail. The remaining 7 warps each emit one
   // 64-element fp8 group (own UE8M0 scale).
   constexpr uint32_t kRopeWarp = kNumWarps - 1;
-  constexpr int64_t kPageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
+  // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
+  constexpr int64_t kPageBytes =
+      kBf16Store ? ((kHeadDim * 2ll) << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
   static_assert(kHeadDim == kBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -391,7 +398,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
 
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
   int32_t position;
-  int32_t out_loc;
+  int64_t out_loc;
   if constexpr (kMode == CompressExtend) {
     const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
     if (plan.is_invalid()) return;
@@ -443,15 +450,26 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     }
   }
 
-  const int32_t page = out_loc >> kPageBits;
-  const int32_t offset = out_loc & ((1 << kPageBits) - 1);
+  const int64_t page = out_loc >> kPageBits;
+  const int64_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * 576;
+  const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : 576);
 
   PDLTriggerSecondary<kUsePDL>();
 
   // part 2: rope on the rope warp (BF16 store), or per-warp FP8 quant + store.
-  if (warp_id == kRopeWarp) {
+  if constexpr (kBf16Store) {
+    Float2 d = data;
+    if (warp_id == kRopeWarp) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      d[0] = x_real * freq_real - x_imag * freq_imag;
+      d[1] = x_real * freq_imag + x_imag * freq_real;
+    }
+    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = cast<bf16x2_t>(fp32x2_t{d[0], d[1]});
+  } else if (warp_id == kRopeWarp) {
     // Each rope-warp lane owns exactly one (real, imag) pair within the rope
     // tail. Apply rotation, downcast to BF16, write to the slot's rope region.
     const auto x_real = data[0];
@@ -470,7 +488,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     const auto x = cast<float>(cast<bf16_t>(data[0]));
     const auto y = cast<float>(cast<bf16_t>(data[1]));
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
-    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    const auto scale_raw = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
     const auto result = pack_fp8(x * inv_scale, y * inv_scale);
@@ -481,13 +499,15 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL, bool kBf16Store = false>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
+  static_assert(!(kIsIndexer && kBf16Store), "bf16 store only for flashmla head_dim=512");
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
-  static constexpr int64_t kPageBytes = kIsIndexer ? kIndexerBytes : kFlashMLABytes;
+  static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
+  static constexpr int64_t kPageBytes = kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
 
   /// TODO: Let's fix the config for now.
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
@@ -498,7 +518,7 @@ struct FusedNormRopeKernel {
     if constexpr (kIsIndexer) {
       return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL>;
     } else {
-      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL>;
+      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
     }
   }
 
@@ -540,7 +560,7 @@ struct FusedNormRopeKernel {
         .with_device(device_)
         .verify(freqs_cis);
     TensorMatcher({-1})  // out_loc
-        .with_dtype<int32_t>()
+        .with_dtype<int64_t>()
         .with_device(device_)
         .verify(out_loc);
     TensorMatcher({-1, -1})  // cache
@@ -567,7 +587,7 @@ struct FusedNormRopeKernel {
         .handle = plan.data_ptr(),
         .weight = weight.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
-        .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
+        .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
         .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
         .eps = eps,
         .compress_ratio = compress_ratio,
@@ -605,7 +625,7 @@ struct FusedNormRopeKernel {
     TensorMatcher({N, kHeadDim}).with_dtype<DType>().with_device(device_).verify(input);
     TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(weight);
     TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
-    TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(out_loc);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device_).verify(out_loc);
     TensorMatcher({-1, -1}).with_strides({kFp4PageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
 
     switch (mode) {
@@ -626,7 +646,7 @@ struct FusedNormRopeKernel {
         .handle = plan.data_ptr(),
         .weight = weight.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
-        .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
+        .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
         .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
         .eps = eps,
         .compress_ratio = compress_ratio,

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pybase64
@@ -146,3 +146,19 @@ def extract_routed_experts_from_meta_info(data):
         pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
     )
     return routed_experts
+
+
+def disable_routed_experts_capture_for_draft(model: Any) -> None:
+    """Opt every draft MoE ``TopK`` out of routed-experts (R3) capture.
+
+    Capture is target-only; a draft ``TopK`` must never write the target's
+    process-global buffer. ``HashTopK`` has no ``topk_config`` and never
+    captures, so it is left untouched.
+    """
+    # Lazy import: ``layers.moe.topk`` imports ``get_global_experts_capturer``
+    # from this module, so a top-level import here would be circular.
+    from sglang.srt.layers.moe.topk import TopK
+
+    for module in model.modules():
+        if isinstance(module, TopK):
+            module.topk_config.allow_routed_experts_capture = False

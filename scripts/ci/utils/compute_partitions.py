@@ -12,6 +12,7 @@ import json
 import math
 import os
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 import yaml  # PyYAML; preinstalled on ubuntu-latest GHA runners.
 
@@ -37,7 +38,7 @@ _TARGET_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 # base-a is the critical-path entry gate; pin its fanout to smoke-coverage
 # defaults instead of est_time. max_parallel = size (no throttle).
 _BASE_A_OVERRIDES = {
-    "base-a-test-cpu": 4,
+    "base-a-test-cpu": 8,
     "base-a-test-1-gpu-small": 1,
 }
 
@@ -179,6 +180,21 @@ def compute_partitions(
     return result
 
 
+def format_fit_window(model: dict) -> str:
+    """Render the model's fit window as `[start, end)` for the step summary.
+
+    Surfacing the whole span keeps the lower-bound date from reading as a
+    staleness marker (it trails today by fit_window_days)."""
+    start = model.get("fit_window_start")
+    days = model.get("fit_window_days")
+    if not start or not isinstance(days, int):
+        return f"fit_window_start={start}"
+    end = (datetime.strptime(start[:10], "%Y-%m-%d") + timedelta(days=days)).strftime(
+        "%Y-%m-%d"
+    )
+    return f"fit over [{start[:10]}, {end}) ({days}d window)"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", default=REPO_ROOT)
@@ -234,7 +250,7 @@ def main():
                 src_note = "no live model -- static est_time + (coeff=1, bias=0)"
             else:
                 src_note = (
-                    f"live model `data_as_of={partition_model.get('data_as_of')}`, "
+                    f"live model: {format_fit_window(partition_model)}, "
                     f"`n_runs={partition_model.get('n_runs')}`"
                 )
             f.write(

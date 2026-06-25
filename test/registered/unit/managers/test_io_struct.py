@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
@@ -418,6 +418,57 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         req.normalize_batch_and_arguments()
         self.assertEqual(req.lora_path, expected_lora_paths)
+
+    def test_extra_key_normalization(self):
+        """Test normalization of extra_key."""
+        # Per-request list
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"])
+        self.assertEqual(req[0].extra_key, "tenant-A")
+        self.assertEqual(req[1].extra_key, "tenant-B")
+
+        # Scalar broadcast
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key="shared",
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["shared", "shared"])
+
+        # None stays None
+        req = GenerateReqInput(text=["Hello", "World"], sampling_params=[{}, {}])
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.extra_key)
+        self.assertIsNone(req[0].extra_key)
+
+        # Parallel sampling expansion
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"] * 2)
+
+        # Wrong-length list
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+        # Non-batched scalar unchanged
+        req = GenerateReqInput(text="Hello", extra_key="solo")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, "solo")
 
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""

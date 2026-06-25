@@ -35,6 +35,7 @@ def flash_attn_with_kvcache(
     scheduler_metadata=None,
     num_splits=0,  # Can be tuned for speed
     pack_gqa=None,  # Can be tuned for speed
+    only_qv=False,  # ver=3 only: skip K matmul when qk rope dim is 0
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
@@ -163,6 +164,7 @@ def flash_attn_with_kvcache(
             scheduler_metadata=scheduler_metadata,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
@@ -230,6 +232,7 @@ def flash_attn_varlen_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
@@ -263,6 +266,7 @@ def flash_attn_varlen_func(
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,

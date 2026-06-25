@@ -83,8 +83,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int64_t sm_margin,
     std::optional<const at::Tensor>& sinks_,  // (h)
-    bool batch_invariant = false,
-    std::optional<at::Tensor> sparse_mask_fine_ = std::nullopt);
+    bool batch_invariant,
+    std::optional<at::Tensor> sparse_mask_fine_,  // [total_q, max_k_blocks, num_int32_per_block]
+    bool only_qv);
 
 /*
  * From flash-attention: get_scheduler_metadata
