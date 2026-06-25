@@ -58,10 +58,49 @@ class TestLoadLoRAAdapterValidation(unittest.TestCase):
             "Both 'lora_name' and 'lora_path' must be provided.",
         )
 
+    def test_whitespace_only_lora_name_rejected(self):
+        stub = _make_stub_self()
+        obj = LoadLoRAAdapterReqInput(lora_name="   ", lora_path="/some/path")
+
+        result = asyncio.run(TokenizerControlMixin.load_lora_adapter(stub, obj))
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.error_message,
+            "Both 'lora_name' and 'lora_path' must be provided.",
+        )
+
+    def test_whitespace_only_lora_path_rejected(self):
+        stub = _make_stub_self()
+        obj = LoadLoRAAdapterReqInput(lora_name="adapter", lora_path="   ")
+
+        result = asyncio.run(TokenizerControlMixin.load_lora_adapter(stub, obj))
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.error_message,
+            "Both 'lora_name' and 'lora_path' must be provided.",
+        )
+
     def test_empty_lora_name_from_tensors_rejected(self):
         stub = _make_stub_self()
         obj = LoadLoRAAdapterFromTensorsReqInput(
             lora_name="",
+            config_dict={},
+            serialized_tensors="",
+        )
+
+        result = asyncio.run(
+            TokenizerControlMixin.load_lora_adapter_from_tensors(stub, obj)
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_message, "'lora_name' must be provided.")
+
+    def test_whitespace_only_lora_name_from_tensors_rejected(self):
+        stub = _make_stub_self()
+        obj = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name="   ",
             config_dict={},
             serialized_tensors="",
         )

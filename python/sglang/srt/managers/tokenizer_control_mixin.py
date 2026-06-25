@@ -551,7 +551,12 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            if not obj.lora_name or not obj.lora_path:
+            if (
+                not obj.lora_name
+                or not obj.lora_name.strip()
+                or not obj.lora_path
+                or not obj.lora_path.strip()
+            ):
                 raise ValueError("Both 'lora_name' and 'lora_path' must be provided.")
 
             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
@@ -632,7 +637,7 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            if not obj.lora_name:
+            if not obj.lora_name or not obj.lora_name.strip():
                 raise ValueError("'lora_name' must be provided.")
 
             assert (
