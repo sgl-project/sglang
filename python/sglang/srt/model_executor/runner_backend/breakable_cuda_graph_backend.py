@@ -37,6 +37,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     enable_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -83,7 +86,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = self._device_module.graph_pool_handle()
+            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None

@@ -129,6 +129,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_gfx95_supported,
+    is_gfx942_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -162,6 +163,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx942_supported = is_gfx942_supported()
 
 if _use_aiter:
     if _is_gfx95_supported:
@@ -977,7 +979,14 @@ class MQALayer(nn.Module):
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # Only [0:n_local_heads] is written below. Uninitialized padded TP
+            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
+            # there; other archs tolerate new_empty and skip the per-forward
+            # memset.
+            if _is_gfx942_supported:
+                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+            else:
+                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
             if self._attn_sink_local is None:
