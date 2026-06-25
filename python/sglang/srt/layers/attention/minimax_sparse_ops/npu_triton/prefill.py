@@ -88,6 +88,38 @@ def _merge_prefill_sparse_blocks(
         block_size,
         rounding_mode="floor",
     )
+    qpos_3d = query_positions[:, None, None]
+    num_blocks_3d = num_blocks[:, None, None]
+
+    if init_blocks == 0 and local_blocks == 1:
+        local = (query_positions // block_size).clamp(min=0)
+        local = torch.minimum(local, (num_blocks - 1).clamp(min=0))
+        local = local.to(dtype).view(num_queries, 1, 1).expand(-1, num_heads, -1)
+        valid_topk = (topk_by_query >= 0) & (
+            topk_by_query.to(torch.long) < num_blocks_3d
+        )
+        valid_topk = valid_topk & (
+            topk_by_query.to(torch.long) * block_size <= qpos_3d
+        )
+        local_duplicate = ((topk_by_query == local) & valid_topk).any(
+            dim=-1, keepdim=True
+        )
+        valid_local = (local >= 0) & (local.to(torch.long) < num_blocks_3d)
+        valid_local = (
+            valid_local
+            & (local.to(torch.long) * block_size <= qpos_3d)
+            & ~local_duplicate
+        )
+        merged = torch.cat(
+            [
+                torch.where(
+                    valid_topk, topk_by_query, torch.full_like(topk_by_query, -1)
+                ),
+                torch.where(valid_local, local, torch.full_like(local, -1)),
+            ],
+            dim=-1,
+        )
+        return merged.permute(1, 0, 2).contiguous()
 
     forced_parts = []
     if init_blocks > 0:
@@ -109,8 +141,6 @@ def _merge_prefill_sparse_blocks(
 
     forced = torch.cat(forced_parts, dim=-1)
     candidates = torch.cat([forced, topk_by_query], dim=-1)
-    num_blocks_3d = num_blocks[:, None, None]
-    qpos_3d = query_positions[:, None, None]
     valid = (candidates >= 0) & (candidates.to(torch.long) < num_blocks_3d)
     valid = valid & (candidates.to(torch.long) * block_size <= qpos_3d)
     invalid_value = num_blocks_3d.expand_as(candidates).to(dtype)
