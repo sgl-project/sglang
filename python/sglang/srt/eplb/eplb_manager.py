@@ -3,6 +3,7 @@ import time
 from typing import TYPE_CHECKING, List
 
 import torch.cuda
+from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -12,7 +13,8 @@ from sglang.srt.eplb.expert_location import (
     format_expert_location_layout_diff,
     get_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import update_expert_location_with_recovery
+from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.runtime_context import get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -188,6 +190,58 @@ class EPLBManager:
                 layer_ids=update_layer_ids,
             ),
         )
+
+
+def update_expert_location_with_recovery(
+    *,
+    expert_location_updater: ExpertLocationUpdater,
+    model: nn.Module,
+    new_expert_location_metadata: ExpertLocationMetadata,
+    update_layer_ids: List[int],
+    nnodes: int,
+    tp_rank: int,
+    expert_backup_client,
+    update_weights_from_disk_callable,
+    ep_dispatch_algorithm: str,
+    init_lplb_solvers_callable,
+):
+    p2p_missing_logical_experts = expert_location_updater.update(
+        model.routed_experts_weights_of_layer,
+        new_expert_location_metadata,
+        update_layer_ids=update_layer_ids,
+        nnodes=nnodes,
+        rank=tp_rank,
+    )
+
+    if len(p2p_missing_logical_experts) > 0:
+        # Load the missing expert weights from disk
+        if callable(getattr(model, "generate_weight_name_filter", None)):
+            # Filter and load only missing expert weights
+            weight_name_filter = model.generate_weight_name_filter(
+                p2p_missing_logical_experts
+            )
+        else:
+            # Do a full reload from disk/DRAM
+            logger.info(
+                "[Elastic EP] Model does not implement generate_weight_name_filter. "
+                "Performing full weight reload."
+            )
+            weight_name_filter = None
+
+        if expert_backup_client is not None and expert_backup_client.use_backup:
+            # Load the missing weights from the DRAM backup
+            expert_backup_client.update_weights(weight_name_filter)
+        else:
+            # Load the missing weights from disk
+            update_weights_from_disk_callable(
+                get_server_args().model_path,
+                get_server_args().load_format,
+                weight_name_filter=weight_name_filter,
+            )
+
+    # Re-init LPLB solvers after expert location update
+    if ep_dispatch_algorithm == "lp":
+        init_lplb_solvers_callable()
 
 
 def _chunk_list(items: List, chunk_size):
