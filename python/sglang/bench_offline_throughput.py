@@ -15,7 +15,7 @@ warnings.warn(
     "`sglang.bench_offline_throughput` is deprecated and will be removed in a "
     "future release; use `sglang.benchmark.offline_throughput` instead "
     "(e.g. `python -m sglang.benchmark.offline_throughput`).",
-    DeprecationWarning,
+    FutureWarning,
     stacklevel=1,
 )
 
