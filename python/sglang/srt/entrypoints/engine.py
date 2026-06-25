@@ -53,6 +53,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -1261,6 +1262,9 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
+    envs.SGLANG_HICACHE_LOCAL_PROCESS_COUNT.set(
+        _calculate_local_scheduler_process_count(server_args)
+    )
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
@@ -1418,6 +1422,19 @@ def _calculate_rank_ranges(
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _calculate_local_scheduler_process_count(server_args: ServerArgs) -> int:
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(
+        server_args.nnodes,
+        server_args.pp_size,
+        server_args.tp_size,
+        server_args.node_rank,
+    )
+    local_size = len(pp_rank_range) * len(tp_rank_range)
+    if server_args.dp_size > 1 and not server_args.enable_dp_attention:
+        local_size *= server_args.dp_size
+    return max(local_size, 1)
 
 
 def _compute_parallelism_ranks(

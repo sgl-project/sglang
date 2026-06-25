@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import os
 import threading
 from functools import wraps
 from typing import Optional
@@ -9,6 +10,7 @@ from typing import Optional
 import psutil
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -32,6 +34,55 @@ def synchronized(func):
             return func(self, *args, **kwargs)
 
     return wrapper
+
+
+def get_local_hicache_process_count() -> int:
+    """Best-effort count of ranks sharing the same host memory budget."""
+    local_process_count = envs.SGLANG_HICACHE_LOCAL_PROCESS_COUNT.get()
+    if local_process_count > 0:
+        return local_process_count
+
+    try:
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        local_size = getattr(get_world_group(), "local_size", 0)
+        if local_size > 0:
+            return local_size
+    except Exception:
+        pass
+
+    for env_name in ("LOCAL_SIZE", "LOCAL_WORLD_SIZE"):
+        try:
+            local_size = int(os.environ.get(env_name, "0"))
+            if local_size > 0:
+                return local_size
+        except ValueError:
+            pass
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return max(1, torch.distributed.get_world_size())
+    return 1
+
+
+def validate_hicache_host_memory(
+    requested_bytes: int,
+    *,
+    description: str,
+) -> tuple[int, int, int]:
+    host_mem = psutil.virtual_memory()
+    available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    local_process_count = get_local_hicache_process_count()
+    aggregate_requested_bytes = requested_bytes * local_process_count
+    if aggregate_requested_bytes > available_bytes:
+        raise ValueError(
+            f"Not enough host memory available for {description}. "
+            f"Requesting {requested_bytes / 1e9:.2f} GB per local process "
+            f"across {local_process_count} local processes "
+            f"({aggregate_requested_bytes / 1e9:.2f} GB total), but only have "
+            f"{available_bytes / 1e9:.2f} GB free. Please reduce the size of "
+            f"the hierarchical cache."
+        )
+    return available_bytes, aggregate_requested_bytes, local_process_count
 
 
 class HostKVCache(abc.ABC):
@@ -71,21 +122,22 @@ class HostKVCache(abc.ABC):
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+        (
+            _,
+            aggregate_requested_bytes,
+            local_process_count,
+        ) = validate_hicache_host_memory(
+            requested_bytes,
+            description="hierarchical KV cache",
+        )
+        logger.info(
+            "Allocating %.2f GB host memory for hierarchical KV cache "
+            "(%.2f GB aggregate across %d local processes).",
+            requested_bytes / 1e9,
+            aggregate_requested_bytes / 1e9,
+            local_process_count,
+        )
 
         self.kv_buffer = self.init_kv_buffer()
 

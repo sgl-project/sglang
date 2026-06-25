@@ -1840,7 +1840,8 @@ class ServerArgs:
     ] = 2.0
     hicache_size: A[
         int,
-        "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        "The size of host KV cache memory pool in gigabytes per local worker process. "
+        "This overrides hicache_ratio if set.",
     ] = 0
     hicache_write_policy: A[
         str,

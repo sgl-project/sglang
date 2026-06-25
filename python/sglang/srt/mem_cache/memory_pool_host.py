@@ -9,7 +9,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
 import numpy as np
-import psutil
 import torch
 
 from sglang.jit_kernel.hicache import (
@@ -41,6 +40,16 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host.base import (
+    synchronized,
+    validate_hicache_host_memory,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    get_allocator_from_storage,
+)
+from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -64,22 +73,11 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
+
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
-
-
-from sglang.srt.mem_cache.pool_host import HostKVCache
-from sglang.srt.mem_cache.pool_host.base import (
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
-    synchronized,
-)
-from sglang.srt.mem_cache.pool_host.common import (
-    ALLOC_MEMORY_FUNCS,
-    get_allocator_from_storage,
-)
-from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -1446,19 +1444,21 @@ class MambaPoolHost(HostKVCache):
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
+        (
+            _,
+            aggregate_requested_bytes,
+            local_process_count,
+        ) = validate_hicache_host_memory(
+            requested_bytes,
+            description="hierarchical Mamba cache",
+        )
         logger.info(
-            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
+            "Allocating %.2f GB host memory for hierarchical Mamba cache "
+            "(%.2f GB aggregate across %d local processes, layout=%s).",
             requested_bytes / 1e9,
+            aggregate_requested_bytes / 1e9,
+            local_process_count,
             self.layout,
         )
 
@@ -2079,14 +2079,14 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
         requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 paged pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        (
+            _,
+            aggregate_requested_bytes,
+            local_process_count,
+        ) = validate_hicache_host_memory(
+            requested_bytes,
+            description=f"V4 paged pool {pool_name}",
+        )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -2123,9 +2123,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
         logger.info(
             "Allocating %.2f GB host memory for V4 paged pool '%s' "
-            "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
+            "(%.2f GB aggregate across %d local processes, "
+            "layers=%d, pages=%d, item_bytes=%d, layout=%s).",
             requested_bytes / 1e9,
             self.pool_name,
+            aggregate_requested_bytes / 1e9,
+            local_process_count,
             self.layer_num,
             num_host_pages,
             self.item_bytes,
@@ -2458,14 +2461,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 state pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        (
+            _,
+            aggregate_requested_bytes,
+            local_process_count,
+        ) = validate_hicache_host_memory(
+            requested_bytes,
+            description=f"V4 state pool {pool_name}",
+        )
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
@@ -2501,9 +2504,12 @@ class DeepSeekV4StateHostPool(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         logger.info(
             "Allocating %.2f GB host memory for V4 state pool '%s' "
-            "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
+            "(%.2f GB aggregate across %d local processes, "
+            "layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
             requested_bytes / 1e9,
             self.pool_name,
+            aggregate_requested_bytes / 1e9,
+            local_process_count,
             self.layer_num,
             num_host_pages,
             self.state_page_bytes,
@@ -2993,17 +2999,20 @@ class DSAIndexerPoolHost(HostKVCache):
 
         buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
         requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
-        host_mem = psutil.virtual_memory()
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for DSA indexer hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
-            )
+        (
+            _,
+            aggregate_requested_bytes,
+            local_process_count,
+        ) = validate_hicache_host_memory(
+            requested_bytes,
+            description="DSA indexer hierarchical cache",
+        )
         logger.info(
-            "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
+            "Allocating %.2f GB host memory for DSA indexer "
+            "(%.2f GB aggregate across %d local processes, layout=%s).",
             requested_bytes / 1e9,
+            aggregate_requested_bytes / 1e9,
+            local_process_count,
             layout,
         )
         self.init_kv_buffer()
