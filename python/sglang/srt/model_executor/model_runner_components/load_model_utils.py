@@ -100,6 +100,22 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[in
     return sliding_window_size
 
 
+def report_online_quantization(*, model, server_args: ServerArgs) -> None:
+    # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
+    quantized_layers = getattr(
+        getattr(model, "quant_config", None), "quantized_layers", None
+    )
+    if (
+        server_args.quantization is not None
+        and isinstance(quantized_layers, tuple)
+        and len(quantized_layers) == 2
+    ):
+        layer_types, quantized_layers_count = quantized_layers
+        logger.info(
+            f"Online {server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
+        )
+
+
 def maybe_register_debug_tensor_dump_hook(
     *,
     model,

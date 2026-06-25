@@ -132,6 +132,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_downgrade_dtype_for_legacy_gpu,
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
+    report_online_quantization,
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
@@ -1451,19 +1452,3 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
-
-
-def report_online_quantization(*, model, server_args: ServerArgs) -> None:
-    # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
-    quantized_layers = getattr(
-        getattr(model, "quant_config", None), "quantized_layers", None
-    )
-    if (
-        server_args.quantization is not None
-        and isinstance(quantized_layers, tuple)
-        and len(quantized_layers) == 2
-    ):
-        layer_types, quantized_layers_count = quantized_layers
-        logger.info(
-            f"Online {server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
-        )
