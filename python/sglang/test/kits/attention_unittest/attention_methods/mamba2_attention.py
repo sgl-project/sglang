@@ -18,6 +18,7 @@ _parallel_override.__enter__()
 # Provide a stub group with world_size=1 so use_symmetric_memory short-circuits.
 _linear_mod.get_tp_group = lambda: SimpleNamespace(world_size=1)
 
+from sglang.srt.configs.falcon_h1 import FalconH1Config  # noqa: E402
 from sglang.srt.configs.mamba_utils import (  # noqa: E402
     Mamba2CacheParams,
     Mamba2StateDType,
@@ -279,10 +280,10 @@ class TinyMamba2ModelConfig:
         self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
-        # Mamba2AttnBackend reads mamba2_config.mamba_chunk_size; expose it
-        # through a SimpleNamespace-as-hf_config so runner.mamba2_config returns
-        # something non-None with the expected attribute.
-        self.hf_config = SimpleNamespace(
+        # Mamba2AttnBackend reads mamba2_config(model_config).mamba_chunk_size, and the
+        # free mamba2_config() detects the config via isinstance against the real hybrid
+        # config classes, so the mock carries a real FalconH1Config holding mamba_chunk_size.
+        self.hf_config = FalconH1Config(
             architectures=["TinyMamba2ForCausalLM"],
             mamba_chunk_size=case.mamba_chunk_size,
         )
