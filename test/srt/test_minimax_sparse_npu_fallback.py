@@ -357,6 +357,16 @@ def test_npu_triton_prefill_does_not_keep_decode_topk_debug_switch():
     assert "use_triton_topk=not _use_torch_topk" not in source
 
 
+def test_npu_triton_prefill_score_kernel_caps_n_tile_for_ub():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+
+    assert "_PREFILL_NPU_SCORE_BLOCK_SIZE_N = 64" in source
+    assert '"BLOCK_SIZE_N": lambda args: _PREFILL_NPU_SCORE_BLOCK_SIZE_N' in source
+
+
 def test_npu_triton_prefill_merge_matches_decode_local_only_semantics():
     module = _load_npu_triton_prefill_module()
     topk_idx = torch.tensor(

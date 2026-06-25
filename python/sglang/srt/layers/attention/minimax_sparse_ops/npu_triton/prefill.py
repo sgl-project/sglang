@@ -11,10 +11,13 @@ from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
 )
 
 
+_PREFILL_NPU_SCORE_BLOCK_SIZE_N = 64
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_N": lambda args: triton.next_power_of_2(args["block_size"]),
+        "BLOCK_SIZE_N": lambda args: _PREFILL_NPU_SCORE_BLOCK_SIZE_N,
     }
 )
 @triton.jit
@@ -60,6 +63,7 @@ def _prefill_npu_score_kernel(
     SCORE_TYPE: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
+    tl.static_assert(block_size % BLOCK_SIZE_N == 0)
 
     pid_q = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -94,30 +98,68 @@ def _prefill_npu_score_kernel(
 
     for block_idx in tl.range(0, max_seqblock):
         valid_block = block_idx * block_size < seq_len
-        pos = block_idx * block_size + off_n
-        pos_mask = valid_block & (pos < seq_len)
-        slots = tl.load(
-            req_to_token_ptr + req_idx * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
+        score_max = tl.full((), -1.0e30, dtype=tl.float32)
+        score_lse_m = tl.full((), -1.0e30, dtype=tl.float32)
+        score_lse_l = tl.full((), 0.0, dtype=tl.float32)
 
-        k = tl.load(
-            k_cache_ptr
-            + slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        qk = tl.sum(q[:, None] * k, axis=0) * sm_scale
-        qk = tl.where(pos_mask, qk, -1.0e30)
+        for inner_start in tl.static_range(0, block_size, BLOCK_SIZE_N):
+            pos = block_idx * block_size + inner_start + off_n
+            pos_mask = valid_block & (pos < seq_len)
+            slots = tl.load(
+                req_to_token_ptr + req_idx * stride_r2t_b + pos,
+                mask=pos_mask,
+                other=0,
+            ).to(tl.int64)
 
-        sub_max = tl.max(qk, axis=0)
+            k = tl.load(
+                k_cache_ptr
+                + slots[None, :] * stride_k_s
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            qk = tl.sum(q[:, None] * k, axis=0) * sm_scale
+            qk = tl.where(pos_mask, qk, -1.0e30)
+
+            sub_max = tl.max(qk, axis=0)
+            if SCORE_TYPE == "max":
+                score_max = tl.maximum(score_max, sub_max)
+            else:
+                m_new = tl.maximum(score_lse_m, sub_max)
+                l_new = tl.sum(tl.exp(qk - m_new), axis=0)
+                old_scale = tl.where(
+                    score_lse_m > float("-inf"),
+                    tl.exp(score_lse_m - m_new),
+                    0.0,
+                )
+                score_lse_l = score_lse_l * old_scale + l_new
+                score_lse_m = m_new
+
+            if HAS_VALUE:
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_v_s
+                    + pid_kh * stride_v_h
+                    + off_d[None, :] * stride_v_d,
+                    mask=pos_mask[:, None] & dim_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                m_new = tl.maximum(m_i, sub_max)
+                p = tl.where(pos_mask, tl.exp(qk - m_new), 0.0)
+                l_new = tl.sum(p, axis=0)
+                acc_scale = tl.where(m_i > float("-inf"), tl.exp(m_i - m_new), 0.0)
+                acc_new = acc * acc_scale + tl.sum(p[:, None] * v, axis=0)
+                l_i_new = l_i * acc_scale + l_new
+
+                acc = tl.where(valid_block, acc_new, acc)
+                l_i = tl.where(valid_block, l_i_new, l_i)
+                m_i = tl.where(valid_block, m_new, m_i)
+
         if SCORE_TYPE == "max":
-            score = sub_max
+            score = score_max
         else:
-            score = sub_max + tl.log(tl.sum(tl.exp(qk - sub_max), axis=0))
+            score = score_lse_m + tl.log(score_lse_l)
             score = tl.where(score != score, float("-inf"), score)
 
         tl.store(
@@ -128,26 +170,6 @@ def _prefill_npu_score_kernel(
             score,
             mask=valid_block,
         )
-
-        if HAS_VALUE:
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_v_s
-                + pid_kh * stride_v_h
-                + off_d[None, :] * stride_v_d,
-                mask=pos_mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            m_new = tl.maximum(m_i, sub_max)
-            p = tl.where(pos_mask, tl.exp(qk - m_new), 0.0)
-            l_new = tl.sum(p, axis=0)
-            acc_scale = tl.where(m_i > float("-inf"), tl.exp(m_i - m_new), 0.0)
-            acc_new = acc * acc_scale + tl.sum(p[:, None] * v, axis=0)
-            l_i_new = l_i * acc_scale + l_new
-
-            acc = tl.where(valid_block, acc_new, acc)
-            l_i = tl.where(valid_block, l_i_new, l_i)
-            m_i = tl.where(valid_block, m_new, m_i)
 
     if HAS_VALUE:
         out = tl.where(l_i > 0.0, acc / l_i, acc)
