@@ -406,7 +406,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 device=idx_q_seq.device,
             )
 
-        scores = torch.einsum("qhd,kd->qhk", idx_q_seq.float(), idx_k_seq.float())
+        # bf16 matmul (fast on NPU), upcast to fp32 only for scoring/softmax
+        # aggregation — matches vLLM-ascend MiniMax prefill (patch einsum+scores.float()).
+        scores = torch.einsum("qhd,kd->qhk", idx_q_seq, idx_k_seq).float()
         padded = num_blocks * block_size
         if padded != seq_len:
             scores = torch.nn.functional.pad(scores, (0, padded - seq_len), value=-1e30)
@@ -467,19 +469,31 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         q_len, _, head_dim = q_group.shape
         num_selected = token_idx.shape[-1]
-        if num_selected == 0:
+        if num_selected == 0 or seq_len == 0:
             return q_group.new_zeros(q_group.shape)
 
-        valid = (token_idx >= 0) & (token_idx < seq_len) & (
-            token_idx <= query_positions[:, None]
+        # Masked-full attention (gather-free). The original gathered each query's
+        # selected tokens via index_select — q_len*num_selected scattered rows,
+        # ~1.9 GB/layer, ~91% of prefill time on NPU (GatherV3). The QK/PV matmuls
+        # are <3% of prefill and NPU matmul is fast, so compute attention over the
+        # full contiguous KV and mask non-selected positions to -inf. Numerically
+        # identical to the sparse version (masked tokens take zero softmax weight).
+        key_pos = torch.arange(seq_len, device=q_group.device, dtype=torch.long)
+        causal = key_pos[None, :] <= query_positions[:, None]  # [q_len, seq_len]
+        valid_sel = (token_idx >= 0) & (token_idx < seq_len)
+        # A trash column at index `seq_len` absorbs invalid (padded -1) entries so
+        # plain scatter never clobbers a genuinely selected position (no reduce=).
+        sel = torch.zeros((q_len, seq_len + 1), dtype=torch.bool, device=q_group.device)
+        safe_idx = torch.where(
+            valid_sel, token_idx.long(), torch.full_like(token_idx, seq_len)
         )
-        safe = token_idx.clamp(0, max(seq_len - 1, 0)).long().reshape(-1)
-        k_sel = k_kvhead.index_select(0, safe).view(q_len, num_selected, head_dim)
-        v_sel = v_kvhead.index_select(0, safe).view(q_len, num_selected, head_dim)
-        scores = torch.einsum("qhd,qkd->qhk", q_group.float(), k_sel.float())
-        scores = (scores * scale).masked_fill(~valid[:, None, :], -1e30)
-        probs = torch.softmax(scores, dim=-1)
-        return torch.einsum("qhk,qkd->qhd", probs.to(v_sel.dtype), v_sel)
+        sel.scatter_(1, safe_idx, True)
+        keep = sel[:, :seq_len] & causal  # [q_len, seq_len]
+
+        scores = torch.einsum("qhd,kd->qhk", q_group, k_kvhead).float() * scale
+        scores = scores.masked_fill(~keep[:, None, :], -1e30)
+        probs = torch.softmax(scores, dim=-1).to(v_kvhead.dtype)
+        return torch.einsum("qhk,kd->qhd", probs, v_kvhead)
 
     @staticmethod
     def _index_dense_attention(
@@ -490,7 +504,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         seq_len: int,
         scale: float,
     ) -> torch.Tensor:
-        scores = torch.einsum("qhd,kd->qhk", idx_q_seq.float(), idx_k_seq.float())
+        # bf16 matmul (fast on NPU), upcast to fp32 only for scoring/softmax
+        # aggregation — matches vLLM-ascend MiniMax prefill (patch einsum+scores.float()).
+        scores = torch.einsum("qhd,kd->qhk", idx_q_seq, idx_k_seq).float()
         scores = scores * scale
         key_pos = torch.arange(
             seq_len, device=idx_q_seq.device, dtype=query_positions.dtype
@@ -605,14 +621,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             locs = self.req_to_token[req_idx, :total_len].to(
                 device=k_slots.device, dtype=torch.long
             )
-            k_seq = k_slots.index_select(0, locs)
-            v_seq = v_slots.index_select(0, locs)
-            idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
-            idx_v_seq = (
-                None
-                if idx_v_slots is None
-                else idx_v_slots.index_select(0, locs)[:, 0, :]
+            # Fast path: NPU ``index_select`` on the paged KV pool is
+            # pathologically slow here (~33 ms/call, ~90% of prefill time).
+            # Prefill slots are handed out as a contiguous run by the token
+            # pool, so when ``locs`` is contiguous a direct slice (a zero-copy
+            # view) replaces the scattered gather and the GatherV3 cost
+            # vanishes. Fall back to index_select for fragmented allocations.
+            is_contig = total_len <= 1 or bool(
+                (locs[1:] - locs[:-1] == 1).all().item()
             )
+            if is_contig:
+                sl = slice(int(locs[0].item()), int(locs[0].item()) + total_len)
+                k_seq = k_slots[sl]
+                v_seq = v_slots[sl]
+                idx_k_seq = idx_k_slots[sl, 0, :]
+                idx_v_seq = (
+                    None if idx_v_slots is None else idx_v_slots[sl, 0, :]
+                )
+                
+            else:
+                k_seq = k_slots.index_select(0, locs)
+                v_seq = v_slots.index_select(0, locs)
+                idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
+                idx_v_seq = (
+                    None
+                    if idx_v_slots is None
+                    else idx_v_slots.index_select(0, locs)[:, 0, :]
+                )
             query_positions = torch.arange(
                 prefix_len,
                 prefix_len + q_len,
@@ -659,14 +694,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             locs = self.req_to_token[req_idx, :total_len].to(
                 device=k_slots.device, dtype=torch.long
             )
-            k_seq = k_slots.index_select(0, locs)
-            v_seq = v_slots.index_select(0, locs)
-            idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
-            idx_v_seq = (
-                None
-                if idx_v_slots is None
-                else idx_v_slots.index_select(0, locs)[:, 0, :]
+            # Fast path: NPU ``index_select`` on the paged KV pool is
+            # pathologically slow here (~33 ms/call, ~90% of prefill time).
+            # Prefill slots are handed out as a contiguous run by the token
+            # pool, so when ``locs`` is contiguous a direct slice (a zero-copy
+            # view) replaces the scattered gather and the GatherV3 cost
+            # vanishes. Fall back to index_select for fragmented allocations.
+            is_contig = total_len <= 1 or bool(
+                (locs[1:] - locs[:-1] == 1).all().item()
             )
+            if is_contig:
+                sl = slice(int(locs[0].item()), int(locs[0].item()) + total_len)
+                k_seq = k_slots[sl]
+                v_seq = v_slots[sl]
+                idx_k_seq = idx_k_slots[sl, 0, :]
+                idx_v_seq = (
+                    None if idx_v_slots is None else idx_v_slots[sl, 0, :]
+                )
+            else:
+                k_seq = k_slots.index_select(0, locs)
+                v_seq = v_slots.index_select(0, locs)
+                idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
+                idx_v_seq = (
+                    None
+                    if idx_v_slots is None
+                    else idx_v_slots.index_select(0, locs)[:, 0, :]
+                )
             query_positions = torch.tensor(
                 [max(total_len - 1, 0)], device=q.device, dtype=torch.long
             )
