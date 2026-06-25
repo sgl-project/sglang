@@ -3992,7 +3992,7 @@ class Scheduler(
                             req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                         req.pd_rebootstrap_in_progress = True
                         req.time_stats.set_retract_time()
-                        self.disagg_decode_prealloc_queue.add_rebootstrap(req)
+                        self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
                     else:
                         self._add_request_to_queue(req)
 
@@ -4022,6 +4022,16 @@ class Scheduler(
                 f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
+        # Enqueue any rebootstrap requests that were staged during a
+        # retract-mode pause. Deferring until resume keeps the preallocation
+        # queue empty during the pause window (so an intervening weight update
+        # can flush the cache) and recomputes the prefix KV under the updated
+        # weights.
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_prealloc_queue is not None
+        ):
+            self.disagg_decode_prealloc_queue.release_held_rebootstrap()
         self._engine_paused = False
 
     def load_lora_adapter(

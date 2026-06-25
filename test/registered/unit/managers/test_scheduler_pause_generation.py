@@ -9,7 +9,10 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import PauseGenerationReqInput
+from sglang.srt.managers.io_struct import (
+    ContinueGenerationReqInput,
+    PauseGenerationReqInput,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 
@@ -152,13 +155,27 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         scheduler._add_request_to_queue.assert_not_called()
-        scheduler.disagg_decode_prealloc_queue.add_rebootstrap.assert_called_once_with(
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_called_once_with(
             req
         )
         self.assertEqual(req.output_ids, [10, 11])
         self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
         self.assertTrue(req.pd_rebootstrap_in_progress)
         self.assertFalse(hasattr(req, "kv_cache_cpu"))
+
+    def test_pd_decode_continue_releases_held_rebootstrap(self):
+        """continue_generation must enqueue staged rebootstrap reqs on resume."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler._engine_paused = True
+
+        scheduler.continue_generation(
+            ContinueGenerationReqInput(torch_empty_cache=False)
+        )
+
+        scheduler.disagg_decode_prealloc_queue.release_held_rebootstrap.assert_called_once_with()
+        self.assertFalse(scheduler._engine_paused)
 
     def test_abort_drains_overlap_queue(self):
         """abort with overlap enabled should drain the result_queue."""

@@ -340,6 +340,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._failed_rebootstrap_prefill_reqs: queue.SimpleQueue[Req] = (
             queue.SimpleQueue()
         )
+        # Retracted requests staged for rebootstrap while generation is paused.
+        # Enqueued into ``self.queue`` only on ``continue_generation`` so the
+        # prefix KV is recomputed under the post-retract (updated) weights.
+        self.held_rebootstrap_reqs: List[Req] = []
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -564,6 +568,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         self.queue.append(decode_req)
         return decode_req
+
+    def hold_rebootstrap(self, req: Req) -> None:
+        """Stage a retracted request for rebootstrap without enqueuing it yet.
+
+        Retraction is always paired with a weight update
+        (``pause_generation(mode="retract")`` -> ``update_weights`` ->
+        ``continue_generation``). Enqueuing the rebootstrap into ``self.queue``
+        here would leave the preallocation queue non-empty, which makes the
+        scheduler non-idle so ``update_weights``' post-update cache flush
+        asserts and crashes the decode worker. Instead we hold the request and
+        enqueue it from ``release_held_rebootstrap`` on resume, so its prefix KV
+        is recomputed by the prefill worker under the updated weights.
+        """
+        self.held_rebootstrap_reqs.append(req)
+
+    def release_held_rebootstrap(self) -> None:
+        """Enqueue all staged rebootstrap requests when generation resumes."""
+        held = self.held_rebootstrap_reqs
+        self.held_rebootstrap_reqs = []
+        for req in held:
+            self.add_rebootstrap(req)
 
     def add_rebootstrap(self, req: Req) -> None:
         """Queue a pause-generation rebootstrap request.
