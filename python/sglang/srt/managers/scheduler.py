@@ -611,6 +611,7 @@ class Scheduler(
                         f"Page size now falls back to {self.dllm_config.block_size}"
                     )
                     self.page_size = self.dllm_config.block_size
+                    self.server_args.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
         is_rank_zero = (
@@ -3250,20 +3251,7 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            # ngram precomputes its draft and does not relay
-                            # through the FutureMap (stash() no-ops for it); its
-                            # verify input also has no bonus_tokens to project.
-                            if not batch.spec_algorithm.is_ngram():
-                                stash_payload = (
-                                    RelayPayload.from_draft_input(
-                                        batch_result.next_draft_input
-                                    )
-                                    if not batch.spec_algorithm.is_none()
-                                    else RelayPayload(
-                                        bonus_tokens=batch_result.next_token_ids
-                                    )
-                                )
-                                self.future_map.stash(future_indices, stash_payload)
+                            self._relay_forward_payload(future_indices, batch_result)
                             # Result D2H on copy_stream overlaps the next forward
                             # instead of serializing on forward_stream; it's a leaf
                             # gated by copy_done, so nothing on forward_stream waits.
@@ -3285,11 +3273,7 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    self.future_map.stash(
-                        batch.req_pool_indices,
-                        RelayPayload(bonus_tokens=batch_result.next_token_ids),
-                    )
+                self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
@@ -3323,12 +3307,9 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                if isinstance(batch_result.next_token_ids, torch.Tensor):
+                if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
-                    self.future_map.stash(
-                        batch.req_pool_indices,
-                        RelayPayload(bonus_tokens=batch_result.next_token_ids),
-                    )
+                    self._relay_forward_payload(batch.req_pool_indices, batch_result)
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3340,9 +3321,9 @@ class Scheduler(
                     req.extend_range.length if req.extend_range is not None else 0
                     for req in batch.reqs
                 ]
-                batch_result.extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
+                batch_result.extend_logprob_start_len_per_req = (
+                    batch.extend_logprob_start_lens
+                )
             else:
                 batch_result.extend_input_len_per_req = None
                 batch_result.extend_logprob_start_len_per_req = None
@@ -3387,6 +3368,21 @@ class Scheduler(
             ActiveRanksOutput(status=dp_active_ranks.tolist())
         )
 
+    def _relay_forward_payload(
+        self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
+    ) -> None:
+        """Stash this iter's relay payload for next iter's resolve_forward_inputs.
+        ngram is skipped: it relays its draft via batch.spec_info, not the FutureMap."""
+        if self.spec_algorithm.is_ngram():
+            return
+        if batch_result.next_draft_input is not None:
+            payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
+        elif batch_result.has_sampled_token_ids:
+            payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
+        else:
+            return
+        self.future_map.stash(future_indices, payload)
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult]:
@@ -3399,11 +3395,8 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            # Delay-sample is non-spec only; stash takes next_token_ids tensor.
-            self.future_map.stash(
-                batch_result.future_indices,
-                RelayPayload(bonus_tokens=batch_result.next_token_ids),
-            )
+            # Delay-sample is non-spec only; relays the sampled bonus tokens.
+            self._relay_forward_payload(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
