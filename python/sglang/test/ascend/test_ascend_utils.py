@@ -669,8 +669,8 @@ def run_and_check_memory_leak(
     t = threading.Thread(target=read_output, args=(output_lines, stderr_file.name))
     t.start()
 
-    # Run the workload
     try:
+        # Run the workload
         workload_func(base_url, model)
     finally:
         # Clean up everything
