@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, NamedTuple, Optional, Set, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -9,10 +9,10 @@ from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.utils.weight_checker_comparator import (
-    _CHUNK_NUMEL,
+    CHUNK_NUMEL,
     ComparableWeight,
     RawComparable,
-    _compare_weights,
+    compare_weights,
     select_comparable_weight,
 )
 
@@ -188,7 +188,7 @@ def _check_tensors(
         name = expect_name
 
         try:
-            equal, max_abs_err, mean_abs_err, num_exceed = _compare_weights(
+            equal, max_abs_err, mean_abs_err, num_exceed = compare_weights(
                 expect_ref, actual_ref
             )
         except Exception as e:
@@ -227,7 +227,7 @@ def _random_like(t: torch.Tensor):
 
     if dtype.is_floating_point:
         out = torch.empty(shape, device=device, dtype=dtype)
-        for chunk in out.view(-1).split(_CHUNK_NUMEL):
+        for chunk in out.view(-1).split(CHUNK_NUMEL):
             chunk.copy_(
                 torch.rand(chunk.shape, device=device, dtype=torch.float32).to(dtype)
             )
@@ -242,9 +242,14 @@ def _random_like(t: torch.Tensor):
     )
 
 
-def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:
-    """Run the router over the model: {weight_name: (ComparableWeight subclass,
-    scale_name)} for each quantized weight; weights absent from the set compare raw."""
+class QuantizedWeight(NamedTuple):
+    comparable_cls: Type[ComparableWeight]
+    scale_name: str
+
+
+def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
+    """Run the router over the model: {weight_name: QuantizedWeight} for each
+    quantized weight; weights absent from the set compare raw."""
     quantized_set = {}
     for module_name, module in model.named_modules():
         comparable_cls = select_comparable_weight(getattr(module, "quant_method", None))
@@ -255,27 +260,29 @@ def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:
         for name in own:
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
-                quantized_set[prefix + name] = (comparable_cls, prefix + scale)
+                quantized_set[prefix + name] = QuantizedWeight(
+                    comparable_cls, prefix + scale
+                )
     return quantized_set
 
 
 def _build_entries(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
-    quantized_set: Optional[Dict[str, Tuple[type, str]]] = None,
+    quantized_set: Optional[Dict[str, QuantizedWeight]] = None,
 ) -> Iterable[Tuple[str, bool, ComparableWeight]]:
     """Yields (name, should_compare, ComparableWeight); quantized weights consume
     their scale, everything else is raw."""
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
-    scale_names = {scale for _, scale in quantized_set.values()}
+    scale_names = {qw.scale_name for qw in quantized_set.values()}
 
     for name, tensor in raw.items():
         if name in scale_names:
             continue  # compared via its weight's comparable
         if name in quantized_set:
-            comparable_cls, s_name = quantized_set[name]
-            yield name, True, comparable_cls(tensor, raw[s_name])
+            qw = quantized_set[name]
+            yield name, True, qw.comparable_cls(tensor, raw[qw.scale_name])
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)

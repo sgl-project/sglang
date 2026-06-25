@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 
 # chunk to avoid too high GPU memory peak
-_CHUNK_NUMEL = 64 * 1024 * 1024
+CHUNK_NUMEL = 64 * 1024 * 1024
 
 
 class ComparableWeight:
@@ -67,7 +67,7 @@ class Fp8BlockComparable(ComparableWeight):
         q3 = w_q.reshape(-1, *w_q.shape[-2:])
         s3 = w_s.reshape(-1, *w_s.shape[-2:])
         n, k = q3.shape[-2:]
-        rows = max(block_n, _CHUNK_NUMEL // k // block_n * block_n)
+        rows = max(block_n, CHUNK_NUMEL // k // block_n * block_n)
         for b in range(q3.shape[0]):
             for r0 in range(0, n, rows):
                 r1 = min(r0 + rows, n)
@@ -104,14 +104,14 @@ class RawComparable(ComparableWeight):
 
     def iter_chunks(self):
         flat = self.tensor.reshape(-1)
-        for start in range(0, flat.numel(), _CHUNK_NUMEL):
-            yield flat[start : start + _CHUNK_NUMEL].cuda(), None
+        for start in range(0, flat.numel(), CHUNK_NUMEL):
+            yield flat[start : start + CHUNK_NUMEL].cuda(), None
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         return self.tensor
 
 
-def _compare_weights(
+def compare_weights(
     expect: ComparableWeight, actual: ComparableWeight
 ) -> Tuple[bool, float, float, int]:
     """Chunked dequant-space compare; returns (equal, max_abs_err, mean_abs_err,
