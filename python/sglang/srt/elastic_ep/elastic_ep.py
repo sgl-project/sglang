@@ -3,13 +3,16 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterator, List, Optional
+from typing import TYPE_CHECKING, Iterator, List, Optional
 
 import torch
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.managers.schedule_batch import ServerArgs
 from sglang.srt.utils import is_cpu, is_cuda
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -199,5 +202,3 @@ def join_process_groups():
             _get_process_group_backend(group.cpu_group, "cpu"),
         )
         _maybe_create_message_queue(group)
-
-    _refresh_ep_members()

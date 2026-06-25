@@ -42,7 +42,6 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import (
     get_tp_group,
-    get_world_group,
 )
 from sglang.srt.distributed.bootstrap import init_torch_distributed
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -418,12 +417,7 @@ class ModelRunner:
             and self.server_args.elastic_ep_rejoin
         ):
             join_process_groups()
-            broadcast_global_expert_location_metadata(
-                src_rank=get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=True
-                )
-            )
-            ElasticEPStateManager.instance().reset()
+            rebroadcast_expert_location_metadata(invoked_in_elastic_ep_rejoin_path=True)
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -928,47 +922,6 @@ class ModelRunner:
                     f"TP rank {self.ps.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
 
-    def maybe_recover_ep_ranks(self):
-        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-        # synchronization, and this function is on the forward-path.
-        # This check only runs when `--elastic-ep-backend` is enabled, so the
-        # synchronization overhead does not propagate to other configs.
-        # Leave for future optimization of the elastic EP path.
-        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
-            return
-
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
-        ranks_to_recover = [
-            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
-        ]
-
-        # try_recover_ranks polls peer state via Mooncake EP backend.
-        # Mooncake's internal semantics guarantee that all ranks observe
-        # consistent peer readiness state, so collective operations below
-        # are safe even though polling appears local.
-        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
-            self.forward_pass_id = 0
-            self.eplb_manager.reset_generator()
-            broadcast_global_expert_location_metadata(
-                src_rank=get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=False
-                )
-            )
-            ElasticEPStateManager.instance().reset()
-
-            broadcast_pyobj(
-                [self.server_args.random_seed],
-                get_world_group().rank,
-                get_world_group().cpu_group,
-                src=get_world_group().ranks[0],
-            )
-            logger.info(f"recover ranks {ranks_to_recover} done")
-
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -1212,8 +1165,12 @@ class ModelRunner:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
 
-        if self.server_args.elastic_ep_backend is not None:
-            self.maybe_recover_ep_ranks()
+        if self.server_args.elastic_ep_backend is not None and maybe_recover_ep_ranks(
+            tp_group=self.tp_group,
+            eplb_manager=self.eplb_manager,
+            random_seed=self.server_args.random_seed,
+        ):
+            self.forward_pass_id = 0
 
         return output
 
@@ -1440,3 +1397,59 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+
+def maybe_recover_ep_ranks(
+    *,
+    tp_group: parallel_state.GroupCoordinator,
+    eplb_manager: EPLBManager,
+    random_seed: int,
+) -> bool:
+    # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+    # synchronization, and this function is on the forward-path.
+    # This check only runs when `--elastic-ep-backend` is enabled, so the
+    # synchronization overhead does not propagate to other configs.
+    # Leave for future optimization of the elastic EP path.
+    if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
+        return False
+
+    tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
+    tp_active_ranks_cpu = tp_group.active_ranks_cpu.detach().numpy()
+    tp_active_ranks &= tp_active_ranks_cpu
+    # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+    # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+    # tp-group index is the same as the global rank index.
+    ranks_to_recover = [
+        i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+    ]
+
+    # try_recover_ranks polls peer state via Mooncake EP backend.
+    # Mooncake's internal semantics guarantee that all ranks observe
+    # consistent peer readiness state, so collective operations below
+    # are safe even though polling appears local.
+    if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+        eplb_manager.reset_generator()
+        rebroadcast_expert_location_metadata(invoked_in_elastic_ep_rejoin_path=False)
+        broadcast_pyobj(
+            [random_seed],
+            parallel_state.get_world_group().rank,
+            parallel_state.get_world_group().cpu_group,
+            src=parallel_state.get_world_group().ranks[0],
+        )
+        logger.info(f"recover ranks {ranks_to_recover} done")
+        return True
+
+    return False
+
+
+def rebroadcast_expert_location_metadata(
+    *, invoked_in_elastic_ep_rejoin_path: bool
+) -> None:
+    broadcast_global_expert_location_metadata(
+        src_rank=get_healthy_expert_location_src_rank(
+            invoked_in_elastic_ep_rejoin_path=invoked_in_elastic_ep_rejoin_path
+        )
+    )
+    ElasticEPStateManager.instance().reset()
+
+    _refresh_ep_members()
