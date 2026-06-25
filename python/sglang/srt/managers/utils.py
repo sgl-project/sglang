@@ -85,6 +85,12 @@ class GenerationBatchResult:
     fpm_start_event: Optional[torch.cuda.Event] = None
     fpm_end_event: Optional[torch.cuda.Event] = None
 
+    @property
+    def has_sampled_token_ids(self) -> bool:
+        """True when this iter sampled token ids; False when none were produced
+        this rank/split (a non-last PP rank or a non-final prefill split)."""
+        return isinstance(self.next_token_ids, torch.Tensor)
+
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
