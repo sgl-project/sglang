@@ -3,167 +3,144 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 import torch
-import triton
 
 from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
     topk_index_reduce,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.common.utils import (
-    get_cu_seqblocks,
-    set_triton_allocator_if_available,
+from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode import (
+    flash_decode_bnsd_with_topk_idx,
 )
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.flash_with_topk_idx import (
-    _flash_attn_fwd_with_block_score_kernel,
-    _topk_index_kernel,
-)
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
-    flash_prefill_with_gqa_share_sparse,
+from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
+    flash_decode_bnsd_with_gqa_share_sparse,
 )
 
 
-@torch.no_grad()
-def _flash_prefill_with_topk_index_npu(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: Optional[torch.Tensor],
-    sink: Optional[torch.Tensor],
+def _cache_as_bnsd(cache: Optional[torch.Tensor], page_size: int):
+    if cache is None:
+        return None
+    if cache.dim() == 4:
+        return cache
+    num_pages = cache.shape[0] // page_size
+    return cache.view(num_pages, page_size, cache.shape[1], cache.shape[2])
+
+
+def _build_prefill_query_meta(
     req_to_token: torch.Tensor,
     slot_ids: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    seq_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
-    max_seqlen_q: int,
     max_seqlen_k: int,
-    block_size_q: int,
-    block_size_k: int,
-    topk: int,
+    page_size: int,
+):
+    extend_lens = torch.diff(cu_seqlens).to(torch.long)
+    batch_size = extend_lens.shape[0]
+    max_blocks = (max_seqlen_k + page_size - 1) // page_size
+    total_q = int(cu_seqlens[-1].item())
+    if total_q == 0:
+        return (
+            cu_seqlens.new_empty((0,), dtype=torch.int32),
+            cu_seqlens.new_empty((0, max_blocks), dtype=torch.int32),
+        )
+
+    device = cu_seqlens.device
+    batch_ids = torch.repeat_interleave(
+        torch.arange(batch_size, device=device, dtype=torch.long), extend_lens
+    )
+    q_starts = torch.repeat_interleave(cu_seqlens[:-1].to(torch.long), extend_lens)
+    q_offsets = torch.arange(total_q, device=device, dtype=torch.long) - q_starts
+    query_seq_lens = (
+        prefix_lens.to(device=device, dtype=torch.long)[batch_ids] + q_offsets + 1
+    ).to(torch.int32)
+
+    req_idx = slot_ids.to(device=req_to_token.device, dtype=torch.long)[
+        batch_ids.to(req_to_token.device)
+    ]
+    blk_cols = (
+        torch.arange(max_blocks, device=req_to_token.device, dtype=torch.long)
+        * page_size
+    )
+    blk_cols = blk_cols.clamp(max=req_to_token.shape[1] - 1)
+    token_slots = req_to_token[req_idx][:, blk_cols]
+    block_table = (token_slots // page_size).to(torch.int32)
+    return query_seq_lens, block_table
+
+
+def _merge_prefill_sparse_blocks(
+    topk_idx: torch.Tensor,
+    query_seq_lens: torch.Tensor,
+    block_size: int,
     init_blocks: int,
     local_blocks: int,
-    sm_scale: Optional[float],
-    score_type: str,
-    disable_index_value: bool,
-    cu_seqblocks_q: torch.Tensor,
-    max_seqblock_q: int,
-    all_seqblock_q: int,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
-    """NPU-friendly variant of the index prefill wrapper.
+) -> torch.Tensor:
+    total_forced = init_blocks + local_blocks
+    if total_forced <= 0:
+        return topk_idx
 
-    The underlying Triton kernel is shared with the generic path. This wrapper
-    keeps pointer arguments typed even when index-value output is disabled.
-    """
-    assert score_type in (
-        "max",
-        "lse",
-    ), f"score_type must be 'max' or 'lse', got {score_type!r}"
-    set_triton_allocator_if_available()
-    assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
-    assert k_cache.dtype == q.dtype
-    assert cu_seqlens.dtype == torch.int32
+    topk_by_query = topk_idx.permute(1, 0, 2).contiguous()
+    num_queries, num_heads, topk = topk_by_query.shape
+    total = topk + total_forced
+    device = topk_by_query.device
+    dtype = topk_by_query.dtype
 
-    total_q, num_heads, qk_head_dim = q.shape
-    max_slots, num_kv_heads, _ = k_cache.shape
-    if disable_index_value:
-        v_cache_arg = k_cache if v_cache is None else v_cache
-        v_head_dim = qk_head_dim
-    else:
-        assert v_cache is not None and v_cache.dtype == q.dtype
-        assert v_cache.shape[1] == k_cache.shape[1]
-        v_cache_arg = v_cache
-        v_head_dim = v_cache.shape[-1]
-    gqa_group_size = num_heads // num_kv_heads
-    batch_size = cu_seqlens.shape[0] - 1
-    assert qk_head_dim <= 256 and v_head_dim <= 256, "head_dim must be less than 256"
-    if sink is not None:
-        assert sink.shape[0] == num_heads and sink.shape[1] == qk_head_dim
-    assert (
-        init_blocks + local_blocks <= topk
-    ), "init_blocks + local_blocks must be less than topk"
-    if sm_scale is None:
-        sm_scale = qk_head_dim**-0.5
-
-    max_seqblock_k = triton.cdiv(max_seqlen_k, block_size_k)
-    o = torch.empty(total_q, num_heads, v_head_dim, dtype=q.dtype, device=q.device)
-    score = torch.full(
-        (num_heads, total_q, max_seqblock_k),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q.device,
+    query_positions = (query_seq_lens.to(torch.long) - 1).clamp(min=0)
+    num_blocks = torch.div(
+        query_seq_lens.to(torch.long) + block_size - 1,
+        block_size,
+        rounding_mode="floor",
     )
 
-    def grid(META):
-        return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
+    forced_parts = []
+    if init_blocks > 0:
+        forced_parts.append(
+            torch.arange(init_blocks, device=device, dtype=dtype)
+            .view(1, 1, -1)
+            .expand(num_queries, num_heads, -1)
+        )
+    if local_blocks > 0:
+        offsets = torch.arange(local_blocks, device=device, dtype=torch.long)
+        block_ids = query_positions // block_size
+        first = (block_ids - local_blocks + 1).clamp(min=0)
+        forced_parts.append(
+            (first[:, None] + offsets[None, :])
+            .to(dtype)
+            .view(num_queries, 1, -1)
+            .expand(-1, num_heads, -1)
+        )
 
-    _flash_attn_fwd_with_block_score_kernel[grid](
-        q,
-        k_cache,
-        v_cache_arg,
-        sink,
-        o,
-        score,
-        req_to_token,
-        cu_seqlens,
-        seq_lens,
-        prefix_lens,
-        slot_ids,
-        max_slots,
-        num_heads,
-        gqa_group_size,
-        qk_head_dim,
-        v_head_dim,
-        block_size_k,
-        sm_scale,
-        False,
-        1,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache_arg.stride(0),
-        v_cache_arg.stride(1),
-        v_cache_arg.stride(2),
-        sink.stride(0) if sink is not None else 0,
-        sink.stride(1) if sink is not None else 0,
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        req_to_token.stride(0),
-        SCORE_TYPE=score_type,
-        DISABLE_INDEX_VALUE=disable_index_value,
-    )
+    forced = torch.cat(forced_parts, dim=-1)
+    candidates = torch.cat([forced, topk_by_query], dim=-1)
+    num_blocks_3d = num_blocks[:, None, None]
+    qpos_3d = query_positions[:, None, None]
+    valid = (candidates >= 0) & (candidates.to(torch.long) < num_blocks_3d)
+    valid = valid & (candidates.to(torch.long) * block_size <= qpos_3d)
+    invalid_value = num_blocks_3d.expand_as(candidates).to(dtype)
 
-    topk_idx = torch.full(
-        (num_heads, all_seqblock_q, topk),
-        fill_value=-1,
-        device=score.device,
-        dtype=torch.int32,
+    sorted_candidates = torch.sort(
+        torch.where(valid, candidates, invalid_value), dim=-1
+    ).values
+    sorted_valid = sorted_candidates.to(torch.long) < num_blocks_3d
+    previous = torch.cat(
+        [
+            torch.full_like(sorted_candidates[..., :1], -1),
+            sorted_candidates[..., :-1],
+        ],
+        dim=-1,
     )
-    grid = (max_seqblock_q, batch_size, num_heads)
-    _topk_index_kernel[grid](
-        score,
-        topk_idx,
-        block_size_q,
-        block_size_k,
-        cu_seqlens,
-        cu_seqblocks_q,
-        prefix_lens,
-        topk,
-        init_blocks,
-        local_blocks,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        topk_idx.stride(0),
-        topk_idx.stride(1),
-        topk_idx.stride(2),
-        MASK_INIT=False,
-        MASK_LOCAL=False,
+    keep = sorted_valid & (sorted_candidates != previous)
+    ranks = torch.cumsum(keep.to(torch.int32), dim=-1) - 1
+    output = torch.full(
+        (num_queries, num_heads, total + 1),
+        -1,
+        dtype=dtype,
+        device=device,
     )
-    return (None if disable_index_value else o), topk_idx
+    overflow_rank = torch.full_like(ranks, total)
+    scatter_index = torch.where(
+        keep & (ranks < total), ranks, overflow_rank
+    ).long()
+    scatter_src = torch.where(keep, sorted_candidates, -1)
+    output.scatter_(2, scatter_index, scatter_src)
+    return output[:, :, :total].permute(1, 0, 2).contiguous()
 
 
 @torch.no_grad()
@@ -196,68 +173,87 @@ def minimax_sparse_prefill_npu_triton(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
     seqlens_cpu: Optional[List[int]] = None,
+    page_size: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
-    """Run MiniMax-M3 sparse prefill through the NPU Triton path.
+    """Run NPU prefill with Ascend-friendly BNSD kernels.
 
-    This mirrors ``minimax_sparse_prefill`` while keeping the NPU path explicit:
-    TMA is disabled and query-block metadata can be supplied by the backend once
-    per forward instead of recomputed by every sparse layer.
+    Each prefill token is represented as a decode query with its own effective
+    KV length. This avoids the generic CUDA prefill kernels and keeps the forced
+    init/local block semantics aligned with the NPU decode path.
     """
-    if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
-        cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
-            cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
-        )
+    del max_seqlen_q, block_size_q, cu_seqblocks_q, max_seqblock_q
+    del all_seqblock_q, seqlens_cpu, seq_lens
 
-    idx_o, topk_idx = _flash_prefill_with_topk_index_npu(
+    page_size = block_size_k if page_size is None else page_size
+    if page_size != block_size_k:
+        raise NotImplementedError(
+            "MiniMax-M3 NPU Triton prefill requires page_size == block_size_k "
+            f"(got page_size={page_size}, block_size_k={block_size_k})."
+        )
+    if sink is not None or idx_sink is not None:
+        raise NotImplementedError("MiniMax-M3 NPU Triton prefill does not support sink")
+    if q.shape[0] == 0:
+        idx_o = None if disable_index_value else idx_q.new_empty(idx_q.shape)
+        return idx_o, q.new_empty(q.shape)
+
+    k_bnsd = _cache_as_bnsd(k_cache, page_size)
+    v_bnsd = _cache_as_bnsd(v_cache, page_size)
+    idx_k_bnsd = _cache_as_bnsd(idx_k_cache, page_size)
+    idx_v_bnsd = None if idx_v_cache is None else _cache_as_bnsd(idx_v_cache, page_size)
+
+    query_seq_lens, block_table = _build_prefill_query_meta(
+        req_to_token,
+        slot_ids,
+        cu_seqlens,
+        prefix_lens,
+        max_seqlen_k,
+        page_size,
+    )
+
+    idx_dim = idx_q.shape[-1]
+    idx_o, topk_idx = flash_decode_bnsd_with_topk_idx(
         q=idx_q,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        sink=idx_sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
+        sink=None,
+        k_cache_bnsd=idx_k_bnsd,
+        v_cache_bnsd=idx_v_bnsd,
+        block_table=block_table,
+        seq_lens=query_seq_lens,
+        max_seqlen=max_seqlen_k,
+        block_size=page_size,
         topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
+        init_blocks=0,
+        local_blocks=0,
+        sm_scale=idx_sm_scale if idx_sm_scale is not None else idx_dim**-0.5,
         score_type=score_type,
         disable_index_value=disable_index_value,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
-        all_seqblock_q=all_seqblock_q,
     )
 
     num_idx_heads = idx_q.shape[1]
-    num_kv_heads = k_cache.shape[1]
-    idx_group_size = num_idx_heads // num_kv_heads
-    if idx_group_size > 1:
+    num_kv_heads = k_bnsd.shape[2]
+    if num_idx_heads > num_kv_heads:
+        idx_group_size = num_idx_heads // num_kv_heads
         topk_idx = topk_index_reduce(
             topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
         )
 
-    o = flash_prefill_with_gqa_share_sparse(
+    topk_idx = _merge_prefill_sparse_blocks(
+        topk_idx,
+        query_seq_lens,
+        page_size,
+        init_blocks,
+        local_blocks,
+    )
+
+    head_dim = q.shape[-1]
+    o = flash_decode_bnsd_with_gqa_share_sparse(
         q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        sink=sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
+        sink=None,
+        k_cache_bnsd=k_bnsd,
+        v_cache_bnsd=v_bnsd,
+        block_table=block_table,
+        seq_lens=query_seq_lens,
+        block_size=page_size,
         topk_idx=topk_idx,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        sm_scale=sm_scale,
-        use_tma=False,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
+        sm_scale=sm_scale if sm_scale is not None else head_dim**-0.5,
     )
     return idx_o, o

@@ -812,6 +812,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             max_seqblock_q=meta.max_seqblock_q,
             all_seqblock_q=meta.all_seqblock_q,
             seqlens_cpu=meta.extend_seq_lens_cpu,
+            page_size=self.page_size,
         )
 
     def _forward_npu_sparse_decode(

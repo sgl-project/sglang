@@ -180,6 +180,29 @@ def test_npu_forward_extend_has_triton_prefill_gate():
     assert "self._forward_npu_triton_prefill(" in source
 
 
+def test_npu_triton_prefill_uses_bnsd_decode_kernels():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+
+    assert "flash_decode_bnsd_with_topk_idx" in source
+    assert "flash_decode_bnsd_with_gqa_share_sparse" in source
+    assert "minimax_sparse_ops.prefill.flash_with_topk_idx" not in source
+    assert "minimax_sparse_ops.prefill.topk_sparse" not in source
+
+
+def test_npu_triton_prefill_appends_forced_blocks_after_pure_topk():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+
+    assert "_merge_prefill_sparse_blocks(" in source
+    assert "init_blocks=0" in source
+    assert "local_blocks=0" in source
+
+
 def test_minimax_sparse_triton_allocator_calls_are_guarded():
     ops_dir = (
         Path(__file__).resolve().parents[2]
