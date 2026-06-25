@@ -1,10 +1,3 @@
-"""Benchmark: fused Q-quant + KV-write vs the per-layer string of tiny launches.
-
-Timing uses FlashInfer's CUPTI-based ``bench_gpu_time_with_cupti`` (kernel-time,
-cold L2), which is what the TRTLLM-GEN MHA decode preamble is bound by: the win
-is collapsing ~8 launches into 1, so wall-clock launch overhead matters.
-"""
-
 from __future__ import annotations
 
 import statistics

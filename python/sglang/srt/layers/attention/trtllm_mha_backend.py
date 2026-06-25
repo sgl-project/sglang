@@ -585,14 +585,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         num_tokens: int,
     ) -> bool:
-        """Single-kernel Q-quant + KV-write path (TRTLLM-GEN, decode family).
-
-        Folds the Q dynamic FP8 quant, the BMM1 descale, and the FP8 KV write
-        into one cooperative launch, removing the per-layer string of tiny
-        islands. Gated to the TRTLLM-GEN FP8 path (q is quantized, q_type=fp8) on
-        the decode-like modes; prefill keeps the parallel per_tensor path. The
-        kernel is grid-sized to the work, so it wins from 1 to 8k+ tokens.
-        """
         return (
             self.data_type == torch.float8_e4m3fn
             and not self.is_xqa_impl
@@ -615,12 +607,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        """Run the fused kernel; return (q_fp8, bmm1_scale, bmm2_scale).
-
-        The slot-major NHD cache assumption matches the legacy fused KV path
-        (the vectorized_5d layout is not supported here). bmm1_scale is a
-        device f32[1] tensor: (amax_q / 448) * k_scale * layer.scaling.
-        """
         from sglang.jit_kernel.fused_q_quant_kv_write import fused_q_quant_kv_write
 
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
@@ -826,7 +812,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        # One-kernel path: Q dynamic FP8 quant + BMM1 descale + FP8 KV write.
         if self._should_use_fused_q_kv_path(
             save_kv_cache, k, forward_batch.forward_mode, q.shape[0]
         ):
@@ -920,8 +905,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         cache_loc = forward_batch.out_cache_loc
 
-        # One-kernel path: Q dynamic FP8 quant + BMM1 descale + FP8 KV write
-        # (target-verify / draft-extend; prefill stays on the parallel path).
         if self._should_use_fused_q_kv_path(
             save_kv_cache, k, forward_batch.forward_mode, q.shape[0]
         ):

@@ -40,7 +40,6 @@ def test_matches_reference(dtype, num_tokens, num_q_heads, num_kv_heads):
     k_ref = torch.zeros_like(k_cache)
     v_ref = torch.zeros_like(v_cache)
 
-    # Reference: the exact ops the fused kernel replaces.
     q_ref, q_scale_ref = scaled_fp8_quant(q.reshape(-1, q.shape[-1]).contiguous(), None)
     q_ref = q_ref.reshape(q.shape)
     bmm1_ref = q_scale_ref * k_scale * scaling
@@ -63,7 +62,6 @@ def test_matches_reference(dtype, num_tokens, num_q_heads, num_kv_heads):
         bmm1_extra=k_scale * scaling,
     )
 
-    # FP8 quant of the same fp32 values; allow 1 ULP for amax reduction order.
     assert _ulp(q_fp8, q_ref) <= 1
     assert _ulp(k_cache, k_ref) <= 1
     assert _ulp(v_cache, v_ref) <= 1
