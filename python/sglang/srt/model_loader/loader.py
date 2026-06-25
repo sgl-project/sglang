@@ -16,6 +16,7 @@ import math
 import os
 import re
 import socket
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -2660,10 +2661,6 @@ class IncModelLoader(DefaultModelLoader):
         scheme, format = self._parse_quantization(model_config.quantization)
 
         try:
-            if self.load_config.inc_save_path is not None:
-                logger.info("Offline quantization mode: Will quantize and save")
-            else:
-                logger.info("Online quantization mode: Will quantize and skip saving")
             autoround = AutoRound(
                 model_config.model_path,
                 scheme=scheme,
@@ -2671,10 +2668,20 @@ class IncModelLoader(DefaultModelLoader):
                 disable_opt_rtn=self.load_config.inc_disable_opt_rtn,
                 low_cpu_mem_usage=False,
             )
-            model, _ = autoround.quantize_and_save(
-                output_dir=self.load_config.inc_save_path, format=format
-            )
-            return model
+            if self.load_config.inc_save_path is not None:
+                logger.info("Offline quantization mode: Will quantize and save")
+                model, _ = autoround.quantize_and_save(
+                    output_dir=self.load_config.inc_save_path, format=format
+                )
+                return model
+            else:
+                logger.info("Online quantization mode: Will quantize and skip saving")
+                # Use a temporary directory and discard it so nothing is persisted in online mode.
+                with tempfile.TemporaryDirectory() as tmp_save_dir:
+                    model, _ = autoround.quantize_and_save(
+                        output_dir=tmp_save_dir, format=format
+                    )
+                return model
         except Exception as e:
             raise ValueError(f"AutoRound quantization failed: {e}")
 
