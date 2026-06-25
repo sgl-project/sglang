@@ -46,11 +46,11 @@ class AWQAscendLinearKernel:
         #   per-tensor scaling would apply, which is a different code path).
         #   This aligns with the NPU's SIMD vectorization width (32 elements)
         #   and ensures efficient memory access patterns.
-        is_support_npu_fast_mm = (group_size == 0) or (
+        is_support_npu_quant_mm = (group_size == 0) or (
             group_size % 32 == 0 and 32 <= group_size < K
         )
 
-        if is_support_npu_fast_mm:
+        if is_support_npu_quant_mm:
             # ----- NPU fast path: unsigned weight + raw zero point -----
             # The NPU kernel expects:
             #   1. qweight: packed unsigned 4-bit values (no XOR)
@@ -99,7 +99,7 @@ class AWQAscendLinearKernel:
         else:
             # ----- Fallback: asymmetric dequantisation on CPU/NPU via standard linear -----
             # When group_size doesn't meet the NPU constraint, we fall back to
-            # a standard dequantisation + FP16 linear. This is slower but correct
+            # a standard dequantisation + FP16 linear. This is gives memory overhead but correct
             # for all group_size values.
             weight_u8 = torch.zeros((K, N), dtype=torch.int8, device=raw_qweight.device)
             zeros_u8 = torch.zeros(
