@@ -149,7 +149,7 @@ def _make_eagle_draft_extend_v2_input(case, batch, *, device: str):
 
 def _set_draft_extend_v2_prefix_lens(batch, case, *, device: str):
     # Production sets seq_lens = prefix + extend before init_forward_metadata
-    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    # (the draft-extend path bumps seq_lens by num_draft_tokens). Match that here.
     seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
     batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")
@@ -675,8 +675,8 @@ def run_eagle_draft_extend_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 
-        testcase.assertTrue(graph_runner.can_run(graph_batch))
-        actual = graph_runner.replay(graph_batch)
+        testcase.assertTrue(graph_runner.can_run_graph(graph_batch))
+        actual = graph_runner.execute(graph_batch)
         adapter.assert_outputs_close(actual, expected, settings)
     finally:
         _reset_cuda_graph_test_buffers()
@@ -821,7 +821,7 @@ def _set_draft_extend_v2_prefix_lens(
     device: str,
 ) -> None:
     # Production sets seq_lens = prefix + extend before init_forward_metadata
-    # (eagle_info_v2.py bumps seq_lens by num_draft_tokens). Match that here.
+    # (the draft-extend path bumps seq_lens by num_draft_tokens). Match that here.
     seq_lens = tuple(p + e for p, e in zip(case.prefix_lens, case.input_lens))
     batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu")

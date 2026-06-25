@@ -36,7 +36,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     enable_breakable_cuda_graph,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_memory_pool,
+)
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -59,8 +62,6 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         enable_memory_saver: bool = False,
         debug_eager: bool = False,
     ) -> None:
-        if is_hip():
-            raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -84,7 +85,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
-            self._pool = self._device_module.graph_pool_handle()
+            self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None

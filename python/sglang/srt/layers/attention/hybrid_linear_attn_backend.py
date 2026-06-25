@@ -188,6 +188,9 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.forward_mode,
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
+            num_padding=(
+                0 if in_capture else getattr(forward_batch, "num_padding", None)
+            ),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -441,13 +444,15 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        num_padding: Optional[int] = None,
     ):
-        if seq_lens_cpu is None:
-            num_padding = 0
-        else:
-            num_padding = torch.count_nonzero(
-                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-            )
+        if num_padding is None:
+            if seq_lens_cpu is None:
+                num_padding = 0
+            else:
+                num_padding = torch.count_nonzero(
+                    seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -577,6 +582,8 @@ class MambaAttnBackendBase(AttentionBackend):
 class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 
+    needs_cpu_seq_lens: bool = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         config = model_runner.mamba2_config
@@ -605,6 +612,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch.forward_mode,
             forward_batch.spec_info,
             forward_batch.seq_lens_cpu if not in_capture else None,
+            num_padding=(
+                0 if in_capture else getattr(forward_batch, "num_padding", None)
+            ),
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
@@ -699,6 +709,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         # Dispatcher aliases the full-attn backend's pool refs.
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
+        self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
+        self.needs_cpu_seq_lens = (
+            full_attn_backend.needs_cpu_seq_lens
+            or linear_attn_backend.needs_cpu_seq_lens
+        )
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None

@@ -35,16 +35,10 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
-_mnnvl_non_blackwell_fallback_logged = False
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
-    """Whether the mnnvl backend is usable on the current system.
-
-    mnnvl runs on Blackwell (SM10x) for both single- and multi-node, and on
-    SM90 for single-node only. Multi-node mnnvl on non-Blackwell is not
-    supported and must fall back to trtllm.
-    """
+    """Whether the mnnvl backend is usable on the current system."""
     if is_sm100_supported():
         return True
     return is_sm90_supported() and not is_multi_node
@@ -52,21 +46,33 @@ def _mnnvl_supported(is_multi_node: bool) -> bool:
 
 def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     """Resolve the requested FlashInfer allreduce fusion backend."""
-    global _mnnvl_non_blackwell_fallback_logged
+    if not (is_sm90_supported() or is_sm100_supported()):
+        raise ValueError(
+            "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
+        )
 
     if backend == "auto":
-        # Prefer mnnvl wherever it is supported (any Blackwell system, or SM90
-        # single-node); fall back to trtllm otherwise.
-        return "mnnvl" if _mnnvl_supported(is_multi_node) else "trtllm"
+        if is_multi_node:
+            if is_sm100_supported():
+                return "mnnvl"
+            raise ValueError(
+                "FlashInfer allreduce fusion does not support multi-node on "
+                "non-Blackwell systems."
+            )
+        if is_sm100_supported():
+            return "mnnvl"
+        return "trtllm"
+
+    if backend == "trtllm" and is_multi_node:
+        raise ValueError(
+            "FlashInfer allreduce fusion trtllm backend supports single-node only."
+        )
 
     if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
-        if not _mnnvl_non_blackwell_fallback_logged:
-            logger.info(
-                "FlashInfer allreduce fusion: forcing trtllm backend "
-                "(mnnvl requires a Blackwell system, or SM90 single-node)."
-            )
-            _mnnvl_non_blackwell_fallback_logged = True
-        return "trtllm"
+        raise ValueError(
+            "FlashInfer allreduce fusion mnnvl backend requires a Blackwell "
+            "system, or SM90 single-node."
+        )
     return backend
 
 
@@ -198,11 +204,10 @@ if is_flashinfer_available():
 #   trtllm    | Yes   | Yes   | Yes         | Yes         | No         |
 #   mnnvl     | Yes   | Yes   | Single-node | Yes         | Blackwell  |
 #
-# mnnvl runs on any Blackwell GPU (SM10x) for both single- and multi-node, and
-# on SM90 for single-node only. auto resolves to mnnvl wherever it is supported
-# and to trtllm otherwise. An explicit mnnvl request on an unsupported
-# configuration (e.g. SM90 multi-node) falls back to trtllm (see
-# _resolve_backend).
+# FlashInfer allreduce fusion requires SM90 or SM10X. auto resolves to trtllm
+# on single-node systems and to mnnvl on Blackwell multi-node systems.
+# Non-Blackwell multi-node allreduce fusion is rejected. Explicit mnnvl remains
+# available on SM90 single-node systems.
 
 
 def is_flashinfer_allreduce_unavailable() -> bool:
