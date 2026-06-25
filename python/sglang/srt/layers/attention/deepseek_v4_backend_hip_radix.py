@@ -415,6 +415,14 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4HipRadixBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    # DSV4 TBO runs ONLY in eager prefill (prefill cuda-graph is disabled);
+    # decode/target-verify graphs are non-TBO (primary backend only). So the TBO
+    # child backends must not be driven through cuda-graph capture/replay — doing
+    # so rebuilds this backend's compressor/indexer metadata per replay step on
+    # both children and leaks ROCm HSA resources (HSA_STATUS_ERROR_OUT_OF_RESOURCES).
+    # TboAttnBackend reads this to skip children in the *_graph paths only.
+    tbo_supports_cuda_graph = False
+
     def __init__(
         self,
         model_runner: ModelRunner,

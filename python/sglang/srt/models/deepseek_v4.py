@@ -1092,6 +1092,21 @@ class MQALayer(nn.Module):
 
         return o
 
+    # ---- TBO op decomposition (prefill two-batch-overlap) ----
+    def op_attn(self, state):
+        """Run the attention forward as a single TBO op.
+
+        Consumes the post-input-norm hidden states produced by
+        ``DeepseekV4DecoderLayer.op_mhc_prepare_attn`` and stores the attention
+        output for ``op_mhc_post_attn_pre_mlp``.
+        """
+        state.hidden_states_after_attn = self.forward(
+            x=state.pop("hidden_states_after_input_norm"),
+            positions=state.positions,
+            forward_batch=state.forward_batch,
+            x_quant=state.pop("attn_x_quant"),
+        )
+
 
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
@@ -1701,6 +1716,118 @@ class DeepseekV4DecoderLayer(nn.Module):
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
         return hidden_states, residual, post, comb
 
+    # ------------------------------------------------------------------
+    # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
+    #
+    # These mirror the NON-fused branch of ``forward`` (cross-layer mHC
+    # fusion is disabled under TBO, so every layer is self-contained), split
+    # into ops so the operations engine can overlap one ubatch's MoE a2a
+    # dispatch/combine with the other ubatch's attention + expert GEMM.
+    # The MoE ops themselves (op_gate / op_select_experts / op_dispatch_a/b /
+    # op_experts / op_combine_a/b / op_shared_experts / op_output) are reused
+    # as-is from ``self.mlp`` (DeepseekV2MoE) — they decompose ``forward_deepep``.
+    # ------------------------------------------------------------------
+    def op_mhc_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor] = None,
+        tbo_subbatch_index: Optional[int] = None,
+        **kwargs,
+    ):
+        # Non-fused attention-side mHC pre + input layernorm.
+        attn_residual = hidden_states
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            norm=self.input_layernorm,
+            forward_batch=forward_batch,
+        )
+        if not norm_fused:
+            if _use_aiter and _is_gfx95_supported:
+                x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+                    hidden_states,
+                    self.input_layernorm.weight,
+                    self.rms_norm_eps,
+                )
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
+                x_quant = None
+        else:
+            x_quant = None
+
+        state.attn_residual = attn_residual
+        state.attn_post = post
+        state.attn_comb = comb
+        state.hidden_states_after_input_norm = hidden_states
+        state.attn_x_quant = x_quant
+        # mori's op_output slices final_hidden_states[:num_tokens].
+        if get_moe_a2a_backend().is_mori():
+            state.num_tokens = attn_residual.shape[0]
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_mhc_post_attn_pre_mlp(self, state):
+        # Close the attention mHC (hc_post), then open the FFN-side mHC pre +
+        # post-attention layernorm. Produces the 2D MoE input.
+        hidden_states = self.hc_post(
+            state.pop("hidden_states_after_attn"),
+            state.pop("attn_residual"),
+            state.pop("attn_post"),
+            state.pop("attn_comb"),
+        )
+        ffn_residual = hidden_states
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
+            forward_batch=state.forward_batch,
+        )
+        if not norm_fused:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+        state.ffn_residual = ffn_residual
+        state.ffn_post = post
+        state.ffn_comb = comb
+        state.hidden_states_mlp_input = hidden_states
+
+    def op_mhc_postprocess(self, state):
+        # Close the FFN mHC (hc_post) and emit the next layer's input dict.
+        hidden_states = self.hc_post(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("ffn_residual"),
+            state.pop("ffn_post"),
+            state.pop("ffn_comb"),
+        )
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            # DSV4 non-fused layers carry no residual across layers; the key is
+            # required by the next layer's op_mhc_prepare_attn (ignored) and by
+            # _model_forward_tbo_merge_outputs (None -> None).
+            residual=None,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
+
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1796,6 +1923,69 @@ class DeepseekV4Model(nn.Module):
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
 
+    def _can_run_tbo(self, forward_batch: ForwardBatch) -> bool:
+        """DSV4 prefill-only two-batch-overlap gate.
+
+        TBO batch prep (tbo_split_seq_index / tbo_children) is populated
+        model-agnostically when --enable-two-batch-overlap is set and the
+        DP-attention preparer allows it (mori `normal` mode permits prefill
+        TBO). We additionally restrict to: prefill (EXTEND), single PP, and the
+        non-CP path, which is the only case the DSV4 op strategy implements.
+        """
+        from sglang.srt.layers.moe import is_tbo_enabled
+
+        return (
+            is_tbo_enabled()
+            and forward_batch.can_run_tbo
+            and forward_batch.tbo_children is not None
+            and forward_batch.global_forward_mode is not None
+            and forward_batch.global_forward_mode.is_extend()
+            and not dsa_use_prefill_cp(forward_batch)
+            and self.pp_group.world_size == 1
+        )
+
+    def _forward_layers_tbo(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.batch_overlap.operations import execute_overlapped_operations
+        from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            _model_forward_filter_inputs,
+            _model_forward_tbo_merge_outputs,
+        )
+
+        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+        operations_strategy = OperationsStrategy.init_new_tbo(
+            layers, forward_batch.global_forward_mode
+        )
+
+        # Split the per-rank batch into the 2 ubatches (token-range slice + pad
+        # to tbo_padded_len). residual is unused by the DSV4 non-fused layer ops.
+        inputs_arr = [
+            _model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=None,
+                positions=positions,
+                output_forward_batch=child,
+                tbo_subbatch_index=idx,
+            )
+            for idx, child in enumerate(forward_batch.tbo_children)
+        ]
+
+        outputs_arr = execute_overlapped_operations(
+            inputs_arr=inputs_arr,
+            operations_arr=[operations_strategy.operations] * 2,
+            delta_stages=[0, operations_strategy.tbo_delta_stages],
+        )
+
+        hidden_states, _ = _model_forward_tbo_merge_outputs(
+            outputs_arr[0], outputs_arr[1], hidden_states.shape[0]
+        )
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1841,32 +2031,41 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        use_fused = self.use_fused_mhc_post_pre
-        prev_residual, prev_post, prev_comb = None, None, None
-        last_layer = None
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            last_layer = layer
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
+        if self._can_run_tbo(forward_batch):
+            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
+            # disabled here (each layer self-contained), so no trailing hc_post.
+            hidden_states = self._forward_layers_tbo(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
-            with ctx:
-                hidden_states, prev_residual, prev_post, prev_comb = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
-                    prev_residual=prev_residual,
-                    prev_post=prev_post,
-                    prev_comb=prev_comb,
+        else:
+            use_fused = self.use_fused_mhc_post_pre
+            prev_residual, prev_post, prev_comb = None, None, None
+            last_layer = None
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                last_layer = layer
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
-        if use_fused and last_layer is not None:
-            hidden_states = last_layer.hc_post(
-                hidden_states, prev_residual, prev_post, prev_comb
-            )
+                with ctx:
+                    hidden_states, prev_residual, prev_post, prev_comb = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        prev_residual=prev_residual,
+                        prev_post=prev_post,
+                        prev_comb=prev_comb,
+                    )
+            if use_fused and last_layer is not None:
+                hidden_states = last_layer.hc_post(
+                    hidden_states, prev_residual, prev_post, prev_comb
+                )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
