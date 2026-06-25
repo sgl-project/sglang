@@ -376,7 +376,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             decode_alloc = spec_decode_alloc_len_per_request(sa)
         else:
             # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
-            # (eagle_info_v2.prepare_for_decode: kv_committed_len + 2 * alloc_len).
+            # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
             decode_alloc = 2 * get_alloc_len_per_decode(sa)
         per_request = trailing_tokens + decode_alloc
 
