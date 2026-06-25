@@ -222,7 +222,7 @@ class GenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
-    
+
     # Agent-aware KV cache hints for workflow/cache metadata.
     agent_hints: Optional[Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]] = None
 
@@ -598,7 +598,7 @@ class GenerateReqInput:
             self.extra_key = self.extra_key * self.parallel_sample_num
         else:
             raise ValueError("extra_key should be a list or a string.")
-    
+
     def _normalize_agent_hints(self, num):
         """Normalize agent_hints for batch and parallel sampling."""
         if self.agent_hints is None:
@@ -608,7 +608,9 @@ class GenerateReqInput:
             self.agent_hints = [copy.deepcopy(self.agent_hints) for _ in range(num)]
         elif isinstance(self.agent_hints, list):
             if len(self.agent_hints) != self.batch_size:
-                raise ValueError("The length of agent_hints should be equal to the batch size.")
+                raise ValueError(
+                    "The length of agent_hints should be equal to the batch size."
+                )
             self.agent_hints = [
                 copy.deepcopy(item) if item is not None else None
                 for item in self.agent_hints
@@ -821,7 +823,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Priority for the request
     priority: Optional[int] = None
-    
+
     agent_hints: Optional[Dict[str, Any]] = None
 
     # Extra cache key for classifying the request (e.g. cache_salt)

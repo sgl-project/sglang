@@ -1,6 +1,8 @@
 import copy
 import unittest
+
 import pytest
+
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -487,7 +489,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         assert req[1].agent_hints["step_id"] == "b"
         assert req[1].agent_hints["reuse_hint"] == "low"
 
-
     def test_generate_req_input_single_agent_hints_dict_broadcasts_to_batch(self):
         req = GenerateReqInput(
             text=["a", "b"],
@@ -501,7 +502,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         assert req[1].agent_hints == {"workflow_id": "wf-1", "reuse_hint": "keep"}
         assert req[0].agent_hints is not req[1].agent_hints
 
-
     def test_generate_req_input_agent_hints_default_none(self):
         req = GenerateReqInput(
             text="hello",
@@ -511,7 +511,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
 
         assert req.agent_hints is None
-
 
     def test_generate_req_input_agent_hints_rejects_bad_batch_length(self):
         req = GenerateReqInput(

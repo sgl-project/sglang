@@ -359,6 +359,7 @@ class TestRadixCache(unittest.TestCase):
                 self.assertEqual(cache.device, torch.device("cpu"))
                 self.assertIsNotNone(cache.root_node)
                 self.assertEqual(len(cache.root_node.key), 0)
+
     def test_annotate_agent_cache_node_sets_metadata(self):
         """Test agent_hints annotate radix cache node metadata."""
         cache = RadixCache.create_simulated()
@@ -406,6 +407,7 @@ class TestRadixCache(unittest.TestCase):
         cache._annotate_agent_cache_node(req, cache.root_node)
 
         self.assertIsNone(cache.root_node.agent_meta)
+
     def test_reset(self):
         """Test reset method."""
         cache = RadixCache.create_simulated()

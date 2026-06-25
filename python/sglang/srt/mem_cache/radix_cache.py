@@ -487,7 +487,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         self._tag_session_leaf(req, radix_key, node=session_leaf)
-        
+
         self._annotate_agent_cache_node(req, session_leaf)
 
         # Remove req slot release the cache lock
@@ -561,7 +561,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         req.last_node = new_last_node
 
         self._tag_session_leaf(req, radix_key, node=new_last_node)
-        
+
         self._annotate_agent_cache_node(req, new_last_node)
 
     def pretty_print(self):
@@ -824,6 +824,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size
+
     def _annotate_agent_cache_node(self, req: Req, node: Optional[TreeNode]) -> None:
         """Attach optional agent-aware metadata to a terminal radix node.
 
@@ -869,6 +870,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         if meta:
             node.agent_meta = meta
+
 
 if __name__ == "__main__":
     tree = RadixCache.create_simulated()

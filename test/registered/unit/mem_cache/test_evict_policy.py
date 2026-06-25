@@ -1,7 +1,9 @@
 """Unit tests for evict_policy.py"""
 
-from sglang.test.ci.ci_register import register_cpu_ci
 import time
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
@@ -9,13 +11,13 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.evict_policy import (
+    AgentAwareStrategy,
     FIFOStrategy,
     FILOStrategy,
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
-    AgentAwareStrategy,
     SLRUStrategy,
 )
 
@@ -141,6 +143,7 @@ class TestPriorityStrategy(unittest.TestCase):
             self.strategy.get_priority(old), self.strategy.get_priority(new)
         )
 
+
 class TestAgentAwareStrategy(unittest.TestCase):
     def setUp(self):
         self.strategy = AgentAwareStrategy()
@@ -219,6 +222,7 @@ class TestAgentAwareStrategy(unittest.TestCase):
             self.strategy.get_priority(normal),
             self.strategy.get_priority(active_ttl_low_reuse),
         )
+
 
 class TestSLRUStrategy(unittest.TestCase):
     def setUp(self):

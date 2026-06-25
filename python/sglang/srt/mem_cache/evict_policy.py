@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Tuple, Union
@@ -45,6 +46,7 @@ class PriorityStrategy(EvictionStrategy):
         # Return (priority, last_access_time) so lower priority nodes are evicted first
         return (node.priority, node.last_access_time)
 
+
 class AgentAwareStrategy(EvictionStrategy):
     """Agent-aware eviction.
 
@@ -86,6 +88,7 @@ class AgentAwareStrategy(EvictionStrategy):
                 bucket = 2
 
         return (bucket, node.last_access_time)
+
 
 class SLRUStrategy(EvictionStrategy):
     def __init__(self, protected_threshold: int = 2):

@@ -206,6 +206,7 @@ class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
 
+
 class AgentHints(BaseModel):
     workflow_id: Optional[str] = None
     agent_id: Optional[str] = None
@@ -231,6 +232,7 @@ class AgentHints(BaseModel):
         if value is not None and value < 0:
             raise ValueError("must be non-negative")
         return value
+
 
 class JsonSchemaResponseFormat(BaseModel):
     name: str

@@ -15,8 +15,7 @@
 
 import unittest
 from typing import List, Optional
-import pytest
-import time
+
 from pydantic import BaseModel, Field, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (

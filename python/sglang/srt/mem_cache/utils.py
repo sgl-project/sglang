@@ -18,6 +18,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.evict_policy import (
+    AgentAwareStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -25,7 +26,6 @@ from sglang.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
-    AgentAwareStrategy,
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.triton_ops.mla_buffer import (
