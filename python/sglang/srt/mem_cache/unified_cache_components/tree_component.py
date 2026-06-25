@@ -193,8 +193,11 @@ class TreeComponent(ABC):
     def should_skip_leaf_creation(
         self, total_prefix_len: int, key_len: int, params: InsertParams
     ) -> bool:
-        """Return True to veto leaf creation when the entire new leaf would
-        be a tombstone for this component."""
+        """Legacy hook kept for downstream component compatibility.
+
+        UnifiedRadixCache no longer calls this hook; Full leaves are materialized
+        even when auxiliary components store a tombstone for the same span.
+        """
         return False
 
     def recover_after_unevict(
