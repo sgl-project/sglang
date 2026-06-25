@@ -61,6 +61,7 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -82,6 +83,27 @@ _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
+)
+
+# Opt-in (default off): fuse the bf16 kv_b_proj GEMM with its nope/v split,
+# k_pe cat, and fp8 cast into a single Triton kernel (bf16 analog of the MXFP4
+# fused_gemm_afp4wfp4_split_cat path). Only valid on gfx95 with bf16/fp16
+# kv_b_proj weights and fp8 prefill attention. Requires a recent aiter exposing
+# fused_gemm_a16w16_split_cat; falls back to the unfused path if not present.
+_has_fused_gemm_a16w16_split_cat = False
+try:
+    from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_split_cat import (
+        fused_gemm_a16w16_split_cat,
+    )
+
+    _has_fused_gemm_a16w16_split_cat = True
+except ImportError:
+    pass
+
+_use_fused_kvb_split_cat = (
+    envs.SGLANG_AITER_FUSED_KVB_SPLIT_CAT.get()
+    and is_gfx95_supported()
+    and _has_fused_gemm_a16w16_split_cat
 )
 
 # Persist
@@ -2028,6 +2050,25 @@ class AiterAttnBackend(AttentionBackend):
                                 fp8_dtype,
                             )
                         )[0]
+                    elif (
+                        _use_fp8_prefill_attn
+                        and _use_fused_kvb_split_cat
+                        and layer.kv_b_proj.weight.dtype
+                        in (torch.bfloat16, torch.float16)
+                    ):
+                        # BF16 weights + FP8 prefill: fuse the kv_b_proj GEMM,
+                        # nope/v split, and k_pe cat into a single kernel
+                        # (fused_gemm_a16w16_split_cat) that writes k and v
+                        # directly in FP8, avoiding separate split / cat /
+                        # float8_copy passes.
+                        k, v = fused_gemm_a16w16_split_cat(
+                            x=kvc.squeeze(1).contiguous(),
+                            w=layer.kv_b_proj.weight,
+                            y=k_pe.expand(-1, layer.tp_k_head_num, -1),
+                            S1=qk_nope_head_dim,
+                            S2=layer.v_head_dim,
+                            dtype=fp8_dtype,
+                        )
                     else:
                         kv = layer.kv_b_proj(kvc.contiguous())[0]
 

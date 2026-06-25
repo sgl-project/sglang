@@ -499,6 +499,9 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Fuse the bf16 kv_b_proj GEMM + nope/v split + k_pe cat + fp8 cast into a
+    # single aiter Triton kernel (fused_gemm_a16w16_split_cat) on ROCm.
+    SGLANG_AITER_FUSED_KVB_SPLIT_CAT = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     # Enable dual-stream MoE (shared experts vs routed experts) on the
