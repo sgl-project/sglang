@@ -355,10 +355,13 @@ impl MetricsRegistry {
     }
 
     /// Observe time-to-first-token (seconds) for `sgl_router_ttft_seconds` —
-    /// the interval from request receipt to the first response chunk arriving
-    /// from the upstream worker. Recorded only for successful *streaming*
-    /// responses; non-streaming "first token" equals total latency, which
-    /// `sgl_router_request_duration_seconds` already captures. Uses
+    /// the interval from request receipt to the first upstream chunk carrying
+    /// an actual content token (the SGLang role-prelude / empty-delta /
+    /// keepalive frames before the first generated token are skipped; a stream
+    /// that ends without any content token records nothing). Recorded only for
+    /// successful *streaming* responses; non-streaming "first token" equals
+    /// total latency, which `sgl_router_request_duration_seconds` already
+    /// captures. Uses
     /// [`TTFT_BUCKETS`], whose edges align with the engine's TTFT histogram so
     /// the two are directly comparable in `histogram_quantile`.
     pub fn observe_ttft(&self, model_id: &str, seconds: f64) {
