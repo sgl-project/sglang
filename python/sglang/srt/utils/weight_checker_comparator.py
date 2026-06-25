@@ -101,7 +101,7 @@ class Fp8BlockComparable(ComparableWeight):
 
 
 class RawComparable(ComparableWeight):
-    """Unquantized tensor: identity dequant, exact (no-tolerance) compare."""
+    """Bitwise equal compare on raw tensor."""
 
     def __init__(self, tensor: torch.Tensor):
         self.tensor = tensor
