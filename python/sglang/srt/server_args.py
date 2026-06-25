@@ -5463,7 +5463,10 @@ class ServerArgs:
             )
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set():
+            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
+                self.quantization == "modelopt_fp4"
+                or self.get_model_config().nvfp4_moe_meta is not None
+            ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
