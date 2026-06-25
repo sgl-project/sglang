@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVIDIA multimem all-gather along the hidden (last) dim, ported from the
-tokenspeed_kernel TritonRSAG ``all_gather_inner`` path.
+"""NVIDIA symmetric-memory multimem all-gather along the hidden (last) dim.
 
-This is a symmetric-memory + ``multimem.st`` Triton kernel that gathers
-per-rank hidden-dim shards ``[T, H/TP]`` into the replicated ``[T, H]`` tensor.
-Each rank stores its shard once into the symmetric multicast buffer with a
-single 128-bit ``multimem.st`` (which lands the bytes on every peer at once),
-so the gather costs one NVLink store pass rather than an NCCL ring.
+A ``multimem.st`` Triton kernel that gathers per-rank hidden-dim shards
+``[T, H/TP]`` into the replicated ``[T, H]`` tensor: each rank stores its shard
+once into a symmetric multicast buffer with a single 128-bit ``multimem.st``
+(which lands the bytes on every peer at once), so the gather costs one NVLink
+store pass rather than an NCCL ring.
 
-Only the NVIDIA inner (concat-along-hidden) path is ported; AMD / token-dim /
-reduce-scatter / dp-sampling paths from tokenspeed_kernel are intentionally
-omitted. Buffers are allocated and rendezvous'd once in ``create_state`` (a
+Only the concat-along-hidden path is implemented (no token-dim / reduce-scatter
+variants). Buffers are allocated and rendezvous'd once in ``create_state`` (a
 collective), so the steady-state ``all_gather_inner`` launch is CUDA-graph
 capturable.
 """
