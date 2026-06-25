@@ -23,36 +23,52 @@ SGL_DEVICE fp8_e4m3_t quant_one(float x, float inv_scale) {
   return static_cast<fp8_e4m3_t>(clipped);
 }
 
-template <typename T, int kVec>
+template <typename T, int kVec, bool kUsePDL>
 __global__ void q_amax_kernel(
     const T* __restrict__ q_in, int q_row, int64_t q_in_row_stride, int num_tokens, float* __restrict__ amax_out) {
   using namespace device;
   using in_vec_t = AlignedVector<T, kVec>;
-  const int64_t q_row_vecs = q_row / kVec;
-  const int64_t total = static_cast<int64_t>(num_tokens) * q_row_vecs;
-  const int64_t gtid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t gstride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  PDLWaitPrimary<kUsePDL>();
 
+  const int q_row_vecs = q_row / kVec;
   float thread_max = 0.0f;
-  for (int64_t idx = gtid; idx < total; idx += gstride) {
-    const int64_t t = idx / q_row_vecs;
-    const int64_t jv = idx % q_row_vecs;
-    in_vec_t v;
-    v.load(q_in + t * q_in_row_stride, jv);
+
+  if (q_in_row_stride == static_cast<int64_t>(q_row)) {
+    const int64_t total = static_cast<int64_t>(num_tokens) * q_row_vecs;
+    const int64_t lin = (static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t lin_stride = static_cast<int64_t>(gridDim.x) * gridDim.y * blockDim.x;
+    for (int64_t idx = lin; idx < total; idx += lin_stride) {
+      in_vec_t v;
+      v.load(q_in, idx);
 #pragma unroll
-    for (int i = 0; i < kVec; ++i) {
-      thread_max = math::max(thread_max, math::abs(static_cast<float>(v[i])));
+      for (int i = 0; i < kVec; ++i) {
+        thread_max = math::max(thread_max, math::abs(static_cast<float>(v[i])));
+      }
+    }
+  } else {
+    for (int t = blockIdx.y; t < num_tokens; t += gridDim.y) {
+      const T* row = q_in + static_cast<int64_t>(t) * q_in_row_stride;
+      for (int jv = blockIdx.x * blockDim.x + threadIdx.x; jv < q_row_vecs; jv += gridDim.x * blockDim.x) {
+        in_vec_t v;
+        v.load(row, jv);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+          thread_max = math::max(thread_max, math::abs(static_cast<float>(v[i])));
+        }
+      }
     }
   }
+
   __shared__ float smem[kFusedBlockSize / 32];
   cta::reduce_max(thread_max, smem);
   __syncthreads();
   if (threadIdx.x == 0) {
     atomic::max(amax_out, smem[0]);
   }
+  PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename T, int kVec>
+template <typename T, int kVec, bool kUsePDL>
 __global__ void apply_kernel(
     const T* __restrict__ q_in,
     fp8_e4m3_t* __restrict__ q_out,
@@ -77,6 +93,7 @@ __global__ void apply_kernel(
   using namespace device;
   using in_vec_t = AlignedVector<T, kVec>;
   using out_vec_t = AlignedVector<fp8_e4m3_t, kVec>;
+  PDLWaitPrimary<kUsePDL>();
 
   const float amax = *amax_io;
   const float inv_q = math::FP8_E4M3_MAX / amax;
@@ -138,6 +155,7 @@ __global__ void apply_kernel(
     *amax_io = 0.0f;
     *done_counter = 0;
   }
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 template <typename Kernel>
@@ -149,6 +167,20 @@ uint32_t plan_grid(Kernel kernel, int64_t work_items, const DLDevice& device) {
   const int64_t want = div_ceil(work_items, static_cast<int64_t>(kFusedBlockSize));
   if (want < 1) return 1;
   return static_cast<uint32_t>(want > max_grid ? max_grid : want);
+}
+
+template <typename Kernel>
+dim3 plan_grid_2d(Kernel kernel, int64_t row_vecs, int64_t num_tokens, const DLDevice& device) {
+  using namespace host;
+  static const uint32_t per_sm = runtime::get_blocks_per_sm(kernel, kFusedBlockSize);
+  static const uint32_t num_sm = runtime::get_sm_count(device.device_id);
+  const uint32_t max_grid = per_sm * num_sm;
+  uint32_t gx = static_cast<uint32_t>(div_ceil(row_vecs, static_cast<int64_t>(kFusedBlockSize)));
+  gx = gx < 1 ? 1 : (gx > max_grid ? max_grid : gx);
+  uint32_t gy = max_grid / gx;
+  if (gy < 1) gy = 1;
+  if (num_tokens >= 1 && gy > static_cast<uint32_t>(num_tokens)) gy = static_cast<uint32_t>(num_tokens);
+  return dim3(gx, gy, 1);
 }
 
 template <typename T>
@@ -197,43 +229,46 @@ void fused_q_quant_kv_write(
   RuntimeCheck(q_row % kVec == 0, "fused_q_quant_kv_write: q_row ", q_row, " must be a multiple of ", kVec);
   RuntimeCheck(kv_row % kVec == 0, "fused_q_quant_kv_write: kv_row ", kv_row, " must be a multiple of ", kVec);
 
-  auto* kA = q_amax_kernel<T, kVec>;
-  auto* kB = apply_kernel<T, kVec>;
+  constexpr bool kUsePDL = true;
+  auto* kA = q_amax_kernel<T, kVec, kUsePDL>;
+  auto* kB = apply_kernel<T, kVec, kUsePDL>;
 
   const int64_t q_vecs = num_tokens * (q_row / kVec);
   const int64_t kv_vecs = num_tokens * (kv_row / kVec);
   const int64_t apply_work = q_vecs > kv_vecs ? q_vecs : kv_vecs;
 
-  LaunchKernel(plan_grid(kA, q_vecs, device), kFusedBlockSize, device)(
-      kA,
-      static_cast<const T*>(q_in.data_ptr()),
-      static_cast<int>(q_row),
-      q_in_row_stride,
-      static_cast<int>(num_tokens),
-      static_cast<float*>(amax_buf.data_ptr()));
+  LaunchKernel(plan_grid_2d(kA, q_row / kVec, num_tokens, device), kFusedBlockSize, device)
+      .enable_pdl(kUsePDL)(
+          kA,
+          static_cast<const T*>(q_in.data_ptr()),
+          static_cast<int>(q_row),
+          q_in_row_stride,
+          static_cast<int>(num_tokens),
+          static_cast<float*>(amax_buf.data_ptr()));
 
-  LaunchKernel(plan_grid(kB, apply_work, device), kFusedBlockSize, device)(
-      kB,
-      static_cast<const T*>(q_in.data_ptr()),
-      static_cast<fp8_e4m3_t*>(q_out.data_ptr()),
-      static_cast<int>(q_row),
-      q_in_row_stride,
-      static_cast<float*>(amax_buf.data_ptr()),
-      static_cast<int*>(done_counter.data_ptr()),
-      static_cast<float*>(bmm1_out.data_ptr()),
-      static_cast<float>(bmm1_extra),
-      static_cast<const T*>(k_in.data_ptr()),
-      static_cast<const T*>(v_in.data_ptr()),
-      static_cast<fp8_e4m3_t*>(k_cache.data_ptr()),
-      static_cast<fp8_e4m3_t*>(v_cache.data_ptr()),
-      static_cast<const int64_t*>(cache_loc.data_ptr()),
-      static_cast<float>(inv_k_scale),
-      static_cast<float>(inv_v_scale),
-      static_cast<int>(num_tokens),
-      static_cast<int>(kv_row),
-      k_in_row_stride,
-      v_in_row_stride,
-      cache_row_stride);
+  LaunchKernel(plan_grid(kB, apply_work, device), kFusedBlockSize, device)
+      .enable_pdl(kUsePDL)(
+          kB,
+          static_cast<const T*>(q_in.data_ptr()),
+          static_cast<fp8_e4m3_t*>(q_out.data_ptr()),
+          static_cast<int>(q_row),
+          q_in_row_stride,
+          static_cast<float*>(amax_buf.data_ptr()),
+          static_cast<int*>(done_counter.data_ptr()),
+          static_cast<float*>(bmm1_out.data_ptr()),
+          static_cast<float>(bmm1_extra),
+          static_cast<const T*>(k_in.data_ptr()),
+          static_cast<const T*>(v_in.data_ptr()),
+          static_cast<fp8_e4m3_t*>(k_cache.data_ptr()),
+          static_cast<fp8_e4m3_t*>(v_cache.data_ptr()),
+          static_cast<const int64_t*>(cache_loc.data_ptr()),
+          static_cast<float>(inv_k_scale),
+          static_cast<float>(inv_v_scale),
+          static_cast<int>(num_tokens),
+          static_cast<int>(kv_row),
+          k_in_row_stride,
+          v_in_row_stride,
+          cache_row_stride);
 }
 
 }  // namespace
