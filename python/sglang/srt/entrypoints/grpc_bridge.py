@@ -479,8 +479,10 @@ class RuntimeHandle:
 
     def start_profile(self, output_dir: Optional[str], chunk_callback) -> None:
         async def _payload():
-            kwargs = {"output_dir": output_dir} if output_dir else {}
-            await self.tokenizer_manager.start_profile(**kwargs)
+            from sglang.srt.managers.io_struct import ProfileReq
+
+            req = ProfileReq(output_dir=output_dir) if output_dir else ProfileReq()
+            await self.tokenizer_manager.start_profile(req)
             return {"message": "Profiling started."}
 
         self._submit_json_unary("start_profile", _payload, chunk_callback)

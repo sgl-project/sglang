@@ -14,7 +14,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from http import HTTPStatus
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Annotated, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 import numpy as np
@@ -23,7 +23,7 @@ import torch
 import uvicorn
 import zmq
 import zmq.asyncio
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoProcessor
 
@@ -46,7 +46,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import (
     ProfileReq,
-    ProfileReqInput,
     ProfileReqType,
     async_sock_recv,
     async_sock_send,
@@ -2981,13 +2980,8 @@ async def _dp_worker_handle_profile(
 ) -> dict:
     prefix = f"dp_rank={dp_rank}: "
     if dp_type == "start_profile":
-        obj = request.get("profile_req")
-        # `is None` (not `if not obj`) so empty dict still raises.
-        req = (
-            ProfileReq(**obj)
-            if obj is not None
-            else ProfileReq(ProfileReqType.START_PROFILE)
-        )
+        req = request.get("profile_req") or ProfileReq()
+        req.req_type = ProfileReqType.START_PROFILE
         if enc.profiler is None:
             enc.profiler = EncoderProfiler(dp_rank)
         ok, msg = enc.profiler.start(req)
@@ -3207,7 +3201,7 @@ async def run_encoder(
     while True:
         request = await async_sock_recv(encoder.schedule_socket)
         if isinstance(request, ProfileReq):
-            if request.type == ProfileReqType.START_PROFILE:
+            if request.req_type == ProfileReqType.START_PROFILE:
                 if encoder.profiler is None:
                     encoder.profiler = EncoderProfiler(encoder.rank)
                 encoder.profiler.start(request)
@@ -3862,51 +3856,21 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-async def start_profile_async(obj: Optional[ProfileReqInput] = None):
+async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     if dp_dispatcher is not None:
-        profile_req = None
         if obj is not None:
-            profile_req = {
-                "type": ProfileReqType.START_PROFILE,
-                "output_dir": obj.output_dir,
-                "start_step": obj.start_step,
-                "num_steps": obj.num_steps,
-                "activities": obj.activities,
-                "with_stack": obj.with_stack,
-                "record_shapes": obj.record_shapes,
-                "profile_by_stage": obj.profile_by_stage,
-                "profile_id": str(time.time()),
-                "merge_profiles": obj.merge_profiles,
-                "profile_prefix": obj.profile_prefix,
-                "profile_stages": obj.profile_stages,
-            }
+            obj.req_type = ProfileReqType.START_PROFILE
         try:
             results = await dp_dispatcher.broadcast(
-                {"_dp_type": "start_profile", "profile_req": profile_req}
+                {"_dp_type": "start_profile", "profile_req": obj}
             )
         except MMError as e:
             return Response(content=f"{e}\n", status_code=int(e.code))
         return _summarise_dp_broadcast(results)
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
-    req = None
-    if obj is None:
-        req = ProfileReq(ProfileReqType.START_PROFILE)
-    else:
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=obj.output_dir,
-            start_step=obj.start_step,
-            num_steps=obj.num_steps,
-            activities=obj.activities,
-            with_stack=obj.with_stack,
-            record_shapes=obj.record_shapes,
-            profile_by_stage=obj.profile_by_stage,
-            profile_id=str(time.time()),
-            merge_profiles=obj.merge_profiles,
-            profile_prefix=obj.profile_prefix,
-            profile_stages=obj.profile_stages,
-        )
+    req = obj or ProfileReq()
+    req.req_type = ProfileReqType.START_PROFILE
     for socket in send_sockets:
         sock_send(socket, req)
     if encoder.profiler is None:
@@ -3937,7 +3901,7 @@ async def stop_profile_async():
         return Response(
             content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
         )
-    req = ProfileReq(ProfileReqType.STOP_PROFILE)
+    req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
         sock_send(socket, req)
     ok, msg = encoder.profiler.stop()
