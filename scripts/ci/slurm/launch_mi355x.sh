@@ -134,7 +134,6 @@ echo "recipe: image=$IMAGE attn=$ATTN ib=$IB ptp=$PTP dtp=$DTP concs=$CONCS isl=
 WORKDIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp "$SCRIPT_DIR/standalone_lb.py" "$WORKDIR/standalone_lb.py"
 
 # Accuracy-gate helpers (written when enabled). Pre-stage the GSM8K test set on
 # shared NFS from the login node (which has internet) so the in-container eval
@@ -239,9 +238,12 @@ docker run $DOCKER_COMMON --name mi355x_bench \
     export PYTHONPATH=/sgl-workspace/sglang/python:\$PYTHONPATH
     echo "[wait] prefill"; for i in \$(seq 1 600); do curl -sf http://\$PIP:$PPORT/health >/dev/null && break; sleep 5; done
     echo "[wait] decode";  for i in \$(seq 1 600); do curl -sf http://\$DIP:$DPORT/health >/dev/null && break; sleep 5; done
-    python3 /host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/standalone_lb.py \
-      --prefill http://\$PIP:$PPORT $PBOOT --decode http://\$DIP:$DPORT \
-      --host 0.0.0.0 --port $LBPORT &
+    python3 -m sglang_router.launch_router \
+      --pd-disaggregation \
+      --prefill http://\$PIP:$PPORT $PBOOT \
+      --decode http://\$DIP:$DPORT \
+      --host 0.0.0.0 --port $LBPORT \
+      --disable-circuit-breaker &
     for i in \$(seq 1 30); do curl -sf http://127.0.0.1:$LBPORT/health >/dev/null && break; sleep 2; done
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
     echo "[smoke] PD end-to-end check via LB"
@@ -303,7 +305,7 @@ DIP=$(getent ahostsv4 "$DNODE" | head -1 | awk '{print $1}')
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
 if (( PW > 1 || DW > 1 )); then
-  echo "[drive] NOTE: standalone_lb + bench use the first prefill and first decode only;"
+  echo "[drive] NOTE: router + bench use the first prefill and first decode only;"
   echo "[drive]       multi-prefill/multi-decode fan-out is not wired yet (LB work)."
 fi
 # Each server's srun runs here on the login node and returns exactly when its
