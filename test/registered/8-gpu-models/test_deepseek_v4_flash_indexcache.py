@@ -62,7 +62,7 @@ class DeepseekV4FlashIndexCacheBase(CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_a_gsm8k(self):
+    def run_gsm8k(self):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
@@ -87,9 +87,15 @@ class DeepseekV4FlashIndexCacheBase(CustomTestCase):
 class TestDeepseekV4FlashIndexTopkPattern(DeepseekV4FlashIndexCacheBase):
     json_model_override_args = f'{{"index_topk_pattern": "{INDEX_TOPK_PATTERN}"}}'
 
+    def test_a_gsm8k(self):
+        self.run_gsm8k()
+
 
 class TestDeepseekV4FlashIndexFreq(DeepseekV4FlashIndexCacheBase):
     json_model_override_args = '{"index_topk_freq": 4}'
+
+    def test_a_gsm8k(self):
+        self.run_gsm8k()
 
 
 if __name__ == "__main__":
