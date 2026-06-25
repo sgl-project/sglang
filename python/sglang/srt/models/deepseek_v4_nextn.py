@@ -171,7 +171,7 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
-        hidden_states, residual, post, comb, _ = self.decoder(
+        hidden_states, residual, post, comb = self.decoder(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,

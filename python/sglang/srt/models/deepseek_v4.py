@@ -15,6 +15,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -273,6 +274,10 @@ def deepseek_v4_attention_with_output(
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
+
+
+class Dsv4IndexTopkState(msgspec.Struct):
+    prev: Optional[torch.Tensor] = None
 
 
 class MQALayer(nn.Module):
@@ -578,7 +583,7 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-        prev_topk_indices: Optional[torch.Tensor] = None,
+        topk_state: Optional[Dsv4IndexTopkState] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
@@ -603,6 +608,9 @@ class MQALayer(nn.Module):
         q_lora_ready = current_stream.record_event()
 
         if self.indexer is not None:
+            prev_topk_indices = (
+                topk_state.prev if topk_state is not None and self.skip_topk else None
+            )
             with torch.cuda.stream(stream_indexer):
                 topk_indices = self.indexer(
                     x=x,
@@ -649,7 +657,7 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-        prev_topk_indices: Optional[torch.Tensor] = None,
+        topk_state: Optional[Dsv4IndexTopkState] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """ATOM-style ROCm path: overlap compressors, keep Q/KV on main stream."""
         assert self.alt_streams is not None
@@ -743,6 +751,9 @@ class MQALayer(nn.Module):
             current_stream.wait_stream(stream_compressor)
             if stream_indexer_compressor is not None:
                 current_stream.wait_stream(stream_indexer_compressor)
+            prev_topk_indices = (
+                topk_state.prev if topk_state is not None and self.skip_topk else None
+            )
             topk_indices = self.indexer(
                 x=x,
                 q_lora=q_lora,
@@ -769,7 +780,7 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-        prev_topk_indices: Optional[torch.Tensor] = None,
+        topk_state: Optional[Dsv4IndexTopkState] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -930,6 +941,9 @@ class MQALayer(nn.Module):
         del qkv_a
 
         if self.indexer is not None:
+            prev_topk_indices = (
+                topk_state.prev if topk_state is not None and self.skip_topk else None
+            )
             topk_indices = self.indexer(
                 x=x,
                 q_lora=q_lora,
@@ -957,9 +971,11 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant=None,
-        prev_topk_indices: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        topk_state: Optional[Dsv4IndexTopkState] = None,
+    ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+            if topk_state is not None and self.next_skip_topk is not None:
+                topk_state.prev = None
             return x
 
         attn_backend = get_attn_backend()
@@ -1016,7 +1032,7 @@ class MQALayer(nn.Module):
                     attn_backend,
                     q_out,
                     x_quant=x_quant,
-                    prev_topk_indices=prev_topk_indices,
+                    topk_state=topk_state,
                 )
             else:
                 q, topk_indices = self._forward_prepare_multi_stream(
@@ -1026,7 +1042,7 @@ class MQALayer(nn.Module):
                     attn_backend,
                     q_out,
                     x_quant=x_quant,
-                    prev_topk_indices=prev_topk_indices,
+                    topk_state=topk_state,
                 )
             kv = None
         else:
@@ -1037,7 +1053,7 @@ class MQALayer(nn.Module):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
-                prev_topk_indices=prev_topk_indices,
+                topk_state=topk_state,
             )
 
         # The cache write is always fused / already done by _forward_prepare* --
@@ -1134,8 +1150,8 @@ class MQALayer(nn.Module):
         if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
             o = attn_tp_all_reduce(o)
 
-        if self.next_skip_topk is not None:
-            return o, topk_indices if self.next_skip_topk else None
+        if topk_state is not None and self.next_skip_topk is not None:
+            topk_state.prev = topk_indices if self.next_skip_topk else None
         return o
 
 
@@ -1489,13 +1505,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
-        prev_topk_indices: Optional[torch.Tensor] = None,
+        topk_state: Optional[Dsv4IndexTopkState] = None,
         prev_residual: Optional[torch.Tensor] = None,
         prev_post: Optional[torch.Tensor] = None,
         prev_comb: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
-        Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -1552,12 +1567,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
-            prev_topk_indices=prev_topk_indices,
+            topk_state=topk_state,
         )
-        if isinstance(hidden_states, tuple):
-            hidden_states, topk_indices = hidden_states
-        else:
-            topk_indices = None
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1720,11 +1731,11 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            return hidden_states, None, None, None, topk_indices
+            return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
-        return hidden_states, residual, post, comb, topk_indices
+        return hidden_states, residual, post, comb
 
 
 class DeepseekV4Model(nn.Module):
@@ -1893,7 +1904,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        topk_indices = None
+        topk_state = Dsv4IndexTopkState()
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
@@ -1911,20 +1922,17 @@ class DeepseekV4Model(nn.Module):
                     prev_residual,
                     prev_post,
                     prev_comb,
-                    layer_topk_indices,
                 ) = layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     input_ids=input_ids,
                     input_ids_global=input_ids_global,
-                    prev_topk_indices=topk_indices,
+                    topk_state=topk_state,
                     prev_residual=prev_residual,
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
-                if layer.self_attn.next_skip_topk is not None:
-                    topk_indices = layer_topk_indices
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
