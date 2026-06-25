@@ -30,28 +30,6 @@ def _npu_use_triton_sparse() -> bool:
     )
 
 
-# Prefill length-routing threshold (max sequence length in the batch). It is
-# configurable so NPU prefill Triton can be enabled for all lengths during perf
-# tuning, while still allowing targeted fallback to the PyTorch path.
-_NPU_PREFILL_TRITON_MIN_SEQLEN_ENV = "SGLANG_MINIMAX_NPU_PREFILL_TRITON_MIN_SEQLEN"
-
-
-def _npu_prefill_triton_min_seqlen() -> int:
-    import os
-
-    return int(os.environ.get(_NPU_PREFILL_TRITON_MIN_SEQLEN_ENV, "0"))
-
-
-def _npu_prefill_max_seqlen(forward_batch: "ForwardBatch") -> int:
-    """Max sequence length in the batch. Read from CPU-side metadata so the
-    routing check does not add a per-layer device sync (forward_extend runs once
-    per layer); falls back to one device sync only when CPU metadata is absent.
-    """
-    slc = getattr(forward_batch, "seq_lens_cpu", None)
-    if slc is not None and slc.numel() > 0:
-        return int(slc.max())
-    return int(forward_batch.seq_lens.max().item())
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -894,129 +872,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_out[q_start:q_end] = idx_o_seq
         return idx_out, out
 
-    def _forward_npu_triton_prefill(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        idx_q: torch.Tensor,
-        idx_k_cache: torch.Tensor,
-        idx_v_cache: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
-        cu_seqlens: torch.Tensor,
-        seq_lens: torch.Tensor,
-        prefix_lens: torch.Tensor,
-    ):
-        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill import (
-            minimax_sparse_prefill_npu_triton,
-        )
-
-        meta = self._get_npu_triton_forward_meta(forward_batch)
-        cu_seqlens = meta.cu_seqlens if meta.cu_seqlens is not None else cu_seqlens
-        seq_lens = meta.seq_lens
-        prefix_lens = (
-            meta.prefix_lens if meta.prefix_lens is not None else prefix_lens
-        )
-
-        idx_o, o = minimax_sparse_prefill_npu_triton(
-            q,
-            self._cache_as_slots(k_cache),
-            self._cache_as_slots(v_cache),
-            None,
-            idx_q,
-            self._cache_as_slots(idx_k_cache),
-            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache),
-            None,
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            cu_seqlens,
-            seq_lens,
-            prefix_lens,
-            self._max_seqlen_q,
-            self._max_seqlen_k,
-            self.block_size_q,
-            self.block_size_k,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            score_type=self.score_type,
-            disable_index_value=idx_v_cache is None,
-            cu_seqblocks_q=meta.cu_seqblocks_q,
-            max_seqblock_q=meta.max_seqblock_q,
-            all_seqblock_q=meta.all_seqblock_q,
-            seqlens_cpu=meta.extend_seq_lens_cpu,
-            page_size=self.page_size,
-        )
-        import os as _os_dbg
-
-        if _os_dbg.environ.get("MINIMAX_NPU_TRITON_PREFILL_DEBUG_DIFF"):
-            try:
-                _idx_o_ref, _o_ref = self._forward_npu_sparse_prefill(
-                    q,
-                    k_cache,
-                    v_cache,
-                    idx_q,
-                    idx_k_cache,
-                    idx_v_cache,
-                    forward_batch,
-                    cu_seqlens,
-                    seq_lens,
-                    prefix_lens,
-                )
-                _diff = (o.float() - _o_ref.float()).abs()
-                _d = _diff.max().item()
-                _r = _d / max(_o_ref.float().abs().max().item(), 1e-6)
-                _loc = _format_prefill_diff_location(
-                    _diff,
-                    cu_seqlens,
-                    prefix_lens,
-                    seq_lens,
-                    forward_batch.req_pool_indices,
-                    self.block_size_k,
-                )
-                logger.warning(
-                    "[MiniMax/NPU triton-prefill-vs-pytorch] "
-                    "main max_abs_diff=%.6f rel=%.5f (q=%s) max_diff_at=%s",
-                    _d,
-                    _r,
-                    tuple(q.shape),
-                    _loc,
-                )
-                if idx_o is not None and _idx_o_ref is not None:
-                    _idx_diff = (idx_o.float() - _idx_o_ref.float()).abs()
-                    _idx_d = _idx_diff.max().item()
-                    _idx_r = _idx_d / max(_idx_o_ref.float().abs().max().item(), 1e-6)
-                    _idx_loc = _format_prefill_diff_location(
-                        _idx_diff,
-                        cu_seqlens,
-                        prefix_lens,
-                        seq_lens,
-                        forward_batch.req_pool_indices,
-                        self.block_size_k,
-                    )
-                    logger.warning(
-                        "[MiniMax/NPU triton-prefill-vs-pytorch] "
-                        "index max_abs_diff=%.6f rel=%.5f max_diff_at=%s",
-                        _idx_d,
-                        _idx_r,
-                        _idx_loc,
-                    )
-                else:
-                    logger.warning(
-                        "[MiniMax/NPU triton-prefill-vs-pytorch] "
-                        "index diff skipped: idx_o=%s ref_idx_o=%s "
-                        "disable_index_value=%s",
-                        "present" if idx_o is not None else "None",
-                        "present" if _idx_o_ref is not None else "None",
-                        idx_v_cache is None,
-                    )
-            except Exception as _e:  # noqa: BLE001
-                logger.warning(
-                    "[MiniMax/NPU triton-prefill-vs-pytorch] reference compute failed: %s",
-                    _e,
-                )
-        return idx_o, o
-
     def _forward_npu_sparse_decode(
         self,
         q: torch.Tensor,
@@ -1361,40 +1216,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
-            # Length-routed prefill: the threshold is configured by
-            # SGLANG_MINIMAX_NPU_PREFILL_TRITON_MIN_SEQLEN. Only routes when the
-            # triton env is enabled; otherwise the PyTorch path handles all
-            # lengths.
-            use_triton_prefill = _npu_use_triton_sparse() and (
-                _npu_prefill_max_seqlen(forward_batch)
-                >= _npu_prefill_triton_min_seqlen()
+            idx_o, o = self._forward_npu_sparse_prefill(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
             )
-            if use_triton_prefill:
-                idx_o, o = self._forward_npu_triton_prefill(
-                    q,
-                    k_cache,
-                    v_cache,
-                    idx_q,
-                    idx_k_cache,
-                    idx_v_cache,
-                    forward_batch,
-                    cu_seqlens,
-                    seq_lens,
-                    prefix_lens,
-                )
-            else:
-                idx_o, o = self._forward_npu_sparse_prefill(
-                    q,
-                    k_cache,
-                    v_cache,
-                    idx_q,
-                    idx_k_cache,
-                    idx_v_cache,
-                    forward_batch,
-                    cu_seqlens,
-                    seq_lens,
-                    prefix_lens,
-                )
         else:
             # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
             # the bf16 k/v) and the DP trim.
