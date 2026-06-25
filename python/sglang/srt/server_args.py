@@ -59,6 +59,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
+from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -650,6 +651,10 @@ class ServerArgs:
         Optional[str],
         "Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
     ] = None  # For flash_rl load format
+    enable_tf32_matmul: A[
+        bool,
+        "Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Memory and scheduling
@@ -854,6 +859,13 @@ class ServerArgs:
             aliases=["--tensor-parallel-size"],
         ),
     ] = 1
+    dcp_size: A[
+        int,
+        Arg(
+            help="The decode context parallelism size.",
+            aliases=["--decode-context-parallel-size"],
+        ),
+    ] = 1
     pp_size: A[
         int,
         Arg(
@@ -970,6 +982,10 @@ class ServerArgs:
     enable_streaming_session: A[
         bool,
         "Enable streaming session mode and StreamingSession wrapper.",
+    ] = False
+    enable_session_radix_cache: A[
+        bool,
+        "Hold per-session KV as ordinary evictable radix entries, tagged by session id and bulk-evicted on close. Requires --radix-eviction-policy priority.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -1250,6 +1266,22 @@ class ServerArgs:
             "prefill is force-released to bound worst-case TTFT. Only consulted "
             "when --prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ "
             "5000; defaults to 5000 if unset."
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
+    # Min free slots delay (prefill refill batching)
+    # -------------------------------------------------------------------------
+    min_free_slots_delay: A[
+        Optional[int],
+        (
+            "Hold new prefills until at least N running-request slots have freed "
+            "up, so they are admitted in one batch instead of one at a time. "
+            "Useful when each admission is disproportionately expensive, e.g. "
+            "speculative decoding with a separate draft prefill pass. Capped to "
+            "the DFlash formula (disabled when max-running-requests < 8; "
+            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
+            "this with the formula when unset; other workloads stay disabled."
         ),
     ] = None
 
@@ -1551,7 +1583,36 @@ class ServerArgs:
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
 
-    # -------------------------------------------------------------------------
+    # Decoupled speculative decoding: draft and verify run as
+    # separate engines, currently connected by a ZMQ IPC mesh.
+    decoupled_spec_bind_endpoint: A[
+        Optional[str],
+        "ZMQ endpoint this engine binds for its inbound channel in decoupled "
+        "speculative decoding (verifier: result PULL; drafter: control PULL).",
+    ] = None
+    decoupled_spec_connect_endpoints: A[
+        Optional[List[str]],
+        Arg(
+            help="Peer inbound (bind) endpoints to connect to, ordered by peer "
+            "rank, for decoupled speculative decoding.",
+            type_parser=json_list_type,
+        ),
+    ] = None
+    decoupled_spec_rank: A[
+        Optional[int],
+        "This engine's rank within its own role space (verifier-rank or "
+        "drafter-rank) for decoupled speculative decoding.",
+    ] = None
+    decoupled_spec_role: A[
+        Literal["null", "verifier", "drafter"],
+        "Role in decoupled speculative decoding: 'null' disables it, 'verifier' "
+        "runs the target/verify half, 'drafter' runs the draft half.",
+    ] = "null"
+    spec_trace_dir: A[
+        Optional[str],
+        "Directory to write decoupled speculative decoding trace files.",
+    ] = None
+
     # Speculative decoding (ngram)
     # -------------------------------------------------------------------------
     speculative_ngram_min_bfs_breadth: A[
@@ -2058,7 +2119,17 @@ class ServerArgs:
     flashinfer_allreduce_fusion_backend: A[
         Optional[Literal["auto", "trtllm", "mnnvl"]],
         Arg(
-            help="Enable FlashInfer allreduce fusion and choose backend. Defaults to auto. 'auto': choose mnnvl on SM90 single-node systems and SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. 'trtllm': available on single-node systems only. 'mnnvl': available on SM90 single-node systems and SM100/SM103 single-node or multi-node systems via MNNVL fabric. Fuses allreduce with Residual + RMSNorm for supported MoE models.",
+            help=(
+                "Enable FlashInfer allreduce fusion and choose backend. "
+                "Requires SM90 or SM10X NVIDIA GPUs. "
+                "Defaults to auto. "
+                "'auto': choose trtllm on single-node systems and mnnvl on "
+                "SM100/SM103 multi-node systems. "
+                "'trtllm': available on single-node systems only. "
+                "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
+                "single-node or multi-node systems via MNNVL fabric. "
+                "Fuses allreduce with Residual + RMSNorm for supported MoE models."
+            ),
         ),
     ] = None
     enable_aiter_allreduce_fusion: A[bool, "Enable Aiter AllReduce Fusion."] = False
@@ -2484,11 +2555,16 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+        if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
+            raise ValueError(
+                "--enable-session-radix-cache requires --radix-eviction-policy priority"
+            )
 
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
         self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
+        self._handle_dcp_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -2634,6 +2710,24 @@ class ServerArgs:
             and self.tokenizer_path != self.model_path
         ):
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+
+    def _handle_dcp_validation(self):
+        # Decode context parallel (DCP) is currently implemented and validated
+        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
+        # early instead of letting them fail deeper in model initialization.
+        if self.dcp_size < 1:
+            raise ValueError(
+                "Decode context parallel size (--dcp-size / "
+                "--decode-context-parallel-size) must be >= 1, but got "
+                f"dcp_size={self.dcp_size}."
+            )
+        if self.dcp_size > 1 and not is_hip():
+            raise ValueError(
+                "Decode context parallel (--dcp-size / "
+                "--decode-context-parallel-size > 1) is currently only "
+                f"supported on the AMD HIP platform, but got dcp_size="
+                f"{self.dcp_size} on a non-HIP platform."
+            )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -3284,12 +3378,9 @@ class ServerArgs:
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
-            effective_chunked_prefill_size = self.chunked_prefill_size // (
-                self.dp_size if self.enable_dp_attention and self.dp_size > 1 else 1
-            )
             # For activation during large prefill
             if self.chunked_prefill_size > 0:
-                reserved_mem += max(effective_chunked_prefill_size, 2048) * 1.5
+                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs
@@ -4254,7 +4345,7 @@ class ServerArgs:
                 ):
                     self.quantization = quant_method
                 if (
-                    self.quantization == "modelopt_fp4"
+                    self.quantization in {"modelopt_fp4", None}
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -4262,6 +4353,10 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                     )
+            self.enable_tf32_matmul = True
+            logger.info(
+                "Enable TF32 matmul for Glm4MoeForCausalLM model to improve gate gemm performance."
+            )
 
         elif model_arch in [
             "FalconH1ForCausalLM",
@@ -4295,6 +4390,12 @@ class ServerArgs:
         elif model_arch in ["ZayaForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
 
+        elif model_arch in ["MiniMaxM2ForCausalLM"]:
+            self.enable_tf32_matmul = True
+            logger.info(
+                "Enable TF32 matmul for MiniMaxM2ForCausalLM model to improve gate gemm performance."
+            )
+
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
             and is_hip()
@@ -4312,13 +4413,10 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # Auto-enable FlashInfer AllReduce Fusion on SM100 only, for models with
+        # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). SM90 is not
-        # auto-enabled because auto resolves to mnnvl, which requires a working
-        # NVLink multicast fabric that SM90 nodes do not reliably have; SM90
-        # users can opt in explicitly via
-        # --flashinfer-allreduce-fusion-backend.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to trtllm on
+        # single-node systems and mnnvl on Blackwell multi-node systems.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -4340,14 +4438,15 @@ class ServerArgs:
                 "NemotronHForCausalLM",
                 "NemotronHPuzzleForCausalLM",
             ]
-            and is_sm100_supported()
+            and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
             and not self.enable_dp_attention
+            and (self.nnodes == 1 or is_sm100_supported())
             and self.moe_a2a_backend == "none"
         ):
             self.flashinfer_allreduce_fusion_backend = "auto"
             logger.info(
-                f"Auto-enabling FlashInfer AllReduce Fusion on SM10X for {model_arch}"
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
             )
 
         # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
@@ -4672,9 +4771,17 @@ class ServerArgs:
             self.attention_backend = "triton"
 
         if (
-            self.prefill_attention_backend == "fa4"
+            (
+                self.attention_backend == "fa4"
+                or self.decode_attention_backend == "fa4"
+                or self.prefill_attention_backend == "fa4"
+            )
             and not self.use_mla_backend()
             and is_sm100_supported()
+            # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
+            # CUTLASS kernel aborts on at page_size>1. That path only works at
+            # page_size==1, so skip the 128 auto-force for it and keep the default.
+            and (self.speculative_eagle_topk or 0) <= 1
         ):
             logger.warning(
                 f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
@@ -7280,6 +7387,9 @@ class PortArgs:
     # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc endpoints between verifier scheduler and drafter scheduler
+    decoupled_spec_ipc_config: Optional[DecoupledSpecIpcConfig]
+
     # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
     # empty when IPC mode derives the address from instance_id).
     load_collector_ipc_name: str = ""
@@ -7308,6 +7418,24 @@ class PortArgs:
 
         instance_id = uuid.uuid4().hex[:12]
 
+        decoupled_spec_ipc_config = None
+        if server_args.decoupled_spec_role != "null":
+            if (
+                server_args.decoupled_spec_bind_endpoint is None
+                or server_args.decoupled_spec_connect_endpoints is None
+                or server_args.decoupled_spec_rank is None
+            ):
+                raise ValueError(
+                    "--decoupled-spec-bind-endpoint, "
+                    "--decoupled-spec-connect-endpoints, and "
+                    "--decoupled-spec-rank are required for decoupled speculative decoding."
+                )
+            decoupled_spec_ipc_config = DecoupledSpecIpcConfig(
+                bind_endpoint=server_args.decoupled_spec_bind_endpoint,
+                connect_endpoints=tuple(server_args.decoupled_spec_connect_endpoints),
+                rank=int(server_args.decoupled_spec_rank),
+            )
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -7318,6 +7446,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                decoupled_spec_ipc_config=decoupled_spec_ipc_config,
                 instance_id=instance_id,
             )
         else:
@@ -7388,6 +7517,7 @@ class PortArgs:
                 rpc_ipc_name=NetworkAddress(dist_init_host, rpc_port).to_tcp(),
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                decoupled_spec_ipc_config=decoupled_spec_ipc_config,
                 load_collector_ipc_name=NetworkAddress(
                     dist_init_host, load_collector_port
                 ).to_tcp(),

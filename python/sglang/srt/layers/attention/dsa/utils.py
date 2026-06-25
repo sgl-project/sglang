@@ -9,9 +9,15 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
 
 
@@ -77,6 +83,19 @@ def is_dsa_prefill_cp_round_robin_split():
     return (
         is_dsa_enable_prefill_cp()
         and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
+    )
+
+
+# Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
+# MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
+# inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
+# this surface (no feature flag); each adds its own extra carve-outs at its call
+# site (e.g. the indexer also excludes DSA prefill context parallelism).
+def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
+    return (
+        is_cuda()
+        and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+        and forward_batch.forward_mode.is_extend_without_speculative()
     )
 
 
