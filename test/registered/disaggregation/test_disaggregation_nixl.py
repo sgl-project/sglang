@@ -54,7 +54,7 @@ def _get_configured_nixl_backend_probe_error():
     backend_params_json = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
 
     try:
-        from nixl._api import nixl_agent, nixl_agent_config
+        from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
     except ImportError as e:
         return f"NIXL import failed: {e}"
 
@@ -64,7 +64,11 @@ def _get_configured_nixl_backend_probe_error():
         return str(e)
 
     try:
-        agent_config = nixl_agent_config(backends=[], num_threads=8)
+        agent_config = nixl_agent_config(
+            backends=[],
+            num_threads=8,
+            sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
+        )
         agent = nixl_agent(f"sglang_nixl_probe_{uuid.uuid4()}", agent_config)
         available_plugins = agent.get_plugin_list()
         if backend not in available_plugins:
