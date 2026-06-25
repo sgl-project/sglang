@@ -177,6 +177,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         loc, _ = unwrap_write_loc(loc_info)
         if layer_id_override is not None:

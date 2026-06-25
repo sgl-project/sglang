@@ -463,6 +463,11 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
+            # Pin CI's shared T2V_PROMPT ("A curious raccoon") instead of relying on
+            # prompt=None / unconditional generation — the latter drifts as the
+            # pipeline evolves, which is why this (previously planner-invisible) case
+            # diverged from its stale sglang_generated GT.
+            T2V_sampling_params,
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
