@@ -172,7 +172,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_bs=self.max_bs,
             max_num_tokens=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
-            is_hybrid_swa=model_runner.is_hybrid_swa,
             is_multimodal=self.is_multimodal,
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,

@@ -361,7 +361,10 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
-                if not self.finalize_bootstrap(req):
+                if should_force_retry(req):  # skip checking for testing
+                    if not self.ensure_metadata_buffer(req):
+                        continue  # no more metadata buffer
+                elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
@@ -931,7 +934,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
-                    self.chunked_req.fill_len,
+                    self.chunked_req.extend_range.end,
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
@@ -967,7 +970,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(req.fill_len, len(req.origin_input_ids))
+            else min(req.extend_range.end, len(req.origin_input_ids))
         )
 
         if not last_chunk:
@@ -998,7 +1001,7 @@ class SchedulerDisaggregationPrefillMixin:
             # length here avoids emitting an extra state page when the sampled
             # token crosses a page boundary, which mismatched src/dst lengths in
             # group_concurrent_contiguous.
-            seq_len = min(req.fill_len, len(req.origin_input_ids))
+            seq_len = min(req.extend_range.end, len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [
