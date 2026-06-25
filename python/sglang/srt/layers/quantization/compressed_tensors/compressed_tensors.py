@@ -195,9 +195,18 @@ class CompressedTensorsConfig(QuantizationConfig):
                 scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             except ValueError:
                 scheme = None
-            if scheme is not None:
+            # Only WNA16 registers weight_packed; others (W8A8-fp8/int8,
+            # W8A16-fp8) register `weight` and would be silently miscomputed
+            # by _compute_lm_head's hasattr("weight") matmul short-circuit.
+            if isinstance(scheme, CompressedTensorsWNA16):
                 layer.scheme = scheme
                 return CompressedTensorsLinearMethod(self)
+            elif scheme is not None:
+                logger.warning_once(
+                    f"ParallelLMHead quantization with {type(scheme).__name__} is "
+                    "not supported (lm_head would be computed without weight_scale); "
+                    "loading lm_head unquantized."
+                )
         return None
 
     def _add_fused_moe_to_target_scheme_map(self):
