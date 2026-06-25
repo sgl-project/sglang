@@ -40,7 +40,7 @@ class ChecksumInfo(_StrictBaseModel):
     parallelism_info: ParallelismInfo
 
 
-class Entry(NamedTuple):
+class CheckEntry(NamedTuple):
     name: str
     should_compare: bool
     comparable: ComparableWeight
@@ -179,8 +179,8 @@ def _hash_tensor(t: torch.Tensor) -> str:
 
 
 def _check_tensors(
-    expect_tensors: Iterable[Entry],
-    actual_tensors: Iterable[Entry],
+    expect_tensors: Iterable[CheckEntry],
+    actual_tensors: Iterable[CheckEntry],
     allow_quant_error: bool = False,
 ):
     good_names = []
@@ -276,8 +276,8 @@ def _build_entries(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
     quantized_set: Optional[Dict[str, QuantizedWeight]] = None,
-) -> Iterable[Entry]:
-    """Yields an Entry per weight; quantized weights consume their scale, everything
+) -> Iterable[CheckEntry]:
+    """Yields a CheckEntry per weight; quantized weights consume their scale, everything
     else is raw."""
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
@@ -288,9 +288,9 @@ def _build_entries(
             continue  # compared via its weight's comparable
         if name in quantized_set:
             qw = quantized_set[name]
-            yield Entry(name, True, qw.comparable_cls(tensor, raw[qw.scale_name]))
+            yield CheckEntry(name, True, qw.comparable_cls(tensor, raw[qw.scale_name]))
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)
             )
-            yield Entry(name, should_compare, RawComparable(tensor))
+            yield CheckEntry(name, should_compare, RawComparable(tensor))

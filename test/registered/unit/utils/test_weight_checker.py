@@ -25,8 +25,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     transform_scale_ue8m0,
 )
 from sglang.srt.utils.weight_checker import (
+    CheckEntry,
     ChecksumInfo,
-    Entry,
     ParallelismInfo,
     QuantizedWeight,
     WeightChecker,
@@ -52,10 +52,12 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 # ---------------------------------------------------------------------------
 
 
-def _assert_entries_close(actual: Iterable[Entry], expected: Iterable[Entry]) -> None:
+def _assert_entries_close(
+    actual: Iterable[CheckEntry], expected: Iterable[CheckEntry]
+) -> None:
     """Compare two streams of (name, should_compare, ComparableWeight)."""
-    actual_list: List[Entry] = list(actual)
-    expected_list: List[Entry] = list(expected)
+    actual_list: List[CheckEntry] = list(actual)
+    expected_list: List[CheckEntry] = list(expected)
     assert len(actual_list) == len(
         expected_list
     ), f"length mismatch: actual={len(actual_list)} expected={len(expected_list)}"
