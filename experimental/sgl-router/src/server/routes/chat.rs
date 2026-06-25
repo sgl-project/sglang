@@ -563,19 +563,20 @@ pub async fn chat_completions(
         Err(e) => e.status_code().as_u16(),
     };
 
-    // Record the client-visible HTTP status now that the outcome is known.
-    // For non-streaming requests the body is already buffered here, so
-    // `start.elapsed()` is true end-to-end latency — record it directly. For
-    // streaming, the body is still pending; the `RecordDurationOnDrop` guard
-    // packed into `stream_guards` records it at stream completion instead (so
-    // we don't capture only time-to-headers). `elapsed` still feeds the
-    // access-log `latency_ms` below for both.
+    // Record end-to-end latency now that the outcome is known. For non-streaming
+    // requests the body is already buffered here, so `start.elapsed()` is true
+    // end-to-end latency — record it directly. For streaming, the body is still
+    // pending; the `RecordDurationOnDrop` guard packed into `stream_guards`
+    // records it at stream completion instead (so we don't capture only
+    // time-to-headers). `elapsed` still feeds the access-log `latency_ms` below
+    // for both. The client-visible HTTP status is counted centrally by the
+    // `record_response_status` middleware (so error short-circuits are counted
+    // too), not here.
     let elapsed = start.elapsed();
     if !streaming {
         ctx.metrics
             .observe_request_duration(&metrics_model, elapsed.as_secs_f64());
     }
-    ctx.metrics.record_response(http_status);
     let outcome_str = match outcome {
         RequestOutcome::Success => "success",
         RequestOutcome::Error => "error",

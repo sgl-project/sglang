@@ -514,7 +514,7 @@ async fn oversized_request_body_returns_413() {
     // must NOT be forwarded to the upstream worker.
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
-    let app = build_router(ctx);
+    let app = build_router(ctx.clone());
 
     // One byte over the configured cap, so the test tracks the cap
     // (`MAX_CHAT_BODY_BYTES`) instead of a hardcoded size.
@@ -533,11 +533,22 @@ async fn oversized_request_body_returns_413() {
         res.status(),
     );
     // The worker must NOT have received the oversized payload.
-    let captured = worker.captured.lock().unwrap();
+    {
+        let captured = worker.captured.lock().unwrap();
+        assert!(
+            captured.last_body.is_none(),
+            "router must not forward oversized body to upstream; got body of {} bytes",
+            captured.last_body.as_ref().map(|b| b.len()).unwrap_or(0),
+        );
+    }
+    // The 413 is produced by the body-limit layer BEFORE the handler runs; the
+    // outermost `record_response_status` middleware must still count it.
     assert!(
-        captured.last_body.is_none(),
-        "router must not forward oversized body to upstream; got body of {} bytes",
-        captured.last_body.as_ref().map(|b| b.len()).unwrap_or(0),
+        ctx.metrics
+            .render()
+            .contains(r#"sgl_router_responses_total{status_code="413"} 1"#),
+        "body-limit 413 must be counted in responses_total: {}",
+        ctx.metrics.render(),
     );
 }
 
@@ -1521,6 +1532,123 @@ async fn admission_parks_second_request_until_first_stream_frees_the_slot() {
             .render()
             .contains("sgl_router_queued_requests 0\n"),
         "queue should drain to 0: {}",
+        ctx.metrics.render(),
+    );
+}
+
+/// A request shed by the admission gate (503 `service_overloaded`) must show up
+/// in BOTH the dedicated `sgl_router_backpressure_rejected_total` counter AND the
+/// general `sgl_router_responses_total{status_code="503"}` series. The latter is
+/// the point of the `record_response_status` middleware: the shed returns via `?`
+/// before the chat handler's own bookkeeping, so without the middleware it would
+/// be invisible in the response-code metric.
+#[tokio::test]
+async fn admission_shed_503_is_counted_in_responses_total() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(80),
+    )
+    .await;
+
+    // cap=1, depth cap 0: once the single slot is taken, the next request is
+    // shed immediately (never parks).
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
+        max_queued_requests: Some(0),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+
+    let make_req = || {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .unwrap();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // A claims the only slot and holds it mid-stream (don't drain the body).
+    let res_a = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+
+    // B is shed: worker at cap, wait queue depth 0 -> 503 service_overloaded.
+    let res_b = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_b.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let m = ctx.metrics.render();
+    // The dedicated reject counter (was already wired).
+    assert!(
+        m.contains(r#"sgl_router_backpressure_rejected_total{model_id="tiny"} 1"#),
+        "shed must increment the dedicated reject counter: {m}",
+    );
+    // The general response-code series now sees the shed too (the fix).
+    assert!(
+        m.contains(r#"sgl_router_responses_total{status_code="503"} 1"#),
+        "shed 503 must be counted in responses_total: {m}",
+    );
+
+    // Drain A to release resources cleanly.
+    let _ = BodyExt::collect(res_a.into_body()).await.unwrap();
+}
+
+/// Guards the refactor that moved status counting into the global middleware:
+/// a successful (200) response must be counted in `sgl_router_responses_total`
+/// exactly once per request — not double-counted (a leftover handler call) nor
+/// dropped (the middleware skipping the success path). Two requests => exactly 2.
+#[tokio::test]
+async fn success_200_counted_once_per_request_in_responses_total() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "tiny",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    for _ in 0..2 {
+        let res = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = res.into_body().collect().await.unwrap();
+    }
+
+    assert!(
+        ctx.metrics
+            .render()
+            .contains(r#"sgl_router_responses_total{status_code="200"} 2"#),
+        "two successes must count to exactly 2 (no double- or under-count): {}",
         ctx.metrics.render(),
     );
 }

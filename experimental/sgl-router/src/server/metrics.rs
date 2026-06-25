@@ -395,9 +395,15 @@ impl MetricsRegistry {
     }
 
     /// Bump `sgl_router_responses_total{status_code}` for the HTTP status the
-    /// client ultimately saw. Cardinality is bounded by the small set of
-    /// status codes the router returns (2xx success, 4xx client, 5xx
-    /// upstream/proxy, 504 stale-cancel).
+    /// client ultimately saw. Driven by the `record_response_status` middleware,
+    /// so it counts EVERY response across all routes — including error
+    /// short-circuits that never reach a handler's own bookkeeping (an admission
+    /// 503, a body-limit 413). For streaming responses the status is the one sent
+    /// with the headers, so a stream that fails mid-body after a 200 header is
+    /// counted as 200 (the breaker / duration metrics capture mid-stream
+    /// failures). Cardinality is bounded by the small set of status codes the
+    /// router returns (2xx success, 4xx client, 5xx upstream/proxy, 504
+    /// stale-cancel).
     pub fn record_response(&self, status_code: u16) {
         let mut guard = self.responses_total.lock();
         let counter = guard
@@ -598,7 +604,7 @@ impl MetricsRegistry {
 
         // responses_total
         out.push_str(
-            "# HELP sgl_router_responses_total Chat-completions responses returned to clients, by HTTP status code (recorded after worker dispatch).\n",
+            "# HELP sgl_router_responses_total HTTP responses returned to clients across all routes, by status code (recorded at response-headers time, so a mid-stream failure after a 200 header counts as 200).\n",
         );
         out.push_str("# TYPE sgl_router_responses_total counter\n");
         let guard = self.responses_total.lock();
