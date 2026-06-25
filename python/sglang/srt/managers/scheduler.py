@@ -92,6 +92,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -103,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -126,7 +128,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
-    PostProcessWeightsReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1339,8 +1340,12 @@ class Scheduler(
                     self.weight_updater.check_weights,
                 ),
                 (
-                    PostProcessWeightsReqInput,
-                    self.weight_updater.post_process_weights,
+                    BeginWeightUpdateReqInput,
+                    self.weight_updater.begin_weight_update,
+                ),
+                (
+                    EndWeightUpdateReqInput,
+                    self.weight_updater.end_weight_update,
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (
