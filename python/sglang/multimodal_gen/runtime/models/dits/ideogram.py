@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     qwen3_apply_rotary_pos_emb,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
@@ -86,7 +87,7 @@ def _linear(
 ):
     tp_size = _tp_size()
     use_column_parallel = tp_size > 1 and out_features % tp_size == 0
-    if quant_config is None:
+    if quant_config is None and get_global_server_args().original_dtype == "auto":
         if use_column_parallel:
             return WeightOnlyFP8ColumnParallelLinear(
                 in_features,
@@ -125,7 +126,7 @@ def _merged_column_linear(
         output_size % tp_size == 0 for output_size in output_sizes
     )
     out_features = sum(output_sizes)
-    if quant_config is None:
+    if quant_config is None and get_global_server_args().original_dtype == "auto":
         if use_column_parallel:
             return WeightOnlyFP8MergedColumnParallelLinear(
                 in_features,
@@ -161,7 +162,7 @@ def _row_linear(
 ):
     tp_size = _tp_size()
     use_row_parallel = tp_size > 1 and in_features % tp_size == 0
-    if quant_config is None:
+    if quant_config is None and get_global_server_args().original_dtype == "auto":
         if use_row_parallel:
             return WeightOnlyFP8RowParallelLinear(
                 in_features,

@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
@@ -98,7 +99,7 @@ def _make_text_linear(
     use_column_parallel = (
         use_tensor_parallel and tp_size > 1 and out_features % tp_size == 0
     )
-    if use_weight_only_fp8:
+    if use_weight_only_fp8 and get_global_server_args().original_dtype == "auto":
         if use_column_parallel:
             return WeightOnlyFP8ColumnParallelLinear(
                 in_features,
@@ -153,7 +154,7 @@ def _make_text_row_linear(
     use_row_parallel = (
         use_tensor_parallel and tp_size > 1 and in_features % tp_size == 0
     )
-    if use_weight_only_fp8:
+    if use_weight_only_fp8 and get_global_server_args().original_dtype == "auto":
         if use_row_parallel:
             return WeightOnlyFP8RowParallelLinear(
                 in_features,

@@ -205,6 +205,8 @@ class ServerArgs(DisaggServerArgsMixin):
     quantization: str | None = None
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
+    # Original data type of model weights
+    original_dtype: str = "auto"
 
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
@@ -1146,6 +1148,14 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.revision,
             help="The specific model version to use (can be a branch name, tag name, or commit id)",
+        )
+        parser.add_argument(
+            "--original-dtype",
+            type=str,
+            default=ServerArgs.original_dtype,
+            choices=["auto", "bfloat16"],
+            help="Original data type of model weights and activations.\n"
+            '* "auto" will use default supported data type for this model or data type from quantization config\n',
         )
 
         parser.add_argument(
