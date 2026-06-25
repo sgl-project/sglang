@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,9 +13,6 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     is_deepseek_dsa,
     is_deepseek_v4,
-)
-from sglang.srt.distributed.parallel_state import (
-    get_world_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -94,174 +90,12 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        # KV pool budget = currently-free GPU memory minus the non-static runtime
-        # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
-        # already resident (model weights, etc.) is thus charged against it.
-        available_gpu_memory = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+        return self.kv_cache_configurator._profile_available_bytes(
+            pre_model_load_memory
         )
-
-        rest_memory = available_gpu_memory - pre_model_load_memory * (
-            1 - self.server_args.mem_fraction_static
-        )
-        if self.mambaish_config is not None:
-            rest_memory = self._handle_max_mamba_cache(rest_memory)
-
-        # Loaded weights (target + draft) can exceed the static budget
-        if rest_memory <= 0:
-            minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
-            )
-            suggested_mem_fraction_static = (
-                math.ceil(minimum_mem_fraction_static * 1000) / 1000
-            )
-            raise ValueError(
-                f"Loaded weights leave no GPU memory for the KV cache under "
-                f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
-                f"Raise --mem-fraction-static above "
-                f"{suggested_mem_fraction_static:.3f} "
-                f"(minimum viable = 1 - available/pre = "
-                f"{minimum_mem_fraction_static:.4f}). If using speculative "
-                f"decoding, draft weights are now counted."
-            )
-
-        return int(rest_memory * (1 << 30))  # return in bytes
-
-    def _handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
-        config = self.mambaish_config
-        server_args = self.server_args
-        assert config is not None
-
-        has_spec_dec = not self.spec_algorithm.is_none()
-        if has_spec_dec:
-            assert server_args.speculative_num_draft_tokens is not None
-            assert server_args.max_running_requests is not None
-
-        if server_args.max_mamba_cache_size is not None:
-            # Use explicitly set max_mamba_cache_size
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
-            )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
-                capped_reqs = min(
-                    server_args.max_running_requests
-                    // (
-                        self.server_args.dp_size
-                        if server_args.enable_dp_attention
-                        else 1
-                    ),
-                    server_args.max_mamba_cache_size // ratio,
-                )
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
-                    * server_args.speculative_num_draft_tokens
-                )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
-        elif (
-            server_args.disable_radix_cache
-            and server_args.max_running_requests is not None
-        ):
-            # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
-            )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
-                )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
-        else:
-            # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
-
-            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
-            # The mamba budget (from the ratio split) must cover both:
-            #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
-            mamba_budget = (
-                total_rest_memory
-                * server_args.mamba_full_memory_ratio
-                / (1 + server_args.mamba_full_memory_ratio)
-            )
-            mamba_budget_bytes = mamba_budget * (1 << 30)
-
-            if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
-                # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
-                )
-                # Intermediate memory is included in mamba_budget, subtract it
-                # so the return value only has main_state subtracted from total
-                capped_reqs = min(
-                    server_args.max_running_requests
-                    // (
-                        self.server_args.dp_size
-                        if server_args.enable_dp_attention
-                        else 1
-                    ),
-                    server_args.max_mamba_cache_size // ratio,
-                )
-                intermediate_size = per_req * capped_reqs * D
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
-            else:
-                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
-
-        # Validate: max_mamba_cache_size must be positive after memory allocation.
-        # A non-positive value means GPU memory is insufficient for the requested
-        # configuration. Fail fast with actionable advice instead of silently
-        # producing garbled output at runtime.
-        if server_args.max_mamba_cache_size <= 0:
-            raise RuntimeError(
-                f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
-                f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
-                f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
-                f"Try: (1) reduce --max-running-requests, "
-                f"(2) increase --mem-fraction-static, "
-                f"(3) reduce --speculative-num-draft-tokens, or "
-                f"(4) use GPUs with more memory."
-            )
-
-        mamba_state_memory = (
-            server_args.max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
-            / (1 << 30)
-        )
-        return total_rest_memory - mamba_state_memory
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
-        if self.server_args.disable_radix_cache:
-            return 1
-
-        additional_ratio = 0
-        if self.server_args.enable_mamba_extra_buffer():
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not self.server_args.disable_overlap_schedule:
-                if self.server_args.enable_mamba_extra_buffer_lazy():
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
-                else:
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
-            else:
-                assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
-
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+        return self.kv_cache_configurator._calculate_mamba_ratio()
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,
@@ -935,72 +769,10 @@ class ModelRunnerKVCacheMixin:
             )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
-        """Apply external constraints to token capacity: user cap, PP sync.
-
-        Page alignment is handled by the configurator, not here.
-        If constraints change the value, the configurator re-runs and re-aligns.
-        """
-        user_limit = self.server_args.max_total_tokens
-
-        # Apply user-specified upper bound
-        if user_limit is not None:
-            if user_limit > token_capacity:
-                logging.warning(
-                    f"max_total_tokens={user_limit} is larger than the profiled value "
-                    f"{token_capacity}. Use the profiled value instead."
-                )
-            token_capacity = min(token_capacity, user_limit)
-
-        # Sync across PP ranks (each may have different layer counts)
-        if self.server_args.pp_size > 1:
-            tensor = torch.tensor(token_capacity, dtype=torch.int64)
-            torch.distributed.all_reduce(
-                tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
-            )
-            token_capacity = tensor.item()
-
-        return token_capacity
+        return self.kv_cache_configurator._apply_token_constraints(token_capacity)
 
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
-        """Compute max concurrent requests (per dp worker) from the finalized
-        token capacity."""
-        # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
-
-        max_num_reqs = self.server_args.max_running_requests
-        if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.server_args.dp_size
-            max_num_reqs = min(requested_per_worker, token_capacity // 2)
-        else:
-            requested_per_worker = None
-            max_num_reqs = min(estimated, token_capacity // 2)
-
-        if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
-            )
-
-            if max_num_reqs <= 0:
-                raise RuntimeError(
-                    f"Hybrid (mamba/linear-attention) state cache is too small to serve "
-                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
-                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
-                    f"Try: (1) reduce --max-running-requests, "
-                    f"(2) increase --mem-fraction-static, or "
-                    f"(3) use GPUs with more memory."
-                )
-        if requested_per_worker is not None and max_num_reqs < requested_per_worker:
-            logger.warning(
-                "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache capacity.",
-                requested_per_worker,
-                max_num_reqs,
-            )
-        return max_num_reqs
+        return self.kv_cache_configurator._resolve_max_num_reqs(token_capacity)
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
         """Apply a resolved MemoryPoolConfig and initialize pools."""
@@ -1036,29 +808,9 @@ class ModelRunnerKVCacheMixin:
     def _resolve_memory_pool_config(
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
-        """Profile GPU memory and resolve all pool parameters into a config."""
-        from sglang.srt.model_executor.model_runner_components.pool_configurator import (
-            create_memory_pool_configurator,
+        return self.kv_cache_configurator._resolve_memory_pool_config(
+            pre_model_load_memory
         )
-
-        available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        page_size = self.server_args.page_size
-
-        configurator = create_memory_pool_configurator(self)
-        config = configurator.calculate_pool_sizes(available_bytes, page_size)
-
-        # Apply external constraints (user cap, page alignment, PP sync)
-        constrained = self._apply_token_constraints(config.max_total_num_tokens)
-        if constrained != config.max_total_num_tokens:
-            config = configurator.calculate_pool_sizes_from_max_tokens(
-                constrained, page_size
-            )
-
-        config.max_running_requests = self._resolve_max_num_reqs(
-            config.max_total_num_tokens
-        )
-        config.mem_fraction_static = self.server_args.mem_fraction_static
-        return config
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
