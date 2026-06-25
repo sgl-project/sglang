@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 def frozen_kv_target_view(
     forward_batch: ForwardBatch,
     kv_context: FrozenKVMTPContext,
-    draft_attn_backend: "AttentionBackend",
+    draft_attn_backend: AttentionBackend,
 ):
     """Build attention metadata against committed target-prefix geometry.
 
@@ -61,7 +61,7 @@ def frozen_kv_target_view(
 def target_kv_pool_view(
     forward_batch: ForwardBatch,
     kv_context: FrozenKVMTPContext,
-    draft_attn_backend: "AttentionBackend",
+    draft_attn_backend: AttentionBackend,
 ):
     """Run the draft model's forward with the target's frozen KV pool.
 

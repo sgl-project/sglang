@@ -27,7 +27,7 @@ class TestEagle3Topk16(Eagle3Base, SpecCorrectnessKit, SpecAccuracyKit, SpecLogp
 
     spec_topk = 16
     spec_tokens = 64
-    disable_overlap = True  # topk>1 -> spec v1
+    disable_overlap = True  # synchronous baseline; SpecV2 subclass flips overlap on
     cuda_graph_max_bs = 5
     acc_length_thres = 3.1
     batch_accept_len_thres = 1.75

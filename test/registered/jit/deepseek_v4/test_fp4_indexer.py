@@ -148,7 +148,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     plan = CompressorDecodePlan.generate_legacy(
         compress_ratio, req_pool_indices, seq_lens
     )
-    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    loc = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
     freqs_cis = precompute_freqs_cis(
         64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
     ).to("cuda")

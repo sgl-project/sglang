@@ -148,7 +148,6 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
-_sm120_mxfp4_min_warps_patched = False
 
 if _is_hip:
     # import aiter
@@ -165,49 +164,6 @@ if _is_hip:
         dynamic_mxfp4_quant = e8m0_shuffle = err
 
 
-def _patch_sm120_mxfp4_min_warps():
-    global _sm120_mxfp4_min_warps_patched
-    if _sm120_mxfp4_min_warps_patched:
-        return
-
-    import inspect
-
-    from triton_kernels.matmul_ogs_details.opt_flags_details import opt_flags_nvidia
-    from triton_kernels.tensor import get_layout
-    from triton_kernels.tensor_details.layout import StridedLayout
-
-    compute_num_warps = opt_flags_nvidia.compute_num_warps
-    params = inspect.signature(compute_num_warps).parameters
-
-    if "is_persistent" in params and not getattr(
-        compute_num_warps, "_sglang_sm120_mxfp4_patch", False
-    ):
-
-        def _compute_num_warps_sm120_mxfp4(
-            block_m, block_n, is_persistent, precision_config
-        ):
-            selected_num_warps = compute_num_warps(
-                block_m, block_n, is_persistent, precision_config
-            )
-            weight_scale = getattr(precision_config, "weight_scale", None)
-            weight_scale_layout = get_layout(weight_scale)
-            if (
-                not is_persistent
-                and weight_scale is not None
-                and (
-                    weight_scale_layout is StridedLayout
-                    or isinstance(weight_scale_layout, StridedLayout)
-                )
-            ):
-                return max(selected_num_warps, 4)
-            return selected_num_warps
-
-        _compute_num_warps_sm120_mxfp4._sglang_sm120_mxfp4_patch = True
-        opt_flags_nvidia.compute_num_warps = _compute_num_warps_sm120_mxfp4
-
-    _sm120_mxfp4_min_warps_patched = True
-
-
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
@@ -215,41 +171,23 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
 
-    if is_sm120_supported():
-        # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
-        # This MXFP4 path uses StridedLayout and the non-persistent kernel.
-        _patch_sm120_mxfp4_min_warps()
-        from triton_kernels.tensor_details.layout import StridedLayout
-
-        value_layout = StridedLayout
-        value_layout_opts = {}
-        scale_layout = StridedLayout
-        scale_layout_opts = {}
+    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+        mx_axis=1
+    )
+    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=1, num_warps=num_warps
+    )
+    if is_sm100_supported():
         constraints = {
-            "is_persistent": False,
-            "num_stages": 1,
+            "is_persistent": True,
+            "epilogue_subtile": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
-    else:
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-            mx_axis=1
-        )
-        scale_layout, scale_layout_opts = (
-            layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
-            )
-        )
-        if is_sm100_supported():
-            constraints = {
-                "is_persistent": True,
-                "epilogue_subtile": 1,
-            }
-            opt_flags.update_opt_flags_constraints(constraints)
-        elif is_sm90_supported():
-            constraints = {
-                "split_k": 1,
-            }
-            opt_flags.update_opt_flags_constraints(constraints)
+    elif is_sm90_supported():
+        constraints = {
+            "split_k": 1,
+        }
+        opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -352,7 +290,7 @@ class Mxfp4Config(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional["QuantizeMethodBase"]:
+    ) -> Optional[QuantizeMethodBase]:
 
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -441,7 +379,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if is_sm100_supported():
+        if self.use_marlin:
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 128
+            )
+            hidden_size = round_up(hidden_size, 256)
+            self.hidden_pad = hidden_size - layer.hidden_size
+            self.intermediate_pad = (
+                intermediate_size_per_partition_after_pad
+                - layer.intermediate_size_per_partition
+            )
+        elif is_sm100_supported():
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, 256
@@ -565,16 +513,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 check_moe_marlin_supports_layer,
             )
             from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+                deinterleave_moe_mxfp4_w13_for_marlin,
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if not is_sm90_supported():
-                raise RuntimeError("MXFP4 Marlin requires Hopper/SM90 or above.")
-            if not check_moe_marlin_supports_layer(layer, 32):
+            if not is_sm90_supported() and not is_sm120_supported():
+                raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+            if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."
                 )
 
+            if self.moe_runner_config.gemm1_alpha is not None:
+                deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
             return
@@ -1164,6 +1115,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
+            if x.shape[-1] == self.hidden_size:
+                x_padded = x
+            else:
+                x_padded = torch.nn.functional.pad(
+                    x, (0, self.hidden_pad), mode="constant", value=0.0
+                )
             quant_info = MarlinMoeQuantInfo(
                 w13_qweight=layer.w13_weight,
                 w2_qweight=layer.w2_weight,
@@ -1173,8 +1130,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_g_idx_sort_indices=None,
                 weight_bits=4,
                 is_k_full=True,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
             )
-            return self.runner.run(dispatch_output, quant_info)
+            return self.runner.run(
+                dispatch_output._replace(hidden_states=x_padded), quant_info
+            )
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)

@@ -93,10 +93,10 @@ def _flashinfer_cutlass_fused_moe():
 
 @register_fused_func("none", "flashinfer_mxfp4")
 def fused_experts_none_to_flashinfer_mxfp4(
-    dispatch_output: "StandardDispatchOutput",
+    dispatch_output: StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> "StandardCombineInput":
+) -> StandardCombineInput:
     """SM90 W4A16 MXFP4 fused expert forward pass.
 
     Mirrors the legacy ``Mxfp4MoEMethod._apply_sm90_cutlass`` and DSv4's

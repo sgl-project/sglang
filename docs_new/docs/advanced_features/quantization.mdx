@@ -30,7 +30,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <th>Method</th>
       <th>NVIDIA GPUs</th>
       <th>AMD GPUs (MI300X/MI325X/MI350X)</th>
-      <th>Ascend NPUs (A2/A3)</th>
+      <th>Ascend NPUs (A2/A3/A5)</th>
       <th>Notes</th>
     </tr>
   </thead>
@@ -48,6 +48,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>WIP</td>
       <td>Requires CDNA3/CDNA4 with MXFP support; uses Aiter</td>
+    </tr>
+    <tr>
+      <td><code>mxfp8</code></td>
+      <td>No</td>
+      <td>No</td>
+      <td>Yes (A5 for Diffusion and LLM Dense Linear)</td>
+      <td>Ascend NPU only; online MXFP8 quantization for Diffusion models (e.g., Wan2.2) and LLM Dense Linear on A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
     </tr>
     <tr>
       <td><code>blockwise_int8</code></td>
@@ -182,13 +189,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>Ascend quantization; Uses CANN kernels</td>
     </tr>
-    <tr>
-      <td><code>mxfp8</code> (diffusion)</td>
-      <td>No</td>
-      <td>No</td>
-      <td>Yes (A2/A3)</td>
-      <td>Ascend NPU only; online MXFP8 quantization for diffusion models (e.g., Wan2.2); requires CANN ≥ 8.0.RC3</td>
-    </tr>
+
   </tbody>
 </table>
 
@@ -199,7 +200,7 @@ On Ascend, various layers quantization configurations are supported, see [Ascend
 ## GEMM Backends for FP4/FP8 Quantization
 
 <Note>
-Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. When running FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **NVFP4** GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
 </Note>
 
 ### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
@@ -257,6 +258,8 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 </table>
 
 **`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
+
+**MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
 
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 

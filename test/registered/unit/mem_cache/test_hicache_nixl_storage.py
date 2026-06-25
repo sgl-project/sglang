@@ -773,5 +773,77 @@ class TestNixlDirectIO(CustomTestCase):
         self.assertFalse(hicache.file_manager.use_direct_io)
 
 
+class TestNixlFileLayout(CustomTestCase):
+    """Tests for deterministic NIXL FILE storage path layout."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_layout_")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_route_key_is_stable_and_bucketed(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+            BUCKET_HEX_CHARS,
+            route_key,
+        )
+
+        self.assertEqual(route_key("page-123", 4), route_key("page-123", 4))
+        disk_idx, bucket = route_key("page-123", 4)
+        self.assertGreaterEqual(disk_idx, 0)
+        self.assertLess(disk_idx, 4)
+        self.assertEqual(len(bucket), BUCKET_HEX_CHARS)
+        self.assertRegex(bucket, rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
+
+    def test_route_key_rejects_empty_disk_set(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key
+
+        with self.assertRaises(ValueError):
+            route_key("page-123", 0)
+
+    def test_file_manager_routes_to_bucketed_base_dir(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+            route_disk,
+            route_key,
+        )
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        base_dirs = [os.path.join(self.test_dir, f"disk{i}") for i in range(3)]
+        fm = NixlFileManager(base_dirs, use_direct_io=False)
+        key = "page-123"
+
+        disk_idx, bucket = route_key(key, len(base_dirs))
+        self.assertEqual(route_disk(key, len(base_dirs)), disk_idx)
+        self.assertEqual(
+            fm.get_file_path(key), os.path.join(base_dirs[disk_idx], bucket, key)
+        )
+        self.assertEqual(fm.iter_all_base_dirs(), base_dirs)
+
+    def test_open_file_creates_bucket_directory(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        fm = NixlFileManager(self.test_dir, use_direct_io=False)
+        file_path = fm.get_file_path("page-123")
+        fd = fm.open_file(file_path, create=True)
+        try:
+            self.assertIsNotNone(fd)
+            self.assertTrue(os.path.exists(file_path))
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def test_clear_removes_nested_bucket_files(self):
+        from sglang.srt.mem_cache.storage.nixl.nixl_utils import NixlFileManager
+
+        fm = NixlFileManager(self.test_dir, use_direct_io=False)
+        file_path = fm.get_file_path("page-123")
+        fd = fm.open_file(file_path, create=True)
+        os.close(fd)
+
+        fm.clear()
+
+        self.assertFalse(os.path.exists(file_path))
+
+
 if __name__ == "__main__":
     unittest.main()

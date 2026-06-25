@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 def get_draft_kv_pool(
     *,
-    draft_worker: "BaseTpWorker",
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
@@ -54,25 +54,18 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    # V2 (EAGLE family) nests the runner under `.draft_worker`; DFLASH /
-    # FROZEN_KV_MTP expose `.model_runner` directly.
-    if spec_algorithm.supports_spec_v2():
-        if server_args.enable_multi_layer_eagle:
-            draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-        else:
-            draft_runner = draft_worker.draft_worker.draft_runner
-        return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-    return (
-        draft_worker.model_runner.token_to_kv_pool,
-        draft_worker.model_config,
-    )
+    # V2 workers nest the draft runner under `.draft_worker`.
+    if server_args.enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool, draft_runner.model_config
 
 
 def maybe_register_hicache_draft(
     *,
-    tree_cache: "BasePrefixCache",
-    draft_worker: "BaseTpWorker",
+    tree_cache: BasePrefixCache,
+    draft_worker: BaseTpWorker,
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
     enable_hierarchical_cache: bool,
@@ -96,8 +89,8 @@ def maybe_register_hicache_draft(
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import (
-        MHATokenToKVPoolHost,
         MLATokenToKVPoolHost,
+        get_mha_host_pool_cls,
     )
 
     pool = draft_kv_pool
@@ -114,7 +107,7 @@ def maybe_register_hicache_draft(
         layout=server_args.hicache_mem_layout,
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:
@@ -129,21 +122,21 @@ def maybe_register_hicache_draft(
 
 def build_kv_cache(
     *,
-    server_args: "ServerArgs",
-    model_config: "ModelConfig",
-    tp_worker: "BaseTpWorker",
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    tp_worker: BaseTpWorker,
     page_size: int,
-    spec_algorithm: "SpeculativeAlgorithm",
-    attn_tp_cpu_group: "ProcessGroup",
-    tp_cpu_group: "ProcessGroup",
-    attn_cp_cpu_group: "ProcessGroup",
+    spec_algorithm: SpeculativeAlgorithm,
+    attn_tp_cpu_group: ProcessGroup,
+    tp_cpu_group: ProcessGroup,
+    attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: "ParallelState",
-    tp_group: "GroupCoordinator",
-    pp_group: "GroupCoordinator",
+    ps: ParallelState,
+    tp_group: GroupCoordinator,
+    pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
-) -> "KVCacheBuildResult":
+) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
