@@ -117,6 +117,42 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    def _collect_stream_content_chunks(
+        self,
+        *,
+        text: str,
+        request: ChatCompletionRequest,
+        choice_logprobs=None,
+    ):
+        async def collect_chunks():
+            gen = self.chat._generate_stream_content(
+                content={
+                    "text": text,
+                    "meta_info": {
+                        "id": "chatcmpl-test",
+                    },
+                },
+                index=0,
+                request=request,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict={},
+                has_tool_calls={},
+                choice_logprobs=choice_logprobs,
+                finish_reason_type=None,
+                continuous_usage_stats=False,
+                prompt_tokens={},
+                reasoning_tokens={},
+                completion_tokens={},
+            )
+            chunks = []
+            async for emitted in gen:
+                chunks.append(json.loads(emitted[len("data: ") :]))
+            return chunks
+
+        loop = get_or_create_event_loop()
+        return loop.run_until_complete(collect_chunks())
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
@@ -891,6 +927,318 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(
             result, "Should return None when parser has no tool call data"
         )
+
+    def test_streaming_reasoning_chunk_includes_logprobs(self):
+        """Reasoning deltas should preserve the matching streaming logprobs."""
+        self.chat.reasoning_parser = "deepseek-r1"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+        choice_logprobs = {
+            "content": [
+                {
+                    "token": "reasoning",
+                    "bytes": list(b"reasoning"),
+                    "logprob": -0.25,
+                    "top_logprobs": [],
+                }
+            ]
+        }
+
+        chunks = self._collect_stream_content_chunks(
+            text="reasoning",
+            request=req,
+            choice_logprobs=choice_logprobs,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        choice = chunks[0]["choices"][0]
+        self.assertEqual(choice["delta"]["reasoning_content"], "reasoning")
+        self.assertEqual(choice["logprobs"], choice_logprobs)
+
+    def test_streaming_reasoning_chunk_without_logprobs_is_unchanged(self):
+        """Reasoning deltas keep null logprobs when no logprobs were requested."""
+        self.chat.reasoning_parser = "deepseek-r1"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=False,
+            separate_reasoning=True,
+        )
+
+        chunks = self._collect_stream_content_chunks(text="reasoning", request=req)
+
+        self.assertEqual(len(chunks), 1)
+        choice = chunks[0]["choices"][0]
+        self.assertEqual(choice["delta"]["reasoning_content"], "reasoning")
+        self.assertIsNone(choice["logprobs"])
+
+    def test_streaming_reasoning_and_content_split_logprobs(self):
+        """Mixed reasoning/content deltas should not duplicate logprobs."""
+        self.chat.reasoning_parser = "deepseek-r1"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+        choice_logprobs = {
+            "content": [
+                {
+                    "token": "reasoning",
+                    "bytes": list(b"reasoning"),
+                    "logprob": -0.25,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "</think>",
+                    "bytes": list(b"</think>"),
+                    "logprob": -0.4,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "answer",
+                    "bytes": list(b"answer"),
+                    "logprob": -0.5,
+                    "top_logprobs": [],
+                },
+            ]
+        }
+
+        chunks = self._collect_stream_content_chunks(
+            text="reasoning</think>answer",
+            request=req,
+            choice_logprobs=choice_logprobs,
+        )
+
+        self.assertEqual(len(chunks), 2)
+        reasoning_choice = chunks[0]["choices"][0]
+        content_choice = chunks[1]["choices"][0]
+        self.assertEqual(reasoning_choice["delta"]["reasoning_content"], "reasoning")
+        self.assertEqual(content_choice["delta"]["content"], "answer")
+        self.assertEqual(
+            reasoning_choice["logprobs"]["content"],
+            [choice_logprobs["content"][0]],
+        )
+        self.assertEqual(
+            content_choice["logprobs"]["content"],
+            [choice_logprobs["content"][2]],
+        )
+
+    def test_streaming_reasoning_logprobs_drop_parser_markers(self):
+        """Parser-swallowed reasoning markers should not be exposed as logprobs."""
+        self.chat.reasoning_parser = "qwen3"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+        choice_logprobs = {
+            "content": [
+                {
+                    "token": "<think>",
+                    "bytes": list(b"<think>"),
+                    "logprob": -0.1,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "reasoning",
+                    "bytes": list(b"reasoning"),
+                    "logprob": -0.25,
+                    "top_logprobs": [],
+                },
+            ]
+        }
+
+        chunks = self._collect_stream_content_chunks(
+            text="<think>reasoning",
+            request=req,
+            choice_logprobs=choice_logprobs,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        choice = chunks[0]["choices"][0]
+        self.assertEqual(choice["delta"]["reasoning_content"], "reasoning")
+        self.assertEqual(
+            choice["logprobs"]["content"],
+            [choice_logprobs["content"][1]],
+        )
+
+    def test_streaming_reasoning_marker_only_chunk_drops_logprobs(self):
+        """Parser-only marker chunks should not surface standalone logprobs."""
+        self.chat.reasoning_parser = "qwen3"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+
+        for parser_name, marker in (
+            ("qwen3", "<think>"),
+            ("qwen3", "<thi"),
+            ("deepseek-r1", "</think>"),
+        ):
+            with self.subTest(parser=parser_name, marker=marker):
+                self.chat.reasoning_parser = parser_name
+                choice_logprobs = {
+                    "content": [
+                        {
+                            "token": marker,
+                            "bytes": list(marker.encode("utf-8")),
+                            "logprob": -0.1,
+                            "top_logprobs": [],
+                        }
+                    ]
+                }
+
+                chunks = self._collect_stream_content_chunks(
+                    text=marker,
+                    request=req,
+                    choice_logprobs=choice_logprobs,
+                )
+
+                self.assertEqual(chunks, [])
+
+    def test_streaming_reasoning_boundary_spanning_token_falls_back(self):
+        """A token crossing a parser marker should preserve #28601 behavior."""
+        self.chat.reasoning_parser = "deepseek-r1"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+        choice_logprobs = {
+            "content": [
+                {
+                    "token": "</think>answer",
+                    "bytes": list(b"</think>answer"),
+                    "logprob": -0.5,
+                    "top_logprobs": [],
+                },
+            ]
+        }
+
+        chunks = self._collect_stream_content_chunks(
+            text="</think>answer",
+            request=req,
+            choice_logprobs=choice_logprobs,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        choice = chunks[0]["choices"][0]
+        self.assertEqual(choice["delta"]["content"], "answer")
+        self.assertEqual(choice["logprobs"], choice_logprobs)
+
+    def test_streaming_reasoning_ambiguous_marker_match_falls_back(self):
+        """Content text repeated inside a swallowed marker must not be misassigned."""
+        self.chat.reasoning_parser = "deepseek-r1"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+        choice_logprobs = {
+            "content": [
+                {
+                    "token": "reasoning",
+                    "bytes": list(b"reasoning"),
+                    "logprob": -0.25,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "</",
+                    "bytes": list(b"</"),
+                    "logprob": -0.3,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "think",
+                    "bytes": list(b"think"),
+                    "logprob": -0.4,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": ">",
+                    "bytes": list(b">"),
+                    "logprob": -0.45,
+                    "top_logprobs": [],
+                },
+                {
+                    "token": "think",
+                    "bytes": list(b"think"),
+                    "logprob": -0.5,
+                    "top_logprobs": [],
+                },
+            ]
+        }
+
+        chunks = self._collect_stream_content_chunks(
+            text="reasoning</think>think",
+            request=req,
+            choice_logprobs=choice_logprobs,
+        )
+
+        self.assertEqual(len(chunks), 2)
+        reasoning_choice = chunks[0]["choices"][0]
+        content_choice = chunks[1]["choices"][0]
+        self.assertEqual(reasoning_choice["delta"]["reasoning_content"], "reasoning")
+        self.assertEqual(content_choice["delta"]["content"], "think")
+        self.assertEqual(reasoning_choice["logprobs"], choice_logprobs)
+        self.assertIsNone(content_choice["logprobs"])
+
+    def test_streaming_content_chunk_keeps_logprobs_with_reasoning_parser(self):
+        """Normal content deltas should keep logprobs when no reasoning is emitted."""
+        self.chat.reasoning_parser = "qwen3"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            logprobs=True,
+            separate_reasoning=True,
+        )
+        choice_logprobs = {
+            "content": [
+                {
+                    "token": "answer",
+                    "bytes": list(b"answer"),
+                    "logprob": -0.5,
+                    "top_logprobs": [],
+                },
+            ]
+        }
+
+        chunks = self._collect_stream_content_chunks(
+            text="answer",
+            request=req,
+            choice_logprobs=choice_logprobs,
+        )
+
+        self.assertEqual(len(chunks), 1)
+        choice = chunks[0]["choices"][0]
+        self.assertEqual(choice["delta"]["content"], "answer")
+        self.assertEqual(choice["logprobs"], choice_logprobs)
 
     # ------------- kimi_k2 tool_call_id formatting -------------
     def test_kimi_k2_non_streaming_tool_call_id_format(self):
