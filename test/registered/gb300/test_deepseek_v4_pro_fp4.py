@@ -6,7 +6,9 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
+register_cuda_ci(
+    est_time=7200, suite="nightly-4-gpu-gb300-deepseek-v4-pro-fp4", nightly=True
+)
 
 MODEL_PATH = "deepseek-ai/DeepSeek-V4-Pro"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -31,7 +33,7 @@ LOW_LATENCY_ARGS = [
     "--swa-full-tokens-ratio",
     "0.1",
     "--mem-fraction-static",
-    "0.90",
+    "0.85",
 ]
 
 BALANCED_ARGS = [
@@ -50,7 +52,7 @@ BALANCED_ARGS = [
     "--speculative-num-draft-tokens",
     "2",
     "--mem-fraction-static",
-    "0.9",
+    "0.85",
     "--cuda-graph-max-bs",
     "128",
     "--max-running-requests",
@@ -67,7 +69,7 @@ HIGH_THROUGHPUT_ARGS = [
     "--moe-a2a-backend",
     "megamoe",
     "--mem-fraction-static",
-    "0.9",
+    "0.85",
     "--cuda-graph-max-bs",
     "128",
     "--max-running-requests",

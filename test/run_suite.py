@@ -121,8 +121,15 @@ NIGHTLY_SUITES = {
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
-        # GB300 (4x GB300 NVL4) nightly suite
+        # GB300 (4x GB300 NVL4) nightly suites
         "nightly-4-gpu-gb300",
+        "nightly-4-gpu-gb300-deepseek-v4-pro-fp4",
+        "nightly-4-gpu-gb300-glm5-fp8",
+        "nightly-4-gpu-gb300-glm5-nvfp4",
+        "nightly-4-gpu-gb300-kimi-k25",
+        "nightly-4-gpu-gb300-kimi-k25-nvfp4",
+        "nightly-4-gpu-gb300-qwen35-fp8",
+        "nightly-4-gpu-gb300-qwen35-nvfp4",
         # Nightly precision regression (per-layer hidden state comparison)
         "nightly-precision-8-gpu-h200",
     ],
