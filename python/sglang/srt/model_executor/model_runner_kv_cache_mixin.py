@@ -1019,8 +1019,10 @@ class ModelRunnerKVCacheMixin:
         return self._clamp_deepep_low_latency_concurrency(max_num_reqs)
 
     def _is_deepep_low_latency(self: ModelRunner) -> bool:
+        from sglang.srt.layers.moe.utils import is_deepep_dispatch_backend
+
         return (
-            self.server_args.moe_a2a_backend == "deepep"
+            is_deepep_dispatch_backend(self.server_args.moe_a2a_backend)
             and self.server_args.deepep_mode != "normal"
         )
 

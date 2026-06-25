@@ -94,7 +94,13 @@ def get_batch_sizes_to_capture(
 
     # DeepEP low_latency caps per-rank dispatch tokens; a decode capture bs above
     # that cap trips the deep_ep dispatch assertion, so clamp the list to it.
-    if server_args.moe_a2a_backend == "deepep" and server_args.deepep_mode != "normal":
+    # Covers every a2a backend that routes through the DeepEP dispatcher.
+    from sglang.srt.layers.moe.utils import is_deepep_dispatch_backend
+
+    if (
+        is_deepep_dispatch_backend(server_args.moe_a2a_backend)
+        and server_args.deepep_mode != "normal"
+    ):
         deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         if max(capture_bs) > deepep_cap:
             capture_bs = [bs for bs in capture_bs if bs <= deepep_cap]

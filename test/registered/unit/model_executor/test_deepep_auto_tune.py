@@ -149,6 +149,12 @@ class TestDeepEPAutoTune(unittest.TestCase):
             self._run(self._runner(pool_size=4096))
             self.assertEqual(_ENV.get(), 1024)
 
+    def test_mooncake_backend_also_tuned(self):
+        # The DeepEP dispatcher family (here mooncake) shares the cap, not just "deepep".
+        with _env_unset():
+            self._run(self._runner(backend="mooncake", pool_size=512))
+            self.assertEqual(_ENV.get(), 512)
+
     def test_low_concurrency_keeps_default(self):
         # need <= default(128): never written, env stays unset.
         with _env_unset():
@@ -185,6 +191,16 @@ class TestDeepEPConcurrencyClamp(unittest.TestCase):
             return_value=SimpleNamespace(world_size=1, cpu_group=None),
         ):
             self.assertEqual(self._clamp(_deepep_runner(), 512), 512)
+
+    def test_mooncake_backend_also_capped(self):
+        # The cap applies to the whole DeepEP-dispatch family, not just "deepep".
+        with patch(
+            f"{_MIXIN_MODULE}.get_moe_ep_group",
+            return_value=SimpleNamespace(world_size=1, cpu_group=None),
+        ):
+            self.assertEqual(
+                self._clamp(_deepep_runner(backend="mooncake"), 2048), 1024
+            )
 
     def test_takes_ep_group_minimum(self):
         # Simulate a peer rank contributing a smaller concurrency: cap is 800,

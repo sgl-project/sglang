@@ -369,6 +369,20 @@ def is_deepep_class_backend() -> bool:
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
 
 
+def is_deepep_dispatch_backend(moe_a2a_backend: str) -> bool:
+    """a2a backends that route through the DeepEP dispatcher and so share its
+    symmetric all-to-all buffer and the low_latency FINISHED_SUM_TAG=1024
+    per-rank dispatch cap (deepep, mooncake, mori, nixl). Name-based so it is
+    usable before the global MoE config is initialized (ServerArgs.__post_init__).
+    """
+    return MoeA2ABackend(moe_a2a_backend) in (
+        MoeA2ABackend.DEEPEP,
+        MoeA2ABackend.MOONCAKE,
+        MoeA2ABackend.MORI,
+        MoeA2ABackend.NIXL,
+    )
+
+
 def is_flashinfer_cutedsl_v1_path() -> bool:
     """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
     return (
