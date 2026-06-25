@@ -579,8 +579,8 @@ class HiCacheHF3FS(HiCacheStorage):
             return
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
-        pool_page_size = getattr(host_pool, "page_size", 1) or 1
-        pool_bytes_per_page = host_pool.get_ksize_per_token() * pool_page_size
+        dummy_page = host_pool.get_dummy_flat_data_page()
+        pool_bytes_per_page = dummy_page.numel() * dummy_page.element_size()
         pool_num_pages = self.file_size // pool_bytes_per_page
         pool_file_path = f"{self.file_path}.{host_pool_name}"
         namespace = host_pool_name  # e.g. PoolName.MAMBA, PoolName.INDEXER
