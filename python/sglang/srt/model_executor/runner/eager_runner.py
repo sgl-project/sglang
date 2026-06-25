@@ -122,6 +122,9 @@ class EagerRunner(BaseRunner):
                 if is_encoder_decoder
                 else 0
             ),
+            encoder_lens_dtype=(
+                torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
+            ),
             dp_size=sa.dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
