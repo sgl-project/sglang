@@ -34,6 +34,25 @@ def _npu_use_triton_sparse() -> bool:
         int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "0"))
     )
 
+
+# Prefill length-routing threshold (max sequence length in the batch). Below it
+# the gather-free masked-full PyTorch path (_forward_npu_sparse_prefill) handles
+# prefill — correct and memory-safe. At/above it the fused triton path
+# (_forward_npu_triton_prefill) takes over to bound the O(seq_len^2) full-
+# attention memory for long context.
+_NPU_PREFILL_TRITON_MIN_SEQLEN = 8192  # 8K
+
+
+def _npu_prefill_max_seqlen(forward_batch: "ForwardBatch") -> int:
+    """Max sequence length in the batch. Read from CPU-side metadata so the
+    routing check does not add a per-layer device sync (forward_extend runs once
+    per layer); falls back to one device sync only when CPU metadata is absent.
+    """
+    slc = getattr(forward_batch, "seq_lens_cpu", None)
+    if slc is not None and slc.numel() > 0:
+        return int(slc.max())
+    return int(forward_batch.seq_lens.max().item())
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -1190,7 +1209,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
-            if _npu_use_triton_sparse():
+            # Length-routed prefill: short context (<8K) uses the gather-free
+            # masked-full PyTorch path (correct + memory-safe); long context
+            # (>=8K) uses the fused triton path to bound the O(seq_len^2)
+            # full-attention memory. Only routes when the triton env is enabled;
+            # otherwise the PyTorch path handles all lengths.
+            use_triton_prefill = _npu_use_triton_sparse() and (
+                _npu_prefill_max_seqlen(forward_batch)
+                >= _NPU_PREFILL_TRITON_MIN_SEQLEN
+            )
+            if use_triton_prefill:
                 idx_o, o = self._forward_npu_triton_prefill(
                     q,
                     k_cache,
