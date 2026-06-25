@@ -1033,6 +1033,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_input: MultimodalInputs,
         seq_len: int,
     ) -> torch.Tensor:
+        # Some generation models precompute decode positions for future tokens.
+        # For example, GLM-Image needs 2D spatial MRoPE positions instead of
+        # sequential delta-based positions.
+        # This is needed for image generation models (e.g. GlmImage) where
+        # decode tokens require 2D spatial MRoPE positions, not sequential.
+        if (
+            mm_input.mrope_positions is not None
+            and mm_input.mrope_positions.shape[1] >= seq_len
+        ):
+            pos = mm_input.mrope_positions[:, seq_len - 1 : seq_len]
+            return pos
+
         # doing below compute on cpu to avoid frequent small kernels
         if mm_input.mrope_position_delta_repeated_cache is None:
             mm_input.mrope_position_delta_repeated_cache = (

@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -6,6 +7,8 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
+
+logger = logging.getLogger(__name__)
 
 
 class VisionLanguageEncoderLoader(ComponentLoader):
@@ -21,6 +24,14 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         transformers_or_diffusers: str = "vision_language_encoder",
     ) -> Any:
         if transformers_or_diffusers == "vision_language_encoder":
+
+            if server_args.srt_encoder_url is not None:
+                logger.info(
+                    f"Use {server_args.srt_encoder_url} as a backend for AR model"
+                    "make sure that a server with the appropriate model is running at this address."
+                )
+                return server_args.srt_encoder_url
+
             from transformers import GlmImageForConditionalGeneration
 
             config = get_hf_config(
