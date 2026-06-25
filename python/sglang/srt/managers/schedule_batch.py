@@ -762,6 +762,9 @@ class Req(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q")
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
+        # Uniform-diffusion (DiffusionGemma #28054) fill length; the canvas scheduler
+        # mutates this. Main tracks masked dLLM via dllm_initialized; uniform needs this.
+        self.fill_len: int = 0
 
         self.session = session
         self.input_embeds = input_embeds
@@ -1519,6 +1522,7 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released = False
         self.extend_range = None
         self.dllm_initialized = False
+        self.fill_len = 0
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None

@@ -89,6 +89,9 @@ class ReqDllmMixin:
                 + self.output_ids
                 + array("q", [self.dllm_config.mask_id] * self.dllm_config.block_size)
             )
+        # #28054's uniform canvas scheduler reads/writes req.fill_len; keep it maintained
+        # alongside main's dllm_initialized so both the masked and uniform paths work.
+        self.fill_len = len(self.full_untruncated_fill_ids)
         self.dllm_initialized = True
 
     def _update_block_offset_for_dllm(self: Req):
