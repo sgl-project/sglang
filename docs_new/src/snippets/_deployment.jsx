@@ -504,15 +504,35 @@ export const Deployment = ({ config, benchmarks }) => {
       const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
+      const vendorOf = (hwId) => {
+        for (const [vendor, list] of Object.entries(HARDWARE_CATALOG)) {
+          if (list.some((h) => h.id === hwId)) return vendor;
+        }
+        const extra = (config.hardware || []).find((h) => h.id === hwId);
+        return (extra && extra.vendor) || "nvidia";
+      };
+      const gpuAccessLines = vendorOf(sel.hw) === "amd"
+        ? [
+            "docker run",
+            "  --device=/dev/kfd --device=/dev/dri",
+            "  --group-add video",
+            "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
+            "  --shm-size 32g",
+          ]
+        : [
+            "docker run --gpus all",
+            "  --shm-size 32g",
+          ];
       const dockerLines = [
-        "docker run --gpus all",
-        "  --shm-size 32g",
+        ...gpuAccessLines,
         // Multi-node needs host networking so the cross-node rendezvous port
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         multinode ? "  --network host" : `  -p ${servePort}:${servePort}`,
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
-        `  --env "HF_TOKEN={{HF_TOKEN}}"`,
+        // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
+        ...(config.placeholders && config.placeholders.HF_TOKEN
+          ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
         `  ${image}`,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, cast
+from typing import TYPE_CHECKING, Generator, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import PackTopkIds
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
@@ -320,6 +321,11 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
 
     assert w13_scale.dtype == torch.uint8
     assert w2_scale.dtype == torch.uint8
+
+    if not is_gated:
+        intermediate = w2_weight.shape[2]
+        w13_weight = w13_weight[:, :intermediate, :].contiguous()
+        w13_scale = w13_scale[:, :intermediate, :].contiguous()
 
     # Pad for kernel alignment (non-gated needs 128, gated needs 16)
     min_alignment = 16 if is_gated else 128
@@ -627,16 +633,6 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     activation_type: int | None = None
 
 
-def _pack_topk_for_flashinfer_routed(
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor
-) -> torch.Tensor:
-    """Pack routed top-k tensors into FlashInfer's int32 format."""
-    packed_ids = topk_ids.to(torch.int32)
-    packed_weights = topk_weights.to(torch.bfloat16)
-    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    return packed
-
-
 def fused_experts_none_to_flashinfer_trtllm_fp8(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
@@ -661,11 +657,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(hidden_states.dtype)
-        )
+        correction_bias = topk_config.correction_bias
     else:
         router_logits = None
         topk_config = None
@@ -688,15 +680,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert quant_info.weight_block_k == 32
             from flashinfer import mxfp8_quantize
 
-            a_q, a_sf = mxfp8_quantize(hidden_states, False)
+            a_q, a_sf = mxfp8_quantize(hidden_states, False, backend="cute-dsl")
             # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
             # [num_tokens, hidden_size // 32] (no transpose).
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
         else:
             a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k
+                hidden_states, quant_info.weight_block_k, column_major_scales=True
             )
-            a_sf_t = a_sf.t().contiguous()
+            a_sf_t = a_sf.t()
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
@@ -717,9 +709,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
             assert TopKOutputChecker.format_is_standard(topk_output)
-            packed_topk_ids = _pack_topk_for_flashinfer_routed(
-                topk_ids=topk_output.topk_ids,
-                topk_weights=topk_output.topk_weights,
+            packed_topk_ids = PackTopkIds.execute(
+                topk_output.topk_ids, topk_output.topk_weights
             )
 
             output = trtllm_fp8_block_scale_routed_moe_wrapper(
@@ -871,6 +862,8 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     routing_method_type: int
     use_per_token_activation: bool = False
 
+    gemm1_clamp_limit: Optional[torch.Tensor] = None
+
 
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
@@ -967,18 +960,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         runner_config.activation, is_gated=runner_config.is_gated
     )
 
-    # Build per-expert clamp-limit tensor from the per-layer scalar.
-    _clamp_val = runner_config.gemm1_clamp_limit
-    if _clamp_val is not None:
-        gemm1_clamp_limit = torch.full(
-            (quant_info.local_num_experts,),
-            _clamp_val,
-            dtype=torch.float32,
-            device=hs_fp4.device,
-        )
-    else:
-        gemm1_clamp_limit = None
-
     # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
     if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
         use_routed_topk = True
@@ -1021,7 +1002,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     if use_routed_topk:
         assert TopKOutputChecker.format_is_standard(topk_output)
 
-        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+        packed_topk_ids = PackTopkIds.execute(
             topk_output.topk_ids, topk_output.topk_weights
         )
         result = trtllm_fp4_block_scale_routed_moe(
@@ -1034,7 +1015,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
@@ -1063,11 +1044,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         topk_config = topk_output.topk_config
         routing_method_type = quant_info.routing_method_type
 
-        correction_bias = (
-            None
-            if topk_config.correction_bias is None
-            else topk_config.correction_bias.to(hidden_states.dtype)
-        )
+        correction_bias = topk_config.correction_bias
         moe_kwargs = dict(
             routing_logits=router_logits,
             routing_bias=correction_bias,
@@ -1078,7 +1055,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
@@ -1201,9 +1178,8 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             elif routing_method_type == RoutingMethodType.DeepSeekV3:
                 routing_method_type = RoutingMethodType.TopK
 
-            packed_topk_ids = _pack_topk_for_flashinfer_routed(
-                topk_ids=topk_output.topk_ids,
-                topk_weights=topk_output.topk_weights,
+            packed_topk_ids = PackTopkIds.execute(
+                topk_output.topk_ids, topk_output.topk_weights
             )
             final_hidden_states = trtllm_bf16_routed_moe(
                 topk_ids=packed_topk_ids,

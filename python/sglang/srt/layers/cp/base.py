@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
+from sglang.srt.runtime_context import get_parallel
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.server_args import ServerArgs
@@ -93,9 +95,8 @@ class ContextParallelStrategy(ABC):
 
     @property
     def cp_rank(self) -> int:
-        from sglang.srt.layers.dp_attention import get_attention_cp_rank
 
-        return get_attention_cp_rank()
+        return get_parallel().attn_cp_rank
 
     @property
     def per_layer_attn_cp_comm(self) -> bool:
@@ -184,6 +185,7 @@ class ContextParallelStrategy(ABC):
         layer: Any,
         k: Any,
         v: Any,
+        swa_loc: Optional[Any] = None,
     ) -> None:
         """Write full-layout K/V to the backend cache if needed."""
 
@@ -234,7 +236,7 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         )
 
 
-def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
+def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     """Return the configured strategy, initializing lazily on first call.
 
     Subprocesses re-import this module with ``_STRATEGY = None`` and never
@@ -256,20 +258,15 @@ def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
     return _STRATEGY
 
 
-def get_cp_strategy() -> Optional[ContextParallelStrategy]:
-    """Return the configured CP strategy for runtime dispatch."""
-    return _get_cp_strategy()
-
-
 def get_cp_strategy_kind() -> ContextParallelStrategyKind:
-    strategy = _get_cp_strategy()
+    strategy = get_cp_strategy()
     if strategy is None:
         return ContextParallelStrategyKind.NONE
     return strategy.kind
 
 
 def is_cp_enabled() -> bool:
-    return _get_cp_strategy() is not None
+    return get_cp_strategy() is not None
 
 
 def is_zigzag() -> bool:

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -79,6 +79,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -374,7 +375,7 @@ class Fp8LinearMethod(LinearMethodBase):
         output_partition_sizes: List[int],
         skip_block_quant_check: bool = False,
     ):
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         block_n, block_k = (
             self.quant_config.weight_block_size[0],
             self.quant_config.weight_block_size[1],
@@ -586,13 +587,29 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+        backend = get_fp8_gemm_runner_backend()
+        if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
             scale_u8 = layer.weight_scale_inv.data
             n, k = weight.shape
             epilogue_tile_m = 128
+            sf_cols = k // 32
+
+            scale_u8 = scale_u8.contiguous().view(torch.uint8).reshape(n, sf_cols)
+            padded_n = ((n + epilogue_tile_m - 1) // epilogue_tile_m) * (
+                epilogue_tile_m
+            )
+            pad_rows = padded_n - n
+
+            if pad_rows:
+                scale_u8 = F.pad(
+                    scale_u8,
+                    (0, 0, 0, pad_rows),
+                    mode="constant",
+                    value=0,
+                )
 
             copy_or_rebind_param(
                 layer,
@@ -603,16 +620,16 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             copy_or_rebind_param(
                 layer,
-                "weight_scale_inv",
+                "weight_scale_inv_shuffled",
                 shuffle_matrix_sf_a(
-                    scale_u8.contiguous().view(torch.uint8).reshape(n, k // 32),
+                    scale_u8,
                     epilogue_tile_m,
                     num_elts_per_sf=32,
                 )
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -775,8 +792,11 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+            backend = get_fp8_gemm_runner_backend()
+            if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
+            elif backend.is_flashinfer_trtllm():
+                weight_scale = layer.weight_scale_inv_shuffled
             else:
                 weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
@@ -899,7 +919,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,

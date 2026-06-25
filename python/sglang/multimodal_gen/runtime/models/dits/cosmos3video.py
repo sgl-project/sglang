@@ -18,6 +18,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoC
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
+    get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
@@ -337,6 +338,19 @@ class Cosmos3CausalAttention(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.tp_size = get_tp_world_size()
+        if num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                "Cosmos3CausalAttention requires num_attention_heads divisible "
+                f"by tp_size, got {num_attention_heads=} {self.tp_size=}."
+            )
+        if num_key_value_heads % self.tp_size != 0:
+            raise ValueError(
+                "Cosmos3CausalAttention requires num_key_value_heads divisible "
+                f"by tp_size, got {num_key_value_heads=} {self.tp_size=}."
+            )
+        self.local_num_attention_heads = num_attention_heads // self.tp_size
+        self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
         self.q_size = num_attention_heads * head_dim
         self.kv_size = num_key_value_heads * head_dim
@@ -344,16 +358,15 @@ class Cosmos3CausalAttention(nn.Module):
             hidden_size,
             [self.q_size, self.kv_size, self.kv_size],
             bias=False,
-            gather_output=True,
+            gather_output=False,
             quant_config=quant_config,
             prefix=add_prefix("to_qkv", prefix),
         )
-        # Output projection - ReplicatedLinear for quantization support
-        # Input is not parallel (gather_output=True on QKV)
-        self.to_out = ReplicatedLinear(
+        self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
             hidden_size,
             bias=False,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=add_prefix("to_out", prefix),
         )
@@ -371,7 +384,7 @@ class Cosmos3CausalAttention(nn.Module):
         """Forward with KV cache return.
 
         Returns:
-            (output, K, V) where K/V are post-norm, post-RoPE
+            (output, K, V) where K/V are TP-local, post-norm, post-RoPE
         """
         batch_size, seq_len = hidden_states.shape[:2]
 
@@ -379,18 +392,23 @@ class Cosmos3CausalAttention(nn.Module):
         qkv = qkv.view(
             batch_size,
             seq_len,
-            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.local_num_attention_heads + 2 * self.local_num_key_value_heads,
             self.head_dim,
         )
-        q = qkv[:, :, : self.num_attention_heads, :]
+        q = qkv[:, :, : self.local_num_attention_heads, :]
         k = qkv[
             :,
             :,
-            self.num_attention_heads : self.num_attention_heads
-            + self.num_key_value_heads,
+            self.local_num_attention_heads : self.local_num_attention_heads
+            + self.local_num_key_value_heads,
             :,
         ]
-        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
+        v = qkv[
+            :,
+            :,
+            self.local_num_attention_heads + self.local_num_key_value_heads :,
+            :,
+        ]
 
         q = F.rms_norm(
             q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
@@ -436,6 +454,19 @@ class Cosmos3CrossAttention(nn.Module):
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.tp_size = get_tp_world_size()
+        if num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                "Cosmos3CrossAttention requires num_attention_heads divisible "
+                f"by tp_size, got {num_attention_heads=} {self.tp_size=}."
+            )
+        if num_key_value_heads % self.tp_size != 0:
+            raise ValueError(
+                "Cosmos3CrossAttention requires num_key_value_heads divisible "
+                f"by tp_size, got {num_key_value_heads=} {self.tp_size=}."
+            )
+        self.local_num_attention_heads = num_attention_heads // self.tp_size
+        self.local_num_key_value_heads = num_key_value_heads // self.tp_size
 
         self.q_size = num_attention_heads * head_dim
         self.kv_size = num_key_value_heads * head_dim
@@ -443,14 +474,15 @@ class Cosmos3CrossAttention(nn.Module):
             hidden_size,
             [self.q_size, self.kv_size, self.kv_size],
             bias=False,
-            gather_output=True,
+            gather_output=False,
             quant_config=quant_config,
             prefix=add_prefix("to_qkv", prefix),
         )
-        self.to_out = ReplicatedLinear(
+        self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
             hidden_size,
             bias=False,
+            input_is_parallel=True,
             quant_config=quant_config,
             prefix=add_prefix("to_out", prefix),
         )
@@ -459,9 +491,9 @@ class Cosmos3CrossAttention(nn.Module):
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
 
         self.attn = USPAttention(
-            num_heads=num_attention_heads,
+            num_heads=self.local_num_attention_heads,
             head_size=head_dim,
-            num_kv_heads=num_key_value_heads,
+            num_kv_heads=self.local_num_key_value_heads,
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("attn", prefix),
@@ -480,8 +512,8 @@ class Cosmos3CrossAttention(nn.Module):
 
         Args:
             hidden_states: [B, S_gen_local, hidden_size] visual tokens (may be sharded)
-            k_und: [B, S_und, H_kv, D] pre-computed UND keys (always full/replicated)
-            v_und: [B, S_und, H_kv, D] pre-computed UND values (always full/replicated)
+            k_und: [B, S_und, H_kv_local, D] UND keys (replicated over SP)
+            v_und: [B, S_und, H_kv_local, D] UND values (replicated over SP)
             cos_sin_cache: [B*S_gen_local, D] local rows of [cos, sin]
             rope_cache_positions: identity row positions into cos_sin_cache
         """
@@ -491,18 +523,23 @@ class Cosmos3CrossAttention(nn.Module):
         qkv = qkv.view(
             batch_size,
             seq_len_gen,
-            self.num_attention_heads + 2 * self.num_key_value_heads,
+            self.local_num_attention_heads + 2 * self.local_num_key_value_heads,
             self.head_dim,
         )
-        q = qkv[:, :, : self.num_attention_heads, :]
+        q = qkv[:, :, : self.local_num_attention_heads, :]
         k = qkv[
             :,
             :,
-            self.num_attention_heads : self.num_attention_heads
-            + self.num_key_value_heads,
+            self.local_num_attention_heads : self.local_num_attention_heads
+            + self.local_num_key_value_heads,
             :,
         ]
-        v = qkv[:, :, self.num_attention_heads + self.num_key_value_heads :, :]
+        v = qkv[
+            :,
+            :,
+            self.local_num_attention_heads + self.local_num_key_value_heads :,
+            :,
+        ]
 
         if use_fused_qk_norm_rope:
             q, k = _apply_qwen3_qk_norm_rope(
@@ -519,7 +556,7 @@ class Cosmos3CrossAttention(nn.Module):
                 q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
             )
 
-        # K/V = [text (replicated full on every SP rank) | image (sharded same as Q)].
+        # K/V = [text (replicated on every SP rank) | image (sharded same as Q)].
         # USPAttention routes through the registered attention backend (FA, sage,
         # …) and handles the Ulysses all-to-all when SP > 1.
         out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
@@ -1179,7 +1216,8 @@ class Cosmos3OmniTransformer(CachableDiT):
         # pick max as the fused scale, requant each shard against the max,
         # then concat the requantized FP8 bytes. input_scale is shared across
         # shards (same activation tensor), so just take max — no requant
-        # needed.
+        # needed. The emitted fused tensors keep the full Q/K/V layout; the
+        # column-parallel loader slices each logical shard for the local TP rank.
         mapping_fn = get_param_names_mapping(self.param_names_mapping)
         pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
         expected_count: dict[str, int] = {}

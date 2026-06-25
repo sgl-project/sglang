@@ -11,6 +11,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    sock_recv,
 )
 
 _WORK_REQ_TYPES = (
@@ -64,7 +65,7 @@ class ScriptedTokenizerRecvProxy:
     def _drain_underlying(self) -> None:
         while True:
             try:
-                req = self._underlying.recv_pyobj(zmq.NOBLOCK)
+                req = sock_recv(self._underlying, zmq.NOBLOCK)
             except zmq.ZMQError:
                 break
             if isinstance(req, _WORK_REQ_TYPES):
