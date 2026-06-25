@@ -7,8 +7,7 @@ from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     _BaseLTX2Pipeline,
     prepare_ltx2_mu,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    LTX2AVLatentPreparationStage,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     LTX2ImageEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo import (
@@ -18,6 +17,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.j
     JoyEchoMultishotSetupStage,
     JoyEchoSigmaPreparationStage,
     PairedAudioVideoMemoryBank,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2 import (
+    LTX2AVLatentPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 

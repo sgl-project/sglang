@@ -21,7 +21,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
