@@ -71,6 +71,37 @@ def _load_minimax_sparse_backend_module():
     return module
 
 
+def _load_npu_triton_prefill_module():
+    _install_fake_modules()
+    for name in (
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton",
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode",
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode",
+    ):
+        sys.modules.setdefault(name, types.ModuleType(name))
+
+    flash_decode = sys.modules[
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode"
+    ]
+    flash_decode.flash_decode_bnsd_with_topk_idx = lambda *args, **kwargs: None
+    topk_decode = sys.modules[
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode"
+    ]
+    topk_decode.flash_decode_bnsd_with_gqa_share_sparse = lambda *args, **kwargs: None
+
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_minimax_sparse_npu_prefill_under_test", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_npu_sparse_block_selection_masks_future_blocks_and_dedups_local():
     module = _load_minimax_sparse_backend_module()
     backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
@@ -201,6 +232,41 @@ def test_npu_triton_prefill_appends_forced_blocks_after_pure_topk():
     assert "_merge_prefill_sparse_blocks(" in source
     assert "init_blocks=0" in source
     assert "local_blocks=0" in source
+
+
+def test_npu_triton_prefill_merge_matches_decode_local_only_semantics():
+    module = _load_npu_triton_prefill_module()
+    topk_idx = torch.tensor(
+        [
+            [
+                [2, 0],
+                [0, 1],
+                [1, -1],
+            ]
+        ],
+        dtype=torch.int32,
+    )
+    query_seq_lens = torch.tensor([1, 3, 5], dtype=torch.int32)
+
+    merged = module._merge_prefill_sparse_blocks(
+        topk_idx,
+        query_seq_lens,
+        block_size=2,
+        init_blocks=0,
+        local_blocks=1,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [-1, 0, -1],
+                [0, 1, -1],
+                [1, -1, 2],
+            ]
+        ],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(merged, expected)
 
 
 def test_minimax_sparse_triton_allocator_calls_are_guarded():

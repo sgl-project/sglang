@@ -785,7 +785,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             meta.prefix_lens if meta.prefix_lens is not None else prefix_lens
         )
 
-        return minimax_sparse_prefill_npu_triton(
+        idx_o, o = minimax_sparse_prefill_npu_triton(
             q,
             self._cache_as_slots(k_cache),
             self._cache_as_slots(v_cache),
@@ -814,6 +814,57 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             seqlens_cpu=meta.extend_seq_lens_cpu,
             page_size=self.page_size,
         )
+        import os as _os_dbg
+
+        if _os_dbg.environ.get("MINIMAX_NPU_TRITON_PREFILL_DEBUG_DIFF"):
+            if not hasattr(self, "_dbg_prefill_diff_count"):
+                self._dbg_prefill_diff_count = 0
+            if self._dbg_prefill_diff_count < 3:
+                self._dbg_prefill_diff_count += 1
+                try:
+                    _idx_o_ref, _o_ref = self._forward_npu_sparse_prefill(
+                        q,
+                        k_cache,
+                        v_cache,
+                        idx_q,
+                        idx_k_cache,
+                        idx_v_cache,
+                        forward_batch,
+                        cu_seqlens,
+                        seq_lens,
+                        prefix_lens,
+                    )
+                    _d = (o.float() - _o_ref.float()).abs().max().item()
+                    _r = _d / max(_o_ref.float().abs().max().item(), 1e-6)
+                    _msg = (
+                        "[MiniMax/NPU triton-prefill-vs-pytorch] call #%d: "
+                        "main max_abs_diff=%.6f rel=%.5f (q=%s)"
+                    )
+                    logger.warning(
+                        _msg,
+                        self._dbg_prefill_diff_count,
+                        _d,
+                        _r,
+                        tuple(q.shape),
+                    )
+                    if idx_o is not None and _idx_o_ref is not None:
+                        _idx_d = (idx_o.float() - _idx_o_ref.float()).abs().max().item()
+                        _idx_r = _idx_d / max(
+                            _idx_o_ref.float().abs().max().item(), 1e-6
+                        )
+                        logger.warning(
+                            "[MiniMax/NPU triton-prefill-vs-pytorch] call #%d: "
+                            "index max_abs_diff=%.6f rel=%.5f",
+                            self._dbg_prefill_diff_count,
+                            _idx_d,
+                            _idx_r,
+                        )
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning(
+                        "[MiniMax/NPU triton-prefill-vs-pytorch] reference compute failed: %s",
+                        _e,
+                    )
+        return idx_o, o
 
     def _forward_npu_sparse_decode(
         self,
