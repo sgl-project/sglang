@@ -1154,6 +1154,18 @@ class Req(ReqDllmMixin):
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
+        # unified_kv compress-only HiCache keeps SWA in a per-request ring that
+        # is not content-stable and never offloaded to host, so a reused /
+        # loaded-back prefix carries stale SWA for its trailing sliding window.
+        # Cap the match so that window stays in the extend segment and is
+        # re-prefilled (repopulating this request's SWA ring), matching
+        # non-HiCache radix reuse. No-op (returns 0) for every other layout.
+        if tree_cache is not None:
+            holdback = tree_cache.swa_ring_holdback_tokens()
+            if holdback:
+                capped = max(0, input_len - holdback)
+                key_limit = capped if key_limit is None else min(key_limit, capped)
+
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:

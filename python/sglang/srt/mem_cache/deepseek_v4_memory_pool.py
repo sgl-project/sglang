@@ -625,6 +625,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self._init_paged_compress_states(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
+        # Under HiCache the compressed region of this buffer is filled by a
+        # per-layer H->D load; block until that layer's transfer lands before
+        # attention reads it. No-op when HiCache is off (counter is None).
+        self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
@@ -711,6 +715,62 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             data_lens.append(swa_pages * row_bytes)
             item_lens.append(row_bytes)
         return data_ptrs, data_lens, item_lens
+
+    def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
+        """Per-layer page-row ``uint8`` views into the compressed region
+        ``[swa_pages:]`` of the unified_kv buffer for ``ratio`` (4 or 128), plus
+        the per-page item size in bytes.
+
+        The unified buffer is ``[swa_pages + compress_rows, head_dim]`` bf16, where
+        each row is a single compressed slot. ``DeepSeekV4PagedHostPool`` transfers
+        at *page* granularity (one indexed row == one whole page), so we must hand
+        it a per-layer tensor whose row is a full page, not a single slot.
+
+        A model page (``page_size`` full tokens) compresses to
+        ``rows_per_page = page_size // ratio`` consecutive slots, and page ``p``
+        occupies rows ``[p*rows_per_page : (p+1)*rows_per_page]`` (since the store
+        location is ``loc // ratio``). We therefore:
+          1. ``narrow`` past the SWA ring (shares storage; the view's data_ptr is
+             already ``base + swa_pages * row_bytes``);
+          2. ``reshape`` to ``[num_pages, rows_per_page * head_dim]`` so one row is
+             one page;
+          3. ``view(uint8)`` to match the host pool's byte dtype and the legacy
+             standalone c4/c128 transfer contract.
+
+        The resulting per-page byte size matches the unified branch of
+        :meth:`get_contiguous_buf_infos` (``rows_per_page * row_bytes``), so the
+        page index ``loc // page_size`` and the existing paged-row transfer
+        kernels work with no device-index remap.
+        """
+        assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
+        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+
+        swa_pages = self.unified_kv_pool.swa_pages
+        head_dim = self.unified_kv_pool.head_dim
+        rows_per_page = self.page_size // ratio
+        stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
+        local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
+
+        views: List[torch.Tensor] = []
+        for local_layer_id in local_layer_ids:
+            buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+            compress_rows = buf.shape[0] - swa_pages
+            assert compress_rows % rows_per_page == 0, (
+                f"compressed rows {compress_rows} not a multiple of "
+                f"rows_per_page {rows_per_page} for ratio {ratio}"
+            )
+            num_pages = compress_rows // rows_per_page
+            page_view = (
+                buf.narrow(0, swa_pages, compress_rows)
+                .reshape(num_pages, rows_per_page * head_dim)
+                .view(torch.uint8)
+            )
+            views.append(page_view)
+
+        item_bytes = (
+            rows_per_page * head_dim * self.unified_kv_pool.kv_buffer[0].element_size()
+        )
+        return views, item_bytes
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

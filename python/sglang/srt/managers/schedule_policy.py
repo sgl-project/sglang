@@ -93,9 +93,20 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    # unified_kv compress-only HiCache keeps SWA in a per-request ring that is
+    # not content-stable and never offloaded to host, so a reused/loaded-back
+    # prefix would read stale SWA for its trailing sliding window. Exclude that
+    # window from the match key so it lands in the extend segment and is
+    # re-prefilled (regenerating this request's SWA ring), matching non-HiCache
+    # radix reuse. Returns 0 (no trim) for every other cache layout.
+    holdback = tree_cache.swa_ring_holdback_tokens()
+    match_token_ids = token_ids
+    if holdback and len(token_ids) > holdback:
+        match_token_ids = token_ids[: len(token_ids) - holdback]
+
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            key=RadixKey(token_ids=match_token_ids, extra_key=req.extra_key),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
         )
