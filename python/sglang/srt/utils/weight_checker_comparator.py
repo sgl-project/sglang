@@ -127,17 +127,21 @@ def compare_weights(
     sum_abs_err = 0.0
     num_exceed = 0
     numel = 0
-    for (e_dq, e_tol), (a_dq, a_tol) in zip(
+    for (expect_dq, expect_tol), (actual_dq, actual_tol) in zip(
         expect.iter_chunks(), actual.iter_chunks(), strict=True
     ):
-        assert e_dq.shape == a_dq.shape, f"{e_dq.shape=} {a_dq.shape=}"
-        numel += e_dq.numel()
-        abs_diff = (a_dq.float() - e_dq.float()).abs()
+        assert (
+            expect_dq.shape == actual_dq.shape
+        ), f"{expect_dq.shape=} {actual_dq.shape=}"
+        numel += expect_dq.numel()
+        abs_diff = (actual_dq.float() - expect_dq.float()).abs()
         if torch.all(abs_diff == 0):
             continue
         equal = False
-        # |a_dq - e_dq| ≤ |a_dq - w| + |e_dq - w| ≤ a_tol + e_tol
-        tol = 0.0 if e_tol is None or a_tol is None else e_tol + a_tol
+        # |actual_dq - expect_dq| ≤ |actual_dq - w| + |expect_dq - w| ≤ actual_tol + expect_tol
+        tol = (
+            0.0 if expect_tol is None or actual_tol is None else expect_tol + actual_tol
+        )
         max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
         sum_abs_err += abs_diff.sum().item()
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.

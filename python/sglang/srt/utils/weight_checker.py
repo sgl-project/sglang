@@ -120,11 +120,11 @@ class WeightChecker:
         # Hash the dequantized weight so two (qweight, scale) pairs with the same
         # bf16 hash equal.
         checksums = {}
-        for name, should_compare, ref in _build_entries(
+        for name, should_compare, comparable in _build_entries(
             dict(self._model_state()), skip_compare_names, quantized_set
         ):
             if should_compare:
-                checksums[name] = _hash_tensor(ref.dequantize().data)
+                checksums[name] = _hash_tensor(comparable.dequantize().data)
 
         h = hashlib.sha256()
         for name in sorted(checksums):
@@ -182,10 +182,10 @@ def _check_tensors(
     error_messages = []
     info_messages = []
 
-    for (expect_name, should_compare, expect_ref), (
+    for (expect_name, should_compare, expect_comparable), (
         actual_name,
         actual_should_compare,
-        actual_ref,
+        actual_comparable,
     ) in zip(expect_tensors, actual_tensors, strict=True):
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
@@ -195,11 +195,11 @@ def _check_tensors(
 
         try:
             equal, max_abs_err, mean_abs_err, num_exceed = compare_weights(
-                expect_ref, actual_ref
+                expect_comparable, actual_comparable
             )
         except Exception as e:
             e.add_note(
-                f"when handling {name=} expect={expect_ref!r} actual={actual_ref!r}"
+                f"when handling {name=} expect={expect_comparable!r} actual={actual_comparable!r}"
             )
             raise
         if equal:
@@ -210,7 +210,7 @@ def _check_tensors(
             f"max_abs_err={max_abs_err} "
             f"mean_abs_err={mean_abs_err} "
             f"num_exceed={num_exceed} "
-            f"expect={expect_ref!r} actual={actual_ref!r} "
+            f"expect={expect_comparable!r} actual={actual_comparable!r} "
         )
         if not should_compare:
             info_messages.append(msg)
