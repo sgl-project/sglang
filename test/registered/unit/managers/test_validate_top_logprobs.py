@@ -31,6 +31,12 @@ class TestValidateTopLogprobsNum(unittest.TestCase):
             with self.subTest(top_logprobs_num=ok):
                 _validate(ok)
 
+    def test_non_integer_raises(self):
+        for bad in (False, True, 0.0, [], ""):
+            with self.subTest(top_logprobs_num=bad):
+                with self.assertRaises(ValueError):
+                    _validate(bad)
+
     def test_out_of_range_raises(self):
         for bad in (VOCAB_SIZE + 1, 100000, -1):
             with self.subTest(top_logprobs_num=bad):

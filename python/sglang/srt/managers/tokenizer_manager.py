@@ -1097,9 +1097,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # upstream, like _validate_token_ids_logprob). It feeds logprobs.topk(k),
         # which raises when k > vocab_size; reject that at the boundary instead.
         top_logprobs_num = obj.top_logprobs_num
-        if not top_logprobs_num:
+        if top_logprobs_num is None:
             return
-        if not isinstance(top_logprobs_num, int):
+        if isinstance(top_logprobs_num, bool) or not isinstance(top_logprobs_num, int):
             raise ValueError("top_logprobs_num must be an integer.")
         vocab_size = self.model_config.vocab_size
         if top_logprobs_num < 0 or top_logprobs_num > vocab_size:
