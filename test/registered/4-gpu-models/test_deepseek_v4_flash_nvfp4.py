@@ -48,6 +48,7 @@ class TestDeepseekV4FlashNvfp4(unittest.TestCase):
             ModelLaunchSettings(
                 DEEPSEEK_V4_FLASH_NVFP4_MODEL_PATH,
                 extra_args=BASE_ARGS + DP_ARGS,
+                env={"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096"},
                 variant="DEP4",
             ),
         ]
