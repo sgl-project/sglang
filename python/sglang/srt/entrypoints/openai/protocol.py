@@ -1664,7 +1664,15 @@ class ResponsesResponse(BaseModel):
                 if request.parallel_tool_calls is not None
                 else True
             ),
-            tool_choice=request.tool_choice,
+            # Echo tool_choice as a string. The object form
+            # (forced function) is semantically "required"; echoing the
+            # raw ToolChoice object breaks the OpenAI SDK's response event
+            # types, whose tool_choice union differs from the request union.
+            tool_choice=(
+                "required"
+                if isinstance(request.tool_choice, ToolChoice)
+                else request.tool_choice
+            ),
             tools=request.tools,
             # fields for parity with v1/responses
             error=None,
