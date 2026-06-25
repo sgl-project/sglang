@@ -4,7 +4,8 @@ Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
 clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks,
 `spec_verify_ct`, and the `maybe_evict_swa()` call) must only be advanced by
 the reviewed owner sites in _OWNER_SITES; spec-v2 draft workers must not
-repeat any of them (the scheduler-driven mixin / resolve path already does).
+repeat any of them (the scheduler-driven free function / resolve path already
+does).
 A clock that runs fast fires SWA eviction in the overlap race window and
 releases the SWA prefix lock early; neither shows up in e2e CI or the idle
 leak checker, hence this AST-level guard.
@@ -39,7 +40,7 @@ _EVICT_METHOD = "maybe_evict_swa"
 # attribute (`= 0` resets exempt) or "evict" for a `maybe_evict_swa()` call.
 # Any added/removed/recounted site fails until reviewed here.
 _SB = "managers/schedule_batch.py"
-_MIXIN = ("speculative/eagle_info_v2.py", "EagleDraftInputV2Mixin.prepare_for_decode")
+_EAGLE_DECODE = ("speculative/eagle_utils.py", "eagle_prepare_for_decode")
 _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
@@ -59,8 +60,8 @@ _OWNER_SITES = {
     ("mem_cache/owned_kv.py", "alloc_for_decode", "kv_allocated_len"): 1,
     ("mem_cache/owned_kv.py", "alloc_for_spec_decode", "kv_allocated_len"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
-    (*_MIXIN, "decode_batch_idx"): 1,
-    (*_MIXIN, "evict"): 1,
+    (*_EAGLE_DECODE, "decode_batch_idx"): 1,
+    (*_EAGLE_DECODE, "evict"): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
     # disaggregation decode prealloc
@@ -221,7 +222,7 @@ class TestDecodeBookkeepingOwnership(CustomTestCase):
             + "\n  ".join(map(str, sorted(violations)))
             + "\nUnder spec v2 the iter-clock ticks, `maybe_evict_swa`, and "
             "KV watermark settlement are owned by the scheduler-driven "
-            "mixin / resolve path. Remove these from the worker.",
+            "free function / resolve path. Remove these from the worker.",
         )
 
 
