@@ -951,7 +951,7 @@ def _load_image(
         # Force decode so corrupt/truncated bytes fail here as a client error
         image.load()
         return image
-    except (OSError, SyntaxError, Image.UnidentifiedImageError) as e:
+    except (OSError, SyntaxError) as e:
         raise ValueError(f"Failed to load image: {e}") from e
 
 
