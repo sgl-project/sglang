@@ -1384,11 +1384,7 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    # OpenAI structured outputs: ``text.format`` selects text / json_object /
-    # json_schema. Mapped to SGLang constrained decoding in to_sampling_params.
     text: Optional[ResponseTextConfig] = None
-    # Accept the object form too, e.g. {"type": "function", "name": "..."};
-    # converted to the chat shape in OpenAIServingResponses._make_request.
     tool_choice: Union[Literal["auto", "required", "none"], Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
@@ -1397,8 +1393,6 @@ class ResponsesRequest(BaseModel):
     user: Optional[str] = None
 
     # Extra SGLang parameters
-    # Forwarded to the chat template (e.g. {"enable_thinking": false}); also
-    # auto-derived from reasoning.effort == "none". Not used on the harmony path.
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
@@ -1462,10 +1456,8 @@ class ResponsesRequest(BaseModel):
         )
         json_output = fmt_type in ("json_schema", "json_object")
 
-        # A forced tool call (tool_choice "required" or a named-function object)
-        # constrains the whole generation to a tool-call grammar, which — like
-        # json output — can't interleave free-form reasoning; otherwise the
-        # forced output is captured as reasoning_content and no tool call lands.
+        # a forced tool call constrains generation to a tool grammar; like json
+        # output it can't interleave reasoning, so thinking has to be off here too.
         tc = values.get("tool_choice")
         forced_tool = tc == "required" or (
             isinstance(tc, dict) and tc.get("type") == "function"
@@ -1474,9 +1466,7 @@ class ResponsesRequest(BaseModel):
         if effort == "none" or json_output or forced_tool:
             existing = values.get("chat_template_kwargs")
             existing = existing if isinstance(existing, dict) else {}
-            # Build a NEW dict rather than mutating the caller's object in
-            # place; spreading ``existing`` last lets an explicit caller value
-            # win over the disabled defaults.
+            # spread existing last so an explicit caller value wins over the default.
             values["chat_template_kwargs"] = {
                 "thinking": False,
                 "enable_thinking": False,
@@ -1505,11 +1495,9 @@ class ResponsesRequest(BaseModel):
         if not isinstance(item, dict):
             return item
 
-        # A message item carrying inline content plus a string id (as in a
-        # response.output item replayed into input for stateless multi-turn)
-        # would otherwise be coerced to an item-reference and lose its content,
-        # then fail chat validation as an empty {}. Drop the id so it validates
-        # as a plain message; input-item ids are not resolved server-side.
+        # an output item replayed into input carries a string id; without this it'd
+        # be read as an item-reference, drop its content, and fail as an empty {}.
+        # input-item ids aren't resolved server-side, so just drop it.
         if isinstance(item.get("id"), str) and item.get("content") is not None:
             item = {k: v for k, v in item.items() if k != "id"}
 
@@ -1755,8 +1743,7 @@ class ResponsesResponse(BaseModel):
             return True
 
         if request.text is not None:
-            # Echo the requested structured-output format back to the caller.
-            # by_alias keeps the OpenAI wire key "schema" (not the py attr schema_).
+            # by_alias keeps the wire key "schema" rather than the attr schema_.
             text_format = request.text.model_dump(by_alias=True, exclude_none=True)
         else:
             text_format = (
@@ -1786,9 +1773,8 @@ class ResponsesResponse(BaseModel):
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
-                # OpenAI's Response.reasoning.effort literal has no "none"
-                # (our request-side extension), and the typed streaming event
-                # wrappers validate against it — echo None instead of "none".
+                # "none" is our request-side extension; OpenAI's effort literal
+                # lacks it and the typed stream events reject it, so echo None.
                 "effort": (
                     request.reasoning.effort
                     if request.reasoning and request.reasoning.effort != "none"

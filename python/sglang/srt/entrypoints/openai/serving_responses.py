@@ -251,7 +251,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 'type="function"; other built-in tool types cannot be forced.'
             )
 
-        # gpt-oss/harmony emits raw token output; per-token logprobs aren't wired.
+        # harmony emits raw tokens; per-token logprobs aren't wired there.
         if self.use_harmony and request.is_include_output_logprobs():
             return self.create_error_response(
                 "logprobs are not supported with gpt-oss models", param="logprobs"
@@ -367,10 +367,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         ),
                     )
 
-                    # Honor the skip_special_tokens decision _process_messages
-                    # made (gpt-oss / gemma4 / tools): the chat_request it set it
-                    # on is discarded, so re-apply it to the engine sampling dict.
-                    # Harmony has no processed_messages and keeps the default.
+                    # _process_messages set skip_special_tokens on a chat_request
+                    # we then discard, so re-apply it to the engine sampling dict.
                     if processed_messages is not None and (
                         not processed_messages.skip_special_tokens
                     ):
@@ -430,8 +428,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         stream=request.stream,
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
-                        # background+stream streams on the initial connection
-                        # (handled below), so don't detach the engine request.
+                        # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                     )
 
@@ -455,9 +452,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             if request.store:
                 self.msg_store[request.request_id] = messages
 
-            # background+stream streams events on the initial connection (the
-            # stream path below also stores the result for later GET); only the
-            # non-streaming background case returns immediately as "queued".
+            # only non-streaming background returns "queued" here; the stream path
+            # below handles background+stream itself.
             if request.background and not request.stream:
                 created_time = int(time.time())
                 response = ResponsesResponse.from_request(
@@ -558,9 +554,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
-        # _process_messages owns the skip_special_tokens decision (gpt-oss /
-        # gemma4 / tools present); carry it so create_responses can apply the
-        # same value the chat path uses instead of re-deriving a subset of it.
+        # carry the chat path's skip_special_tokens so create_responses reuses it.
         processed_messages.skip_special_tokens = chat_request.skip_special_tokens
 
         if is_multimodal:
@@ -644,7 +638,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 output_logprobs=output_logprobs,
             )
 
-            # Calculate usage from actual output
             if meta_info is not None:
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
@@ -735,8 +728,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         """Whether to start the reasoning detector in thinking mode."""
         if not self.reasoning_parser:
             return False
-        # An explicit chat_template_kwargs thinking toggle wins (keys differ by
-        # family: enable_thinking for qwen3/glm, thinking for deepseek/kimi).
+        # an explicit toggle wins; the key differs by family (enable_thinking vs thinking).
         ctk = request.chat_template_kwargs or {}
         thinking_toggles = (ctk.get("enable_thinking"), ctk.get("thinking"))
         if any(toggle is False for toggle in thinking_toggles):
@@ -883,8 +875,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 text=content,
                 annotations=[],  # TODO
                 type="output_text",
-                # Logprobs cover all generated tokens (matching vLLM); they are
-                # not re-sliced to the reasoning/tool-stripped content.
+                # logprobs cover all generated tokens, not just the stripped content.
                 logprobs=output_logprobs,
             )
             message = ResponseOutputMessage(
@@ -1386,9 +1377,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             prev_status = response.status
             if prev_status not in ("queued", "in_progress"):
-                # Idempotent: a response already in a terminal state
-                # (cancelled / completed / failed) can't be cancelled again;
-                # return it as-is rather than erroring (e.g. a second cancel).
+                # already terminal; a second cancel is a no-op, return as-is.
                 return response
 
             # Update the status to "cancelled"
@@ -2247,10 +2236,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 else:
                     normal_text, tool_calls = delta, []
 
-                # Drain tool-call deltas before normal_text: the detector returns
-                # (normal_text, calls) as a flat pair, so on a tool-call boundary
-                # the closing "}" lands in calls while the separator "\n" lands in
-                # normal_text — handling text first truncates the tool's arguments.
+                # drain tool calls before normal_text: on a tool boundary the closing
+                # "}" lands in calls and the separator in text, so text-first truncates args.
                 if tool_calls:
                     if reasoning_state["open"]:
                         for ev in _close_reasoning_item():
@@ -2309,11 +2296,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
 
-                # Whitespace-only normal_text while a tool call is still open is
-                # an inter-call separator (e.g. the ``\n`` between qwen3-coder
-                # tool blocks), not user-visible content. The leading
-                # ``normal_text and`` keeps the tool-state scan lazy on the
-                # common empty-delta chunks.
+                # whitespace-only text while a tool call is open is a separator
+                # between tool blocks, not content. (the `normal_text and` short-
+                # circuits the tool-state scan on the common empty deltas.)
                 if normal_text and _should_emit_normal_text_as_message(
                     normal_text,
                     any_tool_call_in_progress=any(

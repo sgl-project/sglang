@@ -49,8 +49,8 @@ REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
     "medium": ReasoningEffort.MEDIUM,
     "low": ReasoningEffort.LOW,
-    # harmony has no minimal/none mode: map minimal->low; "none" falls through
-    # to the harmony default via .get() below (CoT can't be turned off).
+    # harmony has no minimal; map it to low. "none" isn't here, so .get() below
+    # lets it fall through to the harmony default.
     "minimal": ReasoningEffort.LOW,
 }
 
@@ -77,8 +77,7 @@ def get_system_message(
     if model_identity is not None:
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
     if reasoning_effort is not None:
-        # ``.get()`` so unsupported values ("none") degrade to the harmony
-        # default instead of raising KeyError.
+        # .get() so "none" falls back to the default instead of raising.
         effort = REASONING_EFFORT.get(reasoning_effort)
         if effort is not None:
             sys_msg_content = sys_msg_content.with_reasoning_effort(effort)
