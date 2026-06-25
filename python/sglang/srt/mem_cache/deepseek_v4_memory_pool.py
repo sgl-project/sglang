@@ -946,65 +946,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
-    def snapshot_c128_radix_state(
-        self, req_pool_idx: int, seq_len: int
-    ) -> Optional[List[torch.Tensor]]:
-        """Snapshot request-scoped C128 state for a radix cache node."""
-        if seq_len % 128 == 0:
-            return None
-
-        snapshots: List[torch.Tensor] = []
-        for pool in self.compress_state_pools:
-            if pool is None or pool.ratio != 128:
-                continue
-            state = pool.kv_score_buffer.kv_score
-            if ONLINE_C128:
-                snapshots.append(state[req_pool_idx : req_pool_idx + 1].clone())
-            else:
-                start = req_pool_idx * pool.ring_size
-                state_len = seq_len % 128
-                if state_len == 0:
-                    continue
-                snapshot = state.new_empty((pool.ring_size, state.shape[-1]))
-                half = snapshot.shape[-1] // 2
-                snapshot[:, :half].zero_()
-                snapshot[:, half:].fill_(float("-inf"))
-                positions = torch.arange(
-                    seq_len - state_len,
-                    seq_len,
-                    device=state.device,
-                    dtype=torch.long,
-                )
-                slots = positions % pool.ring_size
-                snapshot[slots] = state[start + slots]
-                snapshots.append(snapshot)
-        return snapshots or None
-
-    def restore_c128_radix_state(
-        self, req_pool_idx: int, snapshots: Optional[List[torch.Tensor]]
-    ) -> None:
-        """Restore radix-cached C128 state into the current request slot."""
-        if not snapshots:
-            return
-
-        snapshot_idx = 0
-        for pool in self.compress_state_pools:
-            if pool is None or pool.ratio != 128:
-                continue
-            snapshot = snapshots[snapshot_idx]
-            snapshot_idx += 1
-
-            state = pool.kv_score_buffer.kv_score
-            if ONLINE_C128:
-                state[req_pool_idx : req_pool_idx + 1].copy_(snapshot)
-            else:
-                start = req_pool_idx * pool.ring_size
-                state[start : start + pool.ring_size].copy_(snapshot)
-
-        assert snapshot_idx == len(snapshots)
-
     def clear_c128_radix_state(self, req_pool_idx: int) -> None:
-        """Reset request-scoped C128 state at a radix-restorable boundary."""
+        """Reset request-scoped C128 state at a C128 block boundary."""
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue
