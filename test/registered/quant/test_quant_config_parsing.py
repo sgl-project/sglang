@@ -1,7 +1,13 @@
 import unittest
 from unittest.mock import MagicMock
 
+import torch
+from compressed_tensors.quantization import QuantizationStrategy
+
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+    CompressedTensorsW8A8Int8,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,6 +77,28 @@ class TestQuantLogString(CustomTestCase):
         result = model_config.get_quantization_config_log_str()
         print(f"\n[Test No Quant] Result: {result}")
         self.assertIsNone(result)
+
+
+class TestW8A8Int8StaticInputScale(CustomTestCase):
+    def test_static_scales_have_one_slot_per_logical_shard(self):
+        # A fused layer (e.g. gate_up_proj) has one activation scale per logical
+        # shard in the checkpoint. Before the fix the static scales were one slot,
+        # so loading the second shard raised IndexError during model load.
+        scheme = CompressedTensorsW8A8Int8(
+            strategy=QuantizationStrategy.TENSOR,
+            is_static_input_scheme=True,
+            input_symmetric=False,
+        )
+        layer = torch.nn.Module()
+        scheme.create_weights(
+            layer,
+            output_partition_sizes=[4, 4],
+            input_size_per_partition=8,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+        self.assertEqual(layer.input_scale.shape, torch.Size([2]))
+        self.assertEqual(layer.input_zero_point.shape, torch.Size([2]))
 
 
 if __name__ == "__main__":
