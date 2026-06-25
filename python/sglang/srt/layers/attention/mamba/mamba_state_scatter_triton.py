@@ -217,13 +217,9 @@ def fused_mamba_state_scatter_with_mask(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
     if not dst.is_cuda or not src.is_cuda:
-        valid_mask = step_indices_raw >= 0
-        if valid_mask.any():
-            valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-            dst_indices = dst_indices_raw[valid_indices]
-            step_indices = step_indices_raw[valid_indices]
-            dst[:, dst_indices] = src[:, valid_indices, step_indices]
-        return
+        raise ValueError(
+            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
+        )
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
