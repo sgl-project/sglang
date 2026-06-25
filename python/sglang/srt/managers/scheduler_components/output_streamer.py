@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    CachedTokensDetails,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -55,7 +56,7 @@ class SchedulerOutputStreamer:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+    def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
@@ -157,7 +158,6 @@ class SchedulerOutputStreamer:
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
-            has_reqs=bool(reqs),
         )
         if payload is not None:
             self.send_to_detokenizer.send_output(payload)
@@ -246,7 +246,7 @@ class _GenerationStreamAccumulator:
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    get_cached_tokens_details: Callable[[Req], Optional[dict]]
+    get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
 
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -498,9 +498,9 @@ class _GenerationStreamAccumulator:
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
     def to_payload(
-        self, *, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
-        if not (has_reqs or is_idle_batch):
+        if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(

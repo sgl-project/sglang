@@ -109,15 +109,15 @@ class TestTopkPaddedRegion(CustomTestCase):
 
     def test_invalid_pad_count_tensor_raises(self):
         x = torch.rand((8, 8), device=self.DEVICE, dtype=torch.float32)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(TypeError):
             _fill_padded_rows(x, 4, 0.0)  # python int, not a tensor
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _fill_padded_rows(
                 x,
                 torch.tensor([1, 2], device=self.DEVICE, dtype=torch.int32),
                 0.0,
             )
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(TypeError):
             _fill_padded_rows(
                 x,
                 torch.tensor(4.0, device=self.DEVICE, dtype=torch.float32),
