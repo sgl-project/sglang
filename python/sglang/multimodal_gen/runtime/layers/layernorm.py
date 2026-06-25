@@ -745,11 +745,23 @@ class _NormScaleShift(CustomOp):
     def forward_npu(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+        hidden_size = x.shape[-1]
+        x_numel = x.numel()
 
-        normalized = self.norm(x)
-        modulated = fused_scale_shift(normalized, scale, shift)
-        return modulated.to(x.dtype)
+        if scale.numel() in (1, hidden_size) and shift.numel() in (
+            1,
+            hidden_size,
+            x_numel,
+        ):
+            from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+
+            normalized = self.norm(x)
+            modulated = fused_scale_shift(
+                normalized, scale.contiguous(), shift.contiguous()
+            )
+            return modulated.to(x.dtype)
+
+        return self.forward_native(x, shift, scale)
 
 
 class LayerNormScaleShift(_NormScaleShift):

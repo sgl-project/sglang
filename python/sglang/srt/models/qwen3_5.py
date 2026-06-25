@@ -105,6 +105,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
     make_layers,
     set_weight_attrs,
 )
@@ -116,6 +117,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
@@ -867,7 +869,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
-        elif _is_hip:
+        elif _is_hip or _is_xpu:
             q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
                 q,
                 k,
@@ -904,7 +906,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
-    def forward_prepare_hip(self, positions, hidden_states):
+    def forward_prepare_fused_gate(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -958,8 +960,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_hip and self.attn_output_gate:
-            q, k, v, gate = self.forward_prepare_hip(
+        if (_is_hip or _is_xpu) and self.attn_output_gate:
+            q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
             )
@@ -1632,8 +1634,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if self.pp_group.is_last_rank and head is not None:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1787,8 +1793,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if self.pp_group.is_last_rank and head is not None:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if _is_xpu:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
