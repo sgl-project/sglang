@@ -240,7 +240,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
                 hidden_states
             )
         scale_args: Dict[str, Any] = {
@@ -344,7 +344,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
                 hidden_states
             )
         scale_args: Dict[str, Any] = {
@@ -491,7 +491,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
         if pertoken_scale is None:
-            hidden_states, pertoken_scale = self.hidden_states_quantizer.forward(
+            hidden_states, pertoken_scale = self.hidden_states_quantizer.__call__(
                 hidden_states
             )
         scale_args: Dict[str, Any] = {
