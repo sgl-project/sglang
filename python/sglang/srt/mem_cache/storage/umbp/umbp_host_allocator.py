@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool_host import HostTensorAllocator
+from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
 
 logger = logging.getLogger(__name__)
 

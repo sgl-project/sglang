@@ -13,6 +13,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+# UMBP is an AMD/ROCm-only feature backed by mori. On machines without mori
+# (e.g. NVIDIA CI) skip the whole module so the umbp suite is all-or-nothing.
+pytest.importorskip("mori.umbp")
+
 
 class FakeBacking(Enum):
     Anonymous = 0
@@ -164,10 +168,8 @@ def test_get_allocator_from_storage_umbp_falls_back(monkeypatch, caplog):
     monkeypatch.delitem(sys.modules, "mori", raising=False)
     monkeypatch.delitem(sys.modules, "mori.umbp", raising=False)
 
-    from sglang.srt.mem_cache.memory_pool_host import (
-        HostTensorAllocator,
-        get_allocator_from_storage,
-    )
+    from sglang.srt.mem_cache.memory_pool_host import get_allocator_from_storage
+    from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
 
     allocator = get_allocator_from_storage("mori")
     assert type(allocator) is HostTensorAllocator

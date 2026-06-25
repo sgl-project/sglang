@@ -7,9 +7,15 @@ from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import MagicMock
 
+import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+# UMBPStore wraps mori's UMBP client (AMD/ROCm only). On machines without mori
+# (e.g. NVIDIA CI), skip the whole module instead of failing at import time.
+pytest.importorskip("mori.umbp")
 
 
 @dataclass
