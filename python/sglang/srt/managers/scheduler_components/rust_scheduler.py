@@ -62,10 +62,6 @@ class RustServer:
         # latency-critical launch thread.
         cores = cls._partition_cores()
 
-        # Tokenizer source: a local path, model dir, or HF Hub repo id. The Rust
-        # backend resolves a repo id to its cached local tokenizer.json itself.
-        tokenizer_path = server_args.tokenizer_path or server_args.model_path
-
         # Keep HF tokenizers (used by the Rust dynamo-tokenizers backend) off
         # rayon's unpinned global thread pool. The Rust pool parallelizes
         # tokenization *across* requests (one sequential encode per pinned core),
@@ -74,14 +70,14 @@ class RustServer:
         # pinning / NUMA isolation. setdefault so an explicit choice still wins.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+        # The bind address (host:port), tokenizer source/revision, and
+        # tokenizer/detok worker counts all live in the dumped `server_args`
+        # blob, so the Rust side resolves them itself (tokenizer_path falls back
+        # to model_path there). Only the Python-computed core partition — which
+        # isn't part of server_args — needs passing here.
         server = Server(
-            bind=f"{server_args.host}:{server_args.port}",
             pin_cores=cores is not None,
             cores=cores,
-            tokenizer_path=tokenizer_path,
-            tokenizer_revision=server_args.revision,
-            tokenizer_threads=server_args.tokenizer_worker_num,
-            detok_shards=server_args.detokenizer_worker_num,
             server_args_json=cls._build_server_args(scheduler),
         )
         logger.info(

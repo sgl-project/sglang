@@ -29,9 +29,9 @@ use crate::{api_server, detokenizer, tokenizer, tokenizer_manager};
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub bind: SocketAddr,
-    pub api_threads: usize,
-    pub tokenizer_threads: usize,
-    pub detok_shards: usize,
+    pub api_worker_num: usize,
+    pub tokenizer_worker_num: usize,
+    pub detokenizer_worker_num: usize,
     pub ingress_ring_cap: usize,
     pub egress_ring_cap: usize,
     pub channel_cap: usize,
@@ -46,55 +46,49 @@ pub struct RuntimeConfig {
     /// byte-stub tokenizer (tests / no real model).
     pub tokenizer_path: Option<String>,
     /// HF revision used only when `tokenizer_path` is a repo id. `None` → main.
-    pub tokenizer_revision: Option<String>,
+    pub revision: Option<String>,
     /// Static server metadata (server_args + model_config) for config endpoints.
-    pub server_args: ServerArgs,
+    /// `Arc` so cloning the config (and, downstream, each `AppState`) is cheap;
+    /// `ServerArgs` itself is immutable after construction.
+    pub server_args: Arc<ServerArgs>,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:30000".parse().unwrap(),
-            api_threads: 2,
-            tokenizer_threads: 2,
-            detok_shards: 2,
+            api_worker_num: 2,
+            tokenizer_worker_num: 2,
+            detokenizer_worker_num: 2,
             ingress_ring_cap: 8192,
             egress_ring_cap: 8192,
             channel_cap: 8192,
             pin_cores: true,
             cores: None,
             tokenizer_path: None,
-            tokenizer_revision: None,
-            server_args: ServerArgs::default(),
+            revision: None,
+            server_args: Arc::new(ServerArgs::default()),
         }
     }
 }
 
 /// Static server metadata for config endpoints (`/v1/models`, …) — the JSON
 /// blob the Python scheduler dumps from `server_args` + `model_config` at
-/// startup, parsed once and read by key. `Arc` so cloning into each `AppState`
-/// is cheap. There is no exposure concern: these threads run inside the
-/// scheduler process, and each endpoint chooses what to return.
-#[derive(Clone, Debug)]
+/// startup, parsed once and read by key. Immutable after construction; the
+/// per-request sharing into each `AppState` is done via an external `Arc`
+/// (see `api_server::AppState`), so the struct itself just owns its data. There
+/// is no exposure concern: these threads run inside the scheduler process, and
+/// each endpoint chooses what to return.
+#[derive(Default, Debug)]
 pub struct ServerArgs {
-    data: Arc<serde_json::Value>,
-}
-
-impl Default for ServerArgs {
-    fn default() -> Self {
-        Self {
-            data: Arc::new(serde_json::Value::Null),
-        }
-    }
+    data: serde_json::Value,
 }
 
 impl ServerArgs {
     /// Parse the JSON blob; errors on malformed JSON.
     pub fn from_json(s: &str) -> Result<Self, String> {
         let data: serde_json::Value = serde_json::from_str(s).map_err(|e| e.to_string())?;
-        Ok(Self {
-            data: Arc::new(data),
-        })
+        Ok(Self { data })
     }
 
     /// Fail fast at startup if a field an endpoint depends on can't be resolved.
@@ -128,6 +122,42 @@ impl ServerArgs {
             .or_else(|| self.data.get("context_length").and_then(|v| v.as_u64()))
     }
 
+    /// Bind address `host:port` from the dumped server_args (both must be
+    /// present). `host` is expected to be an IP — it's parsed as a `SocketAddr`.
+    pub fn bind(&self) -> Option<String> {
+        let host = self.str_field("host")?;
+        let port = self.usize_field("port")?;
+        Some(format!("{host}:{port}"))
+    }
+
+    /// Tokenizer source: explicit `tokenizer_path`, falling back to `model_path`
+    /// (a model dir / HF repo id the Rust backend resolves). `None` → byte stub.
+    /// Mirrors the Python `server_args.tokenizer_path or server_args.model_path`.
+    pub fn tokenizer_path(&self) -> Option<String> {
+        self.str_field("tokenizer_path")
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.str_field("model_path"))
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// HF `revision`, used only when `tokenizer_path` is a repo id. `None` → main.
+    pub fn revision(&self) -> Option<String> {
+        self.str_field("revision")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// `tokenizer_worker_num` — pinned tokenizer threads (server_args default 1).
+    pub fn tokenizer_worker_num(&self) -> usize {
+        self.usize_field("tokenizer_worker_num").unwrap_or(1)
+    }
+
+    /// `detokenizer_worker_num` — pinned detok shards (server_args default 1).
+    pub fn detokenizer_worker_num(&self) -> usize {
+        self.usize_field("detokenizer_worker_num").unwrap_or(1)
+    }
+
     /// `skip_tokenizer_init`: when set the server neither tokenizes input nor
     /// detokenizes output — clients send token ids and receive token ids back.
     /// Drives the detok backend (`SkipDetok`, raw `output_ids` frames) and the
@@ -142,6 +172,15 @@ impl ServerArgs {
 
     fn str_field(&self, key: &str) -> Option<&str> {
         self.data.get(key).and_then(|v| v.as_str())
+    }
+
+    /// A positive integer field (zero/absent → `None`, so callers default it).
+    fn usize_field(&self, key: &str) -> Option<usize> {
+        self.data
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .map(|n| n as usize)
     }
 }
 
@@ -164,12 +203,24 @@ impl Runtime {
     }
 }
 
-/// Partition the machine's cores into three disjoint sets for the pools.
-/// Falls back to no pinning if affinity isn't available.
+/// Cores reserved for the two TokenizerManager router threads (`tm-ingress`,
+/// `tm-egress`) — light, latency-sensitive channel routers, so one core each.
+///
+/// TODO(tm-scaling): if a single egress dispatcher becomes a bottleneck at high
+/// aggregate token rates, the FSM dispatch can be sharded by `RequestId` (each
+/// shard draining its own ring / channel) — at which point this needs to grow
+/// to one core per ingress/egress shard rather than a fixed 2.
+const TM_CORES: usize = 2;
+
+/// Partition the machine's cores into four disjoint sets: the I/O-bound API
+/// pool, the CPU-bound tokenizer and detokenizer pools, and the two TM router
+/// threads. Falls back to no pinning if affinity isn't available or there aren't
+/// enough cores for the (CPU-bound) pools.
 struct CorePlan {
     api: Vec<core_affinity::CoreId>,
     tok: Vec<core_affinity::CoreId>,
     detok: Vec<core_affinity::CoreId>,
+    tm: Vec<core_affinity::CoreId>,
 }
 
 fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
@@ -186,7 +237,7 @@ fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
         }
         _ => core_affinity::get_core_ids()?,
     };
-    if cores.len() < cfg.api_threads + cfg.tokenizer_threads + cfg.detok_shards {
+    if cores.len() < cfg.api_worker_num + cfg.tokenizer_worker_num + cfg.detokenizer_worker_num {
         tracing::warn!(
             available = cores.len(),
             "not enough cores to pin all pools; running unpinned"
@@ -194,10 +245,29 @@ fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
         return None;
     }
     let mut it = cores.into_iter();
-    let api = it.by_ref().take(cfg.api_threads).collect();
-    let tok = it.by_ref().take(cfg.tokenizer_threads).collect();
-    let detok = it.by_ref().take(cfg.detok_shards).collect();
-    Some(CorePlan { api, tok, detok })
+    let api: Vec<core_affinity::CoreId> = it.by_ref().take(cfg.api_worker_num).collect();
+    let tok = it.by_ref().take(cfg.tokenizer_worker_num).collect();
+    let detok = it.by_ref().take(cfg.detokenizer_worker_num).collect();
+    // The two TM router threads get up to `TM_CORES` leftover cores; when none
+    // are spare they fall back to the API set so they never float onto the
+    // CPU-bound tokenizer/detok cores.
+    let mut tm: Vec<core_affinity::CoreId> = it.by_ref().take(TM_CORES).collect();
+    if tm.is_empty() {
+        tm = api.clone();
+    }
+    Some(CorePlan {
+        api,
+        tok,
+        detok,
+        tm,
+    })
+}
+
+/// Pin the calling thread to `core` if one was assigned (no-op otherwise).
+fn pin_current(core: Option<core_affinity::CoreId>) {
+    if let Some(c) = core {
+        core_affinity::set_for_current(c);
+    }
 }
 
 /// Spawn `n` pinned OS threads running `f(worker_index)`.
@@ -243,9 +313,9 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
     // --- inter-stage channels ---
     let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.channel_cap);
     let (tok_tx, tok_rx) = flume::bounded::<crate::message::Request>(cfg.channel_cap);
-    let mut detok_tx = Vec::with_capacity(cfg.detok_shards);
-    let mut detok_rx = Vec::with_capacity(cfg.detok_shards);
-    for _ in 0..cfg.detok_shards {
+    let mut detok_tx = Vec::with_capacity(cfg.detokenizer_worker_num);
+    let mut detok_rx = Vec::with_capacity(cfg.detokenizer_worker_num);
+    for _ in 0..cfg.detokenizer_worker_num {
         let (tx, rx) = flume::bounded::<DetokMsg>(cfg.channel_cap);
         detok_tx.push(tx);
         detok_rx.push(rx);
@@ -270,7 +340,7 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
         None
     } else {
         cfg.tokenizer_path.as_deref().and_then(|path| {
-            match tokenizer::load_tokenizer(path, cfg.tokenizer_revision.as_deref()) {
+            match tokenizer::load_tokenizer(path, cfg.revision.as_deref()) {
                 Ok(t) => {
                     tracing::info!(%path, "loaded tokenizer");
                     Some(t)
@@ -298,7 +368,7 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
         };
         let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         let rxs = Arc::new(std::sync::Mutex::new(detok_rx)); // drained once at spawn
-        spawn_pinned_pool("detok", cfg.detok_shards, detok_cores, &mut threads, {
+        spawn_pinned_pool("detok", cfg.detokenizer_worker_num, detok_cores, &mut threads, {
             move |i| {
                 let rx = rxs.lock().unwrap()[i].clone();
                 detokenizer::run_shard(i, rx, backend.clone());
@@ -309,9 +379,14 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
     {
         let senders = senders.clone();
+        // First TM core: egress is the hotter router (every output token).
+        let core = plan.as_ref().and_then(|p| p.tm.first().copied());
         let handle = std::thread::Builder::new()
             .name("tm-egress".into())
-            .spawn(move || tokenizer_manager::run_egress(egress_rx, senders))
+            .spawn(move || {
+                pin_current(core);
+                tokenizer_manager::run_egress(egress_rx, senders)
+            })
             .expect("spawn tm egress");
         threads.push(handle);
     }
@@ -329,7 +404,7 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
         let tok_rx = tok_rx.clone();
         spawn_pinned_pool(
             "tokenizer",
-            cfg.tokenizer_threads,
+            cfg.tokenizer_worker_num,
             tok_cores,
             &mut threads,
             move |_i| tokenizer::run_worker(tok_rx.clone(), tm_tx.clone(), tokenizer.clone()),
@@ -340,9 +415,15 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
     {
         let senders = senders.clone();
         let ingress_tx = ingress_tx.clone();
+        // Second TM core when present, else share the first (1-core / API-set
+        // fallback) — still off the CPU-bound pool cores either way.
+        let core = plan
+            .as_ref()
+            .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied());
         let handle = std::thread::Builder::new()
             .name("tm-ingress".into())
             .spawn(move || {
+                pin_current(core);
                 tokenizer_manager::run_ingress(tm_rx, senders, ingress_tx, skip_tokenizer_init)
             })
             .expect("spawn tm ingress");
@@ -359,7 +440,7 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
             .name("api-runtime".into())
             .spawn(move || {
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
-                builder.worker_threads(cfg.api_threads).enable_all();
+                builder.worker_threads(cfg.api_worker_num).enable_all();
                 if let Some(cores) = api_cores {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     builder.on_thread_start(move || {

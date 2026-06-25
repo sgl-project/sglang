@@ -29,12 +29,16 @@ use crate::message::{EgressItem, GeneratePayload, Request, RequestKind};
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
 
+/// Shared state for every handler. Holds the submit machinery (`senders`,
+/// `id_gen`, `egress_buf`) plus the static `ServerArgs` read by `/v1/models`.
+/// `server_args` is an `Arc`, so the per-request clone axum makes is a refcount
+/// bump.
 #[derive(Clone)]
 struct AppState {
     senders: Senders,
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
-    server_args: ServerArgs,
+    server_args: Arc<ServerArgs>,
 }
 
 pub async fn serve(
@@ -42,7 +46,7 @@ pub async fn serve(
     senders: Senders,
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
-    server_args: ServerArgs,
+    server_args: Arc<ServerArgs>,
 ) {
     let state = AppState {
         senders,
@@ -56,8 +60,7 @@ pub async fn serve(
         // and returns a single, non-streamed JSON result from the scheduler.
         // Adding one = a route line passing its scheduler request-struct tag.
         .route("/server_info", get(server_info))
-        // Static config endpoint (OpenAI-compatible): served from `meta`, no
-        // scheduler round-trip.
+        // Static config endpoint (OpenAI-compatible): no scheduler round-trip.
         .route("/v1/models", get(available_models))
         .with_state(state);
 
@@ -72,8 +75,8 @@ pub async fn serve(
     }
 }
 
-/// `GET /v1/models` — OpenAI-compatible model list. Served from static
-/// metadata (no scheduler round-trip); mirrors `http_server.available_models`.
+/// `GET /v1/models` — OpenAI-compatible model list. Served from `server_args`;
+/// no scheduler round-trip. Mirrors `http_server.available_models`.
 ///
 /// TODO(v1/models): when `--enable-lora`, append a `ModelCard` per loaded LoRA
 /// adapter (`id=lora_name, root=lora_path, parent=served_model_name,

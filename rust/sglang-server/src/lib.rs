@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::cmp::max;
 
 use crate::runtime::{Runtime, RuntimeConfig};
 
@@ -37,57 +38,88 @@ impl Server {
     /// Boot the frontend (spawns all threads) and return immediately.
     #[new]
     #[pyo3(signature = (
-        bind = "127.0.0.1:30000",
-        api_threads = 2,
-        tokenizer_threads = 2,
-        detok_shards = 2,
+        bind = None,
+        api_worker_num = None,
+        tokenizer_worker_num = None,
+        detokenizer_worker_num = None,
         ingress_ring_cap = 8192,
         egress_ring_cap = 8192,
         channel_cap = 8192,
         pin_cores = true,
         cores = None,
         tokenizer_path = None,
-        tokenizer_revision = None,
+        revision = None,
         server_args_json = "{}",
     ))]
     fn start(
-        bind: &str,
-        api_threads: usize,
-        tokenizer_threads: usize,
-        detok_shards: usize,
+        bind: Option<String>,
+        api_worker_num: Option<usize>,
+        tokenizer_worker_num: Option<usize>,
+        detokenizer_worker_num: Option<usize>,
         ingress_ring_cap: usize,
         egress_ring_cap: usize,
         channel_cap: usize,
         pin_cores: bool,
         cores: Option<Vec<usize>>,
         tokenizer_path: Option<String>,
-        tokenizer_revision: Option<String>,
+        revision: Option<String>,
         server_args_json: &str,
     ) -> PyResult<Self> {
-        let bind: SocketAddr = bind
-            .parse()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad bind: {e}")))?;
         // Static server metadata (server_args + model_config) dumped by the
         // scheduler; parse and validate mandatory fields now so a bad/missing
         // field is a boot error, not a request-time 500.
-        let server_args = runtime::ServerArgs::from_json(server_args_json).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad server_args_json: {e}"))
-        })?;
+        let server_args: runtime::ServerArgs = runtime::ServerArgs::from_json(server_args_json)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "bad server_args_json: {e}"
+                ))
+            })?;
         server_args.validate_mandatory().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
         })?;
+        // The bind address, tokenizer source/threads/shards all live in the
+        // `server_args` blob; resolve them from there so the scheduler doesn't
+        // re-pass them. The explicit params stay as optional overrides for
+        // standalone callers (tests) that construct a `Server` without a full
+        // `server_args`.
+        let bind: SocketAddr = bind
+            .or_else(|| server_args.bind())
+            .unwrap_or_else(|| "127.0.0.1:30000".to_string())
+            .parse()
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad bind: {e}"))
+            })?;
+
+        let tokenizer_worker_num =
+            tokenizer_worker_num.unwrap_or_else(|| server_args.tokenizer_worker_num());
+        let detokenizer_worker_num =
+            detokenizer_worker_num.unwrap_or_else(|| server_args.detokenizer_worker_num());
+        let api_worker_num = api_worker_num.unwrap_or_else(|| {
+            max(
+                4,
+                max(
+                    (tokenizer_worker_num / 2) as usize,
+                    (detokenizer_worker_num / 2) as usize,
+                ),
+            )
+        });
+
+        let tokenizer_path = tokenizer_path.or_else(|| server_args.tokenizer_path());
+        let revision = revision.or_else(|| server_args.revision());
+        let server_args = std::sync::Arc::new(server_args);
+
         let cfg = RuntimeConfig {
             bind,
-            api_threads,
-            tokenizer_threads,
-            detok_shards,
+            api_worker_num,
+            tokenizer_worker_num,
+            detokenizer_worker_num,
             ingress_ring_cap,
             egress_ring_cap,
             channel_cap,
             pin_cores,
             cores,
             tokenizer_path,
-            tokenizer_revision,
+            revision,
             server_args,
         };
         Ok(Server {
