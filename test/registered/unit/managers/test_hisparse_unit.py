@@ -18,17 +18,6 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-
-class _FakeReq(SimpleNamespace):
-    @property
-    def fill_len(self) -> int:
-        return self.extend_range.end
-
-    @property
-    def extend_input_len(self) -> int:
-        return self.extend_range.length
-
-
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
@@ -54,7 +43,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         origin_input_ids = list(range(64))
     if output_ids is None:
         output_ids = []
-    req = _FakeReq(
+    req = SimpleNamespace(
         rid=rid,
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
