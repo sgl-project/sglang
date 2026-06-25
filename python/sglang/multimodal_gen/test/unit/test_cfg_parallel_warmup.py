@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
 )
+from sglang.multimodal_gen.runtime.server_warmup import format_warmup_req
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     DEFAULT_PLACEHOLDER_PROMPT,
     SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION,
@@ -58,7 +59,9 @@ def _make_bare_scheduler(enable_cfg_parallel: bool) -> Scheduler:
     server_args.warmup_steps = 1
     server_args.warmup_resolutions = ["512x512"]
     server_args.enable_cfg_parallel = enable_cfg_parallel
+    server_args.enable_torch_compile = False
     server_args.server_warmup = False
+    server_args.is_arg_explicitly_set.return_value = False
 
     task_type = MagicMock()
     task_type.requires_image_input.return_value = False
@@ -143,6 +146,61 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             )[0]
         self.assertIs(req.do_classifier_free_guidance, False)
         self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
+
+    def test_server_warmup_keeps_minimum_image_steps_without_compile(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=9),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertEqual(req.num_inference_steps, 2)
+
+    def test_torch_compile_respects_explicit_server_warmup_steps(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        server_args.enable_torch_compile = True
+        server_args.is_arg_explicitly_set.side_effect = lambda name: (
+            name == "warmup_steps"
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=9),
+        ):
+            req = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512"],
+                server_based_warmup=True,
+            )[0]
+        self.assertIn("(512x512, 1/9 steps)", format_warmup_req(req))
+
+    def test_torch_compile_server_warmup_repeats_each_bucket(self):
+        server_args = _make_bare_scheduler(enable_cfg_parallel=False).server_args
+        server_args.enable_torch_compile = True
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(num_inference_steps=9),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["512x512", "1024x1024"],
+                server_based_warmup=True,
+            )
+        self.assertEqual(len(reqs), 6)
+        self.assertEqual(
+            [(req.width, req.height) for req in reqs],
+            [(512, 512)] * 3 + [(1024, 1024)] * 3,
+        )
+        self.assertEqual([req.is_warmup for req in reqs], [True, False, False] * 2)
+        self.assertEqual([req.num_inference_steps for req in reqs], [2] * 6)
+        self.assertEqual(
+            [req.extra.get("server_internal_prewarm", False) for req in reqs],
+            [False, True, True] * 2,
+        )
+        self.assertEqual([req.save_output for req in reqs], [False] * 6)
 
     def test_req_based_warmup_remains_explicit_legacy_entry(self):
         scheduler = _make_bare_scheduler(enable_cfg_parallel=False)

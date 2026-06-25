@@ -32,7 +32,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_PLACEHOLDER_PROMPT = "warmup"
+DEFAULT_PLACEHOLDER_PROMPT = "A detailed image."
+DEFAULT_EXTENDED_PLACEHOLDER_PROMPT = (
+    "A high quality image with a clear subject, natural lighting, detailed "
+    "textures, and balanced composition."
+)
+TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS = (
+    DEFAULT_PLACEHOLDER_PROMPT,
+    DEFAULT_EXTENDED_PLACEHOLDER_PROMPT,
+)
 DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION = (64, 64)
 SERVER_WARMUP_IMAGE_FALLBACK_RESOLUTION = (512, 512)
 SERVER_WARMUP_VIDEO_FALLBACK_RESOLUTION = (832, 480)
@@ -247,6 +255,11 @@ def _resolve_warmup_steps(
     if not server_based_warmup:
         return warmup_steps
 
+    if getattr(server_args, "enable_torch_compile", False) is True and (
+        server_args.is_arg_explicitly_set("warmup_steps")
+    ):
+        return warmup_steps
+
     default_steps = sampling_defaults.num_inference_steps
     if default_steps is None or default_steps <= warmup_steps:
         return warmup_steps
@@ -340,12 +353,31 @@ def build_warmup_reqs(
         elif negative_prompt is not None and cfg_scale is not None and cfg_scale > 1.0:
             req_kwargs["do_classifier_free_guidance"] = True
 
-        req = Req(**req_kwargs)
-        req.set_as_warmup(warmup_steps)
-        if return_warmup_result:
-            req.extra["return_warmup_result"] = True
-        if server_based_warmup:
-            req.extra["server_based_warmup"] = True
-        warmup_reqs.append(req)
+        run_real_path_prewarm = (
+            server_based_warmup
+            and getattr(server_args, "enable_torch_compile", False) is True
+        )
+        prompts = (
+            (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
+            if run_real_path_prewarm
+            else (DEFAULT_PLACEHOLDER_PROMPT,)
+        )
+        for prompt_idx, prompt in enumerate(prompts):
+            prompt_req_kwargs = req_kwargs.copy()
+            prompt_req_kwargs["prompt"] = prompt
+            req = Req(**prompt_req_kwargs)
+            if not run_real_path_prewarm or prompt_idx == 0:
+                req.set_as_warmup(warmup_steps)
+            else:
+                req.sampling_params.num_inference_steps = warmup_steps
+                req.save_output = False
+                req.suppress_logs = True
+                req.metrics.suppress_stage_breakdown = True
+                req.extra["server_internal_prewarm"] = True
+            if return_warmup_result:
+                req.extra["return_warmup_result"] = True
+            if server_based_warmup:
+                req.extra["server_based_warmup"] = True
+            warmup_reqs.append(req)
 
     return warmup_reqs

@@ -122,9 +122,10 @@ def build_client_warmup_reqs(
         return_warmup_result=True,
         server_based_warmup=True,
     )
-    warmup_total = len(warmup_reqs)
+    warmup_total = sum(1 for req in warmup_reqs if req.is_warmup)
     for req in warmup_reqs:
-        req.extra["warmup_total"] = warmup_total
+        if req.is_warmup:
+            req.extra["warmup_total"] = warmup_total
     return warmup_reqs
 
 
