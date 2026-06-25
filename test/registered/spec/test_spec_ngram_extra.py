@@ -2,19 +2,28 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 
 # Extra: Triton + Flashinfer NGRAM backends + non-overlap (sync V2) variant.
 # Sibling per-commit file (test_spec_ngram.py) keeps the Paged variant.
 register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
+# AMD: the flashinfer attention backend is not built in the ROCm sgl_kernel,
+# so only the triton-backend NGRAM class runs on ROCm (the flashinfer classes
+# are skipped on ROCm below). This still adds new AMD coverage: the per-commit
+# sibling (test_spec_ngram.py) is flashinfer-only and CUDA-only.
+register_amd_ci(est_time=200, stage="extra-a", runner_config="1-gpu-large-amd")
+
+_AMD_SKIP_BACKEND = "flashinfer attention backend is CUDA-only (not in the ROCm sgl_kernel build)"
 
 
 class TestNgramSpeculativeDecodingTriton(NgramServerBase, GSM8KMixin):
     attention_backend = "triton"
 
 
+@unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
 class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
     """Non-overlap path: the scheduler drives the V2 worker synchronously
     (seq_lens advance via GenerationBatchResult.new_seq_lens, accepted tokens
@@ -24,6 +33,7 @@ class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
     extra_args = ["--disable-overlap-schedule"]
 
 
+@unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
 class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
     attention_backend = "flashinfer"
     extra_args = ["--speculative-ngram-external-sam-budget", "8"]
