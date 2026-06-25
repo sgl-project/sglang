@@ -124,4 +124,8 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
-        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+        gen = tokenizer_manager.generate_request(generate_req_input, None)
+        try:
+            await gen.__anext__()
+        finally:
+            await gen.aclose()

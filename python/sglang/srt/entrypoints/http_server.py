@@ -607,8 +607,11 @@ async def health_generate(request: Request) -> Response:
         )
 
     async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
-            break
+        gen_iter = _global_state.tokenizer_manager.generate_request(gri, request)
+        try:
+            await gen_iter.__anext__()
+        finally:
+            await gen_iter.aclose()
 
     task = asyncio.create_task(gen())
 
@@ -617,12 +620,18 @@ async def health_generate(request: Request) -> Response:
     while time.time() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
             return Response(status_code=200)
-
     task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
@@ -806,38 +815,41 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             background=_global_state.tokenizer_manager.create_abort_task(obj),
         )
     else:
+        gen = _global_state.tokenizer_manager.generate_request(obj, request)
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
-                obj, request
-            ).__anext__()
+            ret = await gen.__anext__()
             return orjson_response(ret)
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+        finally:
+            await gen.aclose()
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
+    gen = _global_state.tokenizer_manager.generate_request(obj, request)
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await gen.__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
+    finally:
+        await gen.aclose()
 
 
 @app.api_route("/classify", methods=["POST", "PUT"])
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
+    gen = _global_state.tokenizer_manager.generate_request(obj, request)
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await gen.__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
+    finally:
+        await gen.aclose()
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])

@@ -135,12 +135,13 @@ class OpenAIServingClassify(OpenAIServingBase):
         """Handle non-streaming classification request."""
         # Generate request ID
 
+        gen = self.tokenizer_manager.generate_request(adapted_request, raw_request)
         try:
-            ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
+            ret = await gen.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        finally:
+            await gen.aclose()
 
         if not isinstance(ret, list):
             ret = [ret]

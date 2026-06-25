@@ -304,9 +304,13 @@ class OpenAIServingRerank(OpenAIServingBase):
                     "If you are serving a decoder-only reranker (e.g., Qwen3-Reranker), "
                     "please provide the corresponding --chat-template and launch without --is-embedding."
                 )
-            ret = await self.tokenizer_manager.generate_request(
+            gen = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
-            ).__anext__()
+            )
+            try:
+                ret = await gen.__anext__()
+            finally:
+                await gen.aclose()
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -444,9 +448,13 @@ class OpenAIServingRerank(OpenAIServingBase):
                 )
 
                 # Execute generation request
-                ret = await self.tokenizer_manager.generate_request(
+                gen = self.tokenizer_manager.generate_request(
                     gen_request, raw_request
-                ).__anext__()
+                )
+                try:
+                    ret = await gen.__anext__()
+                finally:
+                    await gen.aclose()
 
                 # Extract yes/no probabilities from logprobs
                 score = self._extract_score_from_logprobs(ret)

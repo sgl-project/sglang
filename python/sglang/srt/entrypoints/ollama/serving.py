@@ -109,9 +109,13 @@ class OllamaServing:
         start_time = time.time_ns()
 
         # Get response from tokenizer manager
-        response = await self.tokenizer_manager.generate_request(
+        gen = self.tokenizer_manager.generate_request(
             gen_request, raw_request
-        ).__anext__()
+        )
+        try:
+            response = await gen.__anext__()
+        finally:
+            await gen.aclose()
 
         end_time = time.time_ns()
         total_duration = end_time - start_time
@@ -226,9 +230,13 @@ class OllamaServing:
         """Generate non-streaming generate response."""
         start_time = time.time_ns()
 
-        response = await self.tokenizer_manager.generate_request(
+        gen = self.tokenizer_manager.generate_request(
             gen_request, raw_request
-        ).__anext__()
+        )
+        try:
+            response = await gen.__anext__()
+        finally:
+            await gen.aclose()
 
         end_time = time.time_ns()
         total_duration = end_time - start_time

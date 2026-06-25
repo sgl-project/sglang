@@ -245,9 +245,13 @@ class OpenAIServingEmbedding(OpenAIServingBase):
     ) -> Union[EmbeddingResponse, ErrorResponse, ORJSONResponse]:
         """Handle the embedding request"""
         try:
-            ret = await self.tokenizer_manager.generate_request(
+            gen = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
-            ).__anext__()
+            )
+            try:
+                ret = await gen.__anext__()
+            finally:
+                await gen.aclose()
         except ValueError as e:
             return self.create_error_response(str(e))
 

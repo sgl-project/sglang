@@ -290,6 +290,7 @@ class RuntimeHandle:
 
     async def _run_generate(self, obj, chunk_callback, stream: bool, request):
         ready_event = None
+        gen = None
         try:
             ready_event = self._install_on_ready(chunk_callback) if stream else None
             gen = self.tokenizer_manager.generate_request(obj, request=request)
@@ -318,10 +319,13 @@ class RuntimeHandle:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
         finally:
+            if gen is not None:
+                await gen.aclose()
             if stream:
                 self._uninstall_on_ready(chunk_callback)
 
     async def _run_embed(self, obj, chunk_callback, request):
+        gen = None
         try:
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             result = await gen.__anext__()
@@ -331,6 +335,9 @@ class RuntimeHandle:
         except Exception as e:
             logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
             self._send_native_error(chunk_callback, str(e))
+        finally:
+            if gen is not None:
+                await gen.aclose()
 
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
     # called abort. abort_request only enqueues a message on the ZMQ socket,
