@@ -105,10 +105,10 @@ class ModelRunnerKVCacheMixin:
         )
 
         rest_memory = available_gpu_memory - pre_model_load_memory * (
-            1 - self.mem_fraction_static
+            1 - self.server_args.mem_fraction_static
         )
-        if mambaish_config(self.model_config) is not None:
-            rest_memory = self.handle_max_mamba_cache(rest_memory)
+        if self.mambaish_config is not None:
+            rest_memory = self._handle_max_mamba_cache(rest_memory)
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
@@ -120,7 +120,7 @@ class ModelRunnerKVCacheMixin:
             )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
-                f"--mem-fraction-static={self.mem_fraction_static}. "
+                f"--mem-fraction-static={self.server_args.mem_fraction_static}. "
                 f"Raise --mem-fraction-static above "
                 f"{suggested_mem_fraction_static:.3f} "
                 f"(minimum viable = 1 - available/pre = "
@@ -130,8 +130,8 @@ class ModelRunnerKVCacheMixin:
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
-    def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
-        config = mambaish_config(self.model_config)
+    def _handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
+        config = self.mambaish_config
         server_args = self.server_args
         assert config is not None
 
@@ -150,7 +150,11 @@ class ModelRunnerKVCacheMixin:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    // (
+                        self.server_args.dp_size
+                        if server_args.enable_dp_attention
+                        else 1
+                    ),
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
@@ -203,7 +207,11 @@ class ModelRunnerKVCacheMixin:
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
                     server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    // (
+                        self.server_args.dp_size
+                        if server_args.enable_dp_attention
+                        else 1
+                    ),
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = per_req * capped_reqs * D
@@ -944,7 +952,7 @@ class ModelRunnerKVCacheMixin:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if self.pp_size > 1:
+        if self.server_args.pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -964,13 +972,13 @@ class ModelRunnerKVCacheMixin:
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.dp_size
+            requested_per_worker = max_num_reqs // self.server_args.dp_size
             max_num_reqs = min(requested_per_worker, token_capacity // 2)
         else:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
 
-        if mambaish_config(self.model_config) is not None:
+        if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
