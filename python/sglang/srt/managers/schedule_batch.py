@@ -2372,6 +2372,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
     mix_running_indices_cpu: Optional[torch.Tensor] = None
+    # Number of decode requests appended to a MIXED chunked-prefill batch.
+    mix_decode_bs: int = 0
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -3088,6 +3090,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
         self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
+        self.mix_decode_bs = running_bs
         if not self.spec_algorithm.is_none():
             # Spec keeps no per-step out_cache_loc on the running batch; gather
             # each tail's bonus slot at the committed length (rebound under overlap).
