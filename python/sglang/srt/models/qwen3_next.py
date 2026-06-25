@@ -1092,9 +1092,8 @@ class Qwen3NextForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        if not _is_cpu:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -1108,9 +1107,8 @@ class Qwen3NextForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        if not _is_cpu:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False

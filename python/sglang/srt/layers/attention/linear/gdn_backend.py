@@ -455,8 +455,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            if is_cpu():
-                mixed_qkv_reshaped = mixed_qkv_reshaped.contiguous()
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -470,10 +468,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2)
-            if is_cpu():
-                mixed_qkv = mixed_qkv.contiguous()
-            mixed_qkv = mixed_qkv.view(seq_len, -1)
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -519,12 +514,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
-            if is_cpu():
-                verify_cache_indices = cache_indices[:batch_size]
-                verify_state_indices = intermediate_state_indices[:batch_size]
-            else:
-                verify_cache_indices = cache_indices
-                verify_state_indices = intermediate_state_indices
             core_attn_out = self.kernel_dispatcher.target_verify(
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
@@ -534,10 +523,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a=a,
                 b=b,
                 ssm_states=ssm_states,
-                cache_indices=verify_cache_indices,
+                cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
                 intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=verify_state_indices,
+                intermediate_state_indices=intermediate_state_indices,
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )

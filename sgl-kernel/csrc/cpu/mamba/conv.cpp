@@ -654,19 +654,18 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& cache_seqlens,
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
-    bool is_vnni,
-    const std::optional<at::Tensor>& intermediate_conv_window,
-    const std::optional<at::Tensor>& intermediate_state_indices) {
+    bool is_vnni) {
   CHECK_CONTIGUOUS(x);
   CHECK_CONTIGUOUS(weight);
   auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);
 
-  TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "causal_conv1d_update_cpu: expect x to be 2D or 3D tensor.");
+  // TODO: add multi-token prediction support
+  TORCH_CHECK(x.dim() == 2, "causal_conv1d_update_cpu: expect x to be 2D tensor.");
   TORCH_CHECK(!cache_seqlens.has_value(), "causal_conv1d_update_cpu: don't support cache_seqlens.");
 
   int64_t batch = x.size(0);
   int64_t dim = x.size(1);
-  int64_t seqlen = x.dim() == 3 ? x.size(2) : 1;
+  int64_t seqlen = 1;
   int64_t width = weight.size(-1);
 
   const auto scalar_type = x.scalar_type();
@@ -686,98 +685,20 @@ at::Tensor causal_conv1d_update_cpu(
     conv_states.copy_(conv_states_copy);
   }
 
-  if (seqlen == 1) {
-    auto x_2d = x.dim() == 3 ? x.squeeze(2) : x;
-    at::Tensor out = at::empty({batch, dim}, x_2d.options());
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_kernel_impl", [&] {
-      causal_conv1d_update_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
-          x_2d.data_ptr<scalar_t>(),
-          conv_states.data_ptr<scalar_t>(),
-          packed_w.data_ptr<scalar_t>(),
-          conditional_data_ptr<scalar_t>(bias),
-          conditional_data_ptr<int32_t>(conv_state_indices),
-          silu_activation,
-          batch,
-          dim,
-          1,
-          width);
-    });
-    return x.dim() == 3 ? out.unsqueeze(2) : out;
-  }
-
-  // Multi-token path: process each time step sequentially,
-  // updating conv_state after each step.
-  TORCH_CHECK(
-      intermediate_conv_window.has_value() == intermediate_state_indices.has_value(),
-      "causal_conv1d_update_cpu: intermediate_conv_window and intermediate_state_indices "
-      "must be passed together.");
-  const bool cache_intermediate = intermediate_conv_window.has_value();
-  const int64_t state_len = width - 1;
-  if (cache_intermediate) {
-    auto& icw = intermediate_conv_window.value();
-    auto& isi = intermediate_state_indices.value();
-    CHECK_DIM(4, icw);
-    CHECK_CONTIGUOUS(icw);
-    CHECK_EQ(icw.scalar_type(), scalar_type);
-    CHECK_EQ(icw.size(1), seqlen);
-    CHECK_EQ(icw.size(2), dim);
-    CHECK_EQ(icw.size(3), state_len);
-    CHECK_EQ(isi.scalar_type(), at::kInt);
-    CHECK_EQ(isi.numel(), batch);
-  }
-  const int32_t* intermediate_indices_ptr =
-      cache_intermediate ? intermediate_state_indices.value().data_ptr<int32_t>() : nullptr;
-
   at::Tensor out = at::empty_like(x);
-  for (int64_t t = 0; t < seqlen; ++t) {
-    auto x_t = x.select(2, t).contiguous();
-    auto out_t = at::empty({batch, dim}, x_t.options());
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_kernel_impl", [&] {
-      causal_conv1d_update_kernel_impl<scalar_t>(
-          out_t.data_ptr<scalar_t>(),
-          x_t.data_ptr<scalar_t>(),
-          conv_states.data_ptr<scalar_t>(),
-          packed_w.data_ptr<scalar_t>(),
-          conditional_data_ptr<scalar_t>(bias),
-          conditional_data_ptr<int32_t>(conv_state_indices),
-          silu_activation,
-          batch,
-          dim,
-          1,
-          width);
-
-      // Cache intermediate conv states for tree attention rollback.
-      // conv_states has strides {state_len*dim, 1, dim} after as_strided_
-      // (physical: [state_len, dim] per entry, dim contiguous).
-      // intermediate_conv_window is [cache_size, seqlen, dim, state_len]
-      // contiguous (physical: [dim, state_len] per entry, state_len contiguous).
-      // We must transpose during copy.
-      if (cache_intermediate) {
-        const int32_t* csi_ptr = conditional_data_ptr<int32_t>(conv_state_indices);
-        auto& icw = intermediate_conv_window.value();
-        scalar_t* icw_ptr = icw.data_ptr<scalar_t>();
-        const scalar_t* cs_ptr = conv_states.data_ptr<scalar_t>();
-        const int64_t icw_entry_size = dim * state_len;
-        const int64_t icw_seq_stride = seqlen * icw_entry_size;
-        const int64_t cs_entry_stride = dim * state_len;
-        for (int64_t b = 0; b < batch; ++b) {
-          int32_t idx = intermediate_indices_ptr[b];
-          if (idx < 0) continue;
-          int32_t cs_idx = csi_ptr ? csi_ptr[b] : static_cast<int32_t>(b);
-          const scalar_t* src = cs_ptr + cs_idx * cs_entry_stride;
-          scalar_t* dst = icw_ptr + idx * icw_seq_stride + t * icw_entry_size;
-          // src physical: src[w * dim + d] (w slow, d fast)
-          // dst physical: dst[d * state_len + w] (d slow, w fast)
-          for (int64_t d = 0; d < dim; ++d) {
-            for (int64_t w = 0; w < state_len; ++w) {
-              dst[d * state_len + w] = src[w * dim + d];
-            }
-          }
-        }
-      }
-    });
-    out.select(2, t).copy_(out_t);
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_kernel_impl", [&] {
+    causal_conv1d_update_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        x.data_ptr<scalar_t>(),
+        conv_states.data_ptr<scalar_t>(),
+        packed_w.data_ptr<scalar_t>(),
+        conditional_data_ptr<scalar_t>(bias),
+        conditional_data_ptr<int32_t>(conv_state_indices),
+        silu_activation,
+        batch,
+        dim,
+        seqlen,
+        width);
+  });
   return out;
 }
