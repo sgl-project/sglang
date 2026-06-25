@@ -71,6 +71,9 @@ class InsertParams:
     deferred_overlap_values: list[tuple[int, torch.Tensor]] = dataclasses.field(
         default_factory=list
     )
+    created_node_records: list[tuple[int, Any, Any]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -82,6 +85,7 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    insert_skipped: bool = False
 
 
 @dataclasses.dataclass

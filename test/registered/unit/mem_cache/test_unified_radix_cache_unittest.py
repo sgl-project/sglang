@@ -1201,6 +1201,65 @@ class UnifiedRadixCacheSuite:
         tree.dec_lock_ref(node, lock_result.to_dec_params())
         tree.sanity_check()
 
+    def test_swa_unfinished_insert_rolls_back_unaccepted_suffix_after_tombstone(
+        self,
+    ):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        prefix = self._make_seq(1, 4)
+        old_suffix = self._make_seq(100, 1)
+        fresh_suffix = self._make_seq(200, 1)
+        self._insert(tree, allocator, req_to_token_pool, prefix)
+        self._insert(tree, allocator, req_to_token_pool, prefix + old_suffix)
+
+        prefix_node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)))
+        ).last_device_node
+        old_child_key = RadixKey(array("q", old_suffix)).child_key(tree.page_size)
+        self.assertIn(old_child_key, prefix_node.children)
+
+        swa_component = tree.components[ComponentType.SWA]
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_component_and_detach_lru(prefix_node, swa_component, tracker=tracker)
+        self.assertIsNone(prefix_node.component_data[ComponentType.SWA].value)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = prefix + fresh_suffix
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
+        fresh_value = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), fresh_value)
+        req.kv_committed_len = len(tokens)
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        req.swa_evicted_seqlen = 0
+
+        full_available_before = allocator.full_attn_allocator.available_size()
+
+        tree.cache_unfinished_req(req)
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(), full_available_before
+        )
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(req.prefix_indices.tolist(), fresh_value.tolist())
+        self.assertIn(old_child_key, prefix_node.children)
+        self.assertNotIn(
+            RadixKey(array("q", fresh_suffix)).child_key(tree.page_size),
+            prefix_node.children,
+        )
+        self.assertIsNone(prefix_node.component_data[ComponentType.SWA].value)
+
+        tree.sanity_check()
+
     def test_diagnostics(self):
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(tree, allocator, req_to_token_pool, self._make_seq(1, 2))
