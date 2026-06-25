@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
@@ -103,7 +104,7 @@ class SchedulerRequestReceiver:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -112,7 +113,7 @@ class SchedulerRequestReceiver:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)

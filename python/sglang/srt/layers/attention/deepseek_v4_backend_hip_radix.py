@@ -1463,13 +1463,11 @@ class DeepseekV4HipRadixBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import os
-
             from sglang.srt.layers.attention.hip_flash_mla import (
                 flash_mla_with_kvcache_entrypoint,
             )
 
-            backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "kernel")
+            backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
             input_dict = dict(
                 q=q,
                 k_cache=swa_k_cache,
