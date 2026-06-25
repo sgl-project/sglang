@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 import math
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -69,6 +69,30 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
     "intel_xpu",
 ]
+
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def zero_dp_attention_padding(
+    attn_output: torch.Tensor, forward_batch: "ForwardBatch"
+) -> torch.Tensor:
+    """Zero padding rows that FA3 kernel leaves uninitialized in DP attention.
+
+    When DP attention uses SUM_LEN mode and ranks have different sequence
+    lengths, shorter ranks pad their Q tensor. FA3 kernel only computes
+    valid tokens and leaves padding output as uninitialized garbage (NaN/Inf).
+    This garbage propagates through residual connections and corrupts the model.
+    """
+    num_valid = forward_batch.get_num_non_padded_tokens(attn_output.shape[0])
+    if num_valid is None:
+        return attn_output
+
+    if num_valid < attn_output.shape[0]:
+        attn_output[num_valid:] = 0
+
+    return attn_output
 
 
 def awq_dequantize_func():

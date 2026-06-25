@@ -927,6 +927,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens_per_dp=num_tokens_per_dp,
         )
 
+    def get_num_non_padded_tokens(
+        self, max_tokens: Optional[int] = None
+    ) -> Optional[int]:
+        """Return the DP-local valid-token count before DP/MLP-sync padding.
+
+        In extend/prefill, ``extend_seq_lens_cpu`` remains the local request
+        lengths before ``prepare_mlp_sync_batch`` pads tensors and mutates
+        ``extend_num_tokens`` to the communication-aligned length.
+        """
+        if self.forward_mode.is_extend() and self.extend_seq_lens_cpu is not None:
+            if isinstance(self.extend_seq_lens_cpu, torch.Tensor):
+                num_tokens = int(self.extend_seq_lens_cpu.sum().item())
+            else:
+                num_tokens = int(sum(self.extend_seq_lens_cpu))
+            if max_tokens is None or 0 <= num_tokens <= max_tokens:
+                return num_tokens
+
+        if self.num_token_non_padded_cpu is not None:
+            num_tokens = int(self.num_token_non_padded_cpu)
+            if max_tokens is None or 0 <= num_tokens <= max_tokens:
+                return num_tokens
+
+        return None
+
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
         Merge all multimodal inputs in the batch into a single MultiModalInputs object.

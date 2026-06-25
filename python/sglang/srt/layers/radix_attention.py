@@ -232,24 +232,21 @@ def unified_attention_with_output(
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
 
-    if _is_hip:
-        # During PCG replay on AMD, varlen attention kernels only fill positions
-        # 0..actual_tokens-1 and leave padded positions with uninitialized
-        # garbage from torch.empty.  Zero these so garbage (NaN/Inf) does not
-        # propagate through residual connections, MoE routing, and allreduce.
-        # Use context.raw_num_tokens (pre-padding count from PCG runner)
-        # instead of forward_batch.extend_num_tokens, because
-        # extend_num_tokens is None for TARGET_VERIFY (EAGLE) batches.
-        pcg_static_tokens = context.num_tokens
-        actual_tokens = context.raw_num_tokens
-        if (
-            pcg_static_tokens is not None
-            and actual_tokens is not None
-            and pcg_static_tokens > actual_tokens
-        ):
-            first_dim = output.shape[0]
-            elems_per_token = output.numel() // first_dim
-            output.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+    # During PCG replay the attention backend writes only the narrowed
+    # real-token slice (output[:real_num_tokens]) and leaves padded positions
+    # as uninitialized torch.empty garbage. Zero them so garbage (NaN/Inf) does
+    # not propagate through residual connections, MoE routing, and allreduce.
+    # This affects every backend that varlen-writes under PCG, not just ROCm.
+    pcg_static_tokens = context.num_tokens
+    actual_tokens = context.raw_num_tokens
+    if (
+        pcg_static_tokens is not None
+        and actual_tokens is not None
+        and pcg_static_tokens > actual_tokens
+    ):
+        first_dim = output.shape[0]
+        elems_per_token = output.numel() // first_dim
+        output.view(first_dim, elems_per_token)[actual_tokens:].zero_()
     return
 
 
