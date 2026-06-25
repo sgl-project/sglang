@@ -460,7 +460,7 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.chat._process_messages(req, is_multimodal=False)
 
-        expected_tools = [tool.model_dump() for tool in req.tools]
+        expected_tools = [tool.model_dump(exclude_unset=True) for tool in req.tools]
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tools"], expected_tools)
 
@@ -504,9 +504,12 @@ class ServingChatTestCase(unittest.TestCase):
         second_tools = self.tm.tokenizer.apply_chat_template.call_args_list[1].kwargs[
             "tools"
         ]
-        self.assertEqual(first_tools, [tool.model_dump() for tool in req.tools])
         self.assertEqual(
-            second_tools, [tool.function.model_dump() for tool in req.tools]
+            first_tools, [tool.model_dump(exclude_unset=True) for tool in req.tools]
+        )
+        self.assertEqual(
+            second_tools,
+            [tool.function.model_dump(exclude_unset=True) for tool in req.tools],
         )
 
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):

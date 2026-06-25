@@ -644,14 +644,18 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         if request.tools and request.tool_choice != "none":
             request.skip_special_tokens = False
+            # Use exclude_unset so Pydantic defaults the client did not provide
+            # (e.g. strict=False, defer_loading=None) are not injected into the
+            # tool schema rendered into the prompt by apply_chat_template, which
+            # would otherwise cause a train-serving prompt mismatch. See #29061.
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.model_dump()
+                    item.model_dump(exclude_unset=True)
                     for item in request.tools
                     if item.function.name == request.tool_choice.function.name
                 ]
             else:
-                tools = [item.model_dump() for item in request.tools]
+                tools = [item.model_dump(exclude_unset=True) for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
@@ -762,7 +766,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
-                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+                # exclude_unset: keep client-provided tool schema intact in the
+                # prompt, without leaking Pydantic defaults. See #29061.
+                messages[0]["tools"] = [
+                    tool.model_dump(exclude_unset=True) for tool in request.tools
+                ]
 
             # Default encoding (dsv4/dsv32)
             if self.chat_encoding_spec == "dsv4":
