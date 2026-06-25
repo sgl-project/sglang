@@ -970,13 +970,9 @@ class SchedulerDisaggregationPrefillMixin:
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         end_idx = (
-<<<<<<< sync-pr-601-to-main
-            end_idx if end_idx is not None else min(req.fill_len, transfer_input_len)
-=======
             end_idx
             if end_idx is not None
-            else min(req.extend_range.end, len(req.origin_input_ids))
->>>>>>> main
+            else min(req.extend_range.end, transfer_input_len)
         )
 
         if not last_chunk:
@@ -1001,22 +997,12 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
-<<<<<<< sync-pr-601-to-main
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
             # that decode used to register the destination row.
-            seq_len = min(req.fill_len, transfer_input_len)
+            seq_len = min(req.extend_range.end, transfer_input_len)
             c128_seq_len = transfer_input_len
-=======
-            # fill_ids includes the token sampled during prefill, but decode
-            # registers state pages over origin_input_ids (DecodePreallocQueue)
-            # and the main pool send is clamped to end_idx above. Matching that
-            # length here avoids emitting an extra state page when the sampled
-            # token crosses a page boundary, which mismatched src/dst lengths in
-            # group_concurrent_contiguous.
-            seq_len = min(req.extend_range.end, len(req.origin_input_ids))
->>>>>>> main
 
             def _mamba_payload():
                 return [
