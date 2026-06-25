@@ -4,15 +4,15 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Optional
 
+from sglang.srt.layers.moe.moe_runner.ascend import (
+    AscendRunnerCore,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     FusedOpPool,
     MoeRunnerConfig,
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
-from sglang.srt.layers.moe.moe_runner.ascend import (
-    AscendRunnerCore,
-)
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend

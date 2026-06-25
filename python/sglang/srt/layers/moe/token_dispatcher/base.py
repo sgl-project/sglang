@@ -21,6 +21,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
@@ -29,8 +31,6 @@ if TYPE_CHECKING:
         FlashinferDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
-        AscendTPCombineInput,
-        AscendTPDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
 

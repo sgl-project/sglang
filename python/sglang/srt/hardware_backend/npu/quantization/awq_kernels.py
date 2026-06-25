@@ -79,7 +79,9 @@ class AWQAscendLinearKernel:
             #     unsigned_val = signed_val ^ 0x8   (for each 4-bit nibble)
             #   Since we pack two nibbles per byte, we XOR the whole byte
             #   with 0x88 to flip both sign bits simultaneously.
-            qweight_tmp.bitwise_xor_(0x88888888)  # 0x88 per byte = flip sign bit of both nibbles
+            qweight_tmp.bitwise_xor_(
+                0x88888888
+            )  # 0x88 per byte = flip sign bit of both nibbles
 
             # Step 3: Convert zero points from signed to unsigned.
             #   The zero points are stored as signed int4 (-8..7).
