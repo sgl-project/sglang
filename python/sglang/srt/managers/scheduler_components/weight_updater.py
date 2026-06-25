@@ -155,7 +155,9 @@ class SchedulerWeightUpdaterManager:
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success, message)
 
-    def iter_weight_update_workers(self, selector: str = "all") -> List[Tuple[str, Any]]:
+    def iter_weight_update_workers(
+        self, selector: str = "all"
+    ) -> List[Tuple[str, Any]]:
         """Resolve a {target, draft, all} selector to (role, worker) pairs, target
         first: the target worker and, when present, the draft worker. This is the
         worker-level inclusion decision; each worker then contributes its own runners
@@ -366,12 +368,17 @@ class SchedulerWeightUpdaterManager:
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            payload = self.tp_worker.model_runner.check_weights(
+                action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
+            )
 
             if self.draft_worker is not None:
                 draft_runner = _get_draft_model_runner(self.draft_worker)
                 if draft_runner is not None:
-                    draft_payload = draft_runner.check_weights(action=recv_req.action)
+                    draft_payload = draft_runner.check_weights(
+                        action=recv_req.action,
+                        allow_quant_error=recv_req.allow_quant_error,
+                    )
                     if payload is not None and draft_payload is not None:
                         payload = _merge_checksum_payloads(payload, draft_payload)
 
