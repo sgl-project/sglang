@@ -484,22 +484,25 @@ class TestRadixCache(unittest.TestCase):
         mock_allocator.device = torch.device("cpu")
 
         cache = RadixCache.create_simulated(
-            mock_allocator=mock_allocator, enable_kv_cache_events=True
+            mock_allocator=mock_allocator,
+            page_size=2,
+            enable_kv_cache_events=True,
         )
 
         # Insert and then evict data
+        seq = [1, 2, 3, 4]
         cache.insert(
             InsertParams(
-                key=RadixKey(array("q", [1, 2, 3])),
-                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+                key=RadixKey(array("q", seq)),
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
             )
         )
-        result = cache.evict(EvictParams(num_tokens=3))
+        result = cache.evict(EvictParams(num_tokens=len(seq)))
         self.assertIsInstance(result, EvictResult)
         self.assertGreaterEqual(
             result.num_tokens_evicted,
-            3,
-            f"evicted {result.num_tokens_evicted} tokens, expected at least 3",
+            len(seq),
+            f"evicted {result.num_tokens_evicted} tokens, expected at least {len(seq)}",
         )
 
         # Take events - should include both store and remove events
@@ -510,10 +513,17 @@ class TestRadixCache(unittest.TestCase):
         event_types = [type(event).__name__ for event in events]
         self.assertIn("BlockStored", event_types)
 
+        stored_hashes = [
+            event.block_hashes[0]
+            for event in events
+            if isinstance(event, BlockStored)
+        ]
+        self.assertEqual(len(stored_hashes), 2)
+
         # Verify BlockRemoved event content
         remove_events = [e for e in events if isinstance(e, BlockRemoved)]
-        for event in remove_events:
-            self.assertGreater(len(event.block_hashes), 0)
+        self.assertEqual(len(remove_events), 1)
+        self.assertEqual(remove_events[0].block_hashes, stored_hashes)
 
     def test_extra_key_isolation(self):
         """Test that keys with different extra_key values are isolated."""
