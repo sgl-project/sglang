@@ -89,6 +89,7 @@ def _load_npu_triton_prefill_module():
         "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton",
         types.ModuleType("sglang.srt.layers.attention.minimax_sparse_ops.npu_triton"),
     )
+    _load_npu_triton_prefill_index_module()
 
     module_path = (
         Path(__file__).resolve().parents[2]
@@ -98,6 +99,27 @@ def _load_npu_triton_prefill_module():
         "_minimax_sparse_npu_prefill_under_test", module_path
     )
     module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_npu_triton_prefill_index_module():
+    _install_fake_modules()
+    sys.modules.setdefault(
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton",
+        types.ModuleType("sglang.srt.layers.attention.minimax_sparse_ops.npu_triton"),
+    )
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill_index.py"
+    )
+    module_name = (
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill_index"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
@@ -255,12 +277,31 @@ def test_npu_triton_prefill_uses_dedicated_prefill_kernels():
         / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
     ).read_text()
 
-    assert "flash_prefill_npu_with_topk_index" in source
+    assert "flash_prefill_npu_msa_index" in source
     assert "flash_prefill_npu_with_gqa_share_sparse" in source
     assert "minimax_sparse_ops.prefill.flash_with_topk_idx" not in source
     assert "minimax_sparse_ops.prefill.topk_sparse" not in source
     assert "flash_decode_bnsd_with_topk_idx" not in source
     assert "flash_decode_bnsd_with_gqa_share_sparse" not in source
+
+
+def test_npu_triton_prefill_indexer_lives_in_msa_index_module():
+    prefill_source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+    index_source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill_index.py"
+    ).read_text()
+
+    assert "_prefill_npu_msa_index_score_kernel" not in prefill_source
+    assert "_prefill_npu_msa_index_topk_kernel" not in prefill_source
+    assert "def flash_prefill_npu_msa_index(" in index_source
+    assert "_prefill_npu_msa_index_score_kernel" in index_source
+    assert "_prefill_npu_msa_index_topk_kernel" in index_source
+    assert "flash_prefill_npu_with_gqa_share_sparse" not in index_source
+    assert "flash_decode_bnsd_with_topk_idx" not in index_source
 
 
 def test_npu_triton_prefill_appends_forced_blocks_after_pure_topk():
@@ -287,7 +328,7 @@ def test_npu_triton_prefill_calls_prefill_kernels_with_appended_forced_blocks():
         calls["main"] = kwargs
         return kwargs["q"].new_full(kwargs["q"].shape, 7)
 
-    module.flash_prefill_npu_with_topk_index = fake_index_kernel
+    module.flash_prefill_npu_msa_index = fake_index_kernel
     module.flash_prefill_npu_with_gqa_share_sparse = fake_main_kernel
 
     q = torch.zeros((2, 1, 1), dtype=torch.bfloat16)
@@ -360,7 +401,7 @@ def test_npu_triton_prefill_does_not_keep_decode_topk_debug_switch():
 def test_npu_triton_prefill_score_kernel_caps_n_tile_for_ub():
     source = (
         Path(__file__).resolve().parents[2]
-        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill_index.py"
     ).read_text()
 
     assert "_PREFILL_NPU_SCORE_BLOCK_SIZE_N = 64" in source
@@ -376,6 +417,20 @@ def test_npu_triton_prefill_sparse_kernel_caps_n_tile_for_ub():
     assert "_PREFILL_NPU_SPARSE_BLOCK_SIZE_N = 64" in source
     assert '"BLOCK_SIZE_N": lambda args: _PREFILL_NPU_SPARSE_BLOCK_SIZE_N' in source
     assert "for inner_start in tl.static_range(0, block_size, BLOCK_SIZE_N):" in source
+
+
+def test_npu_triton_prefill_main_reuses_grouped_gqa_kernel():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/prefill.py"
+    ).read_text()
+
+    assert "def _prefill_npu_sparse_kernel(" in source
+    assert "pid_kh = tl.program_id(1)" in source
+    assert "pid_h = pid_kh * gqa_group_size" in source
+    assert "grid = (total_q, num_kv_heads)" in source
+    assert "tl.dot(q, k)" in source
+    assert "tl.dot(p.to(v.dtype), v)" in source
 
 
 def test_npu_triton_prefill_merge_matches_decode_local_only_semantics():
