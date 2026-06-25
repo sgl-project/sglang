@@ -2509,6 +2509,36 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         device=x.device,
                     )
 
+            # Forward parameterized/clamped SwiGLU (e.g. GPT-OSS-style gemm1_alpha / clamp_limit)
+            # to the kernel; otherwise it computes vanilla SwiGLU and such models generate garbage.
+            # Mirrors the trtllm path (moe_runner/flashinfer_trtllm.py), which already forwards
+            # gemm1_clamp_limit. swiglu_beta=1.0 is the +1 shift on the linear branch (mxfp4 path).
+            # No-op for models that leave gemm1_alpha/gemm1_clamp_limit unset (vanilla SwiGLU).
+            swiglu_kwargs = {}
+            _gemm1_alpha = moe_runner_config.gemm1_alpha
+            _gemm1_limit = moe_runner_config.gemm1_clamp_limit
+            if _gemm1_alpha is not None or _gemm1_limit is not None:
+                _num_local_experts = layer.w13_weight.shape[0]
+                swiglu_kwargs["swiglu_alpha"] = torch.full(
+                    (_num_local_experts,),
+                    _gemm1_alpha if _gemm1_alpha is not None else 1.0,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                swiglu_kwargs["swiglu_beta"] = torch.full(
+                    (_num_local_experts,),
+                    1.0,
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+                if _gemm1_limit is not None:
+                    swiglu_kwargs["swiglu_limit"] = torch.full(
+                        (_num_local_experts,),
+                        _gemm1_limit,
+                        dtype=torch.float32,
+                        device=x.device,
+                    )
+
             output = flashinfer_cutlass_fused_moe(
                 output=symm_output,
                 input=x,
@@ -2534,6 +2564,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 activation_type=fi_activation,
                 enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
+                **swiglu_kwargs,
             )[0]
 
             return StandardCombineInput(hidden_states=output)
