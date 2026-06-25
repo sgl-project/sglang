@@ -234,6 +234,19 @@ def test_npu_triton_prefill_appends_forced_blocks_after_pure_topk():
     assert "local_blocks=0" in source
 
 
+def test_npu_triton_prefill_debug_logs_every_call():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_backend.py"
+    ).read_text()
+
+    assert "_dbg_prefill_main_diff_count" not in source
+    assert "_dbg_prefill_index_diff_count" not in source
+    assert "_dbg_prefill_index_skip_count" not in source
+    assert "index diff skipped" in source
+    assert "disable_index_value=%s" in source
+
+
 def test_npu_triton_prefill_merge_matches_decode_local_only_semantics():
     module = _load_npu_triton_prefill_module()
     topk_idx = torch.tensor(
