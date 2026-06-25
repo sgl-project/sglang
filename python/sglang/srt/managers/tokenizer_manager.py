@@ -2865,11 +2865,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+            if self.enable_metrics:
+                time_stats.set_metrics_collector(self.metrics_collector)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
             if self.server_args.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            if getattr(obj, "prompt_render_finish_time", None):
+                time_stats.set_prompt_render_finish_time(obj.prompt_render_finish_time)
+            if getattr(obj, "chat_template_render_duration", None):
+                time_stats.chat_template_render_duration = (
+                    obj.chat_template_render_duration
+                )
+            if getattr(obj, "chat_template_encode_duration", None):
+                time_stats.chat_template_encode_duration = (
+                    obj.chat_template_encode_duration
+                )
 
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.

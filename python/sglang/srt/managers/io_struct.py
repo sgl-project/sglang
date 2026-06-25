@@ -242,6 +242,9 @@ class GenerateReqInput:
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
+    prompt_render_finish_time: Optional[float] = None
+    chat_template_render_duration: Optional[float] = None
+    chat_template_encode_duration: Optional[float] = None
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
@@ -720,6 +723,9 @@ class GenerateReqInput:
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
+            prompt_render_finish_time=self.prompt_render_finish_time,
+            chat_template_render_duration=self.chat_template_render_duration,
+            chat_template_encode_duration=self.chat_template_encode_duration,
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
@@ -904,6 +910,7 @@ class EmbeddingReqInput:
     # Propagates trace context via Engine.encode/async_encode
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
+    prompt_render_finish_time: Optional[float] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -1057,6 +1064,7 @@ class EmbeddingReqInput:
                 dimensions=self.dimensions,
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
+                prompt_render_finish_time=self.prompt_render_finish_time,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 multi_item_delimiter_indices=(

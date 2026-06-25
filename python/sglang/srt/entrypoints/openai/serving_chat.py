@@ -619,6 +619,12 @@ class OpenAIServingChat(OpenAIServingBase):
             return_prompt_token_ids=request.return_prompt_token_ids,
         )
 
+        adapted_request.chat_template_render_duration = (
+            processed_messages.chat_template_render_duration
+        )
+        adapted_request.chat_template_encode_duration = (
+            processed_messages.chat_template_encode_duration
+        )
         return adapted_request, request
 
     def _process_messages(
@@ -830,17 +836,18 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
-            # Split apply_chat_template(tokenize=True) into render + encode so we
-            # can skip add_special_tokens=False on tokenizers that don't auto-add
-            # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
-            # templates already include role/special tokens, so the encode must
-            # avoid double BOS on tokenizers that would add it.
+            # Split apply_chat_template(tokenize=True) into render + encode for
+            # per-stage timing. add_special_tokens=False avoids double BOS on
+            # tokenizers that auto-add it (chat template already includes them).
             encode_kwargs = (
                 {"add_special_tokens": False}
                 if self._tokenizer_auto_adds_specials
                 else {}
             )
+            chat_template_render_duration: Optional[float] = None
+            chat_template_encode_duration: Optional[float] = None
             try:
+                _t0 = time.perf_counter()
                 rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=False,
@@ -849,9 +856,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
+                _t1 = time.perf_counter()
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
                     rendered_prompt, **encode_kwargs
                 )
+                _t2 = time.perf_counter()
+                chat_template_render_duration = _t1 - _t0
+                chat_template_encode_duration = _t2 - _t1
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -861,6 +872,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
+                    _t0 = time.perf_counter()
                     rendered_prompt = (
                         self.tokenizer_manager.tokenizer.apply_chat_template(
                             openai_compatible_messages,
@@ -871,9 +883,13 @@ class OpenAIServingChat(OpenAIServingBase):
                             **extra_template_kwargs,
                         )
                     )
+                    _t1 = time.perf_counter()
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
+                    _t2 = time.perf_counter()
+                    chat_template_render_duration = _t1 - _t0
+                    chat_template_encode_duration = _t2 - _t1
                 except (jinja2.TemplateError, TypeError) as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
@@ -902,6 +918,8 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            chat_template_render_duration=chat_template_render_duration,
+            chat_template_encode_duration=chat_template_encode_duration,
         )
 
     def _apply_conversation_template(
