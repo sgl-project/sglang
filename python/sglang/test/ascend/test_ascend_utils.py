@@ -32,6 +32,8 @@ from sglang.test.test_utils import (
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
 HF_MODEL_WEIGHTS_DIR = "/root/.cache/huggingface/hub/"
+IMAGES_DIR = "/root/.cache/modelscope/hub/datasets/images/"
+
 
 # LLM model weights path
 AFM_4_5B_BASE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/AFM-4.5B-Base")
@@ -319,6 +321,9 @@ QWQ_32B_W8A8_WEIGHTS_FOR_TEST = ModelTestConfig(
 
 # Default configuration for testing
 DEFAULT_WEIGHTS_FOR_TEST = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_FOR_TEST
+
+# Images path
+IMAGES_EXAMPLE_PATH = os.path.join(IMAGES_DIR, "example_image.png")
 
 
 def run_command(cmd, shell=True):
