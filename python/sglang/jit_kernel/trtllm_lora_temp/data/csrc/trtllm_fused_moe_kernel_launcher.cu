@@ -3450,6 +3450,418 @@ void sgl_trtllm_fp4_block_scale_moe_lora_finalize(
   FLASHINFER_CHECK(err == cudaSuccess, cudaGetErrorString(err));
 }
 
+// ===========================================================================
+// BF16 MoE LoRA (decomposed / unfused-activation) — bf16 sibling of the FP4
+// trtllm-lora op (FP4BlockScaleLoraLauncher above). The standard BF16 path
+// fuses SwiGLU into GEMM1 (runner.cu: fusedAct = !useDeepSeekFp8), which
+// leaves no seam to inject the gate_up LoRA delta pre-activation. This is the
+// FP4 decomposed pipeline with the two NvFP4 quant stages REMOVED — every
+// stage is bf16 end-to-end:
+//
+//   routing -> permute (gather bf16) -> gate_up GEMM (raw Gemm2::Runner,
+//   Bf16 x Bf16 -> Bf16, K=hidden, N=2*inter, gated-INTERLEAVED out) ->
+//   moe::dev::activation (de-interleaves on read, adds gate_up_lora_delta
+//   pre-SwiGLU, writes activation_lora_input for the down-proj LoRA, bf16
+//   out) -> down GEMM (Gemm2::Runner, K=inter, N=hidden) -> finalize (or
+//   return {gemm2_output, expert_weights, idx} for the python-side down-delta
+//   + sgl_trtllm_fp8_block_scale_moe_lora_finalize, which is pure bf16).
+//
+// Weights are the SAME prepared bf16 tensors the plain trtllm_bf16_moe path
+// consumes (shuffled epilogue_tile_m=128 + BlockMajorK block_k=128, see
+// sglang unquant.py process_weights_after_loading) — layout untouched.
+// FP8/FP4 paths are untouched by this addition.
+// ===========================================================================
+class Bf16LoraLauncher {
+ public:
+  // Match the plain BF16 path's tile ladder (Bf16MoeLauncher::mSupportedTileNums).
+  static constexpr std::array<int32_t, 5> mBaseSupportedTileNums = {8, 16, 32, 64, 128};
+
+  static std::vector<int32_t> getSupportedTileNums() {
+    return std::vector<int32_t>(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
+  }
+
+  Bf16LoraLauncher(
+      TensorView const& expert_indices,
+      Optional<TensorView> const& routing_bias,
+      TensorView const& hidden_states,
+      TensorView const& gemm1_weights,
+      TensorView const& gemm2_weights,
+      TensorView const& gate_up_lora_delta,
+      TensorView const& activation_lora_input,
+      TensorView const& output,
+      int64_t lora_ready_event,
+      int64_t gemm2_done_event)
+      : expert_indices_(expert_indices),
+        routing_bias_(routing_bias),
+        hidden_states_(hidden_states),
+        gemm1_weights_(gemm1_weights),
+        gemm2_weights_(gemm2_weights),
+        gate_up_lora_delta_(gate_up_lora_delta),
+        activation_lora_input_(activation_lora_input),
+        output_(output),
+        lora_ready_event_(lora_ready_event),
+        gemm2_done_event_(gemm2_done_event) {}
+
+  // Returns {output} when do_finalize, else {gemm2_output, expert_weights,
+  // expanded_idx_to_permuted_idx} for a downstream finalize kernel.
+  Array<Tensor>
+  run(int64_t num_experts,
+      int64_t top_k,
+      int64_t intermediate_size,
+      int64_t local_expert_offset,
+      int64_t local_num_experts,
+      double routed_scaling_factor,
+      int64_t routing_method_type,
+      int64_t tile_tokens_dim,
+      bool norm_topk_prob,
+      bool do_finalize,
+      bool enable_pdl) {
+    namespace moe_ns = tensorrt_llm::kernels::trtllmgen_moe;
+    auto device = hidden_states_.device();
+    int dev_id = device.device_id;
+    cudaStream_t stream = get_stream(device);
+
+    int64_t const num_tokens = hidden_states_.size(0);
+    int64_t const hidden_size = hidden_states_.size(1);
+    int64_t const inter = intermediate_size;
+    int64_t const gate_up_n = 2 * inter;  // gated SwiGLU
+
+    // ---- 1) routing (precomputed packed topk) — identical to the FP4 lora path ----
+    Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, device);
+    int32_t max_num_padded_tokens =
+        moe_ns::Routing::getMaxPermutedPaddedCount(num_tokens, top_k, num_experts, tile_tokens_dim);
+    Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, device);
+    Tensor expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
+    Tensor permuted_idx_to_token_idx = alloc_tensor({max_num_padded_tokens}, dl_int32, device);
+    int64_t const hist_size = std::max<int64_t>(num_experts * 2, 256 * 2);
+    Tensor expert_count_histogram = alloc_tensor({hist_size}, dl_int32, device);
+    int32_t max_num_ctas = moe_ns::Routing::getMaxNumCtasInBatchDim(num_tokens, top_k, num_experts, tile_tokens_dim);
+    Tensor cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, device);
+    Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, device);
+    Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, device);
+
+    auto routing_bias_dtype = routing_bias_.has_value() ? routing_bias_.value().dtype() : dl_bfloat16;
+    btg::Dtype mRoutingBiasDtype = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
+
+    auto ew_dtype = mRoutingBiasDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
+    Tensor expert_weights_alloc = alloc_tensor({num_tokens, top_k}, ew_dtype, device);
+    void* expert_weights_ptr = expert_weights_alloc.data_ptr();
+
+    moe_ns::Routing::Runner routing_runner(tile_tokens_dim);
+    routing_runner.run(
+        /*routing_logits=*/nullptr,
+        routing_bias_.has_value() ? routing_bias_.value().data_ptr() : nullptr,
+        num_tokens,
+        num_experts,
+        top_k,
+        /*n_group=*/0,
+        /*topk_group=*/0,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        static_cast<int*>(const_cast<void*>(expert_indices_.data_ptr())),
+        static_cast<int*>(expert_count_histogram.data_ptr()),
+        static_cast<int*>(total_num_padded_tokens.data_ptr()),
+        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+        /*permuted_idx_to_expanded_idx=*/nullptr,
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+        /*expertIds=*/nullptr,
+        expert_weights_ptr,
+        static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()),
+        btg::Dtype::Bfloat16,
+        mRoutingBiasDtype,
+        /*useRoutingScalesOnInput=*/false,
+        /*useDeepSeekFp8=*/false,
+        static_cast<RoutingMethodType>(routing_method_type),
+        stream,
+        btg::Dtype::Bfloat16,
+        norm_topk_prob,
+        /*routing_replay_out=*/nullptr);
+
+    int64_t const tile = tile_tokens_dim;
+
+    // ---- 2+3) permute (gather) bf16 hidden + gate_up GEMM ----
+    // The permuted gather buffer ([max_padded, hidden] bf16) lives only inside this block: it
+    // frees right after the gate_up GEMM is enqueued (stream-ordered caching allocator), before
+    // the equally-large gemm2_output is allocated — same peak-memory trick as the FP4 path.
+    Tensor gate_up_bf16 = alloc_tensor({max_num_padded_tokens, gate_up_n}, dl_bfloat16, device);
+    {
+      Tensor permuted_hidden_bf16 = alloc_tensor({max_num_padded_tokens, hidden_size}, dl_bfloat16, device);
+      // Padding rows intentionally left uninitialized — never reach a valid output (see the FP4
+      // path's rationale; finalize gathers only real tokens via the index map).
+      {
+        moe::dev::permute::Data permData;
+        permData.mDtypeElt = btg::Dtype::Bfloat16;
+        permData.mUsePdl = false;
+        permData.mUseDeepSeekFp8 = false;
+        permData.inPtr = hidden_states_.data_ptr();
+        permData.outPtr = permuted_hidden_bf16.data_ptr();
+        permData.inDqSfsPtr = nullptr;
+        permData.outDqSfsPtr = nullptr;
+        permData.expandedIdxToPermutedIdx = static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
+        permData.hiddenDim = hidden_size;
+        permData.numTokens = num_tokens;
+        permData.topK = top_k;
+        permData.totalNumPaddedTokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
+        moe::dev::permute::run(permData, stream);
+      }
+
+      // gate_up GEMM: raw Gemm2::Runner(Bf16,Bf16,Bf16, K=hidden, N=2*inter). The gated w13
+      // weight makes the output columns pairwise-INTERLEAVED (g0,u0,g1,u1,...) — the activation
+      // below de-interleaves on read (interleavedGateUpInput), same as the FP4 path. Weights are
+      // the plain bf16 path's prepared tensors: shuffled + BlockMajorK (NOT MajorK like FP4's
+      // packed-fp4 weights).
+      moe_ns::Gemm2::Runner gemm_gate_up(
+          btg::Dtype::Bfloat16,
+          btg::Dtype::Bfloat16,
+          btg::Dtype::Bfloat16,
+          /*useDeepSeekFp8=*/false,
+          (int)tile,
+          /*useShuffledMatrix=*/true,
+          batchedGemm::gemm::MatrixLayout::BlockMajorK,
+          /*usePerTokenScaling=*/false,
+          /*usePerChannelScaling=*/false);
+      int64_t cfg =
+          gemm_gate_up.getDefaultValidConfigIndex(top_k, hidden_size, gate_up_n, local_num_experts, num_tokens);
+      size_t ws =
+          gemm_gate_up.getWorkspaceSizeInBytes(top_k, hidden_size, gate_up_n, local_num_experts, num_tokens, cfg);
+      Tensor gemm_ws = alloc_tensor({(int64_t)ws}, dl_int8, device);
+      // Gemm2::Runner semantics: hiddenSize is the OUTPUT N dim, intermediateSize is the K dim.
+      gemm_gate_up.run(
+          permuted_hidden_bf16.data_ptr(),
+          /*hiddenStateScale=*/nullptr,
+          gemm1_weights_.data_ptr(),
+          /*weightScale=*/nullptr,
+          /*perTokenScales=*/nullptr,
+          /*perChannelScales=*/nullptr,
+          /*scaleC=*/nullptr,
+          /*ptrBias=*/nullptr,
+          gate_up_bf16.data_ptr(),
+          /*outputScale=*/nullptr,
+          top_k,
+          /*hiddenSize(N)=*/gate_up_n,
+          /*intermediateSize(K)=*/hidden_size,
+          local_num_experts,
+          num_tokens,
+          static_cast<int*>(num_non_exiting_ctas.data_ptr()),
+          static_cast<int*>(total_num_padded_tokens.data_ptr()),
+          static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+          static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+          gemm_ws.data_ptr(),
+          dev_id,
+          stream,
+          (int)cfg,
+          enable_pdl);
+    }  // permuted_hidden_bf16 frees here -> its block is reused by gemm2_output below.
+
+    // GEMM1-LoRA overlap: wait the side-stream LoRA event that produced the gate_up_lora_delta
+    // consumed by the activation below, so the gate_up GEMM above overlaps the side-stream
+    // LoRA shrink/expand. No-op (0) on the single-stream path.
+    if (lora_ready_event_ != 0) {
+      cudaStreamWaitEvent(stream, reinterpret_cast<cudaEvent_t>(lora_ready_event_), 0);
+    }
+
+    // ---- 4) activation (SwiGLU + gate_up LoRA delta, bf16 -> bf16, NO quant) ----
+    // Same generic activation kernel the FP4 lora path uses in its non-fused mode: bf16 in,
+    // de-interleave on read, add gate_up_lora_delta pre-SwiGLU, capture activation_lora_input
+    // (by EXPANDED idx, for the python-side down-proj LoRA shrink), bf16 out (by permuted idx).
+    auto envFlag = [](char const* name) {
+      char const* e = std::getenv(name);
+      return e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
+    };
+    static int const actOptMode = envFlag("SGLANG_OPT_FUSED_MOE_ACTIVATION_VEC") ? 1 : 0;
+
+    Tensor activated_bf16 = alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
+    {
+      moe::dev::activation::Data actData;
+      actData.mDtypeElt = btg::Dtype::Bfloat16;
+      actData.mUsePdl = false;
+      actData.mUseDeepSeekFp8 = false;
+      actData.inPtr = gate_up_bf16.data_ptr();
+      actData.interleavedGateUpInput = true;
+      actData.outPtr = activated_bf16.data_ptr();
+      actData.inDqSfsPtr = nullptr;
+      actData.outDqSfsPtr = nullptr;
+      actData.gateUpLoraDeltaPtr = static_cast<cutlass::bfloat16_t const*>(gate_up_lora_delta_.data_ptr());
+      actData.activationLoraInputOutPtr = static_cast<cutlass::bfloat16_t*>(activation_lora_input_.data_ptr());
+      actData.innerDim = gate_up_n;
+      actData.numTokens = num_tokens;
+      actData.topK = top_k;
+      actData.expandedIdxToPermutedIdx = static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
+      actData.totalNumPaddedTokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
+      actData.actOptMode = actOptMode;
+      moe::dev::activation::run(actData, stream);
+    }
+
+    // ---- 5) down GEMM: Gemm2::Runner(Bf16,Bf16,Bf16, K=inter, N=hidden) ----
+    Tensor gemm2_output = alloc_tensor({max_num_padded_tokens, hidden_size}, dl_bfloat16, device);
+    {
+      moe_ns::Gemm2::Runner gemm_down(
+          btg::Dtype::Bfloat16,
+          btg::Dtype::Bfloat16,
+          btg::Dtype::Bfloat16,
+          /*useDeepSeekFp8=*/false,
+          (int)tile,
+          /*useShuffledMatrix=*/true,
+          batchedGemm::gemm::MatrixLayout::BlockMajorK,
+          /*usePerTokenScaling=*/false,
+          /*usePerChannelScaling=*/false);
+      int64_t cfg = gemm_down.getDefaultValidConfigIndex(top_k, hidden_size, inter, local_num_experts, num_tokens);
+      size_t ws = gemm_down.getWorkspaceSizeInBytes(top_k, hidden_size, inter, local_num_experts, num_tokens, cfg);
+      Tensor gemm_ws = alloc_tensor({(int64_t)ws}, dl_int8, device);
+      gemm_down.run(
+          activated_bf16.data_ptr(),
+          /*hiddenStateScale=*/nullptr,
+          gemm2_weights_.data_ptr(),
+          /*weightScale=*/nullptr,
+          /*perTokenScales=*/nullptr,
+          /*perChannelScales=*/nullptr,
+          /*scaleC=*/nullptr,
+          /*ptrBias=*/nullptr,
+          gemm2_output.data_ptr(),
+          /*outputScale=*/nullptr,
+          top_k,
+          /*hiddenSize(N)=*/hidden_size,
+          /*intermediateSize(K)=*/inter,
+          local_num_experts,
+          num_tokens,
+          static_cast<int*>(num_non_exiting_ctas.data_ptr()),
+          static_cast<int*>(total_num_padded_tokens.data_ptr()),
+          static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+          static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+          gemm_ws.data_ptr(),
+          dev_id,
+          stream,
+          (int)cfg,
+          enable_pdl);
+    }
+
+    // Down-LoRA/finalize overlap: signal "base down GEMM done" so the LoRA side stream can
+    // start the down-proj LoRA shrink/expand concurrent with the finalize below. 0 = no-op.
+    if (gemm2_done_event_ != 0) {
+      cudaEventRecord(reinterpret_cast<cudaEvent_t>(gemm2_done_event_), stream);
+    }
+
+    if (!do_finalize) {
+      return {gemm2_output, expert_weights_alloc, expanded_idx_to_permuted_idx};
+    }
+
+    // ---- 6) finalize (combine by expert weight) -> output [num_tokens, hidden] ----
+    {
+      moe::dev::finalize::Data finData;
+      finData.mDtypeElt = btg::Dtype::Bfloat16;
+      finData.mDtypeExpW = mRoutingBiasDtype;
+      finData.mUsePdl = false;
+      finData.mUseDeepSeekFp8 = false;
+      finData.inPtr = gemm2_output.data_ptr();
+      finData.outPtr = output_.data_ptr();
+      finData.inDqSfsPtr = nullptr;
+      finData.outDqSfsPtr = nullptr;
+      finData.expertWeightsPtr = expert_weights_ptr;
+      finData.expandedIdxToPermutedIdx = static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
+      finData.numTokens = num_tokens;
+      finData.numExperts = num_experts;
+      finData.topK = top_k;
+      finData.hiddenDim = hidden_size;
+      finData.hiddenDimPadded = hidden_size;
+      finData.totalNumPaddedTokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
+      moe::dev::finalize::run(finData, stream);
+    }
+    sync_check_cuda_error(stream);
+    return Array<Tensor>();
+  }
+
+ private:
+  TensorView expert_indices_;
+  Optional<TensorView> routing_bias_;
+  TensorView hidden_states_;
+  TensorView gemm1_weights_;
+  TensorView gemm2_weights_;
+  TensorView gate_up_lora_delta_;
+  TensorView activation_lora_input_;
+  TensorView output_;
+  int64_t lora_ready_event_ = 0;
+  int64_t gemm2_done_event_ = 0;
+};
+
+Array<Tensor> sgl_trtllm_bf16_routed_moe_lora(
+    TensorView expert_indices,
+    Optional<TensorView> routing_bias,
+    TensorView hidden_states,
+    TensorView gemm1_weights,
+    TensorView gemm2_weights,
+    int64_t num_experts,
+    int64_t top_k,
+    int64_t intermediate_size,
+    int64_t local_expert_offset,
+    int64_t local_num_experts,
+    Optional<double> routed_scaling_factor,
+    int64_t routing_method_type,
+    bool do_finalize,
+    bool enable_pdl,
+    int64_t act_type,
+    TensorView output,
+    bool norm_topk_prob,
+    TensorView gate_up_lora_delta,
+    TensorView activation_lora_input,
+    int64_t lora_ready_event,
+    int64_t gemm2_done_event) {
+  auto activation_type = validateAndCastActivationType(act_type);
+  TVM_FFI_ICHECK(isGatedActivation(activation_type))
+      << "sgl_trtllm_bf16_routed_moe_lora currently supports gated (SwiGLU) activation only.";
+
+  // Precomputed routing is required (packed topk_ids).
+  TVM_FFI_ICHECK(expert_indices.ndim() == 2 && expert_indices.size(0) == hidden_states.size(0))
+      << "bf16 LoRA requires precomputed packed expert_indices [num_tokens, top_k].";
+  TVM_FFI_ICHECK_EQ(expert_indices.dtype(), dl_int32) << "expert_indices must be int32.";
+  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16) << "bf16 LoRA: hidden_states must be bf16.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_bfloat16) << "bf16 LoRA: gemm1_weights must be bf16.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_bfloat16) << "bf16 LoRA: gemm2_weights must be bf16.";
+  TVM_FFI_ICHECK_EQ(intermediate_size % 128, 0)
+      << "bf16 LoRA: intermediate_size must be a multiple of 128 (BlockMajorK weights).";
+  TVM_FFI_ICHECK_EQ(gate_up_lora_delta.dtype(), dl_bfloat16) << "gate_up_lora_delta must be bf16.";
+  TVM_FFI_ICHECK_EQ(gate_up_lora_delta.ndim(), 3)
+      << "gate_up_lora_delta must be [num_tokens, top_k, 2*intermediate_size].";
+  TVM_FFI_ICHECK_EQ(gate_up_lora_delta.size(2), 2 * intermediate_size);
+  TVM_FFI_ICHECK_EQ(activation_lora_input.dtype(), dl_bfloat16) << "activation_lora_input must be bf16.";
+  TVM_FFI_ICHECK_EQ(activation_lora_input.ndim(), 3)
+      << "activation_lora_input must be [num_tokens, top_k, intermediate_size].";
+  TVM_FFI_ICHECK_EQ(activation_lora_input.size(2), intermediate_size);
+  TVM_FFI_ICHECK(gate_up_lora_delta.IsContiguous() && activation_lora_input.IsContiguous())
+      << "lora bridge buffers must be contiguous.";
+
+  int64_t const num_tokens = hidden_states.size(0);
+  int64_t const tile_tokens_dim =
+      selectDefaultTileN(Bf16LoraLauncher::getSupportedTileNums(), num_tokens, top_k, local_num_experts);
+
+  Bf16LoraLauncher launcher(
+      expert_indices,
+      routing_bias,
+      hidden_states,
+      gemm1_weights,
+      gemm2_weights,
+      gate_up_lora_delta,
+      activation_lora_input,
+      output,
+      lora_ready_event,
+      gemm2_done_event);
+  return launcher.run(
+      num_experts,
+      top_k,
+      intermediate_size,
+      local_expert_offset,
+      local_num_experts,
+      routed_scaling_factor.value_or(1.0),
+      routing_method_type,
+      tile_tokens_dim,
+      norm_topk_prob,
+      do_finalize,
+      enable_pdl);
+}
+
 Array<Tensor> trtllm_mxint4_block_scale_moe(
     TensorView routing_logits,
     Optional<TensorView> routing_bias,
@@ -3951,6 +4363,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp8_block_scale_moe_lora, sgl_trtllm_fp
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     sgl_trtllm_fp8_block_scale_moe_lora_finalize, sgl_trtllm_fp8_block_scale_moe_lora_finalize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_bf16_routed_moe_lora, sgl_trtllm_bf16_routed_moe_lora);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sgl_trtllm_fp4_block_scale_moe_lora, sgl_trtllm_fp4_block_scale_moe_lora);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     sgl_trtllm_fp4_block_scale_moe_lora_finalize, sgl_trtllm_fp4_block_scale_moe_lora_finalize);
