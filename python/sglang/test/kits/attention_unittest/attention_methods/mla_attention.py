@@ -234,6 +234,9 @@ class MockMLAModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = SimpleNamespace(
+            tp_size=1, dp_size=1, pp_size=1, tp_rank=0, pp_rank=0, dp_rank=0, gpu_id=0
+        )
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()

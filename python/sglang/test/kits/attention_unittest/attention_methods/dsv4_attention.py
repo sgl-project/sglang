@@ -332,6 +332,9 @@ class MockDSV4ModelRunner:
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = SimpleNamespace(
+            tp_size=1, dp_size=1, pp_size=1, tp_rank=0, pp_rank=0, dp_rank=0, gpu_id=0
+        )
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
