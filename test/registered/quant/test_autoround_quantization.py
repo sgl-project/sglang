@@ -80,8 +80,7 @@ class TestAutoRoundQuantization(CustomTestCase):
         # AutoRound saves the quantized checkpoint into a scheme-derived
         # subfolder (e.g. "<model>-w8a8/") under the output dir
         config_found = any(
-            "config.json" in files
-            for _, _, files in os.walk(self.output_dir)
+            "config.json" in files for _, _, files in os.walk(self.output_dir)
         )
         self.assertTrue(
             config_found,
