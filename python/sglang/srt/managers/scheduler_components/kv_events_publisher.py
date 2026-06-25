@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import time
 from dataclasses import dataclass
 from typing import (
@@ -10,13 +9,14 @@ from typing import (
     Optional,
 )
 
+import msgspec
 import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
 )
-from sglang.srt.managers.io_struct import sock_send
+from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -26,8 +26,7 @@ if TYPE_CHECKING:
 class SchedulerStats: ...  # type: ignore[no-redef]
 
 
-@dataclasses.dataclass
-class KvMetrics:
+class KvMetrics(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     request_active_slots: int = 0
     request_total_slots: int = 0
     kv_active_blocks: int = 0
@@ -36,6 +35,9 @@ class KvMetrics:
     gpu_cache_usage_perc: float = 0.0
     gpu_prefix_cache_hit_rate: float = 0.0
     data_parallel_rank: int = 0
+
+
+hook_custom_types(KvMetrics)
 
 
 @dataclass(kw_only=True, slots=True)
