@@ -49,6 +49,9 @@ REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
     "medium": ReasoningEffort.MEDIUM,
     "low": ReasoningEffort.LOW,
+    # harmony has no minimal/none mode: map minimal->low; "none" falls through
+    # to the harmony default via .get() below (CoT can't be turned off).
+    "minimal": ReasoningEffort.LOW,
 }
 
 _harmony_encoding = None
@@ -63,7 +66,9 @@ def get_encoding():
 
 def get_system_message(
     model_identity: Optional[str] = None,
-    reasoning_effort: Optional[Literal["high", "medium", "low"]] = None,
+    reasoning_effort: Optional[
+        Literal["none", "minimal", "high", "medium", "low"]
+    ] = None,
     start_date: Optional[str] = None,
     browser_description: Optional[str] = None,
     python_description: Optional[str] = None,
@@ -72,9 +77,11 @@ def get_system_message(
     if model_identity is not None:
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
     if reasoning_effort is not None:
-        sys_msg_content = sys_msg_content.with_reasoning_effort(
-            REASONING_EFFORT[reasoning_effort]
-        )
+        # ``.get()`` so unsupported values ("none") degrade to the harmony
+        # default instead of raising KeyError.
+        effort = REASONING_EFFORT.get(reasoning_effort)
+        if effort is not None:
+            sys_msg_content = sys_msg_content.with_reasoning_effort(effort)
     if start_date is None:
         start_date = datetime.datetime.now().strftime("%Y-%m-%d")
     sys_msg_content = sys_msg_content.with_conversation_start_date(start_date)

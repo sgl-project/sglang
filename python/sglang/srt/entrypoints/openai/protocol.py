@@ -40,6 +40,7 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseReasoningItem,
+    ResponseTextConfig,
 )
 from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
@@ -47,6 +48,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -1294,9 +1296,12 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = Field(
         default="medium",
-        description="Constrains effort on reasoning for reasoning models.",
+        description=(
+            "Constrains effort on reasoning for reasoning models. "
+            "'none' disables reasoning entirely; 'minimal' is the least effort."
+        ),
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
@@ -1379,7 +1384,12 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    # OpenAI structured outputs: ``text.format`` selects text / json_object /
+    # json_schema. Mapped to SGLang constrained decoding in to_sampling_params.
+    text: Optional[ResponseTextConfig] = None
+    # Accept the object form too, e.g. {"type": "function", "name": "..."};
+    # converted to the chat shape in OpenAIServingResponses._make_request.
+    tool_choice: Union[Literal["auto", "required", "none"], Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
@@ -1387,6 +1397,9 @@ class ResponsesRequest(BaseModel):
     user: Optional[str] = None
 
     # Extra SGLang parameters
+    # Forwarded to the chat template (e.g. {"enable_thinking": false}); also
+    # auto-derived from reasoning.effort == "none". Not used on the harmony path.
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
     request_id: str = Field(
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
@@ -1419,6 +1432,60 @@ class ResponsesRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def normalize_reasoning_to_thinking(cls, values):
+        """Disable thinking via chat_template_kwargs when either:
+        (a) reasoning.effort == "none" (mirrors ChatCompletionRequest), or
+        (b) text.format requests JSON output. A single grammar-constrained
+        generation can't interleave free-form reasoning with structured output:
+        the json schema forbids ``<think>`` tokens, so a force-thinking reasoning
+        parser would capture the whole JSON as reasoning_content and leave
+        output_text empty. Both "thinking" and "enable_thinking" are set because
+        model families differ ("thinking" for deepseek/kimi, "enable_thinking"
+        for qwen3/glm/...)."""
+        if not isinstance(values, dict):
+            return values
+        r = values.get("reasoning")
+        effort = None
+        if isinstance(r, dict):
+            effort = r.get("effort") or r.get("reasoning_effort")
+        elif r is not None:
+            effort = getattr(r, "effort", None)
+
+        text = values.get("text")
+        fmt = (
+            text.get("format")
+            if isinstance(text, dict)
+            else getattr(text, "format", None)
+        )
+        fmt_type = (
+            fmt.get("type") if isinstance(fmt, dict) else getattr(fmt, "type", None)
+        )
+        json_output = fmt_type in ("json_schema", "json_object")
+
+        # A forced tool call (tool_choice "required" or a named-function object)
+        # constrains the whole generation to a tool-call grammar, which — like
+        # json output — can't interleave free-form reasoning; otherwise the
+        # forced output is captured as reasoning_content and no tool call lands.
+        tc = values.get("tool_choice")
+        forced_tool = tc == "required" or (
+            isinstance(tc, dict) and tc.get("type") == "function"
+        )
+
+        if effort == "none" or json_output or forced_tool:
+            existing = values.get("chat_template_kwargs")
+            existing = existing if isinstance(existing, dict) else {}
+            # Build a NEW dict rather than mutating the caller's object in
+            # place; spreading ``existing`` last lets an explicit caller value
+            # win over the disabled defaults.
+            values["chat_template_kwargs"] = {
+                "thinking": False,
+                "enable_thinking": False,
+                **existing,
+            }
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def normalize_responses_input(cls, values):
         if not isinstance(values, dict):
             return values
@@ -1438,11 +1505,19 @@ class ResponsesRequest(BaseModel):
         if not isinstance(item, dict):
             return item
 
+        # A message item carrying inline content plus a string id (as in a
+        # response.output item replayed into input for stateless multi-turn)
+        # would otherwise be coerced to an item-reference and lose its content,
+        # then fail chat validation as an empty {}. Drop the id so it validates
+        # as a plain message; input-item ids are not resolved server-side.
+        if isinstance(item.get("id"), str) and item.get("content") is not None:
+            item = {k: v for k, v in item.items() if k != "id"}
+
         content = item.get("content")
         if not isinstance(content, list):
             return item
 
-        item = item.copy()
+        item = dict(item)
         item["content"] = [
             ResponsesRequest._normalize_content_part_for_validation(part)
             for part in content
@@ -1461,6 +1536,29 @@ class ResponsesRequest(BaseModel):
         part = part.copy()
         part["detail"] = "auto"
         return part
+
+    @staticmethod
+    def _json_schema_from_text_format(
+        text: Optional[ResponseTextConfig],
+    ) -> Optional[str]:
+        """Pure mapping of a Responses ``text.format`` to a SGLang json_schema
+        string, or None when no JSON constraint applies.
+
+        ``json_object`` -> permissive object schema; ``json_schema`` -> the
+        caller's schema; ``text`` (the default) and anything unrecognized -> None.
+        """
+        response_format = getattr(text, "format", None)
+        fmt_type = getattr(response_format, "type", None)
+        if fmt_type == "json_object":
+            return '{"type": "object"}'
+        if fmt_type != "json_schema":
+            return None
+        schema = getattr(response_format, "schema_", None)
+        return convert_json_schema_to_str(schema) if schema is not None else None
+
+    def is_include_output_logprobs(self) -> bool:
+        """Whether the caller asked for per-token output logprobs via include."""
+        return bool(self.include and "message.output_text.logprobs" in self.include)
 
     def to_sampling_params(
         self,
@@ -1514,6 +1612,10 @@ class ResponsesRequest(BaseModel):
             if key not in params or params[key] is None:
                 params[key] = value
 
+        json_schema = self._json_schema_from_text_format(self.text)
+        if json_schema is not None:
+            params["json_schema"] = json_schema
+
         has_existing_constraints = (
             params.get("regex")
             or params.get("ebnf")
@@ -1557,10 +1659,12 @@ class ResponsesResponse(BaseModel):
     output: List[
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
-    status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
+    status: Literal[
+        "queued", "in_progress", "completed", "incomplete", "failed", "cancelled"
+    ]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Union[str, Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
@@ -1582,6 +1686,26 @@ class ResponsesResponse(BaseModel):
     truncation: Optional[str] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_serializer("usage")
+    def _serialize_usage(self, usage: Optional[UsageInfo], _info):
+        """Serialize usage in the Responses API shape (input_tokens /
+        output_tokens / *_tokens_details), not the Chat Completions shape
+        (prompt_tokens / completion_tokens) that UsageInfo carries."""
+        if usage is None:
+            return None
+        cached = (
+            usage.prompt_tokens_details.cached_tokens
+            if usage.prompt_tokens_details
+            else 0
+        )
+        return {
+            "input_tokens": usage.prompt_tokens,
+            "input_tokens_details": {"cached_tokens": cached},
+            "output_tokens": usage.completion_tokens or 0,
+            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+            "total_tokens": usage.total_tokens,
+        }
 
     @classmethod
     def from_request(
@@ -1630,7 +1754,14 @@ class ResponsesResponse(BaseModel):
                     return False
             return True
 
-        text_format = {"format": {"type": "text"}} if _is_text_only(output) else None
+        if request.text is not None:
+            # Echo the requested structured-output format back to the caller.
+            # by_alias keeps the OpenAI wire key "schema" (not the py attr schema_).
+            text_format = request.text.model_dump(by_alias=True, exclude_none=True)
+        else:
+            text_format = (
+                {"format": {"type": "text"}} if _is_text_only(output) else None
+            )
 
         return cls(
             id=request.request_id,
@@ -1648,12 +1779,21 @@ class ResponsesResponse(BaseModel):
             tools=request.tools,
             # fields for parity with v1/responses
             error=None,
-            incomplete_details=None,
+            incomplete_details=(
+                {"reason": "max_output_tokens"} if status == "incomplete" else None
+            ),
             instructions=request.instructions,
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
-                "effort": request.reasoning.effort if request.reasoning else None,
+                # OpenAI's Response.reasoning.effort literal has no "none"
+                # (our request-side extension), and the typed streaming event
+                # wrappers validate against it — echo None instead of "none".
+                "effort": (
+                    request.reasoning.effort
+                    if request.reasoning and request.reasoning.effort != "none"
+                    else None
+                ),
                 "summary": None,  # unused
             },
             store=request.store,
@@ -1689,6 +1829,8 @@ class MessageProcessingResult:
         modalities: List of modality types present in the messages
         stop: Combined stop strings from template and request
         tool_call_constraint: Optional constraint for structured tool calls
+        skip_special_tokens: Whether the engine should strip special tokens when
+            detokenizing (False keeps tool-call/harmony markers for parsing)
     """
 
     prompt: str
@@ -1699,6 +1841,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    skip_special_tokens: bool = True
 
 
 class ToolCallProcessingResult(NamedTuple):
