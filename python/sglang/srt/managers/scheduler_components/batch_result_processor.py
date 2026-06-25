@@ -708,7 +708,6 @@ class SchedulerBatchResultProcessor:
                 req.hidden_states.extend(
                     logits_output.hidden_states[start : start + accept_len]
                     .cpu()
-                    .clone()
                     .tolist()
                 )
 
