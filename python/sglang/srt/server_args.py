@@ -1896,6 +1896,13 @@ class ServerArgs:
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
+    host_kvcache_allocator: A[
+        str,
+        Arg(
+            help="The allocator type for the host KV cache memory pool (default or shm).",
+            choices=["default", "shm"],
+        ),
+    ] = "default"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
