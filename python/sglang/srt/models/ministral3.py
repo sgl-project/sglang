@@ -44,14 +44,14 @@ class Ministral3Attention(LlamaAttention):
             hidden_size,
             num_heads,
             num_kv_heads,
-            layer_id,
-            rope_theta,
-            rope_scaling,
-            rope_is_neox_style,
-            max_position_embeddings,
-            quant_config,
-            prefix,
-            bias,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            rope_is_neox_style=rope_is_neox_style,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
+            prefix=prefix,
+            bias=bias,
         )
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
@@ -96,7 +96,7 @@ class Ministral3Attention(LlamaAttention):
 
 class Ministral3DecoderLayer(LlamaDecoderLayer):
     def __init__(self, config, layer_id=0, quant_config=None, prefix=""):
-        super().__init__(config, layer_id, quant_config, prefix)
+        super().__init__(config, layer_id=layer_id, quant_config=quant_config, prefix=prefix)
         self.self_attn = Ministral3Attention(
             config=config,
             hidden_size=self.hidden_size,

@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     is_musa,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -50,6 +51,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -77,6 +79,29 @@ if _is_cuda or _is_musa:
     from sglang.jit_kernel.per_token_group_quant_8bit_v2 import (
         per_token_group_quant_8bit_v2 as sgl_per_token_group_quant_8bit_jit_v2,
     )
+
+if _is_xpu:
+    # XPU fallbacks using pure PyTorch ops (no CUDA jit kernels available)
+    def sgl_per_token_quant_fp8(input, output, scale):
+        fp8_max_val = torch.finfo(output.dtype).max
+        eps = 1e-12
+        absmax = input.abs().max(dim=1, keepdim=True).values
+        absmax = torch.clamp(absmax, min=eps)
+        scale_val = absmax / fp8_max_val
+        scale.copy_(scale_val)
+        output.copy_(torch.clamp(input / scale_val, -fp8_max_val, fp8_max_val).to(output.dtype))
+
+    def sgl_per_tensor_quant_fp8(input, output, scale, is_static=False):
+        fp8_max_val = torch.finfo(output.dtype).max
+        if is_static:
+            output.copy_(torch.clamp(input / scale, -fp8_max_val, fp8_max_val).to(output.dtype))
+        else:
+            eps = 1e-12
+            absmax = input.abs().max()
+            absmax = torch.clamp(absmax, min=eps)
+            scale_val = absmax / fp8_max_val
+            scale.view(-1).copy_(scale_val.view(-1))
+            output.copy_(torch.clamp(input / scale_val, -fp8_max_val, fp8_max_val).to(output.dtype))
 
 if _is_hip:
     _has_vllm = False
