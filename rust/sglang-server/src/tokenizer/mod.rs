@@ -2,10 +2,10 @@
 //! executor). Each worker pulls a `Request` from the shared `flume` receiver,
 //! fills `input_ids`, and moves the request back to the TokenizerManager inbox.
 //!
-//! The text→ids step is behind [`TextTokenizer`]. The real backend is
-//! [`DynamoTokenizer`] (dynamo-tokenizers: HuggingFace / tiktoken / fastokens);
-//! [`StubTokenizer`] is the byte fallback used when no tokenizer path is
-//! configured or it fails to load, so the pipeline still runs end-to-end.
+//! The text→ids step is behind [`TextTokenizer`], implemented by
+//! [`DynamoTokenizer`] (dynamo-tokenizers: HuggingFace / tiktoken / fastokens).
+//! A non-skip server requires a real tokenizer (enforced at startup); under
+//! `skip_tokenizer_init` the pool isn't spawned at all.
 //!
 //! Mirrors the Python `_tokenize_one_request` text path: when the request
 //! already carries `input_ids` it skips tokenization (handled upstream in the
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::error::Error;
 use crate::fsm::Event;
 use crate::message::{EgressItem, Request, RequestKind};
+use crate::runtime::Runnable;
 use crate::runtime::channels::TmEvent;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -25,18 +26,30 @@ pub trait TextTokenizer: Send + Sync {
     fn encode(&self, text: &str) -> Result<Vec<i32>, Error>;
 }
 
-/// Load a dynamo-tokenizers `Tokenizer`. `path` may be:
+/// Load the tokenizer shared by the tokenizer pool (encode) and the detok shards
+/// (decode). `None` under `skip_tokenizer_init`; otherwise a real tokenizer is
+/// required, so a missing path or a failed load is an `Err` (the detok backend
+/// defaults to `Dynamo` — `Skip` is reserved for skip mode). Loaded once and
+/// shared (it is `Clone`/Arc-backed) by both pools.
+///
+/// `tokenizer_path` may be:
 ///   * a tokenizer file (`tokenizer.json` for HF, `.model`/`.tiktoken`),
 ///   * a model directory containing `tokenizer.json`, or
 ///   * an HF Hub repo id (e.g. `Qwen/Qwen3-0.6B-FP8`) — resolved to its
 ///     already-downloaded local `tokenizer.json` via the HF cache (no network).
-///
-/// Loaded once and shared (it is `Clone`/Arc-backed) by both the tokenizer pool
-/// and the detokenizer shards.
 pub fn load_tokenizer(
-    path: &str,
+    tokenizer_path: Option<&str>,
     revision: Option<&str>,
-) -> Result<dynamo_tokenizers::Tokenizer, Error> {
+    skip_tokenizer_init: bool,
+) -> Result<Option<dynamo_tokenizers::Tokenizer>, String> {
+    if skip_tokenizer_init {
+        tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
+        return Ok(None);
+    }
+    let path = tokenizer_path.ok_or_else(|| {
+        "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
+    })?;
+
     let p = Path::new(path);
     let file = if p.is_dir() {
         p.join("tokenizer.json").to_string_lossy().into_owned()
@@ -44,10 +57,12 @@ pub fn load_tokenizer(
         path.to_string()
     } else {
         // Not a local path → treat as an HF Hub repo id.
-        resolve_from_hub_cache(path, revision)?
+        resolve_from_hub_cache(path, revision).map_err(|e| e.to_string())?
     };
-    dynamo_tokenizers::Tokenizer::from_file(&file)
-        .map_err(|e| Error::Tokenize(format!("load tokenizer {file}: {e}")))
+    let tokenizer = dynamo_tokenizers::Tokenizer::from_file(&file)
+        .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
+    tracing::info!(%path, "loaded tokenizer");
+    Ok(Some(tokenizer))
 }
 
 /// Locate `tokenizer.json` for an HF Hub repo id in the local cache (shared with
@@ -100,44 +115,50 @@ impl TextTokenizer for DynamoTokenizer {
     }
 }
 
-/// Byte fallback: maps each UTF-8 byte to an id. Lets the pipeline run before a
-/// real tokenizer is configured. Not a valid tokenization for any model.
-pub struct StubTokenizer;
-
-impl TextTokenizer for StubTokenizer {
-    fn encode(&self, text: &str) -> Result<Vec<i32>, Error> {
-        if text.is_empty() {
-            return Err(Error::Tokenize("empty input text".into()));
-        }
-        Ok(text.bytes().map(|b| b as i32).collect())
-    }
-}
-
-/// One worker iteration loop. `rx` is cloned per worker (MPMC), `tm` is the
-/// return path to the TokenizerManager inbox, `tokenizer` is the shared backend.
-pub fn run_worker(
+/// One tokenizer worker: pulls a `Request` off the shared MPMC inbox, fills its
+/// `input_ids`, and returns it to the TokenizerManager. Spawned (pinned) per
+/// worker as a [`Runnable`]; the `tokenizer` backend is shared read-only across
+/// all workers.
+pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
     tokenizer: Arc<dyn TextTokenizer>,
-) {
-    while let Ok(mut req) = rx.recv() {
-        // The tokenizer pool only ever receives generate requests (control
-        // requests skip tokenization in the ingress `classify`).
-        let RequestKind::Generate(g) = &mut req.kind else {
-            tracing::error!("tokenizer pool received a non-generate request");
-            continue;
-        };
-        match tokenizer.encode(g.payload.text.as_deref().unwrap_or("")) {
-            Ok(ids) => {
-                g.input_ids = Some(ids);
-                if tm.send(TmEvent::Tokenized(req)).is_err() {
-                    tracing::error!("tm inbox closed; dropping tokenized request");
-                    break;
+}
+
+impl TokenizerWorker {
+    pub fn new(
+        rx: flume::Receiver<Request>,
+        tm: flume::Sender<TmEvent>,
+        tokenizer: Arc<dyn TextTokenizer>,
+    ) -> Self {
+        Self { rx, tm, tokenizer }
+    }
+}
+
+impl Runnable for TokenizerWorker {
+    fn run(self) {
+        while let Ok(mut req) = self.rx.recv() {
+            // The tokenizer pool only ever receives generate requests (control
+            // requests skip tokenization in the ingress `classify`).
+            let RequestKind::Generate(g) = &mut req.kind else {
+                tracing::error!("tokenizer pool received a non-generate request");
+                continue;
+            };
+            match self
+                .tokenizer
+                .encode(g.payload.text.as_deref().unwrap_or(""))
+            {
+                Ok(ids) => {
+                    g.input_ids = Some(ids);
+                    if self.tm.send(TmEvent::Tokenized(req)).is_err() {
+                        tracing::error!("tm inbox closed; dropping tokenized request");
+                        break;
+                    }
                 }
-            }
-            Err(e) => {
-                let _ = req.state.apply(Event::Error(e.clone()));
-                let _ = req.sink.try_send(EgressItem::Error(e));
+                Err(e) => {
+                    let _ = req.state.apply(Event::Error(e.clone()));
+                    let _ = req.sink.try_send(EgressItem::Error(e));
+                }
             }
         }
     }

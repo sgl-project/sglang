@@ -7,8 +7,9 @@
 //! Real detokenization uses dynamo-tokenizers' `DecodeStream`, a stateful
 //! incremental decoder (TGI/vLLM-style: it buffers partial UTF-8 / byte-fallback
 //! tokens and only emits text once a valid boundary is reached). Each request
-//! gets its own `DecodeStream`. `StubDecoder` (bytes) is the fallback when no
-//! tokenizer is configured.
+//! gets its own `DecodeStream`. When no tokenizer is configured (or
+//! `skip_tokenizer_init` is set) the backend is `Skip`: no decoding, the raw
+//! `output_ids` are emitted instead of text.
 //!
 //! Per-chunk egress flow (no FSM state change inside Streaming):
 //!   ChunkEvent{finish:None}  -> step ids -> delta -> Server frame
@@ -22,11 +23,12 @@ use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::RequestId;
 use crate::message::{ChunkEvent, EgressItem, EgressSink};
+use crate::runtime::Runnable;
 use crate::runtime::channels::DetokMsg;
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
 /// per-request value isn't available on the egress side yet; see the note in
-/// `DetokBackend::new_stream`.
+/// `DetokenizerBackend::new_decoder`.
 const SKIP_SPECIAL_TOKENS: bool = true;
 
 /// Per-request incremental decoder. `step` feeds the new token ids for one chunk
@@ -57,41 +59,30 @@ impl StreamDecoder for DynamoDecoder {
     }
 }
 
-/// Byte fallback: inverse of `tokenizer::StubTokenizer`.
-struct StubDecoder;
-
-impl StreamDecoder for StubDecoder {
-    fn step(&mut self, token_ids: &[i32]) -> Result<String, Error> {
-        let bytes: Vec<u8> = token_ids.iter().map(|&id| id as u8).collect();
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-}
-
 /// Shard-wide detok backend. Cloned per shard; mints a fresh per-request decoder
 /// on each `Register`.
 #[derive(Clone)]
-pub enum DetokBackend {
+pub enum DetokenizerBackend {
     Dynamo(dynamo_tokenizers::Tokenizer),
-    Stub,
-    /// `skip_tokenizer_init`: no decoding at all — the shard accumulates raw
-    /// output token ids and emits them as `output_ids` (no `DecodeStream`).
-    SkipDetok,
+    /// No decoding at all — the shard accumulates the raw output token ids and
+    /// emits them as `output_ids` (no `DecodeStream`). Used for
+    /// `skip_tokenizer_init` and when no tokenizer is configured.
+    Skip,
 }
 
-impl DetokBackend {
-    /// Mint a per-request decoder, or `None` in skip-detok mode (the shard
-    /// passes token ids through untouched instead of decoding text).
+impl DetokenizerBackend {
+    /// Mint a per-request decoder, or `None` in skip mode (the shard passes the
+    /// token ids through untouched instead of decoding text).
     fn new_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
         match self {
             // NOTE: the stream is seeded with an empty prompt context, which is
             // correct for the common case. Seeding with the prompt's trailing
             // tokens (for perfect first-token spacing) would require Register to
             // carry input_ids — deferred.
-            DetokBackend::Dynamo(t) => Some(Box::new(DynamoDecoder {
+            DetokenizerBackend::Dynamo(t) => Some(Box::new(DynamoDecoder {
                 stream: t.decode_stream(&[], SKIP_SPECIAL_TOKENS),
             })),
-            DetokBackend::Stub => Some(Box::new(StubDecoder)),
-            DetokBackend::SkipDetok => None,
+            DetokenizerBackend::Skip => None,
         }
     }
 }
@@ -115,29 +106,46 @@ struct DetokState {
     fsm: RequestState,
 }
 
-pub fn run_shard(shard: usize, rx: flume::Receiver<DetokMsg>, backend: DetokBackend) {
-    let mut table: HashMap<RequestId, DetokState> = HashMap::new();
-    tracing::debug!(shard, "detok shard started");
+/// One detokenizer shard: owns a *local* `id -> DetokState` map (single
+/// accessor, no lock) and the egress backend. Spawned (pinned) per shard as a
+/// [`Runnable`]; a given `RequestId` is routed to exactly one shard.
+pub struct DetokenizerWorker {
+    shard: usize,
+    rx: flume::Receiver<DetokMsg>,
+    backend: DetokenizerBackend,
+}
 
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            DetokMsg::Register { id, sink, stream } => {
-                table.insert(
-                    id,
-                    DetokState {
-                        sink,
-                        stream,
-                        text: String::new(),
-                        output_ids: Vec::new(),
-                        completion_tokens: 0,
-                        decoder: backend.new_decoder(),
-                        // Registered == handed to the scheduler == Queued.
-                        fsm: RequestState::Queued,
-                    },
-                );
+impl DetokenizerWorker {
+    pub fn new(shard: usize, rx: flume::Receiver<DetokMsg>, backend: DetokenizerBackend) -> Self {
+        Self { shard, rx, backend }
+    }
+}
+
+impl Runnable for DetokenizerWorker {
+    fn run(self) {
+        let mut table: HashMap<RequestId, DetokState> = HashMap::new();
+        tracing::debug!(shard = self.shard, "detokenizer worker started");
+
+        while let Ok(msg) = self.rx.recv() {
+            match msg {
+                DetokMsg::Register { id, sink, stream } => {
+                    table.insert(
+                        id,
+                        DetokState {
+                            sink,
+                            stream,
+                            text: String::new(),
+                            output_ids: Vec::new(),
+                            completion_tokens: 0,
+                            decoder: self.backend.new_decoder(),
+                            // Registered == handed to the scheduler == Queued.
+                            fsm: RequestState::Queued,
+                        },
+                    );
+                }
+                DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev),
+                DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
             }
-            DetokMsg::Chunk(ev) => handle_chunk(&mut table, ev),
-            DetokMsg::Result { id, payload } => handle_result(&mut table, id, payload),
         }
     }
 }

@@ -119,9 +119,10 @@ impl Server {
             revision,
             server_args,
         };
-        Ok(Server {
-            rt: runtime::start(cfg),
-        })
+        let rt = runtime::start(cfg).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("runtime start failed: {e}"))
+        })?;
+        Ok(Server { rt })
     }
 
     /// Non-blocking drain of the ingress ring. Returns up to `max` msgpack

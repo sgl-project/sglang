@@ -42,8 +42,8 @@ pub struct RuntimeConfig {
     /// core this process is allowed on (`sched_getaffinity`).
     pub cores: Option<Vec<usize>>,
     /// Path to a `tokenizer.json` (or a model dir containing one, a tiktoken
-    /// model file, or an HF Hub repo id resolved via the local cache). `None` →
-    /// byte-stub tokenizer (tests / no real model).
+    /// model file, or an HF Hub repo id resolved via the local cache). `None`
+    /// requires `skip_tokenizer_init`; otherwise startup is a hard error.
     pub tokenizer_path: Option<String>,
     /// HF revision used only when `tokenizer_path` is a repo id. `None` → main.
     pub revision: Option<String>,
@@ -131,7 +131,7 @@ impl ServerArgs {
     }
 
     /// Tokenizer source: explicit `tokenizer_path`, falling back to `model_path`
-    /// (a model dir / HF repo id the Rust backend resolves). `None` → byte stub.
+    /// (a model dir / HF repo id the Rust backend resolves). `None` → no tokenizer.
     /// Mirrors the Python `server_args.tokenizer_path or server_args.model_path`.
     pub fn tokenizer_path(&self) -> Option<String> {
         self.str_field("tokenizer_path")
@@ -160,7 +160,7 @@ impl ServerArgs {
 
     /// `skip_tokenizer_init`: when set the server neither tokenizes input nor
     /// detokenizes output — clients send token ids and receive token ids back.
-    /// Drives the detok backend (`SkipDetok`, raw `output_ids` frames) and the
+    /// Drives the detok backend (`Skip`, raw `output_ids` frames) and the
     /// ingress branch (already-tokenized only). Read from the dumped blob so it
     /// stays a single source of truth with the rest of `server_args`.
     pub fn skip_tokenizer_init(&self) -> bool {
@@ -270,37 +270,43 @@ fn pin_current(core: Option<core_affinity::CoreId>) {
     }
 }
 
-/// Spawn `n` pinned OS threads running `f(worker_index)`.
-fn spawn_pinned_pool<F>(
+/// A pipeline stage that owns its channel handles + config and runs a blocking
+/// loop until its inbox closes. Lets the runtime spawn stages uniformly via
+/// [`spawn_stage`] instead of calling free `run_*` functions with positional
+/// handles. Implemented by the TokenizerManager router threads (ingress/egress).
+pub trait Runnable: Send + 'static {
+    fn run(self);
+}
+
+/// Spawn a [`Runnable`] stage on a named thread, optionally pinned to `core`.
+fn spawn_stage(
     name: &str,
-    n: usize,
-    cores: Option<Vec<core_affinity::CoreId>>,
+    core: Option<core_affinity::CoreId>,
+    stage: impl Runnable,
     threads: &mut Vec<JoinHandle<()>>,
-    f: F,
-) where
-    F: Fn(usize) + Send + Sync + 'static,
-{
-    let f = Arc::new(f);
-    for i in 0..n {
-        let f = f.clone();
-        let core = cores.as_ref().and_then(|c| c.get(i).copied());
-        let tname = format!("{name}-{i}");
-        let handle = std::thread::Builder::new()
-            .name(tname)
-            .spawn(move || {
-                if let Some(c) = core {
-                    core_affinity::set_for_current(c);
-                }
-                f(i);
-            })
-            .expect("spawn pinned thread");
-        threads.push(handle);
-    }
+) {
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            pin_current(core);
+            stage.run();
+        })
+        .expect("spawn stage");
+    threads.push(handle);
+}
+
+/// Pick the pinned core for worker `i` from an optional pool core set.
+fn pool_core(
+    cores: &Option<Vec<core_affinity::CoreId>>,
+    i: usize,
+) -> Option<core_affinity::CoreId> {
+    cores.as_ref().and_then(|c| c.get(i).copied())
 }
 
 /// Boot the whole frontend. Returns once threads are spawned (non-blocking),
-/// so the Python caller regains control of the GIL immediately.
-pub fn start(cfg: RuntimeConfig) -> Runtime {
+/// so the Python caller regains control of the GIL immediately. `Err` on a
+/// startup misconfiguration (e.g. no tokenizer for a non-skip server).
+pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
@@ -332,108 +338,73 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
     // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init();
 
-    // Load the tokenizer once; the same Arc-backed instance is shared by both
-    // the tokenizer pool (encode) and the detokenizer shards (decode_stream).
-    // Skipped entirely in `skip_tokenizer_init` mode.
-    let dyn_tokenizer: Option<dynamo_tokenizers::Tokenizer> = if skip_tokenizer_init {
-        tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
-        None
-    } else {
-        cfg.tokenizer_path.as_deref().and_then(|path| {
-            match tokenizer::load_tokenizer(path, cfg.revision.as_deref()) {
-                Ok(t) => {
-                    tracing::info!(%path, "loaded tokenizer");
-                    Some(t)
-                }
-                Err(e) => {
-                    tracing::error!(%path, error = %e, "tokenizer load failed; using byte stub");
-                    None
-                }
-            }
-        })
-    };
-    if !skip_tokenizer_init && dyn_tokenizer.is_none() && cfg.tokenizer_path.is_none() {
-        tracing::warn!("no tokenizer_path configured; using byte stub");
-    }
+    // The same instance is shared by the tokenizer pool (encode) and the detok
+    // shards (decode); `None` only under `skip_tokenizer_init`.
+    let dyn_tokenizer = tokenizer::load_tokenizer(
+        cfg.tokenizer_path.as_deref(),
+        cfg.revision.as_deref(),
+        skip_tokenizer_init,
+    )?;
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
-        let backend = if skip_tokenizer_init {
-            detokenizer::DetokBackend::SkipDetok
-        } else {
-            match &dyn_tokenizer {
-                Some(t) => detokenizer::DetokBackend::Dynamo(t.clone()),
-                None => detokenizer::DetokBackend::Stub,
-            }
+        // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
+        // `output_ids`) only happens under `skip_tokenizer_init` —
+        // `load_tokenizer` rejects a non-skip server with no tokenizer.
+        let backend = match &dyn_tokenizer {
+            Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
+            None => detokenizer::DetokenizerBackend::Skip,
         };
         let detok_cores = plan.as_ref().map(|p| p.detok.clone());
-        let rxs = Arc::new(std::sync::Mutex::new(detok_rx)); // drained once at spawn
-        spawn_pinned_pool(
-            "detok",
-            cfg.detokenizer_worker_num,
-            detok_cores,
-            &mut threads,
-            {
-                move |i| {
-                    let rx = rxs.lock().unwrap()[i].clone();
-                    detokenizer::run_shard(i, rx, backend.clone());
-                }
-            },
-        );
+        // Each shard owns its receiver outright (one consumer per shard), so the
+        // owned `detok_rx` Vec is moved out element-by-element — no shared map.
+        for (i, rx) in detok_rx.into_iter().enumerate() {
+            let core = pool_core(&detok_cores, i);
+            let shard = detokenizer::DetokenizerWorker::new(i, rx, backend.clone());
+            spawn_stage(&format!("detok-{i}"), core, shard, &mut threads);
+        }
     }
 
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
     {
-        let senders = senders.clone();
         // First TM core: egress is the hotter router (every output token).
         let core = plan.as_ref().and_then(|p| p.tm.first().copied());
-        let handle = std::thread::Builder::new()
-            .name("tm-egress".into())
-            .spawn(move || {
-                pin_current(core);
-                tokenizer_manager::run_egress(egress_rx, senders)
-            })
-            .expect("spawn tm egress");
-        threads.push(handle);
+        let stage = tokenizer_manager::Egress::new(egress_rx, senders.clone());
+        spawn_stage("tm-egress", core, stage, &mut threads);
     }
 
     // --- Tokenizer pool (pinned, CPU bound) ---
-    {
+    // Only spawned when a real tokenizer is loaded; under `skip_tokenizer_init`
+    // there is none and ingress never routes to the pool, so we skip it.
+    if let Some(t) = &dyn_tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
-        let tokenizer: Arc<dyn tokenizer::TextTokenizer> = match &dyn_tokenizer {
-            Some(t) => Arc::new(tokenizer::DynamoTokenizer::new(t.clone())),
-            None => Arc::new(tokenizer::StubTokenizer),
-        };
-
+        let tokenizer: Arc<dyn tokenizer::TextTokenizer> =
+            Arc::new(tokenizer::DynamoTokenizer::new(t.clone()));
         let tok_cores = plan.as_ref().map(|p| p.tok.clone());
-        let tm_tx = tm_tx.clone();
-        let tok_rx = tok_rx.clone();
-        spawn_pinned_pool(
-            "tokenizer",
-            cfg.tokenizer_worker_num,
-            tok_cores,
-            &mut threads,
-            move |_i| tokenizer::run_worker(tok_rx.clone(), tm_tx.clone(), tokenizer.clone()),
-        );
+        // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
+        // each gets a cheap clone of both.
+        for i in 0..cfg.tokenizer_worker_num {
+            let core = pool_core(&tok_cores, i);
+            let worker =
+                tokenizer::TokenizerWorker::new(tok_rx.clone(), tm_tx.clone(), tokenizer.clone());
+            spawn_stage(&format!("tokenizer-{i}"), core, worker, &mut threads);
+        }
     }
 
     // --- TokenizerManager ingress loop ---
     {
-        let senders = senders.clone();
-        let ingress_tx = ingress_tx.clone();
         // Second TM core when present, else share the first (1-core / API-set
         // fallback) — still off the CPU-bound pool cores either way.
         let core = plan
             .as_ref()
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied());
-        let handle = std::thread::Builder::new()
-            .name("tm-ingress".into())
-            .spawn(move || {
-                pin_current(core);
-                tokenizer_manager::run_ingress(tm_rx, senders, ingress_tx, skip_tokenizer_init)
-            })
-            .expect("spawn tm ingress");
-        threads.push(handle);
+        let stage = tokenizer_manager::Ingress::new(
+            tm_rx,
+            senders.clone(),
+            ingress_tx,
+            skip_tokenizer_init,
+        );
+        spawn_stage("tm-ingress", core, stage, &mut threads);
     }
 
     // --- API server (tokio, I/O bound) ---
@@ -469,10 +440,10 @@ pub fn start(cfg: RuntimeConfig) -> Runtime {
         threads.push(handle);
     }
 
-    Runtime {
+    Ok(Runtime {
         ingress: ingress_rx,
         egress: egress_tx,
         threads,
         shutdown,
-    }
+    })
 }

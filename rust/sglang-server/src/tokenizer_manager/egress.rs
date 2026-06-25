@@ -10,27 +10,43 @@ use bytes::Bytes;
 
 use crate::ids::RequestId;
 use crate::message::{ChunkEvent, EGRESS_TAG_CHUNK, EGRESS_TAG_RESULT};
+use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders};
 use crate::runtime::ring::EgressConsumer;
 
-pub fn run_egress(egress: EgressConsumer, senders: Senders) {
-    while let Some(bytes) = egress.recv() {
-        let Some((&tag, body)) = bytes.split_first() else {
-            continue;
-        };
-        let routed = match tag {
-            EGRESS_TAG_CHUNK => decode_chunk(body),
-            EGRESS_TAG_RESULT => decode_result(body),
-            other => {
-                tracing::warn!(tag = other, "egress: unknown frame tag");
+/// Egress dispatcher stage. Owns the egress-ring consumer + the detok-shard
+/// senders, so the runtime spawns it as a [`Runnable`].
+pub struct Egress {
+    egress: EgressConsumer,
+    senders: Senders,
+}
+
+impl Egress {
+    pub fn new(egress: EgressConsumer, senders: Senders) -> Self {
+        Self { egress, senders }
+    }
+}
+
+impl Runnable for Egress {
+    fn run(self) {
+        while let Some(bytes) = self.egress.recv() {
+            let Some((&tag, body)) = bytes.split_first() else {
                 continue;
+            };
+            let routed = match tag {
+                EGRESS_TAG_CHUNK => decode_chunk(body),
+                EGRESS_TAG_RESULT => decode_result(body),
+                other => {
+                    tracing::warn!(tag = other, "egress: unknown frame tag");
+                    continue;
+                }
+            };
+            let Some((rid, msg)) = routed else {
+                continue;
+            };
+            if self.senders.detok_for(rid).send(msg).is_err() {
+                tracing::error!("egress: detok shard closed");
             }
-        };
-        let Some((rid, msg)) = routed else {
-            continue;
-        };
-        if senders.detok_for(rid).send(msg).is_err() {
-            tracing::error!("egress: detok shard closed");
         }
     }
 }

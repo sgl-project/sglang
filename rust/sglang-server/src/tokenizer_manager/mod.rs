@@ -12,5 +12,5 @@
 mod egress;
 mod ingress;
 
-pub use egress::run_egress;
-pub use ingress::run_ingress;
+pub use egress::Egress;
+pub use ingress::Ingress;
