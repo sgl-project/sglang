@@ -167,32 +167,44 @@ def release_handle(handle: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def reserve_va(size: int, granularity: int) -> int:
-    """Reserve contiguous virtual address space."""
-    va = check_cu_result(cuda.cuMemAddressReserve(size, granularity, 0, 0))
+def _to_int(va) -> int:
+    """Convert a CUdeviceptr or int to plain int for pointer arithmetic."""
     return int(va)
+
+
+def _to_devptr(va):
+    """Convert an int back to CUdeviceptr for CUDA driver API calls."""
+    if isinstance(va, int):
+        return cuda.CUdeviceptr(va)
+    return va
+
+
+def reserve_va(size: int, granularity: int) -> int:
+    """Reserve contiguous virtual address space. Returns VA as int."""
+    va = check_cu_result(cuda.cuMemAddressReserve(size, granularity, 0, 0))
+    return _to_int(va)
 
 
 def free_va(va: int, size: int) -> None:
     """Free reserved virtual address space."""
     if va != 0:
-        check_cu_result(cuda.cuMemAddressFree(va, size))
+        check_cu_result(cuda.cuMemAddressFree(_to_devptr(va), size))
 
 
 def map_handle(va: int, size: int, handle: int, offset: int = 0) -> None:
     """Map a memory handle into virtual address space."""
-    check_cu_result(cuda.cuMemMap(va, size, offset, handle, 0))
+    check_cu_result(cuda.cuMemMap(_to_devptr(va), size, offset, handle, 0))
 
 
 def unmap_va(va: int, size: int) -> None:
     """Unmap a virtual address region."""
-    check_cu_result(cuda.cuMemUnmap(va, size))
+    check_cu_result(cuda.cuMemUnmap(_to_devptr(va), size))
 
 
 def set_access(va: int, size: int, device_id: int) -> None:
     """Set read/write access on a virtual address region."""
     desc = get_access_desc(device_id)
-    check_cu_result(cuda.cuMemSetAccess(va, size, [desc], 1))
+    check_cu_result(cuda.cuMemSetAccess(_to_devptr(va), size, [desc], 1))
 
 
 # ---------------------------------------------------------------------------

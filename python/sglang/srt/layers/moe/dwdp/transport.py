@@ -25,7 +25,6 @@ from sglang.srt.layers.moe.dwdp.specs import (
 )
 from sglang.srt.layers.moe.dwdp.vmm import (
     align_up,
-    check_cu_result,
     create_fabric_handle,
     export_handle,
     free_va,
@@ -40,11 +39,6 @@ from sglang.srt.layers.moe.dwdp.vmm import (
 )
 
 logger = logging.getLogger(__name__)
-
-try:
-    from cuda.bindings import driver as cuda
-except ImportError:
-    from cuda import cuda  # type: ignore[no-redef]
 
 
 class DWDPTransport:
@@ -139,11 +133,14 @@ class DWDPTransport:
                 map_handle(temp_va, phys_size, handle)
                 set_access(temp_va, phys_size, device_id)
 
-                # Copy local param into the fabric handle
-                src_ptr = param.data_ptr()
-                dst_ptr = temp_va + data_offset
-                nbytes = param.numel() * param.element_size()
-                check_cu_result(cuda.cuMemcpyDtoD(dst_ptr, src_ptr, nbytes))
+                # Copy local param into the fabric handle via tensor view
+                handle_tensor = tensor_from_ptr(
+                    ptr=temp_va + data_offset,
+                    shape=tuple(param.shape),
+                    dtype=param.dtype,
+                    device_id=device_id,
+                )
+                handle_tensor.copy_(param)
                 torch.cuda.synchronize()
 
                 # Unmap temp VA
