@@ -67,7 +67,9 @@ class ReqDllmMixin:
             self.full_untruncated_fill_ids = (
                 self.full_untruncated_fill_ids[:prefix_len] + self.dllm_incomplete_ids
             )
-            self.fill_len = len(self.full_untruncated_fill_ids)
+            # extend_range is (re)computed by the staging adder
+            # (add_dllm_staging_req) before this req is scheduled, mirroring the
+            # non-incomplete path which also defers it to the adder.
             return
 
         self.dllm_block_offset = (
