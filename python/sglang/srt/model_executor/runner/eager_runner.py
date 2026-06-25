@@ -282,8 +282,13 @@ class EagerRunner(BaseRunner):
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
 
+        category = (
+            "target_verify"
+            if forward_batch.forward_mode.is_target_verify()
+            else "extend"
+        )
         ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "extend"})
+            model_runner.device_timer.wrap(metadata={"category": category})
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
