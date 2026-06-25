@@ -97,6 +97,7 @@ def renorm_draft_probs(
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_ID = envs.SGLANG_SIMULATE_ACC_TOKEN_ID.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -334,7 +335,7 @@ def generate_simulated_accept_index(
         simulate_acc_len, device=accept_index.device
     )
     num_correct_drafts.fill_(simulate_acc_len - 1)
-    predict.fill_(100)  # some legit token id
+    predict.fill_(SIMULATE_ACC_TOKEN_ID)
     return sim_accept_index
 
 
