@@ -195,6 +195,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                 'type="function"; other built-in tool types cannot be forced.'
             )
 
+        # ``tool_choice`` in the object form (forced function) must name a
+        # tool that is actually present. Without this check the downstream
+        # json_schema fallback receives None and crashes (500). Mirrors the
+        # validation in OpenAIServingChat._validate_request.
+        if isinstance(request.tool_choice, ToolChoice):
+            forced_name = request.tool_choice.function.name
+            if not any(
+                tool.type == "function" and tool.name == forced_name
+                for tool in (request.tools or [])
+            ):
+                return self.create_error_response(
+                    f"Tool '{forced_name}' not found in tools list.",
+                    param="tool_choice",
+                )
+
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
         if prev_response_id is not None:
