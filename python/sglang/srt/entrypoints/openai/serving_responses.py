@@ -16,7 +16,7 @@ import jinja2
 import openai.types.responses as openai_responses_types
 import orjson
 from fastapi import Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
@@ -63,6 +63,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
     Tool,
+    ToolChoice,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -314,6 +315,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context = SimpleContext()
 
                     # Create GenerateReqInput for SGLang
+                    adapted_request: Optional[GenerateReqInput] = None
                     if isinstance(engine_prompt, str):
                         prompt_kwargs = {"text": engine_prompt}
                     else:
@@ -406,7 +408,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             if request.stream:
                 if self.use_harmony:
-                    return self.responses_stream_generator(
+                    stream_gen = self.responses_stream_generator(
                         request,
                         sampling_params,
                         result_generator,
@@ -414,14 +416,36 @@ class OpenAIServingResponses(OpenAIServingChat):
                         model_name,
                         tokenizer,
                         request_metadata,
+                        raw_request=raw_request,
                     )
-                return self.responses_stream_generator_non_harmony(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
+                else:
+                    stream_gen = self.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        raw_request=raw_request,
+                    )
+                # Bind an abort task so a client disconnect stops backend
+                # generation instead of generating to completion. Mirrors
+                # the Anthropic and transcription streaming paths.
+                background = None
+                if adapted_request is not None:
+                    background = (
+                        self.tokenizer_manager.create_abort_task(
+                            adapted_request
+                        )
+                    )
+                return StreamingResponse(
+                    stream_gen,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                    },
+                    background=background,
                 )
             try:
                 result: Union[ORJSONResponse, ResponsesResponse] = (
@@ -480,9 +504,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
     ):
+        # Harmony models route tools through a recipient channel and cannot
+        # honor a forced / required tool_choice. Raise ValueError so the
+        # caller in ``create_responses`` surfaces it as a 400 rather than a
+            # 500 (NotImplementedError is not in the caught exception tuple).
         if request.tool_choice != "auto":
-            raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in " "response API"
+            raise ValueError(
+                "Only 'auto' tool_choice is supported for harmony models on "
+                "the /v1/responses endpoint; forced/required tool_choice is "
+                "supported on non-harmony models only."
             )
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
@@ -688,7 +718,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_items.append(reasoning_item)
 
         chat_tools = self._response_tools_to_chat_tools(request)
-        is_required = request.tool_choice == "required"
+        # ``tool_choice`` may be the object form {"type":"function",...} (forced
+        # function) which must behave like "required" for parser selection.
+        is_required = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
         tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
         if (
@@ -1278,10 +1312,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        raw_request: Optional[Request] = None,
     ) -> AsyncGenerator[str, None]:
-        # TODO:
-        # 1. Handle disconnect
-
         created_time = created_time or int(time.time())
 
         sequence_number = 0
@@ -1328,80 +1360,269 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         )
 
-        async for ctx in result_generator:
+        try:
+            async for ctx in result_generator:
+                if raw_request is not None and await raw_request.is_disconnected():
+                    logger.info(
+                        "[/v1/responses harmony stream] client disconnected, "
+                        "stopping"
+                    )
+                    break
 
-            # Only process context objects that implement the `is_expecting_start()` method,
-            # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
-            # Contexts without this method are skipped, as they do not represent a new turn
-            # or are not compatible with per-turn handling in the /v1/responses endpoint.
-            if not hasattr(ctx, "is_expecting_start"):
-                continue
+                # Only process context objects that implement the `is_expecting_start()` method,
+                # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
+                # Contexts without this method are skipped, as they do not represent a new turn
+                # or are not compatible with per-turn handling in the /v1/responses endpoint.
+                if not hasattr(ctx, "is_expecting_start"):
+                    continue
 
-            if ctx.is_expecting_start():
-                current_output_index += 1
-                sent_output_item_added = False
+                if ctx.is_expecting_start():
+                    current_output_index += 1
+                    sent_output_item_added = False
 
-                if len(ctx.parser.messages) > 0:
-                    previous_item = ctx.parser.messages[-1]
-                    if previous_item.recipient is not None:
-                        # Deal with tool call here
-                        pass
-                    elif previous_item.channel == "analysis":
-                        reasoning_item = ResponseReasoningItem(
-                            id=f"rs_{random_uuid()}",
-                            type="reasoning",
-                            summary=[],
-                            content=[
-                                ResponseReasoningTextContent(
+                    if len(ctx.parser.messages) > 0:
+                        previous_item = ctx.parser.messages[-1]
+                        if previous_item.recipient is not None:
+                            # Deal with tool call here
+                            pass
+                        elif previous_item.channel == "analysis":
+                            reasoning_item = ResponseReasoningItem(
+                                id=f"rs_{random_uuid()}",
+                                type="reasoning",
+                                summary=[],
+                                content=[
+                                    ResponseReasoningTextContent(
+                                        text=previous_item.content[0].text,
+                                        type="reasoning_text",
+                                    ),
+                                ],
+                                status="completed",
+                            )
+                            yield _send_event(
+                                openai_responses_types.ResponseReasoningTextDoneEvent(
+                                    type="response.reasoning_text.done",
+                                    item_id=current_item_id,
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    content_index=current_content_index,
                                     text=previous_item.content[0].text,
-                                    type="reasoning_text",
-                                ),
-                            ],
-                            status="completed",
-                        )
+                                )
+                            )
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemDoneEvent(
+                                    type="response.output_item.done",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item=reasoning_item,
+                                )
+                            )
+                        elif previous_item.channel == "final":
+                            text_content = openai_responses_types.ResponseOutputText(
+                                type="output_text",
+                                text=previous_item.content[0].text,
+                                annotations=[],
+                            )
+                            yield _send_event(
+                                openai_responses_types.ResponseTextDoneEvent(
+                                    type="response.output_text.done",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    content_index=current_content_index,
+                                    text=previous_item.content[0].text,
+                                    logprobs=[],
+                                    item_id=current_item_id,
+                                )
+                            )
+                            yield _send_event(
+                                openai_responses_types.ResponseContentPartDoneEvent(
+                                    type="response.content_part.done",
+                                    sequence_number=-1,
+                                    item_id=current_item_id,
+                                    output_index=current_output_index,
+                                    content_index=current_content_index,
+                                    part=text_content,
+                                )
+                            )
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemDoneEvent(
+                                    type="response.output_item.done",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item=openai_responses_types.ResponseOutputMessage(
+                                        id=current_item_id,
+                                        type="message",
+                                        role="assistant",
+                                        content=[text_content],
+                                        status="completed",
+                                    ),
+                                )
+                            )
+
+                if ctx.parser.last_content_delta:
+                    if (
+                        ctx.parser.current_channel == "final"
+                        and ctx.parser.current_recipient is None
+                    ):
+                        if not sent_output_item_added:
+                            sent_output_item_added = True
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item=openai_responses_types.ResponseOutputMessage(
+                                        id=current_item_id,
+                                        type="message",
+                                        role="assistant",
+                                        content=[],
+                                        status="in_progress",
+                                    ),
+                                )
+                            )
+                            yield _send_event(
+                                openai_responses_types.ResponseContentPartAddedEvent(
+                                    type="response.content_part.added",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item_id=current_item_id,
+                                    content_index=current_content_index,
+                                    part=openai_responses_types.ResponseOutputText(
+                                        type="output_text",
+                                        text="",
+                                        annotations=[],
+                                        logprobs=None,
+                                    ),
+                                )
+                            )
                         yield _send_event(
-                            openai_responses_types.ResponseReasoningTextDoneEvent(
-                                type="response.reasoning_text.done",
+                            openai_responses_types.ResponseTextDeltaEvent(
+                                type="response.output_text.delta",
+                                sequence_number=-1,
+                                content_index=current_content_index,
+                                output_index=current_output_index,
                                 item_id=current_item_id,
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                content_index=current_content_index,
-                                text=previous_item.content[0].text,
-                            )
-                        )
-                        yield _send_event(
-                            openai_responses_types.ResponseOutputItemDoneEvent(
-                                type="response.output_item.done",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                item=reasoning_item,
-                            )
-                        )
-                    elif previous_item.channel == "final":
-                        text_content = openai_responses_types.ResponseOutputText(
-                            type="output_text",
-                            text=previous_item.content[0].text,
-                            annotations=[],
-                        )
-                        yield _send_event(
-                            openai_responses_types.ResponseTextDoneEvent(
-                                type="response.output_text.done",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                content_index=current_content_index,
-                                text=previous_item.content[0].text,
+                                delta=ctx.parser.last_content_delta,
+                                # TODO, use logprobs from ctx.last_request_output
                                 logprobs=[],
+                            )
+                        )
+                    elif (
+                        ctx.parser.current_channel == "analysis"
+                        and ctx.parser.current_recipient is None
+                    ):
+                        if not sent_output_item_added:
+                            sent_output_item_added = True
+                            yield _send_event(
+                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item=openai_responses_types.ResponseReasoningItem(
+                                        type="reasoning",
+                                        id=current_item_id,
+                                        summary=[],
+                                        status="in_progress",
+                                    ),
+                                )
+                            )
+                            yield _send_event(
+                                openai_responses_types.ResponseContentPartAddedEvent(
+                                    type="response.content_part.added",
+                                    sequence_number=-1,
+                                    output_index=current_output_index,
+                                    item_id=current_item_id,
+                                    content_index=current_content_index,
+                                    # TODO: migrate this to
+                                    # ResponseReasoningTextContent for now
+                                    part=openai_responses_types.ResponseOutputText(
+                                        type="output_text",
+                                        text="",
+                                        annotations=[],
+                                        logprobs=None,
+                                    ),
+                                )
+                            )
+                        # TODO: migrate to OpenAI types once updated.
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningTextDeltaEvent(
+                                type="response.reasoning_text.delta",
+                                item_id=current_item_id,
+                                output_index=current_output_index,
+                                content_index=current_content_index,
+                                delta=ctx.parser.last_content_delta,
+                                sequence_number=-1,
+                            )
+                        )
+
+                if ctx.is_assistant_action_turn() and len(ctx.parser.messages) > 0:
+                    previous_item = ctx.parser.messages[-1]
+                    if (
+                        self.supports_browsing
+                        and previous_item.recipient is not None
+                        and previous_item.recipient.startswith("browser.")
+                    ):
+                        function_name = previous_item.recipient[len("browser.") :]
+                        action = None
+                        parsed_args = orjson.loads(previous_item.content[0].text)
+                        if function_name == "search":
+                            action = openai_responses_types.response_function_web_search.ActionSearch(
+                                type="search",
+                                query=parsed_args["query"],
+                            )
+                        elif function_name == "open":
+                            action = openai_responses_types.response_function_web_search.ActionOpenPage(
+                                type="open_page",
+                                # TODO: translate to url
+                                url=f"cursor:{parsed_args.get('cursor', '')}",
+                            )
+                        elif function_name == "find":
+                            action = openai_responses_types.response_function_web_search.ActionFind(
+                                type="find",
+                                pattern=parsed_args["pattern"],
+                                # TODO: translate to url
+                                url=f"cursor:{parsed_args.get('cursor', '')}",
+                            )
+                        else:
+                            raise ValueError(f"Unknown function name: {function_name}")
+
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item=openai_responses_types.response_function_web_search.ResponseFunctionWebSearch(
+                                    # TODO: generate a unique id for web search call
+                                    type="web_search_call",
+                                    id=current_item_id,
+                                    action=action,
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseWebSearchCallInProgressEvent(
+                                type="response.web_search_call.in_progress",
+                                sequence_number=-1,
+                                output_index=current_output_index,
                                 item_id=current_item_id,
                             )
                         )
                         yield _send_event(
-                            openai_responses_types.ResponseContentPartDoneEvent(
-                                type="response.content_part.done",
+                            openai_responses_types.ResponseWebSearchCallSearchingEvent(
+                                type="response.web_search_call.searching",
                                 sequence_number=-1,
-                                item_id=current_item_id,
                                 output_index=current_output_index,
-                                content_index=current_content_index,
-                                part=text_content,
+                                item_id=current_item_id,
+                            )
+                        )
+
+                        # enqueue
+                        yield _send_event(
+                            openai_responses_types.ResponseWebSearchCallCompletedEvent(
+                                type="response.web_search_call.completed",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
                             )
                         )
                         yield _send_event(
@@ -1409,309 +1630,150 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 type="response.output_item.done",
                                 sequence_number=-1,
                                 output_index=current_output_index,
-                                item=openai_responses_types.ResponseOutputMessage(
+                                item=openai_responses_types.ResponseFunctionWebSearch(
+                                    type="web_search_call",
                                     id=current_item_id,
-                                    type="message",
-                                    role="assistant",
-                                    content=[text_content],
+                                    action=action,
                                     status="completed",
                                 ),
                             )
                         )
 
-            if ctx.parser.last_content_delta:
-                if (
-                    ctx.parser.current_channel == "final"
-                    and ctx.parser.current_recipient is None
-                ):
-                    if not sent_output_item_added:
-                        sent_output_item_added = True
+                    if (
+                        self.supports_code_interpreter
+                        and previous_item.recipient is not None
+                        and previous_item.recipient.startswith("python")
+                    ):
                         yield _send_event(
                             openai_responses_types.ResponseOutputItemAddedEvent(
                                 type="response.output_item.added",
                                 sequence_number=-1,
                                 output_index=current_output_index,
-                                item=openai_responses_types.ResponseOutputMessage(
+                                item=openai_responses_types.ResponseCodeInterpreterToolCallParam(
+                                    type="code_interpreter_call",
                                     id=current_item_id,
-                                    type="message",
-                                    role="assistant",
-                                    content=[],
+                                    code="",
+                                    container_id="auto",
+                                    outputs=[],
                                     status="in_progress",
                                 ),
                             )
                         )
                         yield _send_event(
-                            openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
+                            openai_responses_types.ResponseCodeInterpreterCallInProgressEvent(
+                                type="response.code_interpreter_call.in_progress",
                                 sequence_number=-1,
                                 output_index=current_output_index,
                                 item_id=current_item_id,
-                                content_index=current_content_index,
-                                part=openai_responses_types.ResponseOutputText(
-                                    type="output_text",
-                                    text="",
-                                    annotations=[],
-                                    logprobs=None,
-                                ),
                             )
                         )
-                    yield _send_event(
-                        openai_responses_types.ResponseTextDeltaEvent(
-                            type="response.output_text.delta",
-                            sequence_number=-1,
-                            content_index=current_content_index,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                            delta=ctx.parser.last_content_delta,
-                            # TODO, use logprobs from ctx.last_request_output
-                            logprobs=[],
-                        )
-                    )
-                elif (
-                    ctx.parser.current_channel == "analysis"
-                    and ctx.parser.current_recipient is None
-                ):
-                    if not sent_output_item_added:
-                        sent_output_item_added = True
+                        # TODO: do we need to add delta event here?
                         yield _send_event(
-                            openai_responses_types.ResponseOutputItemAddedEvent(
-                                type="response.output_item.added",
-                                sequence_number=-1,
-                                output_index=current_output_index,
-                                item=openai_responses_types.ResponseReasoningItem(
-                                    type="reasoning",
-                                    id=current_item_id,
-                                    summary=[],
-                                    status="in_progress",
-                                ),
-                            )
-                        )
-                        yield _send_event(
-                            openai_responses_types.ResponseContentPartAddedEvent(
-                                type="response.content_part.added",
+                            openai_responses_types.ResponseCodeInterpreterCallCodeDoneEvent(
+                                type="response.code_interpreter_call_code.done",
                                 sequence_number=-1,
                                 output_index=current_output_index,
                                 item_id=current_item_id,
-                                content_index=current_content_index,
-                                # TODO: migrate this to
-                                # ResponseReasoningTextContent for now
-                                part=openai_responses_types.ResponseOutputText(
-                                    type="output_text",
-                                    text="",
-                                    annotations=[],
-                                    logprobs=None,
-                                ),
-                            )
-                        )
-                    # TODO: migrate to OpenAI types once updated.
-                    yield _send_event(
-                        openai_responses_types.ResponseReasoningTextDeltaEvent(
-                            type="response.reasoning_text.delta",
-                            item_id=current_item_id,
-                            output_index=current_output_index,
-                            content_index=current_content_index,
-                            delta=ctx.parser.last_content_delta,
-                            sequence_number=-1,
-                        )
-                    )
-
-            if ctx.is_assistant_action_turn() and len(ctx.parser.messages) > 0:
-                previous_item = ctx.parser.messages[-1]
-                if (
-                    self.supports_browsing
-                    and previous_item.recipient is not None
-                    and previous_item.recipient.startswith("browser.")
-                ):
-                    function_name = previous_item.recipient[len("browser.") :]
-                    action = None
-                    parsed_args = orjson.loads(previous_item.content[0].text)
-                    if function_name == "search":
-                        action = openai_responses_types.response_function_web_search.ActionSearch(
-                            type="search",
-                            query=parsed_args["query"],
-                        )
-                    elif function_name == "open":
-                        action = openai_responses_types.response_function_web_search.ActionOpenPage(
-                            type="open_page",
-                            # TODO: translate to url
-                            url=f"cursor:{parsed_args.get('cursor', '')}",
-                        )
-                    elif function_name == "find":
-                        action = openai_responses_types.response_function_web_search.ActionFind(
-                            type="find",
-                            pattern=parsed_args["pattern"],
-                            # TODO: translate to url
-                            url=f"cursor:{parsed_args.get('cursor', '')}",
-                        )
-                    else:
-                        raise ValueError(f"Unknown function name: {function_name}")
-
-                    yield _send_event(
-                        openai_responses_types.ResponseOutputItemAddedEvent(
-                            type="response.output_item.added",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item=openai_responses_types.response_function_web_search.ResponseFunctionWebSearch(
-                                # TODO: generate a unique id for web search call
-                                type="web_search_call",
-                                id=current_item_id,
-                                action=action,
-                                status="in_progress",
-                            ),
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseWebSearchCallInProgressEvent(
-                            type="response.web_search_call.in_progress",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseWebSearchCallSearchingEvent(
-                            type="response.web_search_call.searching",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                        )
-                    )
-
-                    # enqueue
-                    yield _send_event(
-                        openai_responses_types.ResponseWebSearchCallCompletedEvent(
-                            type="response.web_search_call.completed",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseOutputItemDoneEvent(
-                            type="response.output_item.done",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item=openai_responses_types.ResponseFunctionWebSearch(
-                                type="web_search_call",
-                                id=current_item_id,
-                                action=action,
-                                status="completed",
-                            ),
-                        )
-                    )
-
-                if (
-                    self.supports_code_interpreter
-                    and previous_item.recipient is not None
-                    and previous_item.recipient.startswith("python")
-                ):
-                    yield _send_event(
-                        openai_responses_types.ResponseOutputItemAddedEvent(
-                            type="response.output_item.added",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item=openai_responses_types.ResponseCodeInterpreterToolCallParam(
-                                type="code_interpreter_call",
-                                id=current_item_id,
-                                code="",
-                                container_id="auto",
-                                outputs=[],
-                                status="in_progress",
-                            ),
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseCodeInterpreterCallInProgressEvent(
-                            type="response.code_interpreter_call.in_progress",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                        )
-                    )
-                    # TODO: do we need to add delta event here?
-                    yield _send_event(
-                        openai_responses_types.ResponseCodeInterpreterCallCodeDoneEvent(
-                            type="response.code_interpreter_call_code.done",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                            code=previous_item.content[0].text,
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseCodeInterpreterCallInterpretingEvent(
-                            type="response.code_interpreter_call.interpreting",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseCodeInterpreterCallCompletedEvent(
-                            type="response.code_interpreter_call.completed",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item_id=current_item_id,
-                        )
-                    )
-                    yield _send_event(
-                        openai_responses_types.ResponseOutputItemDoneEvent(
-                            type="response.output_item.done",
-                            sequence_number=-1,
-                            output_index=current_output_index,
-                            item=openai_responses_types.ResponseCodeInterpreterToolCallParam(
-                                type="code_interpreter_call",
-                                id=current_item_id,
                                 code=previous_item.content[0].text,
-                                container_id="auto",
-                                # TODO: add outputs here
-                                outputs=[],
-                                status="completed",
-                            ),
+                            )
                         )
-                    )
+                        yield _send_event(
+                            openai_responses_types.ResponseCodeInterpreterCallInterpretingEvent(
+                                type="response.code_interpreter_call.interpreting",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseCodeInterpreterCallCompletedEvent(
+                                type="response.code_interpreter_call.completed",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item_id=current_item_id,
+                            )
+                        )
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemDoneEvent(
+                                type="response.output_item.done",
+                                sequence_number=-1,
+                                output_index=current_output_index,
+                                item=openai_responses_types.ResponseCodeInterpreterToolCallParam(
+                                    type="code_interpreter_call",
+                                    id=current_item_id,
+                                    code=previous_item.content[0].text,
+                                    container_id="auto",
+                                    # TODO: add outputs here
+                                    outputs=[],
+                                    status="completed",
+                                ),
+                            )
+                        )
 
-        async def empty_async_generator():
-            if False:
-                yield
+            async def empty_async_generator():
+                if False:
+                    yield
 
-        final_response = await self.responses_full_generator(
-            request,
-            sampling_params,
-            empty_async_generator(),
-            context,
-            model_name,
-            tokenizer,
-            request_metadata,
-            created_time=created_time,
-        )
-        # Convert final_response to the format expected by ResponseCompletedEvent
-        response_dict = final_response.model_dump()
-        # OpenAI SDK's Tool union may not know extended types; drop echo.
-        response_dict["tools"] = []
-
-        # Convert UsageInfo to ResponseUsage format
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
-
-        yield _send_event(
-            openai_responses_types.ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=response_dict,
+            final_response = await self.responses_full_generator(
+                request,
+                sampling_params,
+                empty_async_generator(),
+                context,
+                model_name,
+                tokenizer,
+                request_metadata,
+                created_time=created_time,
             )
-        )
+            # Convert final_response to the format expected by ResponseCompletedEvent
+            response_dict = final_response.model_dump()
+            # OpenAI SDK's Tool union may not know extended types; drop echo.
+            response_dict["tools"] = []
+
+            # Convert UsageInfo to ResponseUsage format
+            if response_dict.get("usage"):
+                usage_info = response_dict["usage"]
+                response_dict["usage"] = {
+                    "input_tokens": usage_info.get("prompt_tokens", 0),
+                    "input_tokens_details": {
+                        "cached_tokens": usage_info.get("cached_tokens", 0)
+                    },
+                    "output_tokens": usage_info.get("completion_tokens", 0),
+                    "output_tokens_details": {
+                        "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
+                    },
+                    "total_tokens": usage_info.get("total_tokens", 0),
+                }
+
+            yield _send_event(
+                openai_responses_types.ResponseCompletedEvent(
+                    type="response.completed",
+                    sequence_number=-1,
+                    response=response_dict,
+                )
+            )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Error while streaming /v1/responses (harmony)")
+            failed = ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name=model_name,
+                created_time=created_time,
+                output=[],
+                status="failed",
+                usage=None,
+            ).model_dump()
+            failed["tools"] = []
+            yield _send_event(
+                openai_responses_types.ResponseFailedEvent(
+                    type="response.failed",
+                    sequence_number=-1,
+                    response=failed,
+                )
+            )
+            return
 
     async def responses_stream_generator_non_harmony(
         self,
@@ -1722,6 +1784,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
         request_metadata: RequestResponseMetadata,
         created_time: Optional[int] = None,
+        raw_request: Optional[Request] = None,
     ) -> AsyncGenerator[str, None]:
         """Stream a /v1/responses response as typed OpenAI SSE events for
         non-harmony models. Each engine chunk is run through the reasoning
@@ -1777,7 +1840,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
-        is_required = request.tool_choice == "required"
+        is_required = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if chat_tools and request.tool_choice != "none":
             native_supports_structural_tag = False
@@ -2006,6 +2071,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         try:
             async for ctx in result_generator:
+                if raw_request is not None and await raw_request.is_disconnected():
+                    logger.info(
+                        "[/v1/responses stream] client disconnected, stopping"
+                    )
+                    break
                 if isinstance(ctx, dict):
                     chunk = ctx
                 else:
