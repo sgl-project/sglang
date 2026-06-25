@@ -4,18 +4,18 @@ import gc
 import importlib
 import sys
 import types
+import unittest
 from enum import Enum
+from unittest import mock
 
-import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# UMBP is an AMD/ROCm-only feature backed by mori. On machines without mori
-# (e.g. NVIDIA CI) skip the whole module so the umbp suite is all-or-nothing.
-pytest.importorskip("mori.umbp")
+# These tests stub out mori with a fake in-process module, so they need neither
+# a real mori install nor a GPU and run on NVIDIA / CPU CI.
 
 
 class FakeBacking(Enum):
@@ -86,91 +86,117 @@ class FakeHostMemAllocator:
         handle.mapped_size = 0
 
 
-def install_fake_mori(monkeypatch: pytest.MonkeyPatch):
-    fake_umbp = types.ModuleType("mori.umbp")
-    fake_umbp.UMBPHostBufferBacking = FakeBacking
-    fake_umbp.UMBPHostBufferHandle = FakeHandle
-    fake_umbp.UMBPHostMemAllocator = FakeHostMemAllocator
+class TestUMBPHostAllocator(unittest.TestCase):
+    def _save_mori_modules(self):
+        """Snapshot and restore sys.modules entries for mori on cleanup."""
+        saved = {name: sys.modules.get(name) for name in ("mori", "mori.umbp")}
 
-    fake_mori = types.ModuleType("mori")
-    fake_mori.__path__ = []
-    fake_mori.umbp = fake_umbp
+        def restore():
+            for name, value in saved.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
 
-    monkeypatch.setitem(sys.modules, "mori", fake_mori)
-    monkeypatch.setitem(sys.modules, "mori.umbp", fake_umbp)
-    return fake_umbp
+        self.addCleanup(restore)
+
+    def _install_fake_mori(self):
+        self._save_mori_modules()
+
+        fake_umbp = types.ModuleType("mori.umbp")
+        fake_umbp.UMBPHostBufferBacking = FakeBacking
+        fake_umbp.UMBPHostBufferHandle = FakeHandle
+        fake_umbp.UMBPHostMemAllocator = FakeHostMemAllocator
+
+        fake_mori = types.ModuleType("mori")
+        fake_mori.__path__ = []
+        fake_mori.umbp = fake_umbp
+
+        sys.modules["mori"] = fake_mori
+        sys.modules["mori.umbp"] = fake_umbp
+        return fake_umbp
+
+    def test_umbp_allocator_dispatch_and_tensor_wrap(self):
+        self._install_fake_mori()
+
+        from sglang.srt.mem_cache.memory_pool_host import get_allocator_from_storage
+        from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+            UMBPHostTensorAllocator,
+        )
+
+        allocator = get_allocator_from_storage("mori")
+        self.assertIsInstance(allocator, UMBPHostTensorAllocator)
+
+        tensor = allocator.allocate((2, 3), dtype=torch.float16, device="cpu")
+        alloc_call = allocator._allocator.alloc_calls[0]
+
+        self.assertEqual(tensor.shape, (2, 3))
+        self.assertEqual(tensor.dtype, torch.float16)
+        self.assertEqual(tensor.data_ptr(), alloc_call["handle"].ptr)
+        self.assertEqual(alloc_call["size"], tensor.numel() * tensor.element_size())
+        self.assertEqual(alloc_call["backing"], FakeBacking.AnonymousHugetlb)
+        self.assertEqual(alloc_call["hugepage_size"], 2 * 1024 * 1024)
+        self.assertEqual(alloc_call["numa_node"], -1)
+        self.assertIs(alloc_call["prefault"], True)
+
+        tensor.fill_(3.0)
+        self.assertEqual(float(tensor[0, 0]), 3.0)
+
+    def test_umbp_allocator_del_calls_free_once(self):
+        self._install_fake_mori()
+
+        module = importlib.import_module(
+            "sglang.srt.mem_cache.storage.umbp.umbp_host_allocator"
+        )
+        allocator = module.UMBPHostTensorAllocator()
+        tensor = allocator.allocate((16,), dtype=torch.uint8, device="cpu")
+
+        del tensor
+        gc.collect()
+
+        fake_allocator = allocator._allocator
+        handles = list(allocator._handles.values())
+        self.assertEqual(len(handles), 1)
+        handle = handles[0]
+        allocator.__del__()
+
+        self.assertEqual(len(fake_allocator.free_calls), 1)
+        self.assertIs(fake_allocator.free_calls[0], handle)
+        self.assertIsNone(handle.ptr)
+        self.assertEqual(handle.requested_size, 0)
+        self.assertEqual(handle.mapped_size, 0)
+
+        allocator.__del__()
+        self.assertEqual(len(fake_allocator.free_calls), 1)
+
+    def test_get_allocator_from_storage_umbp_falls_back(self):
+        self._save_mori_modules()
+        sys.modules.pop("mori", None)
+        sys.modules.pop("mori.umbp", None)
+
+        real_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "mori" or name.startswith("mori."):
+                raise ImportError("mori unavailable in test")
+            return real_import(name, globals, locals, fromlist, level)
+
+        from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
+
+        with mock.patch.object(builtins, "__import__", fake_import):
+            with self.assertLogs(level="WARNING") as cm:
+                from sglang.srt.mem_cache.memory_pool_host import (
+                    get_allocator_from_storage,
+                )
+
+                allocator = get_allocator_from_storage("mori")
+
+        self.assertIs(type(allocator), HostTensorAllocator)
+        self.assertTrue(
+            any("UMBPHostTensorAllocator unavailable" in msg for msg in cm.output),
+            f"missing fallback warning in logs: {cm.output}",
+        )
 
 
-def test_umbp_allocator_dispatch_and_tensor_wrap(monkeypatch: pytest.MonkeyPatch):
-    install_fake_mori(monkeypatch)
-
-    from sglang.srt.mem_cache.memory_pool_host import get_allocator_from_storage
-    from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
-        UMBPHostTensorAllocator,
-    )
-
-    allocator = get_allocator_from_storage("mori")
-    assert isinstance(allocator, UMBPHostTensorAllocator)
-
-    tensor = allocator.allocate((2, 3), dtype=torch.float16, device="cpu")
-    alloc_call = allocator._allocator.alloc_calls[0]
-
-    assert tensor.shape == (2, 3)
-    assert tensor.dtype == torch.float16
-    assert tensor.data_ptr() == alloc_call["handle"].ptr
-    assert alloc_call["size"] == tensor.numel() * tensor.element_size()
-    assert alloc_call["backing"] == FakeBacking.AnonymousHugetlb
-    assert alloc_call["hugepage_size"] == 2 * 1024 * 1024
-    assert alloc_call["numa_node"] == -1
-    assert alloc_call["prefault"] is True
-
-    tensor.fill_(3.0)
-    assert float(tensor[0, 0]) == 3.0
-
-
-def test_umbp_allocator_del_calls_free_once(monkeypatch: pytest.MonkeyPatch):
-    install_fake_mori(monkeypatch)
-
-    module = importlib.import_module(
-        "sglang.srt.mem_cache.storage.umbp.umbp_host_allocator"
-    )
-    allocator = module.UMBPHostTensorAllocator()
-    tensor = allocator.allocate((16,), dtype=torch.uint8, device="cpu")
-
-    del tensor
-    gc.collect()
-
-    fake_allocator = allocator._allocator
-    handles = list(allocator._handles.values())
-    assert len(handles) == 1
-    handle = handles[0]
-    allocator.__del__()
-
-    assert len(fake_allocator.free_calls) == 1
-    assert fake_allocator.free_calls[0] is handle
-    assert handle.ptr is None
-    assert handle.requested_size == 0
-    assert handle.mapped_size == 0
-
-    allocator.__del__()
-    assert len(fake_allocator.free_calls) == 1
-
-
-def test_get_allocator_from_storage_umbp_falls_back(monkeypatch, caplog):
-    real_import = builtins.__import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
-        if name == "mori" or name.startswith("mori."):
-            raise ImportError("mori unavailable in test")
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-    monkeypatch.delitem(sys.modules, "mori", raising=False)
-    monkeypatch.delitem(sys.modules, "mori.umbp", raising=False)
-
-    from sglang.srt.mem_cache.memory_pool_host import get_allocator_from_storage
-    from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
-
-    allocator = get_allocator_from_storage("mori")
-    assert type(allocator) is HostTensorAllocator
-    assert "UMBPHostTensorAllocator unavailable" in caplog.text
+if __name__ == "__main__":
+    unittest.main()
