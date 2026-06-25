@@ -59,7 +59,7 @@
 #
 # Workload for the service-level scenario:
 #   HF_ENDPOINT=https://hf-mirror.com \
-#   python3 -m sglang.bench_serving \
+#   python3 -m sglang.benchmark.serving \
 #     --host localhost \
 #     --port 8080 \
 #     --model /data00/models/DeepSeek-V4-Flash \
