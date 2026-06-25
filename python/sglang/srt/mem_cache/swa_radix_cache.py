@@ -385,46 +385,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.swa_lru_list = LRUList(is_swa_list=True)
         self._record_all_cleared_event()
 
-    def _dsv4_kv_pool(self):
-        if self.token_to_kv_pool_allocator is None:
-            return None
-        get_kvcache = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
-        if get_kvcache is None:
-            return None
-        kv_pool = get_kvcache()
-        if not hasattr(kv_pool, "clear_c128_radix_state"):
-            return None
-        return kv_pool
-
-    def _node_prefix_len(self, node: TreeNode) -> int:
-        prefix_len = 0
-        while node is not None and node is not self.root_node:
-            prefix_len += len(node.value)
-            node = node.parent
-        return prefix_len
-
-    def reset_c128_state_for_reqs(self, reqs: List[Req]) -> None:
-        kv_pool = self._dsv4_kv_pool()
-        if kv_pool is None:
-            return
-        for req in reqs:
-            if req.req_pool_idx is None:
-                continue
-            node = getattr(req, "last_node", self.root_node)
-            prefix_len = len(getattr(req, "prefix_indices", []))
-            if node is self.root_node or prefix_len == 0:
-                continue
-            node_prefix_len = self._node_prefix_len(node)
-            if node_prefix_len < prefix_len:
-                # Chunked prefill can keep live, non-radix KV from the previous
-                # chunk in prefix_indices. The request slot already has the
-                # matching C128 state, so radix-hit hygiene must leave it intact.
-                if getattr(req, "kv_committed_len", 0) >= prefix_len:
-                    continue
-            assert node_prefix_len == prefix_len
-            assert prefix_len % 128 == 0
-            kv_pool.clear_c128_radix_state(int(req.req_pool_idx))
-
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:

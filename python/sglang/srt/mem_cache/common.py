@@ -47,6 +47,47 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
+def _clear_c128_req_state_for_new_slots(
+    tree_cache: BasePrefixCache | None,
+    reqs: list[Req],
+    already_allocated: list[bool],
+) -> None:
+    # C128_STATE is request-scoped runtime state indexed by req_pool_idx. When a
+    # req slot is reused for a new request, stale partial C128 state from the
+    # previous request must be cleared before the new request starts using it.
+    # This is intentionally tied to req slot allocation instead of radix-cache
+    # hits: radix/HiCache hits are page-aligned and reuse complete C128 KV, while
+    # chunked continuation reuses an existing req slot and must keep its live
+    # partial state.
+    if tree_cache is None:
+        return
+
+    allocator = getattr(tree_cache, "token_to_kv_pool_allocator", None)
+    if allocator is None:
+        return
+
+    get_kvcache = getattr(allocator, "get_kvcache", None)
+    if get_kvcache is None:
+        return
+
+    kv_pool = get_kvcache()
+    clear_c128_req_states = getattr(kv_pool, "clear_c128_req_states", None)
+    clear_c128_req_state = getattr(kv_pool, "clear_c128_req_state", None)
+    if clear_c128_req_states is None and clear_c128_req_state is None:
+        return
+
+    new_req_pool_indices = [
+        int(req.req_pool_idx)
+        for req, reused in zip(reqs, already_allocated)
+        if not reused and req.req_pool_idx is not None
+    ]
+    if clear_c128_req_states is not None:
+        clear_c128_req_states(new_req_pool_indices)
+    else:
+        for req_pool_idx in new_req_pool_indices:
+            clear_c128_req_state(req_pool_idx)
+
+
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
     # The page is guaranteed to be full except the last page.
     if page_size == 1:
@@ -412,6 +453,7 @@ def alloc_req_slots(
 ) -> list[int]:
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
+    already_allocated = [req.req_pool_idx is not None for req in reqs]
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
         if tree_cache.supports_mamba():
@@ -436,6 +478,7 @@ def alloc_req_slots(
             f"{req_to_token_pool.available_size()=}, "
             f"{num_reqs=}, "
         )
+    _clear_c128_req_state_for_new_slots(tree_cache, reqs, already_allocated)
     return req_pool_indices
 
 
@@ -516,10 +559,6 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
-
-    reset_c128_state = getattr(batch.tree_cache, "reset_c128_state_for_reqs", None)
-    if reset_c128_state is not None:
-        reset_c128_state(batch.reqs)
 
     # DSV4-NPU hook: write c4/c128/swa per-req tables from the stashed bundle.
     # No-op on non-DSV4 paths (out_cache_loc_dsv4 stays None there).
