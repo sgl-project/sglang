@@ -1367,17 +1367,7 @@ class DeepseekSparseAttnBackend(
             # the per-req accept length is handled downstream by output
             # selection, not by reshaping the page table here.
             max_seqlen_k = metadata.page_table_1.shape[1]
-            cache_seqlens = seq_lens.to(torch.int32)
-            metadata.cache_seqlens_int32.copy_(cache_seqlens)
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
-            )
-
-            page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
-            page_indices = torch.repeat_interleave(
-                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
-            )
-            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
+            total_extend_len = self.speculative_num_draft_tokens * bs
 
             # See target-verify note: fill on-device to avoid the blocking
             # pageable H2D from torch.tensor(list, device=cuda).
@@ -1387,17 +1377,74 @@ class DeepseekSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             )
-            seqlens_expanded = seqlens_expand_triton(
-                extend_seq_lens,
-                cache_seqlens,
-                self.speculative_num_draft_tokens * bs,
-                self.speculative_num_draft_tokens,
-            )
-            metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
-            dsa_cache_seqlens = compute_dsa_seqlens(
-                seqlens_expanded, self.dsa_index_topk
-            )
-            metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
+
+            if _USE_FUSED_METADATA_GENERATION and is_cuda():
+                try:
+                    from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                        fused_dsa_draft_extend_metadata,
+                    )
+
+                    fused_dsa_draft_extend_metadata(
+                        seq_lens=seq_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        req_pool_indices=req_pool_indices,
+                        req_to_token=self.req_to_token,
+                        cache_seqlens=metadata.cache_seqlens_int32,
+                        cu_seqlens_k=metadata.cu_seqlens_k,
+                        page_table_1=metadata.page_table_1,
+                        seqlens_expanded=metadata.dsa_seqlens_expanded,
+                        dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                        dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                        real_page_table=metadata.real_page_table,
+                        bs=bs,
+                        total_len=total_extend_len,
+                        max_seqlen_k=max_seqlen_k,
+                        dsa_index_topk=self.dsa_index_topk,
+                        real_page_size=self.real_page_size,
+                    )
+                    cache_seqlens = metadata.cache_seqlens_int32
+                    seqlens_expanded = metadata.dsa_seqlens_expanded[:total_extend_len]
+                    dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[
+                        :total_extend_len
+                    ]
+                    page_indices = None
+                    fused_metadata_generation_succeeded = True
+                except Exception as e:
+                    if not _warned_fused_metadata_generation_failure:
+                        logger.warning(
+                            "Fused DSA draft-extend metadata generation failed; "
+                            "falling back to eager metadata ops. Error: %s",
+                            e,
+                        )
+                        _warned_fused_metadata_generation_failure = True
+                    _USE_FUSED_METADATA_GENERATION = False
+
+            if not fused_metadata_generation_succeeded:
+                cache_seqlens = seq_lens.to(torch.int32)
+                metadata.cache_seqlens_int32.copy_(cache_seqlens)
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+                )
+
+                page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                page_indices = torch.repeat_interleave(
+                    page_indices, repeats=self.speculative_num_draft_tokens, dim=0
+                )
+                metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
+
+                seqlens_expanded = seqlens_expand_triton(
+                    extend_seq_lens,
+                    cache_seqlens,
+                    total_extend_len,
+                    self.speculative_num_draft_tokens,
+                )
+                metadata.dsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
+                    seqlens_expanded
+                )
+                dsa_cache_seqlens = compute_dsa_seqlens(
+                    seqlens_expanded, self.dsa_index_topk
+                )
+                metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
         if is_cuda() and (
