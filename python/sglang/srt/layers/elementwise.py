@@ -598,6 +598,12 @@ def fused_sigmoid_mul(
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
 
+    if attn_output.device.type == "cpu":
+        gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+        if inplace:
+            return attn_output.mul_(torch.sigmoid(gate_val))
+        return attn_output * torch.sigmoid(gate_val)
+
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
