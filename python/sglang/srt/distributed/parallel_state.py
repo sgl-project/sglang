@@ -798,8 +798,57 @@ class GroupCoordinator:
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
+        elif self._maybe_aiter_reduce_scatter(output, input):
+            return
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
+
+    def _has_aiter_custom_reduce_scatter(self) -> bool:
+        ca_comm = self.ca_comm
+        return (
+            ca_comm is not None
+            and not getattr(ca_comm, "disabled", True)
+            and hasattr(ca_comm, "should_custom_ar")
+            and hasattr(ca_comm, "reduce_scatter")
+        )
+
+    def _maybe_aiter_reduce_scatter(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> bool:
+        # Aiter custom reduce-scatter (ROCm). Mirrors `_all_gather_into_tensor`'s
+        # custom all-gather path: an equal-chunk (no variable sizes) reduce-scatter
+        # using the registered symmetric-memory buffers, which is faster than the
+        # generic RCCL kernel for the small, latency-bound decode collective.
+        # Gated by SGLANG_DP_USE_REDUCE_SCATTER. Falls back (returns False)
+        # for non-ROCm / unsupported shape/size/topology so the caller uses RCCL.
+        if not (
+            is_hip()
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            and self._has_aiter_custom_reduce_scatter()
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        ):
+            return False
+        ca_comm = self.ca_comm
+        # input is the full (pre-reduce) buffer; should_custom_ar bounds its size.
+        if not ca_comm.should_custom_ar(input):
+            return False
+        # Equal-chunk only: input rows must split evenly into world_size chunks
+        # matching the per-rank output rows.
+        if input.shape[0] != output.shape[0] * self.world_size:
+            return False
+        if getattr(ca_comm, "_IS_CAPTURING", False):
+            if torch.cuda.is_current_stream_capturing():
+                ca_comm.reduce_scatter(input, output, registered=True)
+            elif is_in_tc_piecewise_cuda_graph():
+                ca_comm.reduce_scatter(input, output, registered=False)
+            else:
+                # True CUDA graph warmup: avoid a different host collective.
+                output.zero_()
+            return True
+        ca_comm.reduce_scatter(input, output, registered=False)
+        return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
