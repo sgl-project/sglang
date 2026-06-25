@@ -160,10 +160,9 @@ class LMCRadixCache(RadixCache):
             self.load_stream_ctx = nullcontext()
             self.store_stream_ctx = nullcontext()
 
-        # MP (multi-process) is the default. XPU defaults to IP (in-process
-        # layerwise) because the MP connector shares the KV cache via CUDA IPC
-        # (``Tensor._share_cuda_``), which is unavailable on XPU.
-        self._mode = LMCacheMode.IP if self.device.type == "xpu" else LMCacheMode.MP
+        # MP is the default. To use the in-process layerwise connector,
+        # set ``self._mode = LMCacheMode.IP`` here.
+        self._mode = LMCacheMode.IP
         if self._mode is LMCacheMode.MP:
             if not cli_lmc_cfg:
                 raise ValueError(
