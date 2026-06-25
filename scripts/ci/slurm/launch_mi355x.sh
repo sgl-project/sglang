@@ -56,6 +56,21 @@ if [[ -z "$MODEL_PATH" ]]; then
     exit 1
 fi
 
+# Resolve a HuggingFace cache dir (models--org--name) to its live snapshot dir.
+# Lets nightly-configs point at the shared cache without hardcoding a snapshot
+# hash; if MODEL_PATH is already a concrete snapshot (or plain dir), use as-is.
+if [[ -f "$MODEL_PATH/refs/main" && -d "$MODEL_PATH/snapshots" ]]; then
+    SNAP_HASH="$(cat "$MODEL_PATH/refs/main")"
+    RESOLVED="$MODEL_PATH/snapshots/$SNAP_HASH"
+    if [[ -d "$RESOLVED" ]]; then
+        echo "resolved snapshot: $MODEL_PATH -> $RESOLVED"
+        MODEL_PATH="$RESOLVED"
+    else
+        echo "ERROR: refs/main=$SNAP_HASH but $RESOLVED missing" >&2
+        exit 1
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Parse the recipe (runtime + bench + topology) into shell vars.
 # ---------------------------------------------------------------------------
@@ -157,7 +172,13 @@ sys.exit(0 if acc > thr else 1)
 PY
 fi
 
-# DSV4-Flash-FP8 load-bearing env (see test/registered/amd/test_deepseek_v4_flash_fp8.py).
+# DSV4 load-bearing env (see test/registered/amd/test_deepseek_v4_flash_fp8.py).
+# SGLANG_DSV4_FP4_EXPERTS is precision-driven: true for fp4 weights, false for fp8.
+if [[ "$PRECISION" == "fp4" ]]; then
+    FP4_EXPERTS=true
+else
+    FP4_EXPERTS=false
+fi
 DSV4_ENV=(
   -e SGLANG_DEFAULT_THINKING=1 -e SGLANG_DSV4_REASONING_EFFORT=max
   -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=false -e SGLANG_USE_AITER=1
@@ -169,7 +190,7 @@ DSV4_ENV=(
   -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
   -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
-  -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=false
+  -e AITER_BF16_FP8_MOE_BOUND=0 -e SGLANG_DSV4_FP4_EXPERTS=$FP4_EXPERTS
 )
 DSV4_ENV_STR="${DSV4_ENV[*]}"
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
