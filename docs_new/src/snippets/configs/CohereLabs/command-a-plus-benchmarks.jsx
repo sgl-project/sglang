@@ -51,10 +51,35 @@ export const benchmarks = [
     accuracy: { gsm8k_pct: 87.6 },
   },
   // ====================================================================
-  // H200 (Hopper) — sanity-checked recipe, not yet benchmarked (cards show "pending").
+  // H200 (Hopper) — verified on an 8x H200 devbox, sglang main @ 20b2817.
+  // Plain TP + default Triton MoE, launched with --cuda-graph-backend-prefill
+  // disabled (the tc_piecewise prefill-graph compile crashes on current main —
+  // see the page §2 note). Decode CUDA graph stays full so throughput is
+  // representative; the disabled prefill graph inflates TTFT (esp. long-input).
+  // tokens/sec/GPU = total output tok/s ÷ TP (BF16 TP=8, FP8 TP=4). GSM8K 5-shot, 200Q.
   // ====================================================================
-  { match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "h200", variant: "default", quant: "fp8",  strategy: "balanced", nodes: "single" } },
+  {
+    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+    sglang_version: "20b2817",
+    speed: [
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 64, num_prompts: 80 },
+        ttft_ms: 806, tpot_ms: 15.22, tokens_per_sec_per_gpu: 368 },
+      { workload: { dataset: "random", isl: 8000, osl: 1000, max_concurrency: 16, num_prompts: 80 },
+        ttft_ms: 1359, tpot_ms: 11.79, tokens_per_sec_per_gpu: 151 },
+    ],
+    accuracy: { gsm8k_pct: 90.5 },
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+    sglang_version: "20b2817",
+    speed: [
+      { workload: { dataset: "random", isl: 1000, osl: 1000, max_concurrency: 80, num_prompts: 80 },
+        ttft_ms: 1088, tpot_ms: 17.60, tokens_per_sec_per_gpu: 1070 },
+      { workload: { dataset: "random", isl: 8000, osl: 1000, max_concurrency: 80, num_prompts: 80 },
+        ttft_ms: 6495, tpot_ms: 24.78, tokens_per_sec_per_gpu: 640 },
+    ],
+    accuracy: { gsm8k_pct: 90.5 },
+  },
   // ====================================================================
   // B200 (Blackwell) — same recipe as B300, not yet benchmarked on B200 (pending).
   // ====================================================================

@@ -4,8 +4,8 @@
 export const config = {
   modelName: "Command A+",
 
-  // B300 is benchmark-verified. B200 (Blackwell — same recipe as B300) and H100/H200
-  // (Hopper — Cohere's plain-TP sizing) are sanity-checked → unverified badge until
+  // B300 + H200 are benchmark-verified. B200 (Blackwell — same recipe as B300) and
+  // H100 (Hopper — same recipe as H200) are sanity-checked → unverified badge until
   // re-run. Other hw auto-greys-out.
   supportedHardware: ["b300", "b200", "h200", "h100"],
 
@@ -279,36 +279,41 @@ sgl-eval run gsm8k \\
     // ====================================================================
     // H200 (Hopper) — plain TP, default Triton FusedMoE (no Blackwell CUTLASS
     // path). Sizes follow Cohere's official per-quant GPU guidance (BF16 TP=8,
-    // FP8 TP=4). Sanity-checked, NOT yet benchmarked → verified: false. W4A4
-    // (NVFP4) is Blackwell-only — the Hopper dequant path isn't validated, so no
-    // H200 W4A4 cell (the Deploy panel greys it out).
+    // FP8 TP=4). VERIFIED on an 8x H200 devbox (sglang main @ 20b2817). The
+    // `--cuda-graph-backend-prefill disabled` flag is REQUIRED on current main:
+    // the tc_piecewise prefill-graph compile crashes for cohere2_moe (see the
+    // page §2 note). Decode CUDA graph stays full. W4A4 (NVFP4) is Blackwell-only
+    // — the Hopper dequant path isn't validated, so no H200 W4A4 cell.
     // ====================================================================
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
+        "--cuda-graph-backend-prefill disabled",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--cuda-graph-backend-prefill disabled",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     // ====================================================================
-    // H100 (Hopper) — same plain-TP recipe as H200 (default Triton MoE). Not yet
+    // H100 (Hopper) — same plain-TP recipe as H200 (default Triton MoE) + the
+    // same `--cuda-graph-backend-prefill disabled` workaround. Not yet
     // benchmarked → verified: false. W4A4 (NVFP4) is Blackwell-only (no H100 cell).
     // ====================================================================
     {
@@ -319,6 +324,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
+        "--cuda-graph-backend-prefill disabled",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -331,6 +337,7 @@ sgl-eval run gsm8k \\
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
+        "--cuda-graph-backend-prefill disabled",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
