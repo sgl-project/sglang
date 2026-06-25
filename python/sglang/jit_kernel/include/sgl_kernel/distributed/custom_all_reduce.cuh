@@ -214,10 +214,6 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
     m_is_graph_capturing = enabled;
   }
 
-  void set_cuda_graph_register_inputs(bool enabled) {
-    m_register_graph_inputs = enabled;
-  }
-
   tvm::ffi::Array<int64_t> get_graph_capture_ptrs() {
     tvm::ffi::Array<int64_t> result;
     const auto new_count = registered_count() - m_cum_registered_count;
@@ -406,7 +402,6 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
   uint32_t m_cta_size;
   // other states
   bool m_is_graph_capturing = false;
-  bool m_register_graph_inputs = true;
   int64_t m_cum_registered_count = 0;
   std::optional<PullController> m_pull_ctrl;
   std::optional<PushController> m_push_ctrl;

@@ -104,9 +104,8 @@ class CustomAllReduceV2:
         if self.disabled:
             yield
             return
-        self.obj.set_cuda_graph_register_inputs(not self.tms_cudagraph)
         try:
-            self.obj.set_cuda_graph_capture(True)
+            self.obj.set_cuda_graph_capture(not self.tms_cudagraph)
             yield
         finally:
             self.obj.set_cuda_graph_capture(False)
@@ -154,7 +153,7 @@ class CustomAllReduceV2:
                 self.obj.set_cuda_graph_capture(False)
                 return self._all_reduce(input)
             finally:
-                self.obj.set_cuda_graph_capture(True)
+                self.obj.set_cuda_graph_capture(not self.tms_cudagraph)
         return self._all_reduce(input)
 
     def close(self):

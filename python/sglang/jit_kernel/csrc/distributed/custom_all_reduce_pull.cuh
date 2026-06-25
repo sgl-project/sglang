@@ -177,7 +177,7 @@ struct CustomAllReducePull : public CustomAllReduceBase {
       RuntimeDeviceCheck(cudaStreamIsCapturing(stream, &status));
       return status == cudaStreamCaptureStatusActive;
     };
-    if (check_capturing() && m_register_graph_inputs) {
+    if (check_capturing()) {
       // no-op if not really capturing, we're in a dummy run
       const auto data_ptr = allocate_graph_capture_input(input_ptr, input_bytes);
       /// NOTE: we assume when the graph is replayed, the data_ptr should be ready
