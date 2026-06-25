@@ -10,7 +10,7 @@ GPT‑OSS is compatible with the OpenAI Responses API. Use `client.responses.cre
 
 ### Built-in Tools
 
-GPT‑OSS can call built‑in tools for web search and Python execution. You can use the demo tool server or connect to external MCP tool servers.
+GPT‑OSS can call built-in tools for web search and Python execution. SGLang provides native web search when an Exa API key is configured on the server. The demo tool server and external MCP tool servers remain available for Python execution and custom tools.
 
 #### Python Tool
 
@@ -20,8 +20,10 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 
 #### Web Search Tool
 
-- Uses the Exa backend for web search.
-- Requires an Exa API key; set `EXA_API_KEY` in your environment. Create a key at `https://exa.ai`.
+- Uses Exa as the default backend for native web search.
+- Requires an Exa API key; set `EXA_API_KEY` in the SGLang server environment. Create a key at `https://dashboard.exa.ai/api-keys`.
+- Uses server-side defaults: `numResults=10`, search `type="auto"`, and `contents.highlights=true`.
+- Tags native Exa requests with `x-exa-integration: sglang` for integration attribution.
 
 ### Tool & Reasoning Parser
 
@@ -30,25 +32,30 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 
 ## Notes
 
-- Use **Python 3.12** for the demo tools. And install the required `gpt-oss` packages.
-- The default demo integrates the web search tool (Exa backend) and a demo Python interpreter via Docker.
-- For search, set `EXA_API_KEY`. For Python execution, either have Docker available or set `PYTHON_EXECUTION_BACKEND=UV`.
+- Native web search does not require `--tool-server demo`; set `EXA_API_KEY` before launching SGLang.
+- Use **Python 3.12** for the demo Python tool. For Python execution, either have Docker available or set `PYTHON_EXECUTION_BACKEND=UV`.
+- MCP remains available for advanced/custom tools. Native SGLang web search is tagged automatically; custom MCP servers are responsible for their own upstream request headers.
 
 Examples:
 ```bash
 export EXA_API_KEY=YOUR_EXA_KEY
+export SGLANG_EXA_NUM_RESULTS=10
+export SGLANG_EXA_SEARCH_TYPE=auto
+export SGLANG_EXA_INCLUDE_HIGHLIGHTS=true
+
 # Optional: run Python tool locally instead of Docker (use with care)
 export PYTHON_EXECUTION_BACKEND=UV
 ```
 
-Launch the server with the demo tool server:
+Launch the server with native web search:
 
 ```bash
 python3 -m sglang.launch_server \
   --model-path openai/gpt-oss-120b \
-  --tool-server demo \
   --tp 2
 ```
+
+Add `--tool-server demo` only when you also want the demo Python tool server.
 
 For production usage, sglang can act as an MCP client for multiple services. An [example tool server](https://github.com/openai/gpt-oss/tree/main/gpt-oss-mcp-server) is provided. Start the servers and point sglang to them:
 ```bash
@@ -87,37 +94,35 @@ client = OpenAI(
     api_key="sk-123456"
 )
 
-tools = [
-    {"type": "code_interpreter"},
-    {"type": "web_search_preview"},
-]
+search_tools = [{"type": "web_search"}]
+python_tools = [{"type": "code_interpreter"}]
 
 # Reasoning level example
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helpful assistant."
-    reasoning_effort="high" # Supports high, medium, or low
+    instructions="You are a helpful assistant.",
+    reasoning_effort="high", # Supports high, medium, or low
     input="In one sentence, explain the transformer architecture.",
 )
 print("====== reasoning: high ======")
 print(response.output_text)
 
-# Test python tool
+# Test python tool. Requires launching SGLang with --tool-server demo.
 response = client.responses.create(
     model="openai/gpt-oss-120b",
     instructions="You are a helpful assistant, you could use python tool to execute code.",
     input="Use python tool to calculate the sum of 29138749187 and 29138749187", # 58,277,498,374
-    tools=tools
+    tools=python_tools
 )
 print("====== test python tool ======")
 print(response.output_text)
 
-# Test browser tool
+# Test web search tool
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helpful assistant, you could use browser to search the web",
+    instructions="You are a helpful assistant, you can search the web when needed.",
     input="Search the web for the latest news about Nvidia stock price",
-    tools=tools
+    tools=search_tools
 )
 print("====== test browser tool ======")
 print(response.output_text)

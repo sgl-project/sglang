@@ -334,6 +334,10 @@ async def lifespan(fast_api_app: FastAPI):
 
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
+    elif os.getenv("EXA_API_KEY"):
+        from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
+
+        tool_server = NativeToolServer()
 
     try:
         from sglang.srt.entrypoints.openai.serving_responses import (

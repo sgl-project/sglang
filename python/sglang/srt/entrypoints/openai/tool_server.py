@@ -175,3 +175,30 @@ class DemoToolServer(ToolServer):
     @asynccontextmanager
     async def get_tool_session(self, tool_name: str):
         yield self.tools[tool_name]
+
+
+class NativeToolServer(ToolServer):
+    """Built-in SGLang hosted tools that do not require an external MCP server."""
+
+    def __init__(self):
+        from sglang.srt.entrypoints.tool import HarmonyBrowserTool, Tool
+
+        self.tools: dict[str, Tool] = {}
+        browser_tool = HarmonyBrowserTool()
+        if browser_tool.enabled:
+            self.tools["browser"] = browser_tool
+
+    def has_tool(self, tool_name: str):
+        return tool_name in self.tools
+
+    def get_tool_description(self, tool_name: str):
+        if tool_name not in self.tools:
+            return None
+        if tool_name == "browser":
+            return ToolNamespaceConfig.browser()
+        else:
+            raise ValueError(f"Unknown tool {tool_name}")
+
+    @asynccontextmanager
+    async def get_tool_session(self, tool_name: str):
+        yield self.tools[tool_name]
