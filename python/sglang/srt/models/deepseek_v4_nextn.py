@@ -274,7 +274,12 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        super().load_weights(weights, is_nextn=True)
+        return super().load_weights(weights, is_nextn=True)
+
+    def is_optional_weight(self, name: str) -> bool:
+        if "lm_head" in name or "embed_tokens" in name:
+            return True
+        return super().is_optional_weight(name)
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)

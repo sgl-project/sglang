@@ -447,6 +447,8 @@ class Llama4VisionModel(nn.Module):
 
 
 class Llama4ForConditionalGeneration(nn.Module):
+    verify_weights_on_load = True
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -692,8 +694,8 @@ class Llama4ForConditionalGeneration(nn.Module):
                     name, loaded_weight
                 )
 
-            if self._handle_scale_remapping(name, params_dict):
-                loaded_params.add(name)
+            name = self._remap_scale_name(name, params_dict)
+            if name is None:
                 continue
 
             if self._handle_stacked_params(
@@ -713,11 +715,7 @@ class Llama4ForConditionalGeneration(nn.Module):
 
             loaded_params.add(name)
             self._handle_default_weight(name, loaded_weight, params_dict)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            logger.warning(
-                f"Some weights are not initialized from checkpoints {unloaded_params}"
-            )
+        return loaded_params
 
     def _should_skip_weight(self, name: str) -> bool:
         """Check if we should skip loading this weight."""
@@ -735,12 +733,17 @@ class Llama4ForConditionalGeneration(nn.Module):
             return f"language_model.{name}"
         return name
 
-    def _handle_scale_remapping(self, name: str, params_dict: dict) -> bool:
-        """Handle scale parameter remapping. Returns True if handled."""
+    def _remap_scale_name(self, name: str, params_dict: dict) -> Optional[str]:
         if "scale" in name and "expert" not in name:
             remapped_name = maybe_remap_kv_scale_name(name, params_dict)
-            return remapped_name != name
-        return False
+            if (
+                remapped_name is not None
+                and remapped_name != name
+                and remapped_name not in params_dict
+            ):
+                return None
+            return remapped_name
+        return name
 
     def _handle_stacked_params(
         self,
