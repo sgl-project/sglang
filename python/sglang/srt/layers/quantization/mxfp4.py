@@ -36,6 +36,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
+    dim_is_supported,
+    dtype_is_supported,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -835,28 +837,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w13_weight
             del layer.w2_weight
         elif _is_cpu and _is_cpu_amx_available:
-            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-            if use_intel_amx_backend(layer):
-                packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
-                    layer.w13_weight_scale
-                )
-                packed_w2_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
-                    layer.w2_weight_scale
-                )
-                layer.w13_weight_scale = Parameter(
-                    packed_w13_weight_scale, requires_grad=False
-                )
-                layer.w2_weight_scale = Parameter(
-                    packed_w2_weight_scale, requires_grad=False
-                )
-                if hasattr(layer, "w13_weight_bias"):
-                    layer.w13_weight_bias = Parameter(
-                        layer.w13_weight_bias.float(), requires_grad=False
+            # _amx_process_weight_after_loading() mutates weights as it walks
+            # them. Pre-check every MXFP4 expert tensor first so a TP-sharded
+            # layer with one unsupported tensor does not end up with a partially
+            # AMX-packed layer. Unsupported CPU shapes should instead use the
+            # torch-native fallback below.
+            can_use_amx = all(
+                dim_is_supported(getattr(layer, weight_name))
+                and dtype_is_supported(getattr(layer, weight_name))
+                for weight_name in ["w13_weight", "w2_weight"]
+            )
+            if can_use_amx:
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+                if use_intel_amx_backend(layer):
+                    packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                        layer.w13_weight_scale
                     )
-                if hasattr(layer, "w2_weight_bias"):
-                    layer.w2_weight_bias = Parameter(
-                        layer.w2_weight_bias.float(), requires_grad=False
+                    packed_w2_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
+                        layer.w2_weight_scale
                     )
+                    layer.w13_weight_scale = Parameter(
+                        packed_w13_weight_scale, requires_grad=False
+                    )
+                    layer.w2_weight_scale = Parameter(
+                        packed_w2_weight_scale, requires_grad=False
+                    )
+                    if hasattr(layer, "w13_weight_bias"):
+                        layer.w13_weight_bias = Parameter(
+                            layer.w13_weight_bias.float(), requires_grad=False
+                        )
+                    if hasattr(layer, "w2_weight_bias"):
+                        layer.w2_weight_bias = Parameter(
+                            layer.w2_weight_bias.float(), requires_grad=False
+                        )
+                    return
+
+            layer.use_intel_amx_backend = False
+            self._dequant_mxfp4_weights_for_native_cpu(layer)
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
@@ -880,6 +897,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
+
+    def _dequant_mxfp4_weights_for_native_cpu(self, layer):
+        from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
+        w13_weight = MXFP4QuantizeUtil.dequantize(
+            quantized_data=layer.w13_weight,
+            dtype=torch.bfloat16,
+            scale=layer.w13_weight_scale,
+            block_sizes=[32],
+        )
+        w2_weight = MXFP4QuantizeUtil.dequantize(
+            quantized_data=layer.w2_weight,
+            dtype=torch.bfloat16,
+            scale=layer.w2_weight_scale,
+            block_sizes=[32],
+        )
+        del layer.w13_weight
+        del layer.w2_weight
+        del layer.w13_weight_scale
+        del layer.w2_weight_scale
+        layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
@@ -1110,6 +1149,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.moe_runner_config.gemm1_alpha,
                 layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        if _is_cpu:
+            # If CPU AMX was unavailable for this layer (for example because
+            # TP-sharded GPT-OSS MXFP4 tensors do not satisfy AMX tile
+            # constraints), process_weights_after_loading() dequantized the
+            # MXFP4 weights to bf16. Use the torch-native MoE implementation
+            # instead of falling through to the generic Triton runner, whose
+            # inplace fused-experts custom op has no CPU backend.
+            from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
+            output = moe_forward_native(
+                layer,
+                x,
+                topk_output,
+                self.moe_runner_config,
             )
             return StandardCombineInput(hidden_states=output)
 
