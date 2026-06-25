@@ -25,6 +25,7 @@ HUNYUAN_3D_2_WEIGHTS_PATH = use_modelscope("Tencent-Hunyuan/Hunyuan3D-2")
 JOYAI_IMAGE_EDIT_WEIGHTS_PATH = use_modelscope(
     "jd-opensource/JoyAI-Image-Edit-Diffusers"
 )
+LTX_2_3_WEIGHTS_PATH = use_modelscope("Lightricks/LTX-2.3")
 MOVA_360_WEIGHTS_PATH = use_modelscope("openmoss/MOVA-360p")
 QWEN_IMAGE_WEIGHTS_PATH = use_modelscope("Qwen/Qwen-Image")
 SANA_WM_MODEL_WEIGHTS_PATH = use_modelscope(
@@ -43,7 +44,7 @@ EXTRAS_DISABLE_WARMUP = ["--warmup-mode", "request"]
 ONE_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
-        "cosmos3_nano_t2i_npu",
+        "cosmos3_nano_t2i_1npu",
         DiffusionServerArgs(
             model_path=COSMOS3_NANO_WEIGHTS_PATH,
             modality="image",
@@ -69,7 +70,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
-        "ernie_image_t2i_1_npu",
+        "ernie_image_t2i_1npu",
         DiffusionServerArgs(
             model_path=ERNIE_IMAGE_WEIGHTS_PATH,
             extras=EXTRAS_DISABLE_WARMUP,
@@ -78,7 +79,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
     ),
     DiffusionTestCase(
-        "glm_image_t2i_1_npu",
+        "glm_image_t2i_1npu",
         DiffusionServerArgs(
             model_path=GLM_IMAGE_WEIGHTS_PATH,
             extras=EXTRAS_DISABLE_WARMUP,
@@ -95,7 +96,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "flux_2_klein_4b_t2i_1_npu",
+        "flux_2_klein_4b_t2i_1npu",
         DiffusionServerArgs(
             model_path=FLUX_2_KLEIN_4B_WEIGHTS_PATH,
             extras=EXTRAS_DISABLE_WARMUP,
@@ -104,7 +105,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
     ),
     DiffusionTestCase(
-        "z_image_t2i_1_npu",
+        "z_image_t2i_1npu",
         DiffusionServerArgs(
             model_path=Z_IMAGE_WEIGHTS_PATH,
             extras=EXTRAS_DISABLE_WARMUP,
@@ -112,17 +113,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
         run_consistency_check=False,
     ),
-    # === Image to Mesh (I2M) ===
-    # TODO: uncomment when Hunyuan3D-2 pipeline will be fixed
-    # DiffusionTestCase(
-    #     "hunyuan_3d_2_i2m_1_npu",
-    #     DiffusionServerArgs(
-    #         model_path=HUNYUAN_3D_2_WEIGHTS_PATH,
-    #         extras=EXTRAS_DISABLE_WARMUP,
-    #     ),
-    #     HUNYUAN3D_SHAPE_sampling_params,
-    #     run_consistency_check=False,
-    # ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_1_npu",
@@ -134,9 +124,9 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
-    # === Text and Image to Image (TI2I)
+    # === Text+Image to Image (TI2I)
     DiffusionTestCase(
-        "joyai_image_edit_ti2i_npu",
+        "joyai_image_edit_ti2i_1npu",
         DiffusionServerArgs(
             model_path=JOYAI_IMAGE_EDIT_WEIGHTS_PATH,
             extras=EXTRAS_DISABLE_WARMUP,
@@ -144,6 +134,17 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
+    # === Image to Mesh (I2M) ===
+    # TODO: uncomment when Hunyuan3D-2 pipeline will be fixed
+    # DiffusionTestCase(
+    #     "hunyuan_3d_2_i2m_1npu",
+    #     DiffusionServerArgs(
+    #         model_path=HUNYUAN_3D_2_WEIGHTS_PATH,
+    #         extras=EXTRAS_DISABLE_WARMUP,
+    #     ),
+    #     HUNYUAN3D_SHAPE_sampling_params,
+    #     run_consistency_check=False,
+    # ),
 ]
 
 TWO_NPU_CASES: list[DiffusionTestCase] = [
@@ -188,7 +189,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
     # DiffusionTestCase(
     #     "ltx_2_3_two_stage_ti2v_2npu",
     #     DiffusionServerArgs(
-    #         model_path="/root/.cache/modelscope/hub/models/Lightricks/LTX-2.3",
+    #         model_path=LTX_2_3_WEIGHTS_PATH,
     #         cfg_parallel=True,
     #         extras=[
     #             "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
@@ -196,12 +197,12 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
     #     ),
     #     run_component_accuracy_check=False,
     # ),
-    # === Text and Image to Video (TI2V)
+    # === Text+Image to Video (TI2V)
     # TODO: fix fail
     # DiffusionTestCase(
     #    "sana_wm_bidirectional_ti2v_2npu",
     #    DiffusionServerArgs(
-    #        model_path="/root/.cache/modelscope/hub/modelsEfficient-Large-Model/SANA-WM_bidirectional",
+    #        model_path=SANA_WM_MODEL_WEIGHTS_PATH,
     #        num_gpus=2,
     #        tp_size=2,
     #        extras=EXTRAS_DISABLE_WARMUP,
@@ -212,6 +213,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
     #     run_models_api_check=False,
     #     run_t2v_input_reference_check=False,
     # ),
+    # === Text to Video+Audio (TI2V)
     DiffusionTestCase(
         "mova_360p_t2va_2npu",
         DiffusionServerArgs(

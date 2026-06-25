@@ -324,7 +324,7 @@
             "expected_avg_denoise_ms": 610.41,
             "expected_median_denoise_ms": 615.39
         },
-        "ernie_image_t2i_1_npu": {
+        "ernie_image_t2i_1npu": {
             "stages_ms": {
                 "InputValidationStage": 0.07,
                 "PromptEnhancementStage": 8787.2,
@@ -390,7 +390,7 @@
             "expected_avg_denoise_ms": 949.3,
             "expected_median_denoise_ms": 982.02
         },
-        "glm_image_t2i_1_npu": {
+        "glm_image_t2i_1npu": {
             "stages_ms": {
                 "GlmImageAR": 69299.14,
                 "GlmImageBeforeDenoisingStage": 94.01,
@@ -433,7 +433,7 @@
             "expected_avg_denoise_ms": 810.55,
             "expected_median_denoise_ms": 819.55
         },
-        "z_image_t2i_1_npu": {
+        "z_image_t2i_1npu": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
                 "TextEncodingStage": 246.13,
@@ -498,7 +498,7 @@
             "expected_avg_denoise_ms": 732.82,
             "expected_median_denoise_ms": 732.5
         },
-        "flux_2_klein_4b_t2i_1_npu": {
+        "flux_2_klein_4b_t2i_1npu": {
             "stages_ms": {
                 "InputValidationStage": 0.07,
                 "TextEncodingStage": 232.96,
@@ -518,7 +518,7 @@
             "expected_avg_denoise_ms": 35.7,
             "expected_median_denoise_ms": 35.34
          },
-        "cosmos3_nano_t2i_npu": {
+        "cosmos3_nano_t2i_1npu": {
             "stages_ms": {
                 "Cosmos3ImagePreprocessStage": 0.01,
                 "Cosmos3TokenizationStage": 1144.71,
@@ -532,7 +532,7 @@
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0
          },
-        "joyai_image_edit_ti2i_npu": {
+        "joyai_image_edit_ti2i_1npu": {
             "stages_ms": {
                 "InputValidationStage": 20.04,
                 "ImageEncodingStage": 1239.81,
