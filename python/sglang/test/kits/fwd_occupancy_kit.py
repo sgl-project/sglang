@@ -93,16 +93,18 @@ class FwdOccupancyMixin:
         )
 
     def _fwd_occupancy_fire(self, prompt: str, max_new_tokens: int):
-        """Fire one /generate. Must not be called concurrently -- that
-        would break the single-batch invariant."""
+        """Fire one /generate, return completion_tokens (0 on failure).
+        Must not be called concurrently -- that would break the
+        single-batch invariant."""
         try:
-            requests.post(
+            resp = requests.post(
                 self.base_url + "/generate",
                 json={
                     "text": prompt,
                     "sampling_params": {
                         "temperature": 0.0,
                         "max_new_tokens": max_new_tokens,
+                        "ignore_eos": True,
                     },
                 },
                 timeout=_GENERATE_REQUEST_TIMEOUT,
@@ -110,7 +112,11 @@ class FwdOccupancyMixin:
         except requests.RequestException:
             # Final stats-vs-threshold is the signal; individual fire
             # failure isn't.
-            pass
+            return 0
+        try:
+            return resp.json().get("meta_info", {}).get("completion_tokens", 0)
+        except ValueError:  # non-JSON body
+            return 0
 
     def _fwd_occupancy_warmup(self):
         """Fill cuda graphs + step the device-timer past its first NaN
@@ -123,13 +129,16 @@ class FwdOccupancyMixin:
 
     def _fwd_occupancy_measure(self):
         """Background-fire one long single-batch request, scrape
-        /metrics on the foreground; return non-NaN samples."""
+        /metrics on the foreground; return (non-NaN samples,
+        token_tps) -- token_tps is completion_tokens / wall time of
+        the long request (0.0 on failure)."""
         samples = []
         request_done = threading.Event()
+        result = {"completion_tokens": 0}
 
         def fire_one():
             try:
-                self._fwd_occupancy_fire(
+                result["completion_tokens"] = self._fwd_occupancy_fire(
                     self.fwd_occupancy_prompt,
                     self.fwd_occupancy_max_new_tokens,
                 )
@@ -139,6 +148,7 @@ class FwdOccupancyMixin:
         firer = threading.Thread(target=fire_one, daemon=True)
         firer.start()
 
+        wall_start = time.perf_counter()
         while not request_done.is_set():
             v = self._scrape_fwd_occupancy()
             if v is not None:
@@ -146,12 +156,14 @@ class FwdOccupancyMixin:
             time.sleep(self.fwd_occupancy_scrape_interval)
 
         firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
-        return samples
+        wall_time = max(time.perf_counter() - wall_start, 1e-6)
+        token_tps = result["completion_tokens"] / wall_time
+        return samples, token_tps
 
     def test_fwd_occupancy(self):
         self._assert_metrics_device_timer_enabled()
         self._fwd_occupancy_warmup()
-        samples = self._fwd_occupancy_measure()
+        samples, token_tps = self._fwd_occupancy_measure()
 
         self.assertGreaterEqual(
             len(samples),
@@ -176,6 +188,7 @@ class FwdOccupancyMixin:
                     ["peak", f"{peak:.2f}"],
                     ["p10", f"{p10:.2f}"],
                     ["threshold", f"{self.fwd_occupancy_threshold:.2f}"],
+                    ["token tps", f"{token_tps:.2f}"],
                 ],
                 headers=["fwd_occupancy", "value"],
                 tablefmt="github",
