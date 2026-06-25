@@ -37,6 +37,9 @@ from sglang.srt.distributed import (
     bootstrap,
     get_world_group,
 )
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    init_mooncake_transfer_engine,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
@@ -831,49 +834,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.pre_model_load_memory = result.pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
-        """
-        Need MooncakeTransferEngine when:
-        1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
-        2) HiCache uses mooncake storage backend
-        3) Encoder disaggregation uses mooncake
-        """
-        use_mooncake_te = (
-            (
-                self.server_args.disaggregation_mode != "null"
-                and self.server_args.disaggregation_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.enable_hierarchical_cache
-                and self.server_args.hicache_storage_backend == "mooncake"
-                and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
-            )
-            or (
-                self.server_args.encoder_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "mooncake"
-            )
-            or (
-                self.server_args.enable_elastic_expert_backup
-                and self.server_args.elastic_ep_backend is not None
-            )
+        maybe_init_shared_mooncake_transfer_engine(
+            server_args=self.server_args, gpu_id=self.gpu_id
         )
-
-        if use_mooncake_te:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                init_mooncake_transfer_engine,
-            )
-
-            init_mooncake_transfer_engine(
-                hostname=get_local_ip_auto(),
-                gpu_id=self.gpu_id,
-                ib_device=(
-                    self.server_args.disaggregation_ib_device
-                    or self.server_args.mooncake_ib_device
-                ),
-            )
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -1867,3 +1830,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=load_format,
         )
         self.load_config = load_config
+
+
+def maybe_init_shared_mooncake_transfer_engine(
+    *, server_args: ServerArgs, gpu_id: int
+) -> None:
+    """
+    Need MooncakeTransferEngine when:
+    1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
+    2) HiCache uses mooncake storage backend
+    3) Encoder disaggregation uses mooncake
+    """
+    use_mooncake_te = (
+        (
+            server_args.disaggregation_mode != "null"
+            and server_args.disaggregation_transfer_backend == "mooncake"
+        )
+        or (
+            server_args.enable_hierarchical_cache
+            and server_args.hicache_storage_backend == "mooncake"
+            and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+        )
+        or (
+            server_args.encoder_only
+            and server_args.encoder_transfer_backend == "mooncake"
+        )
+        or (
+            server_args.language_only
+            and server_args.encoder_transfer_backend == "mooncake"
+        )
+        or (
+            server_args.enable_elastic_expert_backup
+            and server_args.elastic_ep_backend is not None
+        )
+    )
+
+    if use_mooncake_te:
+        init_mooncake_transfer_engine(
+            hostname=get_local_ip_auto(),
+            gpu_id=gpu_id,
+            ib_device=(
+                server_args.disaggregation_ib_device or server_args.mooncake_ib_device
+            ),
+        )

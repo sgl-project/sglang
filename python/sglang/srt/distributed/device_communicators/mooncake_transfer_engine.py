@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -9,7 +11,7 @@ from sglang.srt.utils.network import NetworkAddress, get_free_port
 logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
-_mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
+_mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
 
 
 def parse_ib_device_config(
