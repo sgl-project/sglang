@@ -1036,7 +1036,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         return loaded_params
 
     lora_pattern = re.compile(
-        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+        r"^language_model\.layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.(?:experts|down_proj|gate_up_proj))"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:
