@@ -350,6 +350,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Mixed prefill/decode boundary for backends that split mixed batches.
+    mix_running_indices: Optional[torch.Tensor] = None
+    mix_decode_bs: int = 0
     # The mask to track mamba state if needed
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
@@ -682,6 +685,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             mamba_track_indices=batch.mamba_track_indices,
+            mix_running_indices=batch.mix_running_indices,
+            mix_decode_bs=batch.mix_decode_bs,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,

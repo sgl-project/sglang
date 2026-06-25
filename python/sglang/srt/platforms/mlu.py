@@ -79,6 +79,9 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def apply_server_args_defaults(self, server_args) -> None:
         self.init_backend()
+        server_args.attention_backend = "mlu"
+        server_args.prefill_attention_backend = "mlu"
+        server_args.decode_attention_backend = "mlu"
         server_args.sampling_backend = "pytorch"
         if server_args.page_size is None:
             server_args.page_size = 16
@@ -89,6 +92,9 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
             server_args.enable_hierarchical_cache = False
 
     def get_dispatch_key_name(self) -> str:
+        return "mlu"
+
+    def get_default_attention_backend(self) -> str:
         return "mlu"
 
     def get_mha_kv_pool_cls(self) -> type:
