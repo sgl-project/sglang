@@ -159,6 +159,9 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+)
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -577,7 +580,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
-        self._model_update_group = {}
+        self.weight_updater = WeightUpdater(tp_rank=self.tp_rank, _mr=self)
         self._weights_send_group = {}
 
     def init_msprobe(self):
@@ -1993,8 +1996,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             shape: the shape of the parameter to be updated.
         """
 
-        assert group_name in self._model_update_group, (
-            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+        assert group_name in self.weight_updater._model_update_group, (
+            f"Group {group_name} not in {list(self.weight_updater._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
 
@@ -2014,7 +2017,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     torch.distributed.broadcast(
                         weight,
                         src=0,
-                        group=self._model_update_group[group_name],
+                        group=self.weight_updater._model_update_group[group_name],
                         async_op=True,
                     )
                 )
@@ -2051,7 +2054,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             torch.distributed.broadcast(
                 flattened_tensor,
                 src=0,
-                group=self._model_update_group[group_name],
+                group=self.weight_updater._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.model.load_weights(reconstructed_tensors)
