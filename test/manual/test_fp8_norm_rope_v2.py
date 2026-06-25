@@ -28,7 +28,6 @@ import sys
 import pytest
 import torch
 
-from sglang.jit_kernel.benchmark.bench_activation import register_cuda_ci
 from sglang.jit_kernel.dsv4 import CompressorDecodePlan, compress_norm_rope_store
 from sglang.jit_kernel.dsv4.fused_norm_rope_v2_torch import _fwht128
 from sglang.jit_kernel.hadamard import hadamard_transform
@@ -36,9 +35,6 @@ from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 from sglang.srt.utils import get_device, is_cuda
 
 _is_cuda = is_cuda()
-
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
 
 ROPE_DIM = 64
 PAGE_SIZE = 64
