@@ -639,7 +639,9 @@ def bench_cache_finished(
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", seq)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         req.cache.last_node = node
         req.cache.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)
