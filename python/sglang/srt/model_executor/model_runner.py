@@ -131,6 +131,11 @@ from sglang.srt.model_executor.forward_context import (
     has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    assert_pp_mtp_compat,
+    compute_model_num_layers,
+    resolve_pp_layer_range,
+)
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
     maybe_downgrade_dtype_for_legacy_gpu,
@@ -733,20 +738,14 @@ class ModelRunner:
         # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
         _nnpl = self.model_config.num_nextn_predict_layers
         model_has_mtp_layers = _nnpl is not None and _nnpl > 0
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
-                self.model_config.num_hidden_layers,
-                self.model_config.num_attention_layers,
-            )
+        model_num_layers = compute_model_num_layers(
+            model_config=self.model_config, is_draft_worker=self.is_draft_worker
         )
-        if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
-            model_num_layers = 1
-        elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
-            model_num_layers = 1
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
+        pp_range = resolve_pp_layer_range(
+            model=self.model, model_num_layers=model_num_layers
+        )
+        self.start_layer = pp_range.start_layer
+        self.end_layer = pp_range.end_layer
         self.num_effective_layers = self.end_layer - self.start_layer
 
         self.adjust_hybrid_swa_layers_for_pp()
@@ -756,14 +755,12 @@ class ModelRunner:
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
-            )
-        ), "PP is not compatible with MTP models."
+        assert_pp_mtp_compat(
+            model_has_mtp_layers=model_has_mtp_layers,
+            spec_algorithm=self.spec_algorithm,
+            num_effective_layers=self.num_effective_layers,
+            model_num_layers=model_num_layers,
+        )
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -2241,3 +2238,68 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PPLayerRange:
+    start_layer: int
+    end_layer: int
+
+
+def compute_model_num_layers(
+    *,
+    model_config: ModelConfig,
+    is_draft_worker: bool,
+) -> int:
+    # Some EAGLE3 drafts (e.g. nvidia/Kimi-K2.5-Thinking-Eagle3) carry the full DeepSeek-V3
+    # config schema and explicitly set `num_nextn_predict_layers: 0`. Treat that the same as
+    # the field being absent — otherwise the draft worker takes the MTP branch below with
+    # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
+    # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
+    _nnpl = model_config.num_nextn_predict_layers
+    model_has_mtp_layers = _nnpl is not None and _nnpl > 0
+    model_num_layers = (
+        model_config.num_nextn_predict_layers
+        if is_draft_worker and model_has_mtp_layers
+        else max(
+            model_config.num_hidden_layers,
+            model_config.num_attention_layers,
+        )
+    )
+    if model_config.hf_config.architectures[0] == "MiMoV2MTP":
+        model_num_layers = 1
+    elif model_config.hf_config.architectures[0] == "Step3p5MTP":
+        model_num_layers = 1
+    return model_num_layers
+
+
+def resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> PPLayerRange:
+    return PPLayerRange(
+        start_layer=getattr(model, "start_layer", 0),
+        end_layer=getattr(model, "end_layer", model_num_layers),
+    )
+
+
+def assert_pp_mtp_compat(
+    *,
+    model_has_mtp_layers: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    num_effective_layers: int,
+    model_num_layers: int,
+) -> None:
+    assert (
+        (not model_has_mtp_layers)
+        or (spec_algorithm.is_none())
+        or (
+            (not spec_algorithm.is_none())
+            and (num_effective_layers == model_num_layers)
+        )
+    ), "PP is not compatible with MTP models."
