@@ -46,8 +46,6 @@ configs/
 ├── pipeline_configs/    # Per-model pipeline configs
 ├── sample/             # SamplingParams
 └── models/             # DiT, VAE, Encoder configs
-native/
-└── omnidreams_singleview/  # Vendored FlashDreams native FP8 extension (C++/CUDA + Python shims)
 ```
 
 ### Key Classes

@@ -12,18 +12,16 @@ from typing import Any
 
 from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
 from sglang.multimodal_gen.configs.models.omnidreams_components import (
+    NativeAccelerationMode,
     OmniDreamsTextEncoderConfig,
     OmniDreamsVAEDecoderConfig,
     OmniDreamsVAEEncoderConfig,
+    normalize_native_acceleration_mode,
 )
 from sglang.multimodal_gen.configs.models.vaes.wanvae import OmniDreamsVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
-)
-from sglang.multimodal_gen.native.acceleration import (
-    NativeAccelerationMode,
-    normalize_native_acceleration_mode,
 )
 
 

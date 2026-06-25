@@ -33,9 +33,9 @@ from sglang.multimodal_gen.configs.models.dits.omnidreams import (
     OmniDreamsDiTArchConfig,
     OmniDreamsDiTConfig,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
+from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
+    BlockKVCache,
+    OmniDreamsDiT,
     RotaryPositionEmbedding3D,
     apply_rope_freqs,
     rope_dims,

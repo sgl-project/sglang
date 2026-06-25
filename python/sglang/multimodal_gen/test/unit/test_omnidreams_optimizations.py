@@ -38,8 +38,8 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
     CUDAGraphWrapper,
     set_or_copy,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_kvcache import BlockKVCache
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
+from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
+    BlockKVCache,
     RotaryPositionEmbedding3D,
     apply_rope_freqs,
 )

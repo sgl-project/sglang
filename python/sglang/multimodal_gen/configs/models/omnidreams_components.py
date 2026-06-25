@@ -22,9 +22,53 @@ from typing import Any, Literal
 import torch
 import torch.nn as nn
 
+from loguru import logger
+
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEArchConfig
-from sglang.multimodal_gen.native.acceleration import NativeAccelerationMode
 from sglang.multimodal_gen.runtime.loader.fsdp_load import set_default_torch_dtype
+
+# --------------------------------------------------------------------------- #
+# Native acceleration mode types (folded from native/acceleration.py).       #
+# The native/ config-type shell was removed after Phase-1 dropped the        #
+# vendored CUDA tree; only the mode Literal + normalizer survive, inlined   #
+# here because this is the lower-level module (pipeline_configs imports     #
+# from it, so placing the type there would create a circular import).       #
+# --------------------------------------------------------------------------- #
+NativeAccelerationMode = Literal[
+    "disabled", "weight_only_fp8", "fp8_compute", "auto", "required"
+]
+"""Native DiT acceleration policy (see normalize_native_acceleration_mode)."""
+
+_VALID_NATIVE_MODES: tuple[str, ...] = ("disabled", "weight_only_fp8", "fp8_compute")
+_NATIVE_MODE_ALIASES: dict[str, str] = {
+    "auto": "disabled",
+    "required": "weight_only_fp8",
+}
+
+
+def normalize_native_acceleration_mode(mode: str) -> str:
+    """Map ``auto``/``required`` back-compat aliases to real modes and validate.
+
+    The native FP8 DiT path was removed in Phase 1, so ``auto`` no longer has a
+    native path to opt into (-> ``disabled``) and ``required`` is satisfied by
+    the weight-only FP8 dequant path (-> ``weight_only_fp8``). A warning is
+    logged on alias use.
+    """
+    if mode in _NATIVE_MODE_ALIASES:
+        mapped = _NATIVE_MODE_ALIASES[mode]
+        logger.warning(
+            "native_acceleration mode {!r} is a back-compat alias; mapping to "
+            "{!r} (native FP8 DiT removed in Phase 1).",
+            mode,
+            mapped,
+        )
+        return mapped
+    if mode not in _VALID_NATIVE_MODES:
+        raise ValueError(
+            f"native_acceleration mode must be one of {_VALID_NATIVE_MODES} "
+            f"(or 'auto'/'required' back-compat alias), got {mode!r}"
+        )
+    return mode
 
 # Canonical latent normalization stats from Wan 2.1 (single source of truth).
 _DEFAULT_LATENTS_MEAN = list(WanVAEArchConfig().latents_mean)

@@ -45,7 +45,7 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     TimestepEmbedding,
     Timesteps,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import rope_dims
+from sglang.multimodal_gen.runtime.models.dits.omnidreams import rope_dims
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     COSMOS_REASON1_HIDDEN,
 )

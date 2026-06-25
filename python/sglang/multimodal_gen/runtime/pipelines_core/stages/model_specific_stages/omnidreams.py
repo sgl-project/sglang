@@ -46,7 +46,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
     CUDAGraphWrapper,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_rope import (
+from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     RotaryPositionEmbedding3D,
 )
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
@@ -104,8 +104,6 @@ _TEXT_EMBED_CACHE_MAX_SIZE = 32
 # any other single string is treated as one image (degenerate broadcast).
 _HDMAP_VIDEO_EXTS = (".mp4", ".gif", ".webm", ".mov", ".mkv", ".avi")
 
-# Cache for pre-built latent normalization tensors (keyed by VAE id, device, dtype).
-_latent_norm_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 # Cache for whether vae.encode() accepts a `cache` kwarg (keyed by VAE type name).
 _encode_accepts_cache: dict[str, bool] = {}
 
@@ -177,18 +175,12 @@ def _vae_encode_normalized(
         if hasattr(latent_dist, "mode")
         else latent_dist.sample() if hasattr(latent_dist, "sample") else latent_dist
     )
-    cache_key = (id(vae), latent.device, latent.dtype)
-    cached = _latent_norm_cache.get(cache_key)
-    if cached is None:
-        mean = torch.tensor(
-            vae.latents_mean, device=latent.device, dtype=latent.dtype
-        ).view(1, -1, 1, 1, 1)
-        std = torch.tensor(
-            vae.latents_std, device=latent.device, dtype=latent.dtype
-        ).view(1, -1, 1, 1, 1)
-        _latent_norm_cache[cache_key] = (mean, std)
-    else:
-        mean, std = cached
+    mean = torch.tensor(
+        vae.latents_mean, device=latent.device, dtype=latent.dtype
+    ).view(1, -1, 1, 1, 1)
+    std = torch.tensor(
+        vae.latents_std, device=latent.device, dtype=latent.dtype
+    ).view(1, -1, 1, 1, 1)
     normed = (latent - mean) / std
     _log_omnidreams_stats("vae_encode_normed", normed)
     return normed
@@ -1322,7 +1314,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     "(uses standard PyTorch eager forward)."
                 )
                 cuda_graph_runner = None
-            from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+            from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
                 install_fp8_compute_on_dit,
             )
 
@@ -1872,7 +1864,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         """
         if getattr(self.transformer, "_fp8_compute_applied", False):
             return
-        from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+        from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
             install_fp8_compute_on_dit,
         )
 
@@ -2033,9 +2025,11 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         fmt = (batch.realtime_output_format or "raw").lower()
         # [B, C, T, H, W] -> per-sample frame list
         frame_batches: list[list[bytes]] = []
-        samples = (
-            list(image) if isinstance(image, torch.Tensor) else list(image)
-        )
+        if fmt in ("jpeg", "jpg", "webp"):
+            import io
+
+            from PIL import Image as _PILImage
+        samples = list(image)
         for sample in samples:
             if isinstance(sample, torch.Tensor):
                 # [C, T, H, W] -> [T, H, W, C] uint8
@@ -2061,18 +2055,10 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     frame = frame[:, :, :3]
                 frame = np.ascontiguousarray(frame)
                 if fmt in ("jpeg", "jpg"):
-                    import io
-
-                    from PIL import Image as _PILImage
-
                     buf = io.BytesIO()
                     _PILImage.fromarray(frame).save(buf, format="JPEG")
                     frames.append(buf.getvalue())
                 elif fmt == "webp":
-                    import io
-
-                    from PIL import Image as _PILImage
-
                     buf = io.BytesIO()
                     _PILImage.fromarray(frame).save(buf, format="WEBP")
                     frames.append(buf.getvalue())

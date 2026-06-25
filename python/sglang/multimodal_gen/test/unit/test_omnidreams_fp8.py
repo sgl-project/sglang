@@ -173,7 +173,7 @@ def test_fp8_compute_method_matmul_matches_bf16_within_fp8_tolerance():
     rowwise torch._scaled_mm path needs CUDA + float8_e4m3fn support."""
     if not torch.cuda.is_available() or not hasattr(torch, "float8_e4m3fn"):
         pytest.skip("FP8 _scaled_mm requires CUDA + float8_e4m3fn")
-    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
         OmniDreamsFP8ComputeLinearMethod,
     )
 
@@ -204,7 +204,7 @@ def test_install_fp8_compute_on_dit_is_noop_on_cpu():
         pytest.skip("CPU fallback assertion only runs on CPU-only hosts")
     from sglang.multimodal_gen.configs.models.dits.omnidreams import OmniDreamsDiTConfig
     from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
-    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8_compute import (
+    from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
         install_fp8_compute_on_dit,
     )
 
