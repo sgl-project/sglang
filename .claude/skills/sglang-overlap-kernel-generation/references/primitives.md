@@ -523,7 +523,12 @@ Rule of thumb: any flag whose **point** is to advertise "data is ready" pairs **
 | `barrier_all_intra_node_atomic_cas_block` | ❌ (use host-side `symm_mem_hdl.barrier()`) | ✅ (after grid barrier) | — |
 | `symm_mem_hdl.barrier()` (host-side) | ✅ (around `signal.zero_()`) | ❌ (use in-kernel rank barrier) | ✅ (between iterations) |
 | `tl.debug_barrier()` | ✅ | ✅ | — |
+| `ld_sys` / `st_sys` / `__syncthreads` | — | — | ✅ (signal polling & writing) |
+| `stream_write_value32` / `cuStreamWaitValue32` | — | — | ✅ (CE-side signal ops) |
 
-Without-sm relies on `hdl.barrier()` on the host side and copy-engine `cuStreamWriteValue32` progress polling instead of in-kernel barriers, so it does not pull from this catalog.
+Without-sm does NOT pull from the inter-sm/intra-sm primitives in this catalog. Instead, it uses:
+- **Kernel-side**: `ld_sys` (`ld.global.acquire.sys.b32`) for signal polling, `st_sys` (`st.global.release.sys.b32`) for signal writing, and `__syncthreads` / `tid` helpers — all defined directly in `references/without_sm.md`.
+- **CE-side (host)**: `symm_mem_hdl.stream_write_value32` (comm-first) or `cuda.bindings.driver.cuStreamWaitValue32` (comp-first) for CPU-side CE signal operations.
+- **Cross-rank sync**: `symm_mem_hdl.barrier()` (host-side) around `signal.zero_()` / `progress.fill_(0)` between iterations.
 
 Both inter-sm and without-sm use host-side `symm_mem_hdl.barrier()` (around `signal.zero_()`) for cross-rank synchronization between iterations, since neither has a subsequent in-kernel phase after communication completes.

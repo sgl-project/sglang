@@ -19,6 +19,8 @@ Available primitives (choose based on mode):
 | CTA-Grid barrier | `barrier_on_this_grid` | intra-sm |
 | Cross-rank barrier (in-kernel) | `barrier_all_intra_node_atomic_cas_block` | intra-sm only |
 | Cross-rank barrier (host-side) | `symm_mem_hdl.barrier()` | inter-sm, without-sm (around `signal.zero_()`) |
+| Signal polling/writing (without-sm) | `ld_sys`, `st_sys`, `__syncthreads`, `tid` | without-sm only (defined in `without_sm.md`) |
+| CE-side signal ops (without-sm) | `stream_write_value32`, `cuStreamWaitValue32` | without-sm only (host-side, in `without_sm.md`) |
 
 See `primitives.md` §8 for the full mode-to-primitive mapping.
 

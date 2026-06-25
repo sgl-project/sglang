@@ -8,7 +8,7 @@ This reference covers the three operations that drive NVSwitch in-network comput
 
 - `hdl.multicast_ptr` — host-side, extract the multicast (MC) pointer from a symmetric-memory handle (it is a PyTorch symm_mem property, no extra import needed).
 - `multimem_st(ptr, val0[, val1, val2, val3], dtype=...)` — kernel-side, one PTX instruction broadcasts a value to **all** ranks. **Paste the implementation from §D into the generated file.**
-- `multimem_ld_reduce(ptr, op="sum", dtype=..., acc_dtype=tl.float32)` — kernel-side, one PTX instruction loads + reduces values **from all ranks** inside the NVSwitch fabric. **Paste the implementation from §D into the generated file.**
+- `multimem_ld_reduce(ptr, OP, DTYPE, ACC_DTYPE)` — kernel-side, one PTX instruction loads + reduces values **from all ranks** inside the NVSwitch fabric. **Paste the implementation from §D into the generated file.**
 
 The semantics are exactly equivalent to "N peer stores" / "N peer loads + sum" but cost **one** instruction and **zero** extra SM cycles on the issuer; the data movement and the reduction happen inside the switch.
 
@@ -56,19 +56,21 @@ Supported `dtype` (drives the PTX suffix):
 
 Semantics: one instruction → the value lands at the same byte offset in **every** rank's symmetric-memory region. There is no per-rank loop, no `for peer in range(world_size)`. This is the key reason intra-sm push phases shrink from `O(world_size)` stores to `O(1)`.
 
-### A.4 `multimem_ld_reduce(ptr, op="sum", dtype=..., acc_dtype=tl.float32)`
+### A.4 `multimem_ld_reduce(ptr, OP, DTYPE, ACC_DTYPE)`
 
-- `op`: **only `"sum"` is supported by hardware today** (`tl.static_assert` enforces this in the inlined source).
-- `dtype`: `tl.float32 | tl.bfloat16 | tl.float16` (integer reduce is not exposed here).
-- `acc_dtype`: `tl.float32` (recommended for bf16/fp16) or `tl.float16`. Adds the PTX `.acc::f32` / `.acc::f16` modifier so the in-switch accumulator runs in the requested precision regardless of payload dtype.
-- The default variant emitted is **v4**: returns a tuple `(v0, v1, v2, v3)` of the reduced values (16 B worth). For 4 B scalar loads use the lower-level `_multimem_ld_reduce_impl` (also inlined in §D).
+All three parameters are `tl.constexpr` (compile-time constants), matching Triton's convention for dispatch parameters.
+
+- `OP`: **only `"sum"` is supported by hardware today** (`tl.static_assert` enforces this in the inlined source).
+- `DTYPE`: `tl.float32 | tl.bfloat16 | tl.float16` — selects the PTX operand suffix (integer reduce is not exposed here).
+- `ACC_DTYPE`: `tl.float32` — in-switch accumulator precision. Currently only `tl.float32` is supported (`tl.static_assert` enforces this in the inlined source). The `.acc::f32` PTX modifier is used for bf16/fp16 to preserve reduction precision. Ignored for `DTYPE == tl.float32` (no `.acc::` modifier needed).
+- The default variant emitted is **v4**: returns a tuple `(v0, v1, v2, v3)` of the reduced values (16 B worth).
 
 ```python
 v0, v1, v2, v3 = multimem_ld_reduce(
     mc_ptr + byte_off,            # pointer arithmetic in element units; see §C.4
-    op="sum",
-    dtype=tl.bfloat16,
-    acc_dtype=tl.float32,         # IMPORTANT for bf16/fp16
+    OP="sum",
+    DTYPE=tl.bfloat16,
+    ACC_DTYPE=tl.float32,         # .acc::f32 for bf16/fp16
 )
 ```
 
@@ -189,8 +191,8 @@ import triton.language as tl
 def my_overlap_kernel(...):
     ...
     multimem_st(mc_addr, v0, v1, v2, v3, dtype=tl.bfloat16)
-    a, b, c, d = multimem_ld_reduce(mc_addr, op="sum",
-                                     dtype=tl.bfloat16, acc_dtype=tl.float32)
+    a, b, c, d = multimem_ld_reduce(mc_addr, OP="sum",
+                                     DTYPE=tl.bfloat16, ACC_DTYPE=tl.float32)
 ```
 
 ### C.2 Replacing the intra-sm "push" phase
@@ -240,7 +242,7 @@ Multimem-equivalent — one instruction loads + sums in the switch:
 mc_addr = mc_ptr + (src_off + cols_base) * tl.constexpr(2)
 tl.multiple_of(mc_addr, 16)
 v0, v1, v2, v3 = multimem_ld_reduce(
-    mc_addr, op="sum", dtype=tl.bfloat16, acc_dtype=tl.float32,
+    mc_addr, OP="sum", DTYPE=tl.bfloat16, ACC_DTYPE=tl.float32,
 )
 # v0..v3 are bf16 values (returned as 4 × int32 holding 8 bf16 elements).
 # Either store them back to the local output via 4 × tl.store, or repack
@@ -249,8 +251,8 @@ v0, v1, v2, v3 = multimem_ld_reduce(
 
 Notes:
 
-- `acc_dtype=tl.float32` is required for bf16/fp16 to match the precision rules already enforced by the SKILL.md "Accumulator dtype" check.
-- `op="sum"` is the only operation currently supported by hardware. For mean/scaling, do the divide **after** `multimem_ld_reduce` returns (in fp32, then cast).
+- `ACC_DTYPE=tl.float32` is required for bf16/fp16 to match the precision rules already enforced by the SKILL.md "Accumulator dtype" check.
+- `OP="sum"` is the only operation currently supported by hardware. For mean/scaling, do the divide **after** `multimem_ld_reduce` returns (in fp32, then cast).
 
 ### C.4 Data packing rules (the 16-byte unit)
 
@@ -490,7 +492,7 @@ def _multimem_ld_reduce_v4_f32(ptr):
 
 
 @triton.jit
-def multimem_ld_reduce(ptr, DTYPE: tl.constexpr):
+def multimem_ld_reduce(ptr, OP: tl.constexpr, DTYPE: tl.constexpr, ACC_DTYPE: tl.constexpr):
     """Load + in-switch reduce from all ranks (v4 variant, one PTX instruction).
 
     NVSwitch reads 16 B at `ptr` from every rank, sums them in network, and
@@ -498,14 +500,19 @@ def multimem_ld_reduce(ptr, DTYPE: tl.constexpr):
 
     Args:
         ptr: multicast pointer (byte address, 16 B aligned).
+        OP: reduction operation. Only "sum" is supported by hardware.
         DTYPE: tl.bfloat16 / tl.float16 / tl.float32 — selects the PTX suffix.
-               For bf16/fp16, .acc::f32 is always used for precision.
+        ACC_DTYPE: in-switch accumulator precision. Only tl.float32 is
+                   supported currently. The .acc::f32 PTX modifier is used
+                   for bf16/fp16 to preserve reduction precision.
 
     Returns:
         Tuple (v0, v1, v2, v3):
           - bf16/fp16: 4 × int32, each holding 2 packed reduced elements.
           - fp32: 4 × fp32 reduced values.
     """
+    tl.static_assert(OP == "sum", "multimem_ld_reduce: only OP='sum' is supported by hardware")
+    tl.static_assert(ACC_DTYPE == tl.float32, "multimem_ld_reduce: only ACC_DTYPE=tl.float32 is supported currently")
     if DTYPE == tl.bfloat16:
         return _multimem_ld_reduce_v4_bf16_acc32(ptr)
     elif DTYPE == tl.float16:
@@ -514,7 +521,7 @@ def multimem_ld_reduce(ptr, DTYPE: tl.constexpr):
         return _multimem_ld_reduce_v4_f32(ptr)
 ```
 
-After pasting, the rest of the kernel file uses `multimem_st(ptr, v0, v1, v2, v3, DTYPE)` / `multimem_ld_reduce(ptr, DTYPE)` directly. 
+After pasting, the rest of the kernel file uses `multimem_st(ptr, v0, v1, v2, v3, DTYPE)` / `multimem_ld_reduce(ptr, OP, DTYPE, ACC_DTYPE)` directly. 
 
 ---
 
@@ -526,7 +533,7 @@ After pasting, the rest of the kernel file uses `multimem_st(ptr, v0, v1, v2, v3
 - [ ] Kernel signature: `mc_ptr` declared as a plain scalar (Triton treats it as int64).
 - [ ] Inside kernel: `tl.multiple_of(mc_ptr, 16)` and offset alignment hints in place.
 - [ ] Push path: replaced the `for peer in range(world_size): tl.store(peer_buf, ...)` loop with a single `multimem_st(...)`.
-- [ ] Reduce path: replaced the hand-written `acc += tl.load(peer_buf, ...)` loop with `multimem_ld_reduce(..., op="sum", acc_dtype=tl.float32)`.
+- [ ] Reduce path: replaced the hand-written `acc += tl.load(peer_buf, ...)` loop with `multimem_ld_reduce(..., OP="sum", ACC_DTYPE=tl.float32)`.
 - [ ] Packing: bf16/fp16 v4 loads reinterpreted as 4 × int32; fp32 v4 passes 4 fp32 directly.
 - [ ] Barriers: grid-level + cross-rank barriers are still present around the multimem ops.
-- [ ] Dtype: `acc_dtype=tl.float32` used for bf16/fp16 reductions to preserve precision.
+- [ ] Dtype: `ACC_DTYPE=tl.float32` used for bf16/fp16 reductions to preserve precision.

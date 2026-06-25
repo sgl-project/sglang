@@ -26,7 +26,7 @@ When presenting options to the user via `AskUserQuestion`, put the full explanat
 3. **Communication mechanism**: which hardware path for the collective? *(default: register)*
    - `register` — load/store via symmetric memory (SM-driven)
    - `copy_engine` — DMA copy on a background stream (zero SM cost)
-   - `tma` — Tensor Memory Accelerator async bulk copy
+   - `tma` — Tensor Memory Accelerator async bulk copy **(not yet supported)**
    - `nvswitch` — multimem via NVSwitch hardware (NVLS)
 4. **Overlap mode**: how compute and comm are scheduled: *(default: inter-sm)*
    - `inter-sm` — two separate kernels, two streams
@@ -35,7 +35,9 @@ When presenting options to the user via `AskUserQuestion`, put the full explanat
 5. **Execution order**: compute-first or comm-first
 6. **Overlap triton kernel type**: **persistent** (one CTA loops over multiple tiles) or **non-persistent** (one CTA handles one tile)? *(default: persistent)*
 
-**Constraint**: if communication mechanism = `copy_engine`, overlap mode is forced to `without-sm` (copy engine runs on DMA, not SMs) — inform the user and skip the overlap mode question.
+**Constraint 1**: if communication mechanism = `copy_engine`, overlap mode is forced to `without-sm` (copy engine runs on DMA, not SMs) — inform the user and skip the overlap mode question.
+
+**Constraint 2**: if communication mechanism = `tma`, inform the user that TMA (Tensor Memory Accelerator) async bulk copy is **not yet supported** and ask them to choose a different mechanism (`register`, `copy_engine`, or `nvswitch`). Do not proceed with TMA.
 
 ## Mode Overview
 
@@ -53,7 +55,7 @@ Read `references/intra_sm.md` for barrier primitives, A2A push pattern, kernel s
 
 ### Without-SM — copy engine (DMA)
 
-Communication is offloaded to the **copy engine**, consuming zero SM resources. A background stream performs `copy_()` on symmetric memory (routed through DMA). A `progress` tensor, updated via `cuStreamWriteValue32` after each chunk copy, lets the compute kernel or the collectives (on the other stream) poll and process data as it arrives — local data first (no wait), then remote chunks as they become ready.
+Communication is offloaded to the **copy engine**, consuming zero SM resources. A background stream performs `copy_()` on symmetric memory (routed through DMA). A **signal tensor** (written either via PtoP signal pull or `cuStreamWriteValue32`) lets the compute kernel poll and process data as it arrives — local data first (no wait), then remote chunks as they become ready. The signal tensor shape is `[world_size * splits_per_rank]`, where `splits_per_rank=1` gives per-rank granularity and `splits_per_rank>1` gives finer per-chunk granularity. Both signaling approaches support any granularity.
 
 Read `references/without_sm.md` for copy engine setup, progress tracking, compute kernel polling pattern, and full implementation guide.
 
@@ -128,7 +130,7 @@ When triggered:
 1. Read `references/multimem.md` in addition to the selected mode file.
 2. **Inline the implementation source from `multimem.md` §D** (helpers + `multimem_st` + `multimem_ld_reduce` + their `_v*` impls) into the generated kernel file's PTX Primitives section.
 3. On the host side: extend the context dataclass with `mc_ptr`, access `hdl.multicast_ptr` (stock PyTorch symm_mem property, no extra import) after `symm_mem.rendezvous`, and guard against unsupported hardware (`mc_ptr == 0`).
-4. In the kernel: replace the per-peer `tl.store` push loop with `multimem_st(...)`, and replace the hand-written `acc += tl.load(peer_buf, ...)` reduction loop with `multimem_ld_reduce(..., op="sum", acc_dtype=tl.float32)`. Keep all existing grid-level and cross-rank barriers — multimem swaps out only the bulk data movement, not the synchronization.
+4. In the kernel: replace the per-peer `tl.store` push loop with `multimem_st(...)`, and replace the hand-written `acc += tl.load(peer_buf, ...)` reduction loop with `multimem_ld_reduce(..., OP="sum", ACC_DTYPE=tl.float32)`. Keep all existing grid-level and cross-rank barriers — multimem swaps out only the bulk data movement, not the synchronization.
 
 When **not** triggered: stay on the default path (per-peer `tl.store` for the push phase, hand-written reduction for the reduce phase) and do **not** load `references/multimem.md`.
 
