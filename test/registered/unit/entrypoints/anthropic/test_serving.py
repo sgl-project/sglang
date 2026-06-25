@@ -1369,7 +1369,7 @@ class TestAnthropicServing(unittest.TestCase):
                         },
                         {"type": "text", "text": "second"},
                     ],
-                }
+                },
             ],
         )
         chat_request = serving._convert_to_chat_completion_request(request)
