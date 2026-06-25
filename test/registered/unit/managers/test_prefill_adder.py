@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -471,7 +472,15 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
         req.prefix_indices = []
         req.full_untruncated_fill_ids = list(range(extend_input_len))
-        req.set_extend_range = MagicMock()
+        # set_extend_range is the only writer of extend_range; the production
+        # path reads req.extend_range.length right after calling it, so the mock
+        # must actually set the attribute (a spec=Req mock has the method but
+        # not the instance attribute).
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
         return adder, req
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):

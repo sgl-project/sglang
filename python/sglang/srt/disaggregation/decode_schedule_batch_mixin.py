@@ -37,7 +37,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         req_pool_indices = []
 
         # Pre-calculate total size
-        total_size = sum(req.extend_input_len for req in reqs)
+        total_size = sum(req.extend_range.length for req in reqs)
         out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
 
         # Fill the tensor in one pass
@@ -47,20 +47,20 @@ class ScheduleBatchDisaggregationDecodeMixin:
             pre_len = len(req.prefix_indices)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                pre_len : pre_len + req.extend_input_len
+                pre_len : pre_len + req.extend_range.length
             ]
             assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
-            offset += req.extend_input_len
+                offset + req.extend_range.length <= total_size
+            ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
+            out_cache_loc[offset : offset + req.extend_range.length] = chunk
+            offset += req.extend_range.length
 
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
                 assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
+                    seq_len - pre_len == req.extend_range.length
+                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_range.length={req.extend_range.length}"
 
             if not req.retracted_stain:
                 # Clamp to avoid double-counting: already_computed is seeded from
@@ -99,7 +99,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens = [r.extend_input_len for r in reqs]
+        self.extend_lens = [r.extend_range.length for r in reqs]
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]

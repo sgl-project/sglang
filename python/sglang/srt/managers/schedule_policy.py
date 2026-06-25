@@ -693,7 +693,7 @@ class PrefillAdder:
             else 0
         )
         self._update_prefill_budget(
-            0, req.extend_input_len, max_new_tokens, req.retracted_stain
+            0, req.extend_range.length, max_new_tokens, req.retracted_stain
         )
 
         # Return based on remaining token availability
@@ -730,7 +730,7 @@ class PrefillAdder:
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
-            req.extend_input_len,
+            req.extend_range.length,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
                 if not truncated
@@ -842,7 +842,7 @@ class PrefillAdder:
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
-                req.extend_input_len,
+                req.extend_range.length,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
             )
