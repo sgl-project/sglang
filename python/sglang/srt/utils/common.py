@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import binascii
 import builtins
 import ctypes
 import functools
@@ -64,6 +65,7 @@ from typing import (
     Dict,
     Generic,
     List,
+    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -102,6 +104,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+
+class Range(NamedTuple):
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -566,9 +577,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
-                "which may cause useless memory allocation for torch CUDA context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch CUDA context.",
+                gpu_id,
+                torch.cuda.current_device(),
             )
 
         if empty_cache:
@@ -588,9 +601,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.xpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
-                "which may cause useless memory allocation for torch XPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch XPU context.",
+                gpu_id,
+                torch.xpu.current_device(),
             )
 
         if empty_cache:
@@ -604,9 +619,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.hpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
-                "which may cause useless memory allocation for torch HPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch HPU context.",
+                gpu_id,
+                torch.hpu.current_device(),
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
@@ -621,9 +638,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.npu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
-                "which may cause useless memory allocation for torch NPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch NPU context.",
+                gpu_id,
+                torch.npu.current_device(),
             )
         if empty_cache:
             empty_device_cache(torch.npu)
@@ -642,9 +661,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.musa.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.musa.current_device()}, ",
-                "which may cause useless memory allocation for torch MUSA context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch MUSA context.",
+                gpu_id,
+                torch.musa.current_device(),
             )
         if empty_cache:
             empty_device_cache(torch.musa)
@@ -1630,7 +1651,7 @@ def delete_directory(dirpath):
         # This will remove the directory and all its contents
         shutil.rmtree(dirpath)
     except OSError as e:
-        print(f"Warning: {dirpath} : {e.strerror}")
+        logger.warning("Failed to delete directory %s: %s", dirpath, e.strerror)
 
 
 # Temporary directory for prometheus multiprocess mode
@@ -2467,6 +2488,39 @@ class MultiprocessingSerializer:
             data = pybase64.b64decode(data, validate=True)
 
         return SafeUnpickler(io.BytesIO(data)).load()
+
+
+SerializedTensorPayload = Union[str, bytes, bytearray, memoryview]
+
+
+def _looks_like_pickle_payload(data: bytes) -> bool:
+    return len(data) >= 2 and data[0] == 0x80 and data[1] <= pickle.HIGHEST_PROTOCOL
+
+
+def normalize_serialized_named_tensor_payload(data: SerializedTensorPayload) -> bytes:
+    """Normalize a serialized tensor payload to raw MultiprocessingSerializer bytes."""
+    if isinstance(data, str):
+        return pybase64.b64decode(data, validate=True)
+
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+        if _looks_like_pickle_payload(data):
+            return data
+        try:
+            return pybase64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return data
+
+    raise TypeError(
+        "serialized_named_tensors entries must be base64 strings or bytes-like "
+        f"payloads, got {type(data).__name__}"
+    )
+
+
+def normalize_serialized_named_tensor_payloads(
+    payloads: List[SerializedTensorPayload],
+) -> List[bytes]:
+    return [normalize_serialized_named_tensor_payload(data) for data in payloads]
 
 
 class SafeUnpickler(pickle.Unpickler):
@@ -3939,7 +3993,7 @@ def get_nvidia_driver_version() -> tuple:
 
 
 @lru_cache(maxsize=1)
-def get_nvidia_driver_version_str() -> str:
+def get_nvidia_driver_version_str() -> str | None:
     """Return the NVIDIA driver version string, e.g. '595.58.03'.
     Returns None on failure."""
     try:
@@ -4021,7 +4075,7 @@ def get_device_sm_nvidia_smi():
 
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
         # Handle cases where nvidia-smi isn't available or output is unexpected
-        print(f"Error getting compute capability: {e}")
+        logger.error("Error getting compute capability: %s", e)
         return (0, 0)  # Default/fallback value
 
 
