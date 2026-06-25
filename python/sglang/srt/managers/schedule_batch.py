@@ -3,6 +3,7 @@ from __future__ import annotations
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import (
+    Range,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
     is_pin_memory_available,
@@ -726,7 +727,8 @@ class Req(ReqDllmMixin):
         # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
         # never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
-        self.fill_len: int = 0
+        self.extend_range: Optional[Range] = None
+        self.dllm_initialized: bool = False
 
         self.session = session
         self.input_embeds = input_embeds
@@ -842,8 +844,6 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        # Number of tokens to run prefill.
-        self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
         # TODO(ispobock): rename to last_device_node
@@ -1095,6 +1095,18 @@ class Req(ReqDllmMixin):
     def finished(self) -> bool:
         # Whether request reached finished condition
         return self.finished_reason is not None
+
+    @property
+    def fill_len(self) -> int:
+        return self.extend_range.end
+
+    @property
+    def extend_input_len(self) -> int:
+        return self.extend_range.length
+
+    def set_extend_range(self, start: int, end: int) -> None:
+        self.extend_range = Range(start, end)
+        self._recompute_extend_logprob_start_len()
 
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.fill_len]
@@ -1447,7 +1459,8 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
-        self.extend_input_len = 0
+        self.extend_range = None
+        self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1470,7 +1483,6 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
-        self.fill_len = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1520,14 +1532,13 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_extend_input_len(self, extend_input_len: int):
+    def _recompute_extend_logprob_start_len(self):
         # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
         #
         # Key variables:
         # - logprob_start_len: Absolute position in full sequence where logprob computation begins
         # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
-        self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
             logprob_start_len = len(self.full_untruncated_fill_ids)
         else:
@@ -1997,7 +2008,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if encoder_len == 0:
                 continue
             if len(req.prefix_indices) < encoder_len:
-                req.extend_input_len -= encoder_len
+                assert len(req.prefix_indices) == 0
+                req.extend_range = req.extend_range._replace(
+                    start=req.extend_range.start + encoder_len
+                )
                 req.extend_logprob_start_len = max(
                     0, req.extend_logprob_start_len - encoder_len
                 )
@@ -2382,8 +2396,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for req in running_batch.reqs:
             req._refresh_fill_ids()
-            req.fill_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_input_len(1)
+            full_len = len(req.full_untruncated_fill_ids)
+            req.set_extend_range(full_len - 1, full_len)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
