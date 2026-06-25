@@ -3369,12 +3369,8 @@ class Scheduler(
     def _relay_forward_payload(
         self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
     ) -> None:
-        """Stash this iter's relay payload for the next iter's resolve_forward_inputs.
-        Keys on next_draft_input (not spec_algorithm) so split-prefill relays bonus
-        even under a spec server. ngram is skipped: it precomputes its draft and
-        relays it via batch.spec_info, not the FutureMap (stash() and
-        _resolve_spec_extras() no-op for it too).
-        """
+        """Stash this iter's relay payload for next iter's resolve_forward_inputs.
+        ngram is skipped: it relays its draft via batch.spec_info, not the FutureMap."""
         if self.spec_algorithm.is_ngram():
             return
         if batch_result.next_draft_input is not None:
