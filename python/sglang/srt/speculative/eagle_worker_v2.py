@@ -62,6 +62,7 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.eagle_info_v2 import fill_bonus_tokens
 from sglang.srt.speculative.eagle_utils import (
+    EagleVerifyBuffers,
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
@@ -893,6 +894,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+        # Pre-allocated verify output buffers (predict, accept_index, etc.)
+        decode_max_bs = (
+            server_args.cuda_graph_config.decode.max_bs
+            if server_args.cuda_graph_config is not None
+            else None
+        )
+        max_bs = max(decode_max_bs or 0, server_args.max_running_requests or 0, 1)
+        self.verify_buffers = EagleVerifyBuffers(
+            max_bs=max_bs,
+            max_draft_token_num=self.speculative_num_draft_tokens,
+            max_tree_depth=self.speculative_num_steps + 1,
+            device=self.device,
+        )
+
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
@@ -1321,7 +1336,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_lens,
             accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        ) = eagle_sample(
+            verify_input, batch, logits_output, vocab_mask, self.verify_buffers
+        )
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification

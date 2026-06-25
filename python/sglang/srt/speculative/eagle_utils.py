@@ -377,11 +377,40 @@ def _get_draft_probs_buf(target_probs: torch.Tensor) -> torch.Tensor:
     return buf
 
 
+class EagleVerifyBuffers:
+    """Pre-allocated output buffers reused across decode steps in ``eagle_sample``.
+
+    Avoids per-step ``torch.zeros`` / ``torch.full`` / ``torch.empty`` for
+    predict, accept_index, and num_correct_drafts.  All tensors are allocated
+    at the maximum expected size; each ``eagle_sample`` call slices into the
+    front portion and fills/zeroes in-place.
+    """
+
+    def __init__(
+        self,
+        max_bs: int,
+        max_draft_token_num: int,
+        max_tree_depth: int,
+        device: torch.device,
+    ):
+        # predict: [max_bs * max_draft_token_num]
+        self.predict = torch.zeros(
+            max_bs * max_draft_token_num, dtype=torch.int32, device=device
+        )
+        # accept_index: [max_bs, max_tree_depth]
+        self.accept_index = torch.full(
+            (max_bs, max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        # num_correct_drafts: [max_bs]
+        self.num_correct_drafts = torch.empty(max_bs, dtype=torch.int32, device=device)
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
+    verify_buffers: Optional[EagleVerifyBuffers] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -449,12 +478,28 @@ def eagle_sample(
         )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
-    )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+    predict_size = bs * verify_input.draft_token_num
+    # Reuse pre-allocated output buffers when available, falling back to
+    # fresh allocations for callers that do not pass verify_buffers.
+    if (
+        verify_buffers is not None
+        and verify_buffers.predict.numel() >= predict_size
+        and verify_buffers.accept_index.shape[0] >= bs
+        and verify_buffers.accept_index.shape[1] >= verify_input.max_tree_depth
+        and verify_buffers.num_correct_drafts.numel() >= bs
+    ):
+        predict = verify_buffers.predict[:predict_size]
+        predict.zero_()
+        accept_index = verify_buffers.accept_index[:bs, : verify_input.max_tree_depth]
+        accept_index.fill_(-1)
+        num_correct_drafts = verify_buffers.num_correct_drafts[:bs]
+    else:
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     if sampling_info.is_all_greedy or _is_npu or _is_hip:
