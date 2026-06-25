@@ -15,6 +15,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.utils.common import Range
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -32,10 +33,9 @@ def _make_req(
     req.origin_input_ids = array("q", fill_ids)
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
-    req.fill_len = fill_len
     req.prefix_indices = prefix_indices
     req.req_pool_idx = req_pool_idx
-    req.extend_input_len = extend_input_len
+    req.extend_range = Range(fill_len - extend_input_len, fill_len)
     req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.cache.cache_protected_len = 0
