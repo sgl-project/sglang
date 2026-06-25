@@ -35,12 +35,16 @@ def _npu_use_triton_sparse() -> bool:
     )
 
 
-# Prefill length-routing threshold (max sequence length in the batch). Below it
-# the gather-free masked-full PyTorch path (_forward_npu_sparse_prefill) handles
-# prefill — correct and memory-safe. At/above it the fused triton path
-# (_forward_npu_triton_prefill) takes over to bound the O(seq_len^2) full-
-# attention memory for long context.
-_NPU_PREFILL_TRITON_MIN_SEQLEN = 8192  # 8K
+# Prefill length-routing threshold (max sequence length in the batch). It is
+# configurable so NPU prefill Triton can be enabled for all lengths during perf
+# tuning, while still allowing targeted fallback to the PyTorch path.
+_NPU_PREFILL_TRITON_MIN_SEQLEN_ENV = "SGLANG_MINIMAX_NPU_PREFILL_TRITON_MIN_SEQLEN"
+
+
+def _npu_prefill_triton_min_seqlen() -> int:
+    import os
+
+    return int(os.environ.get(_NPU_PREFILL_TRITON_MIN_SEQLEN_ENV, "0"))
 
 
 def _npu_prefill_max_seqlen(forward_batch: "ForwardBatch") -> int:
@@ -1324,14 +1328,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
-            # Length-routed prefill: short context (<8K) uses the gather-free
-            # masked-full PyTorch path (correct + memory-safe); long context
-            # (>=8K) uses the fused triton path to bound the O(seq_len^2)
-            # full-attention memory. Only routes when the triton env is enabled;
-            # otherwise the PyTorch path handles all lengths.
+            # Length-routed prefill: the threshold is configured by
+            # SGLANG_MINIMAX_NPU_PREFILL_TRITON_MIN_SEQLEN. Only routes when the
+            # triton env is enabled; otherwise the PyTorch path handles all
+            # lengths.
             use_triton_prefill = _npu_use_triton_sparse() and (
                 _npu_prefill_max_seqlen(forward_batch)
-                >= _NPU_PREFILL_TRITON_MIN_SEQLEN
+                >= _npu_prefill_triton_min_seqlen()
             )
             if use_triton_prefill:
                 idx_o, o = self._forward_npu_triton_prefill(

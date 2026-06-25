@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -218,6 +219,23 @@ def test_npu_prefill_debug_diff_location_formats_request_context():
         "token=2,head=1,dim=3,batch=1,req=9,q_offset=1,"
         "prefix_len=8,eff_seq_len=10,seq_len=10,block=4"
     )
+
+
+def test_npu_prefill_triton_min_seqlen_defaults_to_zero_and_reads_env():
+    module = _load_minimax_sparse_backend_module()
+    env_name = module._NPU_PREFILL_TRITON_MIN_SEQLEN_ENV
+    old_value = os.environ.get(env_name)
+    try:
+        os.environ.pop(env_name, None)
+        assert module._npu_prefill_triton_min_seqlen() == 0
+
+        os.environ[env_name] = "8192"
+        assert module._npu_prefill_triton_min_seqlen() == 8192
+    finally:
+        if old_value is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old_value
 
 
 def test_npu_forward_extend_has_triton_prefill_gate():
