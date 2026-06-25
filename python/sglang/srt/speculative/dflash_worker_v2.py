@@ -34,10 +34,8 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
-from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
+from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
-)
-from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
     _prepare_dflash_draft_block_unchecked,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu

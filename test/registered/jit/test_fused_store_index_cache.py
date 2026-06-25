@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
     from sglang.jit_kernel.fused_store_index_cache import (
@@ -50,6 +50,7 @@ except ImportError:
 
 register_cuda_ci(est_time=24, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=24, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
