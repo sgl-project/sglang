@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -115,6 +116,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Per-forward MSA decode metadata (page table + fmha plan), shared by every
         # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
         self._msa_dec_meta = None
+        # Per-forward NPU Triton metadata, shared by every sparse layer. It avoids
+        # rebuilding the same page table / prefill sequence-block metadata per layer.
+        self._npu_triton_forward_meta = None
         if self.use_msa:
             from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -204,6 +208,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
+        self._npu_triton_forward_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -220,6 +225,128 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # captured graph reads. Skipped when the dense-sparse-decode path owns decode.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
             self._prepare_msa_decode_meta(forward_batch)
+
+        if self.is_npu and _npu_use_triton_sparse():
+            self._prepare_npu_triton_forward_meta(forward_batch)
+
+    def _prepare_npu_triton_forward_meta(self, forward_batch: ForwardBatch):
+        """Build per-forward NPU Triton metadata once and share it across layers."""
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        batch_size = seq_lens.shape[0]
+        if batch_size == 0:
+            self._npu_triton_forward_meta = SimpleNamespace(
+                batch_size=0,
+                seq_lens=seq_lens,
+                max_seqlen=0,
+                max_blocks=0,
+                block_table=seq_lens.new_empty((0, 0)),
+                cu_seqlens=None,
+                prefix_lens=None,
+                actual_num_tokens=0,
+                extend_seq_lens_cpu=getattr(forward_batch, "extend_seq_lens_cpu", None),
+                cu_seqblocks_q=None,
+                max_seqblock_q=None,
+                all_seqblock_q=None,
+            )
+            return self._npu_triton_forward_meta
+
+        max_seqlen = (
+            int(self._max_seqlen_k)
+            if getattr(self, "_max_seqlen_k", 0)
+            else int(seq_lens.max().item())
+        )
+        page_size = self.page_size
+        max_blocks = (max_seqlen + page_size - 1) // page_size
+
+        block_table = seq_lens.new_empty((batch_size, 0))
+        if max_blocks > 0:
+            req_idx = forward_batch.req_pool_indices.to(
+                device=self.req_to_token.device, dtype=torch.long
+            )
+            max_cols = self.req_to_token.shape[1]
+            blk_cols = (
+                torch.arange(
+                    max_blocks, device=self.req_to_token.device, dtype=torch.long
+                )
+                * page_size
+            )
+            blk_cols = blk_cols.clamp(max=max_cols - 1)
+            token_slots = self.req_to_token[req_idx][:, blk_cols]
+            block_table = (token_slots // page_size).to(torch.int32)
+
+        cu_seqlens = None
+        prefix_lens = None
+        actual_num_tokens = None
+        cu_seqblocks_q = None
+        max_seqblock_q = None
+        all_seqblock_q = None
+        extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+        if extend_seq_lens is not None:
+            extend_seq_lens = extend_seq_lens.to(torch.int32)
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32, device=extend_seq_lens.device),
+                    extend_seq_lens.cumsum(0).to(torch.int32),
+                ]
+            )
+            extend_prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
+            if extend_prefix_lens is not None:
+                prefix_lens = extend_prefix_lens.to(torch.int32)
+            else:
+                prefix_lens = torch.zeros_like(seq_lens)
+
+            if extend_seq_lens_cpu is not None:
+                actual_num_tokens = int(sum(extend_seq_lens_cpu))
+            else:
+                actual_num_tokens = int(cu_seqlens[-1].item())
+
+            try:
+                from sglang.srt.layers.attention.minimax_sparse_ops.common.utils import (
+                    get_cu_seqblocks,
+                )
+
+                (
+                    cu_seqblocks_q,
+                    max_seqblock_q,
+                    all_seqblock_q,
+                    _,
+                    _,
+                    _,
+                ) = get_cu_seqblocks(
+                    cu_seqlens,
+                    self._max_seqlen_q,
+                    self.block_size_q,
+                    self.block_size_k,
+                    extend_seq_lens_cpu,
+                )
+            except Exception:
+                cu_seqblocks_q = None
+                max_seqblock_q = None
+                all_seqblock_q = None
+
+        self._npu_triton_forward_meta = SimpleNamespace(
+            batch_size=batch_size,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            max_blocks=max_blocks,
+            block_table=block_table,
+            cu_seqlens=cu_seqlens,
+            prefix_lens=prefix_lens,
+            actual_num_tokens=actual_num_tokens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+        )
+        return self._npu_triton_forward_meta
+
+    def _get_npu_triton_forward_meta(self, forward_batch: ForwardBatch):
+        meta = getattr(self, "_npu_triton_forward_meta", None)
+        batch_size = forward_batch.seq_lens.shape[0]
+        if meta is None or getattr(meta, "batch_size", None) != batch_size:
+            meta = self._prepare_npu_triton_forward_meta(forward_batch)
+        return meta
 
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
         """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
@@ -634,6 +761,59 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_out[q_start:q_end] = idx_o_seq
         return idx_out, out
 
+    def _forward_npu_triton_prefill(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill import (
+            minimax_sparse_prefill_npu_triton,
+        )
+
+        meta = self._get_npu_triton_forward_meta(forward_batch)
+        cu_seqlens = meta.cu_seqlens if meta.cu_seqlens is not None else cu_seqlens
+        seq_lens = meta.seq_lens
+        prefix_lens = (
+            meta.prefix_lens if meta.prefix_lens is not None else prefix_lens
+        )
+
+        return minimax_sparse_prefill_npu_triton(
+            q,
+            self._cache_as_slots(k_cache),
+            self._cache_as_slots(v_cache),
+            None,
+            idx_q,
+            self._cache_as_slots(idx_k_cache),
+            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache),
+            None,
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            self._max_seqlen_q,
+            self._max_seqlen_k,
+            self.block_size_q,
+            self.block_size_k,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=idx_v_cache is None,
+            cu_seqblocks_q=meta.cu_seqblocks_q,
+            max_seqblock_q=meta.max_seqblock_q,
+            all_seqblock_q=meta.all_seqblock_q,
+            seqlens_cpu=meta.extend_seq_lens_cpu,
+        )
+
     def _forward_npu_sparse_decode(
         self,
         q: torch.Tensor,
@@ -752,16 +932,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
             )
 
-        # block_table[b, blk] = page holding logical block blk of request b.
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        max_seqlen = int(self._max_seqlen_k) if self._max_seqlen_k else int(seq_lens.max().item())
-        max_blocks = (max_seqlen + page_size - 1) // page_size
-        req_idx = forward_batch.req_pool_indices.long()
-        max_cols = self.req_to_token.shape[1]
-        blk_cols = torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
-        blk_cols = blk_cols.clamp(max=max_cols - 1)
-        token_slots = self.req_to_token[req_idx][:, blk_cols]  # [B, max_blocks]
-        block_table = (token_slots // page_size).to(torch.int32)
+        meta = self._get_npu_triton_forward_meta(forward_batch)
+        seq_lens = meta.seq_lens
+        max_seqlen = meta.max_seqlen
+        max_blocks = meta.max_blocks
+        block_table = meta.block_table
 
         disable_index_value = idx_v_cache is None
 
@@ -961,18 +1136,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
-            idx_o, o = self._forward_npu_sparse_prefill(
-                q,
-                k_cache,
-                v_cache,
-                idx_q,
-                idx_k_cache,
-                idx_v_cache,
-                forward_batch,
-                cu_seqlens,
-                seq_lens,
-                prefix_lens,
-            )
+            if _npu_use_triton_sparse():
+                idx_o, o = self._forward_npu_triton_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                )
+            else:
+                idx_o, o = self._forward_npu_sparse_prefill(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                )
         else:
             idx_o, o = minimax_sparse_prefill(
                 q,
