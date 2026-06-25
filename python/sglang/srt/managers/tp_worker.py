@@ -113,7 +113,7 @@ class BaseTpWorker(ABC):
         return success, message
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.init_weights_update_group(
+        success, message = self.model_runner.weight_updater.init_weights_update_group(
             recv_req.master_address,
             recv_req.master_port,
             recv_req.rank_offset,
@@ -124,8 +124,10 @@ class BaseTpWorker(ABC):
         return success, message
 
     def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.destroy_weights_update_group(
-            recv_req.group_name,
+        success, message = (
+            self.model_runner.weight_updater.destroy_weights_update_group(
+                recv_req.group_name,
+            )
         )
         return success, message
 
