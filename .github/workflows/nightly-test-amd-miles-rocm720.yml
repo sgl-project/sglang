@@ -47,7 +47,6 @@ jobs:
 
       - name: Resolve newest miles ROCm 7.2 image
         run: |
-          registry="10.245.143.50:5000"
           repo="rocm/sgl-dev"
           base="miles-rocm720-mi35x"
           tag="${{ inputs.image_tag }}"
@@ -56,18 +55,18 @@ jobs:
             for i in $(seq 0 6); do
               d=$(date -u -d "-${i} day" +%Y%m%d)
               candidate="${base}-${d}"
-              if docker pull "${registry}/${repo}:${candidate}" >/dev/null 2>&1; then
+              if docker pull "${repo}:${candidate}" >/dev/null 2>&1; then
                 tag="${candidate}"
                 break
               fi
             done
           fi
           if [ -z "${tag}" ]; then
-            echo "::error::No ${repo}:${base}-<date> image found in ${registry} for the last 7 days"
+            echo "::error::No ${repo}:${base}-<date> image found on Docker Hub for the last 7 days"
             exit 1
           fi
-          echo "MILES_IMAGE=${registry}/${repo}:${tag}" >> "$GITHUB_ENV"
-          echo "Using miles image: ${registry}/${repo}:${tag}"
+          echo "MILES_IMAGE=${repo}:${tag}" >> "$GITHUB_ENV"
+          echo "Using miles image: ${repo}:${tag}"
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
