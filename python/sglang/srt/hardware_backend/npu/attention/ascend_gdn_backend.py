@@ -77,7 +77,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        if forward_batch.forward_mode.is_draft_extend(True):
+        if forward_batch.forward_mode.is_draft_extend_v2():
             return
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self.prepare_gdn_inputs(
@@ -88,7 +88,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self.graph_mode = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_draft_extend(True):
+        if forward_batch.forward_mode.is_draft_extend_v2():
             return
         super().init_forward_metadata(forward_batch)
         self.prepare_gdn_inputs(

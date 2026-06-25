@@ -54,19 +54,12 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    # V2 (EAGLE family) nests the runner under `.draft_worker`; DFLASH /
-    # FROZEN_KV_MTP expose `.model_runner` directly.
-    if spec_algorithm.supports_spec_v2():
-        if server_args.enable_multi_layer_eagle:
-            draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-        else:
-            draft_runner = draft_worker.draft_worker.draft_runner
-        return draft_runner.token_to_kv_pool, draft_runner.model_config
-
-    return (
-        draft_worker.model_runner.token_to_kv_pool,
-        draft_worker.model_config,
-    )
+    # V2 workers nest the draft runner under `.draft_worker`.
+    if server_args.enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool, draft_runner.model_config
 
 
 def maybe_register_hicache_draft(
@@ -96,8 +89,8 @@ def maybe_register_hicache_draft(
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import (
-        MHATokenToKVPoolHost,
         MLATokenToKVPoolHost,
+        get_mha_host_pool_cls,
     )
 
     pool = draft_kv_pool
@@ -114,7 +107,7 @@ def maybe_register_hicache_draft(
         layout=server_args.hicache_mem_layout,
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:

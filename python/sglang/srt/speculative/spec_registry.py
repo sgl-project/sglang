@@ -4,6 +4,7 @@ should use that classmethod API; do not import from this module directly.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
 WorkerFactory = Callable[["ServerArgs"], Type]
 ServerArgsValidator = Callable[["ServerArgs"], None]
 
+logger = logging.getLogger(__name__)
+
 
 class CustomSpecAlgo:
     """A plugin-registered speculative algorithm. Duck-types
@@ -28,8 +31,12 @@ class CustomSpecAlgo:
     branches like ``if spec_algorithm.is_eagle():`` in scheduler /
     model_runner). Pass the subclass via ``spec_class=...`` at registration.
 
-    Defaults: all ``is_*()`` return ``False`` except ``is_speculative``;
-    ``supports_spec_v2`` follows ``supports_overlap``.
+    Defaults: all ``is_*()`` return ``False`` except ``is_speculative``.
+
+    ``supports_overlap=False`` is deprecated: the spec V1 worker path has been
+    removed, so such algorithms run on the V2 scheduler schema with overlap
+    disabled (synchronous). Migrate plugin workers to the V2 schema and
+    overlap scheduling.
     """
 
     def __init__(
@@ -82,13 +89,24 @@ class CustomSpecAlgo:
         # Conservative default: the larger KV reserve.
         return True
 
-    def supports_spec_v2(self) -> bool:
-        return self.supports_overlap
+    def handle_server_args(self, server_args: ServerArgs) -> None:
+        pass
 
     def create_worker(self, server_args: ServerArgs) -> Type:
         if not server_args.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(
                 f"Speculative algorithm {self.name} does not support overlap scheduling."
+            )
+        if not self.supports_overlap:
+            # Reached only when overlap is disabled, so the algorithm really
+            # does run synchronously on the V2 schema below.
+            logger.warning(
+                "Speculative algorithm %s is registered with "
+                "supports_overlap=False, which is deprecated: the spec V1 "
+                "worker path has been removed, and the algorithm now runs on "
+                "the V2 scheduler schema with overlap disabled (synchronous). "
+                "Migrate the plugin worker to support overlap scheduling.",
+                self.name,
             )
         return self.factory(server_args)
 

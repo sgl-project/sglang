@@ -216,8 +216,12 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.finished() or req.is_retracted:
-                    # decode req in mixed batch or retracted req
+                if (
+                    req.finished() and req.inflight_middle_chunks <= 0
+                ) or req.is_retracted:
+                    # Decode req in a mixed batch, or a retracted req. Keep an
+                    # aborted middle chunk in the chunked branch long enough to
+                    # drain its accounting without streaming it.
                     continue
 
                 if req.inflight_middle_chunks <= 0:
@@ -552,33 +556,63 @@ class SchedulerBatchResultProcessor:
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
+            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
 
-            if req.is_retracted:
-                # reset_for_retract() already zeroes committed/allocated KV.
-                continue
-
-            if req.finished():
-                if not batch.spec_algorithm.is_dflash():
-                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
-                    req.kv_committed_len -= 1
-                continue
-
-            if batch.spec_algorithm.is_dflash():
-                # DFLASH materialized accepted draft tokens plus the bonus token.
-                req.kv_committed_len += accept_lens[i]
+            if req.is_retracted or req.finished():
+                # Nothing to settle: no worker pre-claims the bonus, so
+                # kv_committed_len already holds the committed prefix.
+                pass
             else:
-                # EAGLE prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len += accept_lens[i] - 1
-            req.spec_verify_ct += 1
+                if req.grammar is not None:
+                    # Stop accepting once the grammar terminates, so the
+                    # over-drafted suffix is never committed to KV nor emitted.
+                    # This advances the grammar FSM; the result loop only syncs
+                    # grammar.finished.
+                    accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
 
-            num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
-            req.spec_num_correct_drafts += num_correct_drafts
-            req.update_spec_correct_drafts_histogram(num_correct_drafts)
+                # Commit the full accepted run (drafts + bonus).
+                num_accept_tokens = len(accept_tokens)
+                req.kv_committed_len += num_accept_tokens
+                req.spec_verify_ct += 1
+
+                num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+                req.spec_num_correct_drafts += num_correct_drafts
+                req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+            predict_tokens.append(accept_tokens)
 
         return predict_tokens
+
+    def _accept_grammar_tokens(
+        self, req: Req, tokens: Union[int, List[int]]
+    ) -> List[int]:
+        """Advance the grammar over the accepted token(s), stopping at the token
+        that terminates it.
+
+        ``tokens`` is a single sampled token (normal decode) or the whole
+        verified run (spec decode). Returns the retained prefix; for spec the
+        suffix past grammar completion is dropped so it is never committed to KV
+        nor emitted. Advances the grammar FSM only -- ``grammar.finished`` is
+        synced by the caller once the finish state is updated.
+        """
+        if isinstance(tokens, int):
+            tokens = [tokens]
+        retained = []
+        try:
+            for token_id in tokens:
+                req.grammar.accept_token(token_id)
+                retained.append(token_id)
+                if req.grammar.is_terminated():
+                    break
+        except ValueError as e:
+            # accept_token raises ValueError if the token is not in the grammar
+            # (misconfigured grammar or invalid token); abort the request.
+            logger.error(
+                f"Grammar accept_token failed for req {req.rid} with token "
+                f"{tokens}: {e}"
+            )
+            self.abort_request(AbortReq(rid=req.rid))
+        return retained
 
     def process_batch_result_idle(
         self,
@@ -631,10 +665,6 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
-        # in the verify phase. Non-spec and V2 handle them here in post-processing.
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
-
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -645,32 +675,24 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-            if is_spec_v1:
-                req.time_stats.set_last_decode_finish_time()
-                self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
-                )
-                if req.return_hidden_states and logits_output.hidden_states is not None:
-                    req.hidden_states.append(
-                        logits_output.hidden_states[i].cpu().clone().tolist()
-                    )
-                if req.grammar is not None:
-                    req.grammar.finished = req.finished()
-                continue
-
-            # Non-spec and V2: full post-processing
+            # Non-spec and Spec V2: full post-processing.
             next_token_id = next_token_ids[i]
-            new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            is_spec = not batch.spec_algorithm.is_none()
+
+            if not is_spec:
+                # Normal decode: a single sampled token.
                 req.output_ids.append(next_token_id)
+                new_accept_len = 1
             else:
+                # Spec: accept the whole verified run. For grammar requests the
+                # run was already truncated at the grammar-terminating token in
+                # _resolve_spec_v2_tokens, so nothing is emitted past completion.
                 req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
+                new_accept_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
-
             req.time_stats.set_last_decode_finish_time()
-            req.update_finish_state(new_accepted_len)
+            req.update_finish_state(new_accept_len)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
@@ -685,14 +707,30 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
+                if not is_spec:
+                    req.hidden_states.append(
+                        logits_output.hidden_states[i].cpu().clone().tolist()
+                    )
+                else:
+                    # Spec V2: hidden_states is [bs * speculative_num_draft_tokens, hidden_dim].
+                    # One row per emitted token; next_token_id is already truncated
+                    # at grammar termination, so this stays aligned with output_ids.
+                    stride = result.speculative_num_draft_tokens
+                    accept_len = len(next_token_id)
+                    start = i * stride
+                    req.hidden_states.extend(
+                        logits_output.hidden_states[start : start + accept_len]
+                        .cpu()
+                        .clone()
+                        .tolist()
+                    )
 
             if req.grammar is not None:
-                self._apply_decode_grammar(
-                    req=req, next_token_id=next_token_id, batch=batch
-                )
+                if not is_spec:
+                    # Normal decode advances the grammar for its single token
+                    # here; spec already advanced it in _resolve_spec_v2_tokens.
+                    self._accept_grammar_tokens(req, next_token_id)
+                req.grammar.finished = req.finished()
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -715,31 +753,27 @@ class SchedulerBatchResultProcessor:
         next_token_ids: Union[torch.Tensor, List[int]],
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_v2_tokens(result, batch)
-            elif isinstance(next_token_ids, list):
-                pass  # MLX path: already a list[int], skip torch round-trip
-            else:
-                next_token_ids = next_token_ids.tolist()
+        if not batch.spec_algorithm.is_none():
+            next_token_ids = self._resolve_spec_v2_tokens(result, batch)
+        elif isinstance(next_token_ids, list):
+            pass  # MLX path: already a list[int], skip torch round-trip
+        else:
+            next_token_ids = next_token_ids.tolist()
 
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if logits_output.next_token_top_logprobs_val:
-                    logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
-                    ]
-                    logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                    ]
+        if batch.return_logprob:
+            next_token_logprobs = logits_output.next_token_logprobs.tolist()
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
 
-                if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
-        # else: Spec V1 — output_ids, update_finish_state, grammar, and reasoning tokens
-        # are already handled in the verify phase (eagle_info.py / ngram_info.py).
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                ]
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
@@ -752,9 +786,8 @@ class SchedulerBatchResultProcessor:
         next_token_logprobs: list,
         logits_output: LogitsProcessorOutput,
     ) -> None:
-        # Spec v1 handles logprobs inside its own worker.
-        # Normalize: non-spec has 1 token, spec v2 has multiple.
-        if batch.is_spec_v2:
+        # Normalize: non-spec has 1 token, spec decoding has multiple.
+        if not batch.spec_algorithm.is_none():
             accepted_logprobs = next_token_logprobs[i]
             accepted_ids = next_token_id
             max_accept = len(accepted_logprobs)
@@ -782,31 +815,6 @@ class SchedulerBatchResultProcessor:
                 req.logprob.output_token_ids_logprobs_idx.append(
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
-
-    def _apply_decode_grammar(
-        self,
-        *,
-        req: Req,
-        next_token_id: Union[int, List[int]],
-        batch: ScheduleBatch,
-    ) -> None:
-        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-        try:
-            if batch.spec_algorithm.is_none():
-                # Normal decode: single token
-                req.grammar.accept_token(next_token_id)
-            elif batch.is_spec_v2:
-                # Speculative decode: next_token_id is a list of accepted tokens
-                for token_id in next_token_id:
-                    req.grammar.accept_token(token_id)
-        except ValueError as e:
-            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-            # This can happen if the grammar is not set correctly or the token is invalid.
-            logger.error(
-                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-            )
-            self.abort_request(AbortReq(rid=req.rid))
-        req.grammar.finished = req.finished()
 
     def _handle_finish_state_updated_req(
         self,

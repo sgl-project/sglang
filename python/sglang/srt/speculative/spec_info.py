@@ -124,6 +124,11 @@ class SpeculativeAlgorithm(Enum):
         per-topk page rounding; see get_alloc_len_per_decode."""
         return not self.is_ngram()
 
+    def carries_draft_hidden_states(self) -> bool:
+        """Whether the disagg prefill->decode transfer carries draft hidden
+        states (EAGLE-family only; STANDALONE's vanilla draft ignores them)."""
+        return self.is_eagle()
+
     def create_future_map(
         self,
         device: torch.device,
@@ -151,16 +156,29 @@ class SpeculativeAlgorithm(Enum):
             )
         return None
 
-    def supports_spec_v2(self) -> bool:
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or self.is_ngram()
-            or self.is_dflash()
-        )
-
     def need_topk(self) -> bool:
         return self.is_eagle() or self.is_standalone()
+
+    def handle_server_args(self, server_args: ServerArgs) -> None:
+        """Hook for per-algorithm server args mutation.
+
+        In-place updated.
+        """
+        from sglang.srt.arg_groups.speculative_hook import (
+            _handle_dflash,
+            _handle_eagle_family,
+            _handle_frozen_kv_mtp,
+            _handle_ngram,
+        )
+
+        if self.is_dflash():
+            _handle_dflash(server_args)
+        elif self.is_frozen_kv_mtp():
+            _handle_frozen_kv_mtp(server_args)
+        elif self.is_eagle() or self.is_standalone():
+            _handle_eagle_family(server_args)
+        elif self.is_ngram():
+            _handle_ngram(server_args)
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -229,7 +247,6 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT_EXTEND = auto()
     EAGLE_VERIFY = auto()
     FROZEN_KV_MTP_DRAFT = auto()
-    FROZEN_KV_MTP_DRAFT_EXTEND = auto()
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
@@ -249,7 +266,6 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
-            SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND,
             SpecInputType.DFLASH_DRAFT,
         }
 
@@ -274,3 +290,66 @@ class SpecInput(ABC):
             x * c2 for x in batch.global_num_tokens_for_logprob
         ]
         return global_num_tokens, global_num_tokens_for_logprob
+
+
+def create_dummy_verify_input(
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+    custom_mask: torch.Tensor,
+    num_tokens_per_bs: int,
+    is_draft_worker: bool,
+) -> Optional[SpecInput]:
+    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    spec_info = None
+    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        if is_draft_worker:
+            raise RuntimeError("This should not happen.")
+        else:
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=custom_mask,
+                positions=None,
+                retrieve_index=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_cum_len=None,
+                spec_steps=server_args.speculative_num_steps,
+                topk=server_args.speculative_eagle_topk,
+                draft_token_num=server_args.speculative_num_draft_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+    elif spec_algorithm.is_dflash():
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+        spec_info = DFlashVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
+    elif spec_algorithm.is_ngram():
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+        spec_info = NgramVerifyInput(
+            draft_token=None,
+            custom_mask=custom_mask,
+            positions=None,
+            retrieve_index=None,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            draft_token_num=num_tokens_per_bs,
+        )
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+    return spec_info

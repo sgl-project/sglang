@@ -463,6 +463,88 @@ class C4IndexerBackendMixin:
         )
         return q, weights, c4_indexer_kv_cache
 
+    @staticmethod
+    def _match_num_queries(
+        tensor: torch.Tensor, num_queries: int, value: int
+    ) -> torch.Tensor:
+        if tensor.shape[0] == num_queries:
+            return tensor
+        if tensor.shape[0] > num_queries:
+            return tensor[:num_queries]
+        pad = (0, 0) * (tensor.dim() - 1) + (0, num_queries - tensor.shape[0])
+        return F.pad(tensor, pad, value=value)
+
+    def _update_hisparse_c4_sparse_indices(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        indexer_metadata: PagedIndexerMetadata,
+        core_metadata,
+        hisparse_coordinator,
+        hisparse_decode: bool,
+        raw_indices: torch.Tensor,
+        compress_layer_id: int,
+    ) -> None:
+        if hisparse_coordinator is None:
+            return
+
+        if hisparse_decode:
+            core_metadata.c4_sparse_page_indices = (
+                hisparse_coordinator.swap_in_selected_pages(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                    top_k_result=raw_indices,
+                    layer_id=compress_layer_id,
+                )
+            )
+        else:
+            # flash_mla C4 attention requires int32 page indices.
+            core_metadata.c4_sparse_page_indices = (
+                token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                    core_metadata.c4_sparse_page_indices
+                ).to(torch.int32)
+            )
+
+    def _forward_c4_indexer_skip_topk(
+        self,
+        *,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        indexer_metadata: PagedIndexerMetadata,
+        core_metadata,
+        c4_seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        c4_sparse_page_indices: torch.Tensor,
+        prev_topk_indices: torch.Tensor,
+        return_topk_indices: bool,
+        hisparse_coordinator,
+        hisparse_decode: bool,
+    ) -> Optional[torch.Tensor]:
+        compress_layer_id = token_to_kv_pool.layer_mapping[
+            c4_indexer.layer_id
+        ].compress_layer_id
+        raw_indices = maybe_capture_indexer_topk(compress_layer_id, prev_topk_indices)
+        transform_raw_c4_indices_to_page_indices(
+            raw_indices,
+            c4_seq_lens,
+            page_table,
+            c4_sparse_page_indices,
+            indexer_metadata.c4_page_size,
+        )
+        self._update_hisparse_c4_sparse_indices(
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            indexer_metadata=indexer_metadata,
+            core_metadata=core_metadata,
+            hisparse_coordinator=hisparse_coordinator,
+            hisparse_decode=hisparse_decode,
+            raw_indices=raw_indices,
+            compress_layer_id=compress_layer_id,
+        )
+        return raw_indices if return_topk_indices else None
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -482,7 +564,7 @@ class C4IndexerBackendMixin:
 
         # PREP_IN_CG lazy upgrade: this runs from MQALayer._forward_prepare,
         # before attn_backend.forward() would trigger the upgrade.
-        self._maybe_upgrade_forward_metadata()
+        self.init_forward_metadata_in_graph(forward_batch)
         token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:
@@ -504,18 +586,14 @@ class C4IndexerBackendMixin:
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
-        def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
-            if tensor.shape[0] == num_queries:
-                return tensor
-            if tensor.shape[0] > num_queries:
-                return tensor[:num_queries]
-            pad = (0, 0) * (tensor.dim() - 1) + (0, num_queries - tensor.shape[0])
-            return F.pad(tensor, pad, value=value)
-
-        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
-        page_table = match_num_queries(indexer_metadata.page_table, value=0)
-        c4_sparse_page_indices = match_num_queries(
-            core_metadata.c4_sparse_page_indices, value=-1
+        c4_seq_lens = self._match_num_queries(
+            indexer_metadata.c4_seq_lens, num_queries, value=1
+        )
+        page_table = self._match_num_queries(
+            indexer_metadata.page_table, num_queries, value=0
+        )
+        c4_sparse_page_indices = self._match_num_queries(
+            core_metadata.c4_sparse_page_indices, num_queries, value=-1
         )
 
         indexer_capturer = get_global_indexer_capturer()
@@ -527,37 +605,20 @@ class C4IndexerBackendMixin:
         )
 
         if skip_topk and prev_topk_indices is not None:
-            compress_layer_id = token_to_kv_pool.layer_mapping[
-                c4_indexer.layer_id
-            ].compress_layer_id
-            raw_indices = maybe_capture_indexer_topk(
-                compress_layer_id, prev_topk_indices
+            return self._forward_c4_indexer_skip_topk(
+                c4_indexer=c4_indexer,
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+                c4_seq_lens=c4_seq_lens,
+                page_table=page_table,
+                c4_sparse_page_indices=c4_sparse_page_indices,
+                prev_topk_indices=prev_topk_indices,
+                return_topk_indices=return_topk_indices,
+                hisparse_coordinator=hisparse_coordinator,
+                hisparse_decode=hisparse_decode,
             )
-            transform_raw_c4_indices_to_page_indices(
-                raw_indices,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-            )
-            if hisparse_coordinator is not None:
-                if hisparse_decode:
-                    core_metadata.c4_sparse_page_indices = (
-                        hisparse_coordinator.swap_in_selected_pages(
-                            req_pool_indices=forward_batch.req_pool_indices,
-                            compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                            top_k_result=raw_indices,
-                            layer_id=compress_layer_id,
-                        )
-                    )
-                else:
-                    # flash_mla C4 attention requires int32 page indices.
-                    core_metadata.c4_sparse_page_indices = (
-                        token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                            core_metadata.c4_sparse_page_indices
-                        ).to(torch.int32)
-                    )
-            return raw_indices if return_topk_indices else None
 
         if enable_multi_stream:
             q_indexer, weights, c4_indexer_kv_cache = (
@@ -627,10 +688,14 @@ class C4IndexerBackendMixin:
 
         if query_rows != num_queries:
             num_queries = query_rows
-            c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
-            page_table = match_num_queries(indexer_metadata.page_table, value=0)
-            c4_sparse_page_indices = match_num_queries(
-                core_metadata.c4_sparse_page_indices, value=-1
+            c4_seq_lens = self._match_num_queries(
+                indexer_metadata.c4_seq_lens, num_queries, value=1
+            )
+            page_table = self._match_num_queries(
+                indexer_metadata.page_table, num_queries, value=0
+            )
+            c4_sparse_page_indices = self._match_num_queries(
+                core_metadata.c4_sparse_page_indices, num_queries, value=-1
             )
         _c4sl = c4_seq_lens
         _use_tilelang = (
@@ -692,25 +757,19 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         if hisparse_coordinator is not None:
-            if hisparse_decode:
-                compress_layer_id = token_to_kv_pool.layer_mapping[
-                    c4_indexer.layer_id
-                ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
-                    )
-                )
-            else:
-                # flash_mla C4 attention requires int32 page indices.
-                core_metadata.c4_sparse_page_indices = (
-                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                        core_metadata.c4_sparse_page_indices
-                    ).to(torch.int32)
-                )
+            compress_layer_id = token_to_kv_pool.layer_mapping[
+                c4_indexer.layer_id
+            ].compress_layer_id
+            self._update_hisparse_c4_sparse_indices(
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+                hisparse_coordinator=hisparse_coordinator,
+                hisparse_decode=hisparse_decode,
+                raw_indices=raw_indices,
+                compress_layer_id=compress_layer_id,
+            )
 
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[

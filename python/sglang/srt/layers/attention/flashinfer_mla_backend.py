@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.runtime_context import get_parallel
+
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
@@ -21,7 +23,6 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.utils import assert_buffer_fits
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -81,7 +82,7 @@ class FlashInferMhaChunkKVRunner:
     ):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -336,7 +337,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 # fast_mla_decode_plan needs _cached_module from the initial
                 # begin_forward above, so install it only after that call completes.
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-            elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+            elif forward_mode.is_target_verify():
                 prefill_wrapper = BatchMLAPagedAttentionWrapper(
                     self.workspace_buffer,
                     use_cuda_graph=True,
@@ -381,17 +382,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=False,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
-        elif forward_batch.forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_wrapper_paged,
-                use_ragged=False,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(self.prefill_wrapper_paged, False)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -493,7 +483,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
             )
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -650,7 +640,7 @@ class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -759,7 +749,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
         self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
