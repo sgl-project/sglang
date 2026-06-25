@@ -1,9 +1,15 @@
 import pytest
 import torch
 
+from sglang.srt.layers.attention import dsa_backend as dsa_backend_module
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
 )
+from sglang.srt.layers.attention.dsa_backend import (
+    DeepseekSparseAttnBackend,
+    DSAMetadata,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
@@ -223,6 +229,7 @@ def test_fused_dsa_draft_extend_metadata(real_page_size, seq_dtype, accept_lengt
     req_to_token_cols = 80
     max_seqlen_k = 37
     total_len = sum(accept_lengths)
+    next_n = max(accept_lengths)
     topk = 23
 
     seq_lens = torch.tensor([37, 12, 23, 4, 31], dtype=seq_dtype, device=device)
@@ -268,7 +275,7 @@ def test_fused_dsa_draft_extend_metadata(real_page_size, seq_dtype, accept_lengt
         max_seqlen_k=max_seqlen_k,
         dsa_index_topk=topk,
         real_page_size=real_page_size,
-        max_total_len=bs * max(accept_lengths),
+        max_total_len=bs * next_n,
     )
     torch.cuda.synchronize()
 
@@ -420,6 +427,95 @@ def test_fused_precompute_target_verify_metadata(real_page_size, next_n):
 
 def _compiled_kernel_cache_size(kernel):
     return sum(len(entry[0]) for entry in kernel.device_caches.values())
+
+
+def test_apply_cuda_graph_metadata_decode_fused_wiring(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = "cuda"
+    bs = 5
+    max_len = 37
+    topk = 23
+    real_page_size = 4
+    req_to_token = (
+        torch.arange(8 * 80, dtype=torch.int32, device=device).view(8, 80).mul_(3)
+    )
+    req_pool_indices = torch.tensor([3, 0, 5, 2, 7], dtype=torch.int64, device=device)
+    seq_lens = torch.tensor([37, 12, 23, 4, 31], dtype=torch.int64, device=device)
+    seq_lens_cpu = seq_lens.cpu()
+    real_cols = (max_len + real_page_size - 1) // real_page_size
+
+    metadata = DSAMetadata(
+        page_size=real_page_size,
+        cache_seqlens_int32=torch.empty(bs, dtype=torch.int32, device=device),
+        max_seq_len_q=1,
+        max_seq_len_k=max_len,
+        cu_seqlens_q=torch.arange(bs + 1, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+        page_table_1=torch.full((bs, max_len), -1, dtype=torch.int32, device=device),
+        real_page_table=torch.full(
+            (bs, real_cols), -1, dtype=torch.int32, device=device
+        ),
+        dsa_cache_seqlens_int32=torch.empty(bs, dtype=torch.int32, device=device),
+        dsa_cu_seqlens_q=torch.arange(bs + 1, dtype=torch.int32, device=device),
+        dsa_cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+        dsa_extend_seq_lens_list=[],
+        dsa_seqlens_expanded=torch.empty(bs, dtype=torch.int32, device=device),
+    )
+
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.decode_cuda_graph_metadata = {bs: metadata}
+    backend.req_to_token = req_to_token
+    backend.real_page_size = real_page_size
+    backend.dsa_index_topk = topk
+    backend.dsa_decode_impl = "none"
+    backend.device = torch.device(device)
+    backend.speculative_num_draft_tokens = 3
+    backend.set_dsa_prefill_impl = lambda forward_batch: None
+
+    class _FakeDeepGemm:
+        @staticmethod
+        def get_num_sms():
+            return 1
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata(context_lens, *_args):
+            return context_lens.to(torch.int32).contiguous()
+
+    monkeypatch.setattr(dsa_backend_module, "deep_gemm", _FakeDeepGemm)
+    monkeypatch.setattr(dsa_backend_module, "_USE_FUSED_METADATA_GENERATION", True)
+
+    backend._apply_cuda_graph_metadata(
+        bs=bs,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        forward_mode=ForwardMode.DECODE,
+        spec_info=None,
+    )
+    torch.cuda.synchronize()
+
+    ref_cache = seq_lens.to(torch.int32)
+    ref_dsa = ref_cache.clamp(max=topk)
+    ref_page = req_to_token[req_pool_indices, :max_len]
+    ref_real = ref_page[:, torch.arange(0, max_len, real_page_size, device=device)]
+    ref_real = ref_real // real_page_size
+
+    assert torch.equal(metadata.cache_seqlens_int32, ref_cache)
+    assert torch.equal(
+        metadata.cu_seqlens_k,
+        torch.nn.functional.pad(torch.cumsum(ref_cache, 0), (1, 0)),
+    )
+    assert torch.equal(metadata.page_table_1, ref_page)
+    assert torch.equal(metadata.dsa_cache_seqlens_int32, ref_dsa)
+    assert torch.equal(
+        metadata.dsa_cu_seqlens_k,
+        torch.nn.functional.pad(torch.cumsum(ref_dsa, 0), (1, 0)),
+    )
+    assert torch.equal(metadata.real_page_table, ref_real)
+    assert torch.equal(metadata.paged_mqa_ctx_lens_2d, ref_cache.view(-1, 1))
+    assert torch.equal(metadata.paged_mqa_schedule_metadata, ref_cache.view(-1, 1))
 
 
 def test_fused_metadata_runtime_lengths_do_not_recompile():

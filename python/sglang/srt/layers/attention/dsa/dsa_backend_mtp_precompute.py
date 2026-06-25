@@ -6,6 +6,7 @@ by precomputing shared metadata once and copying it to multiple backend instance
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -18,6 +19,7 @@ from sglang.srt.utils import is_cuda, is_hip
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
+logger = logging.getLogger(__name__)
 _USE_FUSED_METADATA_GENERATION = (
     envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not is_hip()
 )
@@ -197,14 +199,15 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 )
             except Exception as e:
                 if not _warned_fused_precompute_failure:
-                    import logging
-
-                    logging.getLogger(__name__).warning(
+                    logger.warning(
                         "Fused DSA decode metadata precompute failed; "
                         "falling back to eager metadata precompute. Error: %s",
                         e,
                     )
                     _warned_fused_precompute_failure = True
+                # Disable process-wide after a fused precompute failure. This keeps
+                # correctness on the eager path and avoids exception overhead on
+                # every subsequent replay precompute.
                 _USE_FUSED_METADATA_GENERATION = False
 
         # Convert to int32 and compute cumsum
@@ -348,14 +351,15 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 )
             except Exception as e:
                 if not _warned_fused_precompute_failure:
-                    import logging
-
-                    logging.getLogger(__name__).warning(
+                    logger.warning(
                         "Fused DSA target-verify metadata precompute failed; "
                         "falling back to eager metadata precompute. Error: %s",
                         e,
                     )
                     _warned_fused_precompute_failure = True
+                # Disable process-wide after a fused precompute failure. This keeps
+                # correctness on the eager path and avoids exception overhead on
+                # every subsequent replay precompute.
                 _USE_FUSED_METADATA_GENERATION = False
 
         # Cache seqlens with draft tokens

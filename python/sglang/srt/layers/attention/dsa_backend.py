@@ -1266,6 +1266,9 @@ class DeepseekSparseAttnBackend(
                             e,
                         )
                         _warned_fused_metadata_generation_failure = True
+                    # Disable process-wide after a fused-generation failure. This is a
+                    # conservative perf fallback: correctness stays on the eager path
+                    # without paying exception overhead on every replay.
                     _USE_FUSED_METADATA_GENERATION = False
 
             if not fused_metadata_generation_succeeded:
@@ -1324,6 +1327,9 @@ class DeepseekSparseAttnBackend(
                             e,
                         )
                         _warned_fused_metadata_generation_failure = True
+                    # Disable process-wide after a fused-generation failure. This is a
+                    # conservative perf fallback: correctness stays on the eager path
+                    # without paying exception overhead on every replay.
                     _USE_FUSED_METADATA_GENERATION = False
 
             if not fused_metadata_generation_succeeded:
@@ -1418,6 +1424,9 @@ class DeepseekSparseAttnBackend(
                             e,
                         )
                         _warned_fused_metadata_generation_failure = True
+                    # Disable process-wide after a fused-generation failure. This is a
+                    # conservative perf fallback: correctness stays on the eager path
+                    # without paying exception overhead on every replay.
                     _USE_FUSED_METADATA_GENERATION = False
 
             if not fused_metadata_generation_succeeded:
