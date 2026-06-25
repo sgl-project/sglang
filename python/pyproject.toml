@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "setuptools-rust>=1.10", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -21,7 +21,6 @@ dependencies = [
   "apache-tvm-ffi==0.1.9",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
-  "av",
   "build",
   "compressed-tensors",
   "cuda-python>=13.0",
@@ -35,8 +34,6 @@ dependencies = [
   "flashinfer_cubin==0.6.12",
   "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "hf_transfer",
-  "huggingface_hub",
   "interegular",
   "IPython",
   "kernels>=0.14.1,<0.15",
@@ -45,6 +42,7 @@ dependencies = [
   "modelscope",
   "msgspec",
   "ninja",
+  "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
   "nvidia-cutlass-dsl[cu13]==4.5.2",
   "nvidia-mathdx==25.6.0",
@@ -97,6 +95,7 @@ default = true
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",
@@ -146,14 +145,18 @@ test = [
   "expecttest",
   "granian>=2.6.0",
   "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   "pandas",
+  "parameterized",
   "peft>=0.18.0",
+  "polars",
   "pytest",
   "pytest-cov",
   "sentence_transformers",
   "sglang[fastokens]",
   "tabulate",
+  "granian>=2.6.0",
 ]
 
 dev = ["sglang[test]"]
@@ -174,6 +177,7 @@ vsa = ["setuptools", "torch"]
 
 [project.scripts]
 sglang = "sglang.cli.main:main"
+killall_sglang = "sglang.cli.killall:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
@@ -210,3 +214,11 @@ version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
+
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.grpc._core"
+path = "../rust/sglang-grpc/Cargo.toml"
+binding = "PyO3"
+
+[tool.kernels.dependencies]
+"kernels-community/sgl-flash-attn3" = 1
