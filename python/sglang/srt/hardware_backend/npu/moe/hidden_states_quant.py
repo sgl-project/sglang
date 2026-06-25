@@ -30,7 +30,9 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
-    def __call__(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         quantized, scale = torch.ops.npu.npu_dynamic_quant(
             hidden_states, dst_type=self.quant_dtype
         )
