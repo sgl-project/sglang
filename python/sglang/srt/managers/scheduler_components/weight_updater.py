@@ -16,6 +16,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -77,6 +78,7 @@ class SchedulerWeightUpdaterManager:
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
+    scheduler: Optional[Any] = None
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
@@ -114,12 +116,14 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
                 logger.error(message)
-            return UpdateWeightFromDiskReqOutput(success, message, 0)
+            return UpdateWeightFromDiskReqOutput(
+                success=success, message=message, num_paused_requests=0
+            )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return InitWeightsUpdateGroupReqOutput(success, message)
+        return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
         self,
@@ -127,7 +131,7 @@ class SchedulerWeightUpdaterManager:
     ):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
-        return DestroyWeightsUpdateGroupReqOutput(success, message)
+        return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def update_weights_from_distributed(
         self,
@@ -140,7 +144,9 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
-            return UpdateWeightsFromDistributedReqOutput(success, message)
+            return UpdateWeightsFromDistributedReqOutput(
+                success=success, message=message
+            )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
@@ -155,7 +161,7 @@ class SchedulerWeightUpdaterManager:
             else:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromTensorReqOutput(success, message)
+            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
@@ -169,11 +175,11 @@ class SchedulerWeightUpdaterManager:
             if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromIPCReqOutput(success, message)
+            return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return GetWeightsByNameReqOutput(parameter)
+        return GetWeightsByNameReqOutput(parameter=parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
@@ -189,6 +195,20 @@ class SchedulerWeightUpdaterManager:
             self.offload_tags.add(tag)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            scheduler = self.scheduler
+            if scheduler is not None:
+                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+                    for queue_name in (
+                        "disagg_decode_transfer_queue",
+                        "disagg_decode_prealloc_queue",
+                    ):
+                        queue = getattr(scheduler, queue_name, None)
+                        if queue is not None:
+                            queue.release_memory_occupation()
+                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+                    if queue is not None:
+                        queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
 
@@ -229,6 +249,20 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            scheduler = self.scheduler
+            if scheduler is not None:
+                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+                    for queue_name in (
+                        "disagg_decode_transfer_queue",
+                        "disagg_decode_prealloc_queue",
+                    ):
+                        queue = getattr(scheduler, queue_name, None)
+                        if queue is not None:
+                            queue.resume_memory_occupation()
+                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+                    if queue is not None:
+                        queue.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
 

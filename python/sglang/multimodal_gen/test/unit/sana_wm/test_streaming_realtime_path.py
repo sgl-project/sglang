@@ -23,10 +23,12 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm import (
 from sglang.multimodal_gen.runtime import server_args as _sa_mod
 from sglang.multimodal_gen.runtime.models.dits.sana_wm import SanaWMTransformer3DModel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
-    SanaWMStreamCacheState,
     SanaWMStreamingDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
+from sglang.multimodal_gen.runtime.realtime.states import (
+    get_realtime_causal_dit_state,
+)
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 MC = 8
@@ -124,10 +126,10 @@ def test_realtime_path_multi_tick_carries_state(_global_args):
     # Tick 0 (chunk 0): conditioning frame + 2 new frames.
     chunk0 = torch.cat([fl, _noise(1, MC, 2, 2, 2, seed=1)], dim=2)
     out = stage.forward(_tick(session, 0, chunk0, [3]), server_args)
-    state = session.get_or_create_state(SanaWMStreamCacheState)
+    state = get_realtime_causal_dit_state(session)
     assert out.latents.shape[2] == 3
     assert state.chunk_idx == 1 and state.chunk_indices == [0, 3]
-    assert state.stream_kv_cache[0][0][0] is not None  # GDN state stored
+    assert state.kv_cache[0][0][0] is not None  # GDN state stored
     # The condition frame is held fixed.
     assert torch.allclose(state.latents[:, :, 0].cpu(), fl[:, :, 0])
 
@@ -159,13 +161,13 @@ def test_realtime_path_evicts_stale_kv(_global_args):
         stage.forward(
             _tick(session, i, _noise(1, MC, 2, 2, 2, seed=10 + i), [2]), server_args
         )
-    state = session.get_or_create_state(SanaWMStreamCacheState)
+    state = get_realtime_causal_dit_state(session)
     assert state.chunk_indices == [0, 3, 5, 7, 9, 11]
 
     def _has_any(entry):
         return any(slot is not None for block in entry for slot in block)
 
-    kept = [i for i, e in enumerate(state.stream_kv_cache) if _has_any(e)]
+    kept = [i for i, e in enumerate(state.kv_cache) if _has_any(e)]
     # Sink chunk + the last num_cached_blocks chunks (accumulate's read window).
     assert kept == [0, 3, 4]
 
@@ -183,7 +185,7 @@ def test_realtime_path_is_deterministic(_global_args):
         stage.forward(
             _tick(session, 1, _noise(1, MC, 2, 2, 2, seed=6), [2]), server_args
         )
-        return session.get_or_create_state(SanaWMStreamCacheState).latents.cpu()
+        return get_realtime_causal_dit_state(session).latents.cpu()
 
     torch.manual_seed(1234)
     a = _run()
@@ -199,7 +201,7 @@ def test_realtime_path_resets_on_block_zero(_global_args):
     chunk0 = torch.cat([fl, _noise(1, MC, 2, 2, 2, seed=1)], 2)
     stage.forward(_tick(session, 0, chunk0, [3]), server_args)
     stage.forward(_tick(session, 1, _noise(1, MC, 2, 2, 2, seed=2), [2]), server_args)
-    state = session.get_or_create_state(SanaWMStreamCacheState)
+    state = get_realtime_causal_dit_state(session)
     assert state.chunk_idx == 2
 
     # block_idx == 0 restarts the session in place.

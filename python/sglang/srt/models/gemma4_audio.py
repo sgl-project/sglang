@@ -37,16 +37,13 @@ from sglang.srt.layers.clippable_linear import (
     ClippableQKVParallelLinear,
     ClippableRowParallelLinear,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 # SSCP convolution constants (no longer in config.json, never varied across models)
@@ -69,7 +66,7 @@ class Gemma4AudioRelativePositionEmbedding(nn.Module):
         super().__init__()
         self.config = config
 
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         total_num_heads = config.num_attention_heads
         self.channels = config.hidden_size
         self.head_dim = self.channels // total_num_heads
@@ -219,7 +216,7 @@ class Gemma4AudioAttention(nn.Module):
         super().__init__()
         self.config = config
 
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         total_num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.head_dim = self.hidden_size // total_num_heads
@@ -641,7 +638,7 @@ class Gemma4AudioConformerLightConv1d(nn.Module):
         super().__init__()
         self.config = config
         self.causal_padding = config.conv_kernel_size - 1
-        tp_size = get_attention_tp_size()
+        tp_size = get_parallel().attn_tp_size
         hidden_per_tp = config.hidden_size // tp_size
 
         self.register_buffer(
@@ -673,7 +670,7 @@ class Gemma4AudioConformerLightConv1d(nn.Module):
             hidden_per_tp, eps=config.rms_norm_eps, scale_shift=0.0
         )
 
-        tp_rank = get_attention_tp_rank()
+        tp_rank = get_parallel().attn_tp_rank
 
         def _shard_dim0(param, loaded_weight, _rank=tp_rank, _tp=tp_size):
             shard = param.shape[0]
