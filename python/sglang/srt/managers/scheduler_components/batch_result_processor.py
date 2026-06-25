@@ -744,10 +744,14 @@ class SchedulerBatchResultProcessor:
         # spec unpacks the padded verify output; non-spec wraps its single token.
         if not batch.spec_algorithm.is_none():
             next_token_ids = self._resolve_spec_v2_tokens(result, batch)
-        elif isinstance(next_token_ids, list):
-            next_token_ids = [[t] for t in next_token_ids]  # MLX: list[int]
         else:
-            next_token_ids = [[t] for t in next_token_ids.tolist()]
+            # CUDA workers return a device tensor, MLX a host list[int]; both -> list.
+            ids = (
+                next_token_ids.tolist()
+                if torch.is_tensor(next_token_ids)
+                else next_token_ids
+            )
+            next_token_ids = [[t] for t in ids]
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
