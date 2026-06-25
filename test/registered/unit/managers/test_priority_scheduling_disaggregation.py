@@ -284,11 +284,11 @@ class TestDecodePreallocQueueRebootstrap(unittest.TestCase):
         submitted()
 
         decode_req.kv_receiver.abort.assert_called_once()
-        rebootstrap_queue.scheduler.stream_output.assert_not_called()
+        rebootstrap_queue.scheduler.output_streamer.stream_output.assert_not_called()
 
         rebootstrap_queue.drain_rebootstrap_prefill_failures()
 
-        rebootstrap_queue.scheduler.stream_output.assert_called_once_with(
+        rebootstrap_queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [decode_req.req], decode_req.req.return_logprob
         )
 
