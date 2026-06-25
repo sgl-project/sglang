@@ -1,17 +1,71 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
+from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
+from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+
+def resolve_pp_proxy_topk_size(
+    *, model_config: ModelConfig, pp_size: int, pp_rank: int, start_layer: int
+) -> Optional[int]:
+    hf_config = model_config.hf_text_config
+    if (
+        pp_size <= 1
+        or pp_rank == 0
+        or not is_deepseek_dsa(hf_config)
+        or not dsa_layer_skips_topk(hf_config, start_layer)
+    ):
+        return None
+    return getattr(hf_config, "index_topk", None)
+
+
+def get_healthy_expert_location_src_rank(
+    *, invoked_in_elastic_ep_rejoin_path: bool
+) -> int:
+    world_group = get_world_group()
+    # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+    # A rank that was started as a rejoin rank may later act as a healthy
+    # rank in a subsequent recovery cycle.
+    local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+    gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+    for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+        if not is_rejoin_rank:
+            return world_group.ranks[rank_in_group]
+
+    raise RuntimeError(
+        "No healthy rank found for broadcasting expert location metadata. "
+        "All ranks are marked as elastic_ep_rejoin."
+    )
+
+
+def create_msprobe_debugger(server_args: ServerArgs) -> Optional[Any]:
+    if server_args.msprobe_dump_config is None:
+        return None
+
+    try:
+        from msprobe.pytorch import PrecisionDebugger, seed_all
+    except ImportError:
+        logger.warning(
+            "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
+            "see https://gitcode.com/Ascend/msprobe for details."
+        )
+        return None
+
+    seed_all(mode=True)
+    return PrecisionDebugger(config_path=server_args.msprobe_dump_config)
 
 
 def check_quantized_moe_compatibility(
