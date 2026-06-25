@@ -1113,7 +1113,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
         input_ids: Optional[List[int]],
-        input_embeds: Optional[Union[List[float], None]] = None,
+        input_embeds: Optional[List[List[float]]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
@@ -2050,11 +2050,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
-                if (
-                    recv_obj.pooled_hidden_states is not None
-                    and recv_obj.pooled_hidden_states[i] is not None
-                ):
-                    out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+                # Unpack pooled hidden states (PHS).
+                # See paired sender logic in output_streamer.py.
+                #   Stacked:     len == 1 and N > 1 → unwrap the tensor
+                #   Non-stacked: len == N → index directly
+                pooled_hidden_states = recv_obj.pooled_hidden_states
+                if pooled_hidden_states is not None:
+                    if len(pooled_hidden_states) == 1 and len(recv_obj.rids) > 1:
+                        pooled_hidden_states = pooled_hidden_states[0]
+                    if pooled_hidden_states[i] is not None:
+                        out_dict["pooled_hidden_state"] = pooled_hidden_states[i]
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.

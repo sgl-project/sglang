@@ -409,6 +409,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
     def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -442,7 +443,9 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.future_map)
         indices = torch.tensor([1], dtype=torch.int64)
-        scheduler.future_map.stash(indices, torch.tensor([7], dtype=torch.int64))
+        scheduler.future_map.stash(
+            indices, RelayPayload(bonus_tokens=torch.tensor([7], dtype=torch.int64))
+        )
         self.assertEqual(int(scheduler.future_map.output_tokens_buf[1].item()), 7)
 
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
