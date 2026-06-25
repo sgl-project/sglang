@@ -2493,11 +2493,21 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
+            # Hardware that has a dense varlen MHA prefill kernel wired into
+            # _forward_standard_mha: NVIDIA SM90 (FA3) / SM100 (flashinfer trtllm),
+            # and AMD gfx950 (aiter flash_attn_varlen_func, imported on HIP above).
+            mha_prefill_hw_ok = (
+                device_sm == 90
+                or (device_sm >= 100 and device_sm < 110)
+                or (_is_hip and device_sm == 95)
+            )
+
+            # Requirements: supported HW, short sequences, supported dtype, fits in chunk.
+            # gfx950 prefix-continuation reads the latent back from the fp8 KV cache;
+            # the HIP raw 576B layout (no per-tile scales) is handled by
+            # dequantize_k_cache_paged's dim_quant==576 branch.
             self.use_mha = (
-                (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
-                )  # SM90/SM100 only
+                mha_prefill_hw_ok
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
