@@ -1,8 +1,6 @@
 # Benchmarks SGLang fused layernorm/rmsnorm scale shift kernels
 # 1. fused_norm_scale_shift
 # 2. fused_scale_residual_norm_scale_shift
-import itertools
-
 import torch
 
 from sglang.jit_kernel.benchmark import marker
@@ -29,11 +27,6 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 EPS = 1e-5
 
-CONFIG = list(
-    itertools.product(B_RANGE, S_RANGE, D_RANGE, NORM_TYPE_RANGE, AFFINE_RANGE)
-)
-CI_CONFIG = [(1, 128, 1024, "layer", True)]
-
 
 def preprocess_layer(layer, affine: bool, D: int, DTYPE: torch.dtype):
     if affine:
@@ -50,7 +43,11 @@ def preprocess_layer(layer, affine: bool, D: int, DTYPE: torch.dtype):
 # ============================================================================
 # Benchmark 1: fused_norm_scale_shift
 # ============================================================================
-@marker.parametrize("B,S,D,norm_type,affine", CONFIG, CI_CONFIG)
+@marker.parametrize("B", B_RANGE, [1])
+@marker.parametrize("S", S_RANGE, [128])
+@marker.parametrize("D", D_RANGE, [1024])
+@marker.parametrize("norm_type", NORM_TYPE_RANGE, ["layer"])
+@marker.parametrize("affine", AFFINE_RANGE, [True])
 @marker.benchmark("provider", ["native", "cuda"])
 def bench_fused_norm_scale_shift(
     B: int, S: int, D: int, norm_type: str, affine: bool, provider: str
@@ -76,7 +73,11 @@ def bench_fused_norm_scale_shift(
 # ============================================================================
 # Benchmark 2: fused_scale_residual_norm_scale_shift
 # ============================================================================
-@marker.parametrize("B,S,D,norm_type,affine", CONFIG, CI_CONFIG)
+@marker.parametrize("B", B_RANGE, [1])
+@marker.parametrize("S", S_RANGE, [128])
+@marker.parametrize("D", D_RANGE, [1024])
+@marker.parametrize("norm_type", NORM_TYPE_RANGE, ["layer"])
+@marker.parametrize("affine", AFFINE_RANGE, [True])
 @marker.benchmark("provider", ["native", "cuda"])
 def bench_fused_scale_residual_norm_scale_shift(
     B: int, S: int, D: int, norm_type: str, affine: bool, provider: str

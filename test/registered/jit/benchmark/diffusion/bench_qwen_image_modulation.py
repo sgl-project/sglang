@@ -14,10 +14,9 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 EPS = 1e-6
 SEP = "=" * 80
-CONFIG = [
-    (b, s, d) for b in (1, 2) for s in (128, 512, 2048) for d in (1024, 1536, 3072)
-]
-CI_CONFIG = [(1, 128, 3072)]
+B_RANGE = [1, 2]
+S_RANGE = [128, 512, 2048]
+D_RANGE = [1024, 1536, 3072]
 
 
 def _make_common_inputs(batch_size: int, seq_len: int, hidden_size: int):
@@ -51,7 +50,9 @@ def _apply_select01_modulation(
     return x * (1 + scale) + shift, gate
 
 
-@marker.parametrize("B,S,D", CONFIG, CI_CONFIG)
+@marker.parametrize("B", B_RANGE, [1])
+@marker.parametrize("S", S_RANGE, [128])
+@marker.parametrize("D", D_RANGE, [3072])
 @marker.benchmark("provider", ["split", "fused"])
 def bench_layernorm_scale_shift_gate_select01(B: int, S: int, D: int, provider: str):
     x, weight, bias, index, scale0, shift0, gate0, scale1, shift1, gate1 = (
@@ -95,7 +96,9 @@ def bench_layernorm_scale_shift_gate_select01(B: int, S: int, D: int, provider: 
     return marker.do_bench(fn, input_args=(x,))
 
 
-@marker.parametrize("B,S,D", CONFIG, CI_CONFIG)
+@marker.parametrize("B", B_RANGE, [1])
+@marker.parametrize("S", S_RANGE, [128])
+@marker.parametrize("D", D_RANGE, [3072])
 @marker.benchmark("provider", ["split", "fused"])
 def bench_residual_layernorm_scale_shift_gate_select01(
     B: int, S: int, D: int, provider: str
