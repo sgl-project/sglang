@@ -211,6 +211,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # radix coordination for now, so force_flush is None/zeroed (the ring
         # flushes only at the natural write_pos == L-1 wrap; set in the shared
         # HybridLinearAttn metadata, which zeroes force_flush for KDA models).
+        # NOTE: ReplaySSM decode is a GDN (scalar-gate) bandwidth win; on KDA the
+        # per-K g_cache is K x larger and the reconstruction refolds the per-K
+        # decay every step, so it is correct but SLOWER than packed (a measured
+        # decode regression). Kept wired for correctness + the spec-decode path;
+        # not recommended for KDA decode. Revisit on Blackwell (more tensor-core
+        # throughput may flip the compute/bandwidth tradeoff).
         replayssm_write_pos = getattr(
             self.forward_metadata, "replayssm_write_pos", None
         )

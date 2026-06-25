@@ -1833,7 +1833,14 @@ class ServerArgs:
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[
         bool,
-        "Enable the ReplaySSM buffered output-only linear-attn decode kernel (GDN + KDA). Requires the Triton linear-attn decode backend and --mamba-scheduler-strategy no_buffer (the default).",
+        "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
+        "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
+        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
+        "is numerically correct, but KDA decode is SLOWER than the packed "
+        "baseline (the per-K g_cache is K x larger and the reconstruction "
+        "refolds the per-K decay every step), so it is not recommended for KDA "
+        "models. Requires the Triton linear-attn decode backend and "
+        "--mamba-scheduler-strategy no_buffer (the default).",
     ] = False
     linear_replayssm_cache_len: A[
         int,
