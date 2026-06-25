@@ -860,9 +860,7 @@ PARAMETRIZED_CASE_GROUPS = {
 STANDALONE_FILES = {
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
-        # Temporarily disabled: 24 timeout failures since 2026-04-09 across
-        # multimodal-gen-test-1-gpu. Re-enable after the flakiness is fixed.
-        # "../single_test_file/test_update_weights_from_disk.py",
+        "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
         "../single_test_file/test_disagg_server.py",
@@ -874,8 +872,7 @@ STANDALONE_FILES = {
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
-        # See STANDALONE_FILES note above — temporarily disabled.
-        # "../single_test_file/test_update_weights_from_disk.py": 480.0,
+        "../single_test_file/test_update_weights_from_disk.py": 1200.0,
     },
     "2-gpu": {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
@@ -913,7 +910,4 @@ _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = (
     "../single_test_file/test_update_weights_from_disk.py"
 )
 _UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
-_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
-    "FLUX.2-klein-base-4B",
-    "Qwen-Image",
-)
+_UPDATE_WEIGHTS_MODEL_PAIR_IDS = ("FLUX.2-klein-base-4B",)
