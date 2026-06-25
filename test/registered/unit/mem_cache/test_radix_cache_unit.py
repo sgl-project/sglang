@@ -514,9 +514,7 @@ class TestRadixCache(unittest.TestCase):
         self.assertIn("BlockStored", event_types)
 
         stored_hashes = [
-            event.block_hashes[0]
-            for event in events
-            if isinstance(event, BlockStored)
+            event.block_hashes[0] for event in events if isinstance(event, BlockStored)
         ]
         self.assertEqual(len(stored_hashes), 2)
 
