@@ -29,7 +29,8 @@ template <typename T, int kVec>
 __global__ void fused_q_quant_kv_write_kernel(
     const T* __restrict__ q_in,
     fp8_e4m3_t* __restrict__ q_out,
-    int64_t n_q,
+    int q_row,
+    int64_t q_in_row_stride,
     float* __restrict__ bmm1_out,
     float bmm1_extra,
     const T* __restrict__ k_in,
@@ -51,7 +52,9 @@ __global__ void fused_q_quant_kv_write_kernel(
   cg::grid_group grid = cg::this_grid();
   const int64_t gtid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t gstride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  const int64_t n_qvec = n_q / kVec;
+
+  const int64_t q_row_vecs = q_row / kVec;
+  const int64_t q_total_vecs = static_cast<int64_t>(num_tokens) * q_row_vecs;
 
   if (grid.thread_rank() == 0) {
     *bmm1_out = 0.0f;
@@ -59,16 +62,15 @@ __global__ void fused_q_quant_kv_write_kernel(
   grid.sync();
 
   float thread_max = 0.0f;
-  for (int64_t vi = gtid; vi < n_qvec; vi += gstride) {
+  for (int64_t idx = gtid; idx < q_total_vecs; idx += gstride) {
+    const int64_t t = idx / q_row_vecs;
+    const int64_t jv = idx % q_row_vecs;
     in_vec_t v;
-    v.load(q_in, vi);
+    v.load(q_in + t * q_in_row_stride, jv);
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
       thread_max = math::max(thread_max, math::abs(static_cast<float>(v[i])));
     }
-  }
-  for (int64_t i = n_qvec * kVec + gtid; i < n_q; i += gstride) {
-    thread_max = math::max(thread_max, math::abs(static_cast<float>(q_in[i])));
   }
 
   __shared__ float smem[kFusedBlockSize / 32];
@@ -87,18 +89,17 @@ __global__ void fused_q_quant_kv_write_kernel(
     *bmm1_out = (amax / math::FP8_E4M3_MAX) * bmm1_extra;
   }
 
-  for (int64_t vi = gtid; vi < n_qvec; vi += gstride) {
+  for (int64_t idx = gtid; idx < q_total_vecs; idx += gstride) {
+    const int64_t t = idx / q_row_vecs;
+    const int64_t jv = idx % q_row_vecs;
     in_vec_t v;
-    v.load(q_in, vi);
+    v.load(q_in + t * q_in_row_stride, jv);
     out_vec_t o;
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
       o[i] = quant_one(static_cast<float>(v[i]), inv_q);
     }
-    o.store(q_out, vi);
-  }
-  for (int64_t i = n_qvec * kVec + gtid; i < n_q; i += gstride) {
-    q_out[i] = quant_one(static_cast<float>(q_in[i]), inv_q);
+    o.store(q_out + t * q_row, jv);
   }
 
   const int64_t row_vecs = kv_row / kVec;
@@ -142,7 +143,9 @@ void fused_q_quant_kv_write(
     double inv_v_scale,
     double bmm1_extra,
     int64_t num_tokens,
+    int64_t q_row,
     int64_t kv_row,
+    int64_t q_in_row_stride,
     int64_t k_in_row_stride,
     int64_t v_in_row_stride,
     int64_t cache_row_stride) {
@@ -154,7 +157,6 @@ void fused_q_quant_kv_write(
   auto device_ = SymbolicDevice{};
   device_.set_options<kDLCUDA>();
 
-  TensorMatcher({N}).with_dtype<T>().with_device(device_).verify(q_in);
   TensorMatcher({N}).with_dtype<fp8_e4m3_t>().with_device(device_).verify(q_out);
   TensorMatcher({one}).with_dtype<float>().with_device(device_).verify(bmm1_out);
   TensorMatcher({nt}).with_dtype<int64_t>().with_device(device_).verify(cache_loc);
@@ -169,6 +171,7 @@ void fused_q_quant_kv_write(
       num_tokens);
 
   constexpr int kVec = 16 / sizeof(T);
+  RuntimeCheck(q_row % kVec == 0, "fused_q_quant_kv_write: q_row ", q_row, " must be a multiple of ", kVec);
   RuntimeCheck(kv_row % kVec == 0, "fused_q_quant_kv_write: kv_row ", kv_row, " must be a multiple of ", kVec);
 
   auto* kernel = fused_q_quant_kv_write_kernel<T, kVec>;
@@ -199,7 +202,8 @@ void fused_q_quant_kv_write(
           kernel,
           static_cast<const T*>(q_in.data_ptr()),
           static_cast<fp8_e4m3_t*>(q_out.data_ptr()),
-          n_q,
+          static_cast<int>(q_row),
+          q_in_row_stride,
           static_cast<float*>(bmm1_out.data_ptr()),
           static_cast<float>(bmm1_extra),
           static_cast<const T*>(k_in.data_ptr()),
