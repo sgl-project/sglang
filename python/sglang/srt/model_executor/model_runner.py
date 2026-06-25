@@ -2868,7 +2868,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(build_step_span_name(forward_batch))
 
         canary_ctx = (
             context_tuple(
@@ -3194,7 +3194,7 @@ def _unwrap_tensor(tensor, tp_rank, device):
     return tensor.to(device)
 
 
-def _build_step_span_name(forward_batch: ForwardBatch) -> str:
+def build_step_span_name(forward_batch: ForwardBatch) -> str:
     """Build a profile-trace span name for one forward step."""
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
