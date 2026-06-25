@@ -1950,9 +1950,13 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-                elif self.kv_cache_dtype == fp8_dtype:
+                elif (
+                    self.kv_cache_dtype == fp8_dtype
+                    and not self.use_sliding_window_kv_pool
+                ):
                     # FP8: fuse bf16->fp8 cast + paged write in one kernel instead
                     # of the separate div/cast + store in set_kv_buffer.
+                    # Single-pool only; SWA models fall back to set_kv_buffer.
                     k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
@@ -2436,9 +2440,14 @@ class AiterAttnBackend(AttentionBackend):
                     k_scale=k_descale,
                     v_scale=v_descale,
                 )
-            elif self.kv_cache_dtype == fp8_dtype and not self.use_mla:
+            elif (
+                self.kv_cache_dtype == fp8_dtype
+                and not self.use_mla
+                and not self.use_sliding_window_kv_pool
+            ):
                 # FP8: fuse bf16->fp8 cast + paged write in one kernel. Works for
                 # both unified and standard (paged_attention_ragged) read paths.
+                # Single-pool only; SWA models fall back to set_kv_buffer.
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 launch_reshape_and_cache_flash(
