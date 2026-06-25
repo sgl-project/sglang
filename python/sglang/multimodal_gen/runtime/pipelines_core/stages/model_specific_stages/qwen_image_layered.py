@@ -512,6 +512,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         multiple_of = self.vae_scale_factor * 2
         width = width // multiple_of * multiple_of
         height = height // multiple_of * multiple_of
+        batch.width = width
+        batch.height = height
 
         # if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
         image = self.image_processor.resize(image, calculated_height, calculated_width)
