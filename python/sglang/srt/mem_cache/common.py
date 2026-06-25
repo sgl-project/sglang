@@ -71,6 +71,7 @@ def free_swa_out_of_window_slots(
     page_size: int,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    drop_page_margin: bool = False,
 ) -> None:
     from sglang.srt.environ import envs
 
@@ -86,7 +87,7 @@ def free_swa_out_of_window_slots(
     # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
     # may become tombstoned, causing SWA memory leak.
     # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
-    if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+    if drop_page_margin or envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
         evict_threshold = pre_len - sliding_window_size
     else:
         evict_threshold = pre_len - sliding_window_size - page_size
@@ -242,7 +243,7 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
     """KV length reserved per request at each decode step.
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_info_v2.prepare_for_decode.
+    mode; see eagle_utils.eagle_prepare_for_decode.
     """
     return 2 * get_alloc_len_per_decode(server_args)
 
@@ -438,6 +439,18 @@ def alloc_req_slots(
     return req_pool_indices
 
 
+def _alloc_page_size(batch: ScheduleBatch) -> int:
+    # DCP (HIP-only) swaps in a PagedTokenToKVPoolAllocator whose page_size is
+    # server_args.page_size * dcp_size, so it can be > 1 even when
+    # tree_cache.page_size (== server_args.page_size) is 1. Only on the HIP DCP
+    # path do we branch on the real allocator's page_size so the paged path is
+    # taken; everywhere else tree_cache.page_size is authoritative and the two
+    # are equal (dcp_size == 1), so behavior is unchanged.
+    if _is_hip and get_global_server_args().dcp_size > 1:
+        return batch.tree_cache.token_to_kv_pool_allocator.page_size
+    return batch.tree_cache.page_size
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -468,7 +481,7 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    if batch.tree_cache.page_size == 1:
+    if _alloc_page_size(batch) == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
@@ -583,7 +596,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    if batch.tree_cache.page_size == 1:
+    if _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
