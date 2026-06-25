@@ -40,8 +40,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
     cutlass_fp8_supported,
-    dispatch_w8a8_mxfp8_linear,
-    get_fp8_gemm_runner_backend,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -2465,13 +2463,12 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     uint8 E8M0 biased exponent, bias=127, [out, in/32]). Activations are dynamic
     microscaling, so there is no stored input_scale.
 
-    The GEMM is dispatched through ``dispatch_w8a8_mxfp8_linear()`` -- the same
-    fused MXFP8 W8A8 path the stock ``Fp8LinearMethod`` uses (``fp8.py``). By
-    default this is the Triton block-scaled kernel; ``--fp8-gemm-backend
-    flashinfer_trtllm`` (or ``flashinfer_cutlass``) routes to the fused FlashInfer
-    CUTLASS/TRT-LLM kernel on Blackwell. These kernels consume the raw fp8 weight
-    + uint8 E8M0 scale directly and dynamically quantize activations to MXFP8, so
-    no torchao MXTensor wrapper / runtime scale re-blocking is needed.
+    The GEMM runs on the FlashInfer CUTLASS MXFP8 kernel (``flashinfer.mm_mxfp8``,
+    ``backend="cutlass"``): the fp8 weight is consumed directly, the UE8M0 block
+    scale is interleaved into the kernel's swizzled layout at load, and activations
+    are dynamically MXFP8-quantized per call. Small linears that don't meet the
+    kernel's 128-tile alignment (e.g. Qwen3.5's fused in_proj_ba gate, N=16 per
+    TP=4 shard) fall back to bf16.
     """
 
     BLOCK = 32
@@ -2479,10 +2476,6 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config=None):
         super().__init__()
         self.quant_config = quant_config
-        # Same fused dispatch the stock Fp8LinearMethod uses (fp8.py). Selected at
-        # construction time from --fp8-gemm-backend: Triton (default) or FlashInfer
-        # TRT-LLM/CUTLASS. Replaces the old torchao MXTensor + torch._scaled_mm path.
-        self.mxfp8_linear = dispatch_w8a8_mxfp8_linear()
 
     def create_weights(
         self,
@@ -2536,13 +2529,11 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
             ),
         )
 
-    # Fused MXFP8 GEMMs (Triton / FlashInfer) tile the GEMM and require the
-    # per-shard N and K to be multiples of 128 (Triton asserts k%128 and
-    # n%block_n with block_n in {128,256}). Small linears that don't meet this --
-    # notably Qwen3.5's fused in_proj_ba (b+a gates, N=64 -> 16 per TP=4 shard) --
-    # are dequantized to bf16 and run through a plain GEMM. These are tiny
-    # (e.g. 2048x16), so the cost is negligible and bf16 is numerically safer for
-    # the decay/gate projections. vLLM solved the same constraint by padding.
+    # The CUTLASS mm_mxfp8 kernel tiles the GEMM and requires per-shard N and K to
+    # be multiples of 128. Small linears that don't meet this -- notably Qwen3.5's
+    # fused in_proj_ba (b+a gates, N=64 -> 16 per TP=4 shard) -- are dequantized to
+    # bf16 and run through a plain GEMM. These are tiny (e.g. 2048x16), so the cost
+    # is negligible and bf16 is numerically safer for the decay/gate projections.
     ALIGN = 128
 
     def _kernel_aligned(self, layer) -> bool:
@@ -2553,25 +2544,20 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer) -> None:
         if self._kernel_aligned(layer):
+            # CUTLASS mm_mxfp8 consumes the fp8 weight as-is and needs the UE8M0
+            # block scale interleaved into its swizzled layout.
+            from flashinfer import block_scale_interleave
+
             layer.use_fused_mxfp8 = True
-            weight = layer.weight.data.contiguous()
-            scale_u8 = layer.weight_scale.data.contiguous().view(torch.uint8)
-
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
-                # CUTLASS mm_mxfp8 needs the UE8M0 block scale interleaved into its
-                # swizzled layout (mirrors Fp8LinearMethod._process_mxfp8_linear_weight_scale).
-                # The weight itself is consumed as-is.
-                from flashinfer import block_scale_interleave
-
-                layer.weight = Parameter(weight, requires_grad=False)
-                layer.weight_scale = Parameter(
-                    block_scale_interleave(scale_u8.contiguous()).contiguous(),
-                    requires_grad=False,
-                )
-            else:
-                # Triton (default): canonical 2D UE8M0 scale + raw fp8 weight.
-                layer.weight = Parameter(weight, requires_grad=False)
-                layer.weight_scale = Parameter(scale_u8, requires_grad=False)
+            layer.weight = Parameter(
+                layer.weight.data.contiguous(), requires_grad=False
+            )
+            layer.weight_scale = Parameter(
+                block_scale_interleave(
+                    layer.weight_scale.data.contiguous().view(torch.uint8)
+                ).contiguous(),
+                requires_grad=False,
+            )
             return
 
         # Fallback: reconstruct the bf16 weight from the stored MX block scales
@@ -2589,17 +2575,38 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         del layer.weight_scale
 
     def apply(self, layer, x, bias=None):
-        if getattr(layer, "use_fused_mxfp8", True):
-            # Dynamic-activation MXFP8 W8A8 GEMM via the shared dispatch (Triton by
-            # default, FlashInfer TRT-LLM/CUTLASS when --fp8-gemm-backend selects it).
-            # input_scale=None -> the kernel quantizes x to MXFP8 on the fly.
-            return self.mxfp8_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                input_scale=None,
-                bias=bias,
-                output_dtype=x.dtype,
-            )
-        # bf16 fallback for kernel-unaligned small linears.
-        return torch.nn.functional.linear(x, layer.weight.to(x.dtype), bias)
+        if not getattr(layer, "use_fused_mxfp8", True):
+            # bf16 fallback for kernel-unaligned small linears (e.g. in_proj_ba).
+            return torch.nn.functional.linear(x, layer.weight.to(x.dtype), bias)
+
+        # FlashInfer CUTLASS MXFP8 W8A8 GEMM. Activations are dynamically MXFP8-
+        # quantized (swizzled SF layout); the weight scale was interleaved at load.
+        from sglang.srt.layers.quantization.fp8_utils import (
+            flashinfer_mm_mxfp8,
+            flashinfer_mxfp8_quantize,
+        )
+
+        out_dtype = (
+            x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        )
+        x_2d = x.view(-1, x.shape[-1]).contiguous()
+        q_x, x_scale = flashinfer_mxfp8_quantize(
+            x_2d, is_sf_swizzled_layout=True, alignment=self.BLOCK
+        )
+        weight_scale = (
+            layer.weight_scale.contiguous().t()
+            if layer.weight_scale.ndim == 2
+            else layer.weight_scale.contiguous()
+        )
+        out = flashinfer_mm_mxfp8(
+            q_x,
+            layer.weight.contiguous().t(),
+            x_scale,
+            weight_scale,
+            out_dtype=out_dtype,
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+        )
+        if bias is not None:
+            out = out + bias
+        return out.view(*x.shape[:-1], layer.weight.shape[0])
