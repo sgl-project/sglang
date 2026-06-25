@@ -373,6 +373,8 @@ class RefAwareCacheMixin:
 
     def register_ref(self, req: Req):
         rid = req.rid
+        if not rid:
+            return
         is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
 
         if rid not in self.rid_to_ref_info:
