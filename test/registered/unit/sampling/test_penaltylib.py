@@ -315,7 +315,7 @@ class TestBatchedRepetitionPenalizer(CustomTestCase):
         )
 
     def test_apply_positive_logit_divides(self):
-        orch, pen = self._setup([2.0])
+        _, pen = self._setup([2.0])
         pen.cumulate_output_tokens(torch.tensor([5]))
 
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -324,7 +324,7 @@ class TestBatchedRepetitionPenalizer(CustomTestCase):
         self.assertAlmostEqual(logits[0, 5].item(), 2.0, places=5)
 
     def test_apply_negative_logit_multiplies(self):
-        orch, pen = self._setup([2.0])
+        _, pen = self._setup([2.0])
         pen.cumulate_output_tokens(torch.tensor([5]))
 
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -333,7 +333,7 @@ class TestBatchedRepetitionPenalizer(CustomTestCase):
         self.assertAlmostEqual(logits[0, 5].item(), -8.0, places=5)
 
     def test_apply_untouched_token_unchanged(self):
-        orch, pen = self._setup([2.0])
+        _, pen = self._setup([2.0])
         pen.cumulate_output_tokens(torch.tensor([5]))
 
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -344,7 +344,7 @@ class TestBatchedRepetitionPenalizer(CustomTestCase):
     def test_cumulate_twice_does_not_compound(self):
         # repetition_penalty uses scatter_ (overwrite), unlike frequency_penalty's
         # scatter_add_ — so repeated emissions of the same token do not compound.
-        orch, pen = self._setup([2.0])
+        _, pen = self._setup([2.0])
         pen.cumulate_output_tokens(torch.tensor([5]))
         pen.cumulate_output_tokens(torch.tensor([5]))
 
