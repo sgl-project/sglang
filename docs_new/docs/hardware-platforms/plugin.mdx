@@ -85,7 +85,10 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
   │   └─ activate() returns None      → RuntimeError (hardware unavailable)
   │
   └─ SGLANG_PLATFORM unset (auto-discover, activate all):
-      ├─ 0 activated → fallback base SRTPlatform
+      ├─ 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
+      ├─ 0 activated + CUDA available          → fallback CudaSRTPlatform
+      ├─ 0 activated + ROCm available          → fallback RocmSRTPlatform
+      ├─ 0 activated + none of the above       → fallback base SRTPlatform
       ├─ 1 activated → use it
       └─ N activated → RuntimeError (must set SGLANG_PLATFORM)
 ```

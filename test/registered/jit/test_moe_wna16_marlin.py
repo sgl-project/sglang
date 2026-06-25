@@ -349,7 +349,6 @@ def test_moe_wna16_marlin_gemm(
     torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
 
 
-@pytest.mark.skip(reason="Skip, test pass locally but compiling takes too long in CI")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
@@ -413,7 +412,6 @@ def test_fused_marlin_moe_non_gated_relu2():
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 
 
-@pytest.mark.skip(reason="Skip, test pass locally but compiling takes too long in CI")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE padding test requires CUDA SM8X/SM9X",
@@ -510,7 +508,6 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     assert out.shape == (m, hidden_size)
 
 
-@pytest.mark.skip(reason="Skip, test pass locally but compiling takes too long in CI")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",

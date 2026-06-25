@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
-    GetLoadsReqInput,
+    CachedTokensDetails,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -44,7 +44,6 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
-    load_inquirer_get_loads: Callable[..., Any]
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -57,7 +56,7 @@ class SchedulerOutputStreamer:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+    def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
@@ -144,8 +143,6 @@ class SchedulerOutputStreamer:
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
         )
-        load = self.load_inquirer_get_loads(GetLoadsReqInput(include=["core"]))
-
         for req in reqs:
             if req is skip_req:
                 continue
@@ -159,7 +156,6 @@ class SchedulerOutputStreamer:
 
         # Send to detokenizer
         payload = acc.to_payload(
-            load=load,
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
             has_reqs=bool(reqs),
@@ -251,7 +247,7 @@ class _GenerationStreamAccumulator:
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    get_cached_tokens_details: Callable[[Req], Optional[dict]]
+    get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
 
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -479,9 +475,14 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_idx.append([])
 
         if self.return_hidden_states:
-            self.output_hidden_states.append(
-                req.hidden_states if req.return_hidden_states else None
-            )
+            if req.return_hidden_states:
+                # Mirror output_ids_through_stop: spec verify steps can overshoot finished_len.
+                hs = req.hidden_states
+                if req.finished_len is not None:
+                    hs = hs[: req.finished_len]
+                self.output_hidden_states.append(hs)
+            else:
+                self.output_hidden_states.append(None)
         if self.return_routed_experts:
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
@@ -498,7 +499,7 @@ class _GenerationStreamAccumulator:
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
     def to_payload(
-        self, *, load, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool, has_reqs: bool
     ) -> Optional[BatchTokenIDOutput]:
         if not (has_reqs or is_idle_batch):
             return None
@@ -546,6 +547,5 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
-            load=load,
             dp_ranks=dp_ranks,
         )

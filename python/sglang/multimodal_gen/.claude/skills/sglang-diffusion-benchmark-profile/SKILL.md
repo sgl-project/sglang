@@ -55,6 +55,7 @@ Always rule out these existing families first:
 - HunyuanVideo VAE GroupNorm+SiLU
 - LTX upsampler GroupNorm+SiLU
 - Z-Image residual-form modulation
+- SANA packed self-attention Q/K/V and cross-attention K/V GEMMs
 - fused diffusion `QK norm + RoPE`
 - LTX2 split RoPE
 - varlen USP attention pack/scatter
