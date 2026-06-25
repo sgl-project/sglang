@@ -4281,7 +4281,7 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
-        if self.skip_tokenizer_init:
+        if self.skip_tokenizer_init and not envs.SGLANG_RUST_SERVER.get():
             if self.tokenizer_worker_num != 1:
                 logger.warning(
                     "skip_tokenizer_init=True disables tokenizer workers; forcing tokenizer_worker_num=1 "
