@@ -4,6 +4,7 @@ import logging
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch._C._distributed_c10d import _SymmetricMemory
 import dataclasses
 from typing import List, Optional, Tuple
 import triton
@@ -98,19 +99,16 @@ class AllGatherGemmContextSymmMem:
 
     symm_input_buf: torch.Tensor           # [world_size, M, K]
     symm_ag_a_buf: torch.Tensor            # [M * world_size, K]
-    ag_signal_buf: torch.Tensor            # [world_size] int32
-    signal_one_buf: torch.Tensor = None    # [world_size] int32, all-ones for PtoP signal
+    ag_signal_buf: torch.Tensor            # [world_size] uint32
 
     # symm_mem rendezvous handles
     input_hdl: object = None
     ag_hdl: object = None
     signal_hdl: object = None
-    signal_one_hdl: object = None
 
     mc_ag_a_buf: Optional[torch.Tensor] = None  # deprecated (NVLS)
     peer_signal_ptrs: Optional[torch.Tensor] = None
     peer_symm_input_bufs: Optional[List[torch.Tensor]] = None
-    peer_signal_one_bufs: Optional[List[torch.Tensor]] = None
     group: Optional[object] = None
 
     def finalize(self):
@@ -118,15 +116,12 @@ class AllGatherGemmContextSymmMem:
         self.symm_input_buf = None
         self.symm_ag_a_buf = None
         self.ag_signal_buf = None
-        self.signal_one_buf = None
         self.input_hdl = None
         self.ag_hdl = None
         self.signal_hdl = None
-        self.signal_one_hdl = None
         self.mc_ag_a_buf = None
         self.peer_signal_ptrs = None
         self.peer_symm_input_bufs = None
-        self.peer_signal_one_bufs = None
         if dist.is_initialized():
             dist.barrier(group=self.group)
 
@@ -163,23 +158,16 @@ def create_allgather_gemm_context_symm_mem(
         (max_M * world_size, K), dtype=torch.bfloat16, device=device,
     )
     ag_signal_buf = symm_mem.empty(
-        (world_size,), dtype=torch.int32, device=device,
-    )
-    # All-ones in symm memory — PtoP source for signal writes (avoids DtoD
-    # serialization that would break CE-GEMM overlap).
-    signal_one_buf = symm_mem.empty(
-        (world_size,), dtype=torch.int32, device=device,
+        (world_size,), dtype=torch.uint32, device=device,
     )
 
     symm_input_buf.zero_()
     symm_ag_a_buf.zero_()
     ag_signal_buf.zero_()
-    signal_one_buf.fill_(1)
 
     input_hdl = symm_mem.rendezvous(symm_input_buf, group=rendezvous_group)
     ag_hdl = symm_mem.rendezvous(symm_ag_a_buf, group=rendezvous_group)
     signal_hdl = symm_mem.rendezvous(ag_signal_buf, group=rendezvous_group)
-    signal_one_hdl = symm_mem.rendezvous(signal_one_buf, group=rendezvous_group)
 
     input_hdl.barrier()
 
@@ -191,7 +179,7 @@ def create_allgather_gemm_context_symm_mem(
         )
 
     peer_signal_ptrs = torch.tensor(
-        [signal_hdl.get_buffer(r, (world_size,), torch.int32).data_ptr()
+        [signal_hdl.get_buffer(r, (world_size,), torch.uint32).data_ptr()
          for r in range(world_size)],
         dtype=torch.int64,
         device=device,
@@ -199,11 +187,6 @@ def create_allgather_gemm_context_symm_mem(
 
     peer_symm_input_bufs = [
         input_hdl.get_buffer(r, (world_size, max_M, K), torch.bfloat16)
-        for r in range(world_size)
-    ]
-
-    peer_signal_one_bufs = [
-        signal_one_hdl.get_buffer(r, (world_size,), torch.int32)
         for r in range(world_size)
     ]
 
@@ -219,15 +202,12 @@ def create_allgather_gemm_context_symm_mem(
         symm_input_buf=symm_input_buf,
         symm_ag_a_buf=symm_ag_a_buf,
         ag_signal_buf=ag_signal_buf,
-        signal_one_buf=signal_one_buf,
         input_hdl=input_hdl,
         ag_hdl=ag_hdl,
         signal_hdl=signal_hdl,
-        signal_one_hdl=signal_one_hdl,
         mc_ag_a_buf=mc_ag_a_buf,
         peer_signal_ptrs=peer_signal_ptrs,
         peer_symm_input_bufs=peer_symm_input_bufs,
-        peer_signal_one_bufs=peer_signal_one_bufs,
         group=group,
     )
 
@@ -243,18 +223,16 @@ def cp_engine_full_mesh_pull_ag(
     symm_ag_a: torch.Tensor,
     peer_symm_input_bufs: List[torch.Tensor],
     ag_signal: torch.Tensor,
-    peer_signal_one_bufs: List[torch.Tensor],
-    ag_stream: torch.cuda.Stream,
 ):
     """AllGather via Copy Engine full-mesh pull (PtoP data + PtoP signal).
 
-    All ops route through PtoP channel to avoid DtoD serialization.
+    Signal writes via cuStreamWriteValue32.
     Caller must wrap in `with torch.cuda.stream(ag_stream):`.
     """
-    # Self-shard: local copy + PtoP signal
+    # Self-shard: local copy + PtoP signal via cuStreamWriteValue32
     local_dst = symm_ag_a[rank * M_local : (rank + 1) * M_local, :]
     local_dst.copy_(symm_input)
-    ag_signal[rank:rank + 1].copy_(peer_signal_one_bufs[rank][rank:rank + 1])
+    _SymmetricMemory.stream_write_value32(ag_signal, rank, 1)
 
     # Remote shards in rotated order
     for offset in range(1, world_size):
@@ -262,7 +240,8 @@ def cp_engine_full_mesh_pull_ag(
         remote_src = peer_symm_input_bufs[src_rank][src_rank, :M_local, :]
         local_dst = symm_ag_a[src_rank * M_local : (src_rank + 1) * M_local, :]
         local_dst.copy_(remote_src)
-        ag_signal[src_rank:src_rank + 1].copy_(peer_signal_one_bufs[src_rank][src_rank:src_rank + 1])
+        # cuStreamWriteValue32 issues a system level fence before the write
+        _SymmetricMemory.stream_write_value32(ag_signal, src_rank, 1)
 
 
 @triton.jit
@@ -272,7 +251,7 @@ def consumer_bf16_a_block_fp8_matmul(
     B_ptr,           # fp8 [N, K] weight (col-major)
     C_ptr,           # output [M, N]
     Bs_ptr,          # B scale [N//group_n, K//group_k]
-    ag_signal_ptr,   # [world_size] int32
+    ag_signal_ptr,   # [world_size] uint32
     # Dimensions
     M, N, K,
     M_local,
@@ -427,8 +406,6 @@ def allgather_gemm_op_symm_mem(
             symm_ag_a=symm_ag_a,
             peer_symm_input_bufs=ctx.peer_symm_input_bufs,
             ag_signal=ag_signal,
-            peer_signal_one_bufs=ctx.peer_signal_one_bufs,
-            ag_stream=ag_stream,
         )
 
     # Step 2: consumer GEMM on current_stream
