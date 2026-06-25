@@ -234,7 +234,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
         else:
             if forward_metadata.has_mamba_track_mask:
-                mixed_qkv_to_track = mixed_qkv[:, forward_metadata.track_conv_indices]
+                mixed_qkv_to_track = mixed_qkv[forward_metadata.track_conv_indices]
                 conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
             conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
