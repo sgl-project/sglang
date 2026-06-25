@@ -10,7 +10,7 @@ import torch
 from sglang.srt.distributed import parallel_state
 from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
 from sglang.srt.managers.schedule_batch import ServerArgs
-from sglang.srt.model_executor.model_runner_components.expert_location_helpers import (
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
     get_healthy_expert_location_src_rank,
 )
 from sglang.srt.utils import broadcast_pyobj, is_cpu, is_cuda
