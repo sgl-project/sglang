@@ -1,15 +1,24 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import NetworkAddress, get_free_port
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_port,
+    get_local_ip_auto,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
-_mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
+_mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
 
 
 def parse_ib_device_config(
