@@ -8,7 +8,7 @@ from array import array
 from collections import defaultdict
 from functools import partial
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar, cast
 
 import torch
 
@@ -172,6 +172,13 @@ class UnifiedLRUList:
         assert node.id not in self.cache
         self.cache[node.id] = node
         self._add_node(node)
+
+    def insert_after(
+        self, previous: UnifiedTreeNode, node: UnifiedTreeNode
+    ) -> None:
+        assert node.id not in self.cache
+        self.cache[node.id] = node
+        self._add_node_after(previous, node)
 
     def remove_node(self, node: UnifiedTreeNode):
         assert node.id in self.cache
@@ -636,6 +643,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         return result
 
+    def prepare_swa_compute_lock(self, node: Any) -> None:
+        """Split an SWA node before taking a request compute lock.
+
+        SWA only needs to pin one sliding window, but lock accounting works at
+        node granularity. Cap a long lock node to one page-aligned window. The
+        lock methods do not call this helper implicitly, so short-lived IO locks
+        keep lock_ref as a pure accounting update.
+        """
+        if self.disable or ComponentType.SWA not in self.components:
+            return
+        if not isinstance(node, UnifiedTreeNode) or node is self.root_node:
+            return
+        if self._has_any_lock_ref(node):
+            return
+
+        swa_component = cast(SWAComponent, self.components[ComponentType.SWA])
+        swa_component._maybe_split_leaf_for_swa_lock(node, preserve_lru_position=True)
+
     def dec_lock_ref(
         self,
         node: Any,
@@ -858,6 +883,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
+        self.prepare_swa_compute_lock(new_last_node)
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
@@ -1011,8 +1037,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return result
 
     def _split_node(
-        self, key: RadixKey, child: UnifiedTreeNode, split_len: int
+        self,
+        key: RadixKey,
+        child: UnifiedTreeNode,
+        split_len: int,
+        preserve_lru_position: bool = False,
     ) -> UnifiedTreeNode:
+        original_last_access_time = child.last_access_time
+        preserved_lrus: list[UnifiedLRUList] = []
+        if preserve_lru_position:
+            for lru_dict in (self.lru_lists, self.host_lru_lists):
+                for ct in self.tree_components:
+                    if ct == BASE_COMPONENT_TYPE:
+                        continue
+                    lru = lru_dict[ct]
+                    if lru.in_list(child):
+                        preserved_lrus.append(lru)
+
         new_node = UnifiedTreeNode(self.tree_components, priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -1020,7 +1061,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
 
-        self._for_each_component_lru(child, UnifiedLRUList.remove_node)
+        if not preserve_lru_position:
+            self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -1035,13 +1077,41 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
 
-        self._for_each_component_lru(
-            new_node, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        self._for_each_component_lru(
-            child, UnifiedLRUList.insert_mru, skip_existing=True
-        )
-        child.last_access_time = get_and_increase_time_counter()
+        if preserve_lru_position:
+            for lru in preserved_lrus:
+                if lru.in_list(new_node):
+                    lru.remove_node(new_node)
+
+                ct = lru.component_type
+                is_host_lru = lru is self.host_lru_lists[ct]
+                cd = new_node.component_data[ct]
+                value = cd.host_value if is_host_lru else cd.value
+                if value is not None:
+                    lru.insert_after(child, new_node)
+
+            for target in (EvictLayer.DEVICE, EvictLayer.HOST):
+                self._for_each_component_lru(
+                    new_node,
+                    UnifiedLRUList.insert_mru,
+                    target=target,
+                    skip_existing=True,
+                )
+                self._for_each_component_lru(
+                    child,
+                    UnifiedLRUList.insert_mru,
+                    target=target,
+                    skip_existing=True,
+                )
+            new_node.last_access_time = original_last_access_time
+            child.last_access_time = original_last_access_time
+        else:
+            self._for_each_component_lru(
+                new_node, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            self._for_each_component_lru(
+                child, UnifiedLRUList.insert_mru, skip_existing=True
+            )
+            child.last_access_time = get_and_increase_time_counter()
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1460,6 +1530,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.evictable_host_leaves.add(node)
         else:
             self.evictable_host_leaves.discard(node)
+
+    def _has_any_lock_ref(self, node: UnifiedTreeNode) -> bool:
+        return any(
+            cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
+        )
 
     def _evict_to_host(
         self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None

@@ -1659,6 +1659,110 @@ class UnifiedRadixCacheSuite:
                 )
                 tree.sanity_check()
 
+    def test_swa_compute_lock_caps_leaf_after_child_deleted(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+        seq = self._make_seq(1, 2 * tail_pages + 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        prefix = next(iter(tree.root_node.children.values()))
+        window_leaf = next(iter(prefix.children.values()))
+        prefix_len = len(prefix.key)
+        self.assertGreater(
+            len(prefix.component_data[ComponentType.SWA].value), tail_size
+        )
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_device_leaf(window_leaf, tracker)
+        self.assertEqual(len(prefix.children), 0)
+
+        tree.prepare_swa_compute_lock(prefix)
+        self.assertEqual(
+            len(prefix.component_data[ComponentType.SWA].value), tail_size
+        )
+        self.assertIsNot(prefix.parent, tree.root_node)
+
+        lock_result = tree.inc_lock_ref(prefix)
+        self.assertEqual(tree.swa_protected_size(), tail_size)
+        self.assertEqual(tree.full_protected_size(), prefix_len)
+        tree.dec_lock_ref(prefix, lock_result.to_dec_params())
+        tree.sanity_check()
+
+    def test_swa_compute_lock_split_preserves_lru_position(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+        seq = self._make_seq(1, 2 * tail_pages + 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        prefix = next(iter(tree.root_node.children.values()))
+        window_leaf = next(iter(prefix.children.values()))
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_device_leaf(window_leaf, tracker)
+
+        side_seq = self._make_seq(1000, tail_pages)
+        self._insert(tree, allocator, req_to_token_pool, side_seq)
+        pre = self._swa_lru_order(tree)
+        prefix_pos = pre.index(prefix)
+        original_last_access_time = prefix.last_access_time
+
+        tree.prepare_swa_compute_lock(prefix)
+
+        new_parent = prefix.parent
+        post = self._swa_lru_order(tree)
+        self.assertEqual(post[:prefix_pos], pre[:prefix_pos])
+        self.assertEqual(post[prefix_pos : prefix_pos + 2], [prefix, new_parent])
+        self.assertEqual(post[prefix_pos + 2 :], pre[prefix_pos + 1 :])
+        self.assertEqual(prefix.last_access_time, original_last_access_time)
+        self.assertEqual(new_parent.last_access_time, original_last_access_time)
+        tree.sanity_check()
+
+    def test_swa_compute_lock_caps_host_path_before_load_back(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        tail_size = ((window + ps - 1) // ps) * ps
+        tail_pages = tail_size // ps
+        seq = self._make_seq(1, 2 * tail_pages + 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        host_node = next(iter(tree.root_node.children.values()))
+        swa_cd = host_node.component_data[ComponentType.SWA]
+        self.assertGreater(len(swa_cd.value), tail_size)
+
+        self._simulate_backup(tree, host_node)
+        self._set_aux_host_tombstone(tree, host_node, ComponentType.SWA)
+
+        tree.prepare_swa_compute_lock(host_node)
+        self.assertIsNone(swa_cd.value)
+        self.assertEqual(len(swa_cd.host_value), tail_size)
+        self.assertIsNot(host_node.parent, tree.root_node)
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(host_node))
+        self.assertTrue(
+            tree.host_lru_lists[ComponentType.SWA].in_list(host_node.parent)
+        )
+        tree.sanity_check()
+
     def _swa_lru_order(self, tree):
         lru = tree.lru_lists[ComponentType.SWA]
         pt = lru._pt
