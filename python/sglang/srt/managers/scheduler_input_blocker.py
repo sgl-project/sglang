@@ -14,9 +14,9 @@
 import logging
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
-from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType, sock_send
+from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 from sglang.srt.utils.poll_based_barrier import PollBasedBarrier
 
 logger = logging.getLogger(__name__)
@@ -51,10 +51,10 @@ class SchedulerInputBlocker:
 
     def _handle_recv_req(self, recv_req):
         if isinstance(recv_req, BlockReqInput):
-            if recv_req.type == BlockReqType.BLOCK:
+            if recv_req.req_type == BlockReqType.BLOCK:
                 self._execute_block_req()
                 return []
-            elif recv_req.type == BlockReqType.UNBLOCK:
+            elif recv_req.req_type == BlockReqType.UNBLOCK:
                 self._execute_unblock_req()
                 return []
             else:
@@ -98,9 +98,9 @@ class _State(Enum):
 
 
 @contextmanager
-def input_blocker_guard_region(send_to_scheduler):
-    sock_send(send_to_scheduler, BlockReqInput(BlockReqType.BLOCK))
+def input_blocker_guard_region(dispatch_to_scheduler: Callable[[BlockReqInput], None]):
+    dispatch_to_scheduler(BlockReqInput(req_type=BlockReqType.BLOCK))
     try:
         yield
     finally:
-        sock_send(send_to_scheduler, BlockReqInput(BlockReqType.UNBLOCK))
+        dispatch_to_scheduler(BlockReqInput(req_type=BlockReqType.UNBLOCK))
