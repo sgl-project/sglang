@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, NamedTuple, Optional, Set, Type
+from typing import Dict, Iterable, NamedTuple, Optional, Set
 
 import torch
 import torch.distributed as dist
@@ -249,7 +249,7 @@ def _random_like(t: torch.Tensor):
 
 
 class QuantizedWeight(NamedTuple):
-    comparable_cls: Type[ComparableWeight]
+    comparable_cls: type[ComparableWeight]
     scale_name: str
 
 
