@@ -83,8 +83,15 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.model_executor.model_runner_components.layer_setup import (
+        ModelLayerInfo,
+    )
     from sglang.srt.model_executor.model_runner_components.pool_configurator import (
         MemoryPoolConfig,
+    )
+    from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+        SpecAuxHiddenStateConfig,
     )
 
 
@@ -135,13 +142,18 @@ class KVCacheConfigurator:
     # deployment env (runtime, not in server_args)
     device: str
     gpu_id: int
+    ps: ParallelState
+    pp_group: Any
     # model / dtype (resolved objects, not in server_args)
     model_config: ModelConfig
     server_args: ServerArgs
     kv_cache_dtype: torch.dtype
+    page_size: int
+    sliding_window_size: Optional[int]
     # speculative decoding (runtime / derived, not in server_args)
     spec_algorithm: SpeculativeAlgorithm
     is_draft_worker: bool
+    spec_aux_config: SpecAuxHiddenStateConfig
     # DFLASH-only: target's `cell_size` is scaled to include draft KV cache.
     # ``pool_configurator.DefaultPoolConfigurator`` reads this off the
     # configurator (was ``getattr(mr, "dflash_draft_num_layers", None)`` in
@@ -164,6 +176,18 @@ class KVCacheConfigurator:
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     # draft worker budget
     memory_pool_config: Optional[MemoryPoolConfig]
+
+    @property
+    def layer_info(self) -> ModelLayerInfo:
+        from sglang.srt.model_executor.model_runner_components.layer_setup import (
+            ModelLayerInfo,
+        )
+
+        return ModelLayerInfo(
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            num_effective_layers=self.num_effective_layers,
+        )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
