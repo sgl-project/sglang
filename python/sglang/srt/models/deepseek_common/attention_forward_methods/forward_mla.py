@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_graph_dsa_split_op_surface,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
+from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.layers.utils.dcp_utils import (
     all_gather_kv_cache_for_mla_extend,
@@ -37,6 +43,12 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -57,6 +69,7 @@ from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -64,10 +77,17 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+
+@dataclass(frozen=True)
+class MlaBmmFusionPlan:
+    q_nope_t: torch.Tensor
+    q_nope_out_buf: torch.Tensor
+    q_nope_out_view: torch.Tensor
+    attn_output_buf: torch.Tensor
+
+
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
-
-    from sglang.srt.utils.custom_op import register_custom_op
 
     # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
     # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
@@ -150,6 +170,63 @@ class DeepseekMLAForwardMixin:
             get_global_server_args().flashinfer_mla_disable_ragged
         )
 
+    def _can_fuse_bmm_into_attention(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        # Shared activation surface with the DSA indexer graph dispatch
+        # (in piecewise/breakable graph + non-speculative extend). Like the indexer
+        # dispatch, this fusion is on by default on that surface.
+        if not is_graph_dsa_split_op_surface(forward_batch):
+            return False
+        if not self.use_dsa:
+            return False
+        if self.use_deep_gemm_bmm or _is_hip:
+            return False
+        if is_kv_b_lora_active(self):
+            return False
+        # The isolated 1-kernel graph is the bf16 fallback BMM. The fp8 and
+        # DeepGEMM branches already use different fused paths.
+        if self.w_kc.dtype == torch.float8_e4m3fn:
+            return False
+        if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            return False
+        return True
+
+    def _split_q_nope_pe(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        return q_nope, q_pe, k_pe
+
+    def _make_mla_bmm_fusion_plan(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        q_nope: torch.Tensor,
+    ) -> MlaBmmFusionPlan:
+        q_nope_out_buf = q.new_empty(
+            (
+                self.num_local_heads,
+                q.shape[0],
+                self.kv_lora_rank,
+            )
+        )
+        q_nope_out_view = q_nope_out_buf.transpose(0, 1)
+        attn_output_buf = q.new_empty(
+            (
+                q.shape[0],
+                self.num_local_heads * self.kv_lora_rank,
+            )
+        )
+        return MlaBmmFusionPlan(
+            q_nope_t=q_nope.transpose(0, 1),
+            q_nope_out_buf=q_nope_out_buf,
+            q_nope_out_view=q_nope_out_view,
+            attn_output_buf=attn_output_buf,
+        )
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -161,8 +238,16 @@ class DeepseekMLAForwardMixin:
     ):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        fuse_bmm_attention = (
+            self.q_lora_rank is not None
+            and self._can_fuse_bmm_into_attention(forward_batch)
+        )
         q_lora = None
         topk_indices = None
+        q_nope = None
+        q_pe = None
+        k_pe = None
+        fusion_plan: Optional[MlaBmmFusionPlan] = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -286,6 +371,13 @@ class DeepseekMLAForwardMixin:
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+
+                # Hoist these above the DSA indexer split op so the indexer
+                # and the composite bmm+attention split op are adjacent in FX.
+                if fuse_bmm_attention:
+                    q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
+                    fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
+
                 if q_lora is not None:
                     # See the skip_topk note above: shared layers have no
                     # indexer weights, so this gate must not fall back to
@@ -312,109 +404,123 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        if q_nope is None:
+            q_nope, q_pe, k_pe = self._split_q_nope_pe(q, latent_cache)
 
         _kvb_q = None
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
-            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                kv_b_lora_q_prepare,
-            )
-
-            _kvb_q = kv_b_lora_q_prepare(self, q_nope)
-
-        if self.use_deep_gemm_bmm:
-            (
-                q_nope_val,
-                q_nope_scale,
-                masked_m,
-                expected_m,
-                aligned_m,
-            ) = per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
-            q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
-            )
-            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                (q_nope_val, q_nope_scale),
-                (self.w_kc, self.w_scale_k),
-                q_nope_out,
-                masked_m,
-                expected_m,
-            )
-            q_nope_out = q_nope_out[:, :expected_m, :]
-        elif _is_hip:
-            # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
-                x = q_nope.transpose(0, 1)
-                q_nope_out = torch.empty(
-                    x.shape[0],
-                    x.shape[1],
-                    self.w_kc.shape[2],
-                    device=x.device,
-                    dtype=torch.bfloat16,
+        if fusion_plan is not None:
+            # The composite split op fills q_nope_out_buf and attention reads
+            # this transposed alias directly.
+            q_nope_out = fusion_plan.q_nope_out_view
+        else:
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                # Fork the kv_b q-correction A-step onto the LoRA side stream to overlap the bmm.
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_prepare,
                 )
-                batched_gemm_afp4wfp4_pre_quant(
-                    x,
-                    self.w_kc.transpose(-2, -1),
-                    self.w_scale_k.transpose(-2, -1),
-                    torch.bfloat16,
+
+                _kvb_q = kv_b_lora_q_prepare(self, q_nope)
+
+            if self.use_deep_gemm_bmm:
+                (
+                    q_nope_val,
+                    q_nope_scale,
+                    masked_m,
+                    expected_m,
+                    aligned_m,
+                ) = per_token_group_quant_mla_deep_gemm_masked_fp8(
+                    q_nope.transpose(0, 1)
+                )
+                q_nope_out = q_nope.new_empty(
+                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                )
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (q_nope_val, q_nope_scale),
+                    (self.w_kc, self.w_scale_k),
                     q_nope_out,
+                    masked_m,
+                    expected_m,
                 )
-            else:
-                if (_use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn) or (
-                    get_is_capture_mode() and self.w_kc.dtype == torch.float8_e4m3fnuz
-                ):
-                    # fp8 Triton kernel: always on gfx950,
-                    # cudagraph-only on gfx942 (hides launch overhead)
-                    q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                        X=q_nope,
-                        WQ=self.w_kc.transpose(-1, -2),
-                        w_scale=self.w_scale,
-                        group_size=128,
-                        YQ=None,  # allocate (B, M, N)
-                        transpose_bm=False,  # (B, M, N)
-                        transpose_bm_in=True,  # (M, B, K)
+                q_nope_out = q_nope_out[:, :expected_m, :]
+            elif _is_hip:
+                # TODO(haishaw): add bmm_fp8 to ROCm
+                if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
+                    x = q_nope.transpose(0, 1)
+                    q_nope_out = torch.empty(
+                        x.shape[0],
+                        x.shape[1],
+                        self.w_kc.shape[2],
+                        device=x.device,
                         dtype=torch.bfloat16,
                     )
-
+                    batched_gemm_afp4wfp4_pre_quant(
+                        x,
+                        self.w_kc.transpose(-2, -1),
+                        self.w_scale_k.transpose(-2, -1),
+                        torch.bfloat16,
+                        q_nope_out,
+                    )
                 else:
+                    if (
+                        _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn
+                    ) or (
+                        get_is_capture_mode()
+                        and self.w_kc.dtype == torch.float8_e4m3fnuz
+                    ):
+                        # fp8 Triton kernel: always on gfx950,
+                        # cudagraph-only on gfx942 (hides launch overhead)
+                        q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                            X=q_nope,
+                            WQ=self.w_kc.transpose(-1, -2),
+                            w_scale=self.w_scale,
+                            group_size=128,
+                            YQ=None,  # allocate (B, M, N)
+                            transpose_bm=False,  # (B, M, N)
+                            transpose_bm_in=True,  # (M, B, K)
+                            dtype=torch.bfloat16,
+                        )
+
+                    else:
+                        q_nope_out = torch.bmm(
+                            q_nope.to(torch.bfloat16).transpose(0, 1),
+                            self.w_kc.to(torch.bfloat16) * self.w_scale,
+                        )
+
+            elif self.w_kc.dtype == torch.float8_e4m3fn:
+                if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
                     )
-
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
-            if _is_cpu:
-                q_nope_out = torch.bmm(
-                    q_nope.to(torch.bfloat16).transpose(0, 1),
-                    self.w_kc.to(torch.bfloat16) * self.w_scale,
-                )
+                else:
+                    # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+                    q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                        q_nope.transpose(0, 1),
+                        (
+                            torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                            if _is_cublas_ge_129
+                            else zero_allocator.allocate(1)
+                        ),
+                    )
+                    q_nope_out = bmm_fp8(
+                        q_nope_val,
+                        self.w_kc,
+                        q_nope_scale,
+                        self.w_scale,
+                        torch.bfloat16,
+                    )
             else:
-                # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
-                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                    q_nope.transpose(0, 1),
-                    (
-                        torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
-                        if _is_cublas_ge_129
-                        else zero_allocator.allocate(1)
-                    ),
-                )
-                q_nope_out = bmm_fp8(
-                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-                )
-        else:
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                kv_b_lora_q_apply,
-            )
+            q_nope_out = q_nope_out.transpose(0, 1)
+            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                    kv_b_lora_q_apply,
+                )
 
-            q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-        elif is_kv_b_lora_active(self):
-            q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+            elif is_kv_b_lora_active(self):
+                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         skip_rope_for_dsa_tilelang_fused = self._skip_rope_for_dsa_tilelang_fused()
         skip_rope_for_aiter_fused_mla = self._skip_rope_for_aiter_fused_mla()
@@ -469,6 +575,7 @@ class DeepseekMLAForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            fusion_plan,
         )
 
     def forward_absorb_core(
@@ -482,6 +589,7 @@ class DeepseekMLAForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
 
@@ -563,8 +671,31 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                # set return_lse=True to correct attn_output
-                if forward_batch.forward_mode.is_decode() and dcp_enabled():
+                if fusion_plan is not None:
+                    bmm_attention_fn = (
+                        bcg_mla_bmm_then_unified_attention
+                        if is_in_breakable_cuda_graph()
+                        else mla_bmm_then_unified_attention
+                    )
+                    bmm_attention_fn(
+                        fusion_plan.q_nope_t,
+                        self.w_kc,
+                        fusion_plan.q_nope_out_buf,
+                        q_nope_out,
+                        k_nope,
+                        fusion_plan.attn_output_buf,
+                        save_kv_cache,
+                        self.layer_id,
+                        q_pe,
+                        k_pe,
+                        cos_sin_cache=extra_args.get("cos_sin_cache"),
+                        is_neox=extra_args.get("is_neox"),
+                        llama_4_scaling=extra_args.get("llama_4_scaling"),
+                        topk_indices=topk_indices,
+                    )
+                    attn_output = fusion_plan.attn_output_buf
+                elif forward_batch.forward_mode.is_decode() and dcp_enabled():
+                    # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
                         k_nope,
@@ -870,3 +1001,54 @@ class DeepseekMLAForwardMixin:
             and self.current_attention_backend
             not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )
+
+
+# Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
+# into one eager split op under both PCG and BCG. Without this, the bf16
+# fallback BMM is captured alone in its own single-kernel CUDA graph submodule,
+# paying per-submodule host overhead with no fusion benefit.
+#
+# `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
+# `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
+# `q_nope_out_view`, so the alias's storage is mutated too. Declare it in
+# `mutates_args` to keep the schema honest.
+@register_custom_op(
+    mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
+)
+@register_split_op()
+def mla_bmm_then_unified_attention(
+    q_nope_t: torch.Tensor,
+    w_kc: torch.Tensor,
+    q_nope_out_buf: torch.Tensor,
+    q_nope_out_view: torch.Tensor,
+    k_nope: torch.Tensor,
+    attn_output_buf: torch.Tensor,
+    save_kv_cache: bool,
+    layer_id: int,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    is_neox: Optional[bool] = None,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> None:
+    torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+    unified_attention_with_output(
+        q_nope_out_view,
+        k_nope,
+        k_nope,
+        attn_output_buf,
+        save_kv_cache,
+        layer_id,
+        q_rope=q_pe,
+        k_rope=k_pe,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        llama_4_scaling=llama_4_scaling,
+        topk_indices=topk_indices,
+    )
+
+
+bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(
+    mla_bmm_then_unified_attention
+)
