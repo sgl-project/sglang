@@ -6,10 +6,11 @@ test_pcg_with_speculative_decoding.py.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
 register_cuda_ci(est_time=531, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=531, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
