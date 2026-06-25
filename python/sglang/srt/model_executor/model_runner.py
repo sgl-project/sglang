@@ -126,8 +126,11 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
     get_attention_tp_group,
     initialize_dp_attention,
+    set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.hash_topk import HashTopK
