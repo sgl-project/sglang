@@ -816,6 +816,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+        self.assertEqual(
+            ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1), (8, 1))
+        )
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
@@ -845,6 +848,24 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
+
+    def test_auto_ltx23_large_gpu_counts_prefer_sp_over_cfg_parallel(self):
+        for num_gpus in (4, 8):
+            with self.subTest(num_gpus=num_gpus):
+                args = self._from_dict_with_pipeline_config(
+                    LTX2PipelineConfig(),
+                    kwargs={
+                        "model_path": "Lightricks/LTX-2.3",
+                        "num_gpus": num_gpus,
+                        "performance_mode": "auto",
+                    },
+                )
+
+                self.assertFalse(args.enable_cfg_parallel)
+                self.assertEqual(args.cfg_parallel_degree, 1)
+                self.assertEqual(args.sp_degree, num_gpus)
+                self.assertEqual(args.ulysses_degree, num_gpus)
+                self.assertEqual(args.ring_degree, 1)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(

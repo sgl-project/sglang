@@ -821,48 +821,12 @@ class ServerArgs(DisaggServerArgsMixin):
         # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
             deployment_config = self.pipeline_config.get_model_deployment_config()
-            auto_cfg_parallel_degree = None
-            for num_gpus, cfg_degree in (
-                deployment_config.auto_cfg_parallel_degree_by_num_gpus
-            ):
-                if num_gpus == self.num_gpus:
-                    auto_cfg_parallel_degree = cfg_degree
-                    break
-            if auto_cfg_parallel_degree is None:
-                auto_cfg_parallel_degree = 2
-            if auto_cfg_parallel_degree < 1:
-                self.enable_cfg_parallel = False
-            else:
-                cfg_group_size = (
-                    self.dp_size * self.tp_size * auto_cfg_parallel_degree
-                )
-                if (
-                    self.performance_mode != "manual"
-                    and deployment_config.auto_enable_cfg_parallel
-                    and self.num_gpus >= 2
-                    and self.num_gpus % cfg_group_size == 0
-                    and sp_unspecified
-                    and ulysses_unspecified
-                    and ring_unspecified
-                    and self._model_default_uses_cfg()
-                ):
-                    self.cfg_parallel_degree = auto_cfg_parallel_degree
-                    self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
-                    if self.enable_cfg_parallel:
-                        logger.info(
-                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
-                            "Use --sp-degree / --ulysses-degree to use sequence "
-                            "parallelism instead.",
-                            self.cfg_parallel_degree,
-                            self.num_gpus,
-                        )
-                    else:
-                        logger.info(
-                            "Automatically disabled CFG parallel for %d GPUs based on model deployment config.",
-                            self.num_gpus,
-                        )
-                else:
-                    self.enable_cfg_parallel = False
+            self._adjust_auto_cfg_parallelism(
+                deployment_config,
+                sp_unspecified=sp_unspecified,
+                ulysses_unspecified=ulysses_unspecified,
+                ring_unspecified=ring_unspecified,
+            )
 
         # Resolve cfg_parallel_degree to a concrete int now that enable_cfg_parallel is settled.
         if self.cfg_parallel_degree is None:
@@ -898,6 +862,73 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _adjust_auto_cfg_parallelism(
+        self,
+        deployment_config,
+        *,
+        sp_unspecified: bool,
+        ulysses_unspecified: bool,
+        ring_unspecified: bool,
+    ) -> None:
+        cfg_parallel_degree = self._get_auto_cfg_parallel_degree(deployment_config)
+        if not self._can_apply_auto_cfg_parallelism(
+            deployment_config,
+            cfg_parallel_degree,
+            sp_unspecified=sp_unspecified,
+            ulysses_unspecified=ulysses_unspecified,
+            ring_unspecified=ring_unspecified,
+        ):
+            self.enable_cfg_parallel = False
+            return
+
+        self.cfg_parallel_degree = cfg_parallel_degree
+        self.enable_cfg_parallel = cfg_parallel_degree > 1
+        if self.enable_cfg_parallel:
+            logger.info(
+                "Automatically enabled CFG parallel at degree %d for %d GPUs. "
+                "Use --sp-degree / --ulysses-degree to use sequence parallelism instead.",
+                self.cfg_parallel_degree,
+                self.num_gpus,
+            )
+        else:
+            logger.info(
+                "Automatically kept CFG parallel disabled for %d GPUs based on model deployment config.",
+                self.num_gpus,
+            )
+
+    def _get_auto_cfg_parallel_degree(self, deployment_config) -> int:
+        for (
+            num_gpus,
+            cfg_degree,
+        ) in deployment_config.auto_cfg_parallel_degree_by_num_gpus:
+            if num_gpus == self.num_gpus:
+                return cfg_degree
+        return 2
+
+    def _can_apply_auto_cfg_parallelism(
+        self,
+        deployment_config,
+        cfg_parallel_degree: int,
+        *,
+        sp_unspecified: bool,
+        ulysses_unspecified: bool,
+        ring_unspecified: bool,
+    ) -> bool:
+        if cfg_parallel_degree < 1:
+            return False
+
+        cfg_group_size = self.dp_size * self.tp_size * cfg_parallel_degree
+        return (
+            self.performance_mode != "manual"
+            and deployment_config.auto_enable_cfg_parallel
+            and self.num_gpus >= 2
+            and self.num_gpus % cfg_group_size == 0
+            and sp_unspecified
+            and ulysses_unspecified
+            and ring_unspecified
+            and self._model_default_uses_cfg()
+        )
 
     def _model_default_uses_cfg(self) -> bool:
         """
