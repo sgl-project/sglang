@@ -54,4 +54,9 @@ export const benchmarks = [
     ],
     accuracy: { gsm8k_pct: 87.6 },
   },
+  // ====================================================================
+  // H200 (Hopper) — sanity-checked recipe, not yet benchmarked (cards show "pending").
+  // ====================================================================
+  { match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
+  { match: { hw: "h200", variant: "default", quant: "fp8",  strategy: "balanced", nodes: "single" } },
 ];

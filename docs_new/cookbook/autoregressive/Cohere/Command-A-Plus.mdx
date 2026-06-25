@@ -105,7 +105,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
-**MoE runner backend per precision.** The verified recipes pick the MoE runner that fits each checkpoint's quantization, and the Deploy panel bakes it in:
+**MoE runner backend per precision (Blackwell).** On B300 the verified recipes pick the MoE runner that fits each checkpoint's quantization, and the Deploy panel bakes it in:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -152,7 +152,7 @@ sglang serve --model-path CohereLabs/command-a-plus-05-2026-w4a4 \
 
 **Memory fraction.** Recipes were verified at the default memory fraction; raising `--mem-fraction-static` to `0.9` changed throughput by `<0.5%` at the tested concurrencies (these workloads are MoE-compute-bound, not KV-bound).
 
-**Hardware footprint.** BF16 needs 4× B300 (TP=4), FP8 needs 2× B300 (TP=2), and W4A4 fits a single B300 (TP=1). Cohere's model cards also list FP8 on 4× H100 / 2× B200 and W4A4 on 2× H100 / 1× B200; those configurations are not yet verified in this cookbook.
+**Hardware footprint.** On **B300** (verified): BF16 4× (TP=4), FP8 2× (TP=2), W4A4 1× (TP=1). On **H200** (Hopper) the Deploy panel also offers plain-TP recipes sized from Cohere's official guidance — **BF16 TP=8, FP8 TP=4** on the default Triton FusedMoE runner; these are **sanity-checked, not yet benchmarked** (shown as *Not Verified*, no measured numbers). **W4A4 (NVFP4) is Blackwell-only** — the Hopper dequant path isn't validated, so the Deploy panel greys out W4A4 on H200.
 
 **Hierarchical KV cache.** For a 218B model, host-tier KV offload can extend effective cache capacity — toggle it in the **Hierarchical KV Cache** card of the [Playground above](#playground).
 
@@ -290,28 +290,6 @@ print(resp.choices[0].message.content)
 
 ```text Output
 A man in a yellow shirt is ironing a shirt on an ironing board mounted on the back of a yellow taxi on a busy city street.
-```
-
-</Accordion>
-
-### 3.4 Accuracy (GSM8K)
-
-SGLang ships an in-repo evaluation harness. The example below scores GSM8K (200 questions) against the running server via the **chat endpoint with Command A+'s default thinking mode on**. Note this scores higher than the GSM8K row in the Deploy benchmark card above — that row uses a 5-shot **text-completion** harness (no native thinking), whereas thinking mode lifts reasoning accuracy.
-
-<Accordion title="GSM8K Example (bash)">
-
-```bash Command
-python3 -m sglang.test.run_eval --eval-name gsm8k --num-examples 200 --port 30000
-```
-
-</Accordion>
-
-<Accordion title="Example Output">
-
-```text Output
-Total latency: 31.894 s
-Score: 0.960
-Output throughput: 3081.919 token/s
 ```
 
 </Accordion>

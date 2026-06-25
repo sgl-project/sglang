@@ -4,8 +4,9 @@
 export const config = {
   modelName: "Command A+",
 
-  // Only B300 is benchmark-verified for this model; every other hw auto-greys-out.
-  supportedHardware: ["b300"],
+  // B300 is benchmark-verified. H200 (Hopper) cells are sanity-checked per Cohere's
+  // sizing (not yet benchmarked → unverified badge). Other hw auto-greys-out.
+  supportedHardware: ["b300", "h200"],
 
   // No size variants — the three HF repos differ only by precision (see quantizations).
   variants: [
@@ -74,6 +75,7 @@ sgl-eval run gsm8k \\
 
   dockerImages: {
     b300: "lmsysorg/sglang:dev",
+    h200: "lmsysorg/sglang:dev",
   },
 
   github: {
@@ -225,6 +227,37 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp 1",
         "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // H200 (Hopper) — plain TP, default Triton FusedMoE (no Blackwell CUTLASS
+    // path). Sizes follow Cohere's official per-quant GPU guidance (BF16 TP=8,
+    // FP8 TP=4). Sanity-checked, NOT yet benchmarked → verified: false. W4A4
+    // (NVFP4) is Blackwell-only — the Hopper dequant path isn't validated, so no
+    // H200 W4A4 cell (the Deploy panel greys it out).
+    // ====================================================================
+    {
+      match: { hw: "h200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
