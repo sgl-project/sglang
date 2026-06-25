@@ -33,7 +33,7 @@ class MoeA2ABackend(Enum):
     NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
-    TORCH_NPU = "torch_npu"
+    ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     CUSTOMIZED = "customized"
@@ -65,8 +65,8 @@ class MoeA2ABackend(Enum):
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
 
-    def is_torch_npu(self):
-        return self == MoeA2ABackend.TORCH_NPU
+    def is_ascend_tp(self):
+        return self == MoeA2ABackend.ASCEND_TP
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
@@ -93,7 +93,7 @@ class MoeRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
-    TORCH_NPU = "torch_npu"
+    ASCEND = "ascend"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
@@ -113,7 +113,7 @@ class MoeRunnerBackend(Enum):
     def is_triton(self):
         return self == MoeRunnerBackend.TRITON
 
-    def is_torch_npu(self):
+    def is_ascend(self):
         return self == MoeRunnerBackend.ASCEND
 
     def is_triton_kernels(self):
