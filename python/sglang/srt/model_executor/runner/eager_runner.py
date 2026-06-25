@@ -176,6 +176,12 @@ class EagerRunner(BaseRunner):
         # batch that exceeds the registry capacity, fall back to using the
         # original tensors directly rather than crashing with a size mismatch.
         if raw_num_tokens > registry.max_num_tokens or raw_bs > registry.max_bs:
+            logger.warning(
+                f"Batch (bs={raw_bs}, tokens={raw_num_tokens}) exceeds eager registry capacity "
+                f"(max_bs={registry.max_bs}, max_tokens={registry.max_num_tokens}). "
+                "Falling back to direct tensor usage. This is expected for benchmarks that "
+                "bypass the scheduler, but not in normal operation."
+            )
             return replace(forward_batch)
         registry.fill_from(
             forward_batch,
