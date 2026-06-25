@@ -87,6 +87,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_lora_variant,
     model_capture_mode,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
@@ -365,6 +366,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_req=self.captured_req_width,
             cache_loc_dtype=self._cache_loc_dtype(),
+            position_dtype=self._position_dtype(),
             enable_mamba_track=enable_mamba_track,
             ne_token_table=(
                 model_runner.ngram_embedding_manager.table
@@ -387,6 +389,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_token,
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
+            position_dtype=self._position_dtype(),
             enable_mamba_track=enable_mamba_track,
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,
@@ -437,6 +440,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def _position_dtype(self):
+        return current_platform.get_position_dtype()
 
     def _make_graph_key(self, size, stream_idx=None, variant_label=None):
         return ShapeKey(

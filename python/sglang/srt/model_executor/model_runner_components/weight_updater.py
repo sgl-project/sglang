@@ -168,12 +168,8 @@ class WeightUpdater:
         )
 
         if recapture_cuda_graph and (
-            self.device == "cuda"
-            or self.device == "musa"
-            or (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            )
+            self.device in ("cuda", "musa")
+            or current_platform.support_cuda_graph()
         ):
             self.recapture_cuda_graph()
 

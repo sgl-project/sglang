@@ -70,6 +70,16 @@ class CudaGraphsCapture(msgspec.Struct, frozen=True, kw_only=True):
     decode: DecodeGraphCapture
 
 
+def _should_capture_decode_graph(model_runner: ModelRunner) -> bool:
+    return model_runner.device in (
+        "cuda",
+        "musa",
+        "cpu",
+        "npu",
+        "xpu",
+    ) or current_platform.support_cuda_graph()
+
+
 def capture_cuda_graphs(
     *, model_runner: ModelRunner, capture_decode_cuda_graph: bool = True
 ) -> CudaGraphsCapture:
@@ -101,13 +111,8 @@ def capture_cuda_graphs(
     )
 
     decode = DecodeGraphCapture(runner=None, graph_mem_usage=0)
-    if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
-            decode = capture_decode_graph(model_runner=model_runner)
+    if capture_decode_cuda_graph and _should_capture_decode_graph(model_runner):
+        decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = DecodeGraphCapture(runner=eager_runner, graph_mem_usage=0)
 
@@ -297,6 +302,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
             "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
+            "mlu": "MLU graph",
         },
     )
     role = "draft" if model_runner.is_draft_worker else "target"
@@ -314,23 +320,25 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
-    if current_platform.is_out_of_tree():
-        GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(model_runner)
-    else:
-        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-            DecodeCudaGraphRunner,
-        )
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
 
-        graph_runners = defaultdict(
-            lambda: DecodeCudaGraphRunner,
-            {
-                "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
-                "xpu": XPUGraphRunner,
-            },
+    graph_runners = {
+        "cuda": DecodeCudaGraphRunner,
+        "musa": DecodeCudaGraphRunner,
+        "cpu": CPUGraphRunner,
+        "npu": NPUGraphRunner,
+        "xpu": XPUGraphRunner,
+    }
+    GraphRunnerCls = graph_runners.get(model_runner.device)
+    if GraphRunnerCls is None:
+        GraphRunnerCls = current_platform.get_graph_runner_cls()
+    if GraphRunnerCls is None:
+        raise RuntimeError(
+            f"No graph runner is registered for device {model_runner.device!r}."
         )
-        runner = graph_runners[model_runner.device](model_runner)
+    runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     graph_mem_usage = before_mem - after_mem

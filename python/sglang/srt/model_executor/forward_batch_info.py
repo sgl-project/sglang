@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt import platforms
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
@@ -93,6 +94,10 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
+
+
+def _position_dtype() -> torch.dtype:
+    return platforms.current_platform.get_position_dtype()
 
 
 class ForwardMode(IntEnum):
@@ -831,7 +836,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
-            ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
+            ret.positions = torch.empty(
+                (0,), dtype=_position_dtype(), device=device
+            )
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -1650,10 +1657,14 @@ def compute_position(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    positions_dtype = _position_dtype()
     positions = torch.cat(
         [
             torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
+                prefix_len,
+                prefix_len + extend_len,
+                device=extend_prefix_lens.device,
+                dtype=positions_dtype,
             )
             for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
         ],
@@ -1661,11 +1672,13 @@ def compute_position_torch(
     )
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-    return positions.to(torch.int64), extend_start_loc
+    return positions, extend_start_loc
 
 
 def _clamp_position_native(seq_lens):
-    return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+    return torch.clamp((seq_lens - 1), min=0).to(
+        _position_dtype()
+    )
 
 
 if is_cuda() or is_hip():
