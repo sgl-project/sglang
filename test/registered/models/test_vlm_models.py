@@ -14,7 +14,7 @@ from sglang.test.test_utils import is_in_amd_ci, is_in_ci
 
 
 register_cuda_ci(est_time=317, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=850, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
+register_amd_ci(est_time=2000, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
 
 _is_hip = is_hip()
 # VLM models for testing
