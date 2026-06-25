@@ -675,10 +675,8 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-            # next_token_id is a per-req list of accepted tokens: 1 for non-spec,
-            # the whole verified run for spec. Grammar requests were already
-            # truncated at the terminating token in _resolve_spec_v2_tokens, so
-            # nothing past completion is emitted.
+            # next_token_id is a per-req list: 1 token for non-spec, the verified
+            # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
@@ -703,9 +701,7 @@ class SchedulerBatchResultProcessor:
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
-                # token. stride is speculative_num_draft_tokens for spec, 1 for
-                # non-spec. next_token_id is truncated at grammar termination, so
-                # this stays aligned with output_ids.
+                # token; stride = speculative_num_draft_tokens for spec, 1 for non-spec.
                 stride = result.speculative_num_draft_tokens or 1
                 accept_len = len(next_token_id)
                 start = i * stride
@@ -779,9 +775,8 @@ class SchedulerBatchResultProcessor:
         next_token_logprobs: list,
         logits_output: LogitsProcessorOutput,
     ) -> None:
-        # next_token_id is a per-req list; non-spec logprobs are flat (one per
-        # req) so the scalar logprob still needs wrapping, while accepted_ids is
-        # already a list.
+        # accepted_ids is already a per-req list; non-spec logprobs are flat, so
+        # the scalar logprob still needs wrapping.
         if not batch.spec_algorithm.is_none():
             accepted_logprobs = next_token_logprobs[i]
             accepted_ids = next_token_id
