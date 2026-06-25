@@ -40,18 +40,13 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 def _compare_quant_pair(expect_q, expect_s, actual_q, actual_s):
-    """Test shim: wrap fp8 (q, s) pairs as comparables and compare them."""
     return compare_weights(
         Fp8BlockComparable(expect_q, expect_s), Fp8BlockComparable(actual_q, actual_s)
     )
 
 
 def _build_fp8_quant_pair(device: str = "cuda"):
-    """Construct a real fp8-quantized weight + matching fp32 + ue8m0-packed scales.
-
-    Returns (qweight, sf_fp32, sf_packed_int32) so callers can pick which scale dtype
-    drives the comparison branch under test.
-    """
+    """Returns (qweight, fp32 scale, ue8m0-packed int32 scale) for one random weight."""
     weight_bf16 = torch.randn((256, 128), dtype=torch.bfloat16, device=device)
     block_size = [128, 128]
     qweight, sf_fp32 = quant_weight_ue8m0(
@@ -162,7 +157,7 @@ class TestCompareQuantPair(CustomTestCase):
         # fused_qkv_a_proj_with_mqa out-dim is not a multiple of 128 (e.g. 2112 =
         # 16*128 + 64), so the last row-block is partial. ceil(dim/num_blocks)
         # would infer 125, misaligning scales; the true block size is 128.
-        n, k = 3 * 128 + 64, 256  # 448 rows = partial last block, 256 cols
+        n, k = 3 * 128 + 64, 256
         weight = torch.randn(n, k, device="cuda") * 0.02
         e_q, e_s = self._quantize_partial(weight, 1.0)
         a_q, a_s = self._quantize_partial(weight, 1.001)
