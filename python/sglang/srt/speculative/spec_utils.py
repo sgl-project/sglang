@@ -653,10 +653,8 @@ def commit_mamba_states_after_verify(
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
-    """Dispatch decode preparation to the algorithm-specific owner.
-
-    eagle / eagle3 / ngram / standalone / frozen-kv-mtp share one stateless
-    routine; dflash keeps its own stateful prep on the draft input.
+    """eagle/ngram share a stateless free function; dflash keeps stateful
+    prep on its draft input -- the dispatcher routes.
     """
     if batch.spec_algorithm.is_dflash():
         batch.spec_info.prepare_for_decode(batch)

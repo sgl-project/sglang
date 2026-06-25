@@ -2613,9 +2613,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.attn_cp_metadata = None
 
         if not self.spec_algorithm.is_none():
-            # Spec decoding owns decode preparation (allocation, seq-lens
-            # bookkeeping). eagle/ngram share a stateless free function; dflash
-            # keeps stateful prep on its draft input -- the dispatcher routes.
+            # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
 
             spec_prepare_for_decode(self)
