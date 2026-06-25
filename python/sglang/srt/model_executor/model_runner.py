@@ -2197,32 +2197,3 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             load_format=load_format,
         )
         self.load_config = load_config
-
-
-def adjust_hybrid_swa_layer_ids(
-    *,
-    model_config: ModelConfig,
-    start_layer: int,
-    end_layer: int,
-    is_hybrid_swa: bool,
-) -> None:
-    if not is_hybrid_swa:
-        return
-
-    if model_config.is_deepseek_v4_arch:
-        return
-
-    full_attention_layer_ids = [
-        layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
-        if hasattr(model_config, "full_attention_layer_ids")
-        and layer_idx in model_config.full_attention_layer_ids
-    ]
-    swa_attention_layer_ids = [
-        layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
-        if hasattr(model_config, "swa_attention_layer_ids")
-        and layer_idx in model_config.swa_attention_layer_ids
-    ]
-    model_config.swa_attention_layer_ids = swa_attention_layer_ids
-    model_config.full_attention_layer_ids = full_attention_layer_ids
