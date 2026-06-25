@@ -128,8 +128,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.chunked_req = None
         scheduler.dllm_manager = MagicMock()
         scheduler.dllm_manager.any_staging_reqs.return_value = False
-        scheduler.last_batch = None
-        scheduler.cur_batch = None
+        scheduler.last_iter = None
+        scheduler.idle = True
         scheduler.enable_overlap = False
         scheduler.ps = SimpleNamespace(pp_size=1)
         scheduler.running_mbs = []

@@ -19,8 +19,8 @@ def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     else:
         if s.running_batch is not None:
             yield from s.running_batch.reqs
-        if s.last_batch is not None:
-            yield from s.last_batch.reqs
+        if s.last_iter is not None:
+            yield from s.last_iter.reqs
 
 
 def list_active_reqs(ctx: ScriptedContext) -> List[Req]:
@@ -37,10 +37,14 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
 
     prefill: List[str] = []
     decode: List[str] = []
-    batch = s.last_batch
-    if batch is not None and not batch.is_empty() and batch.forward_mode is not None:
-        bucket = prefill if batch.forward_mode.is_extend() else decode
-        bucket.extend(r.rid for r in batch.reqs if r.rid != chunked_rid)
+    last_iter = s.last_iter
+    if (
+        last_iter is not None
+        and not last_iter.is_empty
+        and last_iter.forward_mode is not None
+    ):
+        bucket = prefill if last_iter.forward_mode.is_extend() else decode
+        bucket.extend(r.rid for r in last_iter.reqs if r.rid != chunked_rid)
 
     return {
         "prefill": prefill,
@@ -61,13 +65,13 @@ def is_idle(ctx: ScriptedContext) -> bool:
 
 def is_fully_idle(ctx: ScriptedContext) -> bool:
     s = ctx.scheduler
-    return is_idle(ctx) and (s.last_batch is None or s.last_batch.is_empty())
+    return is_idle(ctx) and (s.last_iter is None or s.last_iter.is_empty)
 
 
 def last_batch_forward_mode(ctx: ScriptedContext) -> Optional[str]:
     s = ctx.scheduler
-    if s.last_batch is not None and s.last_batch.forward_mode is not None:
-        return s.last_batch.forward_mode.name
+    if s.last_iter is not None and s.last_iter.forward_mode is not None:
+        return s.last_iter.forward_mode.name
     return None
 
 

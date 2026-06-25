@@ -1101,7 +1101,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         stale_batch = SimpleNamespace(input_ids=None)
         batch_copy = SimpleNamespace(input_ids=None)
         schedule_batch = SimpleNamespace(input_ids=None)
-        scheduler.last_batch = stale_batch
+        scheduler.last_iter = stale_batch
 
         pending = MlxPendingJob(
             lazy_tokens=None,
@@ -1114,9 +1114,10 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             reqs=[SimpleNamespace(rid="r0")],
         )
 
-        scheduler._finalize_mlx_pending_job(pending)
+        returned = scheduler._finalize_mlx_pending_job(pending)
 
-        self.assertIs(scheduler.last_batch, schedule_batch)
+        self.assertIs(returned, schedule_batch)
+        self.assertIs(scheduler.last_iter, schedule_batch)
         self.assertTrue(torch.equal(batch_copy.input_ids, token_ids))
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
@@ -1145,8 +1146,10 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.future_map = SimpleNamespace()
-        scheduler.cur_batch = None
-        scheduler.last_batch = None
+        scheduler.last_iter = None
+        scheduler._pending_pause = None
+        scheduler.publish_last_iter = lambda batch: None
+        scheduler._maybe_apply_pending_pause = lambda last_batch: last_batch
         scheduler.tp_worker = SimpleNamespace(
             async_forward_batch_generation_mlx=fake_forward
         )
@@ -1159,7 +1162,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
-        scheduler.get_next_batch_to_run = lambda: batch
+        scheduler.get_next_batch_to_run = lambda last_batch: batch
 
         with self.assertRaises(_StopLoop):
             scheduler.event_loop_overlap_mlx()
@@ -1507,9 +1510,12 @@ if _HAS_MLX:
     class FakeOverlapScheduler(SchedulerMlxOverlapMixin):
         def __init__(self, next_token_ids):
             self.tp_worker = FakeTpWorker(next_token_ids)
-            self.last_batch = None
+            self.last_iter = None
             self.processed_batch = None
             self.processed_result = None
+
+        def publish_last_iter(self, batch):
+            self.last_iter = batch
 
         def process_batch_result(self, batch, result):
             self.processed_batch = batch

@@ -189,6 +189,9 @@ from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcCh
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
+from sglang.srt.managers.scheduler_components.last_iter_snapshot import (
+    LastIterSnapshot,
+)
 from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
@@ -317,7 +320,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
-        self.cur_batch: Optional[ScheduleBatch] = None
+        self.idle: bool = True
+        self.last_iter: Optional[LastIterSnapshot] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -971,10 +975,12 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        # The current forward batch
-        self.cur_batch: Optional[ScheduleBatch] = None
-        # The last forward batch
-        self.last_batch: Optional[ScheduleBatch] = None
+        # cur_batch / last_batch are event-loop locals (see event_loop_*).
+        # Out-of-loop readers (request receiver, pool stats, invariant checker,
+        # watchdog, idle/health checks) use the last_iter snapshot and idle flag
+        # below, published by publish_last_iter each iteration.
+        self.last_iter: Optional[LastIterSnapshot] = None
+        self.idle: bool = True
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -985,6 +991,9 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        # Pending non-in-place pause request, applied by the event loop with its
+        # local last_batch (see pause_generation / _maybe_apply_pending_pause).
+        self._pending_pause: Optional[PauseGenerationReqInput] = None
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1512,9 +1521,26 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    @staticmethod
+    def _last_iter_snapshot(batch: Optional[ScheduleBatch]) -> LastIterSnapshot:
+        return LastIterSnapshot(
+            forward_mode=batch.forward_mode if batch is not None else None,
+            reqs=batch.reqs if batch is not None else [],
+            is_empty=batch is None or batch.is_empty(),
+        )
+
+    def publish_last_iter(self, batch: Optional[ScheduleBatch]) -> None:
+        # Publish the just-dispatched batch for out-of-loop readers (request
+        # receiver, pool stats, invariant checker, watchdog, idle/health). Done
+        # at dispatch time so the watchdog observes the in-flight batch on a
+        # hang, not the previous one.
+        self.last_iter = self._last_iter_snapshot(batch)
+        self.idle = batch is None or batch.is_empty()
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        last_batch: Optional[ScheduleBatch] = None
         while True:
             if self.gracefully_exit:
                 break
@@ -1522,12 +1548,13 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            last_batch = self._maybe_apply_pending_pause(last_batch)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
+            batch = self.get_next_batch_to_run(last_batch)
+            self.publish_last_iter(batch)
 
             # Launch the current batch
             if batch:
@@ -1538,7 +1565,7 @@ class Scheduler(
                 self.on_idle()
 
             # Update last_batch
-            self.last_batch = batch
+            last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -1554,6 +1581,7 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        last_batch: Optional[ScheduleBatch] = None
         while True:
             if self.gracefully_exit:
                 break
@@ -1561,15 +1589,18 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            last_batch = self._maybe_apply_pending_pause(last_batch)
             if self._engine_paused:
                 continue
 
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
-            self.cur_batch = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            batch = self.get_next_batch_to_run(last_batch)
+            self.publish_last_iter(batch)
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                batch, last_batch
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1584,7 +1615,7 @@ class Scheduler(
                 batch_result = None
 
             # Process the last batch
-            if self.last_batch:
+            if last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
@@ -1594,15 +1625,17 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
+                self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
-            self.last_batch = batch
+            last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
-    def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
+    def is_disable_overlap_for_batch(
+        self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    ) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
         # This might slightly hurt the throughput, so we use an environment variable to control it.
         # In DP attention mode, use the globally synchronized is_extend_in_batch
@@ -1614,7 +1647,7 @@ class Scheduler(
             is_extend = lambda b: b and b.forward_mode.is_extend()
 
         batch_is_extend = is_extend(batch)
-        last_batch_is_extend = is_extend(self.last_batch)
+        last_batch_is_extend = is_extend(last_batch)
 
         disable_overlap_for_batch = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
@@ -1731,7 +1764,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_forward_mode=lambda: (
-                self.last_batch.forward_mode if self.last_batch is not None else None
+                self.last_iter.forward_mode if self.last_iter is not None else None
             ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
         )
@@ -1764,7 +1797,7 @@ class Scheduler(
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=self.max_total_num_tokens,
-            get_last_batch=lambda: self.last_batch,
+            get_last_iter=lambda: self.last_iter,
             get_running_batch=lambda: self.running_batch,
         )
 
@@ -1782,7 +1815,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
-            get_last_batch=lambda: self.last_batch,
+            get_last_iter=lambda: self.last_iter,
             get_running_batch=lambda: self.running_batch,
         )
 
@@ -2597,7 +2630,9 @@ class Scheduler(
         return batch
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
-    def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+    def get_next_batch_to_run(
+        self, last_batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -2642,32 +2677,30 @@ class Scheduler(
 
         if (
             not self.enable_hisparse
-            and self.last_batch
-            and self.last_batch.forward_mode.is_extend()
+            and last_batch
+            and last_batch.forward_mode.is_extend()
         ):
-            if self.last_batch.chunked_req is not None:
+            if last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+                chunked_req_to_exclude.add(last_batch.chunked_req)
 
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
+            if self.dllm_config is not None and last_batch.reqs:
+                chunked_req_to_exclude.update(last_batch.reqs)
 
             # Filter batch
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
-            if self.last_batch.batch_size() < last_bs:
+            last_bs = last_batch.batch_size()
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            if last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
-            if not self.last_batch.is_empty():
+            if not last_batch.is_empty():
                 if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                    self.running_batch = last_batch
                 else:
                     # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+                    self.running_batch.merge_batch(last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -3389,7 +3422,7 @@ class Scheduler(
         )
 
     def launch_batch_sample_if_needed(
-        self, batch_result: GenerationBatchResult
+        self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
     ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
@@ -3406,8 +3439,8 @@ class Scheduler(
                 RelayPayload(bonus_tokens=batch_result.next_token_ids),
             )
             batch_result.copy_to_cpu(
-                return_logprob=self.cur_batch.return_logprob,
-                return_hidden_states=self.cur_batch.return_hidden_states,
+                return_logprob=cur_batch.return_logprob,
+                return_hidden_states=cur_batch.return_hidden_states,
             )
 
         # Release the closure and large GPU tensors that are no longer needed.
@@ -3550,8 +3583,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
-            and (self.last_batch is None or self.last_batch.is_empty())
-            and (self.cur_batch is None or self.cur_batch.is_empty())
+            and self.idle
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
@@ -3697,8 +3729,6 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
-            self.cur_batch = None
-            self.last_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -3928,11 +3958,15 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
-        else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+        # Delete requests in the running batch, plus any in-flight prefill reqs
+        # from the last dispatched batch not yet merged into running_batch.
+        # last_iter is the most recently dispatched batch: after a decode iter
+        # its reqs are the running reqs (deduped to once); after a prefill iter
+        # they are the not-yet-merged prefill reqs (added).
+        reqs = list(self.running_batch.reqs)
+        if self.last_iter is not None:
+            seen = {id(req) for req in reqs}
+            reqs.extend(req for req in self.last_iter.reqs if id(req) not in seen)
 
         for req in reqs:
             if not req.finished() and (
@@ -3952,39 +3986,49 @@ class Scheduler(
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
+            # All scheduler state (running_batch, chunked_req, result_queue) is
+            # left untouched, and last_batch is the event loop's local. On
+            # resume, the normal event loop (get_next_batch_to_run) handles
+            # last_batch merge, chunked_req cleanup, and overlap result
+            # processing through the standard code paths. This avoids
+            # duplicating batch manipulation logic and the accounting bugs that
+            # come with it.
             return
 
-        if self.enable_overlap and self.last_batch:
+        # Non-in-place modes need to merge/retract the event loop's last_batch,
+        # which is now a loop-local variable. Record the request and let
+        # _maybe_apply_pending_pause run the manipulation from the loop right
+        # after request dispatch, where last_batch is in scope.
+        self._pending_pause = recv_req
+
+    def _maybe_apply_pending_pause(
+        self, last_batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
+        recv_req = self._pending_pause
+        if recv_req is None:
+            return last_batch
+        self._pending_pause = None
+
+        if self.enable_overlap and last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
+        if last_batch and last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
             if (
-                not self.last_batch.is_empty()
+                not last_batch.is_empty()
                 and self.disaggregation_mode != DisaggregationMode.PREFILL
             ):
                 if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                    self.running_batch = last_batch
                 else:
-                    self.running_batch.merge_batch(self.last_batch)
-
-        self.last_batch = None
-        self.cur_batch = None
+                    self.running_batch.merge_batch(last_batch)
 
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch()
@@ -3995,6 +4039,11 @@ class Scheduler(
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
+
+        # The last batch has been consumed (merged into running_batch and/or
+        # retracted), mirroring the old self.last_batch = None on pause.
+        self.last_iter = None
+        return None
 
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,

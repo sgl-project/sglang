@@ -151,7 +151,7 @@ class SchedulerPoolStatsObserver:
     full_tokens_per_layer: Any
     swa_tokens_per_layer: Any
     max_total_num_tokens: int
-    get_last_batch: Callable
+    get_last_iter: Callable
     get_running_batch: Callable
 
     def streaming_session_count(self) -> int:
@@ -162,16 +162,21 @@ class SchedulerPoolStatsObserver:
         )
 
     def active_pool_idxs(self) -> set:
-        """Pool idxs currently owned by reqs in last_batch / running_batch.
+        """Pool idxs currently owned by reqs in last_iter / running_batch.
 
         Used to decide which session slots' KV is owned by batch reqs
         (and thus counted via uncached_size, not session_held).
         """
         idxs = set()
-        for batch in [self.get_last_batch(), self.get_running_batch()]:
-            if batch is None or batch.is_empty():
-                continue
-            for req in batch.reqs:
+        req_groups = []
+        last_iter = self.get_last_iter()
+        if last_iter is not None and not last_iter.is_empty:
+            req_groups.append(last_iter.reqs)
+        running_batch = self.get_running_batch()
+        if running_batch is not None and not running_batch.is_empty():
+            req_groups.append(running_batch.reqs)
+        for reqs in req_groups:
+            for req in reqs:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
         return idxs

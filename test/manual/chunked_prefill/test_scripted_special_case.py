@@ -1002,18 +1002,18 @@ class TestSpecialCaseRetractMerge(ScriptedTestCase):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
 
-        assert s.last_batch is not None, "last_batch must be set while chunking"
-        assert s.last_batch.forward_mode.is_extend(), (
-            f"last_batch must be the extend/chunk batch; got "
-            f"{s.last_batch.forward_mode!r}"
+        assert s.last_iter is not None, "last_iter must be set while chunking"
+        assert s.last_iter.forward_mode.is_extend(), (
+            f"last_iter must be the extend/chunk batch; got "
+            f"{s.last_iter.forward_mode!r}"
         )
 
         t.pause_generation(mode="retract")
         yield
 
         assert (
-            s.last_batch is None
-        ), "retract must clear last_batch after merging the extend chunk batch"
+            s.last_iter is None
+        ), "retract must clear last_iter after merging the extend chunk batch"
         assert len(s.running_batch.reqs) == 0, (
             "the merged extend chunk batch must be retracted out of running_batch, "
             f"not stranded; got {len(s.running_batch.reqs)} reqs"

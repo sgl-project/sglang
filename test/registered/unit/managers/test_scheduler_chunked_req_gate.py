@@ -81,7 +81,6 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.dllm_manager = None
     s.enable_hisparse = False
     s.enable_fpm = False
-    s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
     s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
@@ -137,7 +136,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         # computed, so the gate must skip stash and leave prefix_indices intact.
         s, req, initial_prefix, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(s, None)
 
         self.assertEqual(req.prefix_indices.shape[0], self.INITIAL_PREFIX_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
@@ -147,7 +146,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         # the cached prefix, stash must run and advance prefix_indices.
         s, req, _, pool = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(s, None)
 
         expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
             dtype=torch.int64
@@ -162,7 +161,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         cache = _make_chunk_cache(pool)
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(s, None)
         self.assertIsNone(s.chunked_req)
 
 

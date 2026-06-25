@@ -7,6 +7,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
@@ -19,9 +20,12 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
+        scheduler._pending_pause = None
         scheduler.enable_overlap = False
-        scheduler.last_batch = None
-        scheduler.cur_batch = None
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        # cur_batch / last_batch are event-loop locals; out-of-loop state is
+        # the last_iter snapshot, cleared when a pending pause is applied.
+        scheduler.last_iter = MagicMock()
         scheduler.chunked_req = None
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
@@ -50,34 +54,31 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         return scheduler
 
     def test_inplace_only_sets_flag(self):
-        """in_place pause should only set _engine_paused and return."""
+        """in_place pause should only set _engine_paused, with no pending pause."""
         scheduler = self._new_scheduler()
-        scheduler.last_batch = MagicMock()
-        scheduler.cur_batch = MagicMock()
         scheduler.chunked_req = MagicMock()
-
-        original_last_batch = scheduler.last_batch
-        original_cur_batch = scheduler.cur_batch
         original_chunked_req = scheduler.chunked_req
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         self.assertTrue(scheduler._engine_paused)
-        # All state must be preserved — no mutation
-        self.assertIs(scheduler.last_batch, original_last_batch)
-        self.assertIs(scheduler.cur_batch, original_cur_batch)
+        # in_place must not enqueue any batch manipulation for the loop to apply.
+        self.assertIsNone(scheduler._pending_pause)
+        # State must be preserved — no mutation.
         self.assertIs(scheduler.chunked_req, original_chunked_req)
 
     def test_inplace_does_not_drain_overlap_queue(self):
-        """in_place should not process the overlap result_queue."""
+        """in_place should not enqueue work that would drain the result_queue."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
-        scheduler.last_batch = MagicMock()
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        # Applying any pending pause is a no-op for in_place.
+        last_batch = scheduler._maybe_apply_pending_pause(MagicMock())
 
         self.assertTrue(scheduler._engine_paused)
+        self.assertIsNotNone(last_batch)
         self.assertEqual(len(scheduler.result_queue), 1)
 
     def test_inplace_does_not_merge_batch(self):
@@ -85,30 +86,32 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler = self._new_scheduler()
         last_batch = MagicMock()
         last_batch.forward_mode.is_extend.return_value = True
-        scheduler.last_batch = last_batch
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        scheduler._maybe_apply_pending_pause(last_batch)
 
         last_batch.filter_batch.assert_not_called()
         scheduler.running_batch.merge_batch.assert_not_called()
 
     def test_abort_clears_state(self):
-        """abort mode should clear last_batch and cur_batch."""
+        """abort mode should consume last_batch and clear the last_iter snapshot."""
         scheduler = self._new_scheduler()
-        scheduler.last_batch = MagicMock()
-        scheduler.last_batch.forward_mode.is_extend.return_value = False
-        scheduler.cur_batch = MagicMock()
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = False
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
-
         self.assertTrue(scheduler._engine_paused)
-        self.assertIsNone(scheduler.last_batch)
-        self.assertIsNone(scheduler.cur_batch)
+        self.assertIsNotNone(scheduler._pending_pause)
+
+        applied = scheduler._maybe_apply_pending_pause(last_batch)
+
+        self.assertIsNone(applied)
+        self.assertIsNone(scheduler.last_iter)
+        self.assertIsNone(scheduler._pending_pause)
 
     def test_retract_clears_running_batch(self):
         """retract mode should retract all requests from running_batch."""
         scheduler = self._new_scheduler()
-        scheduler.last_batch = None
         scheduler.running_batch.reqs = [MagicMock(), MagicMock()]
         scheduler.running_batch.__len__ = lambda self: len(self.reqs)
         scheduler.running_batch.is_empty.return_value = False
@@ -121,6 +124,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.server_args = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        scheduler._maybe_apply_pending_pause(None)
 
         self.assertTrue(scheduler._engine_paused)
         scheduler.running_batch.retract_all.assert_called_once()
@@ -131,13 +135,13 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         """abort with overlap enabled should drain the result_queue."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
-        mock_batch = MagicMock()
-        mock_batch.forward_mode.is_extend.return_value = False
-        scheduler.last_batch = mock_batch
+        last_batch = MagicMock()
+        last_batch.forward_mode.is_extend.return_value = False
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
         scheduler.process_batch_result = MagicMock()
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler._maybe_apply_pending_pause(last_batch)
 
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)

@@ -85,7 +85,9 @@ class MlxPendingJob:
 class SchedulerMlxOverlapMixin:
     """Mixin that adds MLX overlap scheduling to :class:`Scheduler`."""
 
-    def _finalize_mlx_pending_job(self: Scheduler, pending: MlxPendingJob):
+    def _finalize_mlx_pending_job(
+        self: Scheduler, pending: MlxPendingJob
+    ) -> ScheduleBatch:
         result = self.tp_worker.finalize_mlx_result(
             pending.prefills,
             pending.extends,
@@ -96,8 +98,9 @@ class SchedulerMlxOverlapMixin:
         if result.next_token_ids is not None:
             pending.batch_copy.input_ids = result.next_token_ids
             pending.schedule_batch.input_ids = result.next_token_ids
-        self.last_batch = pending.schedule_batch
+        self.publish_last_iter(pending.schedule_batch)
         self.process_batch_result(pending.batch_copy, result)
+        return pending.schedule_batch
 
     @DynamicGradMode()
     def event_loop_overlap_mlx(self: Scheduler):
@@ -141,6 +144,7 @@ class SchedulerMlxOverlapMixin:
         """
         pending_curr: Optional[MlxPendingJob] = None
         pending_next: Optional[MlxPendingJob] = None
+        last_batch: Optional[ScheduleBatch] = None
 
         def _launch_fresh(batch: ScheduleBatch) -> MlxPendingJob:
             # Materialize batch.input_ids from CPU staging (prefill) or the
@@ -186,6 +190,7 @@ class SchedulerMlxOverlapMixin:
         while True:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            last_batch = self._maybe_apply_pending_pause(last_batch)
             if self._engine_paused:
                 continue
 
@@ -207,7 +212,7 @@ class SchedulerMlxOverlapMixin:
             # 2. Finalize/process on pending_curr's tokens.  (GPU is already
             #    executing pending_next at this point.)
             if pending_curr is not None:
-                self._finalize_mlx_pending_job(pending_curr)
+                last_batch = self._finalize_mlx_pending_job(pending_curr)
                 self.result_queue.popleft()
                 pending_curr = None
 
@@ -224,8 +229,8 @@ class SchedulerMlxOverlapMixin:
             ):
                 pending_curr = pending_next
                 pending_next = None
-                self.cur_batch = pending_curr.schedule_batch
-                self.last_batch = pending_curr.schedule_batch
+                last_batch = pending_curr.schedule_batch
+                self.publish_last_iter(pending_curr.schedule_batch)
                 if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                     self.invariant_checker.self_check_during_busy()
                 continue
@@ -233,17 +238,17 @@ class SchedulerMlxOverlapMixin:
             # 4. Chain is broken. Finalise pending_next (if any), then
             #    schedule fresh.
             if pending_next is not None:
-                self._finalize_mlx_pending_job(pending_next)
+                last_batch = self._finalize_mlx_pending_job(pending_next)
                 self.result_queue.popleft()
                 pending_next = None
-            next_batch = self.get_next_batch_to_run()
-            self.cur_batch = next_batch
+            next_batch = self.get_next_batch_to_run(last_batch)
+            self.publish_last_iter(next_batch)
             if next_batch:
                 pending_curr = _launch_fresh(next_batch)
                 self.result_queue.append(pending_curr)
             else:
                 self.on_idle()
 
-            self.last_batch = next_batch
+            last_batch = next_batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()

@@ -1182,11 +1182,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
+            self.scheduler.last_iter is not None
+            and self.scheduler.last_iter.forward_mode is not None
+            and self.scheduler.last_iter.forward_mode.is_prebuilt()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+                self.scheduler.last_iter.reqs
             )
 
         if count_retracted:
@@ -1243,13 +1244,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
-            self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_prebuilt()
+            self.scheduler.last_iter is not None
+            and self.scheduler.last_iter.forward_mode is not None
+            and self.scheduler.last_iter.forward_mode.is_prebuilt()
         ):
             prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
-                self.scheduler.last_batch.reqs
+                self.scheduler.last_iter.reqs
             )
-            prebuilt_n = len(self.scheduler.last_batch.reqs)
+            prebuilt_n = len(self.scheduler.last_iter.reqs)
             prebuilt_swa_growth = max(0, prebuilt_n * window_size - swa_used)
             swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
 
@@ -1752,17 +1754,19 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
+        last_batch: Optional[ScheduleBatch] = None
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            last_batch = self._maybe_apply_pending_pause(last_batch)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
-            self.cur_batch = batch
+            self.publish_last_iter(batch)
 
             # Launch the current batch
             if batch:
@@ -1773,22 +1777,23 @@ class SchedulerDisaggregationDecodeMixin:
                 self.on_idle()
 
             # Update last_batch
-            self.last_batch = batch
+            last_batch = batch
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
-        self.last_batch: Optional[ScheduleBatch] = None
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        last_batch: Optional[ScheduleBatch] = None
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            last_batch = self._maybe_apply_pending_pause(last_batch)
             if self._engine_paused:
                 continue
 
@@ -1796,11 +1801,13 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
-            self.cur_batch = batch
+            self.publish_last_iter(batch)
             # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                batch, last_batch
+            )
 
-            if disable_overlap_for_batch and self.last_batch:
+            if disable_overlap_for_batch and last_batch:
                 pop_and_process()
 
             # Launch the current batch
@@ -1811,7 +1818,7 @@ class SchedulerDisaggregationDecodeMixin:
                 batch_result = None
 
             # Process the last batch
-            if self.last_batch:
+            if last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
@@ -1819,10 +1826,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            self.launch_batch_sample_if_needed(batch_result)
+            self.launch_batch_sample_if_needed(batch_result, batch)
 
             # Update last_batch
-            self.last_batch = batch
+            last_batch = batch
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
