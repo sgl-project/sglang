@@ -24,7 +24,7 @@ into the allocator itself.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -37,6 +37,9 @@ def maybe_write_dsv4_extend(
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
+    *,
+    c4_state_alloc_offsets: Sequence[int] | torch.Tensor | None = None,
+    c128_state_alloc_offsets: Sequence[int] | torch.Tensor | None = None,
 ) -> None:
     """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
 
@@ -87,15 +90,24 @@ def maybe_write_dsv4_extend(
     )
 
     # c4_state / c128_state writes: tail-only. Bundle length is
-    # sum(c{N}_state_alloc_len_i), NOT total raw extend tokens; each req's slots
-    # go at raw positions [req.c{N}_state_alloc_offset, seq_len).
+    # sum(c{N}_state_alloc_len_i), NOT total raw extend tokens. Normal extend
+    # uses the per-Req low-water marks; reserve callers can pass explicit raw
+    # offsets for the pre-reserved interval.
+    if c4_state_alloc_offsets is None:
+        c4_state_alloc_offsets = [
+            getattr(r, "c4_state_alloc_offset", 0) for r in batch.reqs
+        ]
+    if c128_state_alloc_offsets is None:
+        c128_state_alloc_offsets = [
+            getattr(r, "c128_state_alloc_offset", 0) for r in batch.reqs
+        ]
     if bundle.out_c4_state_loc is not None and hasattr(
         req_to_token_pool, "write_c4_state"
     ):
         _write_state_tail_per_req(
             req_to_token_pool.write_c4_state,
             req_pool_indices_cpu,
-            [getattr(r, "c4_state_alloc_offset", 0) for r in batch.reqs],
+            c4_state_alloc_offsets,
             seq_lens_cpu,
             bundle.out_c4_state_loc,
         )
@@ -105,10 +117,33 @@ def maybe_write_dsv4_extend(
         _write_state_tail_per_req(
             req_to_token_pool.write_c128_state,
             req_pool_indices_cpu,
-            [getattr(r, "c128_state_alloc_offset", 0) for r in batch.reqs],
+            c128_state_alloc_offsets,
             seq_lens_cpu,
             bundle.out_c128_state_loc,
         )
+
+
+def maybe_write_dsv4_reserve(
+    batch: ScheduleBatch,
+    req_pool_indices_cpu: torch.Tensor,
+    cur_kv_lens_cpu: torch.Tensor,
+    nxt_kv_lens_cpu: torch.Tensor,
+) -> None:
+    """Post speculative-reserve hook for DSV4.
+
+    Spec-v2 reserves the raw interval ``[cur_kv_lens, nxt_kv_lens)`` before
+    draft/verify. The compressed KV tables use the same interval as extend,
+    while state tables must be written at raw positions starting from
+    ``cur_kv_lens`` instead of the Req eviction low-water mark.
+    """
+    maybe_write_dsv4_extend(
+        batch,
+        req_pool_indices_cpu,
+        cur_kv_lens_cpu,
+        nxt_kv_lens_cpu,
+        c4_state_alloc_offsets=cur_kv_lens_cpu,
+        c128_state_alloc_offsets=cur_kv_lens_cpu,
+    )
 
 
 def maybe_write_dsv4_decode(
