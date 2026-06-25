@@ -1218,8 +1218,6 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        self.set_extend_input_len(input_len - len(self.prefix_indices))
-
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
