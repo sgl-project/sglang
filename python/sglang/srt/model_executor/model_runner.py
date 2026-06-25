@@ -158,6 +158,9 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.model_runner_components.weight_exporter import (
+    WeightExporter,
+)
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
@@ -567,7 +570,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For weight updates
         self.init_weight_updater()
-        self._weights_send_group = {}
+        self.init_weight_exporter()
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -581,6 +584,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             recapture_cuda_graph=self.init_decode_cuda_graph,
             get_model_runner=lambda: self,
         )
+
+    def init_weight_exporter(self):
+        self.weight_exporter = WeightExporter(_model_runner=self)
 
     def init_msprobe(self):
         # Init the msprobe
@@ -1760,13 +1766,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         ports_list = ports.split(",")
         assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+            len(ports_list) == self._model_runner.tp_size
+        ), f"Expected {self._model_runner.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self._model_runner.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self._model_runner.tp_rank}"
 
         logger.info(
-            f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
+            f"init custom process group: tp_rank={self._model_runner.tp_rank}, gpu_id={self._model_runner.gpu_id}, master_address={master_address}, master_port={group_port}, "
             f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
@@ -1781,7 +1787,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 world_size=world_size,
                 rank=group_rank,
                 group_name=group_name,
-                device_id=torch.device("cuda", self.gpu_id),
+                device_id=torch.device("cuda", self._model_runner.gpu_id),
             )
             dist.barrier(group=self._weights_send_group[group_name])
             success = True
@@ -1806,10 +1812,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         ports_list = ports.split(",")
         assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+            len(ports_list) == self._model_runner.tp_size
+        ), f"Expected {self._model_runner.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self._model_runner.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self._model_runner.tp_rank}"
 
         if self._weights_send_group[group_name] is not None:
             send_group = self._weights_send_group[group_name]
@@ -1823,7 +1829,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         na = NetworkAddress(master_address, group_port)
         message = ""
         try:
-            for _, weights in self.model.named_parameters():
+            for _, weights in self._model_runner.model.named_parameters():
                 torch.distributed.broadcast(
                     weights,
                     src=0,
