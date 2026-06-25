@@ -110,8 +110,9 @@ jobs:
       # launch + cleanup steps read it directly. Do NOT set it here from
       # ${{ runner.name }} -- the `runner` context is not available in job-level
       # env and makes the whole workflow file invalid.
-      # Local snapshot on the cluster's shared NFS (preferred over downloading).
-      MODEL_PATH: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8/snapshots/ae01d80c06cdfe30581edfd0e1c5449dc7ed7f17
+      # Shared-NFS HuggingFace cache dir; the launcher resolves the live snapshot
+      # via refs/main. Per-model value comes from nightly-configs.yaml model_path.
+      MODEL_PATH: ${{ matrix.config.model_path }}
 
     steps:
       - name: Checkout code
