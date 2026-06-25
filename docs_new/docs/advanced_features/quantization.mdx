@@ -207,7 +207,7 @@ On Ascend, various layers quantization configurations are supported, see [Ascend
 ## GEMM Backends for FP4/FP8 Quantization
 
 <Note>
-Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. When running FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
+Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **NVFP4** GEMM. When running offline or online FP8 or FP4 quantized models, you can select the GEMM backend via `--fp8-gemm-backend` and `--fp4-gemm-backend`.
 </Note>
 
 ### `--fp8-gemm-backend` (Blockwise FP8 GEMM)
@@ -265,6 +265,8 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 </table>
 
 **`auto` selection order:** 1) DeepGEMM (SM90/SM100, installed); 2) FlashInfer TRTLLM (SM100, FlashInfer available); 3) CUTLASS (SM90/SM100/120); 4) AITER (AMD); 5) Triton. **Exception:** SM120 always resolves to Triton.
+
+**MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
 
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 
