@@ -174,7 +174,7 @@ class AscendRunnerCore(MoeRunnerCore):
 # ---------------------------------------------------------------------------
 @dataclass
 class AscendQuantInfo(MoeQuantInfo):
-    """Quantization payload for torch‑npu."""
+    """Quantization payload for Ascend."""
 
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
