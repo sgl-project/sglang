@@ -645,8 +645,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
             return result
-        if self.disable:
+        if self.disable or node is None:
             return DecLockRefResult()
+        cur = node
+        while cur is not self.root_node:
+            parent = getattr(cur, "parent", None)
+            if parent is None:
+                return DecLockRefResult()
+            cur = parent
         for component in self._components_tuple:
             if skip_swa and component.component_type == ComponentType.SWA:
                 continue
