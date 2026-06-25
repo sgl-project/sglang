@@ -117,6 +117,10 @@ global_workspace_buffer = None
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
+_USE_FUSED_METADATA_GENERATION = (
+    envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not _is_hip
+)
+_warned_fused_metadata_generation_failure = False
 
 
 @dataclass(frozen=True)
@@ -648,7 +652,9 @@ class DeepseekSparseAttnBackend(
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         if forward_batch.seq_lens_cpu is not None:
-            max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+            max_seqlen_k = int(
+                forward_batch.seq_lens_cpu.max().item() + draft_token_num
+            )
         else:
             # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
             # batches; graph replay uses the static page-table width, so only this
@@ -1197,6 +1203,9 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        global _USE_FUSED_METADATA_GENERATION
+        global _warned_fused_metadata_generation_failure
+
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -1218,22 +1227,60 @@ class DeepseekSparseAttnBackend(
 
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
+        fused_metadata_generation_succeeded = False
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = metadata.page_table_1.shape[1]
 
-            cache_seqlens = seq_lens.to(torch.int32)
-            metadata.cache_seqlens_int32.copy_(cache_seqlens)
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
-            )
-            page_indices = self.req_to_token[req_pool_indices, :max_len]
-            metadata.page_table_1[:, :max_len].copy_(page_indices)
-            dsa_cache_seqlens = compute_dsa_seqlens(
-                cache_seqlens, dsa_index_topk=self.dsa_index_topk
-            )
-            metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
-            seqlens_expanded = cache_seqlens
+            if _USE_FUSED_METADATA_GENERATION and is_cuda():
+                try:
+                    from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                        fused_dsa_decode_metadata,
+                    )
+
+                    fused_dsa_decode_metadata(
+                        seq_lens=seq_lens,
+                        req_pool_indices=req_pool_indices,
+                        req_to_token=self.req_to_token,
+                        cache_seqlens=metadata.cache_seqlens_int32,
+                        cu_seqlens_k=metadata.cu_seqlens_k,
+                        page_table_1=metadata.page_table_1,
+                        dsa_cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                        dsa_cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                        real_page_table=metadata.real_page_table,
+                        bs=bs,
+                        max_len=max_len,
+                        dsa_index_topk=self.dsa_index_topk,
+                        real_page_size=self.real_page_size,
+                    )
+                    cache_seqlens = metadata.cache_seqlens_int32
+                    dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
+                    seqlens_expanded = cache_seqlens
+                    page_indices = None
+                    fused_metadata_generation_succeeded = True
+                except Exception as e:
+                    if not _warned_fused_metadata_generation_failure:
+                        logger.warning(
+                            "Fused DSA decode metadata generation failed; "
+                            "falling back to eager metadata ops. Error: %s",
+                            e,
+                        )
+                        _warned_fused_metadata_generation_failure = True
+                    _USE_FUSED_METADATA_GENERATION = False
+
+            if not fused_metadata_generation_succeeded:
+                cache_seqlens = seq_lens.to(torch.int32)
+                metadata.cache_seqlens_int32.copy_(cache_seqlens)
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+                )
+                page_indices = self.req_to_token[req_pool_indices, :max_len]
+                metadata.page_table_1[:, :max_len].copy_(page_indices)
+                dsa_cache_seqlens = compute_dsa_seqlens(
+                    cache_seqlens, dsa_index_topk=self.dsa_index_topk
+                )
+                metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
+                seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
             max_seqlen_k = metadata.page_table_1.shape[1]
 
@@ -1347,17 +1394,19 @@ class DeepseekSparseAttnBackend(
             and self.dsa_index_topk is not None
         )
 
-        metadata.dsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
-            torch.cumsum(dsa_cache_seqlens, dim=0, dtype=torch.int32)
-        )
+        if not fused_metadata_generation_succeeded:
+            metadata.dsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
+                torch.cumsum(dsa_cache_seqlens, dim=0, dtype=torch.int32)
+            )
         # NOTE(dark): (dsa-) cu_seqlens_q is always arange, no need to copy
 
         assert self.real_page_size == metadata.page_size
         if self.real_page_size > 1:
-            real_table = self._transform_table_1_to_real(page_indices)
-            new_rows = real_table.shape[0]
-            new_cols = real_table.shape[1]
-            metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
+            if not fused_metadata_generation_succeeded:
+                real_table = self._transform_table_1_to_real(page_indices)
+                new_rows = real_table.shape[0]
+                new_cols = real_table.shape[1]
+                metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
 
