@@ -1146,6 +1146,12 @@
                       "cookbook/autoregressive/Poolside/Laguna-M.1",
                       "cookbook/autoregressive/Poolside/Laguna-XS.2"
                     ]
+                  },
+                  {
+                    "group": "Cohere",
+                    "pages": [
+                      "cookbook/autoregressive/Cohere/Command-A-Plus"
+                    ]
                   }
                 ]
               },
