@@ -1581,12 +1581,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             and not forward_batch.dp_padding_mode.is_max_len()
         )
         if _use_cp:
-            if get_moe_a2a_backend().is_none():
+            moe_a2a_backend = get_moe_a2a_backend()
+            if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert get_moe_a2a_backend().is_deepep(), (
-                    "CP requires DeepEP (moe_a2a_backend == deepep). "
-                    "Only DeepEP is tested with CP's per-rank token split."
+                cp_moe_backend_supported = (
+                    moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe()
+                )
+                assert cp_moe_backend_supported, (
+                    "CP requires DeepEP (moe_a2a_backend == deepep) or MegaMoE "
+                    "(moe_a2a_backend == megamoe)."
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
