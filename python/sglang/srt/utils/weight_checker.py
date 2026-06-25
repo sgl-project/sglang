@@ -40,6 +40,17 @@ class ChecksumInfo(_StrictBaseModel):
     parallelism_info: ParallelismInfo
 
 
+class Entry(NamedTuple):
+    name: str
+    should_compare: bool
+    comparable: ComparableWeight
+
+
+class QuantizedWeight(NamedTuple):
+    comparable_cls: type[ComparableWeight]
+    scale_name: str
+
+
 _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
     "inv_freq",
@@ -167,12 +178,6 @@ def _hash_tensor(t: torch.Tensor) -> str:
     return f"{tensor_hash(t):016x}"
 
 
-class Entry(NamedTuple):
-    name: str
-    should_compare: bool
-    comparable: ComparableWeight
-
-
 def _check_tensors(
     expect_tensors: Iterable[Entry],
     actual_tensors: Iterable[Entry],
@@ -246,11 +251,6 @@ def _random_like(t: torch.Tensor):
     return torch.randint(
         low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
     )
-
-
-class QuantizedWeight(NamedTuple):
-    comparable_cls: type[ComparableWeight]
-    scale_name: str
 
 
 def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:

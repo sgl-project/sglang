@@ -16,6 +16,13 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 CHUNK_NUMEL = 64 * 1024 * 1024
 
 
+class CompareResult(NamedTuple):
+    equal: bool
+    max_abs_err: float
+    mean_abs_err: float
+    num_exceed: int  # elements past the combined per-side tolerance
+
+
 class ComparableWeight:
     """Base class: a weight in comparable (dequantized) form, for all precisions."""
 
@@ -109,13 +116,6 @@ class RawComparable(ComparableWeight):
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         return self.tensor
-
-
-class CompareResult(NamedTuple):
-    equal: bool
-    max_abs_err: float
-    mean_abs_err: float
-    num_exceed: int  # elements past the combined per-side tolerance
 
 
 def compare_weights(
