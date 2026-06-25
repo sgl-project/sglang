@@ -284,11 +284,21 @@ class BaseSpecWorker(ABC):
 
     @property
     def draft_runner(self):
-        """The draft model's ModelRunner, or None when this algorithm has no
+        """The primary draft ModelRunner, or None when this algorithm has no
         draft model (e.g. NGRAM). For multi-step draft workers this is the
-        first runner; use the draft worker's `draft_runner_list` for all."""
+        first runner; use `draft_runners` for all of them."""
         draft_worker = self.draft_worker
         return draft_worker.draft_runner if draft_worker is not None else None
+
+    @property
+    def draft_runners(self):
+        """All draft ModelRunners (more than one for multi-step draft workers);
+        empty when this algorithm has no draft model (e.g. NGRAM)."""
+        draft_worker = self.draft_worker
+        if draft_worker is None:
+            return []
+        runner_list = getattr(draft_worker, "draft_runner_list", None)
+        return runner_list if runner_list is not None else [draft_worker.draft_runner]
 
     @property
     def war_fastpath_runner(self):
