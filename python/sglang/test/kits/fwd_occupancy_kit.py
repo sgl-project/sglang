@@ -82,20 +82,23 @@ class FwdOccupancyMixin:
         resp = requests.get(
             self.base_url + "/metrics", timeout=_METRICS_REQUEST_TIMEOUT
         )
-        assert resp.status_code == 200, (
-            f"/metrics returned {resp.status_code}; the test class's server "
-            "must be launched with --enable-metrics"
-        )
-        assert "sglang:fwd_occupancy" in resp.text, (
-            "sglang:fwd_occupancy gauge not exposed; set "
-            "SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 in the server's env and "
-            "pass --enable-metrics"
-        )
+        if resp.status_code != 200:
+            raise AssertionError(
+                f"/metrics returned {resp.status_code}; the test class's "
+                "server must be launched with --enable-metrics"
+            )
+        if "sglang:fwd_occupancy" not in resp.text:
+            raise AssertionError(
+                "sglang:fwd_occupancy gauge not exposed; set "
+                "SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 in the server's env "
+                "and pass --enable-metrics"
+            )
 
     def _fwd_occupancy_fire(self, prompt: str, max_new_tokens: int):
-        """Fire one /generate, return completion_tokens (0 on failure).
+        """Fire one /generate, return (completion_tokens, wall_time).
         Must not be called concurrently -- that would break the
         single-batch invariant."""
+        t0 = time.perf_counter()
         try:
             resp = requests.post(
                 self.base_url + "/generate",
@@ -112,11 +115,13 @@ class FwdOccupancyMixin:
         except requests.RequestException:
             # Final stats-vs-threshold is the signal; individual fire
             # failure isn't.
-            return 0
+            return 0, 0.0
+        elapsed = time.perf_counter() - t0
         try:
-            return resp.json().get("meta_info", {}).get("completion_tokens", 0)
+            tokens = resp.json().get("meta_info", {}).get("completion_tokens", 0)
         except ValueError:  # non-JSON body
-            return 0
+            tokens = 0
+        return tokens, elapsed
 
     def _fwd_occupancy_warmup(self):
         """Fill cuda graphs + step the device-timer past its first NaN
@@ -130,17 +135,18 @@ class FwdOccupancyMixin:
     def _fwd_occupancy_measure(self):
         """Background-fire one long single-batch request, scrape
         /metrics on the foreground; return (non-NaN samples,
-        token_tps) -- token_tps is completion_tokens / wall time of
-        the long request (0.0 on failure)."""
+        token_tps)."""
         samples = []
         request_done = threading.Event()
-        result = {"completion_tokens": 0}
+        result = {"completion_tokens": 0, "elapsed": 0.0}
 
         def fire_one():
             try:
-                result["completion_tokens"] = self._fwd_occupancy_fire(
-                    self.fwd_occupancy_prompt,
-                    self.fwd_occupancy_max_new_tokens,
+                result["completion_tokens"], result["elapsed"] = (
+                    self._fwd_occupancy_fire(
+                        self.fwd_occupancy_prompt,
+                        self.fwd_occupancy_max_new_tokens,
+                    )
                 )
             finally:
                 request_done.set()
@@ -148,7 +154,6 @@ class FwdOccupancyMixin:
         firer = threading.Thread(target=fire_one, daemon=True)
         firer.start()
 
-        wall_start = time.perf_counter()
         while not request_done.is_set():
             v = self._scrape_fwd_occupancy()
             if v is not None:
@@ -156,8 +161,11 @@ class FwdOccupancyMixin:
             time.sleep(self.fwd_occupancy_scrape_interval)
 
         firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
-        wall_time = max(time.perf_counter() - wall_start, 1e-6)
-        token_tps = result["completion_tokens"] / wall_time
+        token_tps = (
+            result["completion_tokens"] / result["elapsed"]
+            if result["elapsed"] > 0
+            else 0.0
+        )
         return samples, token_tps
 
     def test_fwd_occupancy(self):
@@ -178,7 +186,8 @@ class FwdOccupancyMixin:
         samples_sorted = sorted(samples)
         median = statistics.median(samples_sorted)
         peak = samples_sorted[-1]
-        p10 = samples_sorted[max(0, len(samples_sorted) // 10 - 1)]
+        p10_idx = min(len(samples_sorted) - 1, max(0, len(samples_sorted) // 10))
+        p10 = samples_sorted[p10_idx]
         print(
             "\n"
             + tabulate.tabulate(
