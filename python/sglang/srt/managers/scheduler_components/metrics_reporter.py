@@ -184,11 +184,10 @@ class SchedulerMetricsReporter:
         timer = self.forward_pass_device_timer
         self.scheduler.tp_worker.model_runner.device_timer = timer
         if self.scheduler.draft_worker is not None:
-            dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
+            dw = self.scheduler.draft_worker.draft_worker
             if dw is not None:
-                if hasattr(dw, "draft_runner"):
-                    dw.draft_runner.device_timer = timer
-                for r in getattr(dw, "draft_runner_list", []):
+                runners = getattr(dw, "draft_runner_list", None) or [dw.draft_runner]
+                for r in runners:
                     r.device_timer = timer
 
     def _init_fpm(self):

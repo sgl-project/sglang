@@ -91,11 +91,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     ):
         # Parse args
         self.eagle_worker = eagle_worker
-        if not hasattr(eagle_worker, "model_runner"):
-            # V2: EagleDraftWorker
-            self.model_runner = model_runner = eagle_worker.draft_runner
-        else:
-            self.model_runner = model_runner = eagle_worker.model_runner
+        self.model_runner = model_runner = eagle_worker.draft_runner
 
         # Fields the parent's capture() reads:
         self.device = model_runner.device

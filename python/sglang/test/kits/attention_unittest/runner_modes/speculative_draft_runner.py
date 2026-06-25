@@ -199,10 +199,6 @@ class _EagleDraftWorkerHarness:
         )
 
     @property
-    def draft_model_runner(self):
-        return self.model_runner
-
-    @property
     def draft_runner(self):
         # V2 draft_forward reads self.draft_runner (forward / model_config /
         # canary_manager); for the harness that's the fixture runner.
@@ -261,7 +257,7 @@ class _FrozenKVMTPWorkerHarness:
         )
 
     @property
-    def draft_model_runner(self):
+    def draft_runner(self):
         return self.model_runner
 
     @property

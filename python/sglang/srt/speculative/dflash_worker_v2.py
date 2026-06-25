@@ -157,12 +157,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             is_draft_worker=True,
         )
         set_global_server_args_for_scheduler(saved_server_args)
-        self.draft_model_runner = self._draft_worker.model_runner
-        # Keep the same alias that other spec-v2 workers expose.
-        self._draft_worker.draft_runner = self.draft_model_runner
-        self.draft_model = self.draft_model_runner.model
+        # The inner TpModelWorker hosts the draft model; expose its runner as
+        # draft_runner so the spec-v2 skeleton and the BaseSpecWorker.draft_runner
+        # property both resolve through draft_worker.draft_runner.
+        self._draft_worker.draft_runner = self._draft_worker.model_runner
+        self.draft_model = self.draft_runner.model
         draft_config = parse_dflash_draft_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
+            draft_hf_config=self.draft_runner.model_config.hf_config
         )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
@@ -269,7 +270,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
         return (
             self._target_worker.model_runner.attn_backend,
-            self.draft_model_runner.attn_backend,
+            self.draft_runner.attn_backend,
         )
 
     def alloc_memory_pool(
@@ -939,7 +940,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                     v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
-                    self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+                    self.draft_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
                         cache_loc_2d,
                         commit_lens,
@@ -988,7 +989,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+            self.draft_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 ctx_cache_loc,
                 k,
@@ -1006,7 +1007,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
-        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        token_to_kv_pool = self.draft_runner.token_to_kv_pool
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
 
@@ -1422,7 +1423,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             assign_req_to_token_pool_func(
                 model_worker_batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
+                self.draft_runner.req_to_token_pool.req_to_token,
                 torch.zeros_like(draft_prefix_lens),
                 draft_prefix_lens,
                 suffix_cache_loc,
@@ -1433,7 +1434,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.add(draft_prefix_lens, block_size, out=block_end)
             assign_req_to_token_pool_func(
                 model_worker_batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
+                self.draft_runner.req_to_token_pool.req_to_token,
                 draft_prefix_lens,
                 block_end,
                 verify_out_cache_loc,
@@ -1480,9 +1481,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         with torch.inference_mode():
-            draft_logits_output = self.draft_model_runner.forward(
-                forward_batch
-            ).logits_output
+            draft_logits_output = self.draft_runner.forward(forward_batch).logits_output
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:

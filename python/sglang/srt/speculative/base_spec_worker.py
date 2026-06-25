@@ -95,7 +95,7 @@ class EagleDraftWorkerBase(ABC):
         batch: ScheduleBatch,
         predict: torch.Tensor,
         num_draft_tokens: int,
-        draft_model_runner: Any,
+        draft_runner: Any,
         cuda_graph_runner: Any,
     ):
         from sglang.srt.model_executor.forward_batch_info import (
@@ -136,7 +136,7 @@ class EagleDraftWorkerBase(ABC):
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
+            if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
         batch.forward_mode = (
@@ -145,7 +145,7 @@ class EagleDraftWorkerBase(ABC):
             else ForwardMode.DRAFT_EXTEND_V2
         )
         batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(batch, draft_runner)
         # Forward sees post-write length (draft extend writes num_draft_tokens
         # slots); mutation stays on forward_batch to preserve SB.seq_lens.
         forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
@@ -160,7 +160,7 @@ class EagleDraftWorkerBase(ABC):
             forward_batch
         )
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            draft_runner.attn_backend.init_forward_metadata(forward_batch)
             # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
             # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
             # (the `_batch_size == batch_size` assertion, see #27091); the
@@ -179,7 +179,7 @@ class EagleDraftWorkerBase(ABC):
         req_to_token_pool: ReqToTokenPool,
         batch: ScheduleBatch,
         cuda_graph_runner: EAGLEDraftCudaGraphRunner,
-        draft_model_runner: ModelRunner,
+        draft_runner: ModelRunner,
         topk: int,
         num_steps: int,
     ):
@@ -245,7 +245,7 @@ class EagleDraftWorkerBase(ABC):
                 # overlapping the prefix tail page; duplicate the real prefix-tail KV
                 # into them so whole-page reads stay coherent (see helper docstring).
                 duplicate_prefix_tail_to_draft_branches(
-                    draft_model_runner.token_to_kv_pool,
+                    draft_runner.token_to_kv_pool,
                     rows,
                     prefix_base,
                     last_page,
@@ -259,12 +259,12 @@ class EagleDraftWorkerBase(ABC):
         draft_input.num_tokens_for_logprob_per_req = topk
         capture_mode = (
             CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
+            if draft_runner.spec_algorithm.is_standalone()
             else CaptureHiddenMode.LAST
         )
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         batch.capture_hidden_mode = capture_mode
-        forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        forward_batch = ForwardBatch.init_new(batch, draft_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )
@@ -281,6 +281,14 @@ class BaseSpecWorker(ABC):
     @abstractmethod
     def draft_worker(self) -> EagleDraftWorkerBase:
         pass
+
+    @property
+    def draft_runner(self):
+        """The draft model's ModelRunner, or None when this algorithm has no
+        draft model (e.g. NGRAM). For multi-step draft workers this is the
+        first runner; use the draft worker's `draft_runner_list` for all."""
+        draft_worker = self.draft_worker
+        return draft_worker.draft_runner if draft_worker is not None else None
 
     @property
     def war_fastpath_runner(self):

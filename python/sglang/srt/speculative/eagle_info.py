@@ -14,18 +14,6 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 logger = logging.getLogger(__name__)
 
 
-def _draft_runner_of(worker):
-    """Draft model_runner accessor across worker shapes.
-
-    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
-    model_runner as `draft_runner`; fall back to `model_runner` for workers
-    that run the draft model directly.
-    """
-    return (
-        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
-    )
-
-
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
@@ -199,13 +187,13 @@ class EagleDraftInput(SpecInput):
         consume the field (e.g., STANDALONE)."""
         if worker.speculative_algorithm.is_standalone():
             return None
-        return _draft_runner_of(worker).model_config.spec_hidden_size
+        return worker.draft_runner.model_config.spec_hidden_size
 
     @classmethod
     def dtype_for(cls, worker) -> Optional[torch.dtype]:
         if worker.speculative_algorithm.is_standalone():
             return None
-        return _draft_runner_of(worker).model_config.dtype
+        return worker.draft_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
