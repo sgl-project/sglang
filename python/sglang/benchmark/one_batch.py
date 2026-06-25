@@ -427,7 +427,7 @@ def prepare_synthetic_inputs_for_latency_test(
             else:
                 ratio = (len(input_ids[i]) + input_len - 1) // len(input_ids[i])
                 input_ids[i] = (input_ids[i] * ratio)[:input_len]
-    
+
         req = Req(
             rid=i,
             origin_input_text="",
