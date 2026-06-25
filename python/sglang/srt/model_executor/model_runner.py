@@ -1010,26 +1010,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
-    def init_engine(self):
-        try:
-            from mooncake.engine import TransferEngine
-        except ImportError as e:
-            logger.warning(
-                "Please install mooncake for using remote instance transfer engine: pip install mooncake"
-            )
-            return
-        self.engine = TransferEngine()
-        local_ip = get_local_ip_auto()
-        self.engine.initialize(
-            local_ip,
-            "P2PHANDSHAKE",
-            envs.MOONCAKE_PROTOCOL.get(),
-            envs.MOONCAKE_DEVICE.get(),
-        )
-        self.session_id = NetworkAddress(
-            local_ip, self.engine.get_rpc_port()
-        ).to_host_port_str()
-
     def _register_to_engine_info_bootstrap(self):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
