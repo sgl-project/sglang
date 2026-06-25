@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 
 import torch
@@ -23,6 +24,34 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+
+class ShmHostTensorAllocator(HostTensorAllocator):
+    def __init__(self):
+        super().__init__()
+        self.fd = None
+        self.mm = None
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        assert (
+            device == "cpu"
+        ), f"ShmHostTensorAllocator only supports CPU allocations; got device={device!r}"
+        self.dtype = dtype
+        self.dims = dims
+        from sglang.srt.mem_cache.mmap_allocator import alloc_shm
+
+        tensor, fd, mm = alloc_shm(dims, dtype)
+        self.fd = fd
+        self.mm = mm
+        return tensor
+
+    def __del__(self):
+        if hasattr(self, "fd") and self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
 
 
 def get_allocator_from_storage(allocator_type):
@@ -54,6 +83,8 @@ def get_allocator_from_storage(allocator_type):
                 exc,
             )
             return HostTensorAllocator()
+    elif allocator_type == "shm":
+        return ShmHostTensorAllocator()
     else:
         return HostTensorAllocator()
 
