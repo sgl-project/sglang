@@ -18,7 +18,7 @@ class BaseHiddenStatesQuant(ABC):
         self.quant_dtype = quant_dtype
 
     @abstractmethod
-    def forward(
+    def __call__(
         self, hidden_states: torch.Tensor, **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: ...
 
@@ -30,7 +30,7 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     Returns ``(quantized_hidden_states, per‑token_scale)``.
     """
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         quantized, scale = torch.ops.npu.npu_dynamic_quant(
             hidden_states, dst_type=self.quant_dtype
         )
@@ -45,7 +45,7 @@ class HiddenStatesStaticQuant(BaseHiddenStatesQuant):
     ``aclnn_input_offset``. Returns ``(quantized_hidden_states, None)``.
     """
 
-    def forward(
+    def __call__(
         self,
         hidden_states: torch.Tensor,
         layer: torch.nn.Module,
