@@ -3200,22 +3200,37 @@ async def run_encoder(
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
     while True:
         request = await async_sock_recv(encoder.schedule_socket)
-        if isinstance(request, ProfileReq):
-            if request.req_type == ProfileReqType.START_PROFILE:
-                if encoder.profiler is None:
-                    encoder.profiler = EncoderProfiler(encoder.rank)
-                encoder.profiler.start(request)
-            else:
-                encoder.profiler.stop()
-        elif isinstance(request, dict) and request.get("type") == "batch_encode":
-            await encoder.batch_encode(
-                request["requests"],
-                Modality.from_str(request["modality"]),
-            )
+        await _handle_encoder_worker_request(encoder, request)
+
+
+async def _handle_encoder_worker_request(encoder: MMEncoder, request):
+    if isinstance(request, ProfileReq):
+        if request.req_type == ProfileReqType.START_PROFILE:
+            if encoder.profiler is None:
+                encoder.profiler = EncoderProfiler(encoder.rank)
+            encoder.profiler.start(request)
         else:
-            await encoder.encode_request(
-                request, Modality.from_str(request["modality"])
-            )
+            encoder.profiler.stop()
+    elif isinstance(request, dict) and request.get("type") == "batch_encode":
+        await encoder.batch_encode(
+            request["requests"],
+            Modality.from_str(request["modality"]),
+        )
+    elif (
+        isinstance(request, dict)
+        and isinstance(request.get("req_id"), str)
+        and request["req_id"].startswith(HEALTH_CHECK_RID_PREFIX)
+    ):
+        await encoder.encode(
+            mm_items=request["mm_items"],
+            modality=Modality.from_str(request["modality"]),
+            req_id=request["req_id"],
+            num_parts=request["num_parts"],
+            part_idx=request["part_idx"],
+            hashes=request.get("hashes"),
+        )
+    else:
+        await encoder.encode_request(request, Modality.from_str(request["modality"]))
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
