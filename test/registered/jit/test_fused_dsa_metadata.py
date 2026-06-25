@@ -268,6 +268,7 @@ def test_fused_dsa_draft_extend_metadata(real_page_size, seq_dtype, accept_lengt
         max_seqlen_k=max_seqlen_k,
         dsa_index_topk=topk,
         real_page_size=real_page_size,
+        max_total_len=bs * max(accept_lengths),
     )
     torch.cuda.synchronize()
 
@@ -415,3 +416,146 @@ def test_fused_precompute_target_verify_metadata(real_page_size, next_n):
         assert torch.equal(metadata.real_page_table, ref_real)
     else:
         assert metadata.real_page_table is None
+
+
+def _compiled_kernel_cache_size(kernel):
+    return sum(len(entry[0]) for entry in kernel.device_caches.values())
+
+
+def test_fused_metadata_runtime_lengths_do_not_recompile():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+        _fused_dsa_decode_metadata_kernel,
+        _fused_dsa_draft_extend_metadata_kernel,
+        _fused_dsa_target_verify_metadata_kernel,
+        fused_dsa_decode_metadata,
+        fused_dsa_draft_extend_metadata,
+        fused_dsa_target_verify_metadata,
+    )
+
+    device = "cuda"
+    bs = 5
+    next_n = 3
+    max_runtime_len = 260
+    topk = 64
+    req_to_token = torch.randint(
+        0, 100000, (16, max_runtime_len), dtype=torch.int32, device=device
+    )
+    req_pool_indices = torch.tensor([3, 0, 5, 2, 7], dtype=torch.int64, device=device)
+    seq_lens = torch.tensor([101, 97, 88, 105, 93], dtype=torch.int64, device=device)
+    extend_seq_lens = torch.tensor([1, 3, 2, 1, 3], dtype=torch.int32, device=device)
+    extend_seq_lens_short = torch.ones(bs, dtype=torch.int32, device=device)
+    extend_seq_lens_full = torch.full((bs,), next_n, dtype=torch.int32, device=device)
+    max_total_len = bs * next_n
+    total_len = int(extend_seq_lens.cpu().sum().item())
+
+    def decode_call(max_len):
+        fused_dsa_decode_metadata(
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            cache_seqlens=torch.empty(bs, dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+            page_table_1=torch.empty((bs, max_len), dtype=torch.int32, device=device),
+            dsa_cache_seqlens=torch.empty(bs, dtype=torch.int32, device=device),
+            dsa_cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+            real_page_table=torch.empty(
+                (bs, max_len), dtype=torch.int32, device=device
+            ),
+            bs=bs,
+            max_len=max_len,
+            dsa_index_topk=topk,
+            real_page_size=1,
+        )
+
+    def target_call(max_seqlen_k):
+        expanded_size = bs * next_n
+        fused_dsa_target_verify_metadata(
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            cache_seqlens=torch.empty(bs, dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+            page_table_1=torch.empty(
+                (expanded_size, max_seqlen_k), dtype=torch.int32, device=device
+            ),
+            seqlens_expanded=torch.empty(
+                expanded_size, dtype=torch.int32, device=device
+            ),
+            dsa_cache_seqlens=torch.empty(
+                expanded_size, dtype=torch.int32, device=device
+            ),
+            dsa_cu_seqlens_k=torch.empty(
+                expanded_size + 1, dtype=torch.int32, device=device
+            ),
+            real_page_table=torch.empty(
+                (expanded_size, max_seqlen_k), dtype=torch.int32, device=device
+            ),
+            bs=bs,
+            max_seqlen_k=max_seqlen_k,
+            dsa_index_topk=topk,
+            real_page_size=1,
+            next_n=next_n,
+        )
+
+    def draft_call(extend_lens, total, max_seqlen_k):
+        fused_dsa_draft_extend_metadata(
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            cache_seqlens=torch.empty(bs, dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+            page_table_1=torch.empty(
+                (total, max_seqlen_k), dtype=torch.int32, device=device
+            ),
+            seqlens_expanded=torch.empty(total, dtype=torch.int32, device=device),
+            dsa_cache_seqlens=torch.empty(total, dtype=torch.int32, device=device),
+            dsa_cu_seqlens_k=torch.empty(total + 1, dtype=torch.int32, device=device),
+            real_page_table=torch.empty(
+                (total, max_seqlen_k), dtype=torch.int32, device=device
+            ),
+            bs=bs,
+            total_len=total,
+            max_seqlen_k=max_seqlen_k,
+            dsa_index_topk=topk,
+            real_page_size=1,
+            max_total_len=max_total_len,
+        )
+
+    decode_call(101)
+    target_call(101)
+    draft_call(extend_seq_lens, total_len, 101)
+    torch.cuda.synchronize()
+
+    decode_cache_size = _compiled_kernel_cache_size(_fused_dsa_decode_metadata_kernel)
+    target_cache_size = _compiled_kernel_cache_size(
+        _fused_dsa_target_verify_metadata_kernel
+    )
+    draft_cache_size = _compiled_kernel_cache_size(
+        _fused_dsa_draft_extend_metadata_kernel
+    )
+
+    for max_len in [102, 127, 128, 129, 257]:
+        decode_call(max_len)
+    for max_seqlen_k in [102, 127, 128, 129, 257]:
+        target_call(max_seqlen_k)
+        draft_call(extend_seq_lens, total_len, max_seqlen_k)
+    draft_call(extend_seq_lens_short, bs, 257)
+    draft_call(extend_seq_lens_full, max_total_len, 257)
+    torch.cuda.synchronize()
+
+    assert (
+        _compiled_kernel_cache_size(_fused_dsa_decode_metadata_kernel)
+        == decode_cache_size
+    )
+    assert (
+        _compiled_kernel_cache_size(_fused_dsa_target_verify_metadata_kernel)
+        == target_cache_size
+    )
+    assert (
+        _compiled_kernel_cache_size(_fused_dsa_draft_extend_metadata_kernel)
+        == draft_cache_size
+    )

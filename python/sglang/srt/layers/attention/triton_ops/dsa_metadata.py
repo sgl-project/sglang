@@ -3,7 +3,13 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "page_table_stride_0",
+        "real_page_table_stride_0",
+        "max_len",
+    ]
+)
 def _fused_dsa_decode_metadata_kernel(
     seq_lens,
     req_pool_indices,
@@ -18,12 +24,12 @@ def _fused_dsa_decode_metadata_kernel(
     req_pool_indices_stride: tl.constexpr,
     req_to_token_stride_0: tl.constexpr,
     req_to_token_stride_1: tl.constexpr,
-    page_table_stride_0: tl.constexpr,
+    page_table_stride_0,
     page_table_stride_1: tl.constexpr,
-    real_page_table_stride_0: tl.constexpr,
+    real_page_table_stride_0,
     real_page_table_stride_1: tl.constexpr,
     bs: tl.constexpr,
-    max_len: tl.constexpr,
+    max_len,
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
@@ -152,7 +158,13 @@ def fused_dsa_decode_metadata(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "page_table_stride_0",
+        "real_page_table_stride_0",
+        "max_seqlen_k",
+    ]
+)
 def _fused_dsa_target_verify_metadata_kernel(
     seq_lens,
     req_pool_indices,
@@ -168,12 +180,12 @@ def _fused_dsa_target_verify_metadata_kernel(
     req_pool_indices_stride: tl.constexpr,
     req_to_token_stride_0: tl.constexpr,
     req_to_token_stride_1: tl.constexpr,
-    page_table_stride_0: tl.constexpr,
+    page_table_stride_0,
     page_table_stride_1: tl.constexpr,
-    real_page_table_stride_0: tl.constexpr,
+    real_page_table_stride_0,
     real_page_table_stride_1: tl.constexpr,
     bs: tl.constexpr,
-    max_seqlen_k: tl.constexpr,
+    max_seqlen_k,
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     next_n: tl.constexpr,
@@ -206,6 +218,7 @@ def _fused_dsa_target_verify_metadata_kernel(
             other=0,
         ).to(tl.int32)
         expanded_seq = base_seq + draft_off + 1
+        expanded_seq = tl.where(mask_e, expanded_seq, 0)
         dsa_seq = tl.minimum(expanded_seq, dsa_index_topk)
         dsa_cu = tl.cumsum(dsa_seq, 0)
 
@@ -327,7 +340,14 @@ def fused_dsa_target_verify_metadata(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "page_table_stride_0",
+        "real_page_table_stride_0",
+        "total_len",
+        "max_seqlen_k",
+    ]
+)
 def _fused_dsa_draft_extend_metadata_kernel(
     seq_lens,
     extend_seq_lens,
@@ -345,13 +365,13 @@ def _fused_dsa_draft_extend_metadata_kernel(
     req_pool_indices_stride: tl.constexpr,
     req_to_token_stride_0: tl.constexpr,
     req_to_token_stride_1: tl.constexpr,
-    page_table_stride_0: tl.constexpr,
+    page_table_stride_0,
     page_table_stride_1: tl.constexpr,
-    real_page_table_stride_0: tl.constexpr,
+    real_page_table_stride_0,
     real_page_table_stride_1: tl.constexpr,
     bs: tl.constexpr,
-    total_len: tl.constexpr,
-    max_seqlen_k: tl.constexpr,
+    total_len,
+    max_seqlen_k,
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
@@ -463,6 +483,7 @@ def fused_dsa_draft_extend_metadata(
     max_seqlen_k: int,
     dsa_index_topk: int,
     real_page_size: int,
+    max_total_len: int,
 ) -> None:
     assert seq_lens.is_cuda
     assert extend_seq_lens.is_cuda
@@ -477,6 +498,7 @@ def fused_dsa_draft_extend_metadata(
 
     if bs == 0 or total_len == 0:
         return
+    assert total_len <= max_total_len
 
     has_real_page_table = real_page_size > 1
     if has_real_page_table:
@@ -486,7 +508,7 @@ def fused_dsa_draft_extend_metadata(
         real_page_table = page_table_1
 
     block_bs = triton.next_power_of_2(bs)
-    block_expanded = triton.next_power_of_2(total_len)
+    block_expanded = triton.next_power_of_2(max_total_len)
     block_n = 128
     num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
     grid = (1 + total_len * num_col_blocks,)
