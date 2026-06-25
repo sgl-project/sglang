@@ -97,7 +97,6 @@ class HostKVCache(abc.ABC):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
-        self.fd = getattr(self.allocator, "fd", None)
         self.can_use_write_back_jit = False
 
         self.dtype = device_pool.store_dtype
@@ -140,6 +139,7 @@ class HostKVCache(abc.ABC):
             )
 
         self.kv_buffer = self.init_kv_buffer()
+        self.fd = getattr(self.allocator, "fd", None)
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
