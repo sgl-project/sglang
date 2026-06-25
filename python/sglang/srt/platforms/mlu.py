@@ -117,6 +117,9 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
     def get_position_dtype(self) -> torch.dtype:
         return torch.int32
 
+    def get_default_attention_backend(self) -> str:
+        return "mlu"
+
     def get_mha_kv_pool_cls(self) -> type:
         from sglang.srt.hardware_backend.mlu.memory_pool import MLUMHATokenToKVPool
 
