@@ -449,15 +449,9 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     at::Tensor& initial_state_source,
     const at::Tensor& initial_state_indices,
     const at::Tensor& cu_seqlens,
-    bool use_qk_l2norm_in_kernel = true,
+    bool use_qk_l2norm_in_kernel,
     double softplus_beta = 1.0,
-    double softplus_threshold = 20.0,
-    bool is_kda = false,
-    bool disable_state_update = false,
-    const std::optional<at::Tensor>& intermediate_states_buffer = std::nullopt,
-    const std::optional<at::Tensor>& intermediate_state_indices = std::nullopt,
-    int64_t cache_steps = 0,
-    const std::optional<at::Tensor>& retrieve_parent_token = std::nullopt);
+    double softplus_threshold = 20.0);
 // fused_gdn_gating
 std::tuple<at::Tensor, at::Tensor>
 fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b, const at::Tensor& dt_bias);
@@ -749,8 +743,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
-      "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni,"
-      "Tensor(a!)? intermediate_conv_window=None, Tensor? intermediate_state_indices=None) -> Tensor");
+      "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 #endif
 
@@ -787,11 +780,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // fused_sigmoid_gating_delta_rule_update
   m.def(
       "fused_sigmoid_gating_delta_rule_update_cpu(Tensor A_log, Tensor dt_bias, Tensor q, Tensor k, Tensor v, Tensor "
-      "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, "
-      "bool use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0, "
-      "bool is_kda=False, bool disable_state_update=False, "
-      "Tensor(a!)? intermediate_states_buffer=None, Tensor? intermediate_state_indices=None, "
-      "int cache_steps=0, Tensor? retrieve_parent_token=None) -> Tensor");
+      "a, Tensor b, Tensor(a!) initial_state_source, Tensor initial_state_indices, Tensor cu_seqlens, bool "
+      "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
   m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
   // fused_gdn_gating
   m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
