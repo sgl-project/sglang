@@ -87,9 +87,8 @@ class GenerationBatchResult:
 
     @property
     def has_sampled_token_ids(self) -> bool:
-        """True iff next_token_ids is a freshly-sampled GPU tensor to relay via
-        the FutureMap this iter. False for: non-last PP rank / non-final prefill
-        split (None), and the MLX backend (list[int], host-side, no device relay)."""
+        """False when next_token_ids isn't a sampled GPU tensor: None (non-last
+        PP rank / non-final prefill split) or list[int] (MLX backend)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
     @torch.profiler.record_function("copy_result_to_cpu")

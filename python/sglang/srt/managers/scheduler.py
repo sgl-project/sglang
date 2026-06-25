@@ -3375,11 +3375,10 @@ class Scheduler(
     def _relay_forward_payload(
         self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
     ) -> None:
-        """Stash this iter's payload for the next iter's resolve_forward_inputs:
-        spec relays its draft input, else the sampled bonus tokens, else no-op
-        (has_sampled False). Dispatch keys on next_draft_input (not spec_algorithm)
-        so split-prefill relays bonus even under a spec server; callers must skip
-        ngram (no bonus_tokens to project)."""
+        """Stash this iter's relay payload for the next iter's resolve_forward_inputs.
+        Keys on next_draft_input (not spec_algorithm) so split-prefill relays bonus
+        even under a spec server; callers must skip ngram (no bonus_tokens to project).
+        """
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
         elif batch_result.has_sampled_token_ids:
