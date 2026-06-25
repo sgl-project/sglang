@@ -878,9 +878,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
-            self.kernel_warmup()
-            self._pre_initialize_flashinfer_allreduce_workspace()
-            self.init_device_graphs()
             self.maybe_init_gdn_recovery_prewarm()
         elif self.device == "cpu":
             self.init_attention_backend()
