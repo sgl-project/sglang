@@ -79,9 +79,11 @@ def _per_file_diff(commit: str, root: str) -> dict[str, dict]:
     for line in out.splitlines():
         if line.startswith("diff --git"):
             path = line.split(" b/")[-1]
-            files[path] = {"removed": [], "added": [], "new": False}
+            files[path] = {"removed": [], "added": [], "new": False, "deleted": False}
         elif line.startswith("new file"):
             files[path]["new"] = True
+        elif line.startswith("deleted file"):
+            files[path]["deleted"] = True
         elif line.startswith(("+++", "---", "@@", "index ")):
             continue
         elif line.startswith("+"):
@@ -210,6 +212,7 @@ class Recipe:
     import_removals: list = field(default_factory=list)
     import_additions: list = field(default_factory=list)
     typechecking_additions: list = field(default_factory=list)
+    deletes: list = field(default_factory=list)
     notes: list = field(default_factory=list)
 
 
@@ -325,6 +328,30 @@ def _wants_future_import(files: dict[str, dict], src: str, dst: str) -> bool:
     gained = any(future in line for line in files[dst]["added"])
     travelled = any(future in line for line in files[src]["removed"])
     return gained and not travelled
+
+
+def _next_sibling_def_name(
+    dst_tree: ast.AST, name: str, into_class: str | None
+) -> str | None:
+    """The name of the def that immediately follows ``name`` at its scope in the destination
+    (module level, or inside ``into_class``), or None when ``name`` is the last def there. Lets
+    a move reinsert the relocated def in the chain's order instead of appending at the end.
+    """
+    container: list = []
+    if into_class is not None:
+        cls = rr._find_class(dst_tree, into_class)
+        container = cls.body if cls is not None else []
+    else:
+        container = getattr(dst_tree, "body", [])
+    defs = [
+        n
+        for n in container
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    for i, node in enumerate(defs):
+        if node.name == name:
+            return defs[i + 1].name if i + 1 < len(defs) else None
+    return None
 
 
 def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
@@ -453,6 +480,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 "into_class": into_class,
                 "dedent": src_indent - dst_indent,
                 "dst_order": dst_def.lineno if dst_def else 0,
+                "before": _next_sibling_def_name(dst_tree, name, into_class),
                 "drop_self_annotation": _self_annotation_dropped(
                     rr._find_def(src_tree, name), dst_def
                 ),
@@ -496,6 +524,13 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             if key not in before_tc:
                 recipe.typechecking_additions.append({"path": path, "text": stmt})
 
+    # A move source the commit deletes (its defs all relocated, leaving only scaffolding) is
+    # removed after the moves; move_symbol only cuts defs, it does not delete the emptied file.
+    move_srcs = {mv["src"] for mv in recipe.moves}
+    for path, f in files.items():
+        if f.get("deleted") and path in move_srcs:
+            recipe.deletes.append(path)
+
     if not recipe.moves and not recipe.extracts:
         recipe.supported = False
         if not recipe.notes:
@@ -527,7 +562,9 @@ def build_repro(recipe: Recipe) -> rr.Repro:
         )
     for im in recipe.import_removals:
         repro.remove_import(im["path"], im["text"], in_function=im["in_function"])
-    for mv in sorted(recipe.moves, key=lambda m: (m["dst"], m["dst_order"])):
+    # Apply same-destination moves in reverse order so each move's ``before`` anchor (a sibling
+    # with a higher dst position) is already present when it is inserted.
+    for mv in sorted(recipe.moves, key=lambda m: (m["dst"], -m["dst_order"])):
         repro.move_symbol(
             mv["name"],
             src=mv["src"],
@@ -535,6 +572,7 @@ def build_repro(recipe: Recipe) -> rr.Repro:
             into_class=mv["into_class"],
             dedent=mv["dedent"],
             drop_self_annotation=mv["drop_self_annotation"],
+            before=mv.get("before"),
         )
     for ex in recipe.extracts:
         repro.extract_to_new_module(
@@ -543,6 +581,8 @@ def build_repro(recipe: Recipe) -> rr.Repro:
             symbols=ex["symbols"],
             future_import=ex["future_import"],
         )
+    for path in recipe.deletes:
+        repro.delete_file(path)
     for im in recipe.import_additions:
         repro.add_import(im["path"], im["text"])
     for im in recipe.typechecking_additions:
@@ -591,17 +631,20 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
         lines.append(f"r.add_import({im['path']!r}, {im['text']!r})")
     for im in recipe.typechecking_additions:
         lines.append(f"r.add_typechecking_import({im['path']!r}, {im['text']!r})")
-    for mv in sorted(recipe.moves, key=lambda m: (m["dst"], m["dst_order"])):
+    for mv in sorted(recipe.moves, key=lambda m: (m["dst"], -m["dst_order"])):
         lines.append(
             f"r.move_symbol({mv['name']!r}, src={mv['src']!r}, dst={mv['dst']!r}, "
             f"into_class={mv['into_class']!r}, dedent={mv['dedent']}, "
-            f"drop_self_annotation={mv['drop_self_annotation']!r})"
+            f"drop_self_annotation={mv['drop_self_annotation']!r}, "
+            f"before={mv.get('before')!r})"
         )
     for ex in recipe.extracts:
         lines.append(
             f"r.extract_to_new_module({ex['src']!r}, {ex['dst']!r}, "
             f"symbols={ex['symbols']!r}, future_import={ex['future_import']!r})"
         )
+    for path in recipe.deletes:
+        lines.append(f"r.delete_file({path!r})")
     lines += ["r.run()", ""]
     return "\n".join(lines)
 

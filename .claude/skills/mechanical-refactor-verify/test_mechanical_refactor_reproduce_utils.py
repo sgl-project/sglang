@@ -460,6 +460,64 @@ def test_move_symbol_to_module_level_with_dedent(tmp_path: Path) -> None:
     assert "def helper" not in (tmp_path / "src.py").read_text()
 
 
+def test_move_symbol_before_inserts_above_named_sibling(tmp_path: Path) -> None:
+    """With before=, the relocated def lands immediately above that sibling, not at the end."""
+    (tmp_path / "src.py").write_text(
+        "class Old:\n    @staticmethod\n    def moved(self):\n        return 1\n"
+    )
+    (tmp_path / "dst.py").write_text(
+        "class New:\n"
+        "    def first(self):\n        return 0\n"
+        "\n"
+        "    def last(self):\n        return 2\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "moved", src="src.py", dst="dst.py", into_class="New", before="last"
+    )
+    _apply(r, tmp_path)
+    dst_out = (tmp_path / "dst.py").read_text()
+    assert (
+        dst_out.index("def first")
+        < dst_out.index("def moved")
+        < dst_out.index("def last")
+    )
+
+
+def test_delete_file_removes_emptied_source(tmp_path: Path) -> None:
+    """delete_file removes a source module left empty after its defs relocated."""
+    (tmp_path / "gone.py").write_text("import os\n")
+    r = Repro("b", "t").delete_file("gone.py")
+    _apply(r, tmp_path)
+    assert not (tmp_path / "gone.py").exists()
+
+
+def test_move_symbol_leave_delegate_keeps_forwarding_stub(tmp_path: Path) -> None:
+    """With leave_delegate, the source keeps a forwarding stub through the named field and the
+    destination gets the full method body."""
+    (tmp_path / "src.py").write_text(
+        "class Mixin:\n"
+        "    def compute(self, n: int) -> int:\n"
+        "        return n + self.cfg.base\n"
+    )
+    (tmp_path / "dst.py").write_text(
+        "class Cfg:\n    def existing(self):\n        return 0\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "compute",
+        src="src.py",
+        dst="dst.py",
+        into_class="Cfg",
+        leave_delegate="cfg",
+    )
+    _apply(r, tmp_path)
+    src_out = (tmp_path / "src.py").read_text()
+    dst_out = (tmp_path / "dst.py").read_text()
+    assert "def compute(self, n: int) -> int:" in src_out
+    assert "return self.cfg.compute(n)" in src_out
+    assert "return n + self.cfg.base" not in src_out
+    assert "return n + self.cfg.base" in dst_out
+
+
 # --- Repro.run end-to-end ------------------------------------------------------
 
 

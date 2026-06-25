@@ -393,12 +393,17 @@ class Repro:
         into_class: str | None,
         dedent: int = 0,
         drop_self_annotation: bool = False,
+        before: str | None = None,
+        leave_delegate: str | None = None,
+        delegate_name: str | None = None,
     ) -> "Repro":
-        """Cut ``def name`` (with decorators) from ``src`` and paste it into ``dst`` -- at
-        the end of ``into_class`` (or module level when None) -- dropping a move decorator
-        and dedenting by ``dedent``. When ``drop_self_annotation``, the moved method's
-        ``self: Target`` annotation is dropped (redundant inside the class). The body is moved
-        verbatim; the formatter normalises the surrounding blank lines."""
+        """Cut ``def name`` (with decorators) from ``src`` and paste it into ``dst`` --
+        immediately above the sibling def ``before`` when given (so the relocated def lands in
+        the chain's order), else at the end of ``into_class`` (or module level when None) --
+        dropping a move decorator and dedenting by ``dedent``. When ``drop_self_annotation``,
+        the moved method's ``self: Target`` annotation is dropped (redundant inside the class).
+        The body is moved verbatim; the formatter normalises the surrounding blank lines.
+        """
 
         def op(root: Path) -> None:
             src_path = root / src
@@ -408,7 +413,27 @@ class Repro:
             assert node is not None, f"{name} not found in {src}"
             start, end = _def_span(node)
             block = src_lines[start - 1 : end]
-            src_path.write_text("".join(src_lines[: start - 1] + src_lines[end:]))
+            if leave_delegate is not None:
+                args = node.args
+                parts = [p.arg for p in args.posonlyargs + args.args if p.arg != "self"]
+                if args.vararg is not None:
+                    parts.append(f"*{args.vararg.arg}")
+                parts += [f"{k.arg}={k.arg}" for k in args.kwonlyargs]
+                if args.kwarg is not None:
+                    parts.append(f"**{args.kwarg.arg}")
+                body_start = node.body[0].lineno
+                signature = src_lines[start - 1 : body_start - 1]
+                body_indent = " " * node.body[0].col_offset
+                forward = (
+                    f"{body_indent}return self.{leave_delegate}."
+                    f"{delegate_name or name}({', '.join(parts)})\n"
+                )
+                delegate = "".join(signature) + forward
+                src_path.write_text(
+                    "".join(src_lines[: start - 1] + [delegate] + src_lines[end:])
+                )
+            else:
+                src_path.write_text("".join(src_lines[: start - 1] + src_lines[end:]))
 
             kept = [ln for ln in block if ln.strip() not in _MOVE_DECORATORS]
             if dedent:
@@ -420,15 +445,40 @@ class Repro:
                 method_text = _drop_self_annotation(method_text, name)
 
             dst_lines = dst_path.read_text().splitlines(keepends=True)
+            dst_tree = ast.parse("".join(dst_lines))
+            container = dst_tree.body
             if into_class is not None:
-                cls = _find_class(ast.parse("".join(dst_lines)), into_class)
+                cls = _find_class(dst_tree, into_class)
                 assert cls is not None, f"class {into_class} not found in {dst}"
-                at = cls.end_lineno
+                container = cls.body
+            target = None
+            if before is not None:
+                target = next(
+                    (
+                        n
+                        for n in container
+                        if isinstance(
+                            n,
+                            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                        )
+                        and n.name == before
+                    ),
+                    None,
+                )
+            if target is not None:
+                at = _def_span(target)[0] - 1
+                dst_path.write_text(
+                    "".join(dst_lines[:at] + [method_text, "\n"] + dst_lines[at:])
+                )
             else:
-                at = len(dst_lines)
-            dst_path.write_text(
-                "".join(dst_lines[:at] + ["\n", method_text] + dst_lines[at:])
-            )
+                at = (
+                    container[-1].end_lineno
+                    if into_class is not None
+                    else len(dst_lines)
+                )
+                dst_path.write_text(
+                    "".join(dst_lines[:at] + ["\n", method_text] + dst_lines[at:])
+                )
 
         self.ops.append(op)
         return self
@@ -491,6 +541,18 @@ class Repro:
             prefix = "from __future__ import annotations\n" if future_import else ""
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             dst_path.write_text(prefix + block)
+
+        self.ops.append(op)
+        return self
+
+    def delete_file(self, path: str) -> "Repro":
+        """Delete a source module that its symbols' relocation left empty (the chain deletes
+        the leftover scaffolding-only file). Run after the moves that empty it."""
+
+        def op(root: Path) -> None:
+            target = root / path
+            if target.exists():
+                target.unlink()
 
         self.ops.append(op)
         return self
