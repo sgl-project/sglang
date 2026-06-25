@@ -83,6 +83,7 @@ from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
 
+
 class DiffusionGemmaAttention(nn.Module):
     """Gemma4 attention with a per-phase causal/bidirectional switch.
 

@@ -1918,7 +1918,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
 
         local_layer_id = layer_id - self.start_layer
         if self._gs_calibrated[local_layer_id]:

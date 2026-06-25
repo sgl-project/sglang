@@ -1261,15 +1261,21 @@ class Req(ReqDllmMixin):
                     self.cache_protected_len,
                     getattr(tree_cache, "page_size", None),
                     getattr(tree_cache, "disable", None),
-                    type(self.last_node).__name__
-                    if self.last_node is not None
-                    else None,
-                    type(self.last_host_node).__name__
-                    if self.last_host_node is not None
-                    else None,
-                    type(self.best_match_node).__name__
-                    if self.best_match_node is not None
-                    else None,
+                    (
+                        type(self.last_node).__name__
+                        if self.last_node is not None
+                        else None
+                    ),
+                    (
+                        type(self.last_host_node).__name__
+                        if self.last_host_node is not None
+                        else None
+                    ),
+                    (
+                        type(self.best_match_node).__name__
+                        if self.best_match_node is not None
+                        else None
+                    ),
                     envs.SGLANG_RADIX_FORCE_MISS.get(),
                 )
 

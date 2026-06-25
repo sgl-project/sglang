@@ -126,8 +126,11 @@ from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
 )
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
     get_attention_tp_group,
     initialize_dp_attention,
+    set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.hash_topk import HashTopK
@@ -197,10 +200,6 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
-from sglang.srt.utils.common import (
-    require_attn_tp_gather,
-    require_mlp_tp_gather,
-)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     broadcast_pyobj,
@@ -220,6 +219,10 @@ from sglang.srt.utils import (
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
+)
+from sglang.srt.utils.common import (
+    require_attn_tp_gather,
+    require_mlp_tp_gather,
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
@@ -961,7 +964,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "only for graph-safety experiments."
             )
 
-
     def _calibrate_nvfp4_kv_cache(self) -> None:
         """Run one eager prefill to freeze NVFP4 KV global scales before capture."""
         fp4_pools = self._get_nvfp4_native_kv_pools()
@@ -1003,15 +1005,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise RuntimeError("no request-pool slot available")
 
             vocab_size = max(1, int(self.model_config.vocab_size))
-            input_ids = torch.arange(
-                num_tokens, dtype=torch.int64, device=self.device
-            ) % vocab_size
-            positions = torch.arange(
-                num_tokens, dtype=torch.int64, device=self.device
+            input_ids = (
+                torch.arange(num_tokens, dtype=torch.int64, device=self.device)
+                % vocab_size
             )
-            seq_lens = torch.tensor(
-                [num_tokens], dtype=torch.int64, device=self.device
-            )
+            positions = torch.arange(num_tokens, dtype=torch.int64, device=self.device)
+            seq_lens = torch.tensor([num_tokens], dtype=torch.int64, device=self.device)
             seq_lens_cpu = torch.tensor([num_tokens], dtype=torch.int64)
             extend_prefix_lens = torch.zeros(
                 (1,), dtype=torch.int32, device=self.device
@@ -1152,9 +1151,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 sum(1 for flag in getattr(pool, "_gs_calibrated", []) if flag)
                 for pool in fp4_pools
             )
-            total = sum(
-                len(getattr(pool, "_gs_calibrated", [])) for pool in fp4_pools
-            )
+            total = sum(len(getattr(pool, "_gs_calibrated", [])) for pool in fp4_pools)
             if calibrated != total:
                 raise RuntimeError(
                     f"only calibrated {calibrated}/{total} NVFP4 KV layers"

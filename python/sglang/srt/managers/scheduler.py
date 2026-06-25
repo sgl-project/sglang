@@ -2220,7 +2220,9 @@ class Scheduler(
             if req.return_logprob:
                 unsupported.append("logprobs")
             if sp.regex or sp.json_schema or sp.ebnf or sp.structural_tag:
-                unsupported.append("structured output (regex/json_schema/ebnf/structural_tag)")
+                unsupported.append(
+                    "structured output (regex/json_schema/ebnf/structural_tag)"
+                )
             if sp.logit_bias:
                 unsupported.append("logit_bias")
             if (

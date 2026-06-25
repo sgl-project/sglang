@@ -461,9 +461,7 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 
 
 class Gemma4VisionPooler(nn.Module):
-    def __init__(
-        self, config: Gemma4VisionConfig, mask_pad_before_pool: bool = False
-    ):
+    def __init__(self, config: Gemma4VisionConfig, mask_pad_before_pool: bool = False):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.root_hidden_size = self.hidden_size**0.5
