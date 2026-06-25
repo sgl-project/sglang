@@ -69,6 +69,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_mlu = platforms.current_platform.is_mlu()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -293,6 +294,8 @@ class GroupCoordinator:
             self.device = torch.device(f"xpu:{local_rank}")
         elif _is_musa:
             self.device = torch.device(f"musa:{local_rank}")
+        elif _is_mlu:
+            self.device = torch.device(f"mlu:{local_rank}")
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
@@ -446,6 +449,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.xpu_communicator import (
             XpuCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.mlu_communicator import (
+            MluCommunicator,
+        )
 
         self.hpu_communicator: Optional[HpuCommunicator] = None
         if use_hpu_communicator and self.world_size > 1:
@@ -458,6 +464,10 @@ class GroupCoordinator:
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
+
+        self.mlu_communicator: Optional[MluCommunicator] = None
+        if _is_mlu and self.world_size > 1:
+            self.mlu_communicator = MluCommunicator(group=self.device_group)
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -609,6 +619,9 @@ class GroupCoordinator:
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
+
+        if self.mlu_communicator is not None and not self.mlu_communicator.disabled:
+            return self.mlu_communicator.all_reduce(input_)
 
         should_use_pymscclpp_allreduce = (
             self.pymscclpp_comm is not None
@@ -973,6 +986,11 @@ class GroupCoordinator:
         npu_comm = self.npu_communicator
         if npu_comm is not None and not npu_comm.disabled:
             return npu_comm.all_gather(input_, dim)
+
+        # For MLUs, use MLU communicator.
+        mlu_comm = self.mlu_communicator
+        if mlu_comm is not None and not mlu_comm.disabled:
+            return mlu_comm.all_gather(input_, dim)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -1562,7 +1580,7 @@ def init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
+            not (_is_npu or _is_xpu or _is_mlu or backend == "mooncake")
             if use_pynccl is None
             else use_pynccl
         ),
