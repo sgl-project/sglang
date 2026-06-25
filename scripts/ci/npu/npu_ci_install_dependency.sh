@@ -70,9 +70,9 @@ mkdir sgl-kernel-npu
 
 ### Install custom_ops
 mkdir custom_ops
-(cd custom_ops && wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/CANN-custom_ops-none-linux.aarch64.run && \
-wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/cann-ops-transformer-custom_linux-aarch64.run && \
-wget https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/custom_ops-1.0-cp311-cp311-linux_aarch64.whl && \
+(cd custom_ops && wget "${GITHUB_PROXY_URL:=""}https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/CANN-custom_ops-none-linux.aarch64.run" && \
+wget "${GITHUB_PROXY_URL:=""}https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/cann-ops-transformer-custom_linux-aarch64.run" && \
+wget "${GITHUB_PROXY_URL:=""}https://github.com/randgun/sgl-kernel-npu/releases/download/other-op/custom_ops-1.0-cp311-cp311-linux_aarch64.whl" && \
 chmod +x *.run && \
 ./CANN-custom_ops-none-linux.aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
 ./cann-ops-transformer-custom_linux-aarch64.run --install-path=/usr/local/Ascend/cann-9.0.0/opp && \
