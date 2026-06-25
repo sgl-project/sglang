@@ -32,6 +32,7 @@ class AMXAttentionBackend(AttentionBackend):
     def get_impl_cls() -> type["AMXATTNImpl"]:
         return AMXATTNImpl
 
+
 class AMXATTNImpl(AttentionImpl):
 
     def __init__(
@@ -65,5 +66,5 @@ class AMXATTNImpl(AttentionImpl):
             max_seqlen_q,
             max_seqlen_k,
             self.causal,
-            self.softmax_scale
+            self.softmax_scale,
         ).unsqueeze(0)

@@ -172,7 +172,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 x = x.view(-1, x.shape[-1])
             output = torch.ops.sgl_kernel.weight_packed_linear(
-                x,
+                x.to(layer.weight.dtype),
                 layer.weight,
                 bias,
                 True,  # is_vnni
