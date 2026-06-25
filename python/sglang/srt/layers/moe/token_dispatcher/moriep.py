@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -35,10 +36,6 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 # Blockwise quantization group sizes: number of elements sharing one scale factor
@@ -217,8 +214,8 @@ def init_mori_op(
 
     import mori
 
-    world_size = get_moe_expert_parallel_world_size()
-    rank = get_moe_expert_parallel_rank()
+    world_size = get_parallel().moe_ep_size
+    rank = get_parallel().moe_ep_rank
 
     gpu_per_node = 8 if world_size >= 8 else world_size
 
@@ -1048,7 +1045,7 @@ class MoriEPDispatcher(BaseDispatcher):
         # experts that are not local to this rank.
         self.expert_mask_gpu = None
         if _use_aiter and num_experts is not None and num_local_experts is not None:
-            ep_rank = get_moe_expert_parallel_rank()
+            ep_rank = get_parallel().moe_ep_rank
             expert_mask = torch.zeros(
                 num_experts,
                 device=torch.cuda.current_device(),

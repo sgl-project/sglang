@@ -99,7 +99,9 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             "Interleave attention dispatch will land in a follow-up PR"
         )
 
-    def materialize_full_kv(self, forward_batch, layer: Any, k: Any, v: Any) -> None:
+    def materialize_full_kv(
+        self, forward_batch, layer: Any, k: Any, v: Any, swa_loc: Optional[Any] = None
+    ) -> None:
         raise NotImplementedError(
             "Interleave KV materialization will land in a follow-up PR"
         )
