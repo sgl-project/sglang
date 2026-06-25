@@ -27,7 +27,7 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -207,10 +207,20 @@ class Eagle3MLAModel(nn.Module):
             getattr(config, "target_hidden_size", None) or config.hidden_size
         )
         self.num_aux_hidden_states = _get_eagle_aux_layer_count(config)
-        self.fc = nn.Linear(
+        # The fc projection over concatenated aux hidden states is the single
+        # largest draft weight (target_hidden * num_aux x hidden ~= 300 MB at
+        # bf16 for Kimi-K2.x). Shard it column-wise across TP so each rank reads
+        # only its 1/TP slice of the weight, then all-gather the partial outputs
+        # back to the replicated hidden the rest of the draft layer expects. At
+        # decode token counts this is HBM-bandwidth bound, so the gather is far
+        # cheaper than every rank re-reading the full weight.
+        self.fc = ColumnParallelLinear(
             target_hidden_size * self.num_aux_hidden_states,
             config.hidden_size,
             bias=getattr(config, "bias", False),
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
         )
 
         # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy
@@ -278,7 +288,7 @@ class Eagle3MLAModel(nn.Module):
                     [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
                     dim=-1,
                 )
-            hidden_states = self.fc(hidden_states)
+            hidden_states, _ = self.fc(hidden_states)
 
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
