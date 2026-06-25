@@ -7,6 +7,8 @@ import torch
 from sglang.srt.utils.common import (
     _get_fastapi_request_path,
     flatten_arrays_to_int64_tensor,
+    get_device_sm_nvidia_smi,
+    get_nvidia_driver_version_str,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -94,6 +96,99 @@ class TestGetFastapiRequestPath(CustomTestCase):
         path, handled = _get_fastapi_request_path(self._request(app, "/nope"))
         self.assertEqual(path, "/nope")
         self.assertFalse(handled)
+
+
+class TestNvidiaDriverVersionStr(CustomTestCase):
+    """`get_nvidia_driver_version_str` is typed as `str | None`: it returns
+    `None` when nvidia-smi is missing, fails, or emits an empty string. These
+    tests exercise both the success and the None-return paths by monkey-
+    patching `subprocess.run`, so they don't require a GPU. The function is
+    `@lru_cache`d, so the cache is cleared around each test to make the patch
+    observable.
+    """
+
+    def setUp(self):
+        get_nvidia_driver_version_str.cache_clear()
+
+    def tearDown(self):
+        get_nvidia_driver_version_str.cache_clear()
+
+    def test_returns_version_string(self):
+        import subprocess
+
+        class _R:
+            stdout = "595.58.03\n"
+
+        original = subprocess.run
+        subprocess.run = lambda *a, **k: _R()
+        try:
+            self.assertEqual(get_nvidia_driver_version_str(), "595.58.03")
+        finally:
+            subprocess.run = original
+
+    def test_returns_none_on_empty_output(self):
+        import subprocess
+
+        class _R:
+            stdout = "\n"
+
+        original = subprocess.run
+        subprocess.run = lambda *a, **k: _R()
+        try:
+            self.assertIsNone(get_nvidia_driver_version_str())
+        finally:
+            subprocess.run = original
+
+    def test_returns_none_on_called_process_error(self):
+        import subprocess
+
+        original = subprocess.run
+
+        def boom(*a, **k):
+            raise subprocess.CalledProcessError(1, "nvidia-smi")
+
+        subprocess.run = boom
+        try:
+            self.assertIsNone(get_nvidia_driver_version_str())
+        finally:
+            subprocess.run = original
+
+    def test_returns_none_on_file_not_found(self):
+        import subprocess
+
+        original = subprocess.run
+
+        def boom(*a, **k):
+            raise FileNotFoundError("nvidia-smi")
+
+        subprocess.run = boom
+        try:
+            self.assertIsNone(get_nvidia_driver_version_str())
+        finally:
+            subprocess.run = original
+
+
+class TestGetDeviceSmNvidiaSmi(CustomTestCase):
+    """`get_device_sm_nvidia_smi` parses nvidia-smi output into a (major,
+    minor) tuple and falls back to (0, 0) -- logging via `logger.error` --
+    when nvidia-smi fails. The success path needs a GPU; the fallback path is
+    covered here by forcing a failure and asserting the (0, 0) return. The
+    fallback path needs no GPU, so this test runs on CPU.
+    """
+
+    def test_fallback_on_failure_returns_zero_zero(self):
+        import subprocess
+
+        original = subprocess.run
+
+        def boom(*a, **k):
+            raise subprocess.CalledProcessError(1, "nvidia-smi")
+
+        subprocess.run = boom
+        try:
+            self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
+        finally:
+            subprocess.run = original
 
 
 if __name__ == "__main__":
