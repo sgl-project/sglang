@@ -48,10 +48,6 @@ def set_global_dwdp_manager(manager: Optional[DwdpManager]) -> None:
 _EXPERT_WEIGHT_NAMES = (
     "w13_weight",
     "w2_weight",
-    "w13_weight_sf",
-    "w2_weight_sf",
-    "w1_alpha",
-    "w2_alpha",
 )
 
 
