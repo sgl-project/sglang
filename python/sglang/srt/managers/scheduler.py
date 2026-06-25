@@ -2079,6 +2079,8 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                pd_rebootstrap_prefill_url=recv_req.pd_rebootstrap_prefill_url,
+                pd_rebootstrap_forced_output_id=recv_req.pd_rebootstrap_forced_output_id,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -3983,7 +3985,16 @@ class Scheduler(
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+                    if self.disaggregation_mode == DisaggregationMode.DECODE:
+                        if hasattr(req, "kv_cache_cpu"):
+                            del req.kv_cache_cpu
+                        if req.output_ids:
+                            req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+                        req.pd_rebootstrap_in_progress = True
+                        req.time_stats.set_retract_time()
+                        self.disagg_decode_prealloc_queue.add_rebootstrap(req)
+                    else:
+                        self._add_request_to_queue(req)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None

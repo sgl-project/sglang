@@ -291,6 +291,131 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.62)
 
 
+class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.launch_all()
+
+    def test_retract_pause_decode_running_batch(self):
+        """Retract-mode pause on a disagg decode node must preserve in-flight
+        requests that are already in running_batch."""
+        asyncio.run(self._run_pause_on_decode_running_batch("retract"))
+
+    async def _get_decode_num_running_reqs(self, session):
+        """Query current decode running_batch size from /v1/loads."""
+        async with session.get(
+            self.decode_url + "/v1/loads?include=core",
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            resp.raise_for_status()
+            body = await resp.json()
+            return sum(load["num_running_reqs"] for load in body["loads"])
+
+    async def _wait_for_decode_running_batch(self, session, timeout):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            if await self._get_decode_num_running_reqs(session) > 0:
+                return
+            await asyncio.sleep(0.2)
+
+        self.fail("Timed out waiting for decode running_batch to become non-empty")
+
+    async def _run_pause_on_decode_running_batch(self, mode):
+        num_requests = 2
+        max_new_tokens = 512
+        prompt = "Write a detailed numbered explanation of distributed inference. " * 12
+
+        async def _post(session, url, json_data, timeout=30):
+            async with session.post(
+                url,
+                json=json_data,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+
+        async def _generate(session, request_id):
+            return await _post(
+                session,
+                self.lb_url + "/generate",
+                {
+                    "text": f"Request {request_id}: {prompt}",
+                    "background": True,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "ignore_eos": True,
+                        "max_new_tokens": max_new_tokens,
+                    },
+                },
+                timeout=180,
+            )
+
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                asyncio.create_task(_generate(session, i)) for i in range(num_requests)
+            ]
+            decode_paused = False
+
+            try:
+                await self._wait_for_decode_running_batch(session, timeout=30)
+                await asyncio.sleep(0.1)
+
+                self.assertTrue(
+                    any(not task.done() for task in tasks),
+                    "All requests finished before decode retract pause was issued.",
+                )
+
+                await _post(
+                    session,
+                    self.decode_url + "/pause_generation",
+                    {"mode": mode},
+                )
+                decode_paused = True
+                await asyncio.sleep(1)
+                await _post(session, self.decode_url + "/continue_generation", {})
+                decode_paused = False
+
+                responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=180)
+            finally:
+                if decode_paused:
+                    try:
+                        await _post(
+                            session, self.decode_url + "/continue_generation", {}
+                        )
+                    except Exception:
+                        pass
+
+                unfinished = [task for task in tasks if not task.done()]
+                if unfinished:
+                    for url in [self.prefill_url, self.decode_url]:
+                        try:
+                            await _post(
+                                session,
+                                url + "/abort_request",
+                                {"abort_all": True},
+                            )
+                        except Exception:
+                            pass
+                    for task in unfinished:
+                        task.cancel()
+                    await asyncio.gather(*unfinished, return_exceptions=True)
+
+            for response in responses:
+                self.assertIn("text", response)
+                self.assertGreater(len(response["text"]), 0)
+
+            self.assertGreater(
+                sum(
+                    response.get("meta_info", {}).get("num_retractions", 0)
+                    for response in responses
+                ),
+                0,
+                "Expected pause_generation(retract) to retract a running decode request.",
+            )
+
+
 class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
     """Regression test: pause_generation must not leak prefill requests into
     running_batch.  With a small --max-running-requests the leak fills the

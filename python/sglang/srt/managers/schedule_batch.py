@@ -693,6 +693,8 @@ class Req(ReqDllmMixin):
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        pd_rebootstrap_prefill_url: Optional[str] = None,
+        pd_rebootstrap_forced_output_id: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
@@ -981,6 +983,10 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.pd_rebootstrap_prefill_url: Optional[str] = pd_rebootstrap_prefill_url
+        self.pd_rebootstrap_forced_output_id: Optional[int] = (
+            pd_rebootstrap_forced_output_id
+        )
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 

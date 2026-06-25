@@ -215,6 +215,13 @@ class GenerateReqInput:
     bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+    # Internal PD retract/rebootstrap support. The router injects the selected
+    # prefill HTTP URL so a decode worker can ask the same prefill worker to
+    # recompute stale KV after pause_generation(mode="retract") and cache flush.
+    pd_rebootstrap_prefill_url: Optional[Union[List[str], str]] = None
+    # Internal prefill-only override used by decode rebootstrap to replay the
+    # last already-emitted token while recomputing KV under newer weights.
+    pd_rebootstrap_forced_output_id: Optional[int] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -648,6 +655,16 @@ class GenerateReqInput:
         elif isinstance(self.decode_tp_size, list):
             self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
 
+        # Normalize pd_rebootstrap_prefill_url
+        if self.pd_rebootstrap_prefill_url is None:
+            self.pd_rebootstrap_prefill_url = [None] * num
+        elif not isinstance(self.pd_rebootstrap_prefill_url, list):
+            self.pd_rebootstrap_prefill_url = [self.pd_rebootstrap_prefill_url] * num
+        elif isinstance(self.pd_rebootstrap_prefill_url, list):
+            self.pd_rebootstrap_prefill_url = (
+                self.pd_rebootstrap_prefill_url * self.parallel_sample_num
+            )
+
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
@@ -718,6 +735,12 @@ class GenerateReqInput:
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
+            pd_rebootstrap_prefill_url=(
+                self.pd_rebootstrap_prefill_url[i]
+                if self.pd_rebootstrap_prefill_url is not None
+                else None
+            ),
+            pd_rebootstrap_forced_output_id=self.pd_rebootstrap_forced_output_id,
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
@@ -793,6 +816,8 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+    pd_rebootstrap_prefill_url: Optional[str] = None
+    pd_rebootstrap_forced_output_id: Optional[int] = None
 
     # For DP routing
     routed_dp_rank: Optional[int] = None

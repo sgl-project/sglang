@@ -20,7 +20,10 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import queue
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -28,6 +31,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import requests
 import torch
 from torch.distributed import ProcessGroup
 
@@ -253,6 +257,7 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    is_rebootstrap: bool = False
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -324,6 +329,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        rebootstrap_prefill_workers = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
+        if rebootstrap_prefill_workers is None:
+            rebootstrap_prefill_workers = 4
+        self._rebootstrap_prefill_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, rebootstrap_prefill_workers),
+            thread_name_prefix="pd-rebootstrap-prefill",
+        )
+        self._rebootstrap_prefill_sessions = threading.local()
+        self._failed_rebootstrap_prefill_reqs: queue.SimpleQueue[Req] = (
+            queue.SimpleQueue()
+        )
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -527,7 +543,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return None
 
-    def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:
+    def _create_receiver_and_enqueue(
+        self, req: Req, is_rebootstrap: bool = False
+    ) -> DecodeRequest:
         backend = (
             TransferBackend.FAKE
             if _is_fake_transfer(req, self.scheduler.server_args)
@@ -541,13 +559,165 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             bootstrap_room=req.bootstrap_room,
         )
 
-        decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
+        decode_req = DecodeRequest(
+            req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
+        )
         self.queue.append(decode_req)
         return decode_req
 
+    def add_rebootstrap(self, req: Req) -> None:
+        """Queue a pause-generation rebootstrap request.
+
+        Unlike OOM retraction, this path must not resume stale CPU KV. Decode
+        preallocates fresh destination pages, then asks the original prefill
+        worker to recompute the prefix KV under the current weights.
+        """
+        if self._check_if_req_exceed_kv_capacity(req):
+            return
+
+        decode_req = self._create_receiver_and_enqueue(req, is_rebootstrap=True)
+        if _is_fake_transfer(req, self.scheduler.server_args):
+            decode_req.kv_receiver.init(0)
+            return
+
+        prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+        logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
+        if prefill_dp_rank is not None:
+            decode_req.kv_receiver.init(prefill_dp_rank)
+            return
+
+        self.pending_reqs.append(decode_req)
+
+    @staticmethod
+    def _rebootstrap_prefill_len(req: Req) -> int:
+        if getattr(req, "pd_rebootstrap_in_progress", False):
+            return len(req.origin_input_ids) + len(req.output_ids)
+        return len(req.origin_input_ids)
+
+    @staticmethod
+    def _pre_alloc_fill_len(req: Req) -> int:
+        if getattr(req, "pd_rebootstrap_in_progress", False):
+            return len(req.origin_input_ids) + len(req.output_ids)
+        return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+
+    @staticmethod
+    def _sampling_params_for_rebootstrap(req: Req) -> dict:
+        sp = req.sampling_params
+        return {
+            "max_new_tokens": 1,
+            "temperature": sp.temperature,
+            "top_p": sp.top_p,
+            "top_k": sp.top_k,
+            "min_p": sp.min_p,
+            "frequency_penalty": sp.frequency_penalty,
+            "presence_penalty": sp.presence_penalty,
+            "repetition_penalty": sp.repetition_penalty,
+            "ignore_eos": sp.ignore_eos,
+            "skip_special_tokens": sp.skip_special_tokens,
+            "spaces_between_special_tokens": sp.spaces_between_special_tokens,
+            "no_stop_trim": sp.no_stop_trim,
+        }
+
+    def _abort_rebootstrap_prefill(
+        self,
+        decode_req: DecodeRequest,
+        error_message: str,
+        status_code: HTTPStatus,
+        *,
+        stream_output: bool,
+    ) -> None:
+        req = decode_req.req
+        prepare_abort(req, error_message, status_code=status_code)
+        decode_req.kv_receiver.abort()
+        if stream_output:
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+        else:
+            self._failed_rebootstrap_prefill_reqs.put(req)
+
+    def drain_rebootstrap_prefill_failures(self) -> None:
+        while True:
+            try:
+                req = self._failed_rebootstrap_prefill_reqs.get_nowait()
+            except queue.Empty:
+                return
+            if not getattr(req, "finished_output", False):
+                self.scheduler.output_streamer.stream_output(
+                    [req], req.return_logprob
+                )
+
+    def _get_rebootstrap_prefill_session(self) -> requests.Session:
+        session = getattr(self._rebootstrap_prefill_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._rebootstrap_prefill_sessions.session = session
+        return session
+
+    def submit_rebootstrap_prefill(self, decode_req: DecodeRequest) -> None:
+        req = decode_req.req
+        prefill_url = req.pd_rebootstrap_prefill_url
+        if not prefill_url:
+            self._abort_rebootstrap_prefill(
+                decode_req,
+                "PD retract rebootstrap requires pd_rebootstrap_prefill_url from the router.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                stream_output=True,
+            )
+            return
+
+        payload = {
+            "input_ids": list(req.origin_input_ids) + list(req.output_ids),
+            "sampling_params": self._sampling_params_for_rebootstrap(req),
+            "return_logprob": False,
+            "stream": False,
+            "rid": req.rid,
+            "bootstrap_host": req.bootstrap_host,
+            "bootstrap_port": req.bootstrap_port,
+            "bootstrap_room": req.bootstrap_room,
+            "pd_rebootstrap_prefill_url": prefill_url,
+            "pd_rebootstrap_forced_output_id": req.pd_rebootstrap_forced_output_id,
+            "priority": req.priority,
+            "extra_key": req.extra_key,
+            "routing_key": req.routing_key,
+            "disagg_prefill_dp_rank": req.disagg_prefill_dp_rank,
+        }
+
+        def _post_rebootstrap() -> None:
+            try:
+                response = self._get_rebootstrap_prefill_session().post(
+                    prefill_url.rstrip("/") + "/generate",
+                    json=payload,
+                    timeout=envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(),
+                )
+                if response.status_code >= 400:
+                    logger.error(
+                        "PD rebootstrap prefill failed for rid=%s status=%s body=%s",
+                        req.rid,
+                        response.status_code,
+                        response.text[:512],
+                    )
+                    self._abort_rebootstrap_prefill(
+                        decode_req,
+                        "PD retract rebootstrap prefill request failed.",
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        stream_output=False,
+                    )
+            except Exception:
+                logger.exception(
+                    "PD rebootstrap prefill request failed for rid=%s", req.rid
+                )
+                self._abort_rebootstrap_prefill(
+                    decode_req,
+                    "PD retract rebootstrap prefill request failed.",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    stream_output=False,
+                )
+
+        self._rebootstrap_prefill_executor.submit(_post_rebootstrap)
+
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        input_len = self._rebootstrap_prefill_len(req)
+        if input_len > self.max_total_num_tokens:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {self.max_total_num_tokens}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
@@ -817,10 +987,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                self.scheduler.output_streamer.stream_output(
-                    [decode_req.req],
-                    decode_req.req.return_logprob,
-                )
+                if not getattr(decode_req.req, "finished_output", False):
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req],
+                        decode_req.req.return_logprob,
+                    )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
@@ -863,9 +1034,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
-            origin_input_len = len(decode_req.req.origin_input_ids)
+            origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
-            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            use_decode_radix_cache = (
+                self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+                and not decode_req.is_rebootstrap
+            )
+            if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
                 prefix_indices = prefix_match.prefix_indices
@@ -877,7 +1052,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
 
-                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
+                fill_len = self._pre_alloc_fill_len(decode_req.req)
                 required_alloc_tokens = self._required_alloc_tokens(
                     fill_len=fill_len, prefix_len=prefix_len
                 )
@@ -894,7 +1069,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_indices = None
                 prefix_len = 0
                 total_prefix_len = 0
-                required_alloc_tokens = origin_input_len
+                required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
 
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
@@ -992,7 +1167,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     .numpy()
                 )
 
-            seq_len = len(decode_req.req.origin_input_ids)
+            seq_len = origin_input_len
 
             def _mamba_payload():
                 return [
@@ -1065,6 +1240,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 decode_prefix_len=total_prefix_len,
             )
+            if decode_req.is_rebootstrap:
+                self.submit_rebootstrap_prefill(decode_req)
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1298,7 +1475,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
-        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        fill_len = self._pre_alloc_fill_len(req)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
@@ -1756,9 +1933,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_queue()
             if self._engine_paused:
                 continue
+            self.process_decode_queue()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1788,9 +1965,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_queue()
             if self._engine_paused:
                 continue
+            self.process_decode_queue()
 
             self._apply_war_barrier()
 
@@ -1938,6 +2115,8 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        self.disagg_decode_prealloc_queue.drain_rebootstrap_prefill_failures()
+
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

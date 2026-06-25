@@ -1,8 +1,10 @@
+import queue
 import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.decode import (  # noqa: E402
@@ -205,6 +207,92 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
 
 
+class TestDecodePreallocQueueRebootstrap(unittest.TestCase):
+    def _sampling_params(self):
+        return SimpleNamespace(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=-1,
+            min_p=0.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            repetition_penalty=1.0,
+            ignore_eos=False,
+            skip_special_tokens=True,
+            spaces_between_special_tokens=True,
+            no_stop_trim=False,
+        )
+
+    def _new_rebootstrap_queue(self, session):
+        rebootstrap_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        rebootstrap_queue.scheduler = MagicMock()
+        rebootstrap_queue._rebootstrap_prefill_executor = MagicMock()
+        rebootstrap_queue._rebootstrap_prefill_sessions = SimpleNamespace(
+            session=session
+        )
+        rebootstrap_queue._failed_rebootstrap_prefill_reqs = queue.SimpleQueue()
+        return rebootstrap_queue
+
+    def _new_decode_req(self):
+        req = SimpleNamespace(
+            rid="rid-0",
+            origin_input_ids=np.array([1, 2], dtype=np.int32),
+            output_ids=[3, 4],
+            sampling_params=self._sampling_params(),
+            return_logprob=False,
+            bootstrap_host="127.0.0.1",
+            bootstrap_port=30000,
+            bootstrap_room=7,
+            pd_rebootstrap_prefill_url="http://prefill",
+            pd_rebootstrap_forced_output_id=5,
+            priority=10,
+            extra_key=None,
+            routing_key=None,
+            disagg_prefill_dp_rank=None,
+            finished_output=False,
+        )
+        return SimpleNamespace(req=req, kv_receiver=MagicMock())
+
+    def test_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=200, text="")
+        rebootstrap_queue = self._new_rebootstrap_queue(session)
+        decode_req = self._new_decode_req()
+
+        rebootstrap_queue.submit_rebootstrap_prefill(decode_req)
+
+        rebootstrap_queue._rebootstrap_prefill_executor.submit.assert_called_once()
+        submitted = rebootstrap_queue._rebootstrap_prefill_executor.submit.call_args[0][
+            0
+        ]
+        submitted()
+
+        session.post.assert_called_once()
+        payload = session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
+
+    def test_rebootstrap_failure_is_drained_to_stream_output(self):
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=500, text="failed")
+        rebootstrap_queue = self._new_rebootstrap_queue(session)
+        decode_req = self._new_decode_req()
+
+        rebootstrap_queue.submit_rebootstrap_prefill(decode_req)
+        submitted = rebootstrap_queue._rebootstrap_prefill_executor.submit.call_args[0][
+            0
+        ]
+        submitted()
+
+        decode_req.kv_receiver.abort.assert_called_once()
+        rebootstrap_queue.scheduler.stream_output.assert_not_called()
+
+        rebootstrap_queue.drain_rebootstrap_prefill_failures()
+
+        rebootstrap_queue.scheduler.stream_output.assert_called_once_with(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+
+
 class TestDecodePrebuiltPriority(unittest.TestCase):
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -229,8 +317,8 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         )
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
-        scheduler.policy.calc_priority.side_effect = (
-            lambda waiting_queue, _: waiting_queue.sort(key=lambda req: -req.priority)
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
+            waiting_queue.sort(key=lambda req: -req.priority)
         )
 
         new_batch = MagicMock()
