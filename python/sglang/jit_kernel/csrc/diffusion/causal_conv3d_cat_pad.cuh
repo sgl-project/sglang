@@ -8,8 +8,9 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>    // For RuntimeCheck, div_ceil
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
+
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel
 
 #include <cstdint>
@@ -43,9 +44,7 @@ __global__ void __launch_bounds__(kBlockSize) cat_pad_flat_kernel(
   };
 
   const int64_t nthreads = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       vid < total_vecs;
-       vid += nthreads) {
+  for (int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; vid < total_vecs; vid += nthreads) {
     int64_t base = vid * kVec;
     int64_t ow = base % out_w;
     int64_t tmp = base / out_w;
@@ -63,11 +62,9 @@ __global__ void __launch_bounds__(kBlockSize) cat_pad_flat_kernel(
     const ET* src = nullptr;
     if (interior) {
       if (src_t < cache_t) {
-        src =
-            cache + (((ob * channels + oc) * cache_t + src_t) * h_size + ih) * w_size;
+        src = cache + (((ob * channels + oc) * cache_t + src_t) * h_size + ih) * w_size;
       } else {
-        src = x
-            + (((ob * channels + oc) * t_size + (src_t - cache_t)) * h_size + ih) * w_size;
+        src = x + (((ob * channels + oc) * t_size + (src_t - cache_t)) * h_size + ih) * w_size;
       }
     }
 
@@ -100,11 +97,9 @@ __global__ void __launch_bounds__(kBlockSize) cat_pad_flat_kernel(
         interior = ih >= 0 && ih < h_size && src_t >= 0 && src_t < cache_t + t_size;
         if (interior) {
           if (src_t < cache_t) {
-            src =
-                cache + (((ob * channels + oc) * cache_t + src_t) * h_size + ih) * w_size;
+            src = cache + (((ob * channels + oc) * cache_t + src_t) * h_size + ih) * w_size;
           } else {
-            src = x
-                + (((ob * channels + oc) * t_size + (src_t - cache_t)) * h_size + ih) * w_size;
+            src = x + (((ob * channels + oc) * t_size + (src_t - cache_t)) * h_size + ih) * w_size;
           }
         } else {
           src = nullptr;
@@ -135,8 +130,7 @@ void launch_cat_pad_flat(
     int64_t pad_w_left,
     DLDevice device) {
   const int64_t total_vecs = total / kVec;
-  const uint32_t grid =
-      static_cast<uint32_t>(host::div_ceil(total_vecs, static_cast<int64_t>(kBlockSize)));
+  const uint32_t grid = static_cast<uint32_t>(host::div_ceil(total_vecs, static_cast<int64_t>(kBlockSize)));
   host::LaunchKernel(grid, kBlockSize, device)(
       cat_pad_flat_kernel<ET, kVec>,
       static_cast<const ET*>(x),
@@ -160,8 +154,8 @@ void launch_cat_pad_flat(
 
 template <typename T>
 struct CausalConv3dCatPadKernel {
-  static void run(
-      tvm::ffi::TensorView out,
+  static void
+  run(tvm::ffi::TensorView out,
       tvm::ffi::TensorView x,
       tvm::ffi::TensorView cache,
       int64_t pad_w_left,
@@ -202,21 +196,18 @@ struct CausalConv3dCatPadKernel {
     RuntimeCheck(pad_d_right == 0, "pad_d_right must be 0");
     RuntimeCheck(pad_w_left == pad_w_right, "width padding must be symmetric");
     RuntimeCheck(pad_h_top == pad_h_bottom, "height padding must be symmetric");
-    RuntimeCheck(
-        out_t.unwrap() == t_size.unwrap() + cache_t.unwrap() + depth_left + pad_d_right, "out_t mismatch");
+    RuntimeCheck(out_t.unwrap() == t_size.unwrap() + cache_t.unwrap() + depth_left + pad_d_right, "out_t mismatch");
     RuntimeCheck(out_h.unwrap() == h_size.unwrap() + pad_h_top + pad_h_bottom, "out_h mismatch");
     RuntimeCheck(out_w.unwrap() == w_size.unwrap() + pad_w_left + pad_w_right, "out_w mismatch");
 
-    const int64_t total =
-        bsz.unwrap() * channels.unwrap() * out_t.unwrap() * out_h.unwrap() * out_w.unwrap();
+    const int64_t total = bsz.unwrap() * channels.unwrap() * out_t.unwrap() * out_h.unwrap() * out_w.unwrap();
     if (total == 0) {
       return;
     }
 
     constexpr int kVec = 16 / sizeof(T);
     RuntimeCheck(total % kVec == 0, "output element count must be divisible by vector width");
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "output pointer must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "output pointer must be 16-byte aligned");
 
     if constexpr (sizeof(T) == 2) {
       launch_cat_pad_flat<uint16_t, kVec>(
