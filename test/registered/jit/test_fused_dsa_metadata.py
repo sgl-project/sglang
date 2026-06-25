@@ -1,9 +1,38 @@
 import pytest
 import torch
 
+from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
+    DeepseekSparseAttnBackendMTPPrecomputeMixin,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
+
+
+class _DummyDSAPrecomputeBackend(DeepseekSparseAttnBackendMTPPrecomputeMixin):
+    def __init__(self, req_to_token, real_page_size, topk, next_n):
+        self.req_to_token = req_to_token
+        self.real_page_size = real_page_size
+        self.dsa_index_topk = topk
+        self.speculative_num_draft_tokens = next_n
+        self.device = req_to_token.device
+        self.dsa_decode_impl = "none"
+
+    def _transform_table_1_to_real(self, page_table):
+        if self.real_page_size == 1:
+            return page_table
+        return (
+            page_table[
+                :,
+                torch.arange(
+                    0,
+                    page_table.shape[1],
+                    self.real_page_size,
+                    device=page_table.device,
+                ),
+            ]
+            // self.real_page_size
+        )
 
 
 @pytest.mark.parametrize("real_page_size", [1, 4])
@@ -277,3 +306,112 @@ def test_fused_dsa_draft_extend_metadata(real_page_size, seq_dtype, accept_lengt
         ref_real = ref_real // real_page_size
         assert torch.equal(real_page_table[:, : ref_real.shape[1]], ref_real)
         assert torch.all(real_page_table[:, ref_real.shape[1] :] == -1)
+
+
+@pytest.mark.parametrize("real_page_size", [1, 4])
+def test_fused_precompute_decode_metadata(real_page_size):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = "cuda"
+    bs = 6
+    max_len = 37
+    topk = 23
+    req_to_token = (
+        torch.arange(8 * 80, dtype=torch.int32, device=device).view(8, 80).mul_(3)
+    )
+    req_pool_indices = torch.tensor(
+        [3, 0, 5, 2, 7, 1], dtype=torch.int64, device=device
+    )
+    seq_lens = torch.tensor([37, 12, 23, 4, 31, 18], dtype=torch.int64, device=device)
+    seq_lens_cpu = seq_lens.cpu()
+
+    backend = _DummyDSAPrecomputeBackend(req_to_token, real_page_size, topk, next_n=3)
+    metadata = backend._precompute_decode_mode(
+        bs, req_pool_indices, seq_lens, seq_lens_cpu
+    )
+
+    ref_cache = seq_lens.to(torch.int32)
+    ref_page = req_to_token[req_pool_indices, :max_len]
+    ref_dsa = ref_cache.clamp(max=topk)
+
+    assert torch.equal(metadata.cache_seqlens, ref_cache)
+    assert torch.equal(
+        metadata.cu_seqlens_k,
+        torch.nn.functional.pad(torch.cumsum(ref_cache, 0), (1, 0)),
+    )
+    assert torch.equal(metadata.page_indices, ref_page)
+    assert metadata.seqlens_expanded is metadata.cache_seqlens
+    assert torch.equal(metadata.dsa_cache_seqlens, ref_dsa)
+    assert torch.equal(
+        metadata.dsa_cu_seqlens_k,
+        torch.nn.functional.pad(torch.cumsum(ref_dsa, 0), (1, 0)),
+    )
+    assert metadata.seqlens_expanded_size == bs
+    assert metadata.max_len == max_len
+    assert metadata.max_seqlen_k == max_len
+
+    if real_page_size > 1:
+        ref_real = ref_page[:, torch.arange(0, max_len, real_page_size, device=device)]
+        ref_real = ref_real // real_page_size
+        assert torch.equal(metadata.real_page_table, ref_real)
+    else:
+        assert metadata.real_page_table is None
+
+
+@pytest.mark.parametrize("real_page_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 3])
+def test_fused_precompute_target_verify_metadata(real_page_size, next_n):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = "cuda"
+    bs = 5
+    topk = 23
+    req_to_token = (
+        torch.arange(8 * 80, dtype=torch.int32, device=device).view(8, 80).mul_(3)
+    )
+    req_pool_indices = torch.tensor([3, 0, 5, 2, 7], dtype=torch.int64, device=device)
+    seq_lens = torch.tensor([37, 12, 23, 4, 31], dtype=torch.int64, device=device)
+    seq_lens_cpu = seq_lens.cpu()
+    max_seqlen_k = int(seq_lens_cpu.max().item() + next_n)
+    expanded_size = bs * next_n
+
+    backend = _DummyDSAPrecomputeBackend(req_to_token, real_page_size, topk, next_n)
+    metadata = backend._precompute_target_verify_mode(
+        bs, req_pool_indices, seq_lens, seq_lens_cpu
+    )
+
+    ref_cache = seq_lens.to(torch.int32) + next_n
+    ref_page = req_to_token[req_pool_indices, :max_seqlen_k]
+    ref_page = torch.repeat_interleave(ref_page, repeats=next_n, dim=0)
+    ref_expanded = (
+        seq_lens.to(torch.int32).view(bs, 1)
+        + torch.arange(1, next_n + 1, dtype=torch.int32, device=device).view(1, next_n)
+    ).reshape(-1)
+    ref_dsa = ref_expanded.clamp(max=topk)
+
+    assert torch.equal(metadata.cache_seqlens, ref_cache)
+    assert torch.equal(
+        metadata.cu_seqlens_k,
+        torch.nn.functional.pad(torch.cumsum(ref_cache, 0), (1, 0)),
+    )
+    assert torch.equal(metadata.page_indices, ref_page)
+    assert torch.equal(metadata.seqlens_expanded, ref_expanded)
+    assert torch.equal(metadata.dsa_cache_seqlens, ref_dsa)
+    assert torch.equal(
+        metadata.dsa_cu_seqlens_k,
+        torch.nn.functional.pad(torch.cumsum(ref_dsa, 0), (1, 0)),
+    )
+    assert metadata.seqlens_expanded_size == expanded_size
+    assert metadata.max_len == -1
+    assert metadata.max_seqlen_k == max_seqlen_k
+
+    if real_page_size > 1:
+        ref_real = ref_page[
+            :, torch.arange(0, max_seqlen_k, real_page_size, device=device)
+        ]
+        ref_real = ref_real // real_page_size
+        assert torch.equal(metadata.real_page_table, ref_real)
+    else:
+        assert metadata.real_page_table is None

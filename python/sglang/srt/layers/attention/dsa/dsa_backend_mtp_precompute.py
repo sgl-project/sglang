@@ -11,10 +11,17 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+_USE_FUSED_METADATA_GENERATION = (
+    envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not is_hip()
+)
+_warned_fused_precompute_failure = False
 
 
 @dataclass
@@ -114,7 +121,91 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         seq_lens_cpu: torch.Tensor,
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
+        global _USE_FUSED_METADATA_GENERATION
+        global _warned_fused_precompute_failure
+
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
+
+        if _USE_FUSED_METADATA_GENERATION and is_cuda():
+            try:
+                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                    fused_dsa_decode_metadata,
+                )
+
+                cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
+                cu_seqlens_k = torch.empty(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+                page_indices = torch.empty(
+                    (bs, max_len), dtype=torch.int32, device=self.device
+                )
+                dsa_cache_seqlens = torch.empty(
+                    bs, dtype=torch.int32, device=self.device
+                )
+                dsa_cu_seqlens_k = torch.empty(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+                if self.real_page_size > 1:
+                    real_cols = (
+                        max_len + self.real_page_size - 1
+                    ) // self.real_page_size
+                    real_page_table = torch.empty(
+                        (bs, real_cols), dtype=torch.int32, device=self.device
+                    )
+                    real_page_table_arg = real_page_table
+                else:
+                    real_page_table = None
+                    real_page_table_arg = page_indices
+
+                fused_dsa_decode_metadata(
+                    seq_lens=seq_lens,
+                    req_pool_indices=req_pool_indices,
+                    req_to_token=self.req_to_token,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_k=cu_seqlens_k,
+                    page_table_1=page_indices,
+                    dsa_cache_seqlens=dsa_cache_seqlens,
+                    dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                    real_page_table=real_page_table_arg,
+                    bs=bs,
+                    max_len=max_len,
+                    dsa_index_topk=self.dsa_index_topk,
+                    real_page_size=self.real_page_size,
+                )
+                seqlens_expanded = cache_seqlens
+                seqlens_expanded_size = bs
+
+                flashmla_metadata = None
+                if self.dsa_decode_impl == "flashmla_kv":
+                    flashmla_metadata = self._compute_flashmla_metadata(
+                        cache_seqlens=dsa_cache_seqlens,
+                        seq_len_q=1,
+                    )
+
+                return PrecomputedMetadata(
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_k=cu_seqlens_k,
+                    page_indices=page_indices,
+                    real_page_table=real_page_table,
+                    seqlens_expanded=seqlens_expanded,
+                    dsa_cache_seqlens=dsa_cache_seqlens,
+                    dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                    seqlens_expanded_size=seqlens_expanded_size,
+                    max_len=max_len,
+                    max_seqlen_k=max_len,
+                    flashmla_metadata=flashmla_metadata,
+                )
+            except Exception as e:
+                if not _warned_fused_precompute_failure:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "Fused DSA decode metadata precompute failed; "
+                        "falling back to eager metadata precompute. Error: %s",
+                        e,
+                    )
+                    _warned_fused_precompute_failure = True
+                _USE_FUSED_METADATA_GENERATION = False
 
         # Convert to int32 and compute cumsum
         cache_seqlens = seq_lens.to(torch.int32)
@@ -169,9 +260,103 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         seq_lens_cpu: torch.Tensor,
     ) -> PrecomputedMetadata:
         """Precompute metadata for target verify mode."""
+        global _USE_FUSED_METADATA_GENERATION
+        global _warned_fused_precompute_failure
+
         max_seqlen_k = int(
             seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
         )
+        seqlens_expanded_size = bs * self.speculative_num_draft_tokens
+
+        if _USE_FUSED_METADATA_GENERATION and is_cuda():
+            try:
+                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                    fused_dsa_target_verify_metadata,
+                )
+
+                cache_seqlens = torch.empty(bs, dtype=torch.int32, device=self.device)
+                cu_seqlens_k = torch.empty(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+                page_indices = torch.empty(
+                    (seqlens_expanded_size, max_seqlen_k),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seqlens_expanded = torch.empty(
+                    seqlens_expanded_size, dtype=torch.int32, device=self.device
+                )
+                dsa_cache_seqlens = torch.empty(
+                    seqlens_expanded_size, dtype=torch.int32, device=self.device
+                )
+                dsa_cu_seqlens_k = torch.empty(
+                    seqlens_expanded_size + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                if self.real_page_size > 1:
+                    real_cols = (
+                        max_seqlen_k + self.real_page_size - 1
+                    ) // self.real_page_size
+                    real_page_table = torch.empty(
+                        (seqlens_expanded_size, real_cols),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    real_page_table_arg = real_page_table
+                else:
+                    real_page_table = None
+                    real_page_table_arg = page_indices
+
+                fused_dsa_target_verify_metadata(
+                    seq_lens=seq_lens,
+                    req_pool_indices=req_pool_indices,
+                    req_to_token=self.req_to_token,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_k=cu_seqlens_k,
+                    page_table_1=page_indices,
+                    seqlens_expanded=seqlens_expanded,
+                    dsa_cache_seqlens=dsa_cache_seqlens,
+                    dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                    real_page_table=real_page_table_arg,
+                    bs=bs,
+                    max_seqlen_k=max_seqlen_k,
+                    dsa_index_topk=self.dsa_index_topk,
+                    real_page_size=self.real_page_size,
+                    next_n=self.speculative_num_draft_tokens,
+                )
+
+                flashmla_metadata = None
+                if self.dsa_decode_impl == "flashmla_kv":
+                    flashmla_metadata = self._compute_flashmla_metadata(
+                        cache_seqlens=dsa_cache_seqlens,
+                        seq_len_q=1,
+                    )
+
+                return PrecomputedMetadata(
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_k=cu_seqlens_k,
+                    page_indices=page_indices,
+                    real_page_table=real_page_table,
+                    seqlens_expanded=seqlens_expanded,
+                    dsa_cache_seqlens=dsa_cache_seqlens,
+                    dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                    seqlens_expanded_size=seqlens_expanded_size,
+                    max_len=-1,
+                    max_seqlen_k=max_seqlen_k,
+                    flashmla_metadata=flashmla_metadata,
+                )
+            except Exception as e:
+                if not _warned_fused_precompute_failure:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "Fused DSA target-verify metadata precompute failed; "
+                        "falling back to eager metadata precompute. Error: %s",
+                        e,
+                    )
+                    _warned_fused_precompute_failure = True
+                _USE_FUSED_METADATA_GENERATION = False
 
         # Cache seqlens with draft tokens
         cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(torch.int32)
