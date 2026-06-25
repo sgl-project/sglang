@@ -20,26 +20,25 @@ def write_dsa_only_k_topk_paged_kernel(
     token_to_batch_idx_ptr,
     out_ptr,
     valid_rows,
-    total_elements,
     page_table_stride,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < total_elements
-    row = offsets // TOPK
-    col = offsets - row * TOPK
+    row = tl.program_id(0)
+    col_block_id = tl.program_id(1)
+    col = col_block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    col_mask = col < TOPK
     row_valid = row < valid_rows
 
-    length = tl.load(lengths_ptr + row, mask=mask & row_valid, other=0)
-    batch_idx = tl.load(token_to_batch_idx_ptr + row, mask=mask & row_valid, other=0)
+    length = tl.load(lengths_ptr + row, mask=row_valid, other=0)
+    batch_idx = tl.load(token_to_batch_idx_ptr + row, mask=row_valid, other=0)
     in_range = row_valid & (col < length)
     values = tl.load(
         page_table_ptr + batch_idx * page_table_stride + col,
-        mask=mask & in_range,
+        mask=col_mask & in_range,
         other=-1,
     )
-    tl.store(out_ptr + offsets, values, mask=mask)
+    tl.store(out_ptr + row * TOPK + col, values, mask=col_mask)
 
 
 def write_dsa_only_k_topk_paged(
@@ -72,14 +71,13 @@ def write_dsa_only_k_topk_paged(
         return output
 
     block_size = 1024
-    grid = (triton.cdiv(output.numel(), block_size),)
+    grid = (output.shape[0], triton.cdiv(topk, block_size))
     write_dsa_only_k_topk_paged_kernel[grid](
         page_table,
         lengths,
         token_to_batch_idx,
         output,
         valid_rows=lengths.shape[0],
-        total_elements=output.numel(),
         page_table_stride=page_table.stride(0),
         TOPK=topk,
         BLOCK_SIZE=block_size,
