@@ -218,6 +218,11 @@ class TestTreeNode(unittest.TestCase):
         self.assertIsNone(node.host_value)
         self.assertIsNone(node.hash_value)
 
+    def test_init_agent_meta_default_none(self):
+        """Test TreeNode agent metadata defaults to None."""
+        node = TreeNode()
+        self.assertIsNone(node.agent_meta)
+
     def test_init_with_id(self):
         """Test initialization with custom ID."""
         node = TreeNode(id=42)
@@ -354,6 +359,54 @@ class TestRadixCache(unittest.TestCase):
                 self.assertEqual(cache.device, torch.device("cpu"))
                 self.assertIsNotNone(cache.root_node)
                 self.assertEqual(len(cache.root_node.key), 0)
+
+    def test_annotate_agent_cache_node_sets_metadata(self):
+        """Test agent_hints annotate radix cache node metadata."""
+        cache = RadixCache.create_simulated()
+        node = TreeNode()
+        req = unittest.mock.Mock()
+        req.agent_hints = {
+            "workflow_id": "wf-1",
+            "agent_id": "agent-1",
+            "step_id": "step-1",
+            "parent_step_id": "root",
+            "expected_tool_duration_ms": 1000,
+            "cache_ttl_ms": 60000,
+            "reuse_hint": "keep",
+        }
+
+        before = time.monotonic()
+        cache._annotate_agent_cache_node(req, node)
+
+        self.assertEqual(node.agent_meta["workflow_id"], "wf-1")
+        self.assertEqual(node.agent_meta["agent_id"], "agent-1")
+        self.assertEqual(node.agent_meta["step_id"], "step-1")
+        self.assertEqual(node.agent_meta["parent_step_id"], "root")
+        self.assertEqual(node.agent_meta["expected_tool_duration_ms"], 1000)
+        self.assertEqual(node.agent_meta["cache_ttl_ms"], 60000)
+        self.assertEqual(node.agent_meta["reuse_hint"], "keep")
+        self.assertGreaterEqual(node.agent_meta["cache_ttl_deadline"], before)
+
+    def test_annotate_agent_cache_node_ignores_missing_hints(self):
+        """Test missing agent_hints leaves node metadata unchanged."""
+        cache = RadixCache.create_simulated()
+        node = TreeNode()
+        req = unittest.mock.Mock()
+        req.agent_hints = None
+
+        cache._annotate_agent_cache_node(req, node)
+
+        self.assertIsNone(node.agent_meta)
+
+    def test_annotate_agent_cache_node_ignores_root_node(self):
+        """Test root node is not annotated."""
+        cache = RadixCache.create_simulated()
+        req = unittest.mock.Mock()
+        req.agent_hints = {"workflow_id": "wf-1", "reuse_hint": "keep"}
+
+        cache._annotate_agent_cache_node(req, cache.root_node)
+
+        self.assertIsNone(cache.root_node.agent_meta)
 
     def test_reset(self):
         """Test reset method."""

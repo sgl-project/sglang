@@ -609,6 +609,11 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             require_reasoning=require_reasoning,
             priority=request.priority,
+            agent_hints=(
+                request.agent_hints.model_dump(exclude_none=True)
+                if request.agent_hints is not None
+                else None
+            ),
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,

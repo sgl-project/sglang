@@ -207,6 +207,33 @@ class StreamOptions(BaseModel):
     continuous_usage_stats: Optional[bool] = False
 
 
+class AgentHints(BaseModel):
+    workflow_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    step_id: Optional[str] = None
+    step_index: Optional[int] = None
+    total_steps: Optional[int] = None
+    parent_step_id: Optional[str] = None
+    children_step_ids: Optional[List[str]] = None
+    tool_name: Optional[str] = None
+    expected_tool_duration_ms: Optional[int] = None
+    cache_ttl_ms: Optional[int] = None
+    shared_prefix_hash: Optional[str] = None
+    reuse_hint: Optional[str] = None
+
+    @field_validator(
+        "step_index",
+        "total_steps",
+        "expected_tool_duration_ms",
+        "cache_ttl_ms",
+    )
+    @classmethod
+    def validate_non_negative(cls, value):
+        if value is not None and value < 0:
+            raise ValueError("must be non-negative")
+        return value
+
+
 class JsonSchemaResponseFormat(BaseModel):
     name: str
     description: Optional[str] = None
@@ -381,6 +408,8 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Agent-aware KV cache hints. Optional experimental metadata.
+    agent_hints: Optional[AgentHints] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -753,6 +782,8 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Agent-aware KV cache hints. Optional experimental metadata.
+    agent_hints: Optional[AgentHints] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None

@@ -1,6 +1,8 @@
 import copy
 import unittest
 
+import pytest
+
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -469,6 +471,56 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req = GenerateReqInput(text="Hello", extra_key="solo")
         req.normalize_batch_and_arguments()
         self.assertEqual(req.extra_key, "solo")
+
+    def test_generate_req_input_batch_preserves_agent_hints(self):
+        req = GenerateReqInput(
+            text=["a", "b"],
+            sampling_params={},
+            agent_hints=[
+                {"workflow_id": "wf-1", "step_id": "a", "reuse_hint": "keep"},
+                {"workflow_id": "wf-1", "step_id": "b", "reuse_hint": "low"},
+            ],
+        )
+
+        req.normalize_batch_and_arguments()
+
+        assert req[0].agent_hints["step_id"] == "a"
+        assert req[0].agent_hints["reuse_hint"] == "keep"
+        assert req[1].agent_hints["step_id"] == "b"
+        assert req[1].agent_hints["reuse_hint"] == "low"
+
+    def test_generate_req_input_single_agent_hints_dict_broadcasts_to_batch(self):
+        req = GenerateReqInput(
+            text=["a", "b"],
+            sampling_params={},
+            agent_hints={"workflow_id": "wf-1", "reuse_hint": "keep"},
+        )
+
+        req.normalize_batch_and_arguments()
+
+        assert req[0].agent_hints == {"workflow_id": "wf-1", "reuse_hint": "keep"}
+        assert req[1].agent_hints == {"workflow_id": "wf-1", "reuse_hint": "keep"}
+        assert req[0].agent_hints is not req[1].agent_hints
+
+    def test_generate_req_input_agent_hints_default_none(self):
+        req = GenerateReqInput(
+            text="hello",
+            sampling_params={},
+        )
+
+        req.normalize_batch_and_arguments()
+
+        assert req.agent_hints is None
+
+    def test_generate_req_input_agent_hints_rejects_bad_batch_length(self):
+        req = GenerateReqInput(
+            text=["a", "b"],
+            sampling_params={},
+            agent_hints=[{"workflow_id": "wf-1"}],
+        )
+
+        with pytest.raises(ValueError, match="agent_hints"):
+            req.normalize_batch_and_arguments()
 
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""

@@ -1,5 +1,7 @@
 """Unit tests for evict_policy.py"""
 
+import time
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -9,6 +11,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.evict_policy import (
+    AgentAwareStrategy,
     FIFOStrategy,
     FILOStrategy,
     LFUStrategy,
@@ -25,6 +28,7 @@ def _make_node(**kwargs):
     node.hit_count = kwargs.get("hit_count", 0)
     node.creation_time = kwargs.get("creation_time", 0.0)
     node.priority = kwargs.get("priority", 0)
+    node.agent_meta = kwargs.get("agent_meta", None)
     return node
 
 
@@ -137,6 +141,86 @@ class TestPriorityStrategy(unittest.TestCase):
         new = _make_node(priority=3, last_access_time=10.0)
         self.assertLess(
             self.strategy.get_priority(old), self.strategy.get_priority(new)
+        )
+
+
+class TestAgentAwareStrategy(unittest.TestCase):
+    def setUp(self):
+        self.strategy = AgentAwareStrategy()
+
+    def test_falls_back_to_lru_without_metadata(self):
+        old = _make_node(last_access_time=1.0)
+        new = _make_node(last_access_time=10.0)
+
+        self.assertLess(
+            self.strategy.get_priority(old),
+            self.strategy.get_priority(new),
+        )
+
+    def test_protects_active_ttl(self):
+        now = time.monotonic()
+        normal = _make_node(last_access_time=10.0)
+        protected = _make_node(
+            last_access_time=1.0,
+            agent_meta={"cache_ttl_deadline": now + 60.0},
+        )
+
+        self.assertLess(
+            self.strategy.get_priority(normal),
+            self.strategy.get_priority(protected),
+        )
+
+    def test_expired_ttl_evicted_before_normal_node(self):
+        now = time.monotonic()
+        normal = _make_node(last_access_time=1.0)
+        expired = _make_node(
+            last_access_time=10.0,
+            agent_meta={"cache_ttl_deadline": now - 1.0},
+        )
+
+        self.assertLess(
+            self.strategy.get_priority(expired),
+            self.strategy.get_priority(normal),
+        )
+
+    def test_high_reuse_hint_is_protected(self):
+        normal = _make_node(last_access_time=10.0)
+        high_reuse = _make_node(
+            last_access_time=1.0,
+            agent_meta={"reuse_hint": "keep"},
+        )
+
+        self.assertLess(
+            self.strategy.get_priority(normal),
+            self.strategy.get_priority(high_reuse),
+        )
+
+    def test_low_reuse_hint_evicted_before_normal_node(self):
+        normal = _make_node(last_access_time=1.0)
+        low_reuse = _make_node(
+            last_access_time=10.0,
+            agent_meta={"reuse_hint": "low"},
+        )
+
+        self.assertLess(
+            self.strategy.get_priority(low_reuse),
+            self.strategy.get_priority(normal),
+        )
+
+    def test_active_ttl_overrides_low_reuse_hint(self):
+        now = time.monotonic()
+        normal = _make_node(last_access_time=10.0)
+        active_ttl_low_reuse = _make_node(
+            last_access_time=1.0,
+            agent_meta={
+                "cache_ttl_deadline": now + 60.0,
+                "reuse_hint": "low",
+            },
+        )
+
+        self.assertLess(
+            self.strategy.get_priority(normal),
+            self.strategy.get_priority(active_ttl_low_reuse),
         )
 
 

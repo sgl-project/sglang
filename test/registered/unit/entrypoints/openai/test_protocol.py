@@ -101,6 +101,22 @@ class TestCompletionRequest(unittest.TestCase):
         self.assertEqual(request.json_schema, '{"type": "object"}')
         self.assertEqual(request.lora_path, "/path/to/lora")
 
+    def test_completion_request_accepts_agent_hints(self):
+        """Test completion request accepts agent-aware KV cache hints."""
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello",
+            agent_hints={
+                "workflow_id": "wf-1",
+                "agent_id": "agent-1",
+                "step_id": "step-1",
+                "parent_step_id": "root",
+                "expected_tool_duration_ms": 1000,
+                "cache_ttl_ms": 60000,
+                "reuse_hint": "keep",
+            },
+        )
+
     def test_completion_request_validation_errors(self):
         """Test completion request validation errors"""
         with self.assertRaises(ValidationError):
@@ -178,6 +194,27 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.separate_reasoning)
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
+
+    def test_chat_completion_accepts_agent_hints(self):
+        """Test chat completion request accepts agent-aware KV cache hints."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            agent_hints={
+                "workflow_id": "wf-1",
+                "agent_id": "planner",
+                "step_id": "step-1",
+                "parent_step_id": "root",
+                "expected_tool_duration_ms": 1000,
+                "cache_ttl_ms": 60000,
+                "reuse_hint": "reuse",
+            },
+        )
+
+        self.assertEqual(request.agent_hints.workflow_id, "wf-1")
+        self.assertEqual(request.agent_hints.agent_id, "planner")
+        self.assertEqual(request.agent_hints.reuse_hint, "reuse")
 
     def test_chat_completion_tito_extensions(self):
         """Test chat completion with pre-tokenized prompt extensions."""
@@ -489,6 +526,17 @@ class TestValidationEdgeCases(unittest.TestCase):
         """Test negative token limits"""
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
+
+    def test_agent_hints_reject_negative_numeric_fields(self):
+        """Test agent_hints rejects negative duration fields."""
+        for field in ("expected_tool_duration_ms", "cache_ttl_ms"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValidationError):
+                    ChatCompletionRequest(
+                        model="test-model",
+                        messages=[{"role": "user", "content": "Hello"}],
+                        agent_hints={field: -1},
+                    )
 
     def test_model_serialization_roundtrip(self):
         """Test that models can be serialized and deserialized"""

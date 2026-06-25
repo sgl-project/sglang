@@ -18,6 +18,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.evict_policy import (
+    AgentAwareStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -59,6 +60,7 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
     "mru": MRUStrategy,
     "filo": FILOStrategy,
     "priority": PriorityStrategy,
+    "agent_aware": AgentAwareStrategy,
     "slru": SLRUStrategy,
 }
 
