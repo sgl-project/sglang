@@ -14,7 +14,7 @@
 """Unit tests for sglang/srt/utils/weight_checker.py."""
 
 import unittest
-from typing import Iterable, List, Tuple
+from typing import Iterable, List
 from unittest.mock import patch
 
 import torch
@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.utils.weight_checker import (
     ChecksumInfo,
+    Entry,
     ParallelismInfo,
     QuantizedWeight,
     WeightChecker,
@@ -37,7 +38,6 @@ from sglang.srt.utils.weight_checker import (
     _random_like,
 )
 from sglang.srt.utils.weight_checker_comparator import (
-    ComparableWeight,
     Fp8BlockComparable,
     RawComparable,
 )
@@ -50,9 +50,6 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-Entry = Tuple[str, bool, ComparableWeight]
 
 
 def _assert_entries_close(actual: Iterable[Entry], expected: Iterable[Entry]) -> None:

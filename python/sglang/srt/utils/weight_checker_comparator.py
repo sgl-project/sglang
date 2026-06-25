@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -111,11 +111,17 @@ class RawComparable(ComparableWeight):
         return self.tensor
 
 
+class CompareResult(NamedTuple):
+    equal: bool
+    max_abs_err: float
+    mean_abs_err: float
+    num_exceed: int  # elements past the combined per-side tolerance
+
+
 def compare_weights(
     expect: ComparableWeight, actual: ComparableWeight
-) -> Tuple[bool, float, float, int]:
-    """Chunked dequant-space compare; returns (equal, max_abs_err, mean_abs_err,
-    num_exceed), num_exceed counting elements past the combined per-side tolerance."""
+) -> CompareResult:
+    """Chunked element-wise compare in dequantized space."""
     equal = True
     max_abs_err = torch.zeros((), dtype=torch.float32)
     sum_abs_err = 0.0
@@ -136,7 +142,9 @@ def compare_weights(
         sum_abs_err += abs_diff.sum().item()
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
         num_exceed += int((~(abs_diff <= tol)).sum())
-    return equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
+    return CompareResult(
+        equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
+    )
 
 
 def select_comparable_weight(quant_method) -> Optional[type]:

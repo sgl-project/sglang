@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, NamedTuple, Optional, Set, Tuple, Type
+from typing import Dict, Iterable, NamedTuple, Optional, Set, Type
 
 import torch
 import torch.distributed as dist
@@ -167,9 +167,15 @@ def _hash_tensor(t: torch.Tensor) -> str:
     return f"{tensor_hash(t):016x}"
 
 
+class Entry(NamedTuple):
+    name: str
+    should_compare: bool
+    comparable: ComparableWeight
+
+
 def _check_tensors(
-    expect_tensors: Iterable[Tuple[str, bool, ComparableWeight]],
-    actual_tensors: Iterable[Tuple[str, bool, ComparableWeight]],
+    expect_tensors: Iterable[Entry],
+    actual_tensors: Iterable[Entry],
     allow_quant_error: bool = False,
 ):
     good_names = []
@@ -270,9 +276,9 @@ def _build_entries(
     raw: Dict[str, torch.Tensor],
     skip_compare_names: Set[str],
     quantized_set: Optional[Dict[str, QuantizedWeight]] = None,
-) -> Iterable[Tuple[str, bool, ComparableWeight]]:
-    """Yields (name, should_compare, ComparableWeight); quantized weights consume
-    their scale, everything else is raw."""
+) -> Iterable[Entry]:
+    """Yields an Entry per weight; quantized weights consume their scale, everything
+    else is raw."""
     skip_compare_names = set(skip_compare_names)
     quantized_set = quantized_set or {}
     scale_names = {qw.scale_name for qw in quantized_set.values()}
@@ -282,9 +288,9 @@ def _build_entries(
             continue  # compared via its weight's comparable
         if name in quantized_set:
             qw = quantized_set[name]
-            yield name, True, qw.comparable_cls(tensor, raw[qw.scale_name])
+            yield Entry(name, True, qw.comparable_cls(tensor, raw[qw.scale_name]))
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)
             )
-            yield name, should_compare, RawComparable(tensor)
+            yield Entry(name, should_compare, RawComparable(tensor))
