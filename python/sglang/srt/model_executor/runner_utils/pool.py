@@ -11,11 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Shared graph memory pool used by the speculative-draft cuda graph
-runners. The new DecodeCudaGraphRunner and PrefillCudaGraphRunner
-backends each own their pool internally; this global is retained for the
-EAGLE / multi-step draft runners that haven't been folded into the new
-backend interface.
+"""Process-wide CUDA graph memory pool shared across the prefill and
+decode graph backends. The two phases never replay concurrently, so
+sharing one pool reserves only the larger phase's capture footprint.
 """
 
 from __future__ import annotations
@@ -32,3 +30,12 @@ def get_global_graph_memory_pool() -> Optional[Any]:
 def set_global_graph_memory_pool(val: Any) -> None:
     global _global_graph_memory_pool
     _global_graph_memory_pool = val
+
+
+def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
+    """Return the shared graph memory pool, creating it on first use so
+    later backends reuse the same handle."""
+    global _global_graph_memory_pool
+    if _global_graph_memory_pool is None:
+        _global_graph_memory_pool = device_module.graph_pool_handle()
+    return _global_graph_memory_pool

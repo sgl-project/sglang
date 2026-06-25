@@ -858,6 +858,13 @@ class ServerArgs:
             aliases=["--tensor-parallel-size"],
         ),
     ] = 1
+    dcp_size: A[
+        int,
+        Arg(
+            help="The decode context parallelism size.",
+            aliases=["--decode-context-parallel-size"],
+        ),
+    ] = 1
     pp_size: A[
         int,
         Arg(
@@ -902,6 +909,13 @@ class ServerArgs:
         Arg(
             help="The moe data parallelism size.",
             aliases=["--moe-data-parallel-size"],
+        ),
+    ] = 1
+    dcp_size: A[
+        int,
+        Arg(
+            help="The decode context parallelism size.",
+            aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
     enable_prefill_cp: A[
@@ -2115,8 +2129,8 @@ class ServerArgs:
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
                 "Defaults to auto. "
-                "'auto': choose trtllm on single-node systems and mnnvl on "
-                "SM100/SM103 multi-node systems. "
+                "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
+                "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
@@ -2539,6 +2553,7 @@ class ServerArgs:
         # defaults inspect enable_prefill_cp/cp_strategy.
         self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
+        self._handle_dcp_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -2684,6 +2699,37 @@ class ServerArgs:
             and self.tokenizer_path != self.model_path
         ):
             ObjectStorageModel.download_and_get_path(self.tokenizer_path)
+
+    def _handle_dcp_validation(self):
+        # Decode context parallel (DCP) is currently implemented and validated
+        # only on AMD HIP/ROCm. Reject invalid or unverified configurations
+        # early instead of letting them fail deeper in model initialization.
+        if self.dcp_size < 1:
+            raise ValueError(
+                "Decode context parallel size (--dcp-size / "
+                "--decode-context-parallel-size) must be >= 1, but got "
+                f"dcp_size={self.dcp_size}."
+            )
+        if not self.dcp_size > 1:
+            return
+        if is_hip():
+            return
+        elif is_cuda():
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "Decode context parallel (--dcp-size / "
+                    "--decode-context-parallel-size > 1) on CUDA platform "
+                    "does not support any speculative algorithm, but got "
+                    f"dcp_size={self.dcp_size} on a CUDA platform with "
+                    "speculative decoding enabled."
+                )
+        else:
+            raise ValueError(
+                "Decode context parallel (--dcp-size / "
+                "--decode-context-parallel-size > 1) is currently only "
+                f"supported on the AMD HIP platform, but got dcp_size="
+                f"{self.dcp_size} on a non-HIP platform."
+            )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -3552,8 +3598,7 @@ class ServerArgs:
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
-        model_config = self.get_model_config()
-        hf_config = model_config.hf_config
+        hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
@@ -4118,17 +4163,8 @@ class ServerArgs:
             "Gemma4ForCausalLM",
             "Gemma4UnifiedForConditionalGeneration",
         ):
-            is_gemma4_modelopt_fp4 = model_config.quantization == "modelopt_fp4"
-            is_gemma4_moe = getattr(
-                model_config.hf_text_config, "enable_moe_block", False
-            )
-            is_gemma4_modelopt_fp4_moe = is_gemma4_modelopt_fp4 and is_gemma4_moe
-            # TODO: switch Gemma4 modelopt_fp4 MoE back to trtllm_mha by default
-            # after the SM10X trtllm_mha accuracy issue is fixed.
             default_attention_backend = (
-                "trtllm_mha"
-                if is_sm100_supported() and not is_gemma4_modelopt_fp4_moe
-                else "triton"
+                "trtllm_mha" if is_sm100_supported() else "triton"
             )
             if self.is_attention_backend_not_set():
                 self.attention_backend = default_attention_backend
@@ -4153,7 +4189,7 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-                if is_gemma4_modelopt_fp4:
+                if self.get_model_config().quantization == "modelopt_fp4":
                     self.quantization = "modelopt_fp4"
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
@@ -4301,7 +4337,7 @@ class ServerArgs:
                 ):
                     self.quantization = quant_method
                 if (
-                    self.quantization == "modelopt_fp4"
+                    self.quantization in {"modelopt_fp4", None}
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -4371,8 +4407,8 @@ class ServerArgs:
 
         # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to trtllm on
-        # single-node systems and mnnvl on Blackwell multi-node systems.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to mnnvl on
+        # Blackwell (single- and multi-node) and trtllm on SM90 single-node systems.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -6200,7 +6236,7 @@ class ServerArgs:
                 )
                 self.enable_lmcache = False
 
-        if not self.pp_size > 1:
+        if self.pp_size > 1:
             logger.warning(
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
