@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -48,6 +49,99 @@ logger = init_logger(__name__)
 
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
+
+_LTX2_TE_NVFP4_RECIPE = None
+_LTX2_TE_NVFP4_LINEAR_CLS = None
+_LTX2_TE_NVFP4_FP8_AUTOCAST = None
+_LTX2_TE_NVFP4_IMPORT_FAILED = False
+_LTX2_TE_NVFP4_RUNTIME_DISABLED = False
+_LTX2_TE_NVFP4_WARNING_EMITTED = False
+_LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_RUNTIME_DISABLED = False
+_LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_WARNING_EMITTED = False
+
+
+def _ltx2_env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _ltx2_te_nvfp4_video_ffn_enabled() -> bool:
+    return _ltx2_env_flag("SGLANG_LTX2_TE_NVFP4_VIDEO_FFN")
+
+
+def _ltx2_te_nvfp4_fused_proj_in_gelu_enabled() -> bool:
+    return _ltx2_env_flag("SGLANG_LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU")
+
+
+def _ltx2_te_nvfp4_cublaslt_gelu_enabled() -> bool:
+    return _ltx2_env_flag("SGLANG_LTX2_TE_NVFP4_CUBLASLT_GELU")
+
+
+def _ltx2_te_nvfp4_fused_proj_out_bias_gate_enabled() -> bool:
+    return _ltx2_env_flag("SGLANG_LTX2_TE_NVFP4_FUSED_PROJ_OUT_BIAS_GATE")
+
+
+def _ltx2_linear_base_for_fusion(layer: nn.Module) -> nn.Module | None:
+    base_layer = getattr(layer, "base_layer", layer)
+    if base_layer is not layer and not (
+        getattr(layer, "merged", False) or getattr(layer, "disable_lora", False)
+    ):
+        return None
+    return base_layer
+
+
+def _ltx2_get_te_nvfp4_context():
+    global _LTX2_TE_NVFP4_RECIPE
+    global _LTX2_TE_NVFP4_LINEAR_CLS
+    global _LTX2_TE_NVFP4_FP8_AUTOCAST
+    global _LTX2_TE_NVFP4_IMPORT_FAILED
+    global _LTX2_TE_NVFP4_RUNTIME_DISABLED
+    global _LTX2_TE_NVFP4_WARNING_EMITTED
+
+    if _LTX2_TE_NVFP4_IMPORT_FAILED or _LTX2_TE_NVFP4_RUNTIME_DISABLED:
+        return None
+
+    try:
+        if (
+            _LTX2_TE_NVFP4_RECIPE is None
+            or _LTX2_TE_NVFP4_LINEAR_CLS is None
+            or _LTX2_TE_NVFP4_FP8_AUTOCAST is None
+        ):
+            import transformer_engine.pytorch as te
+            from transformer_engine.common.recipe import NVFP4BlockScaling
+            from transformer_engine.pytorch import fp8_autocast
+
+            _LTX2_TE_NVFP4_LINEAR_CLS = te.Linear
+            _LTX2_TE_NVFP4_FP8_AUTOCAST = fp8_autocast
+            _LTX2_TE_NVFP4_RECIPE = NVFP4BlockScaling(
+                disable_rht=_ltx2_env_flag("SGLANG_LTX2_TE_NVFP4_DISABLE_RHT", "1"),
+                disable_stochastic_rounding=_ltx2_env_flag(
+                    "SGLANG_LTX2_TE_NVFP4_DISABLE_STOCHASTIC_ROUNDING", "1"
+                ),
+                disable_2d_quantization=_ltx2_env_flag(
+                    "SGLANG_LTX2_TE_NVFP4_DISABLE_2D_QUANTIZATION", "1"
+                ),
+            )
+    except Exception as exc:
+        _LTX2_TE_NVFP4_IMPORT_FAILED = True
+        if not _LTX2_TE_NVFP4_WARNING_EMITTED:
+            logger.warning("Disabling LTX2 TE NVFP4 video FFN fast path: %s", exc)
+            _LTX2_TE_NVFP4_WARNING_EMITTED = True
+        return None
+
+    return (
+        _LTX2_TE_NVFP4_LINEAR_CLS,
+        _LTX2_TE_NVFP4_FP8_AUTOCAST,
+        _LTX2_TE_NVFP4_RECIPE,
+    )
+
+
+def _ltx2_disable_te_nvfp4(exc: Exception) -> None:
+    global _LTX2_TE_NVFP4_RUNTIME_DISABLED
+    global _LTX2_TE_NVFP4_WARNING_EMITTED
+    _LTX2_TE_NVFP4_RUNTIME_DISABLED = True
+    if not _LTX2_TE_NVFP4_WARNING_EMITTED:
+        logger.warning("Disabling LTX2 TE NVFP4 video FFN fast path: %s", exc)
+        _LTX2_TE_NVFP4_WARNING_EMITTED = True
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -791,6 +885,7 @@ class LTX2FeedForward(nn.Module):
         dim_out: int | None = None,
         mult: int = 4,
         quant_config: QuantizationConfig | None = None,
+        enable_te_nvfp4: bool = False,
     ) -> None:
         super().__init__()
         if dim_out is None:
@@ -808,10 +903,342 @@ class LTX2FeedForward(nn.Module):
             input_is_parallel=True,
             quant_config=quant_config,
         )
+        self._te_nvfp4_video_ffn = (
+            enable_te_nvfp4 and dim == 4096 and dim_out == 4096 and inner_dim == 16384
+        )
+        self._te_nvfp4_proj_in = None
+        self._te_nvfp4_proj_out = None
+        self._te_nvfp4_proj_out_return_bias = None
+
+    def _get_te_nvfp4_linear_context(
+        self, cache_attr: str, layer: nn.Module, *, return_bias: bool = False
+    ) -> tuple[nn.Module, object, object] | None:
+        if (
+            not _ltx2_te_nvfp4_video_ffn_enabled()
+            or not self._te_nvfp4_video_ffn
+            or get_tp_world_size() != 1
+        ):
+            return None
+
+        base = _ltx2_linear_base_for_fusion(layer)
+        if base is None:
+            return None
+        if (
+            getattr(base, "quant_method", None).__class__.__name__
+            != "UnquantizedLinearMethod"
+        ):
+            return None
+
+        weight = getattr(base, "weight", None)
+        bias = getattr(base, "bias", None)
+        if (
+            weight is None
+            or not weight.is_cuda
+            or weight.dtype not in (torch.float16, torch.bfloat16)
+            or getattr(base, "tp_size", 1) != 1
+            or getattr(base, "skip_bias_add", False)
+        ):
+            return None
+        if bias is not None and (
+            bias.device != weight.device or bias.dtype != weight.dtype
+        ):
+            return None
+
+        context = _ltx2_get_te_nvfp4_context()
+        if context is None:
+            return None
+        te_linear_cls, fp8_autocast, recipe = context
+
+        input_size = int(getattr(base, "input_size_per_partition", weight.shape[1]))
+        output_size = int(getattr(base, "output_size_per_partition", weight.shape[0]))
+        cached = getattr(self, cache_attr)
+        if (
+            cached is None
+            or getattr(cached, "weight", None) is not weight
+            or getattr(cached, "bias", None) is not bias
+            or bool(getattr(cached, "return_bias", False)) != bool(return_bias)
+        ):
+            te_layer = te_linear_cls(
+                input_size,
+                output_size,
+                bias=bias is not None,
+                return_bias=return_bias,
+                params_dtype=weight.dtype,
+                device=weight.device,
+            )
+            te_layer.weight = weight
+            if bias is not None:
+                te_layer.bias = bias
+            te_layer.train(self.training)
+            setattr(self, cache_attr, te_layer)
+            cached = te_layer
+        else:
+            cached.train(self.training)
+        return cached, fp8_autocast, recipe
+
+    def _try_te_nvfp4_linear_gelu(
+        self, cache_attr: str, layer: nn.Module, x: torch.Tensor
+    ) -> torch.Tensor | None:
+        global _LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_RUNTIME_DISABLED
+        global _LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_WARNING_EMITTED
+
+        if (
+            not _ltx2_te_nvfp4_fused_proj_in_gelu_enabled()
+            or torch.is_grad_enabled()
+            or not x.is_cuda
+            or x.dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return None
+        context = self._get_te_nvfp4_linear_context(cache_attr, layer)
+        if context is None:
+            return None
+        te_layer, fp8_autocast, recipe = context
+        input_shape = tuple(x.shape)
+        if not input_shape or input_shape[-1] != int(te_layer.weight.shape[1]):
+            return None
+
+        if (
+            _ltx2_te_nvfp4_cublaslt_gelu_enabled()
+            and not _LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_RUNTIME_DISABLED
+        ):
+            try:
+                from transformer_engine.pytorch.cpp_extensions import general_gemm
+                from transformer_engine.pytorch.module.base import _2X_ACC_FPROP
+                from transformer_engine.pytorch.quantization import (
+                    FP8GlobalStateManager,
+                )
+                from transformer_engine.pytorch.utils import (
+                    assert_dim_for_fp8_exec,
+                    cast_if_needed,
+                )
+
+                x_2d = x.reshape(-1, input_shape[-1])
+                original_m = int(x_2d.shape[0])
+                pad_m_to = int(os.environ.get("SGLANG_LTX2_TE_NVFP4_PAD_M_TO", "16"))
+                if pad_m_to > 1:
+                    pad_rows = (-original_m) % pad_m_to
+                    if pad_rows:
+                        x_2d = F.pad(x_2d, (0, 0, 0, pad_rows))
+
+                with fp8_autocast(enabled=True, fp8_recipe=recipe):
+                    inp = te_layer.prepare_forward(x_2d, allow_non_contiguous=False)
+                    try:
+                        if not getattr(te_layer, "fp8", False):
+                            raise RuntimeError("TE FP8/NVFP4 mode was not enabled")
+                        weight, bias = te_layer._get_weight_and_bias_tensors()
+                        assert_dim_for_fp8_exec(inp, weight)
+                        (
+                            input_quantizer,
+                            weight_quantizer,
+                            output_quantizer,
+                            _grad_input_quantizer,
+                            _grad_weight_quantizer,
+                            _grad_output_quantizer,
+                        ) = te_layer._get_quantizers(
+                            fp8_output=False,
+                            fp8_grad=False,
+                            is_grad_enabled=False,
+                        )
+                        if input_quantizer is None or weight_quantizer is None:
+                            raise RuntimeError("TE NVFP4 quantizers are unavailable")
+                        input_quantizer.set_usage(rowwise=True, columnwise=False)
+                        inputmat = input_quantizer(inp)
+                        weight_quantizer.set_usage(rowwise=True, columnwise=False)
+                        weightmat = te_layer.get_weight_workspace(
+                            tensor=weight,
+                            quantizer=weight_quantizer,
+                            cache_name=None,
+                            update_workspace=True,
+                            skip_update_flag=None,
+                            fsdp_group=getattr(te_layer, "fsdp_group", None),
+                            workspace_dtype=getattr(
+                                te_layer, "activation_dtype", x.dtype
+                            ),
+                        )
+                        weightmat.update_usage(rowwise_usage=True)
+                        bias_dtype = getattr(te_layer, "activation_dtype", x.dtype)
+                        bias = (
+                            cast_if_needed(bias, bias_dtype)
+                            if bias is not None
+                            else None
+                        )
+                        use_split_accumulator = _2X_ACC_FPROP
+                        fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                        if hasattr(fp8_recipe, "fp8_gemm_fprop"):
+                            use_split_accumulator = (
+                                fp8_recipe.fp8_gemm_fprop.use_split_accumulator
+                            )
+                        out, *_ = general_gemm(
+                            weightmat,
+                            inputmat,
+                            quantization_params=output_quantizer,
+                            out_dtype=getattr(te_layer, "activation_dtype", x.dtype),
+                            bias=bias,
+                            gelu=True,
+                            use_split_accumulator=use_split_accumulator,
+                        )
+                    finally:
+                        te_layer.end_forward()
+                if int(out.shape[0]) != original_m:
+                    out = out[:original_m]
+                return out.reshape(*input_shape[:-1], int(out.shape[-1]))
+            except Exception as exc:
+                _LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_RUNTIME_DISABLED = True
+                if not _LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_WARNING_EMITTED:
+                    logger.warning(
+                        "Disabling LTX2 TE NVFP4 cuBLASLt GELU path after failure: %s",
+                        exc,
+                    )
+                    _LTX2_TE_NVFP4_FUSED_PROJ_IN_GELU_WARNING_EMITTED = True
+
+        hidden = self._try_te_nvfp4_linear(cache_attr, layer, x)
+        if hidden is None:
+            return None
+        if not hidden.is_contiguous():
+            hidden = hidden.contiguous()
+        try:
+            from sglang.jit_kernel.diffusion.triton.ltx2_gelu import (
+                ltx2_gelu_tanh_inplace,
+            )
+
+            return ltx2_gelu_tanh_inplace(hidden)
+        except Exception as exc:
+            logger.warning_once(
+                "Disabling LTX2 TE NVFP4 Triton GELU path after failure: " f"{exc}"
+            )
+            return None
+
+    def _try_te_nvfp4_linear(
+        self, cache_attr: str, layer: nn.Module, x: torch.Tensor
+    ) -> torch.Tensor | None:
+        if not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        context = self._get_te_nvfp4_linear_context(cache_attr, layer)
+        if context is None:
+            return None
+        te_layer, fp8_autocast, recipe = context
+        input_shape = tuple(x.shape)
+        if not input_shape or input_shape[-1] != int(te_layer.weight.shape[1]):
+            return None
+        x_2d = x.reshape(-1, input_shape[-1])
+        original_m = int(x_2d.shape[0])
+        pad_m_to = int(os.environ.get("SGLANG_LTX2_TE_NVFP4_PAD_M_TO", "16"))
+        if pad_m_to > 1:
+            pad_rows = (-original_m) % pad_m_to
+            if pad_rows:
+                x_2d = F.pad(x_2d, (0, 0, 0, pad_rows))
+        try:
+            with fp8_autocast(enabled=True, fp8_recipe=recipe):
+                out = te_layer(x_2d)
+        except Exception as exc:
+            _ltx2_disable_te_nvfp4(exc)
+            return None
+        if int(out.shape[0]) != original_m:
+            out = out[:original_m]
+        return out.reshape(*input_shape[:-1], int(out.shape[-1]))
+
+    def _try_te_nvfp4_linear_return_bias(
+        self, cache_attr: str, layer: nn.Module, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not x.is_cuda or x.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        context = self._get_te_nvfp4_linear_context(cache_attr, layer, return_bias=True)
+        if context is None:
+            return None
+        te_layer, fp8_autocast, recipe = context
+        input_shape = tuple(x.shape)
+        if not input_shape or input_shape[-1] != int(te_layer.weight.shape[1]):
+            return None
+        x_2d = x.reshape(-1, input_shape[-1])
+        original_m = int(x_2d.shape[0])
+        pad_m_to = int(os.environ.get("SGLANG_LTX2_TE_NVFP4_PAD_M_TO", "16"))
+        if pad_m_to > 1:
+            pad_rows = (-original_m) % pad_m_to
+            if pad_rows:
+                x_2d = F.pad(x_2d, (0, 0, 0, pad_rows))
+        try:
+            with fp8_autocast(enabled=True, fp8_recipe=recipe):
+                result = te_layer(x_2d)
+        except Exception as exc:
+            _ltx2_disable_te_nvfp4(exc)
+            return None
+        if not isinstance(result, tuple) or len(result) != 2:
+            return None
+        out, bias = result
+        if bias is None or bias.device != out.device or bias.dtype != out.dtype:
+            return None
+        if int(out.shape[0]) != original_m:
+            out = out[:original_m]
+        return out.reshape(*input_shape[:-1], int(out.shape[-1])), bias
+
+    def _try_te_nvfp4_forward_with_residual_gate(
+        self, x: torch.Tensor, residual: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor | None:
+        if (
+            not _ltx2_te_nvfp4_fused_proj_out_bias_gate_enabled()
+            or not _ltx2_te_nvfp4_video_ffn_enabled()
+            or not self._te_nvfp4_video_ffn
+            or get_tp_world_size() != 1
+            or not x.is_cuda
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or residual.dtype != x.dtype
+            or gate.dtype != x.dtype
+            or residual.shape != x.shape[:-1] + (4096,)
+            or not residual.is_contiguous()
+        ):
+            return None
+        try:
+            from sglang.jit_kernel.diffusion.triton.ltx2_gelu import (
+                ltx2_bias_residual_gate,
+            )
+        except Exception as exc:
+            logger.warning_once(
+                "Disabling LTX2 TE NVFP4 fused proj_out+bias+gate path: " f"{exc}"
+            )
+            return None
+
+        hidden = self._try_te_nvfp4_linear_gelu("_te_nvfp4_proj_in", self.proj_in, x)
+        if hidden is None:
+            hidden = self._try_te_nvfp4_linear("_te_nvfp4_proj_in", self.proj_in, x)
+            if hidden is None:
+                return None
+            hidden = self.act(hidden)
+
+        update_bias = self._try_te_nvfp4_linear_return_bias(
+            "_te_nvfp4_proj_out_return_bias", self.proj_out, hidden
+        )
+        if update_bias is None:
+            return None
+        update, bias = update_bias
+        if not update.is_contiguous():
+            return None
+        return ltx2_bias_residual_gate(update, residual, gate, bias)
+
+    def try_forward_with_residual_gate(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return self._try_te_nvfp4_forward_with_residual_gate(x, residual, gate)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.proj_in(x)
-        x = self.act(x)
+        te_proj_in_gelu = self._try_te_nvfp4_linear_gelu(
+            "_te_nvfp4_proj_in", self.proj_in, x
+        )
+        if te_proj_in_gelu is not None:
+            x = te_proj_in_gelu
+        else:
+            te_proj_in = self._try_te_nvfp4_linear("_te_nvfp4_proj_in", self.proj_in, x)
+            if te_proj_in is not None:
+                x = self.act(te_proj_in)
+            else:
+                x, _ = self.proj_in(x)
+                x = self.act(x)
+
+        te_proj_out = self._try_te_nvfp4_linear("_te_nvfp4_proj_out", self.proj_out, x)
+        if te_proj_out is not None:
+            return te_proj_out
         x, _ = self.proj_out(x)
         return x
 
@@ -933,9 +1360,16 @@ class LTX2TransformerBlock(nn.Module):
         )
 
         # 4. Feedforward layers
-        self.ff = LTX2FeedForward(dim, dim_out=dim, quant_config=quant_config)
+        self.ff = LTX2FeedForward(
+            dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            enable_te_nvfp4=True,
+        )
         self.audio_ff = LTX2FeedForward(
-            audio_dim, dim_out=audio_dim, quant_config=quant_config
+            audio_dim,
+            dim_out=audio_dim,
+            quant_config=quant_config,
         )
 
         # 5. Modulation Parameters
@@ -1010,7 +1444,6 @@ class LTX2TransformerBlock(nn.Module):
         v2a_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
         audio_replicated_for_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         batch_size = hidden_states.size(0)
 
         # 1. Video and Audio Self-Attention
@@ -1228,8 +1661,14 @@ class LTX2TransformerBlock(nn.Module):
         norm_hidden_states = (
             self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
         )
-        ff_output = self.ff(norm_hidden_states)
-        hidden_states = hidden_states + ff_output * vgate_mlp
+        fused_ff_residual = self.ff.try_forward_with_residual_gate(
+            norm_hidden_states, hidden_states, vgate_mlp
+        )
+        if fused_ff_residual is None:
+            ff_output = self.ff(norm_hidden_states)
+            hidden_states = hidden_states + ff_output * vgate_mlp
+        else:
+            hidden_states = fused_ff_residual
 
         ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
             self.audio_scale_shift_table, batch_size, temb_audio, slice(3, 6)
@@ -1641,7 +2080,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         audio_replicated_for_sp: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-
         batch_size = hidden_states.size(0)
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
