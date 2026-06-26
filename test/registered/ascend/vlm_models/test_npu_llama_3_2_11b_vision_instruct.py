@@ -19,6 +19,8 @@ class TestLlama3211BVisionInstruct(TestVLMModels):
     model = LLAMA_3_2_11B_VISION_INSTRUCT_WEIGHTS_PATH
     mmmu_accuracy = 0.2
     other_args = [
+        "--tp-size",
+        "2",
         "--trust-remote-code",
         "--mem-fraction-static",
         "0.8",
