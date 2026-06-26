@@ -159,6 +159,7 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
     return tokenizer_name
 
 
+# TODO: Remove after bumping huggingface transformers to v5.12
 def _retry_auto_tokenizer_with_glm_moe_dsa_config(
     tokenizer_name, args, common_kwargs, error
 ):
