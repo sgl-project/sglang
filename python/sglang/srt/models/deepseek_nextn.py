@@ -16,6 +16,7 @@
 
 import logging
 import os
+from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -171,7 +172,9 @@ class DeepseekModelNextN(nn.Module):
             buffer_size=2,
             dtype=torch.float32,
             device=(
-                input_embeds.device if input_embeds is not None else input_ids.device
+                input_embeds.device
+                if input_embeds is not None
+                else input_ids.device
             ),
         )
 
@@ -212,7 +215,14 @@ class DeepseekModelNextN(nn.Module):
                 forward_batch,
                 residual,
                 zero_allocator,
+                prev_topk_indices=(
+                    forward_batch.topk_indices
+                    if forward_batch.reuse_mtp_topk_indices
+                    else None
+                ),
             )
+            if forward_batch.reuse_mtp_topk_indices:
+                forward_batch.topk_indices = topk_indices
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
@@ -228,16 +238,8 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states,
                     self.cp_size,
                     forward_batch,
-                    residual,
-                    zero_allocator,
-                    prev_topk_indices=(
-                        forward_batch.topk_indices
-                        if forward_batch.reuse_mtp_topk_indices
-                        else None
-                    ),
+                    torch.cuda.current_stream(),
                 )
-                if forward_batch.reuse_mtp_topk_indices:
-                    forward_batch.topk_indices = topk_indices
 
         return hidden_states
 
