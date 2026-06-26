@@ -88,9 +88,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         Returns:
             PrecomputedMetadata containing all shared intermediate results
         """
-        # Slice inputs to batch size. seq_lens_cpu may be None when the backend
-        # has opted out of the host seq-len mirror; the decode path below no
-        # longer reads it (static page-table width).
+        # Slice inputs to batch size
         seq_lens = seq_lens[:bs]
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu[:bs]
@@ -116,10 +114,6 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         seq_lens_cpu: torch.Tensor,
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
-        # Static page-table width (= captured buffer width) instead of a
-        # seq_lens_cpu.max() host read. The kernel bounds each row's reads by the
-        # GPU cache_seqlens, so copying the full width is correct and keeps the
-        # multi-step draft replay independent of the host seq-len mirror.
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
         # Convert to int32 and compute cumsum
