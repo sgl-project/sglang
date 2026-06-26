@@ -21,12 +21,12 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.radix_attention import unified_attention_with_output
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.distributed.parallel_state import get_dcp_group
 from sglang.srt.layers.utils.dcp_utils import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs,
     dcp_enabled,
-    get_attention_dcp_group,
     get_attention_dcp_world_size,
 )
 from sglang.srt.lora.deepseek_mla_correction import (
@@ -774,7 +774,7 @@ class DeepseekMLAForwardMixin:
                 self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_attention_dcp_group())
+            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

@@ -31,7 +31,6 @@ from sglang.srt.layers.cp.dcp.comm import (  # noqa: F401
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla as cp_lse_ag_out_rs,
     dcp_enabled,
-    get_attention_dcp_group,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )

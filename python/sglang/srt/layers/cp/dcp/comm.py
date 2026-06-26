@@ -49,10 +49,6 @@ def dcp_enabled() -> bool:
     return get_dcp_world_size() > 1
 
 
-def get_attention_dcp_group() -> GroupCoordinator:
-    return get_dcp_group()
-
-
 def get_attention_dcp_world_size() -> int:
     if not dcp_enabled():
         return 1

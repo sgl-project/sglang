@@ -52,9 +52,13 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
 
 
 def update_local_kv_lens_for_dcp(kv_len_arr):
+    """In-place per-rank KV length: the start=0 case of get_dcp_lens.
+
+    floor((len - rank - 1) / N) + 1  ==  len // N + (rank < len % N)  for len >= 0
+    (bit-identical; see test/registered/cp/test_dcp_layout_unit.py). Kept as an
+    in-place mutation because callers (plan_dcp_decode_metadata, the FlashInfer-MLA
+    cuda-graph replay path) rely on it.
+    """
     if not dcp_enabled():
         return
-    dcp_world_size = get_dcp_world_size()
-    dcp_rank = get_dcp_rank()
-    offset = dcp_rank + 1
-    kv_len_arr.sub_(offset).div_(dcp_world_size, rounding_mode="floor").add_(1)
+    kv_len_arr.copy_(get_dcp_lens(kv_len_arr, get_dcp_world_size(), get_dcp_rank()))

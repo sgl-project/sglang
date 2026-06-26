@@ -29,7 +29,6 @@ from sglang.srt.layers.cp.dcp.comm import (
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
     dcp_enabled,
-    get_attention_dcp_group,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
@@ -70,7 +69,6 @@ __all__ = [
     "create_triton_kv_indices_for_dcp_triton",
     "dcp_enabled",
     "filter_dcp_local_kv_indices",
-    "get_attention_dcp_group",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
     "get_dcp_lens",
