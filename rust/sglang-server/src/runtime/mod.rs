@@ -18,13 +18,18 @@ use std::thread::JoinHandle;
 
 pub mod channels;
 pub mod ring;
+pub mod threads;
 
 use crate::ids::RequestIdGen;
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
 use crate::runtime::ring::{
     EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
 };
+use crate::runtime::threads::{plan_cores, spawn_pool};
 use crate::{api_server, detokenizer, tokenizer, tokenizer_manager};
+
+// Re-export so stages keep importing `crate::runtime::Runnable`.
+pub use threads::Runnable;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -203,106 +208,6 @@ impl Runtime {
     }
 }
 
-/// Cores reserved for the two TokenizerManager router threads (`tm-ingress`,
-/// `tm-egress`) — light, latency-sensitive channel routers, so one core each.
-///
-/// TODO(tm-scaling): if a single egress dispatcher becomes a bottleneck at high
-/// aggregate token rates, the FSM dispatch can be sharded by `RequestId` (each
-/// shard draining its own ring / channel) — at which point this needs to grow
-/// to one core per ingress/egress shard rather than a fixed 2.
-const TM_CORES: usize = 2;
-
-/// Partition the machine's cores into four disjoint sets: the I/O-bound API
-/// pool, the CPU-bound tokenizer and detokenizer pools, and the two TM router
-/// threads. Falls back to no pinning if affinity isn't available or there aren't
-/// enough cores for the (CPU-bound) pools.
-struct CorePlan {
-    api: Vec<core_affinity::CoreId>,
-    tok: Vec<core_affinity::CoreId>,
-    detok: Vec<core_affinity::CoreId>,
-    tm: Vec<core_affinity::CoreId>,
-}
-
-fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
-    if !cfg.pin_cores {
-        return None;
-    }
-    // Prefer an explicit core list (NUMA-local cores minus the scheduler's
-    // reserved launch cores); otherwise use every core this process is allowed
-    // on. When NUMA binding is active, `get_core_ids` already reflects the
-    // NUMA-local set via `sched_getaffinity`.
-    let cores: Vec<core_affinity::CoreId> = match &cfg.cores {
-        Some(ids) if !ids.is_empty() => {
-            ids.iter().map(|&id| core_affinity::CoreId { id }).collect()
-        }
-        _ => core_affinity::get_core_ids()?,
-    };
-    if cores.len() < cfg.api_worker_num + cfg.tokenizer_worker_num + cfg.detokenizer_worker_num {
-        tracing::warn!(
-            available = cores.len(),
-            "not enough cores to pin all pools; running unpinned"
-        );
-        return None;
-    }
-    let mut it = cores.into_iter();
-    let api: Vec<core_affinity::CoreId> = it.by_ref().take(cfg.api_worker_num).collect();
-    let tok = it.by_ref().take(cfg.tokenizer_worker_num).collect();
-    let detok = it.by_ref().take(cfg.detokenizer_worker_num).collect();
-    // The two TM router threads get up to `TM_CORES` leftover cores; when none
-    // are spare they fall back to the API set so they never float onto the
-    // CPU-bound tokenizer/detok cores.
-    let mut tm: Vec<core_affinity::CoreId> = it.by_ref().take(TM_CORES).collect();
-    if tm.is_empty() {
-        tm = api.clone();
-    }
-    Some(CorePlan {
-        api,
-        tok,
-        detok,
-        tm,
-    })
-}
-
-/// Pin the calling thread to `core` if one was assigned (no-op otherwise).
-fn pin_current(core: Option<core_affinity::CoreId>) {
-    if let Some(c) = core {
-        core_affinity::set_for_current(c);
-    }
-}
-
-/// A pipeline stage that owns its channel handles + config and runs a blocking
-/// loop until its inbox closes. Lets the runtime spawn stages uniformly via
-/// [`spawn_stage`] instead of calling free `run_*` functions with positional
-/// handles. Implemented by the TokenizerManager router threads (ingress/egress).
-pub trait Runnable: Send + 'static {
-    fn run(self);
-}
-
-/// Spawn a [`Runnable`] stage on a named thread, optionally pinned to `core`.
-fn spawn_stage(
-    name: &str,
-    core: Option<core_affinity::CoreId>,
-    stage: impl Runnable,
-    threads: &mut Vec<JoinHandle<()>>,
-) {
-    let handle = std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || {
-            pin_current(core);
-            stage.run();
-        })
-        .expect("spawn stage");
-    threads.push(handle);
-}
-
-/// Pick the pinned core for worker `i` from an optional pool core set.
-fn pool_core(
-    cores: &Option<Vec<core_affinity::CoreId>>,
-    i: usize,
-) -> Option<core_affinity::CoreId> {
-    cores.as_ref().and_then(|c| c.get(i).copied())
-}
-
 /// Boot the whole frontend. Returns once threads are spawned (non-blocking),
 /// so the Python caller regains control of the GIL immediately. `Err` on a
 /// startup misconfiguration (e.g. no tokenizer for a non-skip server).
@@ -357,20 +262,12 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         };
         let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         // Each shard owns its receiver outright (one consumer per shard), so the
-        // owned `detok_rx` Vec is moved out element-by-element — no shared map.
-        for (i, rx) in detok_rx.into_iter().enumerate() {
-            let core = pool_core(&detok_cores, i);
-            let shard = detokenizer::DetokenizerWorker::new(i, rx, backend.clone());
-            spawn_stage(&format!("detok-{i}"), core, shard, &mut threads);
-        }
-    }
-
-    // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
-    {
-        // First TM core: egress is the hotter router (every output token).
-        let core = plan.as_ref().and_then(|p| p.tm.first().copied());
-        let stage = tokenizer_manager::Egress::new(egress_rx, senders.clone());
-        spawn_stage("tm-egress", core, stage, &mut threads);
+        // owned `detok_rx` Vec is moved out element-by-element via the iterator.
+        let count = detok_rx.len();
+        let mut rxs = detok_rx.into_iter();
+        spawn_pool("detokenizer", detok_cores, count, &mut threads, |i| {
+            detokenizer::DetokenizerWorker::new(i, rxs.next().unwrap(), backend.clone())
+        });
     }
 
     // --- Tokenizer pool (pinned, CPU bound) ---
@@ -383,28 +280,43 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
         // each gets a cheap clone of both.
-        for i in 0..cfg.tokenizer_worker_num {
-            let core = pool_core(&tok_cores, i);
-            let worker =
-                tokenizer::TokenizerWorker::new(tok_rx.clone(), tm_tx.clone(), tokenizer.clone());
-            spawn_stage(&format!("tokenizer-{i}"), core, worker, &mut threads);
-        }
+        spawn_pool(
+            "tokenizer",
+            tok_cores,
+            cfg.tokenizer_worker_num,
+            &mut threads,
+            |_i| tokenizer::TokenizerWorker::new(tok_rx.clone(), tm_tx.clone(), tokenizer.clone()),
+        );
+    }
+
+    // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
+    {
+        // First TM core; egress is the hotter router (every output token). One
+        // worker today via `spawn_pool`, so sharding by `RequestId` later (see
+        // `TM_CORES`) is just a larger count + per-shard receivers.
+        let cores = plan
+            .as_ref()
+            .and_then(|p| p.tm.first().copied())
+            .map(|c| vec![c]);
+        let mut egress_rx = Some(egress_rx); // moved into the single worker
+        spawn_pool("tm-egress", cores, 1, &mut threads, |_| {
+            tokenizer_manager::Egress::new(egress_rx.take().unwrap(), senders.clone())
+        });
     }
 
     // --- TokenizerManager ingress loop ---
     {
         // Second TM core when present, else share the first (1-core / API-set
         // fallback) — still off the CPU-bound pool cores either way.
-        let core = plan
+        let cores = plan
             .as_ref()
-            .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied());
-        let stage = tokenizer_manager::Ingress::new(
-            tm_rx,
-            senders.clone(),
-            ingress_tx,
-            skip_tokenizer_init,
-        );
-        spawn_stage("tm-ingress", core, stage, &mut threads);
+            .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
+            .map(|c| vec![c]);
+        let mut parts = Some((tm_rx, ingress_tx)); // moved into the single worker
+        spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
+            let (tm_rx, ingress_tx) = parts.take().unwrap();
+            tokenizer_manager::Ingress::new(tm_rx, senders.clone(), ingress_tx, skip_tokenizer_init)
+        });
     }
 
     // --- API server (tokio, I/O bound) ---
