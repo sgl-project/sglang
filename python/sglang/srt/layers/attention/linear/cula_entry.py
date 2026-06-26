@@ -41,6 +41,8 @@ def _as_contiguous(t: torch.Tensor) -> torch.Tensor:
     pass Ling's fp32 q/k/v straight through — no fp32->bf16 cast, which would add 3
     cast kernels/layer/step that dominated the graph-replay cost.
     """
+    if t.is_contiguous():
+        return t
     return t.contiguous()
 
 
@@ -98,6 +100,7 @@ def cula_decode(q, k, v, temporal, cache_indices, decay, scale, out):
     # Caller must pass a bf16 output buffer; a dtype-dependent re-allocation here
     # would silently swap the buffer baked into a captured CUDA graph.
     assert out.dtype == torch.bfloat16, "cula_decode out must be bf16"
+    assert cache_indices.dtype == torch.int32, "cache_indices must be int32"
     HEAD_DIM = q.shape[-1]
     V_DIM = v.shape[-1]
     pool_size = temporal.shape[0]
@@ -115,7 +118,7 @@ def cula_decode(q, k, v, temporal, cache_indices, decay, scale, out):
         stride_v=v.stride(0),
         stride_s=temporal_3d.stride(0),
         stride_o=out.stride(0),
-        s_offsets=cache_indices.to(torch.int32),
+        s_offsets=cache_indices,
         decay_scales=decay.view(-1),
         HEAD_DIM=HEAD_DIM,
         K_SPLIT_DIM=HEAD_DIM,
@@ -154,6 +157,7 @@ def cula_verify(
     else:
         q, k, v = _as_contiguous(q), _as_contiguous(k), _as_contiguous(v)
     assert out.dtype == torch.bfloat16, "cula_verify out must be bf16"
+    assert cache_indices.dtype == torch.int32, "cache_indices must be int32"
     B = cache_indices.shape[0]
     H = q.shape[1]
     K = q.shape[2]
@@ -170,7 +174,7 @@ def cula_verify(
         temporal,
         out4,
         decay.view(-1),
-        cache_indices.to(torch.int32),
+        cache_indices,
         scale,
         T,
         k_buf=k_buf,
@@ -192,13 +196,15 @@ def cula_commit(draft_k, draft_v, temporal, cache_indices, accepted_len, decay, 
         T: int draft_token_num
     """
     _check_cula()
+    assert cache_indices.dtype == torch.int32, "cache_indices must be int32"
+    assert accepted_len.dtype == torch.int32, "accepted_len must be int32"
     linear_attention_state_update_kvbuffer(
         draft_k,
         draft_v,
         temporal,
         decay.view(-1),
-        cache_indices.to(torch.int32),
-        accepted_len.to(torch.int32),
+        cache_indices,
+        accepted_len,
         T,
     )
 
@@ -218,12 +224,14 @@ def cula_commit_fused(
         T: int draft_token_num
     """
     _check_cula()
+    assert cache_indices.dtype == torch.int32, "cache_indices must be int32"
+    assert accepted_len.dtype == torch.int32, "accepted_len must be int32"
     linear_attention_state_update_kvbuffer_fused(
         draft_k,
         draft_v,
         temporal,
         decay_all,
-        cache_indices.to(torch.int32),
-        accepted_len.to(torch.int32),
+        cache_indices,
+        accepted_len,
         T,
     )

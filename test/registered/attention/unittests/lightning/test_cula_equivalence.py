@@ -93,9 +93,11 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        # fp32 q/k/v: the cuLA verify kernel now loads q/k into fp32 registers
+        # natively (no bf16 cast), matching the runtime path (Ling fp32 rotary).
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )
@@ -136,9 +138,9 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )
@@ -181,9 +183,9 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )
@@ -226,9 +228,9 @@ class TestCulaKernelCorrectness(CustomTestCase):
         scale = D**-0.5
         decay = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
-        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B * T, H, D, device="cuda", dtype=torch.float32)
         state_kmajor = (
             torch.randn(B, H, D, D, device="cuda", dtype=torch.float32) * 0.01
         )

@@ -390,14 +390,17 @@ class MambaPool:
                     # therefore match the `temporal` state pool's leading dim (size + 1);
                     # using spec_state_size + 1 here under-sizes the buffer and lets a
                     # cache slot id >= spec_state_size+1 index out of bounds.
+                    # fp32: the cuLA verify/commit kernels compute in fp32 and now load
+                    # q/k natively as fp32, so the draft buffers stay fp32 end-to-end
+                    # (no fp32<->bf16 cast on the sglang side).
                     draft_k = torch.zeros(
                         (num_mamba_layers, size + 1, T, H, Kd),
-                        dtype=torch.bfloat16,
+                        dtype=torch.float32,
                         device=device,
                     )
                     draft_v = torch.zeros(
                         (num_mamba_layers, size + 1, T, HV, Vd),
-                        dtype=torch.bfloat16,
+                        dtype=torch.float32,
                         device=device,
                     )
                     self.mamba_cache = self.CulaSpeculativeState(
