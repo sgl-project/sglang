@@ -23,8 +23,10 @@ from sglang.srt.debug_utils.comparator.dims_spec import (
     TOKEN_DIM_NAME,
     ParallelAxis,
     apply_dim_names,
+    get_dim_names,
     parse_dims,
     resolve_dim_names,
+    without_dim_names,
 )
 from sglang.srt.debug_utils.comparator.dp_utils import filter_to_non_empty_dp_rank
 from sglang.srt.debug_utils.comparator.log_sink import log_sink
@@ -298,8 +300,8 @@ def _compare_bundle_pair_tensor_type(
     )
 
     # Compare
-    aligned_baseline: torch.Tensor = aligner_result.tensors.x.rename(None)
-    aligned_target: torch.Tensor = aligner_result.tensors.y.rename(None)
+    aligned_baseline: torch.Tensor = without_dim_names(aligner_result.tensors.x)
+    aligned_target: torch.Tensor = without_dim_names(aligner_result.tensors.y)
 
     info = compare_tensor_pair(
         x_baseline=aligned_baseline,
@@ -361,10 +363,9 @@ def _try_generate_viz(
 
 def _resolve_seq_dim(tensor: torch.Tensor) -> Optional[int]:
     """Find the token/seq dimension index from the tensor's named dims."""
-    if tensor.names[0] is None:
+    names: tuple[Optional[str], ...] = get_dim_names(tensor)
+    if names[0] is None:
         return None
-
-    names: tuple[Optional[str], ...] = tensor.names
     for target_name in (TOKEN_DIM_NAME, SEQ_DIM_NAME):
         if target_name in names:
             return list(names).index(target_name)

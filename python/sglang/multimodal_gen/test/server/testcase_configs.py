@@ -21,14 +21,18 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import statistics
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.registry import (
+    get_model_info,
+    get_pipeline_config_classes,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
 
@@ -186,7 +190,6 @@ class DiffusionServerArgs:
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
-    enable_warmup: bool = True
 
     extras: list[str] = field(default_factory=lambda: [])
     env_vars: dict[str, str] = field(default_factory=dict)
@@ -243,6 +246,15 @@ class DiffusionSamplingParams:
 
     num_outputs_per_prompt: int = 1
 
+    # Realtime video consistency harness. When set, server tests use
+    # /v1/realtime_video/generate and fold streamed chunks back into mp4 bytes.
+    realtime_num_chunks: int | None = None
+    realtime_events: list[dict[str, Any]] = field(default_factory=list)
+    realtime_perf_thresholds: dict[str, float] = field(default_factory=dict)
+    realtime_perf_ignore_initial_chunks: int = 0
+    # None keeps the lossless/raw transport used by GT-backed consistency checks.
+    realtime_output_format: str | None = None
+
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
@@ -254,7 +266,7 @@ class DiffusionTestCase:
 
     id: str  # pytest test id and scenario name
     server_args: DiffusionServerArgs
-    sampling_params: DiffusionSamplingParams
+    sampling_params: DiffusionSamplingParams | None = None
     run_perf_check: bool = True
     run_consistency_check: bool = True
     run_component_accuracy_check: bool = True
@@ -266,6 +278,13 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
 
     def __post_init__(self) -> None:
+        if self.sampling_params is None:
+            object.__setattr__(
+                self,
+                "sampling_params",
+                get_default_sampling_params_for_server_args(self.server_args),
+            )
+
         has_startup_lora = self.server_args.lora_path is not None
         has_dynamic_lora = self.server_args.dynamic_lora_path is not None
         has_second_lora = self.server_args.second_lora_path is not None
@@ -289,6 +308,52 @@ class DiffusionTestCase:
             raise ValueError(
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
+
+
+LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+    prompt=(
+        "A slow aerial orbit around a pastel floating island hotel in the open "
+        "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
+        "clean horizon, cinematic but playful."
+    ),
+    image_path=(
+        "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/b8/f9/b9/"
+        "b8f9b9f8-a609-bde2-0302-349436ffc508/825646291038.jpg/600x600bb.jpg"
+    ),
+    output_size="832x480",
+    num_frames=9,
+    fps=16,
+    realtime_num_chunks=4,
+    realtime_perf_thresholds={
+        "p95_chunk_total_ms": 5000.0,
+        "p95_scheduler_forward_ms": 4500.0,
+        "p95_ws_payload_mb": 16.0,
+    },
+    realtime_perf_ignore_initial_chunks=2,
+    extras={
+        "seed": 42,
+        "num_inference_steps": 4,
+        "guidance_scale": 1.0,
+        "realtime_causal_sink_size": 9,
+        "realtime_causal_kv_cache_num_frames": 18,
+        "condition_inputs": {
+            "camera_actions": [
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                ["w"],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            ]
+        },
+    },
+)
 
 
 def sample_step_indices(
@@ -362,10 +427,70 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
+
+IDEOGRAM4_CI_PROMPT = json.dumps(
+    {
+        "high_level_description": IDEOGRAM4_CI_TEXT_PROMPT,
+        "style_description": {
+            "aesthetics": "warm, peaceful, vibrant",
+            "lighting": "bright afternoon sunlight, long soft shadows",
+            "photo": "shallow depth of field, eye-level, 85mm lens",
+            "medium": "photograph",
+            "color_palette": [
+                "#F5C542",
+                "#87CEEB",
+                "#4A4A4A",
+                "#FFFFFF",
+                "#2E8B57",
+            ],
+        },
+        "compositional_deconstruction": {
+            "background": (
+                "A sunlit garden path with green hedges and a wooden bench. "
+                "Dappled light filters through overhead trees."
+            ),
+            "elements": [
+                {
+                    "type": "obj",
+                    "bbox": [260, 260, 760, 780],
+                    "desc": (
+                        "A small tabby cat sitting calmly on a wooden bench, "
+                        "looking toward the camera."
+                    ),
+                },
+                {
+                    "type": "obj",
+                    "bbox": [180, 580, 840, 840],
+                    "desc": (
+                        "A weathered wooden garden bench with soft sunlight "
+                        "falling across the seat."
+                    ),
+                },
+            ],
+        },
+    },
+    separators=(",", ":"),
+    ensure_ascii=False,
+)
+
+IDEOGRAM4_CI_sampling_params = replace(
+    T2I_sampling_params,
+    prompt=IDEOGRAM4_CI_PROMPT,
+    output_size="1024x1024",
+    output_format="png",
+    extras={"preset": "V4_QUALITY_48", "seed": 0},
+)
+
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",
     extras={"num_inference_steps": 12, "seed": 0},
+)
+
+MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
+    MODELOPT_T2I_CI_sampling_params,
+    extras={"num_inference_steps": 50, "seed": 0},
 )
 
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
@@ -411,6 +536,17 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+JOY_ECHO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    num_frames=33,
+    extras={
+        "num_inference_steps": 8,
+        "seed": 42,
+        "enable_memory_bank": False,
+    },
+)
+
 MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
@@ -423,6 +559,15 @@ TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
     direct_url_test=True,
+)
+
+SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=TI2V_sampling_params.prompt,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+    output_size="384x640",
+    num_frames=17,
+    extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
@@ -439,6 +584,62 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
 
+
+def _get_extra_arg_value(extras: Sequence[str], option_name: str) -> str | None:
+    tokens: list[str] = []
+    for item in extras:
+        tokens.extend(shlex.split(item))
+
+    option_prefix = f"{option_name}="
+    for index, token in enumerate(tokens):
+        if token.startswith(option_prefix):
+            return token[len(option_prefix) :]
+        if token == option_name and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def get_model_task_type_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> ModelTaskType:
+    pipeline_class_name = _get_extra_arg_value(
+        server_args.extras, "--pipeline-class-name"
+    )
+    if pipeline_class_name:
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            pipeline_config_cls, _ = config_classes
+            return pipeline_config_cls.task_type
+
+    model_info = get_model_info(server_args.model_path)
+    if model_info is None:
+        raise ValueError(f"Could not resolve model info for {server_args.model_path!r}")
+    return model_info.pipeline_config_cls.task_type
+
+
+def get_default_sampling_params_for_model_task(
+    task_type: ModelTaskType,
+) -> DiffusionSamplingParams:
+    if task_type == ModelTaskType.T2I:
+        return T2I_sampling_params
+    if task_type in (ModelTaskType.I2I, ModelTaskType.TI2I):
+        return TI2I_sampling_params
+    if task_type == ModelTaskType.T2V:
+        return T2V_sampling_params
+    if task_type in (ModelTaskType.I2V, ModelTaskType.TI2V):
+        return TI2V_sampling_params
+    if task_type == ModelTaskType.I2M:
+        return HUNYUAN3D_SHAPE_sampling_params
+    raise ValueError(f"No default sampling params for model task {task_type!r}")
+
+
+def get_default_sampling_params_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> DiffusionSamplingParams:
+    task_type = get_model_task_type_for_server_args(server_args)
+    return get_default_sampling_params_for_model_task(task_type)
+
+
 MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
@@ -451,11 +652,10 @@ MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
 )
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL = "lmsys/qwen-image-2512-modelopt-nvfp4-sglang"
 MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
-MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
-MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {
-    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "trtllm"
-}
+MODELOPT_NVFP4_B200_ENV_VARS = {}
+MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}
 
 
 def _make_modelopt_ci_case(
@@ -473,7 +673,6 @@ def _make_modelopt_ci_case(
         DiffusionServerArgs(
             model_path=model_path,
             modality=modality,
-            enable_warmup=False,
             extras=extras,
             env_vars=env_vars or {},
         ),

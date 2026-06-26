@@ -9,10 +9,10 @@ from torch.nn import LayerNorm
 from transformers.modeling_utils import PreTrainedModel
 
 from sglang.srt.configs.dots_vlm import DotsVisionConfig
-from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -224,7 +224,7 @@ class DotsVisionTransformer(PreTrainedModel):
 
     def _update_vision_config(self):
         """update vision config to support tp"""
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        world_size = get_parallel().tp_size
         num_heads = self.config.num_attention_heads
         head_dim = self.config.embed_dim // num_heads
         num_dummy_heads = 0

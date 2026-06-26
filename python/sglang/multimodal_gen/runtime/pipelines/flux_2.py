@@ -7,6 +7,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.flux_2 import (
+    Flux2ProgressiveDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -56,6 +59,7 @@ class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
             prompt_encoding="text",
             image_vae_stage_kwargs={"vae_image_processor": vae_image_processor},
             prepare_extra_timestep_kwargs=[compute_empirical_mu],
+            progressive_denoising_stage_cls=Flux2ProgressiveDenoisingStage,
         )
 
 

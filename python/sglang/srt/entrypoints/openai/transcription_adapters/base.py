@@ -82,6 +82,14 @@ class TranscriptionAdapter(ABC):
         return False
 
     @property
+    def model_sample_rate(self) -> int:
+        """Target sample rate in Hz the model expects. Realtime WS path
+        resamples client PCM to this rate before chunking. Default 16000
+        matches Whisper / Qwen3-ASR; override for models expecting other rates.
+        """
+        return 16000
+
+    @property
     def prompt_template(self) -> str:
         """Prompt template for chunked streaming requests.
 

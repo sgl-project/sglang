@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,6 +75,69 @@ from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 logger = init_logger(__name__)
 
 MIN_MATCH_RATIO = float(os.getenv("SGLANG_DIFFUSION_WEIGHT_MATCH_RATIO", "0.98"))
+VAE_CHANNELS_LAST_3D_ENV = "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D"
+VAE_CHANNELS_LAST_3D_PARITY_THRESHOLD = float(
+    os.getenv("SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D_PARITY_THRESHOLD", "0.999")
+)
+
+
+@contextmanager
+def _temporary_vae_channels_last_3d(enabled: bool):
+    previous = os.environ.get(VAE_CHANNELS_LAST_3D_ENV)
+    os.environ[VAE_CHANNELS_LAST_3D_ENV] = "true" if enabled else "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(VAE_CHANNELS_LAST_3D_ENV, None)
+        else:
+            os.environ[VAE_CHANNELS_LAST_3D_ENV] = previous
+
+
+@dataclass
+class Conv3dLayoutStats:
+    calls: int = 0
+    channels_last_input_calls: int = 0
+    channels_last_weight_calls: int = 0
+    mixed_layout_calls: int = 0
+
+
+@contextmanager
+def _record_conv3d_layouts():
+    stats = Conv3dLayoutStats()
+    original_conv3d = torch.nn.functional.conv3d
+
+    def wrapped_conv3d(input, weight, *args, **kwargs):
+        if (
+            isinstance(input, torch.Tensor)
+            and isinstance(weight, torch.Tensor)
+            and input.dim() == 5
+            and weight.dim() == 5
+            and hasattr(torch, "channels_last_3d")
+        ):
+            input_channels_last = input.is_contiguous(
+                memory_format=torch.channels_last_3d
+            )
+            weight_channels_last = weight.is_contiguous(
+                memory_format=torch.channels_last_3d
+            )
+        else:
+            input_channels_last = False
+            weight_channels_last = False
+
+        stats.calls += 1
+        stats.channels_last_input_calls += int(input_channels_last)
+        stats.channels_last_weight_calls += int(weight_channels_last)
+        stats.mixed_layout_calls += int(
+            weight_channels_last and not input_channels_last
+        )
+        return original_conv3d(input, weight, *args, **kwargs)
+
+    torch.nn.functional.conv3d = wrapped_conv3d
+    try:
+        yield stats
+    finally:
+        torch.nn.functional.conv3d = original_conv3d
 
 
 @dataclass(frozen=True)
@@ -584,3 +648,114 @@ class AccuracyEngine:
                 )
 
         return sgl_component.eval(), ref_component.eval(), str(device)
+
+    @staticmethod
+    def run_vae_channels_last_3d_parity(
+        case: DiffusionTestCase,
+        num_gpus: int,
+    ) -> None:
+        component = ComponentType.VAE
+        spec = COMPONENT_SPECS[component]
+        hub_id = case.server_args.model_path
+        component_selection = select_component_source(
+            hub_id,
+            case.server_args.extras,
+            component,
+            spec.model_index_keys,
+        )
+        sgl_args = build_accuracy_server_args(
+            component_selection.base_model_id,
+            component_selection.base_model_root,
+            case,
+            component,
+            num_gpus,
+            component_selection.component_paths,
+        )
+
+        baseline_vae = None
+        channels_last_vae = None
+        try:
+            initialize_parallel_runtime(sgl_args)
+            set_global_server_args(sgl_args)
+            device = get_local_torch_device()
+
+            with _temporary_vae_channels_last_3d(False):
+                baseline_vae = _load_sglang_component(
+                    component_selection.source_path,
+                    sgl_args,
+                    component,
+                    spec.reference_library,
+                ).to(device=device, dtype=torch.bfloat16)
+
+            with _temporary_vae_channels_last_3d(True):
+                channels_last_vae = _load_sglang_component(
+                    component_selection.source_path,
+                    sgl_args,
+                    component,
+                    spec.reference_library,
+                ).to(device=device, dtype=torch.bfloat16)
+
+            baseline_vae.eval()
+            channels_last_vae.eval()
+
+            profile = resolve_component_native_profile(component)
+            inputs = profile.build_inputs(
+                case, baseline_vae, str(device), channels_last_vae
+            )
+            baseline_call = profile.prepare_sglang_call(baseline_vae, inputs)
+            channels_last_call = profile.prepare_sglang_call(channels_last_vae, inputs)
+
+            with torch.no_grad():
+                with _record_conv3d_layouts() as baseline_layout:
+                    baseline_raw = AccuracyEngine._execute_with_native_hook(
+                        baseline_call
+                    )
+                with _record_conv3d_layouts() as channels_last_layout:
+                    channels_last_raw = AccuracyEngine._execute_with_native_hook(
+                        channels_last_call
+                    )
+
+            baseline_out = profile.normalize_sglang_output(baseline_raw)
+            channels_last_out = profile.normalize_sglang_output(channels_last_raw)
+
+            AccuracyEngine.check_accuracy(
+                channels_last_out,
+                baseline_out,
+                f"{case.id}_vae_channels_last_3d",
+                VAE_CHANNELS_LAST_3D_PARITY_THRESHOLD,
+            )
+
+            logger.info(
+                "[%s_vae_channels_last_3d] Conv3d layout baseline: calls=%d, "
+                "input_cl3d=%d, weight_cl3d=%d, mixed=%d | channels_last: "
+                "calls=%d, input_cl3d=%d, weight_cl3d=%d, mixed=%d",
+                case.id,
+                baseline_layout.calls,
+                baseline_layout.channels_last_input_calls,
+                baseline_layout.channels_last_weight_calls,
+                baseline_layout.mixed_layout_calls,
+                channels_last_layout.calls,
+                channels_last_layout.channels_last_input_calls,
+                channels_last_layout.channels_last_weight_calls,
+                channels_last_layout.mixed_layout_calls,
+            )
+            if channels_last_layout.calls == 0:
+                raise RuntimeError(
+                    f"{case.id}: VAE channels_last_3d guard did not execute Conv3d"
+                )
+            if channels_last_layout.channels_last_weight_calls == 0:
+                raise RuntimeError(
+                    f"{case.id}: VAE channels_last_3d guard did not see channels_last_3d Conv3d weights"
+                )
+            if channels_last_layout.mixed_layout_calls:
+                raise RuntimeError(
+                    f"{case.id}: {channels_last_layout.mixed_layout_calls} Conv3d calls used "
+                    "channels_last_3d weights with non-channels_last_3d inputs"
+                )
+        finally:
+            if baseline_vae is not None:
+                del baseline_vae
+            if channels_last_vae is not None:
+                del channels_last_vae
+            AccuracyEngine.reset_parallel_runtime()
+            AccuracyEngine.clear_memory()

@@ -1,0 +1,77 @@
+---
+title: ERNIE-Image
+metatags:
+    description: "Deploy ERNIE-Image and ERNIE-Image-Turbo with SGLang Diffusion."
+---
+
+## 1. Model introduction
+
+[ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) is Baidu's text-to-image diffusion model family. SGLang Diffusion supports both the regular and Turbo checkpoints with the native `ErnieImagePipeline`.
+
+| Model | Hugging Face model ID | Notes |
+| --- | --- | --- |
+| ERNIE-Image | `baidu/ERNIE-Image` | Regular text-to-image checkpoint |
+| ERNIE-Image-Turbo | `baidu/ERNIE-Image-Turbo` | Turbo text-to-image checkpoint |
+
+## 2. Installation
+
+Install SGLang with the diffusion dependencies:
+
+```bash Command
+pip install -e "python[diffusion]"
+```
+
+For full installation options, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+## 3. Serve the model
+
+The commands below target a single supported NVIDIA CUDA or AMD ROCm GPU. Start with `--performance-mode auto`; use `speed` only when the full pipeline fits comfortably on the selected GPU(s), and use `memory` when you need lower peak GPU memory.
+
+Serve ERNIE-Image:
+
+```bash Command
+sglang serve \
+  --model-path baidu/ERNIE-Image \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+Serve ERNIE-Image-Turbo:
+
+```bash Command
+sglang serve \
+  --model-path baidu/ERNIE-Image-Turbo \
+  --num-gpus 1 \
+  --performance-mode auto \
+  --port 30010
+```
+
+## 4. Generate an image
+
+Use the OpenAI-compatible image generation API after the server starts:
+
+```python Python
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://127.0.0.1:30010/v1")
+
+response = client.images.generate(
+    model="baidu/ERNIE-Image-Turbo",
+    prompt="A cinematic photo of a quiet lakeside cabin at sunrise",
+    n=1,
+    response_format="b64_json",
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("ernie_image.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+## 5. Configuration tips
+
+- ERNIE-Image is a text-to-image pipeline; do not pass `--image-path`.
+- `--performance-mode auto` keeps conservative defaults while preserving explicit user flags.
+- If the checkpoint includes a PE component, SGLang loads it automatically from `model_index.json`.
+- Treat FSDP, SP/Ulysses/Ring, and TP as explicit benchmark knobs. Measure the target resolution, step count, and GPU type before making them production defaults.

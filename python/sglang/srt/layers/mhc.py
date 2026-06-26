@@ -1,9 +1,8 @@
 import functools
+import logging
 import math
 from typing import Tuple
 
-import tilelang
-import tilelang.language as T
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
@@ -11,12 +10,57 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
-tilelang.set_log_level("WARNING")
+logger = logging.getLogger(__name__)
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
+# Tilelang isn't packaged on every platform (notably Ascend NPU images) but
+# this module is imported transitively from deepseek_v4.py — module-load
+# must succeed even when tilelang is missing. The kernels themselves still
+# require tilelang at runtime; we replace the package with a stub that lets
+# `@tilelang.jit` decorations and `tilelang.PassConfigKey.*` references parse
+# without ImportError, and any actual call into the kernels raises a clear
+# message at execution time instead of crashing on import.
+try:
+    import tilelang
+    import tilelang.language as T
+
+    tilelang.set_log_level("WARNING")
+
+    # Set once mhc_pre() has compiled every n_splits bucket at startup.
+    _mhc_pre_warmed = False
+
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+except ImportError:
+
+    class _TilelangMissing:
+        """Stub so module-level @tilelang.jit and PassConfigKey accesses parse."""
+
+        def __getattr__(self, name):
+            if name == "jit":
+
+                def _jit(*_args, **_kwargs):
+                    def _wrap(fn):
+                        def _raise(*a, **k):
+                            raise RuntimeError(
+                                "tilelang is not installed; this kernel cannot run "
+                                "on the current platform"
+                            )
+
+                        return _raise
+
+                    return _wrap
+
+                return _jit
+            return _TilelangMissing()
+
+        def __call__(self, *_args, **_kwargs):
+            return _TilelangMissing()
+
+    tilelang = _TilelangMissing()
+    T = _TilelangMissing()
+    pass_configs = None
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -453,19 +497,60 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
 def get_mhc_pre_token_count_representatives(
     max_num_tokens: int, hc_hidden_size: int
 ) -> Tuple[int, ...]:
-    """Return one token-count representative for each MHC pre split bucket."""
-    if max_num_tokens <= 0:
-        return tuple()
+    """One representative token count per distinct mhc_pre n_splits bucket over
+    [1, max_num_tokens] (the kernel is specialized only by n_splits)."""
+    reps = {}
+    for grid in range(1, (max(1, max_num_tokens) + 63) // 64 + 1):
+        num_tokens = min(grid * 64, max_num_tokens)
+        reps[_compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)] = num_tokens
+    return tuple(sorted(reps.values()))
 
-    representatives_by_split: dict[int, int] = {}
-    for num_tokens in range(1, max_num_tokens + 1):
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
-        representatives_by_split[n_splits] = num_tokens
 
-    return tuple(
-        representatives_by_split[n_splits]
-        for n_splits in sorted(representatives_by_split)
+def _prewarm_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+    n_splits_pre: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+):
+    """Compile the prenorm kernel for every n_splits bucket by replaying the
+    prenorm with the call's real weights. The compiled kernels are written to
+    the TileLang/DeepGEMM on-disk JIT cache, so this cost is paid only on a cold
+    cache; later server runs hit the cache. Runs once (gated in mhc_pre)."""
+    from sglang.srt.server_args import get_global_server_args
+
+    hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
+    max_num_tokens = get_global_server_args().chunked_prefill_size
+    buckets = get_mhc_pre_token_count_representatives(
+        max_num_tokens, hc_mult * hidden_size
     )
+
+    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    with torch.inference_mode():
+        for num_tokens in buckets:
+            _mhc_pre_impl(
+                residual.new_zeros(num_tokens, hc_mult, hidden_size),
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                n_splits_pre,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
 
 
 @tilelang.jit(
@@ -656,7 +741,64 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # One-shot startup prewarm: on the first non-capturing call, compile every
+    # n_splits bucket up front so it isn't JIT-compiled lazily on the first
+    # prefill. Replays the prenorm via _mhc_pre_impl (no re-entry into mhc_pre).
+    global _mhc_pre_warmed
+    if (
+        not _mhc_pre_warmed
+        and envs.SGLANG_DSV4_MHC_PREWARM.get()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _mhc_pre_warmed = True
+        _prewarm_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            n_splits_pre,
+            norm_weight,
+            norm_eps,
+        )
+    return _mhc_pre_impl(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        n_splits_pre,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
 
+
+def _mhc_pre_impl(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    n_splits_pre: int = 32,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -690,8 +832,6 @@ def mhc_pre(
     )
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        import deep_gemm
-
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -701,12 +841,14 @@ def mhc_pre(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
-        deep_gemm.tf32_hc_prenorm_gemm(
+        from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+
+        tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
             gemm_out_mul,
             gemm_out_sqrsum,
-            num_splits=n_splits,
+            n_splits,
         )
         gemm_last_dim = hc_mult3
         big_fuse_n_splits = n_splits
@@ -914,3 +1056,557 @@ def mhc_post(
         residual.shape[-1],
     )
     return out
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+    },
+)
+def mhc_fused_post_pre_fma_tilelang(
+    prev_comb_mix,
+    prev_residual,
+    prev_post_mix,
+    hidden_in,
+    pre_fn,
+    mixes_partial_out,
+    sqrsum_partial_out,
+    cur_residual_out,
+    hc: int,
+    hidden_size: int,
+    num_mix_outputs: int,
+    n_thr: int = 256,
+    tile_mix_outputs: int = 1,
+    split_k: int = 1,
+) -> tilelang.JITKernel:
+    num_tokens = T.dynamic("num_tokens")
+    split_k = T.dynamic("split_k")
+
+    hidden_per_split = (hidden_size + split_k - 1) // split_k
+    num_mix_output_tiles = (num_mix_outputs + tile_mix_outputs - 1) // tile_mix_outputs
+
+    prev_comb_mix: T.Tensor((num_tokens, hc, hc), T.float32)
+    prev_residual: T.Tensor((num_tokens, hc, hidden_size), T.bfloat16)
+    prev_post_mix: T.Tensor((num_tokens, hc), T.float32)
+    hidden_in: T.Tensor((num_tokens, hidden_size), T.bfloat16)
+    pre_fn: T.Tensor((num_mix_outputs, hc, hidden_size), T.float32)
+
+    mixes_partial_out: T.Tensor((split_k, num_tokens, num_mix_outputs), T.float32)
+    sqrsum_partial_out: T.Tensor((split_k, num_tokens), T.float32)
+    cur_residual_out: T.Tensor((num_tokens, hc, hidden_size), T.bfloat16)
+
+    hidden_iters_per_thread = (hidden_per_split + n_thr - 1) // n_thr
+    num_warps = n_thr // 32
+
+    ENABLE_PDL = is_arch_support_pdl()
+
+    # CTA assignment:
+    #   token_idx           : this CTA handles one token.
+    #   mix_output_tile_idx : this CTA handles a small tile of mix output columns.
+    #                          For HC=4, num_mix_outputs = 24:
+    #                            [0:4]   -> pre logits
+    #                            [4:8]   -> post logits
+    #                            [8:24]  -> comb logits
+    #   hidden_split_idx    : this CTA handles one split of the hidden dimension.
+    #
+    # Thread assignment inside one CTA:
+    #   Each thread owns several hidden positions in this hidden split:
+    #     hidden_idx = hidden_split_start + hidden_iter * n_thr + thread_idx
+    #
+    # For each owned hidden_idx, the thread computes:
+    #   1. post result: cur_residual[token, :, hidden_idx]
+    #   2. sqrsum partial for pre RMS
+    #   3. GEMM partial for several mix output columns
+    with T.Kernel(
+        num_tokens,
+        num_mix_output_tiles,
+        split_k,
+        threads=n_thr,
+    ) as (token_idx, mix_output_tile_idx, hidden_split_idx):
+        thread_idx = T.get_thread_binding()
+        warp_idx = T.get_warp_idx()
+        lane_idx = T.get_lane_idx()
+
+        warp_partials = T.alloc_shared((num_warps, tile_mix_outputs + 1), T.float32)
+        post_mix_smem = T.alloc_shared((hc,), T.float32)
+        comb_mix_smem = T.alloc_shared((hc, hc), T.float32)
+
+        post_mix_for_token = T.alloc_local((hc,), T.float32)
+        comb_mix_for_token = T.alloc_local((hc, hc), T.float32)
+
+        mix_acc = T.alloc_local((tile_mix_outputs,), T.float32)
+        sqrsum_acc = T.alloc_local((1,), T.float32)
+        cur_residual_values = T.alloc_local((hc,), T.float32)
+
+        T.clear(mix_acc)
+        T.clear(sqrsum_acc)
+
+        hidden_split_start = hidden_split_idx * hidden_per_split
+
+        if ENABLE_PDL:
+            T.pdl_sync()
+
+        # Load post/comb coefficients for this token.
+        #
+        # PyTorch equivalent:
+        #   post = prev_post_mix[token_idx]      # [HC]
+        #   comb = prev_comb_mix[token_idx]      # [HC, HC]
+        T.copy(prev_post_mix[token_idx, 0], post_mix_smem)
+        T.copy(prev_comb_mix[token_idx, 0, 0], comb_mix_smem)
+
+        for route_idx in T.unroll(hc):
+            post_mix_for_token[route_idx] = post_mix_smem[route_idx]
+
+        for old_route_idx in T.unroll(hc):
+            for new_route_idx in T.unroll(hc):
+                comb_mix_for_token[old_route_idx, new_route_idx] = comb_mix_smem[
+                    old_route_idx, new_route_idx
+                ]
+
+        for hidden_iter in T.serial(hidden_iters_per_thread):
+            hidden_idx = hidden_split_start + hidden_iter * n_thr + thread_idx
+
+            if hidden_idx < hidden_size:
+                # Step A: fused post.
+                #
+                # PyTorch equivalent:
+                #   cur_residual =
+                #       post.unsqueeze(-1) * hidden_in.unsqueeze(1)
+                #       + (
+                #           comb.unsqueeze(-1)
+                #           * prev_residual.unsqueeze(2)
+                #         ).sum(dim=1)
+                #
+                # Scalar form for this token and this hidden position:
+                #   cur_residual[j, h]
+                #     = post[j] * hidden_in[h]
+                #     + sum_k comb[k, j] * prev_residual[k, h]
+                for new_route_idx in T.unroll(hc):
+                    cur_residual_values[new_route_idx] = (
+                        post_mix_for_token[new_route_idx]
+                        * hidden_in[token_idx, hidden_idx]
+                    )
+
+                    for old_route_idx in T.unroll(hc):
+                        cur_residual_values[new_route_idx] += (
+                            comb_mix_for_token[old_route_idx, new_route_idx]
+                            * prev_residual[token_idx, old_route_idx, hidden_idx]
+                        )
+
+                # Match the unfused path:
+                #   mhc_post writes bf16 residual,
+                #   then mhc_pre reads bf16 residual.
+                for route_idx in T.unroll(hc):
+                    cur_residual_values[route_idx] = T.bfloat16(
+                        cur_residual_values[route_idx]
+                    )
+
+                # Step B1: pre sqrsum partial.
+                #
+                # PyTorch equivalent:
+                #   x_flat = cur_residual.reshape(T, HC * H).float()
+                #   sqrsum = (x_flat * x_flat).sum(dim=-1)
+                #
+                # Only mix_output_tile_idx == 0 writes cur_residual and sqrsum,
+                # otherwise different output-column CTAs would duplicate this work.
+                if mix_output_tile_idx == 0:
+                    for route_idx in T.unroll(hc):
+                        cur_residual_out[token_idx, route_idx, hidden_idx] = (
+                            cur_residual_values[route_idx]
+                        )
+                        sqrsum_acc[0] += (
+                            cur_residual_values[route_idx]
+                            * cur_residual_values[route_idx]
+                        )
+
+                # Step B2: pre GEMM partial.
+                #
+                # PyTorch equivalent:
+                #   mixes = F.linear(x_flat, fn)
+                #
+                # Scalar form:
+                #   mixes[token, o] +=
+                #       pre_fn[o, route, hidden] * cur_residual[route, hidden]
+                #
+                # This CTA computes only tile_mix_outputs columns of mixes.
+                for tile_col_idx in T.unroll(tile_mix_outputs):
+                    mix_output_idx = (
+                        mix_output_tile_idx * tile_mix_outputs + tile_col_idx
+                    )
+
+                    if mix_output_idx < num_mix_outputs:
+                        for route_idx in T.unroll(hc):
+                            mix_acc[tile_col_idx] += (
+                                pre_fn[mix_output_idx, route_idx, hidden_idx]
+                                * cur_residual_values[route_idx]
+                            )
+
+        # Reduce thread partials inside each warp.
+        for tile_col_idx in T.unroll(tile_mix_outputs):
+            mix_acc[tile_col_idx] = T.warp_reduce_sum(mix_acc[tile_col_idx])
+
+        if mix_output_tile_idx == 0:
+            sqrsum_acc[0] = T.warp_reduce_sum(sqrsum_acc[0])
+
+        # One lane per warp writes warp-level partials to shared memory.
+        if lane_idx == 0:
+            for tile_col_idx in T.unroll(tile_mix_outputs):
+                warp_partials[warp_idx, tile_col_idx] = mix_acc[tile_col_idx]
+
+            if mix_output_tile_idx == 0:
+                warp_partials[warp_idx, tile_mix_outputs] = sqrsum_acc[0]
+
+        T.sync_threads()
+
+        # Reduce across warps and write split partials.
+        #
+        # The full PyTorch result would be:
+        #   mixes = F.linear(cur_residual.reshape(T, HC * H), fn)
+        #   sqrsum = (cur_residual.float() ** 2).sum(dim=(1, 2))
+        #
+        # This kernel is split along hidden, so each CTA writes only:
+        #   mixes_partial_out[hidden_split_idx, token, o]
+        #   sqrsum_partial_out[hidden_split_idx, token]
+        #
+        # Later mhc_pre_big_fuse does:
+        #   mixes = mixes_partial_out.sum(dim=0)
+        #   sqrsum = sqrsum_partial_out.sum(dim=0)
+        #   rms = rsqrt(sqrsum / (HC * H) + eps)
+        #   mixes *= rms
+        #   mixes -> pre/post/comb
+        #   layer_input = sum_j pre[j] * cur_residual[j]
+        if warp_idx == 0:
+            for tile_col_idx in T.unroll(tile_mix_outputs):
+                mix_output_idx = mix_output_tile_idx * tile_mix_outputs + tile_col_idx
+
+                if mix_output_idx < num_mix_outputs and lane_idx == tile_col_idx:
+                    mix_output_partial = T.alloc_var(T.float32, init=0.0)
+
+                    for reduce_warp_idx in T.unroll(num_warps):
+                        mix_output_partial += warp_partials[
+                            reduce_warp_idx, tile_col_idx
+                        ]
+
+                    mixes_partial_out[hidden_split_idx, token_idx, mix_output_idx] = (
+                        mix_output_partial
+                    )
+
+            if mix_output_tile_idx == 0 and lane_idx == 0:
+                sqrsum_partial = T.alloc_var(T.float32, init=0.0)
+
+                for reduce_warp_idx in T.unroll(num_warps):
+                    sqrsum_partial += warp_partials[reduce_warp_idx, tile_mix_outputs]
+
+                sqrsum_partial_out[hidden_split_idx, token_idx] = sqrsum_partial
+
+        if ENABLE_PDL:
+            T.pdl_trigger()
+
+
+def mhc_fused_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    tile_n: int = 1,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse the boundary between one mHC post step and the next mHC pre step.
+
+    The unfused sequence is ``mhc_post -> pre-norm GEMM -> mhc_pre big_fuse``.
+    This wrapper keeps the numerically sensitive ``mhc_pre_big_fuse`` stage,
+    including optional RMSNorm, but removes the separate post/pre boundary.
+    Small token batches use the FMA kernel above to combine ``mhc_post`` and the
+    pre-norm GEMM in one launch; larger batches keep DeepGEMM for throughput and
+    only fuse the Python/model-level scheduling boundary.
+
+    Returns:
+        residual_cur: post-mapped residual, shape (..., hc_mult, hidden_size)
+        post_mix_cur: shape (..., hc_mult, 1)
+        comb_mix_cur: shape (..., hc_mult, hc_mult)
+        layer_input_cur: shape (..., hidden_size)
+    """
+
+    assert residual.dtype == torch.bfloat16
+    assert x.dtype == torch.bfloat16
+    assert post_layer_mix.dtype == torch.float32
+    assert comb_res_mix.dtype == torch.float32
+    assert fn.dtype == torch.float32
+    assert hc_scale.dtype == torch.float32
+    assert hc_base.dtype == torch.float32
+
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    hc_mult2 = hc_mult * hc_mult
+    hc_mult3 = hc_mult * 2 + hc_mult2
+    hc_hidden_size = hc_mult * hidden_size
+    outer_shape = residual.shape[:-2]
+
+    assert x.shape == (*outer_shape, hidden_size)
+    assert post_layer_mix.shape in (
+        (*outer_shape, hc_mult, 1),
+        (*outer_shape, hc_mult),
+    )
+    assert comb_res_mix.shape == (*outer_shape, hc_mult, hc_mult)
+    assert fn.shape == (hc_mult3, hc_hidden_size)
+    assert hc_scale.shape == (3,)
+    assert hc_base.shape == (hc_mult3,)
+
+    residual_flat = residual.view(-1, hc_mult, hidden_size)
+    num_tokens = residual_flat.shape[0]
+    if num_tokens == 0:
+        # Some DP/EP ranks can receive no tokens; return correctly typed empty
+        # tensors so later fused layers keep the same contracts as mhc_pre/hc_post.
+        return (
+            torch.empty_like(residual),
+            torch.empty(
+                (*outer_shape, hc_mult, 1), dtype=torch.float32, device=residual.device
+            ),
+            torch.empty(
+                (*outer_shape, hc_mult, hc_mult),
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+            torch.empty(
+                (*outer_shape, hidden_size),
+                dtype=torch.bfloat16,
+                device=residual.device,
+            ),
+        )
+    x_flat = x.view(num_tokens, hidden_size)
+
+    # The scalar-FMA kernel wins only for small batches where launch
+    # overhead dominates; beyond the threshold DeepGEMM's tensor-core path wins.
+    fma_token_threshold = 32
+    if num_tokens <= fma_token_threshold:
+        tile_n = 2 if num_tokens < 8 else 3
+        n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+    else:
+        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+
+    gemm_out_mul = torch.empty(
+        n_splits,
+        num_tokens,
+        hc_mult3,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    gemm_out_sqrsum = torch.empty(
+        n_splits,
+        num_tokens,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    residual_cur = torch.empty_like(residual_flat)
+
+    if num_tokens <= fma_token_threshold:
+        # Small-batch path: one TileLang launch computes hc_post, the bf16
+        # residual write, GEMM partials, and the RMS square-sum partials.
+        mhc_fused_post_pre_fma_tilelang(
+            comb_res_mix.view(num_tokens, hc_mult, hc_mult),
+            residual_flat,
+            post_layer_mix.view(num_tokens, hc_mult),
+            x_flat,
+            fn.view(hc_mult3, hc_mult, hidden_size),
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            residual_cur,
+            hc_mult,
+            hidden_size,
+            hc_mult3,
+            tile_mix_outputs=tile_n,
+            split_k=n_splits,
+        )
+    else:
+        # Large-batch path: keep the existing high-throughput TileLang hc_post +
+        # DeepGEMM pre-norm GEMM decomposition instead of replacing tensor cores.
+        mhc_post_tilelang(
+            comb_res_mix.view(num_tokens, hc_mult, hc_mult),
+            residual_flat,
+            post_layer_mix.view(num_tokens, hc_mult),
+            x_flat,
+            residual_cur,
+            hc_mult,
+            hidden_size,
+        )
+
+        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            import deep_gemm
+
+            deep_gemm.tf32_hc_prenorm_gemm(
+                residual_cur.view(num_tokens, hc_hidden_size),
+                fn,
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                num_splits=n_splits,
+            )
+        else:
+            # Fallback mirrors mhc_pre when DeepGEMM prenorm is disabled.
+            n_splits = 1
+            gemm_out_mul_2d = torch.empty(
+                num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
+            )
+            gemm_out_sqrsum_1d = torch.empty(
+                num_tokens, dtype=torch.float32, device=residual.device
+            )
+            mhc_pre_gemm_sqrsum_tilelang(
+                residual_cur.view(num_tokens, hc_hidden_size),
+                fn,
+                gemm_out_mul_2d,
+                gemm_out_sqrsum_1d,
+                hc_mult3,
+                hc_hidden_size,
+            )
+            gemm_out_mul = gemm_out_mul_2d.unsqueeze(0)
+            gemm_out_sqrsum = gemm_out_sqrsum_1d.unsqueeze(0)
+
+    post_mix_cur = torch.empty(
+        num_tokens,
+        hc_mult,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb_mix_cur = torch.empty(
+        num_tokens,
+        hc_mult2,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    layer_input_cur = torch.empty(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=residual.device,
+    )
+
+    if norm_weight is not None:
+        # Final mhc_pre stage: convert GEMM partials into post/comb/layer_input
+        # and fuse the following RMSNorm when the model passed a norm weight.
+        assert norm_eps is not None
+        assert norm_weight.shape == (hidden_size,)
+        norm_weight_bf = (
+            norm_weight.bfloat16()
+            if norm_weight.dtype != torch.bfloat16
+            else norm_weight
+        )
+        if not norm_weight_bf.is_contiguous():
+            norm_weight_bf = norm_weight_bf.contiguous()
+        mhc_pre_big_fuse_with_norm_tilelang(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            layer_input_cur,
+            norm_weight_bf,
+            hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_eps,
+            n_splits,
+            hc_mult,
+            hc_mult3,
+        )
+    else:
+        # Same mhc_pre finalization without the model-layer RMSNorm.
+        mhc_pre_big_fuse_tilelang(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            layer_input_cur,
+            hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+            hc_mult,
+            hc_mult3,
+        )
+
+    return (
+        residual_cur.view(*outer_shape, hc_mult, hidden_size),
+        post_mix_cur.view(*outer_shape, hc_mult, 1),
+        comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
+        layer_input_cur.view(*outer_shape, hidden_size),
+    )
+
+
+def npu_hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    hc_sinkhorn_iters: int,
+    rms_norm_eps: float,
+    hc_eps: float,
+    forward_batch=None,
+) -> tuple:
+    """NPU-accelerated hc_pre via the custom_ops kernel.
+
+    Returns (y, post, comb, norm_fused).  norm_fused is always False
+    because npu_hc_pre does not fold input_layernorm — the caller must
+    apply it separately.
+    """
+    shape, dtype = x.size(), x.dtype
+
+    # IDLE / empty short-circuit, mirroring the dsv4-flash source.
+    # The kernel emits post/comb in fp32 (sinkhorn iterates in fp32),
+    # so the dummies must too — otherwise downstream comb/post-aware
+    # ops see a silent fp32 ↔ bf16 split between idle and non-idle
+    # batches.
+    is_idle = forward_batch is not None and forward_batch.forward_mode.is_idle()
+    if is_idle or x.shape[0] == 0:
+        bs = x.shape[0]
+        y = torch.empty((bs, shape[-1]), dtype=dtype, device=x.device)
+        post = torch.empty((bs, hc_mult), dtype=torch.float32, device=x.device)
+        comb = torch.empty(
+            (bs, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        return y, post, comb, False
+
+    # Note the return order: (y, post, comb) — y is the (T, hidden)
+    # mixed activation, post / comb are the hc_post inputs. The
+    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
+    # cast back to the input dtype before the downstream
+    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    y, post, comb = torch.ops.custom.npu_hc_pre(
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=hc_sinkhorn_iters,
+        norm_eps=rms_norm_eps,
+        hc_eps=hc_eps,
+    )
+    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
+    # not fold input_layernorm. Return norm_fused=False so the caller
+    # applies the layernorm itself, matching the deepgemm/torch paths.
+    return y.to(dtype), post, comb, False

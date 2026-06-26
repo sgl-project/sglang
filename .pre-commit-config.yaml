@@ -11,9 +11,14 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
+        # Helm chart templates embed Go template syntax ({{- ... -}})
+        # that is not valid YAML on its own; the rendered output is
+        # validated by `helm template` / `helm lint`.
+        exclude: ^experimental/sgl-router/helm/.*/templates/.*\.(yaml|tpl)$
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
+        args: ['--maxkb=1500']
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
@@ -30,7 +35,7 @@ repos:
     hooks:
       - id: ruff
         args:
-          - --select=F401,F821
+          - --select=F401,F821,UP037
           - --fix
         files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
         exclude: |
@@ -88,11 +93,17 @@ repos:
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
       - id: check-registered-tests
-        name: check registered tests have CI registry
+        name: validate registered test CI registries
         entry: python3 scripts/ci/check_registered_tests.py
         language: system
         files: ^test/registered/.*\.py$
         exclude: ^test/registered/.*/utils\.py$
+        pass_filenames: false
+      - id: check-no-registered-tests-in-package
+        name: reject CI-registered tests inside the sglang package
+        entry: python3 scripts/ci/check_no_registered_tests_in_package.py
+        language: system
+        files: ^python/sglang/.*\.py$
         pass_filenames: false
       - id: check-no-docs-changes
         name: reject changes under legacy docs/
@@ -106,6 +117,12 @@ repos:
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
         language: system
         files: ^sgl-model-gateway/.*\.rs$
+        pass_filenames: false
+      - id: rustfmt-sgl-router
+        name: rustfmt experimental/sgl-router
+        entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
+        language: system
+        files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
