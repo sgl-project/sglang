@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
 )
+from sglang.srt.managers.io_struct import sock_send
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -58,7 +59,10 @@ class SchedulerKvEventsPublisher:
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         self.enable_kv_cache_events = bool(
-            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
+            kv_events_config
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
         )
 
         if self.enable_kv_cache_events:
@@ -85,7 +89,7 @@ class SchedulerKvEventsPublisher:
         )
 
         if not self.send_metrics_from_scheduler.closed:
-            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+            sock_send(self.send_metrics_from_scheduler, kv_metrics)
 
     def publish_kv_events(self):
         if not self.enable_kv_cache_events:

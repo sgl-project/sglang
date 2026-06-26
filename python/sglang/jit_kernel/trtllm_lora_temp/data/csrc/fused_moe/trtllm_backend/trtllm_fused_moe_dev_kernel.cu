@@ -720,6 +720,13 @@ __global__ void permuteKernel(KernelParams params) {
       for (int k = 0; k < params.topK; k++) {
         int const expandedIdx = tokenIdx * params.topK + k;
         int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+        // Skip EP-unrouted (token, k) slots: under expert parallelism the routing emits
+        // permutedIdx == -1 for slots whose expert is not on this rank. The write was
+        // previously unguarded, so at prefill scale the negative index OOBs the output
+        // buffer (illegal memory access). moe::dev::finalize already skips permutedIdx == -1.
+        if (permutedIdx < 0) {
+          continue;
+        }
         params.outPtr[permutedIdx * params.hiddenDim + hiddenIdx] = data;
       }
     }
