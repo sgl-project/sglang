@@ -546,6 +546,7 @@ class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
         self.cos_cached_total = None
         self.sin_cached_total = None
         self.cos_cached = None
+        self.sin_cache = None
         self.sin_cached = None
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
@@ -592,8 +593,9 @@ class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
             self.sin_cached = self.sin_cached_total[index].unsqueeze(-2).unsqueeze(
                 -2
             ).to(dtype)
+            self.sin_cache = self.sin_cached
         cos = self.cos_cached.to(positions.device)
-        sin = self.sin_cached.to(positions.device)
+        sin = self.sin_cache.to(positions.device)
         return cos, sin
 
     def forward_npu(
@@ -613,7 +615,7 @@ class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
         num_k_heads = key.shape[1]
 
         cos = self.cos_cached.to(positions.device)
-        sin = self.sin_cached.to(positions.device)
+        sin = self.sin_cache.to(positions.device)
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
         if self.rotary_dim < self.head_size:
