@@ -107,6 +107,7 @@ def _call_varlen_attn(
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=causal,
+            how_v3_bf16_cvt=2,  # RTZ rounding mode
         )
     else:
         raise NotImplementedError(
