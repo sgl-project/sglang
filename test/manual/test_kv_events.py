@@ -140,10 +140,12 @@ class TestKvEvents(CustomTestCase):
                 elif isinstance(event, BlockRemoved):
                     # Validate BlockRemoved structure
                     self.assertIsInstance(event.block_hashes, list)
-                    self.assertEqual(
-                        len(event.block_hashes), 1, "Should have one hash per block"
+                    self.assertGreater(
+                        len(event.block_hashes),
+                        0,
+                        "Should have at least one removed block hash",
                     )
-                    removed_hashes.add(event.block_hashes[0])
+                    removed_hashes.update(event.block_hashes)
 
             # Verify we got both BlockStored and BlockRemoved events
             self.assertGreater(

@@ -938,13 +938,14 @@ class SamplingParams:
         )
         add_argument(
             "--image-path",
+            "--image-paths",
             type=str,
             nargs="+",
             help=(
                 "Path(s) to input image(s) for image-to-image / image-to-video "
-                "generation. For multiple images, pass them as space-separated "
-                "values, e.g.: "
-                '--image-path "img1.png" "img2.png"'
+                "generation. For multiple images, pass them space-separated "
+                "(alias: --image-paths), e.g.: "
+                '--image-paths "img1.png" "img2.png"'
             ),
         )
         add_argument(

@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+from sglang.srt.layers.quantization.nvfp4_online import NvFp4OnlineConfig
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
@@ -54,6 +55,7 @@ from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    is_cpu,
     is_cuda,
     is_hip,
     is_mps,
@@ -74,6 +76,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
+    "nvfp4_online": NvFp4OnlineConfig,
     "modelopt_mixed": ModelOptMixedPrecisionConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
@@ -92,12 +95,13 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "quark": QuarkConfig,
     "quark_mxfp4": QuarkConfig,
     "auto-round": AutoRoundConfig,
+    "auto-round-int8": W8A8Int8Config,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
 }
 
 
-if is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
@@ -128,6 +132,7 @@ CPU_QUANTIZATION_METHODS = {
     "compressed-tensors": CompressedTensorsConfig,
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
+    "mxfp4": Mxfp4Config,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

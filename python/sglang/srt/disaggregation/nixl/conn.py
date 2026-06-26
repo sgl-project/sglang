@@ -71,7 +71,7 @@ class TransferInfo:
     decode_prefix_len: Optional[int] = None  # for decode radix cache
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
-    staging: Optional["StagingTransferInfo"] = None
+    staging: Optional[StagingTransferInfo] = None
 
     def is_dummy(self):
         # A transfer is "dummy" only for CP non-authoritative ranks.
@@ -124,7 +124,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
-    staging: Optional["StagingRegisterInfo"] = None
+    staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -246,7 +246,7 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
-            from nixl._api import nixl_agent, nixl_agent_config
+            from nixl._api import nixl_agent, nixl_agent_config, nixl_thread_sync_t
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
@@ -267,7 +267,13 @@ class NixlKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
-        agent_config = nixl_agent_config(backends=[], num_threads=num_threads)
+        # self.transfer_worker and self._start_bootstrap_thread runs concurrently
+        # so we cannot use sync_mode=None which is thread-unsafe.
+        agent_config = nixl_agent_config(
+            backends=[],
+            num_threads=num_threads,
+            sync_mode=nixl_thread_sync_t.NIXL_THREAD_SYNC_STRICT,
+        )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
@@ -521,17 +527,20 @@ class NixlKVManager(CommonKVManager):
         Uses prefill's kv_item_lens as stride; requires equal per-slot byte size (equal-TP or MLA).
         """
         arrays = []
+        # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set).
+        # Convert once at entry; all downstream arithmetic stays in uint64.
+        kv_ptrs_u64 = np.array(kv_ptrs, dtype=np.uint64)
         for base_ptr, item_len, data_len in zip(
-            kv_ptrs, self.kv_args.kv_item_lens, self.kv_args.kv_data_lens
+            kv_ptrs_u64, self.kv_args.kv_item_lens, self.kv_args.kv_data_lens
         ):
             n = num_slots if num_slots is not None else (data_len // item_len)
-            addrs = np.arange(n, dtype=np.int64) * item_len + base_ptr
+            addrs = np.arange(n, dtype=np.uint64) * np.uint64(item_len) + base_ptr
             arrays.append(
                 np.column_stack(
                     [
                         addrs,
-                        np.full(n, item_len, dtype=np.int64),
-                        np.full(n, gpu_id, dtype=np.int64),
+                        np.full(n, item_len, dtype=np.uint64),
+                        np.full(n, gpu_id, dtype=np.uint64),
                     ]
                 )
             )
@@ -604,25 +613,24 @@ class NixlKVManager(CommonKVManager):
         num_ptr_pairs = len(src_ptrs)
 
         num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
-        slots = np.arange(num_slots, dtype=np.int64)
-        tokens = np.arange(page_size, dtype=np.int64)  # reused in dst dlist below
-        groups = np.arange(num_groups, dtype=np.int64)
+        slots = np.arange(num_slots, dtype=np.uint64)
+        tokens = np.arange(page_size, dtype=np.uint64)  # reused in dst dlist below
+        groups = np.arange(num_groups, dtype=np.uint64)
 
         # Src dlist built once and shared.
         if self.prep_handle_slice_src is None:
-            # (ptr, slot, token, group) → ravel; groups interleaved per token.
-            src_ptrs_arr = np.array(src_ptrs, dtype=np.int64)
+            src_ptrs_arr = np.array(src_ptrs, dtype=np.uint64)
             addrs = (
                 src_ptrs_arr[:, None, None, None]
-                + slots[None, :, None, None] * src_kv_item_len
-                + tokens[None, None, :, None] * bytes_per_token_src
-                + groups[None, None, None, :] * bytes_per_token_to_send
+                + slots[None, :, None, None] * np.uint64(src_kv_item_len)
+                + tokens[None, None, :, None] * np.uint64(bytes_per_token_src)
+                + groups[None, None, None, :] * np.uint64(bytes_per_token_to_send)
             ).ravel()
             src_array = np.column_stack(
                 [
                     addrs,
-                    np.full(len(addrs), bytes_per_token_to_send, dtype=np.int64),
-                    np.full(len(addrs), self.kv_args.gpu_id, dtype=np.int64),
+                    np.full(len(addrs), bytes_per_token_to_send, dtype=np.uint64),
+                    np.full(len(addrs), self.kv_args.gpu_id, dtype=np.uint64),
                 ]
             )
             src_handle = self.agent.prep_xfer_dlist("", src_array, "VRAM")
@@ -642,20 +650,20 @@ class NixlKVManager(CommonKVManager):
             if decode_kv_args.dst_num_slots is not None
             else num_slots
         )
-        dst_slots = np.arange(num_slots_dst, dtype=np.int64)
+        dst_slots = np.arange(num_slots_dst, dtype=np.uint64)
         # (ptr, slot, token) → ravel.
-        dst_ptrs_arr = np.array(dst_ptrs, dtype=np.int64)
+        dst_ptrs_arr = np.array(dst_ptrs, dtype=np.uint64)
         addrs = (
             dst_ptrs_arr[:, None, None]
-            + dst_slots[None, :, None] * dst_kv_item_len
-            + tokens[None, None, :] * bytes_per_token_dst
-            + dst_head_offset
+            + dst_slots[None, :, None] * np.uint64(dst_kv_item_len)
+            + tokens[None, None, :] * np.uint64(bytes_per_token_dst)
+            + np.uint64(dst_head_offset)
         ).ravel()
         dst_array = np.column_stack(
             [
                 addrs,
-                np.full(len(addrs), bytes_per_token_to_send, dtype=np.int64),
-                np.full(len(addrs), decode_kv_args.gpu_id, dtype=np.int64),
+                np.full(len(addrs), bytes_per_token_to_send, dtype=np.uint64),
+                np.full(len(addrs), decode_kv_args.gpu_id, dtype=np.uint64),
             ]
         )
         dst_handle = self.agent.prep_xfer_dlist(peer_name, dst_array, "VRAM")
@@ -1291,9 +1299,9 @@ class NixlKVManager(CommonKVManager):
     def _do_staging_transfer(
         self,
         staging_strategy,
-        kv_chunk: "TransferKVChunk",
-        req: "TransferInfo",
-        dst_info: "KVArgsRegisterInfo",
+        kv_chunk: TransferKVChunk,
+        req: TransferInfo,
+        dst_info: KVArgsRegisterInfo,
         queue: FastQueue,
     ):
         """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
@@ -1610,7 +1618,7 @@ class NixlKVManager(CommonKVManager):
                         dst_gpu_id,
                         comp_notif,
                     )
-            elif st in (StateType.SWA, StateType.DSA):
+            elif st in (StateType.SWA, StateType.DSA, StateType.SWA_RING):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."

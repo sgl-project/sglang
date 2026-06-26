@@ -67,6 +67,7 @@ class PipelineStage(StageDedupMixin, ABC):
     # Class-level default so subclasses that override __init__ without
     # calling super().__init__() still see a consistent explicit-range gate.
     _current_use_nvtx: bool = False
+    _current_batch_is_warmup: bool = False
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -76,7 +77,7 @@ class PipelineStage(StageDedupMixin, ABC):
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
-        if self.server_args.comfyui_mode:
+        if self.server_args.comfyui_mode or self._current_batch_is_warmup:
             return
         logger.info(f"[{self.__class__.__name__}] {msg}", *args)
 
@@ -98,9 +99,11 @@ class PipelineStage(StageDedupMixin, ABC):
         total: int | None = None,
         *,
         disable: bool = False,
+        batch: Req | None = None,
         **kwargs,
     ) -> tqdm:
         is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+        disable = disable or (batch is not None and batch.is_warmup)
         return tqdm(
             iterable=iterable,
             total=total,
@@ -353,6 +356,8 @@ class PipelineStage(StageDedupMixin, ABC):
         self._apply_nvtx_gate(batch.is_warmup)
 
         # Execute the actual stage logic with unified profiling.
+        previous_batch_is_warmup = self._current_batch_is_warmup
+        self._current_batch_is_warmup = batch.is_warmup
         try:
             with StageProfiler(
                 stage_name,
@@ -364,6 +369,7 @@ class PipelineStage(StageDedupMixin, ABC):
             ):
                 result = self.forward(batch, server_args)
         finally:
+            self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False
 
         # Post-execution output verification

@@ -20,8 +20,8 @@ You can install SGLang using any of the methods below. Please go through `System
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HDK</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>26.0.RC1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+26.0.RC1">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>25.5.2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+25.5.2">link</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
@@ -40,8 +40,8 @@ You can install SGLang using any of the methods below. Please go through `System
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://gitcode.com/Ascend/triton-ascend/releases/v3.2.1">link</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1.dev20260530</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 \`<br/>`--extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \`<br/>`--trusted-host mirrors.huaweicloud.com`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
@@ -101,11 +101,9 @@ If you encounter an error like “Terms of Service have not been accepted” dur
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
 conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/
 conda config --set show_channel_urls yes
-
-# Edit the system-level conda config to remove any hardcoded defaults
-vi /root/miniconda3/.condarc
+conda config --remove channels defaults
 ```
-Inside /root/miniconda3/.condarc, delete or comment out any lines containing defaults or official Anaconda URLs.
+Edit the system-level conda config to remove any hardcoded defaults, e.g. vi ~/miniconda3/.condarc
 Then remove the failed environment and recreate it:
 ```bash Command
 conda clean -i
@@ -123,15 +121,26 @@ Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kern
 If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```bash Command
-pip install memfabric-hybrid==1.0.5
+pip install memfabric-hybrid==1.0.8
+```
+
+#### MemFabric-zbal
+
+MemFabric-zbal is a Zero Buffer Acceleration Library of high-performance operators for LLM inference and training on Ascend,
+accelerating computation by eliminating intermediate memory buffers; it is required only on **aarch64** clusters and is
+installed in addition to MemFabric-Hybrid.
+
+```bash Command
+# Only needed on aarch64 (arm64) hosts
+pip install memfabric-zbal==1.1.1
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 ```bash Command
-PYTORCH_VERSION=2.8.0
-TORCHVISION_VERSION=0.23.0
-TORCH_NPU_VERSION=2.8.0.post2
+PYTORCH_VERSION=2.10.0
+TORCHVISION_VERSION=0.25.0
+TORCH_NPU_VERSION=2.10.0
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 pip install torch_npu==$TORCH_NPU_VERSION
 ```
@@ -143,7 +152,9 @@ If you are using other versions of `torch` and install `torch_npu`, check [insta
 We provide our own implementation of Triton for Ascend.
 
 ```bash Command
-pip install triton-ascend
+pip install triton-ascend==3.2.1.dev20260530 \
+  --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \
+  --trusted-host mirrors.huaweicloud.com
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
@@ -185,7 +196,7 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
 
 <Tabs>
@@ -193,7 +204,7 @@ We publish both **stable releases** and **daily builds**. Choose a stable releas
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
@@ -204,7 +215,7 @@ docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-910b
@@ -220,8 +231,11 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-# If there are network errors, please modify the Dockerfile to use offline dependencies or use a proxy
-# <arch_tag> is the target architecture of the image, e.g. amd64, arm64
+# Replace <arch_tag> with the target architecture, e.g. amd64, arm64.
+# Optional build arguments:
+#   --build-arg DEVICE_TYPE=910b          # Required for Atlas 800I A2
+#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
+# If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
 docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
 ```
 
@@ -232,6 +246,7 @@ __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is t
   <Tab title="Atlas 800I A3">
 
 ```bash Command
+# Create a shortcut 'drun' to launch a privileged Docker container
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
@@ -244,6 +259,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
 # Add HF_TOKEN env for download model by SGLang.
+# The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
@@ -253,6 +269,7 @@ drun --env "HF_TOKEN=<secret>" \
   <Tab title="Atlas 800I A2">
 
 ```bash Command
+# Create a shortcut 'drun' to launch a privileged Docker container
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
@@ -263,6 +280,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
 # Add HF_TOKEN env for download model by SGLang.
+# The container runs with the '--rm' flag, so it will be automatically removed after the command finishes (including Ctrl+C)
 drun --env "HF_TOKEN=<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
@@ -501,8 +519,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Some models return responses accompanied with thinking process content. To disable this output, configure parameters as follows:
 ```bash Command
-curl http://127.0.0.1:8000/v1/chat/completions
-  -H "Content-Type: application/json"
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
   -d '{
     "model": "Eco-Tech/Qwen3.5-27B-w8a8-mtp",
     "messages": [{"role": "user", "content": "What is the capital of France?"}],

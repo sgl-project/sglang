@@ -725,9 +725,10 @@ _LEGACY_SUITE_TO_RUNNER_CONFIG = {
     "nightly-perf-vlm-2-gpu": "2-gpu-large",
     "nightly-4-gpu": "4-gpu-h100",
     "nightly-4-gpu-b200": "4-gpu-b200",
-    "nightly-8-gpu-common": "8-gpu-h200",
+    "nightly-8-gpu-common": ["8-gpu-h200", "8-gpu-b200"],
     "nightly-8-gpu-h200": "8-gpu-h200",
     "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    "nightly-precision-8-gpu-h200": "8-gpu-h200",
     "nightly-8-gpu-h20": "8-gpu-h20",
     "nightly-8-gpu-b200": "8-gpu-b200",
     "weekly-8-gpu-h200": "8-gpu-h200",
@@ -829,10 +830,14 @@ def detect_suite(file_path_from_test):
     legacy_suites = _extract_legacy_suites(content)
     mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
     if mappable:
-        return [
-            _resolve_runner_config(_LEGACY_SUITE_TO_RUNNER_CONFIG[s], full_path, s)
-            for s in mappable
-        ]
+        results = []
+        for s in mappable:
+            rcs = _LEGACY_SUITE_TO_RUNNER_CONFIG[s]
+            if isinstance(rcs, str):
+                rcs = [rcs]
+            for rc in rcs:
+                results.append(_resolve_runner_config(rc, full_path, s))
+        return results
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         return [
