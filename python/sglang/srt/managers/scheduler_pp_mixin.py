@@ -25,7 +25,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler_batches import SchedulerBatches
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -528,18 +527,9 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
-        )
-        self.batches = SchedulerBatches(
-            cur_mbs=[None] * self.pp_loop_size,
-            last_mbs=[None] * self.pp_loop_size,
-            running_mbs=[
-                ScheduleBatch(reqs=[], batch_is_full=False)
-                for _ in range(self.pp_loop_size)
-            ],
         )
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None

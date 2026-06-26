@@ -175,10 +175,10 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sglang.srt.managers.scheduler_batches import SchedulerBatches
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.batches import SchedulerBatches
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import IdleSleeper
@@ -318,11 +318,6 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
-        self.batches = SchedulerBatches(
-            cur_mbs=[None],
-            last_mbs=[None],
-            running_mbs=[ScheduleBatch(reqs=[], batch_is_full=False)],
-        )
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -392,6 +387,15 @@ class Scheduler(
             moe_dp_rank=moe_dp_rank,
             moe_dp_size=server_args.moe_dp_size,
             gpu_id=gpu_id,
+        )
+        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
+        self.batches = SchedulerBatches(
+            cur_mbs=[None] * self.pp_loop_size,
+            last_mbs=[None] * self.pp_loop_size,
+            running_mbs=[
+                ScheduleBatch(reqs=[], batch_is_full=False)
+                for _ in range(self.pp_loop_size)
+            ],
         )
 
         # Init model configs
@@ -972,6 +976,7 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    # May remove these delegate properties later
     @property
     def running_batch(self) -> ScheduleBatch:
         return self.batches.running
@@ -998,12 +1003,6 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
-        # The running decoding batch for continuous batching
-        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
-        # The current forward batch
-        self.cur_batch = None
-        # The last forward batch
-        self.last_batch = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(

@@ -9,8 +9,11 @@ if TYPE_CHECKING:
 
 
 class SchedulerBatches(msgspec.Struct):
+    # The current forward batch
     cur_mbs: List[Optional[ScheduleBatch]]
+    # The last forward batch
     last_mbs: List[Optional[ScheduleBatch]]
+    # The running decoding batch for continuous batching
     running_mbs: List[ScheduleBatch]
     active_mb_id: int = 0
 
