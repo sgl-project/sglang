@@ -155,6 +155,9 @@ def test_fused_dsa_target_verify_metadata(real_page_size, seq_dtype, next_n):
     seqlens_expanded = torch.empty(expanded_size, dtype=torch.int32, device=device)
     dsa_cache_seqlens = torch.empty(expanded_size, dtype=torch.int32, device=device)
     dsa_cu_seqlens_k = torch.empty(expanded_size + 1, dtype=torch.int32, device=device)
+    paged_mqa_ctx_lens_2d = torch.full(
+        (bs, next_n), -1, dtype=torch.int32, device=device
+    )
 
     if real_page_size > 1:
         real_cols = (max_seqlen_k + real_page_size - 1) // real_page_size
@@ -180,6 +183,7 @@ def test_fused_dsa_target_verify_metadata(real_page_size, seq_dtype, next_n):
         dsa_index_topk=topk,
         real_page_size=real_page_size,
         next_n=next_n,
+        paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
     )
     torch.cuda.synchronize()
 
@@ -197,6 +201,10 @@ def test_fused_dsa_target_verify_metadata(real_page_size, seq_dtype, next_n):
         cu_seqlens_k, torch.nn.functional.pad(torch.cumsum(ref_cache, 0), (1, 0))
     )
     assert torch.equal(seqlens_expanded, ref_expanded)
+    assert torch.equal(
+        paged_mqa_ctx_lens_2d,
+        ref_cache.view(bs, 1).expand(bs, next_n),
+    )
     assert torch.equal(dsa_cache_seqlens, ref_dsa)
     assert torch.equal(
         dsa_cu_seqlens_k, torch.nn.functional.pad(torch.cumsum(ref_dsa, 0), (1, 0))
@@ -518,6 +526,115 @@ def test_apply_cuda_graph_metadata_decode_fused_wiring(monkeypatch):
     assert torch.equal(metadata.paged_mqa_schedule_metadata, ref_cache.view(-1, 1))
 
 
+def test_apply_cuda_graph_metadata_target_verify_fills_ctx_lens(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    device = "cuda"
+    bs = 5
+    next_n = 3
+    max_seq_len = 37
+    max_seqlen_k = max_seq_len + next_n
+    expanded_size = bs * next_n
+    topk = 23
+    req_to_token = (
+        torch.arange(8 * 80, dtype=torch.int32, device=device).view(8, 80).mul_(3)
+    )
+    req_pool_indices = torch.tensor([3, 0, 5, 2, 7], dtype=torch.int64, device=device)
+    seq_lens = torch.tensor([37, 12, 23, 4, 31], dtype=torch.int64, device=device)
+    seq_lens_cpu = seq_lens.cpu()
+    ctx_lens_2d = torch.full((bs, next_n), -1, dtype=torch.int32, device=device)
+    schedule_metadata = torch.full((2, 2), -1, dtype=torch.int32, device=device)
+    page_table = torch.full(
+        (expanded_size, max_seqlen_k), -1, dtype=torch.int32, device=device
+    )
+    schedule_calls = []
+
+    metadata = DSAMetadata(
+        page_size=1,
+        cache_seqlens_int32=torch.empty(bs, dtype=torch.int32, device=device),
+        max_seq_len_q=1,
+        max_seq_len_k=max_seqlen_k,
+        cu_seqlens_q=torch.arange(expanded_size + 1, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+        page_table_1=page_table,
+        real_page_table=page_table,
+        dsa_cache_seqlens_int32=torch.empty(
+            expanded_size, dtype=torch.int32, device=device
+        ),
+        dsa_cu_seqlens_q=torch.arange(
+            expanded_size + 1, dtype=torch.int32, device=device
+        ),
+        dsa_cu_seqlens_k=torch.empty(
+            expanded_size + 1, dtype=torch.int32, device=device
+        ),
+        dsa_extend_seq_lens_list=[],
+        dsa_seqlens_expanded=torch.empty(
+            expanded_size, dtype=torch.int32, device=device
+        ),
+        paged_mqa_schedule_metadata=schedule_metadata,
+        paged_mqa_ctx_lens_2d=ctx_lens_2d,
+    )
+
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.decode_cuda_graph_metadata = {bs: metadata}
+    backend.req_to_token = req_to_token
+    backend.real_page_size = 1
+    backend.dsa_index_topk = topk
+    backend.dsa_decode_impl = "none"
+    backend.device = torch.device(device)
+    backend.speculative_num_draft_tokens = next_n
+    backend.set_dsa_prefill_impl = lambda forward_batch: None
+
+    def fail_build(*_args, **_kwargs):
+        raise AssertionError("ctx lens builder should be skipped")
+
+    class _FakeDeepGemm:
+        @staticmethod
+        def get_num_sms():
+            return 1
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata_out(
+            context_lens, schedule, block_kv, num_sms, indices=None
+        ):
+            schedule_calls.append((context_lens, block_kv, num_sms, indices))
+            schedule.zero_()
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata(*_args, **_kwargs):
+            raise AssertionError("allocating DeepGEMM metadata path should not run")
+
+    monkeypatch.setattr(dsa_backend_module, "deep_gemm", _FakeDeepGemm)
+    monkeypatch.setattr(dsa_backend_module, "is_sm100_supported", lambda: True)
+    monkeypatch.setattr(dsa_backend_module, "_USE_FUSED_METADATA_GENERATION", True)
+    backend._build_paged_mqa_schedule_2d_ctx_lens = fail_build
+
+    backend._apply_cuda_graph_metadata(
+        bs=bs,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=None,
+    )
+    torch.cuda.synchronize()
+
+    ref_cache = seq_lens.to(torch.int32) + next_n
+    ref_expanded = (
+        seq_lens.to(torch.int32).view(bs, 1)
+        + torch.arange(1, next_n + 1, dtype=torch.int32, device=device).view(1, next_n)
+    ).reshape(-1)
+    assert torch.equal(metadata.cache_seqlens_int32, ref_cache)
+    assert torch.equal(metadata.dsa_seqlens_expanded, ref_expanded)
+    assert metadata.paged_mqa_ctx_lens_2d is ctx_lens_2d
+    assert torch.equal(ctx_lens_2d, ref_cache.view(bs, 1).expand(bs, next_n))
+    assert len(schedule_calls) == 1
+    assert schedule_calls[0][0] is ctx_lens_2d
+    assert schedule_calls[0][1:] == (64, 1, None)
+    assert torch.equal(schedule_metadata, torch.zeros_like(schedule_metadata))
+
+
 def test_refresh_paged_mqa_schedule_metadata_uses_deepgemm_out(monkeypatch):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     schedule = torch.full((5, 2), -1, dtype=torch.int32, device=device)
@@ -707,6 +824,39 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
             next_n=next_n,
         )
 
+    def target_ctx_call(max_seqlen_k):
+        expanded_size = bs * next_n
+        fused_dsa_target_verify_metadata(
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            cache_seqlens=torch.empty(bs, dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+            page_table_1=torch.empty(
+                (expanded_size, max_seqlen_k), dtype=torch.int32, device=device
+            ),
+            seqlens_expanded=torch.empty(
+                expanded_size, dtype=torch.int32, device=device
+            ),
+            dsa_cache_seqlens=torch.empty(
+                expanded_size, dtype=torch.int32, device=device
+            ),
+            dsa_cu_seqlens_k=torch.empty(
+                expanded_size + 1, dtype=torch.int32, device=device
+            ),
+            real_page_table=torch.empty(
+                (expanded_size, max_seqlen_k), dtype=torch.int32, device=device
+            ),
+            bs=bs,
+            max_seqlen_k=max_seqlen_k,
+            dsa_index_topk=topk,
+            real_page_size=1,
+            next_n=next_n,
+            paged_mqa_ctx_lens_2d=torch.empty(
+                (bs, next_n), dtype=torch.int32, device=device
+            ),
+        )
+
     def draft_call(extend_lens, total, max_seqlen_k):
         fused_dsa_draft_extend_metadata(
             seq_lens=seq_lens,
@@ -734,6 +884,7 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
 
     decode_call(101)
     target_call(101)
+    target_ctx_call(101)
     draft_call(extend_seq_lens, total_len, 101)
     torch.cuda.synchronize()
 
@@ -749,6 +900,7 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
         decode_call(max_len)
     for max_seqlen_k in [102, 127, 128, 129, 257]:
         target_call(max_seqlen_k)
+        target_ctx_call(max_seqlen_k)
         draft_call(extend_seq_lens, total_len, max_seqlen_k)
     draft_call(extend_seq_lens_short, bs, 257)
     draft_call(extend_seq_lens_full, max_total_len, 257)

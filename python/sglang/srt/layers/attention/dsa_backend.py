@@ -1259,6 +1259,7 @@ class DeepseekSparseAttnBackend(
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
         fused_metadata_generation_succeeded = False
+        target_verify_ctx_lens_filled = False
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = metadata.page_table_1.shape[1]
@@ -1324,6 +1325,18 @@ class DeepseekSparseAttnBackend(
                         fused_dsa_target_verify_metadata,
                     )
 
+                    paged_mqa_ctx_lens_2d = None
+                    if (
+                        self.speculative_num_draft_tokens >= 2
+                        and is_sm100_supported()
+                        and metadata.paged_mqa_ctx_lens_2d is not None
+                        and metadata.paged_mqa_ctx_lens_2d.dim() == 2
+                        and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
+                        and metadata.paged_mqa_ctx_lens_2d.size(1)
+                        == self.speculative_num_draft_tokens
+                    ):
+                        paged_mqa_ctx_lens_2d = metadata.paged_mqa_ctx_lens_2d
+
                     fused_dsa_target_verify_metadata(
                         seq_lens=seq_lens,
                         req_pool_indices=req_pool_indices,
@@ -1340,7 +1353,9 @@ class DeepseekSparseAttnBackend(
                         dsa_index_topk=self.dsa_index_topk,
                         real_page_size=self.real_page_size,
                         next_n=self.speculative_num_draft_tokens,
+                        paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
                     )
+                    target_verify_ctx_lens_filled = paged_mqa_ctx_lens_2d is not None
                     cache_seqlens = metadata.cache_seqlens_int32
                     seqlens_expanded = metadata.dsa_seqlens_expanded[
                         : self.speculative_num_draft_tokens * bs
@@ -1497,18 +1512,22 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
             else:
                 schedule_seqlens_expanded = seqlens_expanded
-            seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
-                forward_mode,
-                metadata.cache_seqlens_int32,
-                schedule_seqlens_expanded,
-                bs,
-            )
+            if target_verify_ctx_lens_filled:
+                seqlens_32_2d = metadata.paged_mqa_ctx_lens_2d
+            else:
+                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                    forward_mode,
+                    metadata.cache_seqlens_int32,
+                    schedule_seqlens_expanded,
+                    bs,
+                )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
-            else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+            if not target_verify_ctx_lens_filled:
+                if metadata.paged_mqa_ctx_lens_2d is None:
+                    object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+                else:
+                    metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None

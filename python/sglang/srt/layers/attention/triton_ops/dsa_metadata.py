@@ -176,6 +176,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     dsa_cache_seqlens,
     dsa_cu_seqlens_k,
     real_page_table,
+    paged_mqa_ctx_lens_2d,
     seq_lens_stride: tl.constexpr,
     req_pool_indices_stride: tl.constexpr,
     req_to_token_stride_0: tl.constexpr,
@@ -184,12 +185,15 @@ def _fused_dsa_target_verify_metadata_kernel(
     page_table_stride_1: tl.constexpr,
     real_page_table_stride_0,
     real_page_table_stride_1: tl.constexpr,
+    paged_mqa_ctx_lens_stride_0: tl.constexpr,
+    paged_mqa_ctx_lens_stride_1: tl.constexpr,
     bs: tl.constexpr,
     max_seqlen_k,
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     next_n: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
+    HAS_PAGED_MQA_CTX_LENS: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -226,6 +230,15 @@ def _fused_dsa_target_verify_metadata_kernel(
         tl.store(dsa_cache_seqlens + offs_e, dsa_seq, mask=mask_e)
         tl.store(dsa_cu_seqlens_k, tl.full((), 0, tl.int32))
         tl.store(dsa_cu_seqlens_k + 1 + offs_e, dsa_cu, mask=mask_e)
+
+        if HAS_PAGED_MQA_CTX_LENS:
+            tl.store(
+                paged_mqa_ctx_lens_2d
+                + req_row * paged_mqa_ctx_lens_stride_0
+                + draft_off * paged_mqa_ctx_lens_stride_1,
+                base_seq + next_n,
+                mask=mask_e,
+            )
         return
 
     num_col_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
@@ -280,6 +293,7 @@ def fused_dsa_target_verify_metadata(
     dsa_index_topk: int,
     real_page_size: int,
     next_n: int,
+    paged_mqa_ctx_lens_2d: torch.Tensor = None,
 ) -> None:
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
@@ -302,6 +316,16 @@ def fused_dsa_target_verify_metadata(
     else:
         real_page_table = page_table_1
 
+    has_paged_mqa_ctx_lens = paged_mqa_ctx_lens_2d is not None
+    if has_paged_mqa_ctx_lens:
+        assert paged_mqa_ctx_lens_2d.is_cuda
+        assert paged_mqa_ctx_lens_2d.dtype == torch.int32
+        assert paged_mqa_ctx_lens_2d.dim() == 2
+        assert paged_mqa_ctx_lens_2d.size(0) == bs
+        assert paged_mqa_ctx_lens_2d.size(1) == next_n
+    else:
+        paged_mqa_ctx_lens_2d = page_table_1
+
     expanded_size = bs * next_n
     block_bs = triton.next_power_of_2(bs)
     block_expanded = triton.next_power_of_2(expanded_size)
@@ -320,6 +344,7 @@ def fused_dsa_target_verify_metadata(
         dsa_cache_seqlens,
         dsa_cu_seqlens_k,
         real_page_table,
+        paged_mqa_ctx_lens_2d,
         seq_lens.stride(0),
         req_pool_indices.stride(0),
         req_to_token.stride(0),
@@ -328,12 +353,15 @@ def fused_dsa_target_verify_metadata(
         page_table_1.stride(1),
         real_page_table.stride(0) if has_real_page_table else 0,
         real_page_table.stride(1) if has_real_page_table else 0,
+        paged_mqa_ctx_lens_2d.stride(0) if has_paged_mqa_ctx_lens else 0,
+        paged_mqa_ctx_lens_2d.stride(1) if has_paged_mqa_ctx_lens else 0,
         bs,
         max_seqlen_k,
         dsa_index_topk,
         real_page_size,
         next_n,
         has_real_page_table,
+        has_paged_mqa_ctx_lens,
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_N=block_n,
