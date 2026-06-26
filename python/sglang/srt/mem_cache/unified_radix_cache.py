@@ -1176,6 +1176,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
                 for comp in self._components_tuple
             ):
+                # TODO: When leaf creation is skipped, We should release all component
+                # resources here or propagate a flag so that
+                # cleanup_after_caching_req can free them properly.
                 if params.free_skipped_leaf_value:
                     self.token_to_kv_pool_allocator.free(value)
                 return InsertResult(prefix_len=total_prefix_length)
