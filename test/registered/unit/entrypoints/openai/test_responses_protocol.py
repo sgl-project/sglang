@@ -180,11 +180,18 @@ class ThinkingControlTestCase(unittest.TestCase):
             )
             self.assertEqual(req.reasoning.effort, effort)
 
-    def test_thinking_disabled_for_constrained_generations(self):
-        # effort=none, JSON output, and forced tool calls all constrain the
-        # generation so it can't interleave free reasoning -> thinking off.
+    def test_effort_none_disables_thinking(self):
+        ctk = ResponsesRequest(
+            model="x", input="hi", store=False, reasoning={"effort": "none"}
+        ).chat_template_kwargs
+        self.assertEqual((ctk["enable_thinking"], ctk["thinking"]), (False, False))
+
+    def test_thinking_untouched_otherwise(self):
+        # grammar-constrained requests keep thinking on; ReasonerGrammarBackend
+        # defers the grammar past </think> so the two coexist.
         for kw in (
-            {"reasoning": {"effort": "none"}},
+            {"reasoning": {"effort": "medium"}},
+            {"text": {"format": {"type": "text"}}},
             {
                 "text": {
                     "format": {
@@ -197,18 +204,6 @@ class ThinkingControlTestCase(unittest.TestCase):
             {"text": {"format": {"type": "json_object"}}},
             {"tool_choice": "required"},
             {"tool_choice": {"type": "function", "name": "f"}},
-        ):
-            ctk = ResponsesRequest(
-                model="x", input="hi", store=False, **kw
-            ).chat_template_kwargs
-            self.assertEqual(
-                (ctk["enable_thinking"], ctk["thinking"]), (False, False), kw
-            )
-
-    def test_thinking_untouched_otherwise(self):
-        for kw in (
-            {"reasoning": {"effort": "medium"}},
-            {"text": {"format": {"type": "text"}}},
             {},
         ):
             req = ResponsesRequest(model="x", input="hi", store=False, **kw)

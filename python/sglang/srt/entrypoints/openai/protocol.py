@@ -1427,15 +1427,12 @@ class ResponsesRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_to_thinking(cls, values):
-        """Disable thinking via chat_template_kwargs when either:
-        (a) reasoning.effort == "none" (mirrors ChatCompletionRequest), or
-        (b) text.format requests JSON output. A single grammar-constrained
-        generation can't interleave free-form reasoning with structured output:
-        the json schema forbids ``<think>`` tokens, so a force-thinking reasoning
-        parser would capture the whole JSON as reasoning_content and leave
-        output_text empty. Both "thinking" and "enable_thinking" are set because
-        model families differ ("thinking" for deepseek/kimi, "enable_thinking"
-        for qwen3/glm/...)."""
+        """Turn reasoning.effort == "none" into a chat_template_kwargs thinking
+        toggle (mirrors ChatCompletionRequest). Grammar-constrained requests
+        (json output, forced tools) keep thinking on: ReasonerGrammarBackend
+        defers the grammar past </think>, so reasoning and structured output
+        coexist. Both keys are set because families differ ("thinking" for
+        deepseek/kimi, "enable_thinking" for qwen3/glm)."""
         if not isinstance(values, dict):
             return values
         r = values.get("reasoning")
@@ -1445,25 +1442,7 @@ class ResponsesRequest(BaseModel):
         elif r is not None:
             effort = getattr(r, "effort", None)
 
-        text = values.get("text")
-        fmt = (
-            text.get("format")
-            if isinstance(text, dict)
-            else getattr(text, "format", None)
-        )
-        fmt_type = (
-            fmt.get("type") if isinstance(fmt, dict) else getattr(fmt, "type", None)
-        )
-        json_output = fmt_type in ("json_schema", "json_object")
-
-        # a forced tool call constrains generation to a tool grammar; like json
-        # output it can't interleave reasoning, so thinking has to be off here too.
-        tc = values.get("tool_choice")
-        forced_tool = tc == "required" or (
-            isinstance(tc, dict) and tc.get("type") == "function"
-        )
-
-        if effort == "none" or json_output or forced_tool:
+        if effort == "none":
             existing = values.get("chat_template_kwargs")
             existing = existing if isinstance(existing, dict) else {}
             # spread existing last so an explicit caller value wins over the default.

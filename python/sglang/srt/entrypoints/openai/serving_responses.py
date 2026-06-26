@@ -430,6 +430,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         extra_key=self._compute_extra_key(request),
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
+                        # defers any grammar past </think> so reasoning and
+                        # structured output can coexist (same flag the chat path sets).
+                        require_reasoning=self._is_thinking_enabled_for_request(
+                            request
+                        ),
                     )
 
                     generator = self._generate_with_builtin_tools(
