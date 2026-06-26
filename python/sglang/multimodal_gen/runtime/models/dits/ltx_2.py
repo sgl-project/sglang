@@ -68,14 +68,10 @@ def _ltx2_residual_gate_add(
     ):
         try:
             return residual_gate_add_cuda(residual, update, gate)
-        except Exception:
+        except Exception as exc:
             if torch.compiler.is_compiling():
                 raise
-            logger.warning(
-                "residual_gate_add_cuda failed, disabling it and falling back "
-                "to the Triton scale-shift kernel for the rest of this process",
-                exc_info=True,
-            )
+            logger.warning_once(f"Disabling LTX2 residual-gate CUDA fast path: {exc}")
             _LTX2_RESIDUAL_GATE_CUDA_DISABLED = True
 
     return fuse_scale_shift_kernel(update, gate, residual, scale_constant=0)
@@ -1041,7 +1037,6 @@ class LTX2TransformerBlock(nn.Module):
         v2a_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
         audio_replicated_for_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         batch_size = hidden_states.size(0)
 
         # 1. Video and Audio Self-Attention
@@ -1682,7 +1677,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         audio_replicated_for_sp: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-
         batch_size = hidden_states.size(0)
         audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
