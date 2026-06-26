@@ -244,7 +244,11 @@ from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dflash_utils import (
+    resolve_dflash_prefill_refill_target,
+    should_delay_dflash_prefill_for_batching,
+    validate_dflash_request,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -898,6 +902,11 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.dflash_prefill_refill_target = (
+            resolve_dflash_prefill_refill_target(self.max_running_requests)
+            if self.spec_algorithm.is_dflash()
+            else 1
+        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None

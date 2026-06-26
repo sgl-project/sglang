@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+from array import array
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.dllm.config import DllmConfig
