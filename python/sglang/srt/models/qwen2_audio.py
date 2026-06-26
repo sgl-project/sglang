@@ -185,5 +185,16 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+    def get_embed_and_head(self):
+        # EAGLE3 support: delegate to the nested text language model.
+        return self.language_model.get_embed_and_head()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        # EAGLE3 support: the aux-hidden-state capture happens inside the text
+        # backbone. Qwen2ForCausalLM.forward already threads the captured aux
+        # states through its LogitsProcessor, and general_mm_embed_routine calls
+        # that forward directly, so no change to this wrapper's forward is needed.
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
 
 EntryClass = Qwen2AudioForConditionalGeneration
