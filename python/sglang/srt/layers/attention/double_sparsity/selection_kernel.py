@@ -946,6 +946,17 @@ def retrieve_topk_graph_safe(
     # graph-safe path below fills scratch_scores in place and shares the same
     # reduce + radix top-k.
     if not use_triton_fast:
+        if q_pe is not None or k_pe is not None:
+            # Fail closed: the eager fallback does NOT score the rope term, so
+            # returning here with rope inputs would silently produce a no-PE
+            # selection. rope-aware scoring is only defined on the graph-safe
+            # scratch path above.
+            raise RuntimeError(
+                "Double Sparsity rope-aware scoring (q_pe/k_pe) requires the "
+                "graph-safe scratch path; the eager absorbed_topk_select fallback "
+                "does not score the rope term. Refusing to return a no-PE selection "
+                "with rope inputs."
+            )
         indices, valid = absorbed_topk_select(
             queries=queries,
             absorbed_w_sel=absorbed_w_sel,

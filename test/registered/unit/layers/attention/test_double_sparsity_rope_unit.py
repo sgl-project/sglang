@@ -157,6 +157,132 @@ class TestRopeAwareStartupGate(unittest.TestCase):
         self.assertIn("rope_aware_score", str(ctx.exception))
 
 
+class TestRopeAwareFailClosedFallback(unittest.TestCase):
+    """Selection/capture entry points never silently score no-PE (AC-5). CPU-only.
+
+    The deep ``_select_topk_indices`` per-step guards (bf16 resident KV, missing
+    q_pe/positions/rotary_emb, is_nextn, non-decode) are defense-in-depth behind the
+    AUTHORITATIVE startup gate (TestRopeAwareStartupGate, which rejects device/graphs/
+    spec/DCP/dtype up front); reaching them in a unit test needs the full forward-context
+    + graph-state + KV-pool environment, so they are exercised by the serve/integration
+    path. The externally-reachable rope entry points are covered here.
+    """
+
+    def test_retrieve_topk_graph_safe_fallback_raises_with_rope(self):
+        # No scratch + CPU => the eager fallback; it does not score the rope term, so
+        # passing q_pe/k_pe must raise rather than return a no-PE selection.
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            retrieve_topk_graph_safe,
+        )
+
+        bs, num_heads, label = 1, 2, 4
+        common = dict(
+            queries=torch.zeros(bs, num_heads, label),
+            written=torch.ones(1, 8, dtype=torch.bool),
+            channel_selection=torch.zeros(1, num_heads, label, dtype=torch.long),
+            channel_weights=torch.ones(1, num_heads, label),
+            layer_id=0,
+            req_pool_indices=torch.zeros(bs, dtype=torch.int32),
+            req_to_token=torch.zeros(bs, 8, dtype=torch.int32),
+            seq_lens=torch.full((bs,), 4, dtype=torch.int32),
+            max_seq_len=4,
+            max_top_k=2,
+            out_indices=torch.zeros(bs, 2, dtype=torch.int32),
+            out_lengths=torch.zeros(bs, dtype=torch.int32),
+            absorbed_w_sel=torch.zeros(1, num_heads, label, label),
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            retrieve_topk_graph_safe(**common, q_pe=torch.zeros(bs, num_heads, ROPE))
+        self.assertIn("rope", str(ctx.exception).lower())
+
+    def test_capture_decode_step_raises_when_rope_on(self):
+        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+            capture_decode_step,
+        )
+
+        selector = SimpleNamespace(config=SimpleNamespace(rope_aware_score=True))
+        state = SimpleNamespace(max_seq_len=4)
+        with self.assertRaises(RuntimeError) as ctx:
+            capture_decode_step(
+                selector,
+                state=state,
+                queries=torch.zeros(1, 2, 4),
+                layer_id=0,
+                req_pool_indices=torch.zeros(1, dtype=torch.int32),
+                sparse_mask=torch.ones(1, 4, dtype=torch.bool),
+                seq_lens=torch.full((1,), 4, dtype=torch.int32),
+            )
+        self.assertIn("rope_aware_score", str(ctx.exception))
+
+
+def _reduce_worker(rank, world_size, port, out_q):
+    # Module-level (picklable) worker: init a gloo group, run the production
+    # reduce on a per-rank-distinct score row, report the result.
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            reduce_token_scores,
+        )
+
+        # rank r contributes [r+1, (r+1)*10]; SUM over 2 ranks = [3, 30].
+        scores = torch.tensor(
+            [[float(rank + 1), float((rank + 1) * 10)]], dtype=torch.float32
+        )
+        reduce_token_scores(scores, process_group=dist.group.WORLD, use_bf16=False)
+        out_q.put((rank, scores.tolist()))
+    finally:
+        dist.destroy_process_group()
+
+
+class TestRopeAwareCrossTPReduce(unittest.TestCase):
+    """The cross-rank score reduce is SUM, not MAX/local (AC-4). CPU/gloo.
+
+    The rope term is added per head BEFORE the reduce (kernel test), and the SUM
+    reduce composes per-rank partial scores. This proves the reduce is a true SUM:
+    a SUM->MAX or SUM->local regression changes the result. (Full TP=8 captured
+    selected-index identity stays dev-only per DEC-5; this is the CI guard.)
+    """
+
+    def test_reduce_token_scores_is_sum(self):
+        import socket
+
+        import torch.multiprocessing as mp
+
+        if not torch.distributed.is_available():
+            self.skipTest("torch.distributed unavailable")
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        ctx = mp.get_context("spawn")
+        out_q = ctx.Queue()
+        procs = [
+            ctx.Process(target=_reduce_worker, args=(r, 2, port, out_q))
+            for r in range(2)
+        ]
+        for p in procs:
+            p.start()
+        results = [out_q.get(timeout=60) for _ in range(2)]
+        for p in procs:
+            p.join(timeout=60)
+
+        # SUM over ranks: [1,10] + [2,20] = [3,30] on every rank.
+        for _, row in results:
+            self.assertEqual(
+                row,
+                [[3.0, 30.0]],
+                f"reduce is not SUM (got {row}); SUM->MAX/local regression",
+            )
+
+
 def _dequant(latent_fp8, scales, phys):
     g = latent_fp8[phys].to(torch.float32)
     s = scales[phys].to(torch.float32)
@@ -254,7 +380,16 @@ class TestRopeAwareKernel(unittest.TestCase):
                 len(_topk_set(k_on[b], sl) & _topk_set(e_on[b], sl))
                 / len(_topk_set(e_on[b], sl))
             )
-        self.assertGreaterEqual(min(recalls), 0.99, f"top-{TOPK} recall={min(recalls)}")
+        self.assertGreaterEqual(
+            min(recalls), 0.999, f"top-{TOPK} recall={min(recalls)} (plan ~0.9995)"
+        )
+
+    def test_non_power_of_two_rope_dim_rejected(self):
+        # ROPE_DIM must be a power of two (tl.arange); q_pe rope_dim=48 must raise.
+        q_pe_bad = torch.randn(BS, H, 48, device=self.dev)
+        k_pe_bad = torch.randn(T, 48, device=self.dev).to(torch.bfloat16)
+        with self.assertRaises(AssertionError):
+            self._kernel(q_pe=q_pe_bad, k_pe=k_pe_bad)
 
     def test_off_byte_identical(self):
         # AC-1: rope-OFF launch == launch with no q_pe/k_pe == eager no-PE-only.
@@ -352,12 +487,25 @@ class TestRopeAwareGraphAlloc(unittest.TestCase):
             region()
         torch.cuda.synchronize()
 
-        m0 = torch.cuda.memory_allocated()
+        def _snapshot():
+            st = torch.cuda.memory_stats()
+            return (
+                torch.cuda.memory_allocated(),
+                torch.cuda.memory_reserved(),
+                st.get("allocation.all.allocated", 0),
+                st.get("segment.all.allocated", 0),
+            )
+
+        before = _snapshot()
         for _ in range(100):
             g.replay()
         torch.cuda.synchronize()
-        m1 = torch.cuda.memory_allocated()
-        self.assertEqual(m1 - m0, 0, f"grew {m1 - m0} bytes over 100 replays")
+        after = _snapshot()
+        # AC-3: not just bytes flat — the allocator must perform zero new
+        # allocations and zero new segments over the replays.
+        labels = ("memory_allocated", "memory_reserved", "alloc_count", "segment_count")
+        for name, b, a in zip(labels, before, after):
+            self.assertEqual(a, b, f"{name} changed across 100 replays: {b} -> {a}")
 
 
 if __name__ == "__main__":
