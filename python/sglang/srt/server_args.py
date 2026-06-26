@@ -7035,14 +7035,6 @@ class ServerArgs:
                     "Currently LoRA is only compatible with NGRAM speculative decoding."
                 )
 
-            # DSA indexer Q/K fusion folds wk + weights_proj into wk_weights_proj,
-            # so the modules an indexer-targeted adapter wraps no longer exist.
-            if is_cuda() and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get():
-                raise ValueError(
-                    "LoRA is incompatible with DSA indexer Q/K fusion. Set "
-                    "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion when using LoRA."
-                )
-
             # Parse lora_paths
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
