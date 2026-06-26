@@ -255,6 +255,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        # ReplaySSM ring: per-layer ring slices + the once-per-forward per-row
+        # write cursor. All None unless --enable-linear-replayssm, so packed_decode
+        # falls through to the byte-identical legacy KDA path. KDA ships WITHOUT
+        # radix coordination for now, so force_flush is None/zeroed (the ring
+        # flushes only at the natural write_pos == L-1 wrap; set in the shared
+        # HybridLinearAttn metadata, which zeroes force_flush for KDA models).
+        # NOTE: ReplaySSM decode is a GDN (scalar-gate) bandwidth win; on KDA the
+        # per-K g_cache is K x larger and the reconstruction refolds the per-K
+        # decay every step, so it is correct but SLOWER than packed (a measured
+        # decode regression). Kept wired for correctness + the spec-decode path;
+        # not recommended for KDA decode. Revisit on Blackwell (more tensor-core
+        # throughput may flip the compute/bandwidth tradeoff).
+        replayssm_write_pos = getattr(
+            self.forward_metadata, "replayssm_write_pos", None
+        )
+        replayssm_force_flush = getattr(
+            self.forward_metadata, "replayssm_force_flush", None
+        )
+        replayssm_d = layer_cache.replayssm_d
+        replayssm_k = layer_cache.replayssm_k
+        replayssm_g = layer_cache.replayssm_g
+
         qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states.transpose(-1, -2),
@@ -290,6 +312,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                replayssm_d=replayssm_d,
+                replayssm_k=replayssm_k,
+                replayssm_g=replayssm_g,
+                replayssm_write_pos=replayssm_write_pos,
+                replayssm_force_flush=replayssm_force_flush,
             )
 
         q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
