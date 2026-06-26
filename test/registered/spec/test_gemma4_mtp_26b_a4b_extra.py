@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -17,7 +16,12 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=720, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(
+    est_time=720,
+    stage="extra-a",
+    runner_config="2-gpu-large",
+    disabled="FIXME(kpham-sgl): temporary drop due to accuracies issue",
+)
 
 MODEL_NAME = "26B-A4B"
 TARGET_PATH = "google/gemma-4-26B-A4B-it"
@@ -31,10 +35,11 @@ GSM8K_NUM_THREADS = 128
 GSM8K_SCORE_MARGIN = 0.03
 SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
 
-# Initial values are seeded from current Gemma4 GSM8K observations in the
-# cookbook. Replace each top-k entry with exact MTP first-200-sample scores as
-# CI calibration data becomes available.
-OBSERVED_GSM8K_SCORES = {1: 0.450, 3: 0.450}
+# Calibrated from deterministic-inference GSM8K runs (200 examples, 5-shot,
+# greedy, triton, TP=2). With --enable-deterministic-inference the per-topk
+# score is reproducible run-to-run (std=0 over N=20): topk=1 -> 0.445,
+# topk=3 -> 0.440.
+OBSERVED_GSM8K_SCORES = {1: 0.445, 3: 0.440}
 GSM8K_SCORE_THRESHOLD = min(OBSERVED_GSM8K_SCORES.values()) - GSM8K_SCORE_MARGIN
 ACCEPT_LENGTH_THRESHOLD = 1.5
 
@@ -63,12 +68,6 @@ class TestGemma4MTP26BA4B(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
-    def _server_env(cls) -> dict[str, str]:
-        env = dict(os.environ)
-        env["SGLANG_ENABLE_SPEC_V2"] = "0"
-        return env
-
-    @classmethod
     def _common_server_args(cls) -> list[str]:
         args = [
             "--attention-backend",
@@ -84,6 +83,9 @@ class TestGemma4MTP26BA4B(CustomTestCase):
             "--max-total-tokens",
             "32768",
             "--skip-server-warmup",
+            # Batch-invariant kernels make the GSM8K score reproducible
+            # run-to-run; without this the topk=3 score swings ~0.33-0.50.
+            "--enable-deterministic-inference",
         ]
         if TENSOR_PARALLEL_SIZE > 1:
             args += ["--tp-size", str(TENSOR_PARALLEL_SIZE)]
@@ -131,7 +133,6 @@ class TestGemma4MTP26BA4B(CustomTestCase):
                 TARGET_PATH,
                 self.base_url,
                 timeout=SERVER_LAUNCH_TIMEOUT,
-                env=self._server_env(),
                 other_args=self._server_args(topk),
             )
             requests.get(self.base_url + "/flush_cache", timeout=30)

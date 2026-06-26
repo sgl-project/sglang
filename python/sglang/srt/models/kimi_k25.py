@@ -804,6 +804,24 @@ class KimiK25ForConditionalGeneration(nn.Module):
             for _ in stream_language_weights():
                 pass
 
+    def post_load_weights(self):
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
+
+    @property
+    def stacked_params_mapping(self):
+        return getattr(self.language_model, "stacked_params_mapping", [])
+
+    @property
+    def expert_params_mapping(self):
+        return getattr(self.language_model, "expert_params_mapping", [])
+
+    def mutate_weight_preload(self, name):
+        return self.language_model.mutate_weight_preload(name)
+
+    def custom_scale_remap(self, name):
+        return self.language_model.custom_scale_remap(name)
+
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):
         text_config = config.text_config

@@ -140,6 +140,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertIn("json_schema", sampling_params)
         self.assertIsInstance(sampling_params["json_schema"], str)
 
+    def test_response_format_json_schema_missing_schema(self):
+        """Test that json_schema response_format without a schema raises a ValueError."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Generate a JSON object:",
+            max_tokens=100,
+            response_format={"type": "json_schema"},
+        )
+        with self.assertRaises(ValueError):
+            self.sc._build_sampling_params(req)
+
     def test_response_format_structural_tag(self):
         """Test that response_format structural_tag is correctly processed in sampling params."""
         req = CompletionRequest(
