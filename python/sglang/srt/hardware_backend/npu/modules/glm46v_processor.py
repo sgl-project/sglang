@@ -42,7 +42,7 @@ def npu_wrapper_glm46v_preprocess(func):
         images: list["torch.Tensor"],
         do_resize: bool,
         size: SizeDict,
-        interpolation: Optional["tvF.InterpolationMode"],
+        resample: "PILImageResampling | tvF.InterpolationMode | int | None",
         do_rescale: bool,
         rescale_factor: float,
         do_normalize: bool,
@@ -74,7 +74,7 @@ def npu_wrapper_glm46v_preprocess(func):
                 stacked_images = self.resize(
                     stacked_images,
                     size=SizeDict(height=resized_height, width=resized_width),
-                    interpolation=interpolation,
+                    resample=resample,
                 )
             resized_images_grouped[shape] = stacked_images
 
@@ -161,7 +161,7 @@ def npu_wrapper_glm46v_video_preprocess(func):
         do_convert_rgb: bool = True,
         do_resize: bool = True,
         size: SizeDict | None = None,
-        interpolation: PILImageResampling = PILImageResampling.BICUBIC,
+        resample: "PILImageResampling | tvF.InterpolationMode | int | None" = PILImageResampling.BICUBIC,
         do_rescale: bool = True,
         rescale_factor: float = 1 / 255.0,
         do_normalize: bool = True,
@@ -193,7 +193,7 @@ def npu_wrapper_glm46v_video_preprocess(func):
                 stacked_videos = self.resize(
                     stacked_videos,
                     size=SizeDict(height=resized_height, width=resized_width),
-                    interpolation=interpolation,
+                    resample=resample,
                 )
                 stacked_videos = stacked_videos.view(
                     B, T, C, resized_height, resized_width
