@@ -79,6 +79,7 @@ class HarmonyContext(ConversationContext):
         self.num_cached_tokens = 0
         self.num_output_tokens = 0
         self.num_reasoning_tokens = 0
+        self.finish_reason = None
 
     def append_output(self, output) -> None:
         if isinstance(output, dict) and "output_ids" in output:
@@ -97,6 +98,9 @@ class HarmonyContext(ConversationContext):
                     self.num_cached_tokens = meta_info["cached_tokens"]
                 if "completion_tokens" in meta_info:
                     self.num_output_tokens += meta_info["completion_tokens"]
+                finish_reason = meta_info.get("finish_reason")
+                if finish_reason:
+                    self.finish_reason = finish_reason
 
         else:
             output_msgs = output
@@ -209,6 +213,10 @@ class StreamingHarmonyContext(HarmonyContext):
                 # The output_ids contains only the new tokens.
                 new_token_ids = output_token_ids
                 self.num_processed_tokens += len(output_token_ids)
+
+            finish_reason = meta_info.get("finish_reason")
+            if finish_reason:
+                self.finish_reason = finish_reason
 
             for token_id in new_token_ids:
                 self.parser.process(token_id)

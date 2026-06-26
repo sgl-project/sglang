@@ -8,7 +8,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import collect_stream_events, event_payloads, event_types, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
@@ -606,6 +606,107 @@ class CancelIdempotencyTestCase(unittest.TestCase):
         out = asyncio.run(serving.cancel_responses(resp.id))
         self.assertIs(out, resp)
         self.assertEqual(out.status, "cancelled")
+
+
+class StreamingLogprobsRejectionTestCase(unittest.TestCase):
+    def test_stream_with_logprobs_include_rejected(self):
+        import orjson
+
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            store=False,
+            stream=True,
+            include=["message.output_text.logprobs"],
+        )
+        result = asyncio.run(serving.create_responses(request))
+        self.assertEqual(result.status_code, 400)
+        body = orjson.loads(result.body)
+        self.assertIn("streaming mode", body["error"]["message"])
+
+
+class MultiToolCallStreamingOrderTestCase(unittest.TestCase):
+    def test_prior_tool_call_done_before_next_added(self):
+        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+        serving = make_serving()
+        serving.tool_call_parser = "qwen3_coder"
+        serving.reasoning_parser = None
+
+        det = Qwen3CoderDetector()
+        s, e = det.tool_call_start_token, det.tool_call_end_token
+        fp, fe = det.tool_call_prefix, det.function_end_token
+        pp, pe = det.parameter_prefix, det.parameter_end_token
+        tool1 = f"{s}{fp}get_weather>{pp}city>Beijing{pe}{fe}{e}"
+        tool2 = f"{s}{fp}get_time>{pp}tz>UTC{pe}{fe}{e}"
+        full = tool1 + "\n" + tool2
+
+        async def fake_gen():
+            yield {"text": tool1, "meta_info": {}}
+            yield {"text": tool1 + "\n", "meta_info": {}}
+            yield {"text": full, "meta_info": {}}
+            yield {
+                "text": full,
+                "meta_info": {
+                    "finish_reason": {"type": "stop"},
+                    "prompt_tokens": 5,
+                    "completion_tokens": 10,
+                },
+            }
+
+        request = ResponsesRequest(
+            model="x",
+            input="weather and time",
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "type": "function",
+                    "name": "get_time",
+                    "parameters": {"type": "object"},
+                },
+            ],
+        )
+
+        async def run():
+            stream = serving.responses_stream_generator_non_harmony(
+                request,
+                {},
+                fake_gen(),
+                "x",
+                Mock(),
+                RequestResponseMetadata(request_id="r"),
+            )
+            return await collect_stream_events(stream)
+
+        events = asyncio.run(run())
+        seq = list(zip(event_types(events), event_payloads(events)))
+
+        def position(pred):
+            return next(i for i, (t, p) in enumerate(seq) if pred(t, p))
+
+        done0 = position(
+            lambda t, p: t == "response.output_item.done" and p["output_index"] == 0
+        )
+        added1 = position(
+            lambda t, p: t == "response.output_item.added" and p["output_index"] == 1
+        )
+        self.assertLess(done0, added1)
+
+        fc_done_items = [
+            p["item"]
+            for t, p in seq
+            if t == "response.output_item.done"
+            and p["item"].get("type") == "function_call"
+        ]
+        self.assertEqual(len(fc_done_items), 2)
+        names = sorted(item["name"] for item in fc_done_items)
+        self.assertEqual(names, ["get_time", "get_weather"])
 
 
 if __name__ == "__main__":

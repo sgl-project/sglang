@@ -256,6 +256,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(
                 "logprobs are not supported with gpt-oss models", param="logprobs"
             )
+        # streaming skips the logprobs build path; reject so the include doesn't silently no-op.
+        if request.stream and request.is_include_output_logprobs():
+            return self.create_error_response(
+                "logprobs are not supported in streaming mode", param="logprobs"
+            )
 
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
@@ -617,6 +622,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             num_generated_tokens = context.num_output_tokens
             num_cached_tokens = context.num_cached_tokens
             num_reasoning_tokens = context.num_reasoning_tokens
+            status = self._status_from_finish_reason(
+                getattr(context, "finish_reason", None)
+            )
         else:
             assert isinstance(context, SimpleContext)
             final_res = context.last_output
@@ -2255,6 +2263,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tool_index = call.tool_index
                     state = tool_call_states.get(tool_index)
                     if state is None or state.get("done"):
+                        # finalize other open tool calls first so their output_item.done lands
+                        # before the next output_item.added; else they stay open till end-of-stream.
+                        for other_index in list(tool_call_states):
+                            if other_index != tool_index and not tool_call_states[
+                                other_index
+                            ].get("done"):
+                                for ev in _close_tool_call_state(other_index):
+                                    yield ev
                         current_output_index += 1
                         item_id = f"fc_{random_uuid()[:8]}"
                         call_id = f"call_{random_uuid()[:24]}"
@@ -2478,6 +2494,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
+                require_reasoning=adapted_request.require_reasoning,
             )
 
             # Update sampling params with reduced max_tokens
