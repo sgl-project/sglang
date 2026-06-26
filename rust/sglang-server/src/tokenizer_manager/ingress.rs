@@ -19,7 +19,8 @@ use bytes::Bytes;
 use crate::error::Error;
 use crate::fsm::{Event, ValidationOutcome};
 use crate::message::{
-    EgressItem, GenerateRequest, Request, RequestKind, TokenizedReqPayload, control_req_msgpack,
+    EgressItem, GenerateRequest, IngressMsg, Request, RequestKind, TokenizedReqPayload,
+    control_req_msgpack,
 };
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
@@ -146,14 +147,18 @@ impl Ingress {
     /// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
     /// egress ring as a single `Result`.
     fn push_control_to_ring(&self, mut req: Request, tag: &str) {
-        let bytes = match control_req_msgpack(tag, &req.id.0.to_string()) {
+        let header = match control_req_msgpack(tag, &req.id.0.to_string()) {
             Ok(b) => b,
             Err(e) => {
                 fail(&mut req, e);
                 return;
             }
         };
-        if !self.ingress.try_push(bytes) {
+        // Control requests carry no tensor cell — empty `ids`.
+        if !self.ingress.try_push(IngressMsg {
+            header,
+            ids: Bytes::new(),
+        }) {
             fail(&mut req, Error::QueueFull);
         }
     }
@@ -199,15 +204,18 @@ impl Ingress {
             stream,
         };
 
-        let bytes: Bytes = match payload.to_msgpack() {
+        // Columnar split: scalar header through msgpack, the ids tensor as a raw
+        // int64 buffer alongside (concatenated across the batch in `recv_requests`).
+        let header: Bytes = match payload.to_header_msgpack() {
             Ok(b) => b,
             Err(e) => {
                 fail(&mut req, e);
                 return;
             }
         };
+        let ids = payload.input_ids_i64_le();
 
-        if !self.ingress.try_push(bytes) {
+        if !self.ingress.try_push(IngressMsg { header, ids }) {
             fail(&mut req, Error::QueueFull);
         }
         // On success the request is now owned by the scheduler; egress will

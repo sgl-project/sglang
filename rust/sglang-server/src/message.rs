@@ -135,6 +135,17 @@ impl GeneratePayload {
     }
 }
 
+/// One ingress-ring entry, split columnar: the scalar `header` (msgpack, with
+/// `input_ids` omitted) plus the request's raw `ids` cell (little-endian int64,
+/// empty for control requests). `recv_requests` concatenates the `ids` cells of
+/// a drained batch into one buffer so the large tensor never goes through
+/// msgpack; the scalar headers stay tiny.
+#[derive(Debug)]
+pub struct IngressMsg {
+    pub header: Bytes,
+    pub ids: Bytes,
+}
+
 /// Wire form of `TokenizedGenerateReqInput`.
 ///
 /// The scheduler decodes this with msgspec, whose IPC structs are
@@ -152,18 +163,27 @@ pub struct TokenizedReqPayload {
 }
 
 impl TokenizedReqPayload {
-    /// Serialize to the msgspec-compatible tagged array (one allocation; the
-    /// ring takes ownership of the resulting `Bytes`).
-    pub fn to_msgpack(&self) -> Result<Bytes, Error> {
+    /// Widen `input_ids` (i32) to the raw little-endian **int64** bytes the
+    /// scheduler's `array("q")` expects. This is the *columnar tensor cell*: it
+    /// travels the ingress ring as raw bytes (no msgpack) and is concatenated
+    /// with the other requests' cells in `recv_requests`.
+    pub fn input_ids_i64_le(&self) -> Bytes {
+        let mut buf = Vec::with_capacity(self.input_ids.len() * 8);
+        for &id in &self.input_ids {
+            buf.extend_from_slice(&(id as i64).to_le_bytes());
+        }
+        Bytes::from(buf)
+    }
+
+    /// Serialize the *scalar header* to the msgspec-compatible tagged array,
+    /// with `input_ids` left as `Nil` — the ids ride alongside as a raw columnar
+    /// buffer (see [`input_ids_i64_le`](Self::input_ids_i64_le)) and are set on
+    /// the decoded struct by the Python `drain`.
+    pub fn to_header_msgpack(&self) -> Result<Bytes, Error> {
         use rmpv::Value;
 
-        // `input_ids: Optional[array]` is a Python `array("q", ...)` (int64);
-        // msgspec's enc_hook encodes it as the 2-tuple `(typecode, le_bytes)`.
-        let mut id_bytes = Vec::with_capacity(self.input_ids.len() * 8);
-        for &id in &self.input_ids {
-            id_bytes.extend_from_slice(&(id as i64).to_le_bytes());
-        }
-        let input_ids_val = Value::Array(vec![Value::from("q"), Value::Binary(id_bytes)]);
+        // input_ids omitted from the header; delivered as a columnar buffer.
+        let input_ids_val = Value::Nil;
 
         let input_text_val = match &self.input_text {
             Some(t) => Value::from(t.as_str()),

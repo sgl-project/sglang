@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import os
+from array import array
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
@@ -93,15 +94,34 @@ class RustServer:
         method (`hasattr(recv_from_tokenizer, "drain")`) to use the rust path
         instead of the zmq socket.
 
-        Mirrors `sock_recv`: each raw msgpack frame is run through
-        `msgpack_decode`, yielding the same `TokenizedGenerateReqInput` / control
-        objects the zmq path produces (so the IPC schema is tracked
-        automatically). `Server.recv_requests` releases the GIL while popping, so
-        this never holds the GIL across a wait — same contract as `zmq.NOBLOCK`.
+        The transfer is **columnar**: `recv_requests` returns scalar msgpack
+        `headers` (with `input_ids` omitted) plus one concatenated raw int64
+        `ids_buf` and per-request `lengths`, so the large `input_ids` tensor never
+        goes through msgpack. Each header is `msgpack_decode`d (yielding the same
+        `TokenizedGenerateReqInput` / control objects the zmq path produces, so
+        the IPC schema is tracked automatically) and its `input_ids` slice is
+        wrapped as the `array("q")` the scheduler expects. `recv_requests`
+        releases the GIL for the drain + concat, so this never holds the GIL
+        across a wait — same contract as `zmq.NOBLOCK`.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
-        raw_frames = self.server.recv_requests(limit)
-        return [msgpack_decode(bytes(frame)) for frame in raw_frames]
+        headers, ids_buf, lengths = self.server.recv_requests(limit)
+        if not headers:
+            return []
+
+        ids_view = memoryview(ids_buf)
+        out = []
+        pos = 0  # byte offset into ids_buf
+        for header, n in zip(headers, lengths):
+            obj = msgpack_decode(header)
+            if n:  # generate request: attach its int64 ids slice as array("q")
+                nbytes = n * 8
+                ids = array("q")
+                ids.frombytes(ids_view[pos : pos + nbytes])
+                obj.input_ids = ids
+                pos += nbytes
+            out.append(obj)
+        return out
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting

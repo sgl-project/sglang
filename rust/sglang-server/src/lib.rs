@@ -27,6 +27,11 @@ use std::cmp::max;
 
 use crate::runtime::{Runtime, RuntimeConfig};
 
+/// Columnar ingress batch handed to Python by [`Server::recv_requests`]:
+/// `(headers, ids_buf, lengths)` — per-request scalar msgpack headers, all
+/// requests' raw int64 ids concatenated, and per-request token counts.
+type IngressBatch<'py> = (Vec<Bound<'py, PyBytes>>, Bound<'py, PyBytes>, Vec<u32>);
+
 /// Handle owned by the Python scheduler process. Construct once via
 /// [`Server::start`], then poll it from the scheduler event loop.
 #[pyclass]
@@ -125,16 +130,32 @@ impl Server {
         Ok(Server { rt })
     }
 
-    /// Non-blocking drain of the ingress ring. Returns up to `max` msgpack
-    /// payloads (`bytes`) for the scheduler's `recv_requests` to decode into
-    /// `TokenizedGenerateReqInput`. Releases the GIL while popping from the
-    /// Rust ring so producer threads never contend with us.
+    /// Non-blocking drain of the ingress ring, returned **columnar** so the large
+    /// `input_ids` tensor never goes through msgpack. Yields a 3-tuple:
+    ///   * `headers`: `list[bytes]` — one msgpack scalar header per request
+    ///     (`input_ids` omitted), decoded individually by the scheduler;
+    ///   * `ids_buf`: `bytes` — all requests' raw little-endian int64 ids,
+    ///     concatenated; sliced per request and wrapped as `array("q")`;
+    ///   * `lengths`: `list[int]` — per-request token count (0 for control reqs),
+    ///     so the scheduler can slice `ids_buf`.
+    /// The GIL is released for the drain + columnar split; only the `PyBytes`
+    /// marshaling needs it. The `ids` cells are copied **directly into the result
+    /// `bytes`** (one copy, no intermediate buffer).
     #[pyo3(signature = (max = 256))]
-    fn recv_requests<'py>(&self, py: Python<'py>, max: usize) -> Vec<Bound<'py, PyBytes>> {
-        let msgs = py.detach(|| self.rt.ingress.drain(max));
-        msgs.into_iter()
-            .map(|b| PyBytes::new(py, b.as_ref()))
-            .collect()
+    fn recv_requests<'py>(&self, py: Python<'py>, max: usize) -> PyResult<IngressBatch<'py>> {
+        let cols = py.detach(|| self.rt.ingress.drain(max));
+        let headers = cols.headers.iter().map(|h| PyBytes::new(py, h)).collect();
+        // Single pass: copy each raw ids cell straight into the output `bytes`.
+        let ids_buf = PyBytes::new_with(py, cols.ids_total, |buf| {
+            let mut pos = 0;
+            for cell in &cols.ids {
+                let end = pos + cell.len();
+                buf[pos..end].copy_from_slice(cell);
+                pos = end;
+            }
+            Ok(())
+        })?;
+        Ok((headers, ids_buf, cols.lengths))
     }
 
     /// Push one scheduler-output chunk (already msgpack-encoded `ChunkEvent`)
