@@ -50,9 +50,7 @@ ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
 
 _LTX2_FUSED_DUAL_MODULATE_RUNTIME_DISABLED = False
-_LTX2_FUSED_DUAL_MODULATE_WARNING_EMITTED = False
 _LTX2_FUSED_CA_DUAL_MODULATE_RUNTIME_DISABLED = False
-_LTX2_FUSED_CA_DUAL_MODULATE_WARNING_EMITTED = False
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -63,20 +61,14 @@ def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
 
 def _ltx2_disable_fused_dual_modulate(exc: Exception) -> None:
     global _LTX2_FUSED_DUAL_MODULATE_RUNTIME_DISABLED
-    global _LTX2_FUSED_DUAL_MODULATE_WARNING_EMITTED
     _LTX2_FUSED_DUAL_MODULATE_RUNTIME_DISABLED = True
-    if not _LTX2_FUSED_DUAL_MODULATE_WARNING_EMITTED:
-        logger.warning("Disabling LTX2 fused dual-modulate fast path: %s", exc)
-        _LTX2_FUSED_DUAL_MODULATE_WARNING_EMITTED = True
+    logger.warning_once(f"Disabling LTX2 fused dual-modulate fast path: {exc}")
 
 
 def _ltx2_disable_fused_ca_dual_modulate(exc: Exception) -> None:
     global _LTX2_FUSED_CA_DUAL_MODULATE_RUNTIME_DISABLED
-    global _LTX2_FUSED_CA_DUAL_MODULATE_WARNING_EMITTED
     _LTX2_FUSED_CA_DUAL_MODULATE_RUNTIME_DISABLED = True
-    if not _LTX2_FUSED_CA_DUAL_MODULATE_WARNING_EMITTED:
-        logger.warning("Disabling LTX2 fused CA dual-modulate fast path: %s", exc)
-        _LTX2_FUSED_CA_DUAL_MODULATE_WARNING_EMITTED = True
+    logger.warning_once(f"Disabling LTX2 fused CA dual-modulate fast path: {exc}")
 
 
 def _ltx2_mod_param_supported(

@@ -32,17 +32,16 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("batch,seq,hidden", [(1, 4, 4096), (2, 3, 2048)])
-@pytest.mark.parametrize("param_seq", [1, 3])
+@pytest.mark.parametrize(
+    ("batch", "seq", "hidden", "param_seq"),
+    [(1, 4, 4096, 1), (2, 3, 2048, 1), (2, 3, 2048, 3)],
+)
 def test_ltx2_rmsnorm_dual_modulate(
     batch: int,
     seq: int,
     hidden: int,
     param_seq: int,
 ) -> None:
-    if param_seq != 1 and param_seq != seq:
-        pytest.skip("param_seq must be broadcastable to seq")
-
     x = torch.randn(batch, seq, hidden, device=DEVICE, dtype=torch.bfloat16)
     scale0 = torch.randn(batch, param_seq, hidden, device=DEVICE, dtype=torch.bfloat16)
     shift0 = torch.randn(batch, param_seq, hidden, device=DEVICE, dtype=torch.bfloat16)
