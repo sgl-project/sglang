@@ -70,7 +70,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _is_dsa_cache_layer_split_enabled(mr: ModelRunner) -> bool:
+def _is_glm_dsa_cache_layer_split_enabled(mr: ModelRunner) -> bool:
     return (
         not mr.is_draft_worker
         and mr.server_args.enable_dsa_cache_layer_split
@@ -79,8 +79,10 @@ def _is_dsa_cache_layer_split_enabled(mr: ModelRunner) -> bool:
     )
 
 
-def _get_layer_split_effective_num_layers(mr: ModelRunner, num_layers: int) -> int:
-    if not _is_dsa_cache_layer_split_enabled(mr):
+def _get_glm_dsa_layer_split_effective_num_layers(
+    mr: ModelRunner, num_layers: int
+) -> int:
+    if not _is_glm_dsa_cache_layer_split_enabled(mr):
         return num_layers
     shard_size = get_attention_cp_size()
     if shard_size <= 1:
@@ -191,7 +193,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
-        effective_num_layers = _get_layer_split_effective_num_layers(mr, num_layers)
+        effective_num_layers = _get_glm_dsa_layer_split_effective_num_layers(
+            mr, num_layers
+        )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()

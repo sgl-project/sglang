@@ -87,17 +87,17 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
-def _is_dsa_cache_layer_split_enabled(model_runner: ModelRunner) -> bool:
+def _is_glm_dsa_cache_layer_split_enabled(model_runner: ModelRunner) -> bool:
     return (
         not model_runner.is_draft_worker
         and model_runner.server_args.enable_dsa_cache_layer_split
     )
 
 
-def _get_dsa_cp_layer_shard_info(
+def _get_glm_dsa_cp_layer_shard_info(
     model_runner: ModelRunner,
 ) -> tuple[Optional[int], int]:
-    if not _is_dsa_cache_layer_split_enabled(model_runner):
+    if not _is_glm_dsa_cache_layer_split_enabled(model_runner):
         return None, 1
     shard_size = get_attention_cp_size()
     if shard_size <= 1:
@@ -454,9 +454,10 @@ class ModelRunnerKVCacheMixin:
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
-        dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = _get_dsa_cp_layer_shard_info(
-            self
-        )
+        (
+            dsa_cp_layer_shard_rank,
+            dsa_cp_layer_shard_size,
+        ) = _get_glm_dsa_cp_layer_shard_info(self)
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
