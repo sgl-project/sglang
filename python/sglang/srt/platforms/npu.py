@@ -74,9 +74,7 @@ class NpuDeviceMixin(DeviceMixin):
 
     def get_torch_distributed_backend_str(self) -> str:
         # zbal is the Ascend zero-bubble balanced backend; it replaces hccl when
-        # a local memory budget is configured. Mirrors the "npu" entry in the
-        # base DeviceMixin's _DEVICE_TO_DISTRIBUTED_BACKEND, but resolved at call
-        # time so a late SGLANG_ZBAL_LOCAL_MEM_SIZE is honored.
+        # a local memory budget is configured.
         return "hccl" if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() <= 0 else "zbal"
 
     @classmethod
