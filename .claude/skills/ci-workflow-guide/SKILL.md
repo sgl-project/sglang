@@ -290,6 +290,8 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `base-c-test-8-gpu-b200` | registered only | `8-gpu-b200` | — |
 | `base-c-test-4-gpu-gb200` | registered only | `4-gpu-gb200` | — |
 
+> **Suite names are generated**, not hand-written: each comes from a test's `register_*_ci(stage=..., runner_config=...)` as `{stage}-test-{runner_config}`, and `runner_config` maps to the `Runner` column via `scripts/ci/runner_configs.yml`.
+>
 > **Note**: Kernel suites (`base-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. `base-c-test-8-gpu-b200` is registered in `test/run_suite.py` but not wired to PR CI. The GB200 job is currently commented out in `pr-test.yml` until a company-owned runner is provisioned. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
 **Workflow usage:**

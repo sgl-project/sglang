@@ -50,8 +50,13 @@ Defined in `python/sglang/test/test_utils.py`:
 
 ### Naming Conventions
 
-- **Suite**: `base-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `base-b-test-1-gpu-small`)
-- **CI runner**: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
+A per-commit suite name is **generated** from registration metadata as `{stage}-test-{runner_config}` — you don't hand-write it:
+
+- **`stage`** — the CI stage (e.g. `base-b`, `base-b-kernel-unit`, `base-c`).
+- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
+- **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
+
+> Legacy single-string `suite=` is only for suites that don't fit that shape — nightly/stress/weekly and some AMD/CPU/NPU pools (e.g. `suite="nightly-kernel-1-gpu", nightly=True`). Per-commit tests always use `stage=` + `runner_config=`.
 
 ### All CI Suites
 
@@ -365,7 +370,7 @@ register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
 ```
 
-Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing
+The `stage` + `runner_config` calls generate suites like `base-b-kernel-unit-test-1-gpu-large`; nightly keeps the legacy `suite=` string. Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
 
 ---
 
