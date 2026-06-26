@@ -80,6 +80,7 @@ class TreeNode:
         self.host_value = None
         # store hash values of each page
         self.hash_value: Optional[List[str]] = None
+        
         # for lru list, invariant:
         # 1. prev has greater last_access_time
         # 2. next has smaller last_access_time
