@@ -177,6 +177,9 @@ export const GLM51Deployment = () => {
     cmd += ' \\\n  --speculative-num-steps 3';
     cmd += ' \\\n  --speculative-eagle-topk 1';
     cmd += ' \\\n  --speculative-num-draft-tokens 4';
+    // On AMD GPUs the aiter custom all-reduce kernel deadlocks during EAGLE
+    // verify at high concurrency, so disable it to avoid server hangs.
+    if (isAMD) cmd += ' \\\n  --disable-custom-all-reduce';
 
     cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
     return cmd;
