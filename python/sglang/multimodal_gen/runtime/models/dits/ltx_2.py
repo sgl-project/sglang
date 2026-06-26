@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -41,6 +40,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 _is_npu = current_platform.is_npu()
@@ -55,15 +55,10 @@ _LTX2_TE_NVFP4_LINEAR_CLS = None
 _LTX2_TE_NVFP4_FP8_AUTOCAST = None
 _LTX2_TE_NVFP4_IMPORT_FAILED = False
 _LTX2_TE_NVFP4_RUNTIME_DISABLED = False
-_LTX2_TE_NVFP4_WARNING_EMITTED = False
-
-
-def _ltx2_env_flag(name: str) -> bool:
-    return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
 
 
 def _ltx2_te_nvfp4_video_ffn_enabled() -> bool:
-    return _ltx2_env_flag("SGLANG_LTX2_TE_NVFP4_VIDEO_FFN")
+    return get_bool_env_var("SGLANG_LTX2_TE_NVFP4_VIDEO_FFN")
 
 
 def _ltx2_linear_base_for_fusion(layer: nn.Module) -> nn.Module | None:
@@ -81,7 +76,6 @@ def _ltx2_get_te_nvfp4_context():
     global _LTX2_TE_NVFP4_FP8_AUTOCAST
     global _LTX2_TE_NVFP4_IMPORT_FAILED
     global _LTX2_TE_NVFP4_RUNTIME_DISABLED
-    global _LTX2_TE_NVFP4_WARNING_EMITTED
 
     if _LTX2_TE_NVFP4_IMPORT_FAILED or _LTX2_TE_NVFP4_RUNTIME_DISABLED:
         return None
@@ -105,9 +99,7 @@ def _ltx2_get_te_nvfp4_context():
             )
     except Exception as exc:
         _LTX2_TE_NVFP4_IMPORT_FAILED = True
-        if not _LTX2_TE_NVFP4_WARNING_EMITTED:
-            logger.warning("Disabling LTX2 TE NVFP4 video FFN fast path: %s", exc)
-            _LTX2_TE_NVFP4_WARNING_EMITTED = True
+        logger.warning_once(f"Disabling LTX2 TE NVFP4 video FFN fast path: {exc}")
         return None
 
     return (
@@ -119,11 +111,8 @@ def _ltx2_get_te_nvfp4_context():
 
 def _ltx2_disable_te_nvfp4(exc: Exception) -> None:
     global _LTX2_TE_NVFP4_RUNTIME_DISABLED
-    global _LTX2_TE_NVFP4_WARNING_EMITTED
     _LTX2_TE_NVFP4_RUNTIME_DISABLED = True
-    if not _LTX2_TE_NVFP4_WARNING_EMITTED:
-        logger.warning("Disabling LTX2 TE NVFP4 video FFN fast path: %s", exc)
-        _LTX2_TE_NVFP4_WARNING_EMITTED = True
+    logger.warning_once(f"Disabling LTX2 TE NVFP4 video FFN fast path: {exc}")
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
