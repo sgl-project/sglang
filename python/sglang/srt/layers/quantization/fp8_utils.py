@@ -73,7 +73,21 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
+# Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
+# projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
+# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
+# SGLANG_FORCE_CK_W8A8=1 still works as an override.
+_FORCE_CK_W8A8: bool = False
+
+
+def set_force_ck_w8a8(enabled: bool = True) -> None:
+    global _FORCE_CK_W8A8
+    _FORCE_CK_W8A8 = enabled
+
+
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
+    if _FORCE_CK_W8A8:
+        return False
     return (n, k) in [
         (1024, 8192),
         (16384, 1536),
@@ -259,7 +273,7 @@ if is_blackwell_supported() and is_flashinfer_available():
             x_scale.reshape(1),
             weight_scale.reshape(1),
             out_dtype,
-            backend="auto",
+            backend="cublas",
         ).view(m, n)
 
     @lru_cache(maxsize=1)
@@ -399,15 +413,8 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
-    """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
-
-    For MXFP8, Triton remains the default path. We only route to FlashInfer
-    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
-    """
     backend = get_fp8_gemm_runner_backend()
-    if backend.is_flashinfer_trtllm():
-        return flashinfer_mxfp8_blockscaled_linear
-    elif backend.is_flashinfer_cutlass():
+    if backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
 
@@ -505,7 +512,17 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"
 
-    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
+    backend = Fp8GemmRunnerBackend(backend)
+
+    if (
+        backend.is_auto()
+        and server_args.quantization == "mxfp8"
+        and _is_sm100_supported
+        and is_flashinfer_available()
+    ):
+        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    FP8_GEMM_RUNNER_BACKEND = backend
 
 
 def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
@@ -1153,7 +1170,6 @@ def flashinfer_mxfp8_blockscaled_linear(
     weight_t = weight.contiguous().t()
 
     if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
-
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,

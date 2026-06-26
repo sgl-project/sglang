@@ -19,7 +19,7 @@ Backend selection comes from cuda_graph_config.prefill:
                       torch.compile's internal cache. Multi-batch supported.
   - "breakable" — BreakableCudaGraphBackend: segmented capture (no
                       torch.compile). Captures with bs=1; rejects multi-req
-                      prefill in can_run.
+                      prefill in can_run_graph.
   - "full"      — rejected at config validation; not supported for prefill.
   - "disabled"  — handled at the model_runner level — runner not
                       constructed.
@@ -47,6 +47,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -65,6 +66,9 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     set_tc_piecewise_forward_context,
 )
@@ -76,7 +80,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     is_npu,
-    log_info_on_rank0,
     require_attn_tp_gather,
     require_mlp_tp_gather,
 )
@@ -134,10 +137,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.max_bs = model_runner.req_to_token_pool.size
 
-        log_info_on_rank0(
-            logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
-        )
-
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         # If returning hidden states is enabled, or if speculative prefill
@@ -148,6 +147,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             or model_runner.spec_algorithm.is_dflash()
         ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
+        # EAGLE captures FULL hidden states for the target and LAST for the
+        # draft (can_run_graph rejects on mismatch). BCG only; tc_piecewise
+        # EAGLE is routed to eager in ModelRunner.init_prefill_cuda_graph.
+        _cg_cfg = model_runner.server_args.cuda_graph_config
+        _prefill_backend_name = (
+            _cg_cfg.prefill.backend if _cg_cfg is not None else Backend.TC_PIECEWISE
+        )
+        if (
+            _prefill_backend_name == Backend.BREAKABLE
+            and model_runner.spec_algorithm.is_eagle()
+        ):
+            self.capture_hidden_mode = (
+                CaptureHiddenMode.LAST
+                if model_runner.is_draft_worker
+                else CaptureHiddenMode.FULL
+            )
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
@@ -157,7 +172,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             max_bs=self.max_bs,
             max_num_tokens=self.max_num_tokens,
             cache_loc_dtype=self._cache_loc_dtype(),
-            is_hybrid_swa=model_runner.is_hybrid_swa,
             is_multimodal=self.is_multimodal,
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
@@ -196,20 +210,56 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Initialize the slot to None BEFORE constructing the backend:
         # TcPiecewise runs its compile pass during __init__ which calls
         # _run_dummy_forward -> capture_prepare, and capture_prepare reads
-        # self._prefill_static_buffers. self.layer_model has the same
-        # ordering requirement: _run_forward checks `self.layer_model is
-        # not None` to decide whether to call the inner stack or outer
-        # model.forward, and that check fires inside TcPiecewise's
-        # _run_compile_pass before backend resolution returns.
+        # self._prefill_static_buffers and self.static_draft_hidden_states.
+        # self.layer_model has the same ordering requirement: _run_forward
+        # checks `self.layer_model is not None` to decide whether to call
+        # the inner stack or outer model.forward, and that check fires
+        # inside TcPiecewise's _run_compile_pass before backend resolution
+        # returns.
         self._prefill_static_buffers: Optional[Dict[str, torch.Tensor]] = None
+        self.static_draft_hidden_states: Optional[torch.Tensor] = None
         self.layer_model = None
-        self.backend = resolve_prefill_backend(self)
+        try:
+            self.backend = resolve_prefill_backend(self)
+        except RuntimeError as e:
+            if _prefill_backend_name == Backend.TC_PIECEWISE:
+                raise Exception(
+                    f"Capture prefill CUDA graph failed: {e}\n"
+                    f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
+            raise
         if isinstance(self.backend, BreakableCudaGraphBackend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
                     for name in _PREFILL_STATIC_FIELDS
                 }
+
+        # Static hidden_states buffer giving the captured graph a stable
+        # address; load_batch refreshes it from live spec_info at replay.
+        # Draft consumes the aux-concatenated hidden states from the target
+        # (e.g. EAGLE3 stacks 3 target layers), so read the dim from the
+        # draft model's input fc when available; fall back to the per-layer
+        # dim for arches without an fc projection.
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_eagle()
+        ):
+            from sglang.srt.speculative.eagle_utils import get_draft_hidden_dim
+
+            inner = getattr(model_runner.model, "model", model_runner.model)
+            fc = getattr(inner, "fc", None)
+            hidden_dim = (
+                fc.in_features
+                if fc is not None and hasattr(fc, "in_features")
+                else get_draft_hidden_dim(model_runner)
+            )
+            with torch.device(self.device):
+                self.static_draft_hidden_states = torch.zeros(
+                    (self.max_num_tokens, hidden_dim),
+                    dtype=model_runner.dtype,
+                )
 
         # Some attention backends (e.g. DSV4) opt into a captured-metadata
         # contract under BCG: capture-time builds a per-bucket metadata
@@ -259,7 +309,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        try:
+            self.capture()
+        except RuntimeError as e:
+            raise Exception(
+                f"Capture prefill CUDA graph failed: {e}\n"
+                f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
 
         self.raw_num_tokens = 0
 
@@ -420,7 +476,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch=static_forward_batch,
         )
 
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.input_embeds is not None:
             return False
         if forward_batch.replace_embeds is not None:
@@ -451,7 +507,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     return False
         if num_tokens > self.max_num_tokens:
             return False
-        # No backend-level shape check here: replay_prepare bucket-pads
+        # No backend-level shape check here: load_batch bucket-pads
         # num_tokens up to the nearest captured shape, so eligibility is
         # bounded by num_tokens <= self.max_num_tokens (already
         # checked above), not by exact shape membership.
@@ -461,6 +517,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # transformer stack, then the outer model.forward runs
         # logits_processor eagerly on top with live multi-req metadata.
         return True
+
+    def _build_capture_spec_info(self, num_tokens: int):
+        if self.static_draft_hidden_states is None:
+            return None
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        return EagleDraftInput(
+            hidden_states=self.static_draft_hidden_states[:num_tokens],
+        )
 
     def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, AttentionBackend]:
         """Build a dummy prefill ForwardBatch for capture/warmup at this shape.
@@ -572,7 +637,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 ),
                 spec_algorithm=None,
-                spec_info=None,
+                spec_info=self._build_capture_spec_info(num_tokens),
                 # Use self.capture_hidden_mode so dflash spec (which needs
                 # FULL aux hidden states) captures with the right mode.
                 # Ported from main #27468.
@@ -587,6 +652,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
+        # Warm up + autotune kernels once before capture (run-once across the
+        # decode + prefill runners; see BaseRunner.warmup).
+        self.warmup()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream
@@ -663,7 +731,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             post_warmup_hook=post_warmup_hook,
         )
 
-    def replay_prepare(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
+    def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
         the model code reads during replay.
         """
@@ -790,6 +858,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.orig_seq_lens is not None:
                 s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
 
+        # Refresh the static buffer the captured graph reads from.
+        if (
+            self.static_draft_hidden_states is not None
+            and forward_batch.spec_info is not None
+        ):
+            self.static_draft_hidden_states[:num_tokens].copy_(
+                forward_batch.spec_info.hidden_states
+            )
+
         self._prepare_forward_metadata_for_replay(
             forward_batch, static_forward_batch, static_num_tokens
         )
@@ -797,11 +874,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._static_num_tokens = static_num_tokens
         return static_forward_batch
 
-    def replay(
+    def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
-            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 

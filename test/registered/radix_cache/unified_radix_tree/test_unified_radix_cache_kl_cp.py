@@ -13,14 +13,14 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=950, stage="extra-b", runner_config="4-gpu-h100")
 
-QWEN3_30B_MODEL = "Qwen/Qwen3-30B-A3B-FP8"
+QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
 
 class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
-    """Qwen3-30B-A3B-FP8 + HiCache + CP + UnifiedRadixCache."""
+    """Qwen3-32B + HiCache + CP + UnifiedRadixCache."""
 
-    hicache_io_backend = "direct"
-    hicache_mem_layout = "page_first_direct"
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "page_first"
     max_running_requests = 32
     kl_threshold = 0.005
     gsm8k_threshold = 0.7
@@ -28,7 +28,7 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_30B_MODEL
+        cls.model = QWEN3_32B_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -37,10 +37,6 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp-size",
-                "4",
-                "--moe-dp-size",
-                "1",
-                "--ep-size",
                 "4",
                 "--attn-cp-size",
                 "2",
@@ -51,6 +47,8 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "32",
                 "--max-running-requests",
                 str(cls.max_running_requests),
+                "--max-total-tokens",
+                "14000",  # loadback trigger
                 "--disable-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
