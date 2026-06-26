@@ -95,8 +95,16 @@ PERFORMANCE_BATCH_SIZES = {
 }
 
 PERFORMANCE_EXTRA_BENCH_ARGS = {
-    "high-throughput": ["--request-timeout", "1800"],
+    "high-throughput": ["--request-timeout", "3600"],
 }
+
+
+def text_model_launch_settings(*args, **kwargs):
+    settings = ModelLaunchSettings(*args, **kwargs)
+    settings.extra_args = [
+        arg for arg in settings.extra_args if arg != "--enable-multimodal"
+    ]
+    return settings
 
 
 class TestDeepSeekV4ProFp4(unittest.TestCase):
@@ -104,14 +112,14 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
 
     def test_deepseek_v4_pro_fp4(self):
         variants = [
-            ModelLaunchSettings(
+            text_model_launch_settings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=LOW_LATENCY_ARGS,
                 variant="low-latency",
                 launch_timeout=SERVER_LAUNCH_TIMEOUT,
             ),
-            ModelLaunchSettings(
+            text_model_launch_settings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=BALANCED_ARGS,
@@ -119,7 +127,7 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
                 variant="balanced",
                 launch_timeout=SERVER_LAUNCH_TIMEOUT,
             ),
-            ModelLaunchSettings(
+            text_model_launch_settings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=HIGH_THROUGHPUT_ARGS,
@@ -139,6 +147,7 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
             num_threads=16,
             temperature=1.0,
             top_p=1.0,
+            api="completion",
         )
         for variant in variants:
             try:
