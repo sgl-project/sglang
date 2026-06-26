@@ -1843,7 +1843,7 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> Optional[ScheduleBatch]:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        new_prebuilt_batch = self.get_new_prebuilt_batch(self.running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -1872,7 +1872,9 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
-    def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
+    def get_new_prebuilt_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -1883,9 +1885,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+            self.policy.calc_priority(self.waiting_queue, running_batch)
 
-        curr_batch_size = self.running_batch.batch_size()
+        curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 

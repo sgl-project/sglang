@@ -251,7 +251,9 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk(last_batch=self.last_batch)
-                batch = self.get_new_batch_prefill()
+                batch, self.running_batch = self.get_new_batch_prefill(
+                    self.running_batch
+                )
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch

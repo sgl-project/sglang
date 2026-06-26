@@ -458,7 +458,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.resolve_waiting_queue_bootstrap()
 
-        batch = self.get_new_batch_prefill()
+        batch, self.running_batch = self.get_new_batch_prefill(self.running_batch)
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
