@@ -11,6 +11,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
+use tower_http::catch_panic::CatchPanicLayer;
 
 /// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method
 /// and URI so an operator investigating "client X gets 413s" has a
@@ -76,12 +77,78 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
         )
+        // Convert a handler panic into a 500 response. hyper otherwise catches
+        // the panic and drops the connection WITHOUT a Response, so the failure
+        // never reaches the `record_response_status` middleware below and is
+        // invisible to metrics and logs. Positioned INNER relative to that
+        // middleware (added before it, so it sits closer to the handlers) so the
+        // synthesized 500 is observed and counted.
+        .layer(CatchPanicLayer::new())
         // Outermost layer: count the final status of every response, so error
-        // short-circuits (admission 503s, 413s, …) land in
-        // `sgl_router_responses_total` alongside successes.
+        // short-circuits (admission 503s, 413s, …) and synthesized panic-500s
+        // land in `sgl_router_responses_total` alongside successes.
         .layer(middleware::from_fn_with_state(
             Arc::clone(&ctx.metrics),
             record_response_status,
         ))
         .with_state(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// A handler panic must become a 500 that the `record_response_status`
+    /// middleware still observes. hyper catches a handler panic and drops the
+    /// connection WITHOUT producing a Response, so without `CatchPanicLayer`
+    /// the failure is invisible to the response-code metric. `CatchPanicLayer`
+    /// synthesizes a 500; the metrics layer must be OUTER (applied after) so it
+    /// counts that synthesized 500.
+    ///
+    /// This composes the SAME two layers in the SAME order as `build_router`
+    /// (metrics outer, catch-panic inner) over a panicking route — the real
+    /// `build_router` has no panicking route to exercise, so a minimal Router
+    /// pins the ordering contract directly.
+    #[tokio::test]
+    async fn handler_panic_becomes_500_and_is_counted() {
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    panic!("handler exploded");
+                    #[allow(unreachable_code)]
+                    StatusCode::OK
+                }),
+            )
+            // Inner: convert a handler panic into a 500 response.
+            .layer(CatchPanicLayer::new())
+            // Outer: count the final status — must observe the synthesized 500.
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                record_response_status,
+            ));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/boom")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a handler panic must surface as 500, not a dropped connection",
+        );
+        assert!(
+            metrics
+                .render()
+                .contains(r#"sgl_router_responses_total{status_code="500"} 1"#),
+            "the metrics middleware must observe and count the panic-500; got:\n{}",
+            metrics.render(),
+        );
+    }
 }
