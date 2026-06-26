@@ -15,8 +15,8 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_helpers import (
     cp_kv_layer_split_pre_compressor_skip,
     is_cp_kv_layer_split_deepseek_v4_pool,
-    maybe_sync_cp_kv_extra_for_read,
-    maybe_sync_cp_kv_indexer_for_read,
+    maybe_prefetch_cp_kv_extra,
+    maybe_prefetch_cp_kv_indexer,
 )
 
 if TYPE_CHECKING:
@@ -574,9 +574,9 @@ class CompressorBackendMixin:
                     or forward_batch.forward_mode,
                 )
         if compressor.is_in_indexer:
-            maybe_sync_cp_kv_indexer_for_read(token_to_kv_pool, layer_id, forward_batch)
+            maybe_prefetch_cp_kv_indexer(token_to_kv_pool, layer_id, forward_batch)
         else:
-            maybe_sync_cp_kv_extra_for_read(token_to_kv_pool, layer_id, forward_batch)
+            maybe_prefetch_cp_kv_extra(token_to_kv_pool, layer_id, forward_batch)
 
     def _forward_unified_hip(
         self,

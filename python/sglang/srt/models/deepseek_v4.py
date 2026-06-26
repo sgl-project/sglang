@@ -133,8 +133,8 @@ else:
 
 from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_helpers import (
     is_cp_kv_layer_split_deepseek_v4_pool,
-    maybe_finish_cp_kv_swa_for_read,
-    maybe_start_cp_kv_swa_for_read,
+    maybe_prefetch_cp_kv_swa,
+    maybe_wait_cp_kv_swa_prefetch,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -955,9 +955,7 @@ class MQALayer(nn.Module):
                 )
                 kv = None
 
-        maybe_start_cp_kv_swa_for_read(
-            get_token_to_kv_pool(), self.layer_id, forward_batch
-        )
+        maybe_prefetch_cp_kv_swa(get_token_to_kv_pool(), self.layer_id, forward_batch)
 
         del qkv_a
 
@@ -1084,7 +1082,7 @@ class MQALayer(nn.Module):
                     x_quant=x_quant,
                 )
             kv = None
-            maybe_start_cp_kv_swa_for_read(
+            maybe_prefetch_cp_kv_swa(
                 get_token_to_kv_pool(), self.layer_id, forward_batch
             )
         else:
@@ -1098,7 +1096,7 @@ class MQALayer(nn.Module):
             )
 
         if not has_tokens:
-            maybe_finish_cp_kv_swa_for_read(
+            maybe_wait_cp_kv_swa_prefetch(
                 get_token_to_kv_pool(), self.layer_id, forward_batch
             )
             assert (
@@ -1111,7 +1109,7 @@ class MQALayer(nn.Module):
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
-        maybe_finish_cp_kv_swa_for_read(
+        maybe_wait_cp_kv_swa_prefetch(
             get_token_to_kv_pool(), self.layer_id, forward_batch
         )
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (

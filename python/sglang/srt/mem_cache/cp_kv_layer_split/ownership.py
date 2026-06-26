@@ -6,16 +6,37 @@ from sglang.srt.layers.dp_attention import get_attention_cp_group
 
 
 def layers_per_cp_rank(num_layers: int, cp_size: int) -> int:
-    """Max local KV buffers per CP rank (contiguous block split)."""
+    """Max local KV buffers per CP rank (balanced contiguous split)."""
     assert num_layers > 0 and cp_size > 0
     return (num_layers + cp_size - 1) // cp_size
 
 
+def _kv_layer_range_for_cp_rank(
+    cp_rank: int, cp_size: int, num_layers: int
+) -> tuple[int, int]:
+    """Balanced contiguous global layer range owned by one CP rank."""
+    assert num_layers > 0 and cp_size > 0
+    assert 0 <= cp_rank < cp_size
+
+    base = num_layers // cp_size
+    remainder = num_layers % cp_size
+    start = cp_rank * base + min(cp_rank, remainder)
+    end = start + base + (1 if cp_rank < remainder else 0)
+    return start, end
+
+
 def kv_layer_owner(layer_id: int, cp_size: int, num_layers: int) -> int:
     """CP rank that stores KV cache for global transformer layer ``layer_id``."""
+    assert num_layers > 0 and cp_size > 0
     assert 0 <= layer_id < num_layers
-    block = layers_per_cp_rank(num_layers, cp_size)
-    return min(layer_id // block, cp_size - 1)
+    base = num_layers // cp_size
+    remainder = num_layers % cp_size
+    if base == 0:
+        return layer_id
+    long_layers = (base + 1) * remainder
+    if layer_id < long_layers:
+        return layer_id // (base + 1)
+    return remainder + (layer_id - long_layers) // base
 
 
 def owns_kv_layer(layer_id: int, cp_rank: int, cp_size: int, num_layers: int) -> bool:
@@ -39,14 +60,12 @@ def owned_kv_layer_range(
     if start_layer >= end_layer_exclusive:
         return start_layer, start_layer
 
-    owned = [
-        layer_id
-        for layer_id in range(start_layer, end_layer_exclusive)
-        if owns_kv_layer(layer_id, cp_rank, cp_size, num_layers)
-    ]
-    if not owned:
+    owner_start, owner_end = _kv_layer_range_for_cp_rank(cp_rank, cp_size, num_layers)
+    owned_start = max(start_layer, owner_start)
+    owned_end = min(end_layer_exclusive, owner_end)
+    if owned_start >= owned_end:
         return start_layer, start_layer
-    return owned[0], owned[-1] + 1
+    return owned_start, owned_end
 
 
 def num_owned_kv_layers(

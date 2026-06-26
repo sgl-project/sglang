@@ -634,8 +634,8 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
                 local_id += 1
         raise RuntimeError(f"layer {layer_id} not in C4 indexer KV set")
 
-    def start_swa_layer_for_read(self, layer_id: int, indices: torch.Tensor) -> None:
-        """Start owner SWA page broadcast; caller must finish before attention read."""
+    def prefetch_swa_layer(self, layer_id: int, indices: torch.Tensor) -> None:
+        """Start current-layer SWA page broadcast; caller waits before attention."""
         self.wait_layer_transfer(layer_id)
         self._extra_staging_layer_id = None
         self._extra_page_table_selected_pages = None
@@ -680,14 +680,12 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         self._swa_remapped_indices = swa_cache.remapped
         self._swa_remapped_layer_id = layer_id
 
-    def finish_swa_layer_for_read(self, layer_id: int) -> None:
-        """Wait for a pending SWA broadcast before the layer reads SWA KV."""
+    def wait_swa_prefetch(self, layer_id: int) -> None:
+        """Wait for the pending SWA prefetch before attention consumes it."""
         self._broadcast_slots.finish("swa", layer_id)
 
-    def prepare_extra_key_layer_for_read(
-        self, layer_id: int, indices: torch.Tensor
-    ) -> None:
-        """Broadcast compact owner C4/C128 KV pages and remap read indices."""
+    def _prefetch_extra_key_pages(self, layer_id: int, indices: torch.Tensor) -> None:
+        """Broadcast compact owner C4/C128 KV pages and remap indices."""
         self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
         assert item is not None
@@ -744,10 +742,10 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         self._extra_remapped_layer_id = layer_id
         self._extra_staging_layer_id = layer_id
 
-    def start_page_table_extra_key_layer_for_read(
+    def prefetch_extra_key_layer_from_page_table(
         self, layer_id: int, page_table: torch.Tensor
     ) -> None:
-        """Broadcast C4 extra KV pages selected by the batch page table."""
+        """Prefetch C4 extra KV pages selected by the batch page table."""
         self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
         assert item is not None
@@ -796,9 +794,7 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         self._extra_page_table_page_size = page_size
         self._extra_page_table_max_pages = max_pages
 
-    def prepare_index_k_layer_for_read(
-        self, layer_id: int, page_table: torch.Tensor
-    ) -> None:
+    def _prefetch_index_k_pages(self, layer_id: int, page_table: torch.Tensor) -> None:
         """Broadcast compact owner C4 indexer pages for ``layer_id``."""
         self.wait_layer_transfer(layer_id)
         compress_ratio, _, _ = self.layer_mapping[layer_id]
@@ -841,8 +837,8 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
         self._indexer_remapped_layer_id = layer_id
         self._indexer_staging_layer_id = layer_id
 
-    def sync_extra_key_layer_for_read(self, layer_id: int, core_metadata) -> None:
-        """Collective after owner C4/C128 KV write and before extra-KV reads."""
+    def prefetch_extra_key_layer(self, layer_id: int, core_metadata) -> None:
+        """Prefetch current-layer C4/C128 KV after the owner-side write."""
         item = self.layer_mapping[layer_id]
         if item is None:
             return
@@ -856,17 +852,15 @@ class CpKvLayerSplitDeepSeekV4TokenToKVPool(
                 raise RuntimeError(
                     f"CP KV LayerSplit missing compressed indices for layer {layer_id}"
                 )
-            self.prepare_extra_key_layer_for_read(layer_id, indices)
+            self._prefetch_extra_key_pages(layer_id, indices)
 
-    def sync_index_k_layer_for_read(
-        self, layer_id: int, page_table: torch.Tensor
-    ) -> None:
-        """Collective after owner C4 indexer KV write and before indexer reads."""
+    def prefetch_index_k_layer(self, layer_id: int, page_table: torch.Tensor) -> None:
+        """Prefetch current-layer C4 indexer KV after the owner-side write."""
         item = self.layer_mapping[layer_id]
         if item is None:
             return
         if item.compress_ratio == 4:
-            self.prepare_index_k_layer_for_read(layer_id, page_table)
+            self._prefetch_index_k_pages(layer_id, page_table)
 
     def _rebuild_compressed_layer_mapping_for_cp(self) -> None:
         """``compress_layer_id`` counts only layers owned by this CP rank."""

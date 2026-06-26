@@ -42,30 +42,34 @@ def cp_kv_layer_split_pre_compressor_skip(
     return pool.should_skip_core_compressor_write(layer_id)
 
 
-def maybe_start_cp_kv_swa_for_read(pool, layer_id: int, forward_batch=None) -> None:
+def maybe_prefetch_cp_kv_swa(pool, layer_id: int, forward_batch=None) -> None:
+    """Start current-layer SWA prefetch after the SWA write."""
     if _should_sync_cp_kv_layer_split(pool, forward_batch):
         core_metadata = _get_core_attn_metadata()
-        pool.start_swa_layer_for_read(layer_id, core_metadata.swa_page_indices)
+        pool.prefetch_swa_layer(layer_id, core_metadata.swa_page_indices)
 
 
-def maybe_finish_cp_kv_swa_for_read(pool, layer_id: int, forward_batch=None) -> None:
+def maybe_wait_cp_kv_swa_prefetch(pool, layer_id: int, forward_batch=None) -> None:
+    """Wait for the current-layer SWA prefetch before attention consumes it."""
     if _should_sync_cp_kv_layer_split(pool, forward_batch):
-        pool.finish_swa_layer_for_read(layer_id)
+        pool.wait_swa_prefetch(layer_id)
 
 
-def maybe_sync_cp_kv_extra_for_read(pool, layer_id: int, forward_batch=None) -> None:
+def maybe_prefetch_cp_kv_extra(pool, layer_id: int, forward_batch=None) -> None:
+    """Start current-layer C4/C128 KV prefetch after the compressor write."""
     if _should_sync_cp_kv_layer_split(pool, forward_batch):
         if pool.should_use_c4_extra_broadcast_overlap(layer_id):
             core_metadata = _get_core_attn_metadata()
-            pool.start_page_table_extra_key_layer_for_read(
+            pool.prefetch_extra_key_layer_from_page_table(
                 layer_id, core_metadata.page_table
             )
             return
         core_metadata = _get_core_attn_metadata()
-        pool.sync_extra_key_layer_for_read(layer_id, core_metadata)
+        pool.prefetch_extra_key_layer(layer_id, core_metadata)
 
 
-def maybe_sync_cp_kv_indexer_for_read(pool, layer_id: int, forward_batch=None) -> None:
+def maybe_prefetch_cp_kv_indexer(pool, layer_id: int, forward_batch=None) -> None:
+    """Start current-layer C4 indexer KV prefetch after the indexer write."""
     if _should_sync_cp_kv_layer_split(pool, forward_batch):
         attn_backend = get_attn_backend()
         if hasattr(attn_backend, "_maybe_upgrade_forward_metadata"):
@@ -74,7 +78,7 @@ def maybe_sync_cp_kv_indexer_for_read(pool, layer_id: int, forward_batch=None) -
         indexer_metadata = getattr(metadata, "indexer_metadata", None)
         if indexer_metadata is None:
             raise RuntimeError("CP KV LayerSplit requires DSV4 indexer metadata")
-        pool.sync_index_k_layer_for_read(layer_id, indexer_metadata.page_table)
+        pool.prefetch_index_k_layer(layer_id, indexer_metadata.page_table)
 
 
 def _get_core_attn_metadata():
