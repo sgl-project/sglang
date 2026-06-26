@@ -649,7 +649,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sglang-data)
           # This directory persists across container restarts on the self-hosted runner
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
@@ -679,7 +679,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"
@@ -789,7 +789,7 @@ jobs:
 
       - name: Setup kernel caches
         run: |
-          # Use the persistent /sgl-data directory (mounted from /home/runner/sgl-data)
+          # Use the persistent /sgl-data directory (mounted from /home/runner/sglang-data)
           docker exec ci_sglang mkdir -p /sgl-data/aiter-kernels /sgl-data/miopen-cache /sgl-data/hf-cache/hub
 
           # Clear pre-built AITER kernels from Docker image to avoid segfaults
@@ -818,7 +818,7 @@ jobs:
           free -h
           echo ""
           echo "=== Disk Space ==="
-          df -h /home/runner/sgl-data 2>/dev/null || df -h
+          df -h /home/runner/sglang-data 2>/dev/null || df -h
           echo ""
           echo "=== HF Cache Directory Structure ==="
           docker exec ci_sglang ls -la /sgl-data/hf-cache/ 2>/dev/null || echo "HF cache dir not found"

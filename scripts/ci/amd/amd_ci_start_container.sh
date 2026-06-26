@@ -283,7 +283,7 @@ else
   fi
 fi
 
-CACHE_HOST=/home/runner/sgl-data
+CACHE_HOST=/home/runner/sglang-data
 echo "=== Host /sgl-data cache diagnostics ==="
 echo "CACHE_HOST=${CACHE_HOST}"
 for host_path in "${CACHE_HOST}"; do
