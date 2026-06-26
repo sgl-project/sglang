@@ -11,6 +11,13 @@ CMAKE_BUILD_PARALLEL_LEVEL ?= $(MAX_JOBS)
 UV_BUILD_DIR ?= build
 CMAKE_POLICY_VERSION_MINIMUM ?= 3.5
 
+# Optional GitHub mirror for FetchContent (e.g. internal artifactory).
+# Empty -> CMakeLists.txt default (github.com).
+GITHUB_ARTIFACTORY ?=
+ifneq ($(strip $(GITHUB_ARTIFACTORY)),)
+CMAKE_ARGS += -DGITHUB_ARTIFACTORY=$(GITHUB_ARTIFACTORY)
+endif
+
 # Show help for each target
 help: ## Show this help message
 	@echo "Available targets:"

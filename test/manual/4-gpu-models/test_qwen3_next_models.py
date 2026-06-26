@@ -19,11 +19,42 @@ class TestQwen3Next(
         "--tp-size",
         "4",
         "--chunked-prefill-size",
-        "2048",
+        "1024",
         "--mamba-scheduler-strategy",
         "extra_buffer",
         "--mamba-track-interval",
-        "128",
+        "2",
+        "--page-size",
+        "1",
+        "--attention-backend",
+        "triton",
+        "--moe-runner-backend",
+        "triton",
+    ]
+
+
+class TestQwen3NextLazyExtraBuffer(
+    GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    model = QWEN3_NEXT_MODEL
+    cache_chunk_size = 64
+    gsm8k_accuracy_thres = 0.93
+    kl_div_thres = 0.0025
+    other_args = [
+        "--tp-size",
+        "4",
+        "--chunked-prefill-size",
+        "1024",
+        "--mamba-scheduler-strategy",
+        "extra_buffer_lazy",
+        "--mamba-track-interval",
+        "2",
+        "--page-size",
+        "1",
+        "--attention-backend",
+        "triton",
+        "--moe-runner-backend",
+        "triton",
     ]
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
@@ -73,7 +74,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import (
+    get_bool_env_var,
+    normalize_serialized_named_tensor_payloads,
+)
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -128,7 +132,11 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
+            comm = FanOutCommunicator(
+                self._dispatch_to_scheduler,
+                server_args.dp_size,
+                mode,
+            )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
@@ -316,43 +324,25 @@ class TokenizerControlMixin:
 
     async def start_profile(
         self: TokenizerManager,
-        output_dir: Optional[str] = None,
-        start_step: Optional[int] = None,
-        num_steps: Optional[int] = None,
-        activities: Optional[List[str]] = None,
-        with_stack: Optional[bool] = None,
-        record_shapes: Optional[bool] = None,
-        profile_by_stage: bool = False,
-        merge_profiles: bool = False,
-        profile_prefix: Optional[str] = None,
-        profile_stages: Optional[List[str]] = None,
+        req: Optional[ProfileReq] = None,
     ):
         self.auto_create_handle_loop()
+        req = req or ProfileReq()
+        req.req_type = ProfileReqType.START_PROFILE
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
-        with_stack = False if with_stack is False or env_with_stack is False else True
+        req.with_stack = (
+            False if req.with_stack is False or env_with_stack is False else True
+        )
         env_record_shapes: bool = get_bool_env_var(
             "SGLANG_PROFILE_RECORD_SHAPES", "true"
         )
-        record_shapes = (record_shapes is not False) and env_record_shapes
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=output_dir,
-            start_step=start_step,
-            num_steps=num_steps,
-            activities=activities,
-            with_stack=with_stack,
-            record_shapes=record_shapes,
-            profile_by_stage=profile_by_stage,
-            profile_id=str(time.time()),
-            merge_profiles=merge_profiles,
-            profile_prefix=profile_prefix,
-            profile_stages=profile_stages,
-        )
+        req.record_shapes = (req.record_shapes is not False) and env_record_shapes
+        req.profile_id = req.profile_id or str(time.time())
         return await self._execute_profile(req)
 
     async def stop_profile(self: TokenizerManager):
         self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
@@ -472,6 +462,10 @@ class TokenizerControlMixin:
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+            obj.serialized_named_tensors
+        )
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -757,14 +751,24 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str, Optional[List[Dict]]]:
+    ) -> Tuple[bool, str, Optional[List[Dict]], Optional[str]]:
         self.auto_create_handle_loop()
         results = await self.check_weights_communicator(obj)
         success, message = FanOutCommunicator.merge_results(results)
         ranks: Optional[List[Dict]] = None
+        per_engine_checksum: Optional[str] = None
         if any(r.payload is not None for r in results):
-            ranks = [r.payload for r in results]
-        return success, message, ranks
+            ranks = []
+            for r in results:
+                if isinstance(r.payload, list):
+                    ranks.extend(r.payload)
+                else:
+                    ranks.append(r.payload)
+            h = hashlib.sha256()
+            for rank in ranks:
+                h.update(rank["per_gpu_checksum"].encode())
+            per_engine_checksum = h.hexdigest()
+        return success, message, ranks, per_engine_checksum
 
     async def slow_down(
         self: TokenizerManager,
@@ -846,7 +850,7 @@ class TokenizerControlMixin:
 
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        self.send_to_scheduler.send_pyobj(obj)
+        self._dispatch_to_scheduler(obj)
 
         try:
             return await future
@@ -858,7 +862,7 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await self.send_to_scheduler.send_pyobj(obj)
+        await self._async_dispatch_to_scheduler(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]

@@ -74,6 +74,8 @@ class InsertResult:
     """Result of an insert operation"""
 
     prefix_len: int
+    total_len: int = 0
+    last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
 
@@ -110,7 +112,7 @@ class IncLockRefResult:
         default_factory=dict
     )
 
-    def to_dec_params(self) -> "DecLockRefParams":
+    def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
@@ -166,11 +168,12 @@ class MatchResult(NamedTuple):
                             load_back walk (FULL / SWA / ...). For legacy caches
                             that don't run multi-component validation, set this
                             equal to `last_host_node`.
-        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
-                            number of evicted KV tokens on CPU. For hybrid Mamba models this
-                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
-                            host hit still triggers load-back without adding a separate field.
-                            0 if HiCache is not enabled.
+        host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
+                            loaded back to device. Pure-KV cache semantics;
+        swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
+                            window) and will be load-back into the SWA device pool.
+        mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
+                            into the Mamba device pool. Typically 0 or 1.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
@@ -181,11 +184,13 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     best_match_node: Any
     host_hit_length: int = 0
+    swa_host_hit_length: int = 0
+    mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
 
 
-def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
+def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
     if tree_cache.is_chunk_cache():
         # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
         return match_result
@@ -198,6 +203,8 @@ def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
         last_host_node=root,
         best_match_node=root,
         host_hit_length=0,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
     )
 
 
@@ -236,6 +243,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     @abstractmethod
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
+
+    def supports_fast_match_prefix(self) -> bool:
+        return False
 
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):

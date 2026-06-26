@@ -17,6 +17,7 @@ def _init_compressed_attn_metadata_kernel(
     c4_seq_lens_clamp1_ptr,
     c128_out_loc_ptr,
     c128_positions_ptr,
+    c128_seq_lens_raw_ptr,
     c128_seq_lens_clamp1_ptr,
     c128_page_indices_ptr,
     bs,
@@ -54,6 +55,7 @@ def _init_compressed_attn_metadata_kernel(
 
     tl.store(c128_out_loc_ptr + batch_id, c128_out_loc)
     tl.store(c128_positions_ptr + batch_id, c128_positions)
+    tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw)
     tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
 
     if COMPUTE_PAGE_INDICES:
@@ -99,18 +101,20 @@ def _init_compressed_attn_metadata_triton(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
     Optional[torch.Tensor],
 ]:
     bs = seq_lens.shape[0]
     device = seq_lens.device
 
-    c4_out_loc = torch.empty(bs, dtype=torch.int32, device=device)
+    c4_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
     c4_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
-    c128_out_loc = torch.empty(bs, dtype=torch.int32, device=device)
+    c128_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
     c128_positions = torch.empty(bs, dtype=torch.int32, device=device)
+    c128_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
     if compute_page_indices:
@@ -146,6 +150,7 @@ def _init_compressed_attn_metadata_triton(
         c4_seq_lens_clamp1,
         c128_out_loc,
         c128_positions,
+        c128_seq_lens_raw,
         c128_seq_lens_clamp1,
         (
             c128_page_indices
@@ -168,6 +173,7 @@ def _init_compressed_attn_metadata_triton(
         c4_seq_lens_clamp1,
         c128_out_loc,
         c128_positions,
+        c128_seq_lens_raw,
         c128_seq_lens_clamp1,
         c128_page_indices,
     )
@@ -181,6 +187,7 @@ def init_compression_metadata(
     page_size: int = 0,
     compute_page_indices: bool = True,
 ) -> Tuple[
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
