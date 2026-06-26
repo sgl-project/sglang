@@ -152,11 +152,14 @@ class LagunaConfig(PretrainedConfig):
 
         # SGLang's hybrid-SWA core reads `swa_*` KV/head_dim from hf_text_config.
         # Per-layer Q-head count is read directly from num_attention_heads_per_layer.
-        # Pure-SWA models would have no full_attention layer, but the synthesized
-        # default above always plants one at index 0; let .index() raise if a
-        # caller passes an all-sliding layer_types — silent fallback would wire
-        # the SWA head count into a "full" attribute and corrupt downstream sizes.
-        full_idx = self.layer_types.index("full_attention")
+        # DFlash draft configs can be all-SWA. In that case there is no full
+        # layer geometry to expose, so use layer 0 for the default attention
+        # fields and keep the SWA-specific fields below explicit.
+        full_idx = (
+            self.layer_types.index("full_attention")
+            if "full_attention" in self.layer_types
+            else 0
+        )
         self.num_attention_heads = self.num_attention_heads_per_layer[full_idx]
         self.swa_num_key_value_heads = num_key_value_heads
         self.swa_head_dim = head_dim
@@ -164,8 +167,8 @@ class LagunaConfig(PretrainedConfig):
 
         # Released checkpoint nests rope_parameters under layer-type keys.
         rp = rope_parameters if isinstance(rope_parameters, dict) else {}
-        full_rp = rp.get("full_attention") or {}
         swa_rp = rp.get("sliding_attention") or {}
+        full_rp = rp.get("full_attention") or swa_rp or {}
 
         # transformers v5 aliases `rope_scaling` ↔ `rope_parameters` on
         # PretrainedConfig — writing one clobbers the other. Keep the nested
