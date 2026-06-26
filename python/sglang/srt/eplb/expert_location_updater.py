@@ -26,7 +26,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 class ExpertLocationUpdater:
@@ -485,7 +486,33 @@ def update_expert_weights_single_layer(
         if len(p2p_ops) == 0:
             return
 
-        if _is_hip:
+        if _is_npu:
+            # NPU P2P (HCCL) requires a contiguous tensor with
+            # storage_offset == 0. Expert weight views may have Ascend
+            # internal format with non-zero storage_offset, which triggers
+            # ERR02007 ("DIST feature not supported").
+            contiguous_p2p_ops = []
+            recv_copy_back_pairs = []
+            for op in p2p_ops:
+                target_tensor = op.tensor
+                if op.op is torch.distributed.irecv:
+                    contiguous_buffer = torch.empty(
+                        target_tensor.shape,
+                        dtype=target_tensor.dtype,
+                        device=target_tensor.device,
+                    )
+                    recv_copy_back_pairs.append((contiguous_buffer, target_tensor))
+                else:
+                    contiguous_buffer = target_tensor.clone()
+                contiguous_p2p_ops.append(
+                    P2POp(op=op.op, tensor=contiguous_buffer, peer=op.peer, group=op.group, tag=op.tag)
+                )
+            reqs = torch.distributed.batch_isend_irecv(contiguous_p2p_ops)
+            for req in reqs:
+                req.wait()
+            for src_tensor, dst_tensor in recv_copy_back_pairs:
+                dst_tensor.copy_(src_tensor)
+        elif _is_hip:
             # Submit P2P ops in batches to prevent RCCL GPU-side
             # accumulation hangs. All ranks use the same expert_id ranges
             # (based on num_physical_experts) to ensure matching send/recv
