@@ -972,7 +972,7 @@ class SchedulerMetricsReporter:
 
             # For PP mode, check all running micro batches
             if self.scheduler.server_args.pp_size > 1:
-                for batch in self.scheduler.running_mbs:
+                for batch in self.scheduler.batches.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:
                             if hasattr(req, "lora_id") and req.lora_id is not None:
