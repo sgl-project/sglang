@@ -130,6 +130,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        num_padding: Optional[int] = None,
     ):
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
@@ -157,16 +158,11 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 )
         elif forward_mode.is_target_verify():
             ssm_state_indices = torch.arange(
-                len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num,
+                bs * spec_info.draft_token_num,
                 dtype=torch.int32,
                 device=mamba_indices.device,
             )
-            self.state_indices_list_gdn[bs - 1][
-                : len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num
-            ].copy_(ssm_state_indices)
-            self.state_indices_list_gdn[bs - 1][
-                len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num :
-            ] = 0
+            self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
             if num_padding == 0:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
@@ -269,6 +265,28 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+            mamba_track_indices = mamba_track_indices.to(torch.int64)
+            mamba_steps_to_track = mamba_steps_to_track.to(torch.int64)
+
+            move_intermediate_cache(
+                ssm_states,
+                intermediate_state_cache,
+                mamba_track_indices,
+                src_indices_tensor,
+                mamba_steps_to_track,
+            )
+
+            track_mask = mamba_steps_to_track >= 0
+            # Track conv state from the verify-time window before rolling back
+            # the working slot; NPU does not keep per-step conv intermediates.
+            track_indices = mamba_track_indices[track_mask]
+            if track_indices.numel() > 0:
+                conv_states[:, track_indices] = conv_states[
+                    :, dst_indices_tensor[track_mask]
+                ]
+
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(
                 conv_states,
@@ -276,6 +294,15 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 last_steps,
                 draft_token_num,
             )
+
+        if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
+            conv_state_rollback(
+                conv_states,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                draft_token_num,
+            )
+
         return
 
     def update_verify_buffers_to_fill_after_draft(

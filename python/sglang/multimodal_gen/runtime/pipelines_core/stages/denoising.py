@@ -101,11 +101,24 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
+from sglang.multimodal_gen.utils import dict_to_3d_list
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
+
+
+def _ensure_tensor_model_output(model_output):
+    sample = getattr(model_output, "sample", None)
+    if isinstance(sample, torch.Tensor):
+        return sample
+    return model_output
 
 
 @dataclass(slots=True)
@@ -196,6 +209,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
         selected_attention_backend = self._infer_transformer_attention_backend()
+        # precision-constraint: attention backend metadata allocation currently assumes fp16;
+        # do not replace with user precision policy without auditing backend support.
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
             dtype=torch.float16,
@@ -244,7 +259,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         stage_name = self._component_stage_name(stage_name)
         uses: list[ComponentUse] = []
         if self.vae is not None:
-            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            vae_dtype = resolve_precision(
+                server_args, "vae", precision_attr="vae_precision"
+            )
             uses.append(
                 ComponentUse(
                     stage_name=stage_name,
@@ -311,8 +328,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
+                dit_config,
+                "torch_compile_mode",
+                "max-autotune-no-cudagraphs",
             )
             compile_kwargs["mode"] = mode
             logger.info(f"Compiling transformer with mode: {mode}")
@@ -611,7 +631,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         scheduler = batch.scheduler
         assert scheduler is not None
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch, scheduler)
+        boundary_timestep = (
+            self._handle_boundary_ratio(server_args, batch, scheduler)
+            if self.transformer_2 is not None
+            else None
+        )
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
@@ -652,10 +676,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # Setup precision and autocast settings
-        target_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        target_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
+        autocast_enabled = precision_autocast_enabled(
+            target_dtype, server_args.disable_autocast
+        )
 
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
@@ -679,7 +705,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # TI2V specific preparations - before SP sharding
         if should_preprocess_for_wan_ti2v:
-            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            vae_dtype = resolve_precision(
+                server_args, "vae", precision_attr="vae_precision"
+            )
             with self.use_declared_component(
                 component_name="vae",
                 module=self.vae,
@@ -1318,6 +1346,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 target_dtype,
                 seq_len,
                 reserved_frames_mask,
+                server_args.pipeline_config.dit_config.arch_config.patch_size,
             )
         else:
             timestep = t_device.repeat(bsz)
@@ -1370,7 +1399,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
-            with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
+            with self.progress_bar(
+                total=ctx.num_inference_steps, batch=batch
+            ) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
                     # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                     # use non-integer timesteps keep their precision in markers.
@@ -1786,12 +1817,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
-        return current_model(
+        model_output = current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
             **guidance_kwargs,
             **kwargs,
         )
+        return _ensure_tensor_model_output(model_output)
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

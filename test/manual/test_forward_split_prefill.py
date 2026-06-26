@@ -13,7 +13,7 @@ from array import array
 import numpy as np
 import torch
 
-from sglang.bench_one_batch import TreeCacheNamespace
+from sglang.benchmark.one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -95,9 +95,11 @@ class TestForwardSplitPrefill(CustomTestCase):
                 origin_input_ids=array("q", input_ids[i]),
                 sampling_params=sampling_params,
             )
-            req.fill_ids = req.origin_input_ids
+            req.full_untruncated_fill_ids = req.origin_input_ids
             req.logprob_start_len = -1
-            req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+            req.set_extend_range(
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+            )
             reqs.append(req)
 
         # Create dummy tree_cache for tests (no prefix caching, just allocation)
