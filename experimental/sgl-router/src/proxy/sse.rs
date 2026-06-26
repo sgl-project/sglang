@@ -146,6 +146,53 @@ where
     Body::from_stream(ReceiverStream::new(rx))
 }
 
+/// Wrap a byte stream with an idle (between-chunks) timeout. If the upstream
+/// delivers no chunk for `idle`, the wrapped stream yields one `io::Error` and
+/// ends — so a hung upstream (sends 200 headers then stalls without sending
+/// data or closing, e.g. a half-open TCP after a worker restart) can no longer
+/// block the SSE pump forever. Without this the pump's `stream_guards` (the
+/// per-worker admission slot + active-load entry) never drop and the router's
+/// in-flight counter leaks, eventually pinning every worker at its cap and
+/// shedding all traffic while the engines sit idle.
+///
+/// This is an *idle* timeout, not a total one: each delivered chunk resets it,
+/// so a slow-but-progressing long generation is unaffected — only a true stall
+/// trips it.
+pub fn idle_timeout_stream<S, E>(
+    stream: S,
+    idle: std::time::Duration,
+) -> futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    futures::stream::unfold((stream, false), move |(mut s, ended)| async move {
+        if ended {
+            return None;
+        }
+        match tokio::time::timeout(idle, s.next()).await {
+            // Chunk arrived in time: pass it through, keep going.
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), (s, false))),
+            // Upstream error: surface it and stop (the pump breaks on errors).
+            Ok(Some(Err(e))) => Some((
+                std::io::Result::Err(std::io::Error::other(e.to_string())),
+                (s, true),
+            )),
+            // Upstream ended cleanly.
+            Ok(None) => None,
+            // Idle timeout: surface a terminal error so the pump exits and drops
+            // its guards instead of blocking on `s.next()` forever.
+            Err(_elapsed) => Some((
+                std::io::Result::Err(std::io::Error::other(format!(
+                    "upstream stream idle for {idle:?}; aborting to release in-flight slot"
+                ))),
+                (s, true),
+            )),
+        }
+    })
+    .boxed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +439,50 @@ mod tests {
         assert!(
             final_polls < 1000,
             "pump drained the entire upstream after client disconnect ({final_polls} polls); the break-on-tx.send-err path is dead"
+        );
+    }
+
+    /// A stalled upstream — sends headers, then never delivers a byte and never
+    /// closes (a half-open TCP after a worker restart) — must not pin the SSE
+    /// pump forever. The pump must exit and DROP its `stream_guards` (the
+    /// per-worker admission slot + active-load entry). Without an idle timeout
+    /// the pump blocks on `s.next()` indefinitely and the guard leaks,
+    /// eventually pinning every worker at its cap (false shedding while engines
+    /// sit idle).
+    #[tokio::test]
+    async fn stalled_upstream_releases_stream_guards() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard: Box<dyn Send + 'static> = Box::new(DropFlag(Arc::clone(&dropped)));
+
+        // Upstream that never yields a byte and never ends, wrapped in the idle
+        // timeout so the pump aborts and releases the guard.
+        let stalled = idle_timeout_stream(
+            stream::pending::<Result<Bytes, std::io::Error>>(),
+            std::time::Duration::from_millis(50),
+        );
+        let body = bytes_stream_to_body(stalled, Some(guard), None, None);
+        tokio::spawn(async move {
+            let _ = body.collect().await;
+        });
+
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "stalled upstream must release stream_guards via the idle timeout",
         );
     }
 }

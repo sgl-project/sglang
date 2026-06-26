@@ -30,6 +30,15 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
     })
 }
 
+/// Idle (between-bytes) timeout for streaming upstream responses. A stream that
+/// delivers no bytes for this long is treated as hung and aborted, releasing the
+/// admission / active-load guards it holds. Distinct from `request_timeout` (the
+/// total budget, which streaming deliberately skips so long generations can run):
+/// this fires only on a *stall*, not on slow-but-progressing generation. Without
+/// it, a half-open upstream (e.g. a worker killed mid-stream) pins the SSE pump
+/// and leaks the per-worker in-flight slot forever.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Debug)]
 pub struct Proxy {
     pub client: Client,
@@ -240,7 +249,7 @@ impl Proxy {
             None
         };
         let body = sse::bytes_stream_to_body(
-            resp.bytes_stream(),
+            sse::idle_timeout_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT),
             stream_guards,
             on_complete,
             first_byte_hook,
