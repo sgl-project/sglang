@@ -283,12 +283,40 @@ else
   fi
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
+CACHE_HOST=/home/runner/sgl-data
+echo "=== Host /sgl-data cache diagnostics ==="
+echo "CACHE_HOST=${CACHE_HOST}"
+for host_path in "${CACHE_HOST}"; do
+  echo ""
+  echo "-- host path: ${host_path} --"
+  if [[ -e "${host_path}" ]]; then
+    ls -ld "${host_path}" 2>&1 || true
+  else
+    echo "missing"
+  fi
+
+  if [[ -d "${host_path}" ]]; then
+    if mountpoint -q "${host_path}" 2>/dev/null; then
+      echo "${host_path} is a mount point"
+    else
+      echo "${host_path} is NOT a mount point"
+    fi
+    findmnt -T "${host_path}" 2>&1 || true
+    df -hT "${host_path}" 2>&1 || true
+    stat -c "path=%n type=%F owner=%U:%G mode=%a device=%D inode=%i" "${host_path}" 2>&1 || true
+    ls -la "${host_path}" 2>&1 | sed -n "1,40p" || true
+  else
+    echo "not a directory"
+  fi
+done
+echo "=== End host /sgl-data cache diagnostics ==="
+
 if [[ -d "$CACHE_HOST" ]]; then
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+    echo "Using CACHE_VOLUME=${CACHE_VOLUME}"
 else
     CACHE_VOLUME=""
+    echo "CACHE_HOST ${CACHE_HOST} is not a directory; /sgl-data bind mount disabled"
 fi
 
 echo "Launching container: ci_sglang"
@@ -310,6 +338,40 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+echo "=== Container /sgl-data diagnostics ==="
+echo "-- docker inspect mounts --"
+docker inspect ci_sglang \
+  --format '{{range .Mounts}}{{println .Type .Source "->" .Destination}}{{end}}' \
+  | grep -E -- '-> /sgl-data($| )' || echo "No /sgl-data mount found in docker inspect"
+echo ""
+docker exec ci_sglang bash -lc '
+  set +e
+  echo "HF_HOME=${HF_HOME:-}"
+  echo "HF_HUB_CACHE=${HF_HUB_CACHE:-}"
+  echo ""
+  echo "-- mountpoint --"
+  if mountpoint -q /sgl-data 2>/dev/null; then
+    echo "/sgl-data is a mount point"
+  else
+    echo "/sgl-data is NOT a mount point"
+  fi
+  echo ""
+  echo "-- findmnt -T /sgl-data --"
+  findmnt -T /sgl-data 2>&1 || true
+  echo ""
+  echo "-- df -hT /sgl-data --"
+  df -hT /sgl-data 2>&1 || true
+  echo ""
+  echo "-- stat /sgl-data --"
+  stat -c "path=%n type=%F owner=%U:%G mode=%a device=%D inode=%i" /sgl-data 2>&1 || true
+  echo ""
+  echo "-- /sgl-data contents --"
+  ls -la /sgl-data 2>&1 | sed -n "1,80p" || true
+  echo ""
+  echo "-- HF cache dirs --"
+  ls -ld /sgl-data/hf-cache /sgl-data/hf-cache/hub 2>&1 || true
+' || true
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
