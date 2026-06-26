@@ -15,11 +15,16 @@ from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     save_jsonl,
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    ACTIVE_TEST_CLASS,
+    CONFIGMAP_NAME,
+    NAMESPACE,
     SERVICE_PORT,
     check_role,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
+    query_configmap,
+    wait_for_prefill_decode_exit,
     wait_server_ready,
 )
 from sglang.test.test_utils import (
@@ -338,6 +343,7 @@ def run_bench_serving(
     repeat_rate=None,
     temperature=None,
     top_p=None,
+    env=None,
 ):
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
@@ -449,7 +455,7 @@ def run_bench_serving(
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
     process = subprocess.Popen(
-        cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
     )
     try:
         # Read output line by line

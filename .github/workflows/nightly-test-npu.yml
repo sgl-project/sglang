@@ -1,4 +1,4 @@
-name: Nightly Test (NPU)
+﻿name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 18 * * *'  # Execute at 2:00 a.m. Beijing Time every day
@@ -168,9 +168,9 @@ jobs:
             runner: linux-aarch64-a3-4
             test_case: test/registered/ascend/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_2p_in16k_out1k_50ms.py
             test_type: 'perf'
-          - name: qwen3_6_27b_w8a8_2p_in64k_out1k_50ms
+          - name: qwen3_6_27b_w8a8_1p_in64k_out1k_50ms
             runner: linux-aarch64-a3-4
-            test_case: test/registered/ascend/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_2p_in64k_out1k_50ms.py
+            test_case: test/registered/ascend/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in64k_out1k_50ms.py
             test_type: 'perf'
           - name: qwen3_6_27b_w8a8_2p_in128k_out1k_50ms
             runner: linux-aarch64-a3-4
@@ -337,9 +337,9 @@ jobs:
         run: |
           status_emoji() {
             case "$1" in
-              pass)   echo "✅" ;;
-              fail)   echo "❌" ;;
-              *)      echo "❓" ;;
+              pass)   echo "鉁? ;;
+              fail)   echo "鉂? ;;
+              *)      echo "鉂? ;;
             esac
           }
 
@@ -350,11 +350,11 @@ jobs:
 
           group_icon() {
             case "$1" in
-              success)   echo "✅" ;;
-              failure)   echo "❌" ;;
-              cancelled) echo "⏭️" ;;
-              skipped)   echo "⏭️" ;;
-              *)         echo "❓" ;;
+              success)   echo "鉁? ;;
+              failure)   echo "鉂? ;;
+              cancelled) echo "鈴笍" ;;
+              skipped)   echo "鈴笍" ;;
+              *)         echo "鉂? ;;
             esac
           }
 
@@ -382,7 +382,7 @@ jobs:
               echo "tc = d.get('test_case', '-')" >> /tmp/parse_metrics.py
               echo "tp = d.get('test_type', '-')" >> /tmp/parse_metrics.py
               echo "st = d.get('status', 'unknown')" >> /tmp/parse_metrics.py
-              echo "icon = '✅' if st == 'pass' else '❌'" >> /tmp/parse_metrics.py
+              echo "icon = '鉁? if st == 'pass' else '鉂?" >> /tmp/parse_metrics.py
               echo "metrics = d.get('metrics', {})" >> /tmp/parse_metrics.py
               echo "baselines = d.get('baselines', {})" >> /tmp/parse_metrics.py
               echo "mstr = ', '.join(f'{k}={v}' for k,v in metrics.items()) if metrics else '-'" >> /tmp/parse_metrics.py

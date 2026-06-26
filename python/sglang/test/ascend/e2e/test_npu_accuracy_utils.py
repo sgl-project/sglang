@@ -249,6 +249,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     max_attempts = 2
+    n_runs = 3
     accuracy = 0.1
 
     @classmethod
@@ -312,6 +313,67 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 eval_type=self.eval_type,
             )
             assert_metrics(self, metrics)
+
+    def run_accuracy_multiple(self, n_runs=None):
+        if n_runs is None:
+            n_runs = self.n_runs
+
+        parsed_url = urlparse(self.base_url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+
+        if self.benchmark_tool != EVALSCOPE:
+            raise Exception(
+                "run_accuracy_multiple only supports evalscope benchmark tool"
+            )
+
+        model_name = os.path.basename(self.model)
+        all_metrics = []
+
+        for i in range(n_runs):
+            logger.info(f"=== Accuracy run {i + 1}/{n_runs} ===")
+            metrics = run_evalscope(
+                host=host,
+                port=port,
+                model=model_name,
+                datasets=self.datasets,
+                dataset_args=self._get_dataset_args(),
+                eval_batch_size=self.eval_batch_size,
+                limit=self.limit,
+                generation_config=self.generation_config,
+                dataset_dir=self.dataset_dir,
+                stream=self.stream,
+                timeout=self.timeout,
+                eval_type=self.eval_type,
+            )
+            all_metrics.append(metrics)
+            if metrics and "accuracy" in metrics:
+                logger.info(f"Run {i + 1} accuracy: {metrics['accuracy']}")
+            else:
+                logger.warning(f"Run {i + 1} failed to get accuracy metric")
+
+        valid_metrics = [m for m in all_metrics if m and "accuracy" in m]
+        if not valid_metrics:
+            raise Exception("No valid accuracy metrics obtained from any run")
+
+        avg_accuracy = sum(float(m["accuracy"]) for m in valid_metrics) / len(
+            valid_metrics
+        )
+
+        logger.info("=" * 60)
+        logger.info("Multiple Run Accuracy Results:")
+        for i, m in enumerate(valid_metrics):
+            logger.info(f"  Run {i + 1}: {m['accuracy']}")
+        logger.info(f"  Average: {avg_accuracy}")
+        logger.info("=" * 60)
+
+        avg_metrics = {"accuracy": avg_accuracy}
+        dump_metric(
+            "accuracy_avg",
+            avg_accuracy,
+            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
+        )
+        assert_metrics(self, avg_metrics)
 
 
 class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):

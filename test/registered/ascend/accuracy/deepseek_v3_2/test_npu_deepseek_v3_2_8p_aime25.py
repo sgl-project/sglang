@@ -25,6 +25,7 @@ OTHER_ARGS = [
     "--quantization",
     "modelslim",
     "--disable-radix-cache",
+    "--reasoning-parser",
 ]
 
 
