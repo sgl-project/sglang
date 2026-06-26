@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.runtime_context import get_parallel
 
 if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
     from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -33,6 +34,7 @@ else:
         FusedCompressMetadata,
         create_paged_compressor_data,
     )
+
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
@@ -44,10 +46,6 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
-)
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_rank,
-    get_attention_cp_size,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -289,8 +287,8 @@ class DSV4AttnMetadata:
     ]
 
     def apply_cp_reindex(self) -> None:
-        cp_rank = get_attention_cp_rank()
-        cp_size = get_attention_cp_size()
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
         idx = slice(cp_rank, None, cp_size)
         pre_global_len = self.seq_lens_casual.shape[0]
         assert pre_global_len % cp_size == 0, (
@@ -1203,7 +1201,7 @@ class DeepseekV4HipRadixBackend(
         # HIP backend (DeepseekV4HipRadixBackend, selected only when is_hip()).
         # The NVIDIA path uses DeepseekV4AttnBackend and never reaches here, so
         # these CP changes do not affect B200/H200 execution.
-        _cp_size = get_attention_cp_size()
+        _cp_size = get_parallel().attn_cp_size
         _cp_active = (
             _cp_size > 1
             and is_dsa_prefill_cp_round_robin_split()
@@ -1214,7 +1212,7 @@ class DeepseekV4HipRadixBackend(
         final_pos_full = final_pos
         positions_full = positions
         if _cp_active:
-            _sl = slice(get_attention_cp_rank(), None, _cp_size)
+            _sl = slice(get_parallel().attn_cp_rank, None, _cp_size)
             state_slot = state_slot[_sl].contiguous()
             chunk_start = chunk_start[_sl].contiguous()
             cu_q = cu_q[_sl].contiguous()
@@ -1316,24 +1314,37 @@ class DeepseekV4HipRadixBackend(
         recompute at store time, matching the pre-cache per-layer behavior, for
         paths that never ran the decode-stream init (eager prefill/extend, idle,
         or a batch re-padded after init -> shape mismatch).
+
+        Cached swa_loc is computed once from committed positions, so every draft-decode
+        step would reuse the same ring slot and break the chain. Recompute from the live
+        per-step positions; only the draft path is affected, the rest keeps the fast path.
         """
         positions = forward_batch.positions
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         unified = getattr(core, "unified", None) if core is not None else None
         cached = unified.swa_loc if unified is not None else None
+        is_multistep_draft_decode = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and self.speculative_num_steps > 1
+        )
         if (
             cached is not None
             and not forward_batch.forward_mode.is_idle()
             and cached.shape[0] == positions.shape[0]
+            and not is_multistep_draft_decode
         ):
-            return cached
-        ring = self.token_to_kv_pool.unified_swa_ring_size
-        req_slot = forward_batch.req_pool_indices.to(torch.int64)
-        if req_slot.shape[0] != positions.shape[0]:
-            req_slot = req_slot.repeat_interleave(
-                positions.shape[0] // req_slot.shape[0]
+            result = cached
+        else:
+            ring = self.token_to_kv_pool.unified_swa_ring_size
+            req_slot = forward_batch.req_pool_indices.to(torch.int64)
+            if req_slot.shape[0] != positions.shape[0]:
+                req_slot = req_slot.repeat_interleave(
+                    positions.shape[0] // req_slot.shape[0]
+                )
+            result = (req_slot * ring + positions.to(torch.int64) % ring).to(
+                torch.int32
             )
-        return (req_slot * ring + positions.to(torch.int64) % ring).to(torch.int32)
+        return result
 
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
@@ -1461,13 +1472,11 @@ class DeepseekV4HipRadixBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import os
-
             from sglang.srt.layers.attention.hip_flash_mla import (
                 flash_mla_with_kvcache_entrypoint,
             )
 
-            backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "kernel")
+            backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
             input_dict = dict(
                 q=q,
                 k_cache=swa_k_cache,
