@@ -401,24 +401,24 @@ class _DeepEPDispatcherImplBase:
     def set_deepep_dispatcher_dtype(self) -> None:
         # 1. Resolve the initial desired output dtype
         self.deepep_output_dtype = get_deepep_output_dtype(self)
-    
+
         # 2. Validate and adjust dtype according to hardware capabilities
         self._validate_and_adjust_dtype()
-    
+
         # 3. Always set use_fp8 / use_nvfp4 / fp8_configs
         self._apply_low_latency_quantization_flags()
-    
+
         # 4. NPU quant tensor for normal dispatch (only on Ascend)
         if _is_npu and (self.deepep_mode.enable_normal()):
             self.npu_quant_tensor = self._get_npu_normal_quant_tensor()
         else:
             self.npu_quant_tensor = None
-    
+
     def _apply_low_latency_quantization_flags(self) -> None:
         """Set use_fp8, use_nvfp4, and fp8_configs from the resolved output dtype."""
         dtype = self.deepep_output_dtype
         self.fp8_configs = dict()
-    
+
         if dtype == DeepEPOutputDtype.BF16:
             self.use_fp8 = False
             self.use_nvfp4 = False
@@ -469,7 +469,7 @@ class _DeepEPDispatcherImplBase:
         elif dtype == DeepEPOutputDtype.MXFP8_e4m3fn:
             return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
         elif dtype == DeepEPOutputDtype.MXFP8_e5m2:
-             return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
+            return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
         elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
             return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
         else:
@@ -741,10 +741,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: Optional[torch.Tensor] = None,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
-    
+
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-    
+
         # Build dispatch kwargs common to GPU and NPU
         dispatch_kwargs = dict(
             use_fp8=self.use_fp8,
@@ -756,11 +756,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             dispatch_kwargs["use_nvfp4"] = True
         if input_global_scale is not None:
             dispatch_kwargs["x_global_scale"] = input_global_scale
-    
+
         # NPU requires topk_weights during dispatch
         if _is_npu and topk_weights is not None:
             dispatch_kwargs["topk_weights"] = topk_weights
-    
+
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,

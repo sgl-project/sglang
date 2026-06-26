@@ -1699,7 +1699,16 @@ class ServerArgs:
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
     ] = "auto"
     deepep_dispatcher_output_dtype: A[
-        Literal["auto", "bf16", "int8", "fp8", "mxfp8_e4m3fn", "mxfp8_e5m2", "mxfp4_e2m1fn_x2", "nvfp4"],
+        Literal[
+            "auto",
+            "bf16",
+            "int8",
+            "fp8",
+            "mxfp8_e4m3fn",
+            "mxfp8_e5m2",
+            "mxfp4_e2m1fn_x2",
+            "nvfp4",
+        ],
         "Select DeepEP dispatcher output dtype",
     ] = "auto"
     ep_num_redundant_experts: A[

@@ -16,7 +16,6 @@
 
 import logging
 import os
-from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -172,9 +171,7 @@ class DeepseekModelNextN(nn.Module):
             buffer_size=2,
             dtype=torch.float32,
             device=(
-                input_embeds.device
-                if input_embeds is not None
-                else input_ids.device
+                input_embeds.device if input_embeds is not None else input_ids.device
             ),
         )
 
