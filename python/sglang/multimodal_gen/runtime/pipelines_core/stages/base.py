@@ -275,6 +275,7 @@ class PipelineStage(StageDedupMixin, ABC):
     def cfg_parallel_local_batch_fields(
         self, batch: Req, server_args: ServerArgs
     ) -> tuple[str, ...]:
+        """the name of fields which already have a local version on each GPU in CFG-Parallel, no need to broadcast"""
         return ()
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

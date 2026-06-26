@@ -72,6 +72,7 @@ class ParallelExecutor(PipelineExecutor):
                     local_batch_fields = stage.cfg_parallel_local_batch_fields(
                         batch, server_args
                     )
+                    # filter local batch fields from batch
                     if rank == 0 and local_batch_fields:
                         local_field_values = {
                             name: getattr(batch, name) for name in local_batch_fields
@@ -80,6 +81,7 @@ class ParallelExecutor(PipelineExecutor):
                             setattr(batch, name, None)
                     else:
                         local_field_values = {}
+
                     obj_list = [batch] if rank == 0 else []
                     try:
                         # `dist.broadcast(src=...)` expects a global rank for process groups.
@@ -91,6 +93,7 @@ class ParallelExecutor(PipelineExecutor):
                         )
                     finally:
                         if rank == 0:
+                            # resume local batch fields on rank 0
                             for name, value in local_field_values.items():
                                 setattr(batch, name, value)
                     if rank != 0:
