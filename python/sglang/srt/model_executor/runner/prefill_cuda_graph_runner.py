@@ -70,10 +70,10 @@ from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
-    BREAKABLE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+    BCG_FAILURE_HINT,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+    TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.runner_utils.buffers import (
@@ -97,14 +97,16 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 def _prefill_failure_msg(backend_name: str) -> str:
-    """Pick the right user-facing hint for a prefill CUDA-graph failure based
-    on which backend was active. Falls back to the generic prefill message
-    for unknown/disabled backends."""
+    """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
+    suggestion plugged into its {} placeholder. Empty hint when no backend
+    is selected so the rest of the template still renders cleanly."""
     if backend_name == Backend.BREAKABLE:
-        return BREAKABLE_CUDA_GRAPH_CAPTURE_FAILED_MSG
-    if backend_name == Backend.TC_PIECEWISE:
-        return TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG
-    return PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG
+        hint = BCG_FAILURE_HINT
+    elif backend_name == Backend.TC_PIECEWISE:
+        hint = TCPCG_FAILURE_HINT
+    else:
+        hint = ""
+    return PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(hint)
 
 
 # Names of the static prefill input tensors a Breakable-backed prefill

@@ -97,13 +97,10 @@ def set_tc_piecewise_forward_context(
         _tc_piecewise_forward_context = None
 
 
-TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
-    "TcPiecewise CUDA graph failed.\n"
-    "Possible solutions:\n"
-    "1. switch to the breakable prefill CUDA graph backend by "
+# Backend-specific suggestion plugged into PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG
+# when the failing prefill backend is TcPiecewise. Kept as a small piece of text
+# so the overall message template lives in runner_backend_utils/__init__.py.
+TCPCG_FAILURE_HINT = (
+    "- switch to the breakable prefill CUDA graph backend by "
     "--cuda-graph-backend-prefill=breakable\n"
-    "2. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled.\n"
-    "3. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-    "4. set --cuda-graph-max-bs-prefill to a smaller value (e.g., 2048)\n"
-    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
 )
