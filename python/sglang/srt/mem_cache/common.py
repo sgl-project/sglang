@@ -1,44 +1,22 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state_on_swa,
-    maybe_write_dsv4_decode,
-    maybe_write_dsv4_extend,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.mem_cache.triton_ops.common import (
-    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.common import (
-    get_last_loc_kernel as get_last_loc_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.common import (
-    get_last_loc_triton,
-    get_last_loc_triton_safe,
-    write_req_to_token_pool_triton,
-)
-from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
-
-_is_npu = is_npu()
-
-_is_hip = is_hip()
-
-_is_cuda = is_cuda()
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
@@ -120,6 +98,138 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
+
+
+def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+    if tree_cache is None:
+        return
+
+    if tree_cache.is_chunk_cache():
+        return
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
+        # Hybrid allocator
+        full_available_size = allocator.full_available_size()
+        swa_available_size = allocator.swa_available_size()
+
+        if full_available_size < num_tokens or swa_available_size < num_tokens:
+            full_num_tokens = max(0, num_tokens - full_available_size)
+            swa_num_tokens = max(0, num_tokens - swa_available_size)
+            tree_cache.evict(
+                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+            )
+    else:
+        # Standard allocator
+        if allocator.available_size() < num_tokens:
+            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+
+
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    # the two resources currently have the same lifecycle, thus simplify logic below
+    assert (req.req_pool_idx is None) == (req.kv is None)
+    # MambaRadixCache may alloc mamba state before alloc KV cache
+    if req.req_pool_idx is None:
+        assert (
+            tree_cache.supports_mamba()
+        ), "Only MambaRadixCache allow freeing before alloc"
+        # TODO (csy, hanming): clean up this early allocation logic
+        if req.mamba_pool_idx is not None:
+            tree_cache.req_to_token_pool.mamba_allocator.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+        return
+
+    effective_kv_committed_len = req.effective_kv_committed_len()
+    tree_cache.cache_finished_req(
+        req,
+        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+        kv_len_to_handle=effective_kv_committed_len,
+    )
+
+    # StreamingSession.cache_finished_req handles speculative tail trim
+    # internally, then sets req_pool_idx = None.
+    assert (req.req_pool_idx is None) == (req.kv is None)
+    if req.req_pool_idx is None and req.kv is None:
+        return
+
+    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+
+    global_server_args = get_global_server_args()
+    page_size = global_server_args.page_size
+    spec_algo = global_server_args.speculative_algorithm
+
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path below (#22373).
+    if spec_algo is None and not global_server_args.strip_thinking_cache:
+        assert (
+            start_p == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+
+    if page_size > 1:
+        start_p = ceil_align(start_p, page_size)
+
+    if start_p < end_p:
+        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+            start_p:end_p
+        ]
+        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+    # If the prefix cache doesn't manage mamba states, we must free them here.
+    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
+        not tree_cache.supports_mamba()
+    ):
+        assert (
+            req.mamba_pool_idx is not None
+        ), "mamba state is freed while the tree cache does not manage mamba states"
+        tree_cache.req_to_token_pool.free_mamba_cache(req)
+    # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
+    # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
+    tree_cache.req_to_token_pool.free(req)
+    req.kv = None
+
+
+def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.available_and_evictable_str()
+
+
+import logging
+from typing import TYPE_CHECKING, Optional
+
+import torch
+
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_write_dsv4_decode,
+    maybe_write_dsv4_extend,
+)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.common import (
+    MAMBA_STATE_PER_REQ_NO_CACHE,
+    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+    available_and_evictable_str,
+    evict_from_tree_cache,
+)
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.triton_ops.common import (
+    get_last_loc_triton,
+    get_last_loc_triton_safe,
+    write_req_to_token_pool_triton,
+)
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
+from sglang.srt.utils.common import is_pin_memory_available
+
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_cuda = is_cuda()
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.model_executor.forward_batch_info import DSV4StateLens
+
+logger = logging.getLogger(__name__)
 
 
 def write_cache_indices(
@@ -213,65 +323,6 @@ def get_last_loc_torch(
     )
 
 
-def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
-    if server_args is None:
-        server_args = get_global_server_args()
-
-    if server_args.speculative_algorithm is None:
-        return 1
-
-    # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per
-    # decode step (draft chain and verify block share the reservation).
-
-    spec_steps = server_args.speculative_num_steps or 1
-    spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.max_speculative_num_draft_tokens
-    page_size = server_args.page_size
-
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-    spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
-        return max(spec_steps * spec_topk, spec_tokens)
-    else:
-        # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree
-        # footprint. Per topk branch needs ceil((last_page_len + num_steps) / page)
-        # pages; the partial tail page can be up to page_size - 1, and each branch
-        # gets its own (duplicated) copy -- so reserve for all topk branches.
-        num_new_pages_per_topk = (
-            (page_size - 1) + spec_steps + page_size - 1
-        ) // page_size
-        return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
-
-
-def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
-    """KV length reserved per request at each decode step.
-
-    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
-    """
-    return 2 * get_alloc_len_per_decode(server_args)
-
-
-def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
-    """req_to_token row headroom beyond the model context length.
-
-    Sized to hold the decode over-allocation (kv_committed_len +
-    get_alloc_reserve_per_decode). The spec v2 page>1 topk>1 holey draft footprint
-    can outgrow the default num_draft_tokens headroom (PR #26972).
-    """
-    # FIXME(lsyin): this is the temporary fix for the context length issue when
-    # using speculative decoding
-    extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
-    if (
-        server_args.speculative_algorithm is not None
-        and server_args.page_size > 1
-        and (server_args.speculative_eagle_topk or 1) > 1
-    ):
-        extra = max(extra, get_alloc_reserve_per_decode(server_args))
-    return extra
-
-
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
@@ -298,32 +349,6 @@ def alloc_token_slots(
         raise RuntimeError(error_msg)
 
     return (out_cache_loc, state) if backup_state else out_cache_loc
-
-
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
-    if tree_cache is None:
-        return
-
-    if tree_cache.is_chunk_cache():
-        return
-
-    allocator = tree_cache.token_to_kv_pool_allocator
-
-    if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
-
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
-    else:
-        # Standard allocator
-        if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
@@ -645,69 +670,65 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    # the two resources currently have the same lifecycle, thus simplify logic below
-    assert (req.req_pool_idx is None) == (req.kv is None)
-    # MambaRadixCache may alloc mamba state before alloc KV cache
-    if req.req_pool_idx is None:
-        assert (
-            tree_cache.supports_mamba()
-        ), "Only MambaRadixCache allow freeing before alloc"
-        # TODO (csy, hanming): clean up this early allocation logic
-        if req.mamba_pool_idx is not None:
-            tree_cache.req_to_token_pool.mamba_allocator.free(
-                req.mamba_pool_idx.unsqueeze(-1)
-            )
-            req.mamba_pool_idx = None
-        return
+from typing import Optional
 
-    effective_kv_committed_len = req.effective_kv_committed_len()
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        kv_len_to_handle=effective_kv_committed_len,
-    )
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 
-    # StreamingSession.cache_finished_req handles speculative tail trim
-    # internally, then sets req_pool_idx = None.
-    assert (req.req_pool_idx is None) == (req.kv is None)
-    if req.req_pool_idx is None and req.kv is None:
-        return
 
-    start_p, end_p = effective_kv_committed_len, req.kv.kv_allocated_len
+def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    if server_args is None:
+        server_args = get_global_server_args()
 
-    global_server_args = get_global_server_args()
-    page_size = global_server_args.page_size
-    spec_algo = global_server_args.speculative_algorithm
+    if server_args.speculative_algorithm is None:
+        return 1
 
-    # strip_thinking_cache intentionally reports output tokens as overallocated
-    # so they fall into the free path below (#22373).
-    if spec_algo is None and not global_server_args.strip_thinking_cache:
-        assert (
-            start_p == end_p
-        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+    # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per
+    # decode step (draft chain and verify block share the reservation).
 
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
+    spec_steps = server_args.speculative_num_steps or 1
+    spec_topk = server_args.speculative_eagle_topk or 1
+    spec_tokens = server_args.max_speculative_num_draft_tokens
+    page_size = server_args.page_size
 
-    if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
-    # If the prefix cache doesn't manage mamba states, we must free them here.
-    if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
-        not tree_cache.supports_mamba()
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
+        return max(spec_steps * spec_topk, spec_tokens)
+    else:
+        # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree
+        # footprint. Per topk branch needs ceil((last_page_len + num_steps) / page)
+        # pages; the partial tail page can be up to page_size - 1, and each branch
+        # gets its own (duplicated) copy -- so reserve for all topk branches.
+        num_new_pages_per_topk = (
+            (page_size - 1) + spec_steps + page_size - 1
+        ) // page_size
+        return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
+
+
+def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    """KV length reserved per request at each decode step.
+
+    The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
+    mode; see eagle_utils.eagle_prepare_for_decode.
+    """
+    return 2 * get_alloc_len_per_decode(server_args)
+
+
+def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
+    """req_to_token row headroom beyond the model context length.
+
+    Sized to hold the decode over-allocation (kv_committed_len +
+    get_alloc_reserve_per_decode). The spec v2 page>1 topk>1 holey draft footprint
+    can outgrow the default num_draft_tokens headroom (PR #26972).
+    """
+    # FIXME(lsyin): this is the temporary fix for the context length issue when
+    # using speculative decoding
+    extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
+    if (
+        server_args.speculative_algorithm is not None
+        and server_args.page_size > 1
+        and (server_args.speculative_eagle_topk or 1) > 1
     ):
-        assert (
-            req.mamba_pool_idx is not None
-        ), "mamba state is freed while the tree cache does not manage mamba states"
-        tree_cache.req_to_token_pool.free_mamba_cache(req)
-    # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
-    # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
-    tree_cache.req_to_token_pool.free(req)
-    req.kv = None
-
-
-def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
-    return tree_cache.available_and_evictable_str()
+        extra = max(extra, get_alloc_reserve_per_decode(server_args))
+    return extra
