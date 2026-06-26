@@ -1976,10 +1976,27 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         )
 
         denom = E2M1_MAX * MAX_BLOCK_SCALE_FP8
+        # Calibration headroom. A global scale of amax/denom maps this warmup's amax
+        # to the very TOP of the NVFP4 representable range, i.e. ZERO headroom: any
+        # serving-time |k|/|v| larger than the single eager warmup prefill's amax
+        # saturates the fp4 + fp8-block range and is clipped. The warmup is short and
+        # not guaranteed representative of real traffic, so a tight (headroom=1) fit
+        # clips the heavier tails of real data, and the clipped KV reads compound into
+        # runaway repetition the deeper a sequence is decoded. Quantization-calibration
+        # practice is to leave headroom above the observed max; here the risk is
+        # strongly asymmetric (under-scaling -> catastrophic degeneration, over-scaling
+        # -> only minor precision loss), so we map amax into a FRACTION of the range.
+        # Default 2.0 = amax sits at half the representable range. Measured on
+        # Gemma-4-12B (GB10 / GSM8K 5-shot): headroom 1.0 -> 6-10% garbled, acc 0.33;
+        # 2.0 -> ~2% garbled, acc matches the bf16-KV baseline; >=4.0 starts to lose
+        # precision again. A checkpoint that ships k_scale/v_scale overrides this path.
+        headroom = float(os.environ.get("SGLANG_FP4_KV_AUTOCALIB_HEADROOM", "2.0"))
+        if headroom <= 0:
+            headroom = 1.0
         k_amax = cache_k.detach().abs().amax().float()
         v_amax = cache_v.detach().abs().amax().float()
-        k_gs = (k_amax / denom).clamp_(min=1e-8)
-        v_gs = (v_amax / denom).clamp_(min=1e-8)
+        k_gs = (k_amax * headroom / denom).clamp_(min=1e-8)
+        v_gs = (v_amax * headroom / denom).clamp_(min=1e-8)
         self.k_global[local_layer_id].copy_(k_gs)
         self.v_global[local_layer_id].copy_(v_gs)
         self.k_global_float[local_layer_id] = float(k_gs)
@@ -1988,12 +2005,13 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         if not explicit_autocalib:
             logger.info(
                 "NVFP4 KV auto-calibrated layer %d: k_amax=%.4g v_amax=%.4g "
-                "k_gs=%.4g v_gs=%.4g (n_tokens=%d)",
+                "k_gs=%.4g v_gs=%.4g headroom=%.3g (n_tokens=%d)",
                 layer_id,
                 float(k_amax),
                 float(v_amax),
                 self.k_global_float[local_layer_id],
                 self.v_global_float[local_layer_id],
+                headroom,
                 cache_k.shape[0],
             )
 
