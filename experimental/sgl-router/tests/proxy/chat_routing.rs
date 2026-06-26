@@ -465,6 +465,57 @@ async fn non_streaming_upstream_500_preserved() {
     assert_eq!(got, upstream_body);
 }
 
+/// A response the router FORWARDS from a worker with a non-2xx status is an
+/// `Ok(Response)` at the router layer (only transport failures become `Err`).
+/// The per-worker `sgl_router_requests_total` outcome must be derived from the
+/// client-visible HTTP status, not from `Result::Ok`/`Err` — so a forwarded 5xx
+/// is counted `outcome="error"`, NOT credited as a success.
+#[tokio::test]
+async fn forwarded_5xx_records_outcome_error_not_success() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": {"type": "server_error", "message": "boom"}}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let m = ctx.metrics.render();
+    let error_line = format!(
+        r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="error"}} 1"#,
+        worker.url,
+    );
+    assert!(
+        m.contains(&error_line),
+        "a forwarded 5xx must be counted as outcome=\"error\"; got:\n{m}",
+    );
+    let success_line = format!(
+        r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}}"#,
+        worker.url,
+    );
+    assert!(
+        !m.contains(&success_line),
+        "a forwarded 5xx must NOT be credited as a success; got:\n{m}",
+    );
+}
+
 #[tokio::test]
 async fn non_streaming_upstream_4xx_body_passthrough() {
     // Regression: the worker's response bytes must reach the client

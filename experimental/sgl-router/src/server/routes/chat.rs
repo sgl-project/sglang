@@ -562,30 +562,6 @@ async fn chat_completions_inner(
         }
     };
 
-    // Record the dispatch outcome AFTER we know whether the upstream
-    // accepted the request. A 504 from the stale-request branch counts as
-    // `cancelled` — semantically distinct from upstream errors that bubble
-    // through as `error`. The metric is per-worker so convergence tests
-    // can scrape `/metrics` and assert that ≥N requests landed on a
-    // single prefill worker.
-    let outcome = match &result {
-        Ok(_) => RequestOutcome::Success,
-        Err(ApiError::StaleRequestExpired { .. }) => {
-            // The janitor fired the stale-cancel and we observed it
-            // user-side; record both the per-request `cancelled` outcome
-            // AND the global `expired` count. The two views are useful for
-            // different alerts: per-worker request_total{cancelled} flags a
-            // worker that's hanging, while stale_requests_total{expired}
-            // tracks the global health of the janitor.
-            ctx.metrics
-                .record_stale_request(StaleRequestOutcome::Expired);
-            RequestOutcome::Cancelled
-        }
-        Err(_) => RequestOutcome::Error,
-    };
-    ctx.metrics
-        .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
-
     // Per-request access log — always on at INFO so incoming traffic and its
     // status are visible without DEBUG. `request_id` is the client/gateway
     // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
@@ -599,6 +575,34 @@ async fn chat_completions_inner(
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.status_code().as_u16(),
     };
+
+    // Record the dispatch outcome AFTER we know the client-visible status.
+    // Derive `outcome` from the final HTTP status, NOT from `Result::Ok`/`Err`:
+    // a response the router FORWARDS from a worker with a 4xx/5xx status is an
+    // `Ok(Response)` here (only transport failures bubble up as `Err`), so
+    // keying off `Ok` would mislabel a forwarded engine error as a success.
+    //   * 2xx        → success
+    //   * 504        → cancelled (the stale-request branch; see below)
+    //   * everything → error (incl. forwarded 4xx/5xx and proxy-side 5xx)
+    // The metric is per-worker so convergence tests can scrape `/metrics` and
+    // assert that ≥N requests landed on a single prefill worker.
+    if matches!(&result, Err(ApiError::StaleRequestExpired { .. })) {
+        // The janitor fired the stale-cancel and we observed it user-side
+        // (surfaced as a 504). Record the global `expired` count in addition
+        // to the per-request `cancelled` outcome below. The two views are
+        // useful for different alerts: per-worker request_total{cancelled}
+        // flags a worker that's hanging, while stale_requests_total{expired}
+        // tracks the global health of the janitor.
+        ctx.metrics
+            .record_stale_request(StaleRequestOutcome::Expired);
+    }
+    let outcome = match http_status {
+        200..=299 => RequestOutcome::Success,
+        504 => RequestOutcome::Cancelled,
+        _ => RequestOutcome::Error,
+    };
+    ctx.metrics
+        .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
     // Record end-to-end latency now that the outcome is known. For non-streaming
     // requests the body is already buffered here, so `start.elapsed()` is true
