@@ -410,7 +410,11 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
 
                 # get batch to run and proxy tensors if needed
-                batch = self.get_next_disagg_decode_batch_to_run()
+                plan = self.get_next_disagg_decode_batch_to_run(
+                    running_batch=self.running_batch
+                )
+                self.running_batch = plan.running_batch
+                batch = plan.batch_to_run
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
