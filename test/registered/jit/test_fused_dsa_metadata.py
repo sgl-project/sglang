@@ -629,65 +629,14 @@ def test_refresh_paged_mqa_schedule_metadata_copies_without_deepgemm_out(monkeyp
     assert torch.equal(schedule, new_schedule)
 
 
-def test_prepare_paged_mqa_ctx_lens_target_verify_fills_existing(monkeypatch):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    device = "cuda"
-    bs = 3
-    next_n = 4
-    cache_seqlens = torch.tensor([11, 23, 37], dtype=torch.int32, device=device)
-    ctx_lens = torch.full((bs, next_n), -1, dtype=torch.int32, device=device)
-    metadata = DSAMetadata(
-        page_size=1,
-        cache_seqlens_int32=cache_seqlens,
-        max_seq_len_q=1,
-        max_seq_len_k=64,
-        cu_seqlens_q=torch.empty(bs + 1, dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
-        page_table_1=torch.empty((bs * next_n, 64), dtype=torch.int32, device=device),
-        real_page_table=torch.empty(
-            (bs * next_n, 64), dtype=torch.int32, device=device
-        ),
-        dsa_cache_seqlens_int32=torch.empty(
-            bs * next_n, dtype=torch.int32, device=device
-        ),
-        dsa_cu_seqlens_q=torch.empty(bs * next_n + 1, dtype=torch.int32, device=device),
-        dsa_cu_seqlens_k=torch.empty(bs * next_n + 1, dtype=torch.int32, device=device),
-        dsa_extend_seq_lens_list=[],
-        dsa_seqlens_expanded=torch.empty(bs * next_n, dtype=torch.int32, device=device),
-        paged_mqa_ctx_lens_2d=ctx_lens,
-    )
-    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
-    backend.speculative_num_draft_tokens = next_n
-    monkeypatch.setattr(dsa_backend_module, "is_sm100_supported", lambda: True)
-
-    returned = DeepseekSparseAttnBackend._prepare_paged_mqa_ctx_lens_2d(
-        backend,
-        metadata,
-        ForwardMode.TARGET_VERIFY,
-        cache_seqlens,
-        metadata.dsa_seqlens_expanded,
-        bs,
-    )
-    torch.cuda.synchronize()
-
-    expected = cache_seqlens.view(bs, 1).expand(bs, next_n).contiguous()
-    assert returned is ctx_lens
-    assert metadata.paged_mqa_ctx_lens_2d is ctx_lens
-    assert torch.equal(ctx_lens, expected)
-
-
 def test_fused_metadata_runtime_lengths_do_not_recompile():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
     from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
-        _fill_paged_mqa_ctx_lens_target_verify_kernel,
         _fused_dsa_decode_metadata_kernel,
         _fused_dsa_draft_extend_metadata_kernel,
         _fused_dsa_target_verify_metadata_kernel,
-        fill_paged_mqa_ctx_lens_target_verify,
         fused_dsa_decode_metadata,
         fused_dsa_draft_extend_metadata,
         fused_dsa_target_verify_metadata,
@@ -783,20 +732,9 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
             max_total_len=max_total_len,
         )
 
-    def fill_ctx_call(fill_bs):
-        fill_paged_mqa_ctx_lens_target_verify(
-            cache_seqlens=torch.arange(fill_bs, dtype=torch.int32, device=device),
-            ctx_lens_2d=torch.empty(
-                (fill_bs, next_n), dtype=torch.int32, device=device
-            ),
-            bs=fill_bs,
-            next_n=next_n,
-        )
-
     decode_call(101)
     target_call(101)
     draft_call(extend_seq_lens, total_len, 101)
-    fill_ctx_call(5)
     torch.cuda.synchronize()
 
     decode_cache_size = _compiled_kernel_cache_size(_fused_dsa_decode_metadata_kernel)
@@ -806,9 +744,6 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
     draft_cache_size = _compiled_kernel_cache_size(
         _fused_dsa_draft_extend_metadata_kernel
     )
-    fill_ctx_cache_size = _compiled_kernel_cache_size(
-        _fill_paged_mqa_ctx_lens_target_verify_kernel
-    )
 
     for max_len in [102, 127, 128, 129, 257]:
         decode_call(max_len)
@@ -817,8 +752,6 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
         draft_call(extend_seq_lens, total_len, max_seqlen_k)
     draft_call(extend_seq_lens_short, bs, 257)
     draft_call(extend_seq_lens_full, max_total_len, 257)
-    for fill_bs in [1, 2, 3, 4, 5, 8, 16]:
-        fill_ctx_call(fill_bs)
     torch.cuda.synchronize()
 
     assert (
@@ -832,8 +765,4 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
     assert (
         _compiled_kernel_cache_size(_fused_dsa_draft_extend_metadata_kernel)
         == draft_cache_size
-    )
-    assert (
-        _compiled_kernel_cache_size(_fill_paged_mqa_ctx_lens_target_verify_kernel)
-        == fill_ctx_cache_size
     )
