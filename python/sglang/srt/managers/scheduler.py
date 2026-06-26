@@ -3928,12 +3928,13 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
-        if self.cur_batch is self.running_batch or self.cur_batch is None:
-            reqs = self.running_batch.reqs
+        if self.ps.pp_size == 1:
+            inflight_batches = [self.running_batch, self.cur_batch]
         else:
-            reqs = self.running_batch.reqs + self.cur_batch.reqs
+            inflight_batches = [*self.running_mbs, *self.mbs]
 
-        for req in reqs:
+        inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
+        for req in inflight_reqs:
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
