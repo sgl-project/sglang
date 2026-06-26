@@ -59,7 +59,10 @@ class SchedulerKvEventsPublisher:
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         self.enable_kv_cache_events = bool(
-            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
+            kv_events_config
+            and self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
         )
 
         if self.enable_kv_cache_events:

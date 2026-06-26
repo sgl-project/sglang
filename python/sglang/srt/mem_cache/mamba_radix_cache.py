@@ -530,11 +530,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ]
 
         if is_insert:
-            cache_len = (
-                req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
-                else len(token_ids)
-            )
+            if self.enable_mamba_extra_buffer:
+                cache_len = req.mamba_last_track_seqlen
+            else:
+                cache_len = len(token_ids)
+                # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by
+                # the slot's unflushed ring depth (`write_pos`), so cap the
+                # donate to the last flush boundary (where temporal is current)
+                # and reset the cursor, keeping the donated checkpoint consistent
+                # with its key length. page_size is asserted == 1, so no realign.
+                write_pos_buf = self.req_to_token_pool.mamba_pool.replayssm_write_pos
+                if write_pos_buf is not None:
+                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
+                    write_pos_buf[req.mamba_pool_idx] = 0
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
@@ -627,7 +635,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : req.fill_len
+                req.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
