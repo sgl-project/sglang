@@ -121,18 +121,9 @@ _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-# Fuse the GatedDeltaNet output gated-RMSNorm + FP8 per-token activation quant into a
-# single AITER kernel feeding out_proj's a8w8 GEMM. Auto-enabled on AITER/HIP; the real
-# gate is the per-layer capability check in _can_fuse_oproj (FP8 per-token a8w8
-# out_proj, head_dim/heads/gate constraints), so it only engages for AttnFP8-style
-# checkpoints and is a no-op everywhere else. Set SGLANG_DISABLE_GDN_OUT_PROJ_FUSION=1
-# to force it off.
 _fuse_gdn_oproj = _use_aiter and not get_bool_env_var(
     "SGLANG_DISABLE_GDN_OUT_PROJ_FUSION", "False"
 )
-# TODO(temporary): one-shot guard for the A/B verification log in
-# _fused_norm_quant_out_proj; remove once fusion parity is confirmed.
-_logged_oproj_fusion_active = False
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
@@ -500,23 +491,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def _can_fuse_oproj(self) -> bool:
         """Whether the gated-RMSNorm + FP8 per-token quant -> out_proj fusion applies.
 
-        Only valid for AttnFP8 checkpoints where out_proj is an a8w8 (per-token act
-        x per-channel weight) FP8 GEMM, with the kernel's shape constraints met and a
-        SiLU output gate. Computed once on first access (from forward(), so weights are
-        loaded by then and out_proj.weight_scale is populated) and cached on the
-        instance __dict__ thereafter.
+        Only valid for AttnFP8 checkpoints whose out_proj is a per-token-act x
+        per-channel-weight a8w8 FP8 GEMM with a SiLU gate and the kernel's shape
+        constraints. Cached on first access from forward() (weights loaded by then).
 
-        The fused path feeds out_proj.weight straight into gemm_a8w8_bpreshuffle, which
-        requires the weight to be pre-shuffled (and, for e4m3fnuz, fn->fnuz normalized)
-        and the GEMM to run the per-token-act x per-channel-weight a8w8 branch. The flag
-        that signals this preparation lives on different objects depending on the quant
-        backend serving out_proj:
-          - Fp8LinearMethod: quant_method.use_per_token_if_dynamic (set when
-            SGLANG_USE_AITER_FP8_PER_TOKEN prepared the weight).
-          - Quark QuarkW8A8Fp8: layer.scheme.per_token (the scheme always pre-shuffles
-            the weight under AITER, so per_token alone implies a valid bpreshuffle layout).
-        Fusing without that preparation would feed a plain-layout weight into the
-        pre-shuffled GEMM and corrupt the output, so we require it here."""
+        The fused path feeds out_proj.weight straight into gemm_a8w8_bpreshuffle,
+        which needs a pre-shuffled weight; we require the per-token-a8w8 prep flag
+        (Fp8LinearMethod.use_per_token_if_dynamic or Quark scheme.per_token, which
+        always pre-shuffles under AITER), else the GEMM would corrupt the output."""
         ok = False
         if _fuse_gdn_oproj:
             weight = getattr(self.out_proj, "weight", None)
@@ -545,24 +527,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z: torch.Tensor,
         z_shape_og: torch.Size,
     ) -> torch.Tensor:
-        """Fused gated RMSNorm + FP8 per-token quant, then the out_proj a8w8 GEMM.
-
-        Replaces ``self.norm(core_attn_out, z)`` + out_proj's internal per-token
-        activation quant with a single AITER kernel producing the FP8 activation and
-        its per-token scale, which are fed straight into the same GEMM helper the
-        non-fused path uses (identical weight layout / scales)."""
+        """Fused gated RMSNorm + FP8 per-token quant, then the out_proj a8w8 GEMM."""
         from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
             gated_rmsnorm_fp8_per_token_quant,
         )
 
         from sglang.srt.layers.quantization.fp8_utils import apply_fp8_linear
-
-        # TODO(temporary): A/B verification log; confirms the fused path actually
-        # engaged (a misconfigured run silently falls back via _can_fuse_oproj).
-        global _logged_oproj_fusion_active
-        if not _logged_oproj_fusion_active:
-            logger.info("GDN out_proj fusion ACTIVE")
-            _logged_oproj_fusion_active = True
 
         num_tokens, num_heads, head_dim = z_shape_og
         x3 = core_attn_out.reshape(z_shape_og)

@@ -1547,10 +1547,10 @@ def apply_fp8_linear(
     # below exactly (same weight.T layout and weight_scale), so results match.
     if _use_aiter and isinstance(input, tuple):
         qinput, x_scale = input
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
         qinput = qinput.view(-1, qinput.shape[-1])
         if x_scale.dim() == 1:
             x_scale = x_scale.view(-1, 1)
-        output_shape = [*qinput.shape[:-1], weight.shape[1]]
         if not use_per_token_if_dynamic:
             raise NotImplementedError(
                 "Pre-quantized fp8 input is only supported on the AITER "
