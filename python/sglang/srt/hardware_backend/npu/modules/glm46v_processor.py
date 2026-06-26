@@ -8,8 +8,6 @@ This patch restructures the computation to stay within 8 dimensions, following
 the same pattern as the Qwen VL NPU patch.
 """
 
-from typing import Optional
-
 import torch
 import torchvision.transforms.v2.functional as tvF
 from transformers.image_processing_utils import BatchFeature
