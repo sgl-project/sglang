@@ -52,6 +52,10 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+  **NVFP4 (B300 / GB300)** deploys on the dev image **`lmsysorg/sglang:dev-glm52-nvfp4`** — the command panel's **Docker** toggle selects it automatically. The FP8 / BF16 recipes use the release **`lmsysorg/sglang:latest`** (the `docker pull` in Install above).
+</Note>
+
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
