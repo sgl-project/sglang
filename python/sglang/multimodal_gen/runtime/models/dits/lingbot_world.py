@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_tp_rank,
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
@@ -281,10 +282,23 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
+        if (
+            not sequence_shard_enabled
+            and not update_cache_only
+            and kv_cache.can_direct_current_attention(roped_key.shape[1])
+        ):
+            return self.attn(roped_query, roped_key, v)
+
+        cache_head_start = (
+            get_tp_rank() * roped_key.shape[2]
+            if sequence_shard_enabled
+            else self.head_start
+        )
         cache_view = kv_cache.update_and_get_attention_kv(
             key=roped_key,
             value=v,
             current_chunk_start=current_start,
+            cache_head_start=cache_head_start,
             debug_name="LingBot KV cache",
         )
         if update_cache_only:
@@ -862,15 +876,20 @@ class LingBotWorldTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
 
 class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
+    _use_megatron_tp = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        head_start = self.attn1.head_start
         self.attn1 = LingBotWorldCausalSelfAttention(
             dim=self.hidden_dim,
-            num_heads=self.num_attention_heads,
+            num_heads=self.local_num_heads,
             local_attn_size=self.local_attn_size,
             sink_size=self.attn1.sink_size,
             qk_norm=self.attn1.qk_norm,
             eps=self.attn1.eps,
+            head_dim=self.dim_head,
+            head_start=head_start,
         )
         self.cam_conditioner = LingBotWorldCamConditioner(self.hidden_dim)
         self._fused_qkv_weight = None
@@ -1042,11 +1061,15 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             .to(orig_dtype)
         )
         query, key, value = self._project_qkv(norm_hidden_states)
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        if self.tp_rmsnorm:
+            query = tensor_parallel_rms_norm(query, self.norm_q)
+            key = tensor_parallel_rms_norm(key, self.norm_k)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
 
         attn_output = self.attn1(
             query,

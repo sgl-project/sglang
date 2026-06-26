@@ -354,13 +354,13 @@ sgl-eval run aime25 \\
     },
 
     // ====================================================================
-    // B300 + FP8 (Blackwell Ultra, 8-GPU single node) — TP8.
-    // Inferred from the verified B200 (sm100) FP8 recipe; B300 is the same Blackwell
-    // family (sm103). Benchmarks pending → verified:false.
+    // B300 + FP8 (Blackwell Ultra, 8-GPU single node) — TP8. Verified on 8xB300 (v0.5.13.post1).
+    // Recipe mirrors the verified B200 (sm100) FP8 path. B300 (sm103) currently trails B200 per-GPU
+    // because deep_gemm/DSA are tuned for sm100; expected to improve as sm103 gets first-class kernels.
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -377,7 +377,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -399,7 +399,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -416,14 +416,14 @@ sgl-eval run aime25 \\
     },
 
     // ====================================================================
-    // B300 + BF16 (Blackwell Ultra, 8-GPU single node) — TP8.
+    // B300 + BF16 (Blackwell Ultra, 8-GPU single node) — TP8. Verified on 8xB300 (v0.5.13.post1).
     // The unquantized GLM-5.2 (~700B, ~1.51 TB) only fits single-node on 8xB300
-    // (~2.1 TB HBM); smaller GPUs need multi-node (e.g. 2x 8xH200). Recipes are
-    // proposed, single-node TP8; benchmarks pending → verified:false.
+    // (~2.1 TB HBM); smaller GPUs need multi-node (e.g. 2x 8xH200). balanced/HT run plain TP8
+    // (no DP-Attention/DeepEP), so they trail the FP8 recipe at high concurrency.
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -440,7 +440,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -459,7 +459,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

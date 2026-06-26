@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=1200, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=1000, stage="extra-b", runner_config="4-gpu-h100")
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
@@ -113,6 +113,9 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache L3 (file backend) + UnifiedRadixCache."""
 
+    l3_prefetch_page_size = 256
+    l3_prefetch_prompt_pages = 4
+
     @classmethod
     def setUpClass(cls):
         cls.model = DSV4_FLASH_MODEL
@@ -143,9 +146,9 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--hicache-storage-backend",
                 "file",
                 "--swa-full-tokens-ratio",
@@ -169,6 +172,8 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
     """DeepSeek V4 Flash EAGLE + HiCache L3 should load from storage."""
 
     page_size = 256
+    l3_prefetch_page_size = 256
+    l3_prefetch_prompt_pages = 4
     input_ids = list(range(4000, 4300))
     storage_wait_timeout = 120
     num_gsm8k_questions = 100
@@ -195,7 +200,7 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
                 "--chunked-prefill-size",
                 "8192",
                 "--mem-fraction-static",
-                "0.9",
+                "0.95",
                 "--disable-shared-experts-fusion",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
@@ -205,9 +210,9 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
                 "--hicache-storage-prefetch-policy",
                 "wait_complete",
                 "--hicache-io-backend",
-                "direct",
+                "kernel",
                 "--hicache-mem-layout",
-                "page_first_direct",
+                "page_first",
                 "--hicache-storage-backend",
                 "file",
                 "--enable-cache-report",
