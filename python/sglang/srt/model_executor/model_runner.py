@@ -1831,6 +1831,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and current_platform.support_cuda_graph()
             )
         ):
+            if getattr(self, "decode_cuda_graph_runner", None) is not None:
+                del self.decode_cuda_graph_runner
+                self.decode_cuda_graph_runner = None
+            if getattr(self, "prefill_cuda_graph_runner", None) is not None:
+                del self.prefill_cuda_graph_runner
+                self.prefill_cuda_graph_runner = None
+            gc.collect()
+            torch.cuda.empty_cache()
             self.init_decode_cuda_graph()
 
         logger.info("Update weights end.")
