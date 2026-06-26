@@ -14,6 +14,14 @@ class DeviceTimer:
     def add_reporter(self, reporter: Callable):
         self._reporters.append(reporter)
 
+    def remove_reporter(self, reporter: Callable) -> bool:
+        """Remove a previously added reporter. Returns True if it was present."""
+        try:
+            self._reporters.remove(reporter)
+            return True
+        except ValueError:
+            return False
+
     @contextmanager
     def wrap(self, metadata: Dict):
         self._intervals.append(_TimingInterval.create())
