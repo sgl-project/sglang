@@ -7,7 +7,10 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(
-    est_time=7200, suite="nightly-4-gpu-gb300", nightly=True, disabled="not needed"
+    est_time=7200,
+    suite="nightly-4-gpu-gb300-glm5-fp8",
+    nightly=True,
+    disabled="not needed",
 )
 
 MODEL_PATH = "zai-org/GLM-5.1-FP8"

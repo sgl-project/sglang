@@ -163,6 +163,7 @@ QUANTIZATION_CHOICES = [
     "w4afp8",
     "mxfp4",  # MOE-only.
     "auto-round",
+    "auto-round-int8",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
@@ -909,6 +910,13 @@ class ServerArgs:
         Arg(
             help="The moe data parallelism size.",
             aliases=["--moe-data-parallel-size"],
+        ),
+    ] = 1
+    dcp_size: A[
+        int,
+        Arg(
+            help="The decode context parallelism size.",
+            aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
     enable_prefill_cp: A[
@@ -2703,7 +2711,20 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
-        if self.dcp_size > 1 and not is_hip():
+        if not self.dcp_size > 1:
+            return
+        if is_hip():
+            return
+        elif is_cuda():
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "Decode context parallel (--dcp-size / "
+                    "--decode-context-parallel-size > 1) on CUDA platform "
+                    "does not support any speculative algorithm, but got "
+                    f"dcp_size={self.dcp_size} on a CUDA platform with "
+                    "speculative decoding enabled."
+                )
+        else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
                 "--decode-context-parallel-size > 1) is currently only "
