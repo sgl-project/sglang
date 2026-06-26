@@ -27,6 +27,11 @@ _FWD_OCCUPANCY_RE = re.compile(
 )
 _GENERATE_REQUEST_TIMEOUT = 600
 _METRICS_REQUEST_TIMEOUT = 10
+# How long to wait for background requests (e.g. a sibling test method's
+# long-running batch) to drain before starting the single-batch
+# measurement. The gauge is meaningless if other reqs share the batch.
+_IDLE_WAIT_TIMEOUT = 60
+_IDLE_POLL_INTERVAL = 0.5
 
 
 class FwdOccupancyMixin:
@@ -131,6 +136,30 @@ class FwdOccupancyMixin:
         )
         time.sleep(self.fwd_occupancy_warmup_settle_seconds)
 
+    def _wait_for_idle(self):
+        """Block until no running/waiting reqs remain. The gauge is a
+        single-batch signal; concurrent traffic from a sibling test method
+        (e.g. a long-running eval batch) silently corrupts it. Fails
+        loudly instead of emitting a bogus regression."""
+        deadline = time.perf_counter() + _IDLE_WAIT_TIMEOUT
+        while time.perf_counter() < deadline:
+            try:
+                load = requests.get(
+                    self.base_url + "/get_load", timeout=_METRICS_REQUEST_TIMEOUT
+                ).json()
+            except (requests.RequestException, ValueError):
+                load = []
+            num_reqs = sum(dp.get("num_reqs", 0) for dp in load)
+            if num_reqs == 0:
+                return
+            time.sleep(_IDLE_POLL_INTERVAL)
+        raise AssertionError(
+            f"server not idle after {_IDLE_WAIT_TIMEOUT}s ({num_reqs} reqs still "
+            "running/waiting); fwd_occupancy is a single-batch metric and cannot "
+            "be measured with concurrent traffic -- another test method's "
+            "batch may still be draining on this shared server"
+        )
+
     def _fwd_occupancy_measure(self):
         """Background-fire one long single-batch request, scrape
         /metrics on the foreground; return (non-NaN samples, perf)."""
@@ -176,6 +205,7 @@ class FwdOccupancyMixin:
     def test_fwd_occupancy(self):
         self._assert_metrics_device_timer_enabled()
         self._fwd_occupancy_warmup()
+        self._wait_for_idle()
         samples, perf = self._fwd_occupancy_measure()
 
         # avg_spec_accept_length is only present under a spec algorithm;
