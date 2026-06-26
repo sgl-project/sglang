@@ -715,6 +715,9 @@ class LTX2PipelineConfig(PipelineConfig):
 class LTX23PipelineConfig(LTX2PipelineConfig):
     """Configuration overrides for LTX-2.3."""
 
+    def __post_init__(self):
+        self.dit_config.arch_config.enable_packed_qkv_input_a2a = True
+
 
 @dataclasses.dataclass
 class LTX2I2VPipelineConfig(LTX2PipelineConfig):

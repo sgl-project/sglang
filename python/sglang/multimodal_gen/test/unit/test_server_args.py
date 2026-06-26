@@ -15,7 +15,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -795,6 +798,7 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        ltx23_config = LTX23PipelineConfig()
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
@@ -822,6 +826,10 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(4), 1)
         self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(8), 1)
         self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(2), 2)
+        self.assertFalse(
+            LTX2PipelineConfig().dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
+        self.assertTrue(ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a)
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
