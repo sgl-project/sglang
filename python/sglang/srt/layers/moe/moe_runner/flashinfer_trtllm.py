@@ -930,7 +930,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    hidden_states_scale = dispatch_output.hidden_states_scale
+    hidden_states_scale = dispatch_output.hidden_states_scale if hasattr(dispatch_output, "hidden_states_scale") else None
     per_token_scale = None
     if hidden_states_scale is not None:
         # NVFP4 dispatch, inputs are already quantized.
