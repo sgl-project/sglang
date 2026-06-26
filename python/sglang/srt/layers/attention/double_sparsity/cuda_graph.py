@@ -444,6 +444,17 @@ def capture_decode_step(
     capture; this keeps unit tests portable.
     """
 
+    if getattr(getattr(selector, "config", None), "rope_aware_score", False):
+        # Fail closed: this convenience capture wrapper does not thread the rope
+        # query/key, so capturing here while rope_aware_score is on would score
+        # no-PE. The production rope-aware path is the model-side graph-safe
+        # selector (deepseek_v2._select_topk_indices), not this helper.
+        raise RuntimeError(
+            "Double Sparsity 'rope_aware_score' is not wired through "
+            "capture_decode_step (it does not thread the rope query/key); refusing "
+            "to capture a no-PE selection while the flag is on."
+        )
+
     # Resolve static max_seq_len BEFORE any capture region.
     # state.max_seq_len is the preferred source (set at allocate_graph_state time).
     # Fall through to the parameter, then to a one-time .item() that is safe here

@@ -2328,6 +2328,7 @@ class DeepseekV2AttentionMLA(
         layer_id: int,
         return_indices: bool = True,
         q_nope: Optional[torch.Tensor] = None,
+        q_pe: Optional[torch.Tensor] = None,
     ):
         """The one config-gated branch: Double Sparsity selector OR NSA Indexer.
 
@@ -2554,6 +2555,44 @@ class DeepseekV2AttentionMLA(
                     # fp8 nope latent + per-128-block scales off the MLA KV pool.
                     _absorbed_latent_fp8 = None
                     _absorbed_latent_scales = None
+                    # rope-aware recovery tensors (off by default → both stay None →
+                    # the kernel scores no-PE, byte-identical to today).
+                    _rope_q_pe = None
+                    _rope_k_pe = None
+                    _rope_aware = getattr(_selector.config, "rope_aware_score", False)
+                    if _rope_aware:
+                        # Fail closed: rope-aware selection is validated ONLY for
+                        # single-token MLA decode on fp8 KV with q_pe/positions/
+                        # rotary_emb present (the loop14/15 config). Non-validated
+                        # runtimes raise here rather than silently scoring no-PE.
+                        # (bf16 KV is rejected in the latent-unpack branch below; NSA
+                        # and CPU/NPU cannot reach this DS graph-safe path by
+                        # construction.)
+                        if self.is_nextn:
+                            raise RuntimeError(
+                                "Double Sparsity 'rope_aware_score' is not supported "
+                                "on MTP/nextn layers (not validated); set "
+                                "rope_aware_score=false or disable MTP."
+                            )
+                        if get_attention_dcp_world_size() > 1:
+                            raise RuntimeError(
+                                "Double Sparsity 'rope_aware_score' is not supported "
+                                "with decode context parallel (DCP world size > 1; "
+                                "not validated); set rope_aware_score=false."
+                            )
+                        if not forward_batch.forward_mode.is_decode_or_idle():
+                            raise RuntimeError(
+                                "Double Sparsity 'rope_aware_score' is validated only "
+                                "for single-token decode; got forward_mode "
+                                f"{forward_batch.forward_mode!r} (speculative/extend "
+                                "not supported). Set rope_aware_score=false."
+                            )
+                        if q_pe is None or positions is None or self.rotary_emb is None:
+                            raise RuntimeError(
+                                "Double Sparsity 'rope_aware_score' requires q_pe, "
+                                "positions, and rotary_emb at the selection site; one "
+                                "is None (the rope query is not threaded on this path)."
+                            )
                     if _selector.absorbed_w_sel is not None:
                         from sglang.srt.model_executor.forward_context import (
                             get_token_to_kv_pool as _get_token_to_kv_pool,
@@ -2572,6 +2611,13 @@ class DeepseekV2AttentionMLA(
                             _lora = int(_selector.absorbed_w_sel.shape[-1])
                             _nblk = _lora // 128
                             if _nope_u8.dtype == torch.bfloat16:
+                                if _rope_aware:
+                                    raise RuntimeError(
+                                        "Double Sparsity 'rope_aware_score' is "
+                                        "validated only for fp8 KV cache; the resident "
+                                        "KV here is bf16. Pin --kv-cache-dtype "
+                                        "fp8_e4m3 or set rope_aware_score=false."
+                                    )
                                 # BF16 KV cache: the resident latent IS the
                                 # dequantized k_nope (no fp8 bytes / per-block
                                 # scales). Pass the bf16 k_nope directly; the score
@@ -2585,6 +2631,23 @@ class DeepseekV2AttentionMLA(
                                 _absorbed_latent_scales = _nope_u8[
                                     :, 0, _lora : _lora + _nblk * 4
                                 ].view(torch.float32)
+                                if _rope_aware:
+                                    # The resident post-RoPE k_pe view + the post-RoPE
+                                    # q_pe scratch. q_pe is PRE-RoPE at selection (the
+                                    # model's rotary_emb runs later in the forward), so
+                                    # rotate a clone with a dummy zero key — captured
+                                    # in-graph (rotary_emb already runs in the decode
+                                    # forward), so it replays 0-alloc. k_pe is the bf16
+                                    # rope bytes after the fp8 latent + fp32 scales.
+                                    _qp = q_pe.contiguous()
+                                    _rope_q_pe, _ = self.rotary_emb(
+                                        positions,
+                                        _qp.clone(),
+                                        torch.zeros_like(_qp[:, :1, :]),
+                                    )
+                                    _rope_k_pe = _nope_u8[
+                                        :, 0, _lora + _nblk * 4 :
+                                    ].view(torch.bfloat16)[:, : self.qk_rope_head_dim]
 
                     # The validity `written` arg is the slot_written bitmap [L, T]
                     # (the absorbed kernel masks unwritten slots to -inf via its
@@ -2603,6 +2666,16 @@ class DeepseekV2AttentionMLA(
                             "bitmap, but it is absent on the attention backend; a "
                             "reused KV slot's stale latent could be selected. "
                             "Ensure the DSA backend allocated _ds_slot_written."
+                        )
+                    if _rope_aware and (_rope_q_pe is None or _rope_k_pe is None):
+                        # Catch-all fail-closed chokepoint: rope is on but the rope
+                        # tensors were not built (no absorbed_w_sel / no forward
+                        # context / non-fp8 latent). Refuse to score no-PE.
+                        raise RuntimeError(
+                            "Double Sparsity 'rope_aware_score' is on but the rope "
+                            "query/key tensors were not built (absorbed_w_sel, forward "
+                            "context, or fp8 latent unavailable); refusing to silently "
+                            "score no-PE."
                         )
                     retrieve_topk_graph_safe(
                         queries=queries_for_ds,
@@ -2671,10 +2744,10 @@ class DeepseekV2AttentionMLA(
                         scratch_cur_index=getattr(
                             _ds_graph_state, "scratch_cur_index", None
                         ),
-                        key_norm_cache=getattr(
-                            _sw_backend, "_ds_key_norm_cache", None
-                        ),
+                        key_norm_cache=getattr(_sw_backend, "_ds_key_norm_cache", None),
                         scratch_qnorm=getattr(_ds_graph_state, "scratch_qnorm", None),
+                        q_pe=_rope_q_pe,
+                        k_pe=_rope_k_pe,
                     )
                     selected_indices = _ds_graph_state.selected_indices[:_bs]
                     valid_lengths = _ds_graph_state.valid_lengths[:_bs]

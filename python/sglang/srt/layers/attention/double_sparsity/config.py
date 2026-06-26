@@ -30,6 +30,7 @@ _ALLOWED_FIELDS = {
     "selector_width_overflow_policy",
     "score_reduce_dtype",
     "include_current_slot",
+    "rope_aware_score",
     "extra",
 }
 
@@ -102,6 +103,12 @@ class DoubleSparsityConfig:
     # masked, so the stale-slot hazard is not reopened). ON by default (the served
     # Fix A); explicit `false` keeps the current-excluded raw behavior for bisection.
     include_current_slot: bool = _DEFAULT_INCLUDE_CURRENT_SLOT
+    # rope_aware_score: add the RoPE term q_pe·k_pe[t] to the absorbed selection
+    # score (raw-dot + rope), recovering long-context accuracy. OFF by default → the
+    # production score is unchanged (byte-identical kernel launch). Only valid with
+    # scorer_norm="off"; every non-validated runtime (bf16 KV, spec/MTP/DCP/NSA, etc.)
+    # fails closed at the selection site rather than silently scoring no-PE.
+    rope_aware_score: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -159,6 +166,19 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'include_current_slot' must be a boolean, "
                 f"got {self.include_current_slot!r}."
+            )
+        if not isinstance(self.rope_aware_score, bool):
+            raise ValueError(
+                f"Double Sparsity 'rope_aware_score' must be a boolean, "
+                f"got {self.rope_aware_score!r}."
+            )
+        if self.rope_aware_score and self.scorer_norm != "off":
+            # The absorbed identity score = max_h v_h·c_kv holds only for the raw dot;
+            # the rope term is added on top of it. cosine-normalized no-PE mixed with a
+            # raw rope dot is not a defined scorer — fail closed rather than score it.
+            raise ValueError(
+                "Double Sparsity 'rope_aware_score' requires scorer_norm='off' "
+                f"(raw-dot absorbed score), got scorer_norm={self.scorer_norm!r}."
             )
         if not isinstance(self.top_k, int) or self.top_k <= 0:
             raise ValueError(
@@ -257,5 +277,6 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         include_current_slot=data.get(
             "include_current_slot", _DEFAULT_INCLUDE_CURRENT_SLOT
         ),
+        rope_aware_score=data.get("rope_aware_score", False),
         extra=data.get("extra", {}),
     )

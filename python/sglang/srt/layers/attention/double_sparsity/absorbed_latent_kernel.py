@@ -95,6 +95,12 @@ if _HAS_TRITON:
         out_ptr,  # [bs, max_seq_len] fp32 (pre-allocated)
         q_norm_ptr,  # [bs, H] fp32 — per (batch, head) query norm (COSINE only)
         k_norm_ptr,  # [max_tokens, H] fp32 — per (slot, head) key norm (COSINE only)
+        qpe_ptr,  # [bs, H, rope_dim] fp32 — post-RoPE query (HAS_ROPE only)
+        kpe_ptr,  # [max_tokens, rope_dim] bf16 — resident RoPE key (HAS_ROPE only)
+        qpe_stride_b: tl.constexpr,
+        qpe_stride_h: tl.constexpr,
+        qpe_stride_r: tl.constexpr,
+        kpe_stride_t: tl.constexpr,
         num_heads: tl.constexpr,
         max_seq_len: tl.constexpr,
         lora: tl.constexpr,
@@ -118,6 +124,8 @@ if _HAS_TRITON:
         HAS_WRITTEN: tl.constexpr,
         COSINE: tl.constexpr,
         BF16_LATENT: tl.constexpr,
+        HAS_ROPE: tl.constexpr,
+        ROPE_DIM: tl.constexpr,
         WORKERS: tl.constexpr,
     ):
         # Persistent-worker layout: static (bs, WORKERS) grid; each worker
@@ -233,6 +241,34 @@ if _HAS_TRITON:
                     ).to(tl.float32)
                     acc = acc / (qn[None, :] * kn + eps)
 
+                if HAS_ROPE:
+                    # Add the RoPE term q_pe_h·k_pe[t] per head BEFORE the head
+                    # reduce — rank tokens by the full attention logit (no-PE
+                    # absorbed dot + rope), not no-PE alone. k_pe[t] is the
+                    # resident post-RoPE rope key (shared across heads in MLA);
+                    # q_pe[h] the post-RoPE query. rope[t,h] = Σ_r k_pe[t,r]·q_pe[h,r]
+                    # via a [TOKEN_BLOCK, ROPE_DIM] @ [ROPE_DIM, H_POW2] MMA. Pad
+                    # heads load 0 (h_mask) so their rope add is 0 before the reduce.
+                    r_offs = tl.arange(0, ROPE_DIM)
+                    kpe_blk = tl.load(
+                        kpe_ptr + safe_phys[:, None] * kpe_stride_t + r_offs[None, :],
+                        mask=in_range[:, None],
+                        other=0.0,
+                    ).to(
+                        tl.float32
+                    )  # [TOKEN_BLOCK, ROPE_DIM]
+                    qpe_t = tl.load(
+                        qpe_ptr
+                        + batch_id * qpe_stride_b
+                        + h_offs[None, :] * qpe_stride_h
+                        + r_offs[:, None] * qpe_stride_r,
+                        mask=h_mask[None, :],
+                        other=0.0,
+                    ).to(
+                        tl.float32
+                    )  # [ROPE_DIM, H_POW2]
+                    acc += tl.dot(kpe_blk, qpe_t, allow_tf32=True)
+
                 if HEAD_AGG_MEAN:
                     acc = tl.where(h_mask[None, :], acc, 0.0)
                     score = tl.sum(acc, axis=1) / num_heads
@@ -272,6 +308,8 @@ def absorbed_score_paged_fp8(
     q_norm: Optional[torch.Tensor] = None,
     key_norm_cache: Optional[torch.Tensor] = None,
     cosine: bool = False,
+    q_pe: Optional[torch.Tensor] = None,
+    k_pe: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Paged absorbed score from the resident fp8 latent — GPU.
@@ -356,6 +394,26 @@ def absorbed_score_paged_fp8(
         kn_stride_t = 0
         kn_stride_h = 0
 
+    # RoPE term. When off, pass v as a harmless non-null pointer with zero strides —
+    # HAS_ROPE=False makes the kernel never dereference it, so the no-rope launch is
+    # byte-identical. q_pe is [bs, H, rope_dim] post-RoPE; k_pe is the resident
+    # [max_tokens, rope_dim] bf16 RoPE key.
+    has_rope = q_pe is not None and k_pe is not None
+    if has_rope:
+        rope_dim = int(q_pe.shape[-1])
+        assert (
+            rope_dim & (rope_dim - 1) == 0
+        ), f"rope_dim {rope_dim} must be a power of 2"
+        qpe_ptr, kpe_ptr = q_pe, k_pe
+        qpe_stride_b = q_pe.stride(0)
+        qpe_stride_h = q_pe.stride(1)
+        qpe_stride_r = q_pe.stride(2)
+        kpe_stride_t = k_pe.stride(0)
+    else:
+        rope_dim = 16  # unused (HAS_ROPE=False); a valid power-of-2 constexpr
+        qpe_ptr = kpe_ptr = v
+        qpe_stride_b = qpe_stride_h = qpe_stride_r = kpe_stride_t = 0
+
     # For bf16 the scale pointer is never dereferenced (BF16_LATENT branch); pass
     # the latent itself as a harmless non-null pointer when scales are absent.
     scale_arg = latent_fp8 if (bf16_latent or latent_scales is None) else latent_scales
@@ -370,6 +428,12 @@ def absorbed_score_paged_fp8(
         out,
         q_norm_ptr,
         k_norm_ptr,
+        qpe_ptr,
+        kpe_ptr,
+        qpe_stride_b=qpe_stride_b,
+        qpe_stride_h=qpe_stride_h,
+        qpe_stride_r=qpe_stride_r,
+        kpe_stride_t=kpe_stride_t,
         num_heads=num_heads,
         max_seq_len=max_seq_len,
         lora=lora,
@@ -393,6 +457,8 @@ def absorbed_score_paged_fp8(
         HAS_WRITTEN=has_written,
         COSINE=cosine,
         BF16_LATENT=bf16_latent,
+        HAS_ROPE=has_rope,
+        ROPE_DIM=rope_dim,
         WORKERS=num_workers,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -424,6 +490,8 @@ def absorbed_latent_score_logical_paged(
     cosine: bool = False,
     key_norm_cache: Optional[torch.Tensor] = None,
     scratch_qnorm: Optional[torch.Tensor] = None,
+    q_pe: Optional[torch.Tensor] = None,
+    k_pe: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """GPU equivalent of ``absorbed_latent.absorbed_latent_score_logical`` reading
@@ -495,5 +563,7 @@ def absorbed_latent_score_logical_paged(
         q_norm=q_norm,
         key_norm_cache=key_norm_cache,
         cosine=cosine,
+        q_pe=q_pe,
+        k_pe=k_pe,
         eps=eps,
     )

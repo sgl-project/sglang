@@ -133,6 +133,52 @@ def validate_double_sparsity(server_args: ServerArgs) -> None:
             "speculative decoding or set 'include_current_slot' to false."
         )
 
+    # rope_aware_score (the long-context RoPE recovery) is validated ONLY for the
+    # loop14/15 config: single-token MLA decode on CUDA, fp8 KV, CUDA graphs ON, no
+    # speculative/MTP/DCP. The selection-site guard in
+    # deepseek_v2._select_topk_indices is the in-loop backstop, but CPU/NPU and
+    # graphs-off decode can bypass that selector entirely, so this startup gate is the
+    # authoritative fail-closed: every non-validated runtime is rejected before serving
+    # rather than silently scoring no-PE (or silently ignoring the flag).
+    if getattr(config, "rope_aware_score", False):
+        device = getattr(server_args, "device", None)
+        if device not in (None, "cuda"):
+            raise ValueError(
+                "Double Sparsity 'rope_aware_score' is validated only on the CUDA MLA "
+                f"path; got --device={device!r}. Set rope_aware_score=false."
+            )
+        if getattr(server_args, "disable_cuda_graph", False):
+            raise ValueError(
+                "Double Sparsity 'rope_aware_score' is validated only with CUDA graphs "
+                "ON (the loop14/15 config); it is not supported with "
+                "--disable-cuda-graph. Set rope_aware_score=false."
+            )
+        if getattr(server_args, "speculative_algorithm", None) is not None:
+            raise ValueError(
+                "Double Sparsity 'rope_aware_score' is not supported with speculative/"
+                "MTP decoding (speculative_algorithm="
+                f"{getattr(server_args, 'speculative_algorithm', None)!r}); the rope "
+                "query is validated for single-token decode only. Set "
+                "rope_aware_score=false."
+            )
+        if int(getattr(server_args, "dcp_size", 1) or 1) > 1:
+            raise ValueError(
+                "Double Sparsity 'rope_aware_score' is not supported with decode "
+                f"context parallel (--dcp-size={getattr(server_args, 'dcp_size', None)!r}); "
+                "not validated. Set rope_aware_score=false."
+            )
+        # fp8 KV requirement. '--kv-cache-dtype auto' resolves to fp8 only on SM>=10
+        # (bf16 on H100/H200), so an explicit non-fp8 dtype is rejected here and the
+        # resident-latent dtype is re-checked at the selection site (the auto->bf16
+        # backstop in _select_topk_indices).
+        rope_kv_dtype = getattr(server_args, "kv_cache_dtype", None)
+        if rope_kv_dtype not in (None, "auto") and "fp8" not in str(rope_kv_dtype):
+            raise ValueError(
+                "Double Sparsity 'rope_aware_score' is validated only for fp8 KV "
+                f"cache; got --kv-cache-dtype={rope_kv_dtype!r}. Pin "
+                "--kv-cache-dtype fp8_e4m3 or set rope_aware_score=false."
+            )
+
     # Page size pairing (config vs server) + supported set.
     server_page_size = getattr(server_args, "page_size", None)
     if config.page_size not in _SUPPORTED_PAGE_SIZES:

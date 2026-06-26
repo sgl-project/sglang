@@ -379,6 +379,15 @@ class DeepseekMLAForwardMixin:
                     if self.use_double_sparsity
                     else None
                 )
+                # Pre-RoPE rope query for the rope-aware DS selector. Normal query
+                # RoPE is applied later in this method, so q[..., qk_nope_head_dim:]
+                # is the PRE-RoPE rope component; the selector rotates it in-graph.
+                # Unused (a cheap view) when rope_aware_score is off.
+                q_pe_for_ds = (
+                    q[..., self.qk_nope_head_dim :]
+                    if self.use_double_sparsity
+                    else None
+                )
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.
@@ -403,6 +412,7 @@ class DeepseekMLAForwardMixin:
                             forward_batch=forward_batch,
                             layer_id=self.layer_id,
                             q_nope=q_nope_for_ds,
+                            q_pe=q_pe_for_ds,
                         )
                     else:
                         topk_indices = maybe_capture_indexer_topk(

@@ -879,6 +879,12 @@ def retrieve_topk_graph_safe(
     scratch_cur_index: Optional[torch.Tensor] = None,  # int64 [max_bs]
     key_norm_cache: Optional[torch.Tensor] = None,  # fp32 [L, max_tokens, H] (cosine)
     scratch_qnorm: Optional[torch.Tensor] = None,  # fp32 [max_bs, H] (cosine)
+    q_pe: Optional[
+        torch.Tensor
+    ] = None,  # fp32 [bs, H, rope_dim] post-RoPE (rope-aware)
+    k_pe: Optional[
+        torch.Tensor
+    ] = None,  # bf16 [max_tokens, rope_dim] resident RoPE key
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Capture-safe selection that writes results into caller-owned buffers.
 
@@ -1072,6 +1078,8 @@ def retrieve_topk_graph_safe(
         cosine=cosine,
         key_norm_cache=k_norm_cache_layer,
         scratch_qnorm=scratch_qnorm,
+        q_pe=q_pe,
+        k_pe=k_pe,
     )
     torch.cuda.nvtx.range_pop()
 
