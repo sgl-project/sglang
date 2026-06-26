@@ -928,7 +928,13 @@ class TritonAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                # The TARGET_VERIFY mask length is
+                # num_draft_tokens * (seq_len + num_draft_tokens) (see
+                # _update_target_verify_buffers seq_mask_len), so the capture-time
+                # buffer must include the +num_draft_tokens term or it overflows by
+                # max_num_tokens * num_draft_tokens at seq_len == max_context_len.
+                # (... or 0) leaves the size unchanged when spec decoding is off.
+                (max_num_tokens * (self.max_context_len + (self.num_draft_tokens or 0))),
                 dtype=torch.uint8,
                 device=self.device,
             )
