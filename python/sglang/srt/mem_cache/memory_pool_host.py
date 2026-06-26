@@ -1445,9 +1445,14 @@ class MambaPoolHost(HostKVCache):
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "L2 cache effectiveness is reduced."
+                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                self.size,
+                device_pool.size,
+            )
 
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token

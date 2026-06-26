@@ -29,6 +29,10 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
+def _event_hashes(events):
+    return [block_hash for event in events for block_hash in event.block_hashes]
+
+
 class TestMamba(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -374,9 +378,9 @@ class TestMamba(unittest.TestCase):
         result = tree.evict(EvictParams(num_tokens=1))
         self.assertGreaterEqual(result.num_tokens_evicted, 1)
         events = tree.take_events()
-        removed_hashes = [
-            e.block_hashes[0] for e in events if isinstance(e, BlockRemoved)
-        ]
+        removed_hashes = _event_hashes(
+            [e for e in events if isinstance(e, BlockRemoved)]
+        )
         self.assertCountEqual(removed_hashes, stored_hashes)
 
     def test_mamba_radix_cache_kv_events_split_hash(self):
