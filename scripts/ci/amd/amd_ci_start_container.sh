@@ -333,8 +333,11 @@ else
   fi
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
+# Cirrascale Austin MI300 .test runners mount a 5Ti shared cache volume at
+# /home/runner/sglang-data (HF_HOME -> /home/runner/sglang-data/hf-cache).
+# Bind that into the container as /sgl-data so HF/pip/MIOPEN caches persist
+# across jobs instead of re-downloading into the container layer.
+CACHE_HOST=/home/runner/sglang-data
 if [[ -d "$CACHE_HOST" ]]; then
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
 else
