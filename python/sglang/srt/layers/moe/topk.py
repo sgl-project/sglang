@@ -1809,7 +1809,7 @@ def _post_process_topk_ids(
     if _aiter_append and _deepep_remap:
         # Fused path: append shared experts AND apply the DeepEP interleaved
         # remap in a single Triton kernel. This replaces the original
-        # fused_append_shared_experts() + eager _remap_topk_for_deepep() pair,
+        # fused_append_shared_experts() + eager per-rank shared-slot remap pair,
         # collapsing ~6 launch-bound elementwise kernels/layer (div_floor / add /
         # arange / fill / copy) into the one append kernel that already runs.
         #
@@ -1817,7 +1817,7 @@ def _post_process_topk_ids(
         # aiter_biased_grouped_topk folds routed_scaling_factor into the routed
         # weights and forward_deepep skips the post-MoE multiply for _use_aiter,
         # so the always-on shared expert must contribute 1.0x. (The eager
-        # _remap_topk_for_deepep instead sets shared weight to
+        # per-rank shared-slot remap instead sets shared weight to
         # 1/routed_scaling_factor to compensate a post-MoE scale that the aiter
         # path does not apply; see PR #28237.)
         num_physical_routed_experts = (

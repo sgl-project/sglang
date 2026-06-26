@@ -1,7 +1,8 @@
 """Unit tests for the fused append + DeepEP-remap shared-experts Triton kernel.
 
 Covers ``fused_append_remap_shared_experts_deepep``, which collapses
-``fused_append_shared_experts()`` followed by ``_remap_topk_for_deepep()`` into a
+``fused_append_shared_experts()`` followed by
+``remap_topk_for_per_rank_shared_slots()`` into a
 single Triton launch on the aiter/DeepEP-class path. The kernel is GPU-only
 (Triton), so these tests are skipped when no accelerator is present.
 """
@@ -14,7 +15,10 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels impo
     fused_append_remap_shared_experts_deepep,
     fused_append_shared_experts,
 )
-from sglang.srt.layers.moe.topk import TopKConfig, _remap_topk_for_deepep
+from sglang.srt.layers.moe.topk import (
+    TopKConfig,
+    remap_topk_for_per_rank_shared_slots,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -107,7 +111,7 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
                 self.assertTrue(torch.allclose(got_w, exp_w))
 
     def test_equivalence_with_eager_append_then_remap(self):
-        """Fused kernel == fused_append_shared_experts() + _remap_topk_for_deepep().
+        """Fused kernel == append shared experts + per-rank shared-slot remap.
 
         The eager remap overwrites the shared weight with 1/routed_scaling_factor,
         so the fused kernel is invoked with that same value to make the two paths
@@ -139,7 +143,7 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
                         scale_factor,
                         npr,  # shared-expert base id (overwritten by the remap)
                     )
-                    eager_ids, eager_w = _remap_topk_for_deepep(
+                    eager_ids, eager_w = remap_topk_for_per_rank_shared_slots(
                         eager_ids,
                         eager_w,
                         s,
