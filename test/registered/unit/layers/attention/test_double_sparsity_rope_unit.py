@@ -531,12 +531,35 @@ class TestRopeAwareKernel(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_CUDA, "rope-aware DS graph audit requires CUDA")
 class TestRopeAwareGraphAlloc(unittest.TestCase):
-    """Zero new allocations under CUDA-graph replay (AC-3)."""
+    """Zero new allocations under CUDA-graph replay (AC-3).
+
+    Uses the PRODUCTION rotary embedding (the class _select_topk_indices builds via
+    get_rope_wrapper), called exactly as the model does — rotary_emb(positions,
+    q_pe.clone(), zeros_like(q_pe[:, :1, :])) — followed by the real rope-aware score
+    kernel, all inside the captured region.
+    """
 
     @staticmethod
-    def _rotate_half(x):
-        h = x.shape[-1] // 2
-        return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
+    def _build_production_rope(dev):
+        # The rope module reads get_global_server_args() during inv_freq init; set a
+        # minimal global for the test (the only field it needs is rl_on_policy_target).
+        import sglang.srt.server_args as sa
+        from sglang.srt.models.deepseek_v2 import get_rope_wrapper
+
+        sa.set_global_server_args_for_scheduler(
+            SimpleNamespace(rl_on_policy_target=None, device=dev)
+        )
+        rope = get_rope_wrapper(
+            ROPE,
+            rotary_dim=ROPE,
+            max_position=8192,
+            base=10000,
+            is_neox_style=True,
+            device=dev,
+        )
+        if hasattr(rope, "cos_sin_cache"):
+            rope.cos_sin_cache = rope.cos_sin_cache.to(dev)
+        return rope.to(dev)
 
     def test_zero_alloc_replay(self):
         from sglang.srt.layers.attention.double_sparsity.absorbed_latent_kernel import (
@@ -545,13 +568,13 @@ class TestRopeAwareGraphAlloc(unittest.TestCase):
 
         dev = "cuda"
         torch.manual_seed(0)
+        rope = self._build_production_rope(dev)
         v = torch.randn(BS, H, LORA, device=dev)
         latent_fp8 = (torch.randn(T, LORA, device=dev) * 0.3).to(torch.float8_e4m3fn)
         scales = torch.rand(T, NBLK, device=dev) * 0.1 + 0.05
         q_pe = torch.randn(BS, H, ROPE, device=dev)
         k_pe = torch.randn(T, ROPE, device=dev).to(torch.bfloat16)
-        cos = torch.randn(BS, 1, ROPE, device=dev)
-        sin = torch.randn(BS, 1, ROPE, device=dev)
+        positions = torch.arange(BS, device=dev, dtype=torch.int64)
         perm = torch.randperm(T, device=dev)
         rtt = torch.zeros(BS, SEQ, dtype=torch.int32, device=dev)
         for b in range(BS):
@@ -561,11 +584,10 @@ class TestRopeAwareGraphAlloc(unittest.TestCase):
         out_buf = torch.empty((BS, SEQ), dtype=torch.float32, device=dev)
 
         def region():
+            # Exactly the production selection-site rope region: in-graph rotary on a
+            # clone with a dummy zero key, then the rope-aware score kernel.
             _qp = q_pe.contiguous()
-            c = _qp.clone()
-            z = torch.zeros_like(_qp[:, :1, :])
-            q_rot = c * cos + self._rotate_half(c) * sin
-            q_rot = q_rot + z.sum() * 0.0
+            q_rot, _ = rope(positions, _qp.clone(), torch.zeros_like(_qp[:, :1, :]))
             absorbed_score_paged_fp8(
                 v,
                 latent_fp8,
