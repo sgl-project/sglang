@@ -909,7 +909,7 @@ jobs:
           max-wait-minutes: '480'
 
   stage-c-test-4-gpu-amd:
-    name: ${{ format('stage-c-test-4-gpu-amd (linux-sglang-mi300-8gpu.test, {0})', matrix.part) }}
+    name: ${{ format('stage-c-test-4-gpu-amd (linux-mi300-4gpu-sglang, {0})', matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
     if: |
       always() &&
@@ -925,7 +925,7 @@ jobs:
       fail-fast: false
       matrix:
         part: [0]
-    runs-on: linux-sglang-mi300-8gpu.test
+    runs-on: linux-mi300-4gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
