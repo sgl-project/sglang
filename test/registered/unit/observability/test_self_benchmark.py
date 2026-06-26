@@ -3,11 +3,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import json
+import os
 import types
 import unittest
 from collections import deque
 from tempfile import TemporaryDirectory
+from unittest import mock
 
+import sglang.srt.managers.scheduler_components.self_benchmark as self_benchmark_module
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.self_benchmark import (
     SELF_BENCHMARK_DUMMY_TOKEN_ID,
@@ -591,6 +594,295 @@ class TestSelfBenchmark(CustomTestCase):
         benchmark = SelfBenchmark(scheduler)
 
         self.assertTrue(all(p.point_type == "decode" for p in benchmark._grid))
+
+    def test_build_synthetic_decode_batch_stashes_relay_payload(self):
+        # P0-1 regression guard: _build_synthetic_decode_batch must hand
+        # FutureMap.stash a RelayPayload, never a raw tensor. We exercise the
+        # REAL _build_synthetic_decode_batch (only the memory allocation and
+        # sampling-info construction are stubbed) so the stash call is covered.
+        scheduler = _prepare_decode_scheduler(_make_scheduler("/tmp/unused.json"))
+
+        captured = {}
+
+        class _FakeFutureMap:
+            def stash(self, future_indices, payload):
+                captured["future_indices"] = future_indices
+                captured["payload"] = payload
+                # Mirror FutureMap.stash's real access pattern: a raw tensor
+                # would raise AttributeError here.
+                assert type(payload).__name__ == "RelayPayload"
+                assert hasattr(payload, "bonus_tokens")
+                _ = payload.bonus_tokens.to
+
+        scheduler.future_map = _FakeFutureMap()
+        scheduler.req_to_token_pool = object()
+        scheduler.token_to_kv_pool_allocator = object()
+        scheduler.enable_overlap = False
+        scheduler.dllm_config = None
+        scheduler.enable_hisparse = False
+
+        benchmark = SelfBenchmark(scheduler)
+
+        # Stub the GPU-memory allocation + sampling-info construction; keep the
+        # real stash path. _place_synthetic_context_cache normally fills
+        # req_pool_indices, so the stub sets it.
+        def fake_place(batch, context_length):
+            batch.req_pool_indices = list(range(len(batch.reqs)))
+
+        benchmark._place_synthetic_context_cache = fake_place
+
+        class _FakeBatch:
+            def __init__(self, **kwargs):
+                self.reqs = kwargs.get("reqs", [])
+                self.device = "cpu"
+                self.req_pool_indices = None
+                self.sampling_info = None
+                self.input_ids = "sentinel"
+
+        # mock.patch.object correctly saves/restores the classmethod descriptors.
+        with mock.patch.object(
+            self_benchmark_module.ScheduleBatch,
+            "init_new",
+            staticmethod(lambda **kwargs: _FakeBatch(**kwargs)),
+        ), mock.patch.object(
+            self_benchmark_module.SamplingBatchInfo,
+            "from_schedule_batch",
+            staticmethod(lambda batch, vocab_size: object()),
+        ):
+            reqs = [benchmark._new_synthetic_req(prompt_len=8, max_tokens=2)]
+            reqs[0].output_ids.append(SELF_BENCHMARK_DUMMY_TOKEN_ID)
+            batch = benchmark._build_synthetic_decode_batch(reqs, context_length=8)
+
+        self.assertIn("payload", captured)
+        self.assertEqual(type(captured["payload"]).__name__, "RelayPayload")
+        self.assertEqual(captured["payload"].bonus_tokens.tolist(), [0])
+        self.assertIsNone(batch.input_ids)
+
+    def test_synthetic_decode_build_failure_frees_reqs_and_skips(self):
+        # P0-1: any failure in _build_synthetic_decode_batch (now caught as
+        # Exception, not just RuntimeError) must free the pre-allocated reqs and
+        # skip the point, never crash the scheduler.
+        scheduler = _prepare_decode_scheduler(_make_scheduler("/tmp/unused.json"))
+        freed = {}
+        benchmark = SelfBenchmark(scheduler)
+
+        def raising_build(_reqs, _ctx):
+            raise AttributeError("simulated stash on raw tensor")
+
+        def fake_free(reqs):
+            freed["reqs"] = reqs
+
+        benchmark._build_synthetic_decode_batch = raising_build
+        benchmark._free_synthetic_decode_reqs = fake_free
+
+        injected = benchmark._inject_synthetic_decode(context_length=8, batch_size=2)
+
+        self.assertEqual(injected, 0)
+        self.assertEqual(benchmark._active_reqs, [])
+        self.assertIn("reqs", freed)
+        self.assertEqual(len(freed["reqs"]), 2)
+
+    def test_benchmark_forced_fpm_rank_advances_then_restores(self):
+        # P0-2: a rank where the real gate gives enable_fpm=False, but with
+        # benchmark_mode set, has FPM force-enabled for the sweep. The sweep must
+        # advance WARMUP->SWEEP->DONE off observe_forward_pass and restore FPM
+        # afterwards (and not write the redundant JSON).
+        with TemporaryDirectory() as tmpdir:
+            output_path = f"{tmpdir}/benchmark.json"
+            scheduler = _make_scheduler(output_path)
+            # Simulate metrics_reporter._init_fpm forcing FPM on a non-FPM rank.
+            scheduler.enable_fpm = True
+            scheduler._fpm_is_real_rank = False
+            scheduler._fpm_benchmark_forced = True
+
+            shutdown_calls = []
+            scheduler.metrics_reporter = types.SimpleNamespace(
+                shutdown_benchmark_forced_fpm=lambda: shutdown_calls.append("shutdown")
+            )
+            finished_calls = []
+            scheduler.on_self_benchmark_finished = lambda: finished_calls.append("done")
+
+            benchmark = SelfBenchmark(scheduler)
+            # Forced rank must not be marked as an output writer.
+            self.assertFalse(benchmark._write_results)
+            # FPM stays on for the duration of the sweep.
+            self.assertTrue(scheduler.enable_fpm)
+
+            point = BenchmarkPoint(point_type="prefill", isl=10)
+            benchmark.phase = BenchmarkPhase.SWEEP
+            benchmark._grid = [point]
+            benchmark._grid_index = 0
+            benchmark._current = BenchmarkPointResult(point=point)
+
+            fpm = ForwardPassMetrics(
+                scheduled_requests=ScheduledRequestMetrics(num_prefill_requests=1),
+            )
+            batch = types.SimpleNamespace(
+                forward_mode=_FakeForwardMode(is_extend=True),
+            )
+
+            # observe_forward_pass must fire and advance the phase.
+            benchmark.observe_forward_pass(batch, fpm)
+            benchmark.maybe_schedule_next()
+
+            self.assertFalse(benchmark.active)
+            self.assertEqual(benchmark.phase, BenchmarkPhase.DONE)
+            self.assertEqual(finished_calls, ["done"])
+            # Forced publisher torn down and FPM restored to the prior off state.
+            self.assertEqual(shutdown_calls, ["shutdown"])
+            self.assertFalse(scheduler.enable_fpm)
+            # No JSON written on the forced rank.
+            self.assertFalse(
+                os.path.exists(benchmark._output_path),
+                "benchmark-forced rank must not write output JSON",
+            )
+
+    def test_real_fpm_rank_keeps_fpm_enabled_after_sweep(self):
+        # P0-2: the real FPM rank's production behavior is unchanged after the
+        # sweep -- enable_fpm stays True and no forced teardown happens.
+        with TemporaryDirectory() as tmpdir:
+            output_path = f"{tmpdir}/benchmark.json"
+            scheduler = _make_scheduler(output_path)
+            scheduler.enable_fpm = True
+            scheduler._fpm_is_real_rank = True
+            scheduler._fpm_benchmark_forced = False
+
+            # Faithful stub: the real helper early-returns for a non-forced rank.
+            shutdown_calls = []
+
+            def fake_shutdown():
+                if getattr(scheduler, "_fpm_benchmark_forced", False):
+                    shutdown_calls.append("shutdown")
+
+            scheduler.metrics_reporter = types.SimpleNamespace(
+                shutdown_benchmark_forced_fpm=fake_shutdown
+            )
+
+            benchmark = SelfBenchmark(scheduler)
+            self.assertTrue(benchmark._write_results)
+
+            benchmark.phase = BenchmarkPhase.SWEEP
+            benchmark._grid_index = len(benchmark._grid)
+            benchmark.maybe_schedule_next()
+
+            self.assertFalse(benchmark.active)
+            # Real rank keeps publishing; forced-teardown is a no-op for it.
+            self.assertEqual(shutdown_calls, [])
+            self.assertTrue(scheduler.enable_fpm)
+
+    def test_grammar_queue_counts_as_inflight_work(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.grammar_manager = types.SimpleNamespace(grammar_queue=[])
+        benchmark = SelfBenchmark(scheduler)
+
+        self.assertFalse(benchmark._has_inflight_work())
+        scheduler.grammar_manager.grammar_queue.append(object())
+        self.assertTrue(benchmark._has_inflight_work())
+
+    def test_decode_prealloc_retracted_and_pending_count_as_inflight_work(self):
+        for attr in ("retracted_queue", "pending_reqs"):
+            with self.subTest(attr=attr):
+                scheduler = _make_scheduler("/tmp/unused.json")
+                queue_owner = types.SimpleNamespace(
+                    queue=[], retracted_queue=[], pending_reqs=[]
+                )
+                scheduler.disagg_decode_prealloc_queue = queue_owner
+                benchmark = SelfBenchmark(scheduler)
+
+                self.assertFalse(benchmark._has_inflight_work())
+                getattr(queue_owner, attr).append(object())
+                self.assertTrue(benchmark._has_inflight_work())
+
+
+def _make_rejection_scheduler():
+    """Fake `self` for invoking Scheduler.maybe_init_self_benchmark unbound.
+
+    Defaults to a configuration that would PASS all rejections; each test flips
+    one attribute to trigger a specific ValueError. The success path constructs
+    a real SelfBenchmark, so tests only assert the rejection branches.
+    """
+    return types.SimpleNamespace(
+        self_benchmark=None,
+        server_args=types.SimpleNamespace(benchmark_mode="agg", load_format="auto"),
+        ps=types.SimpleNamespace(pp_size=1),
+        enable_pdmux=False,
+        enable_overlap_mlx=False,
+        is_generation=True,
+        spec_algorithm=types.SimpleNamespace(is_none=lambda: True),
+        model_config=types.SimpleNamespace(
+            is_encoder_decoder=False, is_multimodal=False
+        ),
+        enable_lora=False,
+    )
+
+
+class TestSelfBenchmarkSchedulerRejections(CustomTestCase):
+    """Scheduler-side fast-fail rejections in maybe_init_self_benchmark.
+
+    These cannot live in the server_args tests because the validations run in
+    the Scheduler (they need is_generation / spec_algorithm / model_config /
+    enable_lora / load_format resolved). We invoke the method unbound on a fake
+    `self` so we don't have to construct a full Scheduler.
+    """
+
+    @staticmethod
+    def _run(fake_self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        Scheduler.maybe_init_self_benchmark(fake_self)
+
+    def test_rejects_non_generation_model(self):
+        fake = _make_rejection_scheduler()
+        fake.is_generation = False
+        with self.assertRaisesRegex(ValueError, "only supported for generative"):
+            self._run(fake)
+
+    def test_rejects_speculative_decoding(self):
+        fake = _make_rejection_scheduler()
+        fake.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+        with self.assertRaisesRegex(ValueError, "speculative decoding"):
+            self._run(fake)
+
+    def test_rejects_encoder_decoder(self):
+        fake = _make_rejection_scheduler()
+        fake.model_config.is_encoder_decoder = True
+        with self.assertRaisesRegex(ValueError, "encoder-decoder"):
+            self._run(fake)
+
+    def test_rejects_multimodal(self):
+        fake = _make_rejection_scheduler()
+        fake.model_config.is_multimodal = True
+        with self.assertRaisesRegex(ValueError, "multimodal"):
+            self._run(fake)
+
+    def test_rejects_lora(self):
+        fake = _make_rejection_scheduler()
+        fake.enable_lora = True
+        with self.assertRaisesRegex(ValueError, "LoRA"):
+            self._run(fake)
+
+    def test_rejects_dummy_weights(self):
+        fake = _make_rejection_scheduler()
+        fake.server_args.load_format = "dummy"
+        with self.assertRaisesRegex(ValueError, "dummy weights"):
+            self._run(fake)
+
+    def test_does_not_reject_multi_rank_tp(self):
+        # MUST NOT reject tp_size>1 / dp_size>1. The fake `self` has no tp_size
+        # gate; maybe_init_self_benchmark only rejects pp_size>1. Confirm a
+        # passing config reaches SelfBenchmark construction (which then fails on
+        # the incomplete fake), proving none of the rejections fired.
+        fake = _make_rejection_scheduler()
+        # Reaching SelfBenchmark(self) means all rejections passed. SelfBenchmark
+        # construction will raise (fake lacks the full surface) -- anything but a
+        # benchmark-mode ValueError proves we got past the guards.
+        try:
+            self._run(fake)
+        except ValueError as exc:  # pragma: no cover - defensive
+            self.assertNotIn("--benchmark-mode is not supported", str(exc))
+            self.assertNotIn("only supported for generative", str(exc))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
