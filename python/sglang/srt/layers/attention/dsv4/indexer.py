@@ -308,7 +308,56 @@ def topk_transform_512_pytorch_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
-def transform_raw_c4_indices_to_page_indices(
+@triton.jit
+def _transform_raw_c4_indices_to_page_indices_kernel(
+    raw_indices,
+    seq_lens,
+    page_table,
+    out_page_indices,
+    raw_stride_b: tl.constexpr,
+    raw_stride_k: tl.constexpr,
+    seq_lens_stride_b: tl.constexpr,
+    page_table_stride_b: tl.constexpr,
+    page_table_stride_p: tl.constexpr,
+    out_stride_b: tl.constexpr,
+    out_stride_k: tl.constexpr,
+    topk: tl.constexpr,
+    max_page_idx: tl.constexpr,
+    page_bits: tl.constexpr,
+    page_mask: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < topk
+
+    raw = tl.load(
+        raw_indices + bid * raw_stride_b + offsets * raw_stride_k,
+        mask=mask,
+        other=-1,
+    )
+    seq_len = tl.load(seq_lens + bid * seq_lens_stride_b)
+
+    page_idx = raw >> page_bits
+    offset_in_page = raw & page_mask
+    page_idx_clamped = tl.minimum(tl.maximum(page_idx, 0), max_page_idx)
+    physical_pages = tl.load(
+        page_table + bid * page_table_stride_b + page_idx_clamped * page_table_stride_p,
+        mask=mask,
+        other=-1,
+    )
+
+    valid = (raw >= 0) & (raw < seq_len) & (physical_pages >= 0) & mask
+    page_indices = (physical_pages << page_bits) | offset_in_page
+    page_indices = tl.where(valid, page_indices, -1)
+    tl.store(
+        out_page_indices + bid * out_stride_b + offsets * out_stride_k,
+        page_indices,
+        mask=mask,
+    )
+
+
+def transform_raw_c4_indices_to_page_indices_torch(
     raw_indices: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
@@ -336,6 +385,80 @@ def transform_raw_c4_indices_to_page_indices(
     valid &= physical_pages >= 0
     page_indices.masked_fill_(~valid, -1)
     out_page_indices.copy_(page_indices.to(torch.int32))
+
+
+def transform_raw_c4_indices_to_page_indices_triton(
+    raw_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    assert raw_indices.shape == out_page_indices.shape
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0
+
+    if seq_lens.dim() == 2:
+        seq_lens = seq_lens.squeeze(-1)
+    assert seq_lens.dim() == 1
+    assert raw_indices.shape[0] == seq_lens.shape[0] == page_table.shape[0]
+
+    topk = raw_indices.shape[1]
+    if topk == 0:
+        return
+
+    page_bits = (page_size - 1).bit_length()
+    page_mask = page_size - 1
+    block = triton.next_power_of_2(topk)
+    grid = (raw_indices.shape[0],)
+    _transform_raw_c4_indices_to_page_indices_kernel[grid](
+        raw_indices,
+        seq_lens,
+        page_table,
+        out_page_indices,
+        raw_indices.stride(0),
+        raw_indices.stride(1),
+        seq_lens.stride(0),
+        page_table.stride(0),
+        page_table.stride(1),
+        out_page_indices.stride(0),
+        out_page_indices.stride(1),
+        topk,
+        page_table.shape[1] - 1,
+        page_bits,
+        page_mask,
+        BLOCK=block,
+    )
+
+
+def transform_raw_c4_indices_to_page_indices(
+    raw_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    if (
+        raw_indices.is_cuda
+        and seq_lens.is_cuda
+        and page_table.is_cuda
+        and out_page_indices.is_cuda
+        and not is_hip()
+    ):
+        transform_raw_c4_indices_to_page_indices_triton(
+            raw_indices,
+            seq_lens,
+            page_table,
+            out_page_indices,
+            page_size,
+        )
+    else:
+        transform_raw_c4_indices_to_page_indices_torch(
+            raw_indices,
+            seq_lens,
+            page_table,
+            out_page_indices,
+            page_size,
+        )
 
 
 @triton.jit
