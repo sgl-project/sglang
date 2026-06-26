@@ -314,6 +314,54 @@ class Repro:
         self.ops.append(op)
         return self
 
+    def remove_imported_name(
+        self, rel: str, *, module: str | None, name: str, asname: str | None = None
+    ) -> "Repro":
+        """Drop a single imported ``name`` from a module-level import: from a ``from module
+        import a, b`` keep the rest and drop only ``name``; when it was the sole name -- or for
+        a plain ``import name`` (``module=None``) -- remove the whole statement. The symbol's
+        home changed, so an importer that no longer references it loses exactly that name; the
+        import sorter rewrites the surviving line. An import diff is always whitelisted, so this
+        realises a lost name directly instead of relying on the formatter to prune it."""
+
+        def alias_text(alias: ast.alias) -> str:
+            return alias.name + (f" as {alias.asname}" if alias.asname else "")
+
+        def op(root: Path) -> None:
+            path = root / rel
+            lines = path.read_text().splitlines(keepends=True)
+            edits: list[tuple[int, int, str | None]] = []
+            for node in ast.parse("".join(lines)).body:
+                if module is None:
+                    if not isinstance(node, ast.Import):
+                        continue
+                else:
+                    if not isinstance(node, ast.ImportFrom):
+                        continue
+                    if "." * node.level + (node.module or "") != module:
+                        continue
+                kept = [
+                    a for a in node.names if not (a.name == name and a.asname == asname)
+                ]
+                if len(kept) == len(node.names):
+                    continue
+                if not kept:
+                    edits.append((node.lineno, node.end_lineno, None))
+                else:
+                    keyword = "import " if module is None else f"from {module} import "
+                    rebuilt = keyword + ", ".join(alias_text(a) for a in kept) + "\n"
+                    edits.append((node.lineno, node.end_lineno, rebuilt))
+            assert edits, f"import of {name!r} from {module!r} not found in {rel}"
+            for lo, hi, repl in sorted(edits, reverse=True):
+                if repl is None:
+                    del lines[lo - 1 : hi]
+                else:
+                    lines[lo - 1 : hi] = [repl]
+            path.write_text("".join(lines))
+
+        self.ops.append(op)
+        return self
+
     def add_import(self, rel: str, import_stmt: str) -> "Repro":
         """Append an import after the last top-level import; the formatter's import sorter
         places it (so the exact insertion point does not matter)."""

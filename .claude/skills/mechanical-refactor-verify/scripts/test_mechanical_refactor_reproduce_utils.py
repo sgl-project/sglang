@@ -405,6 +405,57 @@ def test_remove_import_removes_every_occurrence_in_scope(tmp_path: Path) -> None
     assert "from pkg import M" not in (tmp_path / "m.py").read_text()
 
 
+# --- remove_imported_name ------------------------------------------------------
+
+
+def test_remove_imported_name_drops_one_name_from_a_multi_name_import(
+    tmp_path: Path,
+) -> None:
+    """One name is dropped from a `from m import a, b, c`; the others stay on the line."""
+    (tmp_path / "m.py").write_text("from pkg import a, moved, b\n\nx = a + b\n")
+    r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "from pkg import a, b\n\nx = a + b\n"
+
+
+def test_remove_imported_name_drops_whole_statement_when_sole_name(
+    tmp_path: Path,
+) -> None:
+    """Dropping the only name removes the whole `from` statement."""
+    (tmp_path / "m.py").write_text("from pkg import moved\nimport os\n\nx = 1\n")
+    r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="moved")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "import os\n\nx = 1\n"
+
+
+def test_remove_imported_name_drops_a_plain_import_with_module_none(
+    tmp_path: Path,
+) -> None:
+    """With module=None a plain `import name` statement is removed."""
+    (tmp_path / "m.py").write_text("import gc\nimport os\n\nx = 1\n")
+    r = Repro("b", "t").remove_imported_name("m.py", module=None, name="gc")
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "import os\n\nx = 1\n"
+
+
+def test_remove_imported_name_matches_an_asname(tmp_path: Path) -> None:
+    """The alias is matched on both the name and the asname, so `import numpy as np` is found."""
+    (tmp_path / "m.py").write_text("import numpy as np\nimport os\n\nx = 1\n")
+    r = Repro("b", "t").remove_imported_name(
+        "m.py", module=None, name="numpy", asname="np"
+    )
+    _apply(r, tmp_path)
+    assert (tmp_path / "m.py").read_text() == "import os\n\nx = 1\n"
+
+
+def test_remove_imported_name_asserts_when_absent(tmp_path: Path) -> None:
+    """Removing a name that is not imported raises, so a wrong recipe fails loudly."""
+    (tmp_path / "m.py").write_text("from pkg import a, b\n")
+    r = Repro("b", "t").remove_imported_name("m.py", module="pkg", name="missing")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
 # --- add_import ----------------------------------------------------------------
 
 

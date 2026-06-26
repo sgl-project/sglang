@@ -4,8 +4,9 @@ runnable reproduce script -- no one hand-writes it.
 
 A recipe is inferred from the commit's diff and its before-state AST: which symbols moved
 (src -> dst, into which class, or into a new module), which call sites were adapted, which
-imports were repathed, and which module-level or TYPE_CHECKING imports each file gained (lost
-imports are left to ruff's F401 --fix).
+imports were repathed, and the symmetric module-level import diff each file gained or lost
+(realised directly with add_import / remove_imported_name, since an import diff is always
+whitelisted).
 ``recipe_to_script`` emits a standalone ``repro_scripts/<sha>.py`` (importing only the
 reproduce util); running it reproduces the commit and diffs it byte-for-byte.
 ``generate_range`` writes a whole folder (scripts + output.log + output.html) for a range.
@@ -200,6 +201,21 @@ def _local_import_of(
     return None
 
 
+def _removal_from_key(path: str, key) -> dict:
+    """Turn an ``_import_pairs`` key the target dropped into a ``remove_imported_name`` call. A
+    ``(module, name, asname)`` key drops one name from a ``from`` import; a bare ``import x``
+    statement string drops a plain import."""
+    if isinstance(key, tuple):
+        module, name, asname = key
+        return {"path": path, "module": module, "name": name, "asname": asname}
+    rest = key.removeprefix("import ")
+    if " as " in rest:
+        name, asname = rest.split(" as ", 1)
+    else:
+        name, asname = rest, None
+    return {"path": path, "module": None, "name": name, "asname": asname}
+
+
 @dataclass
 class Recipe:
     base: str
@@ -210,6 +226,7 @@ class Recipe:
     lowerings: list = field(default_factory=list)
     repaths: list = field(default_factory=list)
     import_removals: list = field(default_factory=list)
+    module_import_removals: list = field(default_factory=list)
     import_additions: list = field(default_factory=list)
     typechecking_additions: list = field(default_factory=list)
     deletes: list = field(default_factory=list)
@@ -502,12 +519,15 @@ def infer_recipe(commit: str, root: str) -> Recipe:
                 recipe, files, name=name, src=src, dst=dst, commit=commit, root=root
             )
 
-    # Module-level imports a file gained: the destination needs the moved code's imports, and
-    # a caller of a moved free function gains an import of it. Removals are not inferred --
-    # ruff's F401 --fix prunes the now-unused imports during pre-commit, exactly as the chain
-    # itself was committed. A new file is written whole by extract_to_new_module, so it is
-    # skipped.
+    # Module-level imports a file gained or lost are realised directly from the symmetric
+    # base<->target diff: a gained name is added (the destination needs the moved code's
+    # imports, or a caller of a moved free function gains one), a lost name is removed. An
+    # import diff is always whitelisted, so this is deterministic and does not depend on the
+    # formatter pruning (this repo's ruff has no F811, so a still-used symbol repointed to a new
+    # module would otherwise leave a duplicate). A file written whole by extract_to_new_module
+    # (the new file, or the extract source whose tail the cut removed) is skipped.
     extract_dsts = {ex["dst"] for ex in recipe.extracts}
+    extract_srcs = {ex["src"] for ex in recipe.extracts}
     for path in sorted(files):
         if path in new_files or path in extract_dsts:
             continue
@@ -518,6 +538,10 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         for key, stmt in after_pairs.items():
             if key not in before_pairs:
                 recipe.import_additions.append({"path": path, "text": stmt})
+        if path not in extract_srcs:
+            for key in before_pairs:
+                if key not in after_pairs:
+                    recipe.module_import_removals.append(_removal_from_key(path, key))
         before_tc = _typechecking_pairs(before) if before.strip() else {}
         after_tc = _typechecking_pairs(after) if after.strip() else {}
         for key, stmt in after_tc.items():
@@ -540,53 +564,90 @@ def infer_recipe(commit: str, root: str) -> Recipe:
     return recipe
 
 
-def build_repro(recipe: Recipe) -> rr.Repro:
-    """A Repro that adapts call sites and repaths/removes imports BEFORE moving, so a call to
-    a moved method from inside another moved method is lowered while still in the source and
-    travels with the body; relocations run next (move_symbol in destination order, then the
-    new-module extracts), and import_additions run LAST so a consumer import is placed after
-    the extract has cut the trailing block out of the source (otherwise it would be swept
-    into the new module)."""
-    repro = rr.Repro(base=recipe.base, target=recipe.target)
+def _recipe_ops(recipe: Recipe) -> list:
+    """The ordered relocation operations a recipe replays, as ``(method, args, kwargs)`` --
+    shared by ``build_repro`` (which runs them on a Repro) and ``recipe_to_script`` (which
+    renders them as ``r.method(...)`` lines), so the emitted script and the in-process run can
+    never drift.
+
+    Call sites and import repaths/removals run BEFORE the moves, so a call to a moved method
+    from inside another moved method is adapted while still in the source and travels with the
+    body. The moves (in destination order) and the new-module extracts relocate next.
+    Module-level import additions/removals run LAST, so a consumer import lands after an extract
+    has cut the source tail (otherwise it would be swept into the new module). Same-destination
+    moves are emitted in reverse destination order so each move's ``before`` anchor (a sibling
+    further down) is already present when the move is inserted."""
+    ops: list = []
     for lo in recipe.lowerings:
-        if lo["kind"] == "requalify":
-            repro.requalify_call_sites(lo["name"], lo["owner"], paths=[lo["path"]])
-        else:
-            repro.lower_call_sites(lo["name"], lo["owner"], paths=[lo["path"]])
+        method = (
+            "requalify_call_sites" if lo["kind"] == "requalify" else "lower_call_sites"
+        )
+        ops.append((method, (lo["name"], lo["owner"]), {"paths": [lo["path"]]}))
     for rp in recipe.repaths:
-        repro.repath_import(
-            rp["path"],
-            old_module=rp["old_module"],
-            new_module=rp["new_module"],
-            name=rp["name"],
+        ops.append(
+            (
+                "repath_import",
+                (rp["path"],),
+                {
+                    "old_module": rp["old_module"],
+                    "new_module": rp["new_module"],
+                    "name": rp["name"],
+                },
+            )
         )
     for im in recipe.import_removals:
-        repro.remove_import(im["path"], im["text"], in_function=im["in_function"])
-    # Apply same-destination moves in reverse order so each move's ``before`` anchor (a sibling
-    # with a higher dst position) is already present when it is inserted.
+        ops.append(
+            (
+                "remove_import",
+                (im["path"], im["text"]),
+                {"in_function": im["in_function"]},
+            )
+        )
     for mv in sorted(recipe.moves, key=lambda m: (m["dst"], -m["dst_order"])):
-        repro.move_symbol(
-            mv["name"],
-            src=mv["src"],
-            dst=mv["dst"],
-            into_class=mv["into_class"],
-            dedent=mv["dedent"],
-            drop_self_annotation=mv["drop_self_annotation"],
-            before=mv.get("before"),
+        ops.append(
+            (
+                "move_symbol",
+                (mv["name"],),
+                {
+                    "src": mv["src"],
+                    "dst": mv["dst"],
+                    "into_class": mv["into_class"],
+                    "dedent": mv["dedent"],
+                    "drop_self_annotation": mv["drop_self_annotation"],
+                    "before": mv.get("before"),
+                },
+            )
         )
     for ex in recipe.extracts:
-        repro.extract_to_new_module(
-            ex["src"],
-            ex["dst"],
-            symbols=ex["symbols"],
-            future_import=ex["future_import"],
+        ops.append(
+            (
+                "extract_to_new_module",
+                (ex["src"], ex["dst"]),
+                {"symbols": ex["symbols"], "future_import": ex["future_import"]},
+            )
         )
     for path in recipe.deletes:
-        repro.delete_file(path)
+        ops.append(("delete_file", (path,), {}))
+    for im in recipe.module_import_removals:
+        ops.append(
+            (
+                "remove_imported_name",
+                (im["path"],),
+                {"module": im["module"], "name": im["name"], "asname": im["asname"]},
+            )
+        )
     for im in recipe.import_additions:
-        repro.add_import(im["path"], im["text"])
+        ops.append(("add_import", (im["path"], im["text"]), {}))
     for im in recipe.typechecking_additions:
-        repro.add_typechecking_import(im["path"], im["text"])
+        ops.append(("add_typechecking_import", (im["path"], im["text"]), {}))
+    return ops
+
+
+def build_repro(recipe: Recipe) -> rr.Repro:
+    """Compose a Repro from the recipe's canonical ordered operations (``_recipe_ops``)."""
+    repro = rr.Repro(base=recipe.base, target=recipe.target)
+    for method, args, kwargs in _recipe_ops(recipe):
+        getattr(repro, method)(*args, **kwargs)
     return repro
 
 
@@ -610,41 +671,9 @@ def recipe_to_script(recipe: Recipe, subject: str) -> str:
         "",
         f"r = Repro(base={recipe.base!r}, target={recipe.target!r})",
     ]
-    for lo in recipe.lowerings:
-        method = (
-            "requalify_call_sites" if lo["kind"] == "requalify" else "lower_call_sites"
-        )
-        lines.append(
-            f"r.{method}({lo['name']!r}, {lo['owner']!r}, paths=[{lo['path']!r}])"
-        )
-    for rp in recipe.repaths:
-        lines.append(
-            f"r.repath_import({rp['path']!r}, old_module={rp['old_module']!r}, "
-            f"new_module={rp['new_module']!r}, name={rp['name']!r})"
-        )
-    for im in recipe.import_removals:
-        lines.append(
-            f"r.remove_import({im['path']!r}, {im['text']!r}, "
-            f"in_function={im['in_function']!r})"
-        )
-    for im in recipe.import_additions:
-        lines.append(f"r.add_import({im['path']!r}, {im['text']!r})")
-    for im in recipe.typechecking_additions:
-        lines.append(f"r.add_typechecking_import({im['path']!r}, {im['text']!r})")
-    for mv in sorted(recipe.moves, key=lambda m: (m["dst"], -m["dst_order"])):
-        lines.append(
-            f"r.move_symbol({mv['name']!r}, src={mv['src']!r}, dst={mv['dst']!r}, "
-            f"into_class={mv['into_class']!r}, dedent={mv['dedent']}, "
-            f"drop_self_annotation={mv['drop_self_annotation']!r}, "
-            f"before={mv.get('before')!r})"
-        )
-    for ex in recipe.extracts:
-        lines.append(
-            f"r.extract_to_new_module({ex['src']!r}, {ex['dst']!r}, "
-            f"symbols={ex['symbols']!r}, future_import={ex['future_import']!r})"
-        )
-    for path in recipe.deletes:
-        lines.append(f"r.delete_file({path!r})")
+    for method, args, kwargs in _recipe_ops(recipe):
+        rendered = [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
+        lines.append(f"r.{method}(" + ", ".join(rendered) + ")")
     lines += ["r.run()", ""]
     return "\n".join(lines)
 

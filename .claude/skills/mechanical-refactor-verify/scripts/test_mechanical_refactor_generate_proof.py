@@ -425,3 +425,105 @@ def test_recipe_to_script_is_self_contained_and_ordered(repo: Path) -> None:
     # importing nothing else from the skill keeps the script auditable in isolation
     assert "mechanical_refactor_verify_utils" not in script
     assert "mechanical_refactor_generate_proof" not in script
+
+
+def _free_function_move_with_module_level_caller(repo: Path) -> None:
+    """Stage a free function moved model.py -> util.py whose caller imports it at module
+    level (so the repoint shows up in the symmetric module-level import diff)."""
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n\n\ndef resolve(m):\n    return m\n",
+            "util.py": "import os\n",
+            "caller.py": (
+                "from model import resolve\n\n\ndef run(m):\n    return resolve(m)\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n",
+            "util.py": "import os\n\n\ndef resolve(m):\n    return m\n",
+            "caller.py": (
+                "from util import resolve\n\n\ndef run(m):\n    return resolve(m)\n"
+            ),
+        },
+    )
+    _commit(repo, "move resolve to util")
+
+
+def test_infer_recipe_module_level_import_repoint_realised_by_diff(repo: Path) -> None:
+    """A module-level consumer whose import is repointed old -> new yields a remove of the old
+    name and an add of the new -- not a reliance on the formatter pruning a duplicate."""
+    _free_function_move_with_module_level_caller(repo)
+    recipe = infer_recipe("HEAD", str(repo))
+    assert recipe.repaths == []
+    assert {
+        "path": "caller.py",
+        "module": "model",
+        "name": "resolve",
+        "asname": None,
+    } in recipe.module_import_removals
+    assert {"path": "caller.py", "text": "from util import resolve"} in (
+        recipe.import_additions
+    )
+
+
+def test_recipe_to_script_orders_import_ops_after_moves(repo: Path) -> None:
+    """The emitted script applies module-level import add/remove AFTER the move, matching
+    build_repro's run order so the script and the in-process verdict cannot diverge."""
+    _free_function_move_with_module_level_caller(repo)
+    script = recipe_to_script(infer_recipe("HEAD", str(repo)), "move resolve to util")
+    assert script.index("move_symbol") < script.index("remove_imported_name")
+    assert script.index("move_symbol") < script.index("add_import")
+
+
+def test_infer_recipe_removes_an_import_the_source_no_longer_uses(repo: Path) -> None:
+    """When the moved body took the source's only use of an import, the source's lost name is
+    realised as a removal (deterministic, not left to the formatter)."""
+    _write(
+        repo,
+        **{
+            "model.py": (
+                "import gc\n"
+                "\n"
+                "class M:\n"
+                "    @staticmethod\n"
+                "    def foo(self):\n"
+                "        gc.collect()\n"
+                "        return 1\n"
+                "\n"
+                "    def other(self):\n"
+                "        return 0\n"
+            ),
+            "comp.py": "class C:\n    def keep(self):\n        return 1\n",
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "class M:\n    def other(self):\n        return 0\n",
+            "comp.py": (
+                "import gc\n"
+                "\n"
+                "class C:\n"
+                "    def keep(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def foo(self):\n"
+                "        gc.collect()\n"
+                "        return 1\n"
+            ),
+        },
+    )
+    _commit(repo, "move foo onto C")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert {
+        "path": "model.py",
+        "module": None,
+        "name": "gc",
+        "asname": None,
+    } in recipe.module_import_removals
