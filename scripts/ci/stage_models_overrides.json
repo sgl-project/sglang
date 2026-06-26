@@ -1,0 +1,10 @@
+{
+  "_comment": "Manual overrides for list_stage_models.py. by_file/by_suite ADD models the static scan cannot see (models built dynamically, read from configs, passed via CLI args). deny REMOVES false-positive ids the heuristic mistakes for models. Keys in by_file are repo-relative test paths (e.g. test/registered/foo/test_bar.py).",
+  "by_file": {},
+  "by_suite": {},
+  "deny": [
+    "tok/req",
+    "qwen/qwen3",
+    "qwen/qwen3-vl"
+  ]
+}
