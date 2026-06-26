@@ -555,15 +555,13 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
-        self.init_init_info_sender()
+        self.init_startup_readiness_sender()
 
         self.maybe_init_self_benchmark()
 
-        maybe_revert_pr_fix()
-
         self.is_initializing = False
 
-    def init_init_info_sender(self) -> None:
+    def init_startup_readiness_sender(self) -> None:
         self._init_info_pipe_writer = None
         self._init_info_sent = False
 
