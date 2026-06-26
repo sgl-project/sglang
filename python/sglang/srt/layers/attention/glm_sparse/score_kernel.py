@@ -45,6 +45,7 @@ def _glm_sparse_score_kernel(
     stride_score_row: tl.constexpr,
     num_kv_heads: tl.constexpr,
     group_size: tl.constexpr,
+    block_m: tl.constexpr,
     head_dim: tl.constexpr,
     block_n: tl.constexpr,
     force_left: tl.constexpr,
@@ -64,10 +65,12 @@ def _glm_sparse_score_kernel(
 
     offs_n = n_start + tl.arange(0, block_n)
     offs_d = tl.arange(0, head_dim)
+    offs_m = tl.arange(0, block_m)
     valid_n = offs_n < seq_len
+    valid_m = offs_m < group_size
 
-    # Load this (batch, kv_head) K tile once; reuse it across all query heads in the GQA group. 
-    # K is shared within a group, so the per-head cost is a cheap dot + running max.
+    # Load this (batch, kv_head) K tile once; reuse it across all query heads in the GQA group.
+    # K is shared within a group, so we compute the whole group's scores with one tensor-core GEMM.
     req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
     phys_ptrs = req_to_token_ptr + req_idx * stride_r2t_req + offs_n
     phys_loc = tl.load(phys_ptrs, mask=valid_n, other=0).to(tl.int64)
@@ -77,20 +80,33 @@ def _glm_sparse_score_kernel(
         + pid_h * stride_k_h
         + offs_d[None, :]
     )
-    k_vec = tl.load(k_ptrs, mask=valid_n[:, None], other=0.0).to(tl.float32)
+    # K tile [block_n, head_dim] in bf16 (kept low-precision for tensor-core dot).
+    k_vec = tl.load(k_ptrs, mask=valid_n[:, None], other=0.0)
 
-    # GEMM per query head, then max-pool over the group: for each query head g in
-    # this kv-head's group compute <q_g, K> and keep the column-wise running max.
-    # q layout is [batch, num_heads, head_dim] with num_heads = kv_heads*group;
-    # the group for kv-head ``pid_h`` is the contiguous block
-    # ``[pid_h*group, pid_h*group + group)``.
-    scores_block = tl.full((block_n,), float("-inf"), dtype=tl.float32)
+    # Load the whole GQA group's queries as a [block_m, head_dim] tile (block_m padded
+    # up to a tensor-core-friendly size; rows >= group_size are masked to 0 and ignored
+    # in the post-GEMM max-pool). q layout is [batch, num_heads, head_dim] with
+    # num_heads = kv_heads*group; the group for kv-head pid_h is the contiguous block
+    # [pid_h*group, pid_h*group + group).
     q_head_base = pid_h * group_size
-    for g in tl.static_range(group_size):
-        q_ptrs = q_ptr + pid_b * stride_q_b + (q_head_base + g) * stride_q_h + offs_d
-        q_vec = tl.load(q_ptrs).to(tl.float32)
-        head_score = tl.sum(q_vec[None, :] * k_vec, axis=-1)
-        scores_block = tl.maximum(scores_block, head_score)
+    q_ptrs = (
+        q_ptr
+        + pid_b * stride_q_b
+        + (q_head_base + offs_m[:, None]) * stride_q_h
+        + offs_d[None, :]
+    )
+    q_tile = tl.load(q_ptrs, mask=valid_m[:, None], other=0.0)
+
+    # One tensor-core GEMM: [block_m, head_dim] @ [head_dim, block_n] -> [block_m, block_n].
+    # Cast both operands to bf16 so tl.dot uses tensor cores (accumulates in fp32).
+    qk = tl.dot(q_tile.to(tl.bfloat16), tl.trans(k_vec).to(tl.bfloat16))  # [block_m, block_n] fp32
+
+    # Mask padded query rows (>= group_size) to -inf so they don't win the max-pool,
+    # then max-pool over the group dimension to get per-token scores.
+    qk = tl.where(valid_m[:, None], qk, float("-inf"))
+    scores_block = tl.max(qk, axis=0)  # [block_n]
+    # KV positions beyond seq_len must stay -inf for the downstream topk padding.
+    scores_block = tl.where(valid_n, scores_block, float("-inf"))
 
     # Force-select mask (StreamingLLM-style sink + local window): the first
     # ``force_left`` tokens and the last ``force_right`` history tokens are
@@ -179,6 +195,10 @@ def glm_sparse_compute_scores(
     req_pool_i32 = req_pool_indices.to(torch.int32).contiguous()
     seq_lens_i32 = seq_lens.to(torch.int32).contiguous()
 
+    # tl.dot requires the M (group) dim to be a tensor-core-friendly size (>= 16).
+    # group_size for GLM is 12, so pad M up to 16; padded rows are masked out.
+    block_m = max(16, triton.next_power_of_2(group_size))
+
     grid = (
         triton.cdiv(max_score_len, block_n),
         kv_heads,
@@ -199,6 +219,7 @@ def glm_sparse_compute_scores(
         stride_score_row=scores.stride(0),
         num_kv_heads=kv_heads,
         group_size=group_size,
+        block_m=block_m,
         head_dim=head_dim,
         block_n=block_n,
         force_left=force_left,
