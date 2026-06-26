@@ -2002,7 +2002,7 @@ class DisaggregationMetrics(msgspec.Struct, array_like=True):
 
 
 class QueueMetrics(msgspec.Struct, array_like=True):
-    """Detailed queue breakdown."""
+    """Detailed queue info breakdown."""
 
     waiting: int
     grammar: int
