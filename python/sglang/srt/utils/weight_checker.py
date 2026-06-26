@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.utils.weight_checker_comparator import (
+    _CHUNK_NUMEL,
     ComparableWeight,
     RawComparable,
     _compare_weights,
@@ -114,7 +115,7 @@ class WeightChecker:
                 name, param, skip_tensor_list
             ):
                 continue
-            param.copy_(_sentinel_like(param))
+            param.copy_(_random_like(param))
 
     def _compare(
         self,
@@ -245,21 +246,26 @@ def _check_tensors(
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
-# Deterministic non-zero poison: must differ from every real weight so a missed
-# sync is caught by compare. Avoid 0 (zero-init params) and 1.0 (norm weights),
-# which alias stale weights and hide the miss.
-_RESET_SENTINEL = (
-    88.0  # fits fp8 e4m3 (max 448), unlike real weight magnitudes
-)
+def _random_like(t: torch.Tensor):
+    device = t.device
+    shape = t.shape
+    dtype = t.dtype
 
+    if dtype.is_floating_point:
+        out = torch.empty(shape, device=device, dtype=dtype)
+        for chunk in out.view(-1).split(_CHUNK_NUMEL):
+            chunk.copy_(
+                torch.rand(chunk.shape, device=device, dtype=torch.float32).to(dtype)
+            )
+        return out
 
-def _sentinel_like(t: torch.Tensor) -> torch.Tensor:
-    if t.dtype == torch.bool:
-        return torch.ones_like(t)
-    if t.dtype.is_floating_point:
-        return torch.full_like(t, _RESET_SENTINEL)
-    info = torch.iinfo(t.dtype)
-    return torch.full_like(t, min(int(_RESET_SENTINEL), info.max))
+    if dtype == torch.bool:
+        return torch.rand(shape, device=device) > 0.5
+
+    info = torch.iinfo(dtype)
+    return torch.randint(
+        low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
+    )
 
 
 def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:
