@@ -72,7 +72,7 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input) {
         num_tokens,
         d,
         [](float x) { return x / (1.f + std::exp(-x)); },
-        [](Vec x) { return x / (Vec(1.f) + x.neg().exp()); });
+        [](Vec x) { return x / (Vec(1.f) + x.neg().exp_u20()); });
   });
   return out;
 }
