@@ -40,6 +40,7 @@ from sglang.srt.configs.step3_vl import (
 )
 from sglang.srt.configs.step3p5 import Step3p5Config
 from sglang.srt.configs.step3p7 import Step3p7Config
+from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
     "AfmoeConfig",
@@ -82,4 +83,5 @@ __all__ = [
     "Step3p5Config",
     "Step3p7Config",
     "Qwen3ASRConfig",
+    "ZayaConfig",
 ]

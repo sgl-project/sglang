@@ -8,16 +8,145 @@ import torch
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import mxfp_supported
+from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
 if _is_hip:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-        fused_gemm_afp4wfp4_split_cat,
+        fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
-    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
+    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
+        gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
+    )
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
+
+    def _aiter_gemm_afp4wfp4(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        x_scales: torch.Tensor,
+        w_scales: torch.Tensor,
+        y: torch.Tensor,
+    ) -> None:
+        _gemm_afp4wfp4_orig(x, w, x_scales, w_scales, y.dtype, y)
+
+    def _aiter_gemm_afp4wfp4_fake(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        x_scales: torch.Tensor,
+        w_scales: torch.Tensor,
+        y: torch.Tensor,
+    ) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="aiter_gemm_afp4wfp4",
+        op_func=_aiter_gemm_afp4wfp4,
+        mutates_args=["y"],
+        fake_impl=_aiter_gemm_afp4wfp4_fake,
+    )
+
+    def gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, y):
+        torch.ops.sglang.aiter_gemm_afp4wfp4(x, w, x_scales, w_scales, y)
+
+    def _aiter_gemm_afp4wfp4_pre_quant(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        w_scales: torch.Tensor,
+        y: torch.Tensor,
+    ) -> None:
+        _gemm_afp4wfp4_pre_quant_orig(x, w, w_scales, y.dtype, y)
+
+    def _aiter_gemm_afp4wfp4_pre_quant_fake(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        w_scales: torch.Tensor,
+        y: torch.Tensor,
+    ) -> None:
+        return None
+
+    direct_register_custom_op(
+        op_name="aiter_gemm_afp4wfp4_pre_quant",
+        op_func=_aiter_gemm_afp4wfp4_pre_quant,
+        mutates_args=["y"],
+        fake_impl=_aiter_gemm_afp4wfp4_pre_quant_fake,
+    )
+
+    def gemm_afp4wfp4_pre_quant(x, w, w_scales, dtype, y):
+        torch.ops.sglang.aiter_gemm_afp4wfp4_pre_quant(x, w, w_scales, y)
+
+    def _aiter_dynamic_mxfp4_quant(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _dynamic_mxfp4_quant_orig(x)
+
+    def _aiter_dynamic_mxfp4_quant_fake(
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        M, N = x.shape
+        x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+        blockscale = torch.empty(
+            (M, (N + 31) // 32), dtype=torch.uint8, device=x.device
+        )
+        return x_fp4, blockscale
+
+    direct_register_custom_op(
+        op_name="aiter_dynamic_mxfp4_quant",
+        op_func=_aiter_dynamic_mxfp4_quant,
+        mutates_args=[],
+        fake_impl=_aiter_dynamic_mxfp4_quant_fake,
+    )
+
+    def dynamic_mxfp4_quant(x):
+        return torch.ops.sglang.aiter_dynamic_mxfp4_quant(x)
+
+    def _aiter_fused_gemm_split_cat(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        y: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        S1: int,
+        S2: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _fused_gemm_afp4wfp4_split_cat_orig(
+            x=x,
+            w=w,
+            y=y,
+            x_scale=x_scale,
+            w_scale=w_scale,
+            S1=S1,
+            S2=S2,
+            dtype=y.dtype,
+        )
+
+    def _aiter_fused_gemm_split_cat_fake(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        y: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        S1: int,
+        S2: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        M = x.shape[0]
+        D = y.shape[1]
+        S3 = y.shape[2]
+        c1 = torch.empty((M, D, S1 + S3), dtype=y.dtype, device=x.device)
+        c2 = torch.empty((M, D, S2), dtype=y.dtype, device=x.device)
+        return c1, c2
+
+    direct_register_custom_op(
+        op_name="aiter_fused_gemm_split_cat",
+        op_func=_aiter_fused_gemm_split_cat,
+        mutates_args=[],
+        fake_impl=_aiter_fused_gemm_split_cat_fake,
+    )
+
+    def fused_gemm_afp4wfp4_split_cat(x, w, y, x_scale, w_scale, S1, S2, dtype):
+        return torch.ops.sglang.aiter_fused_gemm_split_cat(
+            x, w, y, x_scale, w_scale, S1, S2
+        )
 
 
 __all__ = ["QuarkW4A4MXFP4"]

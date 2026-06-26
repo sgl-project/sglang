@@ -253,7 +253,7 @@ class ExpertLocationMetadata:
 
     def update(
         self,
-        other: "ExpertLocationMetadata",
+        other: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
         for field in [

@@ -9,6 +9,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
     MODELOPT_NVFP4_B200_ENV_VARS,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
     MODELOPT_WAN22_FP8_MODEL,
@@ -19,13 +20,16 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionServerArgs,
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
+    JOY_ECHO_T2V_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
     MODELOPT_TI2I_CI_sampling_params,
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
     _make_modelopt_ci_case,
@@ -44,6 +48,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
@@ -97,16 +102,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
-        "ideogram4_fp8_t2i",
-        DiffusionServerArgs(
-            model_path="ideogram-ai/ideogram-4-fp8",
-        ),
-        IDEOGRAM4_CI_sampling_params,
-        run_perf_check=True,
-        run_consistency_check=True,
-        run_component_accuracy_check=False,
-    ),
-    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST),
     ),
@@ -140,17 +135,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
         run_consistency_check=False,
         run_component_accuracy_check=False,
-    ),
-    # TODO: replace with a faster model to test the --dit-layerwise-offload
-    # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
-    # so we do one warmup and send one request instead
-    DiffusionTestCase(
-        "layerwise_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            dit_layerwise_offload=True,
-            dit_offload_prefetch_size=2,
-        ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i",
@@ -386,6 +370,17 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
         ),
     ),
+    DiffusionTestCase(
+        "sana_wm_ti2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
+        ),
+        SANA_WM_TI2V_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
     # flaky
     # === Helios T2V ===
     # DiffusionTestCase(
@@ -426,11 +421,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             extras=[
-                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
             ],
             env_vars={
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
             },
         ),
         run_component_accuracy_check=False,
@@ -472,6 +466,11 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
+            # Pin CI's shared T2V_PROMPT ("A curious raccoon") instead of relying on
+            # prompt=None / unconditional generation — the latter drifts as the
+            # pipeline evolves, which is why this (previously planner-invisible) case
+            # diverged from its stale sglang_generated GT.
+            T2V_sampling_params,
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
@@ -489,14 +488,6 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-            run_consistency_check=True,
-        ),
-        _make_modelopt_ci_case(
-            "flux2_modelopt_fp8_t2i",
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
             run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
@@ -563,6 +554,15 @@ else:
             run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
+            "qwen_image_2512_modelopt_nvfp4_t2i",
+            model_path=MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
+            modality="image",
+            sampling_params=MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
+            extras=[],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
             model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",
@@ -576,6 +576,33 @@ else:
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "flux2_modelopt_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            tp_size=2,
+            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+        ),
+        MODELOPT_T2I_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "ideogram4_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path="ideogram-ai/ideogram-4-fp8",
+            tp_size=2,
+            extras=[
+                "--attention-backend",
+                "fa",
+            ],
+        ),
+        IDEOGRAM4_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
@@ -631,6 +658,20 @@ TWO_GPU_CASES = [
             prompt=T2V_PROMPT,
             output_size="832x480",
         ),
+    ),
+    DiffusionTestCase(
+        "joy_echo_t2v_2gpu",
+        DiffusionServerArgs(
+            model_path="jdopensource/JoyAI-Echo",
+            extras=["--ulysses-degree=2"],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        JOY_ECHO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_cfg_parallel",

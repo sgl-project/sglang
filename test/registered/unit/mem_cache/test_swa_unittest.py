@@ -27,6 +27,10 @@ register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
+def _event_hashes(events):
+    return [block_hash for event in events for block_hash in event.block_hashes]
+
+
 class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
@@ -172,9 +176,9 @@ class TestSWA(unittest.TestCase):
 
         result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
         self.assertGreaterEqual(result.num_tokens_evicted, 1)
-        removed_hashes = [
-            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
-        ]
+        removed_hashes = _event_hashes(
+            [e for e in tree.take_events() if isinstance(e, BlockRemoved)]
+        )
         self.assertCountEqual(removed_hashes, stored_hashes)
 
     def test_swa_radix_cache_kv_events_split_hash(self):
@@ -245,6 +249,30 @@ class TestSWA(unittest.TestCase):
         alloc.free_swa(index)
         result = alloc.translate_loc_from_full_to_swa(index)
         print(result)
+
+    def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        self.assertEqual(allocator.swa_available_size(), 16 - page_size)
+
+        allocator.free_swa(full_indices[:1])
+        self.assertEqual(allocator.swa_available_size(), 16)
+        self.assertTrue(
+            torch.all(
+                allocator.full_to_swa_index_mapping[full_indices.to(torch.int64)] == 0
+            )
+        )
+
+        allocator.free_swa(full_indices[1:2])
+        self.assertEqual(allocator.swa_available_size(), 16)
 
     def test_swa_radix_cache_1(self):
         # args
