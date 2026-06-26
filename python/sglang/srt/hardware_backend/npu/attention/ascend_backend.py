@@ -318,7 +318,6 @@ class AscendAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
-        self.use_graph_swa_mask = True
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -534,20 +533,19 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            if self.use_graph_swa_mask:
-                # SWA mask: True = masked out (don't attend), False = attend.
-                # Pre-allocated at max size, sliced per batch size during capture,
-                # content updated via copy_() during replay.
-                self.graph_metadata["swa_mask"] = torch.ones(
-                    (max_bs, 1, total_context_len),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
-                # Pre-allocated index buffer for mask generation during replay,
-                # avoids torch.arange allocation on every replay step.
-                self.graph_metadata["swa_indices"] = torch.arange(
-                    total_context_len, device=self.device, dtype=torch.int32
-                )
+            # SWA mask: True = masked out (don't attend), False = attend.
+            # Pre-allocated at max size, sliced per batch size during capture,
+            # content updated via copy_() during replay.
+            self.graph_metadata["swa_mask"] = torch.ones(
+                (max_bs, 1, total_context_len),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            # Pre-allocated index buffer for mask generation during replay,
+            # avoids torch.arange allocation on every replay step.
+            self.graph_metadata["swa_indices"] = torch.arange(
+                total_context_len, device=self.device, dtype=torch.int32
+            )
         if self.use_sliding_window_kv_pool:
             # refilled in place at replay; the captured graph reads this storage
             self.swa_out_cache_loc_buf = torch.zeros(
@@ -578,8 +576,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
-            if self.use_graph_swa_mask:
-                metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
+            metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
@@ -679,18 +676,17 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
 
-            if self.use_graph_swa_mask:
-                # Update SWA mask: True = masked out, False = attend.
-                seq_lens_int = seq_lens_cpu[:bs].int()
-                starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-                indices = self.graph_metadata["swa_indices"]
-                start_exp = starts.unsqueeze(1).to(self.device)
-                seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
-                mask = (indices.unsqueeze(0) < start_exp) | (
-                    indices.unsqueeze(0) >= seq_exp
-                )
-                metadata.swa_mask[:bs, 0, :].copy_(mask)
-                metadata.swa_mask[bs:, :, :].fill_(True)
+            # Update SWA mask: True = masked out, False = attend.
+            seq_lens_int = seq_lens_cpu[:bs].int()
+            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
+            indices = self.graph_metadata["swa_indices"]
+            start_exp = starts.unsqueeze(1).to(self.device)
+            seq_exp = seq_lens_int.unsqueeze(1).to(self.device)
+            mask = (indices.unsqueeze(0) < start_exp) | (
+                indices.unsqueeze(0) >= seq_exp
+            )
+            metadata.swa_mask[:bs, 0, :].copy_(mask)
+            metadata.swa_mask[bs:, :, :].fill_(True)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
             self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
             // self.page_size
