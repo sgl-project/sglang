@@ -2115,7 +2115,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_trtllm_moe
+            or get_moe_runner_backend().is_flashinfer_megamoe()
+        ):
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2135,7 +2138,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_trtllm_moe
+            or get_moe_runner_backend().is_flashinfer_megamoe()
+        ):
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2256,7 +2262,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return
 
         # Calculate input scales based on strategy
-        if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
+        if (
+            self.enable_flashinfer_cutlass_moe
+            or self.enable_flashinfer_trtllm_moe
+            or moe_runner_backend.is_flashinfer_megamoe()
+        ):
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         elif self.enable_flashinfer_cutedsl_moe:
@@ -2384,6 +2394,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
+
+        if moe_runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                build_flashinfer_nvfp4_megamoe_layer,
+            )
+
+            build_flashinfer_nvfp4_megamoe_layer(layer)
+            return
 
         # Weight processing based on strategy
         if (
@@ -2553,8 +2571,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "moe_runner_backend=cutlass is not supported for NVFP4 MoE. "
                 "Use --moe-runner-backend flashinfer_cutlass instead."
             )
-
-        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        if not moe_runner_backend.is_flashinfer_megamoe():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def get_marlin_quant_info(self, layer: torch.nn.Module):
         """Marlin payload for the fp4-marlin (W4A16) fallback; the weights were
@@ -2604,6 +2622,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in _SUPPORTED_ACT_STRS
         ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
         moe_runner_config = self.moe_runner_config
+
+        if moe_runner_backend.is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                run_flashinfer_megamoe,
+            )
+
+            return run_flashinfer_megamoe(layer, dispatch_output)
 
         if moe_runner_backend.is_marlin():
             quant_info = self.get_marlin_quant_info(layer)
