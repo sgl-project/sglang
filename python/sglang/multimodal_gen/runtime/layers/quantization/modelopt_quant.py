@@ -593,30 +593,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
 
-        _, flashinfer_backend = _get_fp4_gemm_op()
-        uses_flux1_scale_layout = not getattr(
-            self.quant_config, "checkpoint_uses_packed_qkv", False
-        ) and getattr(layer, "prefix", "").startswith(
-            ("transformer_blocks.", "single_transformer_blocks.")
+        # The trtllm backend returned above with its own scale shuffle, so every
+        # GEMM consumer that reaches this point expects the TMA blockscale
+        # layout: the sgl_kernel CUTLASS fallback (backend is None) and flashinfer
+        # cutlass/cudnn/auto. The latter covers FLUX.1 transformer blocks as well
+        # as packed-qkv checkpoints such as FLUX.2 (which CI only ever exercised
+        # via trtllm on B200, so this case was previously missed and produced a
+        # corrupted latent on sm_120). Every reachable backend needs it, so always
+        # permute.
+        padded_scales = padded_scales.reshape(
+            B, M_padded // 128, 4, 32, K_padded // 4, 4
         )
-        # The trtllm backend already returned above with its own scale shuffle,
-        # so every GEMM consumer that reaches this point expects the TMA
-        # blockscale layout: the sgl_kernel CUTLASS fallback (flashinfer_backend
-        # is None), the FLUX.1 cutlass/cudnn path (uses_flux1_scale_layout), and
-        # also flashinfer cutlass/cudnn/auto for packed-qkv checkpoints such as
-        # FLUX.2 (which CI only ever exercised via trtllm on B200, so this case
-        # was previously missed and produced a corrupted latent on sm_120).
-        needs_tma_scale_layout = (
-            flashinfer_backend is None
-            or uses_flux1_scale_layout
-            or flashinfer_backend in ("cutlass", "cudnn", "auto")
-        )
-        if needs_tma_scale_layout:
-            # CUTLASS / CUDNN / auto paths need the TMA scale layout.
-            padded_scales = padded_scales.reshape(
-                B, M_padded // 128, 4, 32, K_padded // 4, 4
-            )
-            padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
+        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
 
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
