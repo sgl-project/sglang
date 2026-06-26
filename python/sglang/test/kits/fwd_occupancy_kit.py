@@ -157,13 +157,18 @@ class FwdOccupancyMixin:
         (e.g. a long-running eval batch) silently corrupts it. Fails
         loudly instead of emitting a bogus regression."""
         deadline = time.perf_counter() + _IDLE_WAIT_TIMEOUT
+        num_reqs = -1
         while time.perf_counter() < deadline:
             try:
-                load = requests.get(
+                resp = requests.get(
                     self.base_url + "/get_load", timeout=_METRICS_REQUEST_TIMEOUT
-                ).json()
+                )
+                resp.raise_for_status()
+                load = resp.json()
             except (requests.RequestException, ValueError):
-                load = []
+                # Transient scrape failure -- retry, don't assume idle.
+                time.sleep(_IDLE_POLL_INTERVAL)
+                continue
             num_reqs = sum(dp.get("num_reqs", 0) for dp in load)
             if num_reqs == 0:
                 return
@@ -202,7 +207,10 @@ class FwdOccupancyMixin:
             v, running = self._scrape_fwd_occupancy()
             if v is not None and running is not None:
                 if running > 1:
-                    firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
+                    # Don't wait the full request timeout for our own
+                    # request to drain -- the daemon thread dies with the
+                    # process; surface the violation immediately.
+                    request_done.set()
                     raise AssertionError(
                         f"single-batch invariant violated: {running} reqs running "
                         f"during measurement (expected 1). fwd_occupancy is a bs=1 "
