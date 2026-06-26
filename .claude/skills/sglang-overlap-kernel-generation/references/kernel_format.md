@@ -8,21 +8,7 @@ All low-level PTX inline assembly helpers needed by the kernel. These are self-c
 
 **The canonical implementations live in `references/primitives.md`.** Read that file to get the exact code for each helper. Copy only the primitives the kernel actually uses into this section.
 
-Available primitives (choose based on mode):
-
-| Category | Primitives | Used by |
-|----------|-----------|---------|
-| Thread/block ID | `_get_flat_tid`, `_get_flat_bid` | all in-kernel modes |
-| GPU-scope atomics | `_atomic_add_release`, `_load_acquire`, `_store_release_with_highbit` | intra-sm (grid barrier) |
-| System-scope CAS | `_cas_sys_release`, `_cas_sys_acquire` | intra-sm only |
-| Per-tile signals | `_send_signal`, `_wait_signal` | inter-sm only |
-| CTA-Grid barrier | `barrier_on_this_grid` | intra-sm |
-| Cross-rank barrier (in-kernel) | `barrier_all_intra_node_atomic_cas_block` | intra-sm only |
-| Cross-rank barrier (host-side) | `symm_mem_hdl.barrier()` | inter-sm, without-sm (around `signal.zero_()`) |
-| Signal polling/writing (without-sm) | `ld_sys`, `st_sys`, `__syncthreads`, `tid` | without-sm only (defined in `without_sm.md`) |
-| CE-side signal ops (without-sm) | `stream_write_value32`, `cuStreamWaitValue32` | without-sm only (host-side, in `without_sm.md`) |
-
-See `primitives.md` §8 for the full mode-to-primitive mapping.
+See `primitives.md` §8 for the authoritative mode-to-primitive mapping. Copy only the primitives the kernel actually uses into this section.
 
 ## Section 2: Context Dataclass & Initialization
 
@@ -82,7 +68,8 @@ class <Op>OverlapContext:
         # Allocate signal tensor for two-stream tile-level sync (one slot per tile, reused across calls)
         # Size based on max possible tiles: cdiv(max_M, block_m) * cdiv(N, block_n)
         # Reset to 0 before each kernel launch via signal.zero_()
-        # self.signal = torch.zeros(max_total_tiles, dtype=torch.int32, device=device)
+        # self.signal = torch.zeros(max_total_tiles, dtype=torch.uint32, device=device)
+        # Note: without-sm mode MUST use uint32 for cuStreamWriteValue32 compatibility;
         # 1. Allocate symmetric buffer via symm_mem.empty()
         #    IMPORTANT: The symm_mem buffer shape must match the collective communication's
         #    data layout, NOT the compute kernel's input/output shape. The buffer is the

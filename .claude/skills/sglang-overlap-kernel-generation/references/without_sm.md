@@ -45,7 +45,7 @@ before the write, guaranteeing that all prior `copy_()` operations on that strea
 visible before the signal value becomes `1`.
 
 **Comm-First**: After the CE copies data from a peer, it writes `1` to the progress tensor
-via `hdl.stream_write_value32`. The compute kernel polls via `ld_sys`.
+via `hdl.stream_write_value32` or `from torch._C._distributed_c10d import _SymmetricMemory _SymmetricMemory.stream_write_value32`. The compute kernel polls via `ld_sys`.
 
 **Comp-First**: The compute kernel writes `1` to a signal slot via `st_sys` after each
 tile's stores complete. The CE stream enqueues `cuStreamWaitValue32` — a GPU-side hardware
@@ -68,9 +68,9 @@ contiguous uint32 tensor.` Always double-check that the signal tensor is `uint32
 Without-sm does NOT use `_send_signal` / `_wait_signal` / `barrier_all_intra_node_atomic_cas_block`.
 Instead, it uses the following from `primitives.md`:
 
-- **Kernel-side**: `ld_sys`, `st_sys`, `tid(axis)`, `__syncthreads` (§2 & §5)
-- **CE-side (host)**: `hdl.stream_write_value32` (comm-first) or `cuda.bindings.driver.cuStreamWaitValue32` (comp-first)
-- **Cross-rank sync**: `symm_mem_hdl.barrier()` (§6.4) between iterations
+- **Kernel-side**: `ld_sys`, `st_sys`, `_get_flat_tid`, `__syncthreads` (§1 & §4)
+- **CE-side (host)**: `_SymmetricMemory.stream_write_value32` (comm-first) or `cuda.bindings.driver.cuStreamWaitValue32` (comp-first)
+- **Cross-rank sync**: `symm_mem_hdl.barrier()` (§5.4) between iterations
 
 ---
 
@@ -93,7 +93,7 @@ as they arrive.
 | `ag_hdl` | handle | `rendezvous(symm_ag_a_buf)`. |
 | `splits_per_rank` | `int` | Number of chunk splits per rank (≥1). Higher = finer overlap. |
 
-The `progress` tensor is a regular local device tensor — it does not need to be in
+The `progress` tensor can be a regular local device tensor — it does not need to be in
 symmetric memory because it is only written by the local CE (via `stream_write_value32`)
 and read by the local compute kernel (via `ld_sys`).
 
@@ -109,7 +109,7 @@ def cp_engine_full_mesh_pull_ag(
     symm_input: torch.Tensor,              # this rank's [M_local, K] shard (view into symm_input_buf[rank])
     symm_ag_output: torch.Tensor,          # local [M_local * world_size, K] gathered buffer
     peer_symm_input_bufs: List[torch.Tensor],  # peer views: peer_symm_input_bufs[i] is rank i's symm_input_buf
-    ag_signal: torch.Tensor,               # local ag_signal [world_size] int32
+    ag_signal: torch.Tensor,               # local ag_signal [world_size] uint32
 ):
     """
     AllGather via Copy Engine (full-mesh pull).
@@ -159,7 +159,7 @@ is controlled by `splits_per_rank`: `=1` means one signal per rank (per-rank), `
 one signal per chunk within each rank (per-chunk). Local data (this rank's own shard) needs
 no waiting — the signal is already set to 1 for all local chunks.
 
-**Critical**: Only **one thread** (threadIdx.x == 0) polls the signal via `ld_sys`. After
+**Critical**: Only **one thread** (`_get_flat_tid() == 0`) polls the signal via `ld_sys`. After
 the poll exits, `__syncthreads()` ensures all threads in the CTA see the signal before
 proceeding. If all threads poll independently, each thread issues its own
 `ld.global.acquire.sys` — wasting memory bandwidth and adding unnecessary synchronization
@@ -209,9 +209,9 @@ def consumer_gemm_kernel(
     pid_m = (src_rank * splits_per_rank + split_id) * M_split_tiles + tile_in_chunk
 
     # Poll signal for this chunk (system-scope acquire load).
-    # Only tid(0) polls; __syncthreads() broadcasts the result.
+    # Only _get_flat_tid()==0 polls; __syncthreads() broadcasts the result.
     signal_idx = src_rank * splits_per_rank + split_id
-    if tid(0) == 0:
+    if _get_flat_tid() == 0:
         while ld_sys(signal_ptr + signal_idx) != 1:
             pass
     __syncthreads()
@@ -231,7 +231,7 @@ def consumer_gemm_kernel(
   System-scope acquire is required because the signal was written by the CE
   (`cuStreamWriteValue32`); plain `tl.load` has no cross-device visibility guarantee
   and may read stale L2 cache data.
-- Only `tid(0) == 0` polls to reduce `ld.global.acquire.sys` traffic to 1-per-CTA.
+- Only `_get_flat_tid() == 0` polls to reduce `ld.global.acquire.sys` traffic to 1-per-CTA.
 - Chunk-aware rotation ensures CTAs for the local shard process first (signal
   already set), then peers in the same rotated order as the CE AG helper — minimizing
   spin-wait time.
@@ -305,22 +305,6 @@ Example: GEMM (compute) → ReduceScatter (CE). The compute kernel writes per-ti
 as tiles complete; the CE stream enqueues `cuStreamWaitValue32` + `copy_()` per tile to
 pipeline copies behind computation.
 
-### Anti-patterns
-
-❌ **Host-side CPU spin-wait** — each `.item()` call triggers GPU→CPU sync (~5–50 μs),
-and `pass` in the loop burns a CPU core at 100%:
-```python
-# ❌ BAD: CPU spin-wait — D2H latency × num_tiles
-for tile_id in range(num_tiles):
-    while signal_pad[tile_id].item() != 1:
-        pass
-    issue_ce_copy(tile_id)
-```
-
-❌ **Chunked kernel launch + CUDA event** — per-chunk kernel launch overhead is
-prohibitively expensive for fine-grained tile-level overlap. The whole point of
-without-sm is a single compute kernel launch with CE pipelining behind it.
-
 ### Recommended: GPU-side signal + `cuStreamWaitValue32`
 
 Single compute kernel launch. Each CTA writes a per-tile signal via `st_sys`
@@ -345,7 +329,7 @@ def compute_kernel_with_push_signal(
     # After all tile stores are done, signal this tile's completion.
     # st_sys = st.global.release.sys.b32 — ensures tile data is visible before signal.
     # Only one thread per CTA needs to write the signal.
-    if tid(0) == 0:
+    if _get_flat_tid() == 0:
         st_sys(signal_pad_ptr + pid, 1)
 ```
 
@@ -505,10 +489,3 @@ hdl.barrier()              # all ranks see reset before launching
 # Sync pattern (after each iteration):
 current_stream.wait_stream(ce_stream)   # wait for CE to finish
 ```
-
-**Why not in-kernel barriers?** In without-sm mode, the compute kernel and CE stream
-run as separate entities with no shared in-kernel phase after communication. The
-barrier needs to happen on the host side between iterations. Using in-kernel
-`barrier_all_intra_node_atomic_cas_block` is incorrect here — there is no single
-kernel that encompasses both compute and communication. Use host-side
-`symm_mem_hdl.barrier()` instead (see `primitives.md` §6.4).

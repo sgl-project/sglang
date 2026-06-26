@@ -211,10 +211,10 @@ These checks prevent `CUDA error: an illegal memory access was encountered`. Thi
 | **tl.constexpr strides** | Stride parameters are declared as `tl.constexpr` so the compiler can optimize address calculations at compile time |
 | **Incremental pointer update** | topk/reduction loops use `tl.static_range` + `ptr + j * stride` instead of recomputing full addresses each iteration |
 | **Input layout flattening** | 3D inputs like `[M, topk, N]` are flattened to `[M*topk, N]` for contiguous memory access in the topk dimension |
-| **Master CTA barrier** | `barrier_on_this_grid` uses the master CTA pattern (bid==0 spins, others wait for high bit) with a single `tl.debug_barrier()`, not the naive 3-barrier pattern (see `primitives.md` §6.2) |
-| **Multi-threaded CAS barrier** | `barrier_all_intra_node_atomic_cas_block` uses `flat_tid < world_size` for parallel peer signaling, not single-threaded serial iteration (see `primitives.md` §6.3) |
-| **Cross-rank barrier placement** | In-kernel `barrier_all_intra_node_atomic_cas_block` is only needed when the kernel has a subsequent phase after communication (intra-sm). For inter-sm and without-sm, use host-side `symm_mem_hdl.barrier()` around `signal.zero_()` instead — the comm kernel exits once communication is done, so no in-kernel cross-rank sync is required. See `primitives.md` §6.3 for the in-kernel barrier and §6.4 for the host-side barrier |
-| **PTX-level CAS spin-loop** | `_cas_sys_release`/`_cas_sys_acquire` have the spin-loop inside PTX (`@!%p0 bra cas_loop`), not in Python-level `while` loops (see `primitives.md` §4) |
+| **Master CTA barrier** | `barrier_on_this_grid` uses the master CTA pattern (bid==0 spins, others wait for high bit) with a single `tl.debug_barrier()`, not the naive 3-barrier pattern (see `primitives.md` §5.2) |
+| **Multi-threaded CAS barrier** | `barrier_all_intra_node_atomic_cas_block` uses `flat_tid < world_size` for parallel peer signaling, not single-threaded serial iteration (see `primitives.md` §5.3) |
+| **Cross-rank barrier placement** | In-kernel `barrier_all_intra_node_atomic_cas_block` is only needed when the kernel has a subsequent phase after communication (intra-sm). For inter-sm and without-sm, use the host-side `barrier() → signal.zero_() → barrier()` pattern (two barriers flanking the reset, not just one) instead — the comm kernel exits once communication is done, so no in-kernel cross-rank sync is required. See `primitives.md` §5.3 for the in-kernel barrier and §5.4 for the host-side barrier |
+| **PTX-level CAS spin-loop** | `_cas_sys_release`/`_cas_sys_acquire` have the spin-loop inside PTX (`@!%p0 bra cas_loop`), not in Python-level `while` loops (see `primitives.md` §3) |
 | **Auto block size** | `BLOCK_M`/`BLOCK_N` default to `None` and are auto-computed based on problem size: `BLOCK_N = next_power_of_2(N_per_chunk)`, `BLOCK_M = next_power_of_2(16K / BLOCK_N / element_size)` |
 
 If any check fails, fix the generated kernel before proceeding.
@@ -226,9 +226,10 @@ Generate a test file with four modes: `correctness`, `performance`, `multi_size`
 The performance test must separately benchmark:
 1. **Compute-only**: the compute kernel in isolation
 2. **Comm-only**: the collective (NCCL) in isolation
-3. **Overlap**: the fused overlap kernel
+3. **Non-overlap**: compute + comm sequentially (no overlap)
+4. **Overlap**: the fused overlap kernel
 
-This enables calculating **overlap efficiency** = `max(compute_time, comm_time) / overlap_time`.
+This enables calculating **speedup** = `(compute_time + comm_time) / overlap_time` and **overlap efficiency** = `max(compute_time, comm_time) / overlap_time` (how close to the ideal of fully overlapping compute and comm).
 
 Read `references/benchmark_template.md` for the complete test file structure, argument conventions, and output format.
 

@@ -82,7 +82,7 @@ One instruction → NVSwitch reads the value at this offset from every rank, sum
 - **Zero SM occupancy for the comm itself.** Compute can keep using the same warps; the switch does the broadcast / reduction.
 - **Bandwidth-optimal.** `multimem.st` consumes 1× NVLink BW for an N-rank broadcast (vs. N-1×). `multimem.ld_reduce` returns reduced data, saving (N-1)/N of the ingress BW.
 - **Alignment-sensitive.** Misaligned `ptr` produces undefined behaviour; the v4 path requires 16 B alignment of both `ptr` and the multicast region's base.
-- **Visibility model.** Multimem is a memory operation, not a barrier. Producer/consumer ordering across ranks **still requires** the same cross-rank barriers you would use with `tl.store` (see §C.5).
+- **Visibility model.** Multimem is a memory operation, not a barrier — cross-rank barriers are still required. See §C.6 for details.
 
 ---
 

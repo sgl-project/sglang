@@ -221,8 +221,8 @@ def w8a8_block_fp8_matmul_triton(
 | `BLOCK_SIZE_N` | 128 | Match `group_n` for clean B-scale indexing |
 | `BLOCK_SIZE_K` | 128 | Match `group_k` for clean A-scale stepping |
 | `GROUP_SIZE_M` | 32 | L2 swizzle group; 32 is a good default |
-| `num_warps` | 4 | Standard for matmul kernels |
-| `num_stages` | 3 | Software pipelining for memory latency hiding |
+| `num_warps` | 4 | Standard for **standalone** matmul kernels (compute-bound). When the FP8 GEMM is embedded **inside an overlap kernel** (intra-sm, without-sm), the outer kernel is memory-bound and should use `num_warps=32` per the SKILL.md Performance Checks. The two settings apply at different levels: the matmul inner loop benefits from 4 warps (more SM occupancy for tensor cores), while the overlap wrapper needs 32 warps (hide memory latency for signal polling / barriers). |
+| `num_stages` | 3 | Standard for standalone matmul (software pipelining). When embedded in an overlap kernel, `num_stages=1` is used for the outer wrapper (simple load/store patterns, no pipelining). |
 
 When `BLOCK_SIZE_K == group_k`, the scale stepping logic simplifies: scales advance every K-tile, and `n_tiles_k_per_group_k == 1`.
 
