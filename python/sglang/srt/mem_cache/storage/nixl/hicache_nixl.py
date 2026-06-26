@@ -157,6 +157,7 @@ class HiCacheNixl(HiCacheStorage):
         self._bounce_get: Optional[torch.Tensor] = None
         self._bounce_page_bytes: Optional[int] = None
         self._hybrid_pool_ctx: dict[PoolName, _HybridPoolContext] = {}
+        self.registered_pools: dict[PoolName, HostKVCache] = {}
         cleanup_dirs = (
             self.file_manager.iter_all_base_dirs()
             if self.file_manager is not None
@@ -462,6 +463,15 @@ class HiCacheNixl(HiCacheStorage):
     def _get_hybrid_zero_copy_buffers(
         self, transfer: PoolTransfer, ctx: _HybridPoolContext
     ) -> tuple[List[str], List[tuple], int]:
+        """Build NIXL keys and memory descriptors for zero-copy hybrid transfers.
+
+        The host pool returns one or more physical buffers per logical cache page
+        depending on the pool type, for example K/V buffers for SWA or temporal
+        plus convolution buffers for Mamba. This helper expands each logical page
+        key into component-level storage keys, validates that the expanded keys
+        match the host-pool metadata, and returns `(key_strs, host_buffers,
+        key_multiplier)`.
+        """
         ptr_list, size_list = ctx.host_pool.get_page_buffer_meta(transfer.host_indices)
         page_num = len(transfer.keys or [])
         if page_num == 0 or len(ptr_list) % page_num != 0:
@@ -852,7 +862,7 @@ class HiCacheNixl(HiCacheStorage):
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
-            if transfer.name not in getattr(self, "registered_pools", {}):
+            if transfer.name not in self.registered_pools:
                 final_pages = 0
                 break
 
