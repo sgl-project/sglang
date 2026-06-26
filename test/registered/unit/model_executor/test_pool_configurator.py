@@ -130,7 +130,7 @@ def _make_model_runner(
     mr.layer_info = SimpleNamespace(
         start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
     )
-    mr.ps = SimpleNamespace(dp_size=1, pp_size=1)
+    mr.ps = SimpleNamespace(dp_size=1, attn_dp_size=1, pp_size=1)
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None, dflash_draft_num_layers=None
