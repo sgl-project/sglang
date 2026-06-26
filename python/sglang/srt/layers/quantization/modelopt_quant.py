@@ -2562,15 +2562,12 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
 
         # Fallback: reconstruct the bf16 weight from the stored MX block scales
         # (w_bf16 = fp8_weight * 2^(E8M0-127), per BLOCK along K) and drop the scale.
+        # E8M0 (bias 127) reinterpreted as float8_e8m0fnu casts to the 2^k multiplier;
+        # repeat_interleave expands each block scale across its BLOCK input columns.
         layer.use_fused_mxfp8 = False
-        w = layer.weight.data  # float8_e4m3fn [out, in]
-        out_f, in_f = w.shape
-        # uint8 E8M0 (bias 127) reinterpreted as float8_e8m0fnu casts to the 2^k value.
-        scale = layer.weight_scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
-        w_bf16 = (
-            w.to(torch.float32).view(out_f, in_f // self.BLOCK, self.BLOCK)
-            * scale.unsqueeze(-1)
-        ).view(out_f, in_f).to(torch.bfloat16)
+        w = layer.weight.data.float()  # float8_e4m3fn -> f32 [out, in]
+        scale = layer.weight_scale.data.view(torch.float8_e8m0fnu).float()
+        w_bf16 = (w * scale.repeat_interleave(self.BLOCK, dim=1)).to(torch.bfloat16)
         layer.weight = Parameter(w_bf16, requires_grad=False)
         del layer.weight_scale
 
