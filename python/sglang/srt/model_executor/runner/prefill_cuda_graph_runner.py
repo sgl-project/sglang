@@ -98,15 +98,22 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def prefill_failure_msg(backend_name: str) -> str:
     """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
-    suggestion plugged into its {} placeholder. Empty hint when no backend
-    is selected so the rest of the template still renders cleanly."""
+    numbered suggestion list. The runner is only constructed for BREAKABLE
+    or TC_PIECEWISE; other values fall back to a generic OOM-style list."""
     if backend_name == Backend.BREAKABLE:
         hint = BCG_FAILURE_HINT
     elif backend_name == Backend.TC_PIECEWISE:
         hint = TCPCG_FAILURE_HINT
     else:
-        hint = ""
-    return PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(hint)
+        hint = (
+            "1. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled\n"
+            "2. if it is an OOM problem, set --mem-fraction-static to a smaller value "
+            "(e.g., 0.8 or 0.7) or set --cuda-graph-max-bs-prefill to a smaller value "
+            "(e.g., 2048)\n"
+        )
+    return PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
+        backend=backend_name, suggestions=hint
+    )
 
 
 # Names of the static prefill input tensors a Breakable-backed prefill

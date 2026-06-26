@@ -34,10 +34,13 @@ def enable_breakable_cuda_graph():
         _in_breakable_cuda_graph = False
 
 
-# Backend-specific suggestion plugged into PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG
-# when the failing prefill backend is BCG. Kept as a small piece of text so the
-# overall message template lives in runner_backend_utils/__init__.py.
+# Numbered suggestion list plugged into PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG
+# when the failing prefill backend is BCG. The overall message template lives
+# in runner_backend_utils/__init__.py.
 BCG_FAILURE_HINT = (
-    "- switch to the tc_piecewise prefill CUDA graph backend by "
-    "--cuda-graph-backend-prefill=tc_piecewise\n"
+    "1. change to tc_piecewise by --cuda-graph-backend-prefill=tc_piecewise\n"
+    "2. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled\n"
+    "3. if it is an OOM problem, set --mem-fraction-static to a smaller value "
+    "(e.g., 0.8 or 0.7) or set --cuda-graph-max-bs-prefill to a smaller value "
+    "(e.g., 2048)\n"
 )
