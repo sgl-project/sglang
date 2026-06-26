@@ -1095,7 +1095,7 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: Optional[List[int]] = None,
+        extend_seq_lens_cpu: List[int],
     ) -> None:
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1112,9 +1112,7 @@ class DeepseekV4HipRadixBackend(
         # back from the GPU: the tensor-repeats form otherwise forces a D2H sync
         # that serializes batch N execution with batch N+1 scheduling. (Matches
         # the CUDA backend _expand_prefill_casually_vectorized.)
-        output_size = (
-            int(sum(extend_seq_lens_cpu)) if extend_seq_lens_cpu is not None else None
-        )
+        output_size = sum(extend_seq_lens_cpu)
         bid = torch.repeat_interleave(
             torch.arange(bs, device=device, dtype=torch.int64),
             extend_seq_lens,
