@@ -526,11 +526,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_specific_adjustment()
 
         # Set the global server_args in the scheduler process
-        set_global_server_args_for_scheduler(server_args)
-        global_server_args = get_global_server_args()
-
-        # FIXME: hacky set `use_mla_backend`
-        global_server_args.use_mla_backend = self.use_mla_backend
+        self.maybe_init_global_server_args(server_args)
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -1159,6 +1155,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
                     f"You can fix this by setting arguments `--tp` and `--ep` correctly."
                 )
+
+    def maybe_init_global_server_args(self, server_args: ServerArgs):
+        # Draft workers share the process with their target and must not clobber
+        # the global server_args with their own (possibly mutated) copy.
+        if self.is_draft_worker:
+            return
+        set_global_server_args_for_scheduler(server_args)
+        # FIXME: hacky set `use_mla_backend`
+        get_global_server_args().use_mla_backend = self.use_mla_backend
 
     def init_torch_distributed(self):
         tic = time.perf_counter()

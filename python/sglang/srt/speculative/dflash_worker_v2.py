@@ -15,11 +15,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.server_args import (
-    ServerArgs,
-    get_global_server_args,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -143,7 +139,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
-        saved_server_args = get_global_server_args()
         self._draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
@@ -156,7 +151,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             nccl_port=nccl_port,
             is_draft_worker=True,
         )
-        set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
