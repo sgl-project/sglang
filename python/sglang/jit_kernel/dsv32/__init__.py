@@ -1,4 +1,4 @@
-"""DeepSeek-V3.2 only."""
+"""DSA only."""
 
 from .elementwise import (
     fused_k_indexer_norm_rope,

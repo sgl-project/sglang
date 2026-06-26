@@ -1,4 +1,4 @@
-"""DeepSeek-V3.2 only. DSA indexer K kernels (JIT)."""
+"""DSA only. Indexer K kernels (JIT)."""
 
 import torch
 
@@ -9,8 +9,6 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 
-from .utils import make_name
-
 _CUDA_FILE = "deepseek_v32/indexer_k.cuh"
 
 
@@ -18,7 +16,7 @@ _CUDA_FILE = "deepseek_v32/indexer_k.cuh"
 def _jit_k_indexer_norm_rope_module(dtype: torch.dtype):
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
-        make_name("k_indexer_norm_rope"),
+        "dpsk_v32_k_indexer_norm_rope",
         *args,
         cuda_files=[_CUDA_FILE],
         cuda_wrappers=[
@@ -31,7 +29,7 @@ def _jit_k_indexer_norm_rope_module(dtype: torch.dtype):
 def _jit_k_indexer_norm_rope_store_module(dtype: torch.dtype, page_size: int):
     args = make_cpp_args(dtype, is_arch_support_pdl(), page_size)
     return load_jit(
-        make_name(f"k_indexer_norm_rope_store_p{page_size}"),
+        f"dpsk_v32_k_indexer_norm_rope_store_p{page_size}",
         *args,
         cuda_files=[_CUDA_FILE],
         cuda_wrappers=[
