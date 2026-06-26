@@ -72,6 +72,16 @@ install_with_retry() {
   return 1
 }
 
+# The anthropic SDK passes `socket_options` to httpx.HTTPTransport, which only
+# exists in httpx>=0.25.0. The CI image ships an older httpx, and several deps
+# installed below (lmms-eval, aiter's requirements.txt, etc.) can pull a stale
+# httpx back in, so test_anthropic_server fails with:
+#   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
+# Call this as the LAST pip operation so nothing can downgrade httpx afterwards.
+ensure_httpx() {
+  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
+}
+
 # Helper function to git clone with retries
 git_clone_with_retry() {
   local repo_url="$1"
@@ -212,6 +222,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
 fi
 
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
+  ensure_httpx
   exit 0
 fi
 
@@ -321,24 +332,6 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # Re-apply Dockerfile hotpatches for ROCm 7.2 (the fresh clone lost them, can be removed after triton fixed this problem)
-    ROCM_VERSION=$(docker exec ci_sglang bash -c "cat /opt/rocm/.info/version 2>/dev/null || echo unknown")
-    if [[ "${ROCM_VERSION}" == 7.2* ]]; then
-        echo "[CI-AITER-CHECK] ROCm 7.2 detected (${ROCM_VERSION}), applying AITER hotpatches..."
-        docker exec ci_sglang bash -c "
-            cd /sgl-workspace/aiter && \
-            TARGET_FILE='aiter/ops/triton/attention/pa_mqa_logits.py' && \
-            if [ -f \"\${TARGET_FILE}\" ]; then \
-                sed -i '459 s/if.*:/if False:/' \"\${TARGET_FILE}\" && \
-                echo '[CI-AITER-CHECK] Hotpatch applied to pa_mqa_logits.py'; \
-            else \
-                echo '[CI-AITER-CHECK] pa_mqa_logits.py not found, skipping hotpatch'; \
-            fi
-        "
-    else
-        echo "[CI-AITER-CHECK] ROCm version=${ROCM_VERSION}, no hotpatch needed"
-    fi
-
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
@@ -349,6 +342,10 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
 fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
+
+# Must be the final pip operation: force httpx>=0.25.0 so the anthropic SDK can
+# construct its httpx transport (see ensure_httpx definition above).
+ensure_httpx
 
 
 # # Clear pre-built AITER kernels from Docker image to avoid segfaults

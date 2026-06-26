@@ -8,10 +8,7 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.eagle_info_v2 import (
-    EagleDraftInputV2Mixin,
-    EagleVerifyInputV2Mixin,
-)
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -30,7 +27,7 @@ def _draft_runner_of(worker):
 
 
 @dataclass
-class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
@@ -45,6 +42,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
+    # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
+    # vocab); only set under rejection sampling. Consumed by the verify kernel.
+    draft_probs: torch.Tensor = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -53,6 +53,19 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+
+    @property
+    def max_tree_depth(self) -> int:
+        """Longest root-to-leaf chain of the verify tree, incl. the root;
+        bounds the accept_index row width. EAGLE trees are depth-bounded by
+        the draft loop. Algorithms with other tree shapes override this."""
+        return self.spec_steps + 1
+
+    @property
+    def tree_topk(self) -> int:
+        """Branching factor passed to the tree-verify kernels; -1 means an
+        irregular tree (no fixed per-level branching)."""
+        return self.topk
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -141,7 +154,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 
 @dataclass
-class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+class EagleDraftInput(SpecInput):
     # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
     # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
     # `bonus_tokens` unconditionally.
@@ -149,6 +162,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
+    # shape: (b, vocab) - single-step draft proposal q from draft-extend;
+    # only set under rejection sampling.
+    draft_probs: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).
@@ -168,10 +184,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # V2 overlap worker only: req_pool_indices used as buf slot keys.
     future_indices: Optional[torch.Tensor] = None
-    # V2 reuses `EagleDraftInput` across phases (V1 has a separate
-    # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
-    num_correct_drafts: Optional[torch.Tensor] = None
-    num_accept_tokens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -203,6 +215,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         dtype: Optional[torch.dtype],
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
+        vocab_size: int = 0,
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
@@ -213,6 +226,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            draft_probs=(
+                torch.empty((0, vocab_size), device=device, dtype=torch.float32)
+                if get_global_server_args().speculative_use_rejection_sampling
+                else None
+            ),
             capture_hidden_mode=capture_hidden_mode,
         )
 
@@ -234,6 +252,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
+            if self.draft_probs is not None:
+                self.draft_probs = self.draft_probs[: len(new_indices)]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
@@ -241,6 +261,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
+            if self.draft_probs is not None:
+                self.draft_probs = self.draft_probs[new_indices]
             if self.hidden_states is not None:
                 self.hidden_states = self.hidden_states[new_indices]
             self.bonus_tokens = self.bonus_tokens[new_indices]
@@ -261,6 +283,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.draft_probs = spec_info.draft_probs
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -273,20 +296,23 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.draft_probs is not None and spec_info.draft_probs is not None:
+            self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
 
 @dataclass
 class EagleDraftExtendInput(SpecInput):
-    """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
+    """Inputs to the draft-extend forward (the fill-draft-kvcache pass after
+    target prefill / verify).
 
-    Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
-    the draft-extend forward, then replaced with a fresh `EagleDraftInput` for
-    the next iter's draft.
+    Installed on `batch.spec_info` by the worker's `_draft_extend_for_*`
+    (and synthetically by draft-extend cuda-graph capture), then replaced
+    with a fresh `EagleDraftInput` for the next iter's draft.
     """
 
-    # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
-    # by accept_index; consumed by the draft-extend forward. None when the spec
-    # algorithm's draft doesn't read hidden_states (e.g., STANDALONE).
+    # Target-model hidden states for the draft-extend forward; None when the
+    # draft doesn't read hidden_states (e.g., STANDALONE). Shape: decode
+    # (bs * num_draft_tokens, hidden), prefill (extend_num_tokens, hidden).
     hidden_states: Optional[torch.Tensor] = None
 
     # Per-req accept counts. `num_accept_tokens = num_correct_drafts + 1`.
@@ -314,6 +340,10 @@ class EagleDraftExtendInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
+
+    # None for draft-extend's idle batch; attention backends fall back to
+    # rebuilding plain metadata from seq_lens when this is None.
+    kv_indptr: torch.Tensor = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
@@ -387,8 +417,14 @@ class EagleDraftExtendInput(SpecInput):
     ):
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
-        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        qo_indptr[1:] = torch.cumsum(self.num_accept_tokens, dim=0)
+        # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
+        qo_indptr = torch.arange(
+            0,
+            (bs + 1) * self.num_tokens_per_req,
+            step=self.num_tokens_per_req,
+            dtype=torch.int32,
+            device=device,
+        )
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 

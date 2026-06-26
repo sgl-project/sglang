@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestPrefillAdder(CustomTestCase):
@@ -85,7 +85,7 @@ class TestPrefillAdder(CustomTestCase):
         req.rid = str(rid)
         req.priority = priority
         req.prefix_indices = []
-        req.get_full_untruncated_fill_len.return_value = 0
+        req.full_untruncated_fill_ids = []
         req.output_ids = [0] * output_len
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
@@ -120,6 +120,7 @@ class TestPrefillAdder(CustomTestCase):
         req.dllm_config = None
         req.origin_input_ids = array("q", range(origin_len))
         req.output_ids = array("q", range(origin_len, origin_len + output_len))
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
         req.extend_range = Range(0, extend_end)
         req.phase = ReqPhase.EXTEND_NON_LAST
         req.retracted_stain = True
@@ -133,7 +134,7 @@ class TestPrefillAdder(CustomTestCase):
             extend_end=600,
         )
 
-        self.assertEqual(req.get_full_untruncated_fill_len(), 805)
+        self.assertEqual(len(req.full_untruncated_fill_ids), 805)
         self.assertTrue(
             _compute_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
         )
@@ -180,11 +181,14 @@ class TestPrefillAdder(CustomTestCase):
         last_chunk_req.dllm_config = None
         last_chunk_req.origin_input_ids = array("q", range(128))
         last_chunk_req.output_ids = array("q", [])
+        last_chunk_req.full_untruncated_fill_ids = (
+            last_chunk_req.origin_input_ids + last_chunk_req.output_ids
+        )
         last_chunk_req.extend_range = Range(0, len(last_chunk_req.origin_input_ids))
         last_chunk_req.phase = ReqPhase.EXTEND_LAST
         last_chunk_req.retracted_stain = False
 
-        self.assertEqual(last_chunk_req.get_full_untruncated_fill_len(), 128)
+        self.assertEqual(len(last_chunk_req.full_untruncated_fill_ids), 128)
         self.assertFalse(
             _compute_is_extend_intermediate(
                 last_chunk_req, dllm_config=None, forward_mode=None
@@ -476,7 +480,7 @@ class TestPrefillAdder(CustomTestCase):
         req1 = self.create_mock_req("req1", priority=0, max_new_tokens=64)
         req1.host_hit_length = 0
         req1.prefix_indices = []
-        req1.get_full_untruncated_fill_len.return_value = 56
+        req1.full_untruncated_fill_ids = list(range(56))
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
@@ -507,7 +511,7 @@ class TestPrefillAdder(CustomTestCase):
         req2 = self.create_mock_req("req2", priority=0, max_new_tokens=64)
         req2.host_hit_length = 0
         req2.prefix_indices = []
-        req2.get_full_untruncated_fill_len.return_value = 56
+        req2.full_untruncated_fill_ids = list(range(56))
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
@@ -521,7 +525,7 @@ class TestPrefillAdder(CustomTestCase):
         req3 = self.create_mock_req("req3", priority=0, max_new_tokens=16)
         req3.host_hit_length = 0
         req3.prefix_indices = []
-        req3.get_full_untruncated_fill_len.return_value = 3
+        req3.full_untruncated_fill_ids = list(range(3))
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
@@ -555,7 +559,7 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req("resumed", priority=0, max_new_tokens=128)
         req.phase = ReqPhase.EXTEND_NON_LAST
         req.prefix_indices = []
-        req.get_full_untruncated_fill_len.return_value = extend_input_len
+        req.full_untruncated_fill_ids = list(range(extend_input_len))
         # set_extend_range is the only writer of extend_range; the production
         # path reads req.extend_range.length right after calling it, so the mock
         # must actually set the attribute (a spec=Req mock has the method but
@@ -589,7 +593,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
         self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
         # Truncated below the full prompt: chunked prefill continues.
-        self.assertLess(end, req.get_full_untruncated_fill_len())
+        self.assertLess(end, len(req.full_untruncated_fill_ids))
 
     def test_add_resumed_extend_req_hybrid_swa_defers_when_swa_below_page(self):
         """Hybrid-SWA resume defers with NO_TOKEN when rem_swa_tokens <= page_size."""

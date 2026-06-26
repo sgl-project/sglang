@@ -6,6 +6,11 @@ disable-model-invocation: true
 
 # Add a model to the SGLang Cookbook
 
+> Migrating an **existing legacy-template page** (one that imports a monolithic
+> `…/autoregressive/<slug>-deployment.jsx` generator)? Use the
+> `cookbook-migrate-model` skill instead — same target format, but the legacy
+> page (not the user) is the source of truth.
+
 The cookbook is **config-driven**: two shared engines contain NO model-specific code —
 `docs_new/src/snippets/_deployment.jsx` (the 5-dim deploy matrix) and
 `_playground.jsx` (the diff-based override Playground). Adding a model = adding **data**:

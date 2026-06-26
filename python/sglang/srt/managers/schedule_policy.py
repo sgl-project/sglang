@@ -662,7 +662,7 @@ class PrefillAdder:
         # A dllm block may or may not reach the fill target; decide here.
         req.phase = (
             ReqPhase.EXTEND_NON_LAST
-            if prefix_len + trunc_len < req.get_full_untruncated_fill_len()
+            if prefix_len + trunc_len < len(req.full_untruncated_fill_ids)
             else ReqPhase.EXTEND_LAST
         )
 
@@ -683,7 +683,7 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         # Truncate input length to available tokens and update request metadata
-        cand_extend_input_len = req.get_full_untruncated_fill_len() - len(
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
         truncated = cand_extend_input_len > _rem_tokens
@@ -731,7 +731,7 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 _rem_tokens = self.rem_chunk_tokens
 
-        cand_extend_input_len = req.get_full_untruncated_fill_len() - len(
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
         truncated = cand_extend_input_len > _rem_tokens
@@ -770,7 +770,7 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
-        cand_extend_input_len = req.get_full_untruncated_fill_len() - len(
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
         paged_input = self.ceil_paged_tokens(cand_extend_input_len)
@@ -847,7 +847,7 @@ class PrefillAdder:
         ):
             # Non-chunked prefill — the whole sequence is committed this iter.
             req.set_extend_range(
-                len(req.prefix_indices), req.get_full_untruncated_fill_len()
+                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
             req.phase = ReqPhase.EXTEND_LAST
             self.can_run_list.append(req)
@@ -913,7 +913,7 @@ class PrefillAdder:
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        cand_extend_input_len = req.get_full_untruncated_fill_len() - len(
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
         total_tokens = cand_extend_input_len + max_new + self.page_size
@@ -968,7 +968,7 @@ class PrefillAdder:
                 req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(
-                req.get_full_untruncated_fill_len() - len(req.prefix_indices)
+                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
             if (
@@ -994,7 +994,7 @@ class PrefillAdder:
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
-                    len(req.prefix_indices), req.get_full_untruncated_fill_len()
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
                 req.phase = ReqPhase.EXTEND_LAST
                 self.can_run_list.append(req)
@@ -1079,7 +1079,7 @@ class PrefillAdder:
 
         preemptible_reqs = []
         min_tokens_to_remove = (
-            req.get_full_untruncated_fill_len()
+            len(req.full_untruncated_fill_ids)
             - len(req.prefix_indices)
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens

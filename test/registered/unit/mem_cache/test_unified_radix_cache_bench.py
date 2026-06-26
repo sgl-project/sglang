@@ -638,8 +638,9 @@ def bench_cache_finished(
         req = env.make_req()
         req.origin_input_ids = array("q", seq)
         req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", seq)
         req.set_extend_range(
-            len(req.prefix_indices), req.get_full_untruncated_fill_len()
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
         )
         req.last_node = node
         req.cache_protected_len = matched_len

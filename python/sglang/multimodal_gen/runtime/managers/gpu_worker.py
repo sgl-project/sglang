@@ -5,6 +5,7 @@ import gc
 import logging
 import multiprocessing as mp
 import os
+import tempfile
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -39,6 +40,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    MemoryOccupationController,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
@@ -127,6 +131,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
+        self.memory_occupation: MemoryOccupationController | None = None
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -145,6 +150,47 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 torch.cuda.empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
+    def _configure_persistent_torch_compile_cache(self) -> None:
+        """Persist torch.compile's Inductor/Triton cache across restarts"""
+        compile_cache_root = os.path.join(
+            envs.SGLANG_DIFFUSION_CACHE_ROOT, "torch_compile_cache"
+        )
+        tmp_root = tempfile.gettempdir()
+        for env_name, sub in (
+            ("TORCHINDUCTOR_CACHE_DIR", "inductor"),
+            ("TRITON_CACHE_DIR", "triton"),
+        ):
+            current = os.environ.get(env_name)
+            if current and not current.startswith(tmp_root):
+                # Respect an explicit, non-ephemeral user-provided cache dir.
+                continue
+            cache_path = os.path.join(compile_cache_root, sub)
+            try:
+                os.makedirs(cache_path, exist_ok=True)
+            except OSError as e:
+                logger.warning(
+                    "Could not create torch.compile cache dir %s: %s", cache_path, e
+                )
+                continue
+            os.environ[env_name] = cache_path
+        logger.info(
+            "torch.compile cache: TORCHINDUCTOR_CACHE_DIR=%s TRITON_CACHE_DIR=%s",
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+            os.environ.get("TRITON_CACHE_DIR"),
+        )
+
+    def is_sleeping(self) -> bool:
+        return self.memory_occupation.is_sleeping() if self.memory_occupation else False
+
+    def _get_memory_occupation(self) -> MemoryOccupationController:
+        if self.memory_occupation is None:
+            self.memory_occupation = MemoryOccupationController(
+                pipeline=self.pipeline,
+                rank=self.rank,
+                use_fsdp_inference=self.server_args.use_fsdp_inference,
+            )
+        return self.memory_occupation
+
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         torch.get_device_module().set_device(self.local_rank)
@@ -154,6 +200,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+        self._configure_persistent_torch_compile_cache()
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
@@ -890,6 +937,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return OutputBatch(error="Lora is not enabled")
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
+
+    def release_memory_occupation(self) -> dict:
+        return self._get_memory_occupation().release_memory_occupation()
+
+    def resume_memory_occupation(self) -> dict:
+        if self.memory_occupation is None:
+            return {
+                "success": True,
+                "sleeping": False,
+                "message": "already awake",
+            }
+        return self.memory_occupation.resume_memory_occupation()
 
 
 OOM_MSG = """

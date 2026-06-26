@@ -84,9 +84,6 @@ class MockReq:
         self.kv_allocated_len = len(fill_ids)
         self.kv_committed_freed = False
 
-    def get_full_untruncated_fill_ids(self):
-        return self.full_untruncated_fill_ids
-
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
 

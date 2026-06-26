@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
+)
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
@@ -89,8 +92,8 @@ def maybe_register_hicache_draft(
         MLATokenToKVPool,
     )
     from sglang.srt.mem_cache.memory_pool_host import (
-        MHATokenToKVPoolHost,
         MLATokenToKVPoolHost,
+        get_mha_host_pool_cls,
     )
 
     pool = draft_kv_pool
@@ -107,7 +110,7 @@ def maybe_register_hicache_draft(
         layout=server_args.hicache_mem_layout,
     )
     if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
+        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
     else:
@@ -200,7 +203,12 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        page_size=page_size,
+        # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
+        # TreeCache.page_size should keep the same as allocator.page_size to
+        # avoid kv page eviction conflicts.
+        page_size=(
+            page_size if not dcp_enabled() else token_to_kv_pool_allocator.page_size
+        ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group

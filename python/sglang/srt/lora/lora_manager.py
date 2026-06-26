@@ -813,7 +813,11 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
+            parts = module_name.split(".")
+            if (
+                parts[-1] in self.target_modules
+                or ".".join(parts[-2:]) in self.target_modules
+            ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue

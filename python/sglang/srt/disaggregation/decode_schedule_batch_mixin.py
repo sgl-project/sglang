@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -150,5 +151,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         else:
             # Non-spec: stash last token into the relay so the first DECODE's
             # resolve_forward_inputs gathers it like any other decode iter.
-            future_map.stash(self.req_pool_indices, last_tokens_tensor)
+            future_map.stash(
+                self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
+            )
             self.input_ids = None
