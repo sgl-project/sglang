@@ -185,6 +185,7 @@ class TinyGDNModelConfig:
         self.hf_config = SimpleNamespace(architectures=["TinyGDNForCausalLM"])
         self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0

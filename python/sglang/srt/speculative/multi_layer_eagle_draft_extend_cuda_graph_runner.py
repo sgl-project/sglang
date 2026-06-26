@@ -554,7 +554,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    dp_size = runner.ps.attn_dp_size
+                    dp_size = runner.dp_size
                     global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
                     global_num_tokens_for_logprob_gpu = torch.zeros(
                         (dp_size,), dtype=torch.int32

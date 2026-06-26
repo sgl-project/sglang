@@ -194,6 +194,7 @@ class TinyMLAModelConfig:
         )
         self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0

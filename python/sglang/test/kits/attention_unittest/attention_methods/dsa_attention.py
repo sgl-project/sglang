@@ -261,6 +261,7 @@ class TinyDSAModelConfig:
         )
         self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
 
 class DSAMockModelRunner(ModelRunner):
