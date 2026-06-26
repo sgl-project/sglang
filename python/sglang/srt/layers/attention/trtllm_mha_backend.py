@@ -778,9 +778,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
+                swa_loc = self.forward_metadata.swa_out_cache_loc
+                if swa_loc is not None:
+                    swa_loc = swa_loc[: cache_loc.shape[0]]
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc(cache_loc, swa_loc),
                     k,
                     v,
                     layer.k_scale,
@@ -861,9 +864,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
+                swa_loc = self.forward_metadata.swa_out_cache_loc
+                if swa_loc is not None:
+                    swa_loc = swa_loc[: cache_loc.shape[0]]
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                    KVWriteLoc(cache_loc, swa_loc),
                     k,
                     v,
                     layer.k_scale,
