@@ -585,14 +585,10 @@ class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
                 "Call sync_explicit_npu_interleaved_cache() before "
                 "get_cos_sin_cache()."
             )
-        if layer_id == 0 or self.cos_cached is None or self.sin_cache is None:
+        if layer_id == 0:
             index = torch.add(positions, offsets) if offsets is not None else positions
             self.cos_cached = self.cos_cached_total[index].to(dtype).contiguous()
             self.sin_cache = self.sin_cached_total[index].to(dtype).contiguous()
-            self.sin_cached = self.sin_cache
-        else:
-            self.cos_cached = self.cos_cached.to(dtype)
-            self.sin_cache = self.sin_cache.to(dtype)
             self.sin_cached = self.sin_cache
         cos = self.cos_cached.to(positions.device).unsqueeze(-2).unsqueeze(-2)
         sin = self.sin_cache.to(positions.device).unsqueeze(-2).unsqueeze(-2)
