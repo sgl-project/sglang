@@ -638,13 +638,21 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
+        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.70",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
-        "# TODO(nvfp4): recipe pending",
       ],
     },
     {
