@@ -14,13 +14,16 @@
 """
 The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
+
+Keep this file focused on IPC struct definitions so it stays concise. Put
+normalizers, helper utilities, and future non-struct logic in the owning module
+instead, such as sglang.srt.utils.common.
 """
 
 from __future__ import annotations
 
 import copy
 import uuid
-from abc import ABC
 from array import array
 from collections import Counter
 from dataclasses import dataclass, field
@@ -43,7 +46,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
@@ -57,39 +60,20 @@ from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
-
-    from sglang.srt.managers.tokenizer_manager import SenderWrapper
 else:
     Image = Any
 
 
 @dataclass
-class BaseReq(ABC):
-    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+class BaseReq:
+    rid: Optional[str] = field(default=None, kw_only=True)
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
-
-    def regenerate_rid(self):
-        """Generate a new request ID and return it."""
-        if isinstance(self.rid, list):
-            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
-        else:
-            self.rid = uuid.uuid4().hex
-        return self.rid
-
-    def _validate_rid_uniqueness(self):
-        """Validate that request IDs within a batch are unique."""
-        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
-            counts = Counter(self.rid)
-            duplicates = [rid for rid, count in counts.items() if count > 1]
-            raise ValueError(
-                f"Duplicate request IDs detected within the request: {duplicates}"
-            )
 
 
 @dataclass
-class BaseBatchReq(ABC):
+class BaseBatchReq:
     rids: Optional[List[str]] = field(default=None, kw_only=True)
-    http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
+    http_worker_ipcs: Optional[List[Optional[str]]] = field(default=None, kw_only=True)
 
     def regenerate_rids(self):
         """Generate new request IDs and return them."""
@@ -97,44 +81,37 @@ class BaseBatchReq(ABC):
         return self.rids
 
 
-@dataclass
-class SpeculativeDecodingMetricsMixin:
-    """
-    Mixin class containing speculative decoding metrics.
-
-    This class consolidates speculative decoding metrics that are shared across
-    batch output types that support speculative decoding to avoid code duplication.
-    """
-
-    # Verify count: number of verification forward passes
-    spec_verify_ct: List[int]
-
-    # Accepted drafts: Number of accepted draft tokens during speculative decoding
-    # (strict drafts-only count, excludes the bonus token).
-    spec_num_correct_drafts: List[int]
-
-    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
-    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
-    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
-    # Empty list [] when speculative decoding is disabled.
-    spec_correct_drafts_histogram: List[List[int]]
-
-
 # Parameters for a session
 @dataclass
 class SessionParams:
+    # The session identifier. Used by the scheduler to look up or create the
+    # Session object that groups all requests in a multi-turn conversation.
     id: Optional[str] = None
+    # A request identifier *within* the session. In non-streaming sessions the
+    # session maintains a tree of request nodes keyed by rid; this field selects
+    # which node to continue from (append) or replace. When None the default
+    # branch point is used (latest node for streaming, all nodes cleared on
+    # replace).
     rid: Optional[str] = None
+    # Token-level insertion point. When set, the new request's tokens are
+    # spliced into the accumulated context at this position instead of being
+    # appended at the end (i.e. ``context[:offset] + new_tokens``).
     offset: Optional[int] = None
+    # When True, the request node identified by ``rid`` (or all nodes if
+    # ``rid`` is None) is aborted and its children are cleared before the new
+    # request is inserted. Not supported in streaming sessions.
     replace: Optional[bool] = None
+    # When True, the previous request's generated output tokens are excluded
+    # from the accumulated context so the new turn sees only the original input.
+    # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
 
 
 # Type definitions for multimodal input data
 # Individual data item types for each modality
-ImageDataInputItem = Union[Image, str, ImageData, Dict]
-AudioDataInputItem = Union[str, Dict]
-VideoDataInputItem = Union[str, VideoData, Dict]
+ImageDataInputItem = Union[str, bytes, Dict[str, Any], ImageData, Image]
+AudioDataInputItem = Union[str, bytes, Dict[str, Any]]
+VideoDataInputItem = Union[str, bytes, Dict[str, Any], VideoData]
 # Union type for any multimodal data item
 MultimodalDataInputItem = Union[
     ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
@@ -148,11 +125,13 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq):
+class GenerateReqInput:
+    # Request ID(s). If omitted, generated during normalization. For batch
+    # requests, a string is expanded to per-item IDs using it as a prefix.
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
-    #
     # Use C-loop validator to replace Pydantic per-element type check for efficiency.
     input_ids: Annotated[
         Optional[Union[List[List[int]], List[int]]],
@@ -171,8 +150,10 @@ class GenerateReqInput(BaseReq):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
-    # Optional per-image hashes the caller has already computed (hex strings,
-    # one per image in `image_data`). When supplied, each MultimodalDataItem's
+    # Optional per-image hashes the caller has already computed (hex strings).
+    # Single request: one hash per image. Batch request: either one hash per
+    # request when each request has one image, or one list of hashes per request.
+    # When supplied, each MultimodalDataItem's
     # `hash` is initialised from this list and `set_pad_value` skips the
     # internal `hash_feature()` recompute, so the resulting `pad_value` is
     # deterministic from the caller's hash. Intended for external KV routers
@@ -183,7 +164,7 @@ class GenerateReqInput(BaseReq):
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
     # The sampling_params. See descriptions below.
-    sampling_params: Optional[Union[List[Dict], Dict]] = None
+    sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -203,21 +184,21 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
-    return_indexer_topk: bool = False
     # Absolute start position for returned routings; response covers
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
     routed_experts_start_len: int = 0
+    return_indexer_topk: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
-    session_params: Optional[Union[List[Dict], Dict]] = None
+    session_params: Optional[Dict[str, Any]] = None
 
     # The path to the LoRA adaptors
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    lora_path: Optional[Union[List[Optional[str]], str]] = None
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
-    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    lora_id: Optional[Union[List[Optional[str]], str]] = None
 
     # Custom logit processor for advanced sampling control. Must be a serialized instance
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
@@ -229,60 +210,54 @@ class GenerateReqInput(BaseReq):
     positional_embed_overrides: Any = None
 
     # For disaggregated inference
-    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_host: Optional[Union[List[Optional[str]], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
-    bootstrap_pair_key: Optional[Union[List[str], str]] = None
+    bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
-
-    # Require reasoning for the request (hybrid reasoning model only)
-    require_reasoning: bool = False
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+    # Conversation id used for tracking requests
+    conversation_id: Optional[str] = None
+    # Internal IPC endpoint of the HTTP/tokenizer worker that owns this request.
+    # Used to route outputs back in multi-tokenizer mode.
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
     # For background responses (OpenAI responses API)
     background: bool = False
-
-    # Conversation id used for tracking requests
-    conversation_id: Optional[str] = None
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
 
     # Priority for the request
     priority: Optional[int] = None
-
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
-
-    # Routing key for routing-key schedule policy
-    routing_key: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
-
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
-
     # Whether to return entropy
     return_entropy: bool = False
-
     # Whether to return prompt token IDs without computing logprobs
     return_prompt_token_ids: bool = False
 
     # Propagates trace context via Engine.generate/async_generate
-    external_trace_header: Optional[Dict] = None
+    external_trace_header: Optional[Dict[str, Any]] = None
     received_time: Optional[float] = None
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
-    mm_data_mooncake: Optional[List] = None
+    mm_data_mooncake: Optional[List[Any]] = None
     # Snapshot of encoder URLs at the time tokenizer-side computed
     # ``num_items_assigned``.
     encoder_urls: Optional[List[str]] = None
@@ -296,6 +271,23 @@ class GenerateReqInput(BaseReq):
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+    def _validate_rid_uniqueness(self):
+        """Validate that request IDs within a batch are unique."""
+        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            counts = Counter(self.rid)
+            duplicates = [rid for rid, count in counts.items() if count > 1]
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {duplicates}"
+            )
 
     def contains_mm_input(self) -> bool:
         return (
@@ -317,18 +309,6 @@ class GenerateReqInput(BaseReq):
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
-        if self.data_parallel_rank is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.routed_dp_rank is None:
-                self.routed_dp_rank = self.data_parallel_rank
-            self.data_parallel_rank = None
-
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -660,13 +640,13 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
-    def _validate_session_params(self):
-        """Validate that session parameters are properly formatted."""
-        if self.session_params is not None:
-            if not isinstance(self.session_params, dict) and not isinstance(
-                self.session_params[0], dict
-            ):
-                raise ValueError("Session params must be a dict or a list of dicts.")
+        # Normalize decode_tp_size
+        if self.decode_tp_size is None:
+            self.decode_tp_size = [None] * num
+        elif not isinstance(self.decode_tp_size, list):
+            self.decode_tp_size = [self.decode_tp_size] * num
+        elif isinstance(self.decode_tp_size, list):
+            self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
 
     def _get_positional_embed_overrides_item(
         self, i: int
@@ -685,17 +665,16 @@ class GenerateReqInput(BaseReq):
         if i in cache:
             return cache[i]
         sub = GenerateReqInput(
+            rid=self.rid[i],
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
-            positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
             sampling_params=self.sampling_params[i],
-            rid=self.rid[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
             top_logprobs_num=self.top_logprobs_num[i],
@@ -720,7 +699,8 @@ class GenerateReqInput(BaseReq):
                 if self.custom_logit_processor is not None
                 else None
             ),
-            # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
+            positional_embed_overrides=self._get_positional_embed_overrides_item(i),
+            # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),
@@ -741,6 +721,7 @@ class GenerateReqInput(BaseReq):
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
+            http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
@@ -749,7 +730,6 @@ class GenerateReqInput(BaseReq):
             return_entropy=self.return_entropy,
             return_prompt_token_ids=self.return_prompt_token_ids,
             external_trace_header=self.external_trace_header,
-            http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
@@ -764,11 +744,14 @@ class GenerateReqInput(BaseReq):
 @dataclass
 class TokenizedGenerateReqInput(BaseReq):
     # The input text
-    input_text: str
+    input_text: Optional[Union[str, List[Union[str, List[str]]]]]
     # The input token ids
-    input_ids: Optional[array[int]]
+    input_ids: Optional[array]  # Optional[array[int]]
+    # The input embeds
+    input_embeds: Optional[List[List[float]]]
     # The multimodal inputs
-    mm_inputs: object
+    mm_inputs: Optional[MultimodalInputs]
+    token_type_ids: Optional[List[int]]
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -778,7 +761,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: int
     # If return logprobs, the token id to return logprob for
-    token_ids_logprob: List[int]
+    token_ids_logprob: Optional[List[int]]
     # Whether to stream output
     stream: bool
 
@@ -789,14 +772,7 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
-
     return_indexer_topk: bool = False
-
-    # The input embeds
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-
-    # Embedding overrides to place at specific token positions.
-    positional_embed_overrides: Optional[PositionalEmbeds] = None
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
@@ -808,6 +784,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[str] = None
+    # Embedding overrides to place at specific token positions.
+    positional_embed_overrides: Optional[PositionalEmbeds] = None
 
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
@@ -816,37 +794,33 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
 
-    # Require reasoning for the request (hybrid reasoning model only)
-    require_reasoning: bool = False
-
     # For DP routing
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
 
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
+
     # Priority for the request
     priority: Optional[int] = None
 
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
-
-    # Routing key for routing-key schedule policy
-    routing_key: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
 
     # (Internal) Whether to return bytes for image generation
     return_bytes: bool = False
-
     # Whether to return entropy
     return_entropy: bool = False
 
-    token_type_ids: Optional[List[int]] = None
-
-    need_wait_for_mm_inputs: bool = False
+    need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
-    mm_data_mooncake: Optional[List] = None
+    mm_data_mooncake: Optional[List[Any]] = None
     # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
@@ -875,9 +849,16 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq):
+class EmbeddingReqInput:
+    # Request ID(s). If omitted, generated during normalization. For batch
+    # requests, a string is expanded to per-item IDs using it as a prefix.
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
+    # The token ids for text; one can either specify text or input_ids.
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # Dummy input embeds for compatibility
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -889,8 +870,6 @@ class EmbeddingReqInput(BaseReq):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
-    # The token ids for text; one can either specify text or input_ids.
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # Placeholder token ID used to locate embedding override positions in input token IDs.
     embed_override_token_id: Optional[int] = None
     # Unresolved embedding overrides: per-input list of tensors.
@@ -900,48 +879,64 @@ class EmbeddingReqInput(BaseReq):
     # Runtime type: Optional[List[Optional[List[torch.Tensor]]]]
     # Typed as Any to avoid Pydantic/FastAPI schema errors (contains torch.Tensor).
     embed_overrides: Any = None
-    # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
-    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
-    positional_embed_overrides: Any = None
     # Dummy sampling params for compatibility
-    sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # Dummy input embeds for compatibility
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    sampling_params: Optional[Union[List[Dict[str, Any]], Dict[str, Any]]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
-    # Priority for the request
-    priority: Optional[int] = None
+    # The path to the LoRA adaptors
+    lora_path: Optional[Union[List[Optional[str]], str]] = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: Optional[Union[List[Optional[str]], str]] = None
+    # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    positional_embed_overrides: Any = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+    # Internal IPC endpoint of the HTTP/tokenizer worker that owns this request.
+    # Used to route outputs back in multi-tokenizer mode.
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
     # For background responses (OpenAI responses API)
     background: bool = False
 
-    # Propagates trace context via Engine.encode/async_encode
-    external_trace_header: Optional[Dict] = None
-    received_time: Optional[float] = None
+    # Priority for the request
+    priority: Optional[int] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
-
-    # The path to the LoRA adaptors
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    # The uid of LoRA adaptors, should be initialized by tokenizer manager
-    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
-
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
-
     # Whether to return prompt token IDs without computing logprobs
     return_prompt_token_ids: bool = False
+
+    # Propagates trace context via Engine.encode/async_encode
+    external_trace_header: Optional[Dict[str, Any]] = None
+    received_time: Optional[float] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+    def _validate_rid_uniqueness(self):
+        """Validate that request IDs within a batch are unique."""
+        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            counts = Counter(self.rid)
+            duplicates = [rid for rid, count in counts.items() if count > 1]
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {duplicates}"
+            )
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -1036,13 +1031,13 @@ class EmbeddingReqInput(BaseReq):
 
         if self.is_cross_encoder_request:
             sub = EmbeddingReqInput(
-                text=[self.text[i]] if self.text is not None else None,
-                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
-                sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
+                text=[self.text[i]] if self.text is not None else None,
+                sampling_params=self.sampling_params[i],
+                is_cross_encoder_request=True,
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
-                is_cross_encoder_request=True,
+                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
@@ -1054,28 +1049,28 @@ class EmbeddingReqInput(BaseReq):
             )
         else:
             sub = EmbeddingReqInput(
+                rid=self.rid[i],
                 text=self.text[i] if self.text is not None else None,
                 input_ids=self.input_ids[i] if self.input_ids is not None else None,
+                image_data=self.image_data[i] if self.image_data is not None else None,
+                video_data=self.video_data[i] if self.video_data is not None else None,
+                audio_data=self.audio_data[i] if self.audio_data is not None else None,
                 embed_override_token_id=self.embed_override_token_id,
                 embed_overrides=(
                     self.embed_overrides[i]
                     if self.embed_overrides is not None
                     else None
                 ),
-                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
-                image_data=self.image_data[i] if self.image_data is not None else None,
-                audio_data=self.audio_data[i] if self.audio_data is not None else None,
-                video_data=self.video_data[i] if self.video_data is not None else None,
                 sampling_params=self.sampling_params[i],
-                rid=self.rid[i],
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
-                external_trace_header=self.external_trace_header,
-                dimensions=self.dimensions,
+                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
-                received_time=self.received_time,
+                dimensions=self.dimensions,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
+                external_trace_header=self.external_trace_header,
+                received_time=self.received_time,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
                     if self.multi_item_delimiter_indices is not None
@@ -1089,15 +1084,17 @@ class EmbeddingReqInput(BaseReq):
 @dataclass
 class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
-    input_text: str
+    input_text: Optional[Union[str, List[Union[str, List[str]]]]]
     # The input token ids
-    input_ids: array[int]
-    # The image inputs
-    image_inputs: dict
+    input_ids: Optional[array]  # array[int]
+    # The multimodal inputs
+    mm_inputs: Optional[MultimodalInputs]
     # The token type ids
-    token_type_ids: List[int]
+    token_type_ids: Optional[List[int]]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # LoRA related
+    lora_id: Optional[str] = None  # None means just use the base model
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing
@@ -1106,16 +1103,13 @@ class TokenizedEmbeddingReqInput(BaseReq):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
-
-    # LoRA related
-    lora_id: Optional[str] = None  # None means just use the base model
-    # Pre-computed delimiter indices for multi-item scoring
-    multi_item_delimiter_indices: Optional[List[int]] = None
-    # For observability
-    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
-
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
+    # Pre-computed delimiter indices for multi-item scoring
+    multi_item_delimiter_indices: Optional[List[int]] = None
+
+    # For observability
+    time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
 @dataclass
@@ -1133,16 +1127,29 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
         return iter(self.batch)
 
 
+TokenLogprobValues = Optional[List[Optional[List[Optional[float]]]]]
+TokenLogprobIndices = Optional[List[Optional[List[Optional[int]]]]]
+TopLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
+TopLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
+TokenIdsLogprobValues = Optional[List[Optional[List[Optional[List[float]]]]]]
+TokenIdsLogprobIndices = Optional[List[Optional[List[Optional[List[int]]]]]]
+HiddenStateChunk = List[Optional[Union[float, List[float]]]]
+OutputHiddenStates = Optional[List[Optional[List[HiddenStateChunk]]]]
+CachedTokensDetails = Dict[str, Union[int, str]]
+# Serialized form of BaseFinishReason.to_json() — all values are primitives.
+FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
+
+
 @dataclass
-class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+class BatchTokenIDOutput(BaseBatchReq):
     # The finish reason
-    finished_reasons: List[BaseFinishReason]
+    finished_reasons: List[Optional[FinishReasonDict]]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[array[int]]
+    decode_ids: List[array]  # List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[array[int]]]
+    output_ids: Optional[List[array]]  # Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
@@ -1155,49 +1162,49 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    input_top_logprobs_val: List[List]
-    input_top_logprobs_idx: List[List]
-    output_top_logprobs_val: List[List]
-    output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
-    output_token_entropy_val: List[float]
+    input_token_logprobs_val: TokenLogprobValues
+    input_token_logprobs_idx: TokenLogprobIndices
+    output_token_logprobs_val: TokenLogprobValues
+    output_token_logprobs_idx: TokenLogprobIndices
+    input_top_logprobs_val: TopLogprobValues
+    input_top_logprobs_idx: TopLogprobIndices
+    output_top_logprobs_val: TopLogprobValues
+    output_top_logprobs_idx: TopLogprobIndices
+    input_token_ids_logprobs_val: TokenIdsLogprobValues
+    input_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_token_ids_logprobs_val: TokenIdsLogprobValues
+    output_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: OutputHiddenStates
 
     # Per-request routed experts (input + output tokens), shape
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
     # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
     # straight to TokenizerManager, which encodes on demand.
-    routed_experts: List[Optional[torch.Tensor]]
+    routed_experts: Optional[List[Optional[torch.Tensor]]]
 
-    indexer_topk: List[Optional[torch.Tensor]]
+    indexer_topk: Optional[List[Optional[torch.Tensor]]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
+    placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
+    placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
     # Number of times each request was retracted.
-    retraction_counts: List[int]
+    retraction_counts: Optional[List[int]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
+    token_steps: Optional[List[List[int]]] = None
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
-    dp_ranks: Optional[List[int]] = None
+    dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1207,15 +1214,22 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
 
+    # Verify count: number of verification forward passes
+    spec_verify_ct: Optional[List[int]] = None
+    # Accepted drafts
+    spec_num_correct_drafts: Optional[List[int]] = None
+    # Acceptance histogram
+    spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+
 
 @dataclass
-class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+class BatchStrOutput(BaseBatchReq):
     # The finish reason
-    finished_reasons: List[dict]
+    finished_reasons: List[Optional[FinishReasonDict]]
     # The output decoded strings
     output_strs: List[str]
     # The token ids
-    output_ids: Optional[List[int]]
+    output_ids: Optional[List[array]]
 
     # Token counts
     prompt_tokens: List[int]
@@ -1224,48 +1238,48 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens: List[int]
 
     # Logprobs
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    input_top_logprobs_val: List[List]
-    input_top_logprobs_idx: List[List]
-    output_top_logprobs_val: List[List]
-    output_top_logprobs_idx: List[List]
-    input_token_ids_logprobs_val: List[List]
-    input_token_ids_logprobs_idx: List[List]
-    output_token_ids_logprobs_val: List[List]
-    output_token_ids_logprobs_idx: List[List]
-    output_token_entropy_val: List[float]
+    input_token_logprobs_val: TokenLogprobValues
+    input_token_logprobs_idx: TokenLogprobIndices
+    output_token_logprobs_val: TokenLogprobValues
+    output_token_logprobs_idx: TokenLogprobIndices
+    input_top_logprobs_val: TopLogprobValues
+    input_top_logprobs_idx: TopLogprobIndices
+    output_top_logprobs_val: TopLogprobValues
+    output_top_logprobs_idx: TopLogprobIndices
+    input_token_ids_logprobs_val: TokenIdsLogprobValues
+    input_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_token_ids_logprobs_val: TokenIdsLogprobValues
+    output_token_ids_logprobs_idx: TokenIdsLogprobIndices
+    output_token_entropy_val: Optional[List[Optional[float]]]
 
     # Hidden states
-    output_hidden_states: List[List[float]]
+    output_hidden_states: OutputHiddenStates
 
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
-    routed_experts: List[Optional[str]]
+    routed_experts: Optional[List[Optional[str]]]
 
-    indexer_topk: List[Optional[str]]
+    indexer_topk: Optional[List[Optional[str]]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
+    placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
+    placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
     # Number of times each request was retracted.
-    retraction_counts: List[int]
+    retraction_counts: Optional[List[int]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
+    token_steps: Optional[List[List[int]]] = None
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
-    dp_ranks: Optional[List[int]] = None
+    dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1275,33 +1289,40 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
 
+    # Verify count: number of verification forward passes
+    spec_verify_ct: Optional[List[int]] = None
+    # Accepted drafts
+    spec_num_correct_drafts: Optional[List[int]] = None
+    # Acceptance histogram
+    spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+
 
 @dataclass
 class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
-    finished_reasons: List[BaseFinishReason]
+    finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
-    embeddings: Union[List[List[float]], List[Dict[int, float]]]
+    embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
     # Placeholder token info
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
+    placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
+    placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
     # Number of times each request was retracted.
-    retraction_counts: List[int]
+    retraction_counts: Optional[List[int]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     # Optional pooled hidden states (pre-head transformer output).
-    # Sent as a single stacked tensor to minimize pickle overhead.
-    pooled_hidden_states: Optional[
-        Union[List[Optional[torch.Tensor]], torch.Tensor]
-    ] = None
+    # Two IPC formats, disambiguated by len vs len(rids):
+    #   Stacked:     [stacked_tensor(N, ...)] — len 1, reduces pickle overhead
+    #   Non-stacked: [t0, t1, ..., tN]       — len N, when shapes differ or None entries exist
+    pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
 
 
 @dataclass
@@ -1378,26 +1399,6 @@ class AttachHiCacheStorageReqInput(BaseReq):
     hicache_storage_prefetch_policy: Optional[str] = None
     hicache_write_policy: Optional[str] = None
 
-    def __post_init__(self):
-        if self.hicache_storage_prefetch_policy is None:
-            pass
-        else:
-            allowed = ["best_effort", "wait_complete", "timeout"]
-            if self.hicache_storage_prefetch_policy not in allowed:
-                raise ValueError(
-                    f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
-                    f"Expected one of {allowed}."
-                )
-
-        if self.hicache_write_policy is None:
-            return
-        allowed = ["write_back", "write_through", "write_through_selective"]
-        if self.hicache_write_policy not in allowed:
-            raise ValueError(
-                f"Invalid hicache_write_policy: {self.hicache_write_policy!r}. "
-                f"Expected one of {allowed}."
-            )
-
 
 @dataclass
 class AttachHiCacheStorageReqOutput(BaseReq):
@@ -1440,13 +1441,6 @@ class PauseGenerationReqInput(BaseReq):
 
     mode: Literal["abort", "retract", "in_place"] = "abort"
 
-    def __post_init__(self):
-        allowed = ["abort", "retract", "in_place"]
-        if self.mode not in allowed:
-            raise ValueError(
-                f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
-            )
-
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
@@ -1459,14 +1453,14 @@ class ContinueGenerationReqInput(BaseReq):
 
 
 @dataclass
-class TokenizerWorkerRegistration:
+class TokenizerWorkerRegistrationReq(BaseReq):
     """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 
 
 @dataclass
-class PauseContinueBroadcast:
+class PauseContinueBroadcastReq(BaseReq):
     """Broadcast from router to all workers to set is_pause state."""
 
     is_pause: bool
@@ -1503,7 +1497,7 @@ class UpdateWeightFromDiskReqOutput(BaseReq):
     success: bool
     message: str
     # Number of paused requests during weight sync.
-    num_paused_requests: Optional[int] = 0
+    num_paused_requests: int = 0
 
 
 @dataclass
@@ -1539,6 +1533,10 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     - Data is structured in JSON for easy transmission over HTTP
     """
 
+    # Accepts both base64 str (from HTTP/JSON, which has no bytes type) and
+    # raw bytes (from the Python Engine API / MultiprocessingSerializer).
+    # Normalized to List[bytes] by normalize_serialized_named_tensor_payloads
+    # in tokenizer_control_mixin before forwarding over scheduler IPC.
     serialized_named_tensors: List[Union[str, bytes]]
     # Optional format specification for loading
     load_format: Optional[str] = None
@@ -1680,7 +1678,7 @@ class GetWeightsByNameReqInput(BaseReq):
 
 @dataclass
 class GetWeightsByNameReqOutput(BaseReq):
-    parameter: list
+    parameter: Optional[List[Any]]
 
 
 @dataclass
@@ -1716,7 +1714,7 @@ class CheckWeightsReqInput(BaseReq):
 class CheckWeightsReqOutput(BaseReq):
     success: bool
     message: str
-    payload: Optional[Dict] = None
+    payload: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1733,8 +1731,8 @@ class SlowDownReqOutput(BaseReq):
 class AbortReq(BaseReq):
     # Whether to abort all requests
     abort_all: bool = False
-    # The finished reason data
-    finished_reason: Optional[Dict[str, Any]] = None
+    # The finished reason data (from BaseFinishReason.to_json())
+    finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
 
     def __post_init__(self):
@@ -1755,7 +1753,7 @@ class GetInternalStateReq(BaseReq):
 
 @dataclass
 class GetInternalStateReqOutput(BaseReq):
-    internal_state: Dict[Any, Any]
+    internal_state: Dict[str, Any]
 
 
 @dataclass
@@ -1769,8 +1767,14 @@ class SetInternalStateReqOutput(BaseReq):
     server_args: Dict[str, Any]
 
 
+class ProfileReqType(Enum):
+    START_PROFILE = 1
+    STOP_PROFILE = 2
+
+
 @dataclass
-class ProfileReqInput(BaseReq):
+class ProfileReq(BaseReq):
+    req_type: ProfileReqType = ProfileReqType.START_PROFILE
     # The output directory
     output_dir: Optional[str] = None
     # Specify the steps to start the profiling
@@ -1787,32 +1791,12 @@ class ProfileReqInput(BaseReq):
     with_stack: Optional[bool] = None
     # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
     # The prefix of the profile filenames
     profile_prefix: Optional[str] = None
     # Only profile these stages and ignore others
-    profile_stages: Optional[List[str]] = None
-
-
-class ProfileReqType(Enum):
-    START_PROFILE = 1
-    STOP_PROFILE = 2
-
-
-@dataclass
-class ProfileReq(BaseReq):
-    type: ProfileReqType
-    output_dir: Optional[str] = None
-    start_step: Optional[int] = None
-    num_steps: Optional[int] = None
-    activities: Optional[List[str]] = None
-    profile_by_stage: bool = False
-    with_stack: Optional[bool] = None
-    record_shapes: Optional[bool] = None
-    profile_id: Optional[str] = None
-    merge_profiles: bool = False
-    profile_prefix: Optional[str] = None
     profile_stages: Optional[List[str]] = None
 
 
@@ -1890,13 +1874,13 @@ class ExpertDistributionReqOutput(BaseReq):
 class Function:
     description: Optional[str] = None
     name: Optional[str] = None
-    parameters: Optional[object] = None
+    parameters: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class Tool:
     function: Function
-    type: Optional[str] = "function"
+    type: str = "function"
 
 
 @dataclass
@@ -1919,14 +1903,14 @@ class SeparateReasoningReqInput(BaseReq):
 
 @dataclass
 class VertexGenerateReqInput(BaseReq):
-    instances: List[dict]
-    parameters: Optional[dict] = None
+    instances: List[Dict[str, Any]]
+    parameters: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class RpcReqInput(BaseReq):
     method: str
-    parameters: Optional[Dict] = None
+    parameters: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1992,7 +1976,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
 class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Optional[Dict[str, LoRARef]] = None
+    loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
@@ -2007,91 +1991,58 @@ class BlockReqType(Enum):
 
 @dataclass
 class BlockReqInput(BaseReq):
-    type: BlockReqType
+    req_type: BlockReqType
 
 
 @dataclass
 class MemoryMetrics:
     """Memory breakdown metrics."""
 
-    weight_gb: float = field(
-        metadata={"metric": ("gauge", "Model weight memory in GB")}
-    )
-    kv_cache_gb: float = field(metadata={"metric": ("gauge", "KV cache memory in GB")})
-    graph_gb: float = field(metadata={"metric": ("gauge", "CUDA graph memory in GB")})
-    token_capacity: int = field(
-        metadata={"metric": ("gauge", "Max tokens in KV cache")}
-    )
+    weight_gb: float
+    kv_cache_gb: float
+    graph_gb: float
+    token_capacity: int
 
 
 @dataclass
 class SpeculativeMetrics:
     """Speculative decoding metrics."""
 
-    accept_length: float = field(
-        metadata={
-            "metric": (
-                "gauge",
-                "Mean acceptance length (accepted drafts + bonus token per forward)",
-            )
-        }
-    )
-    accept_rate: float = field(
-        metadata={"metric": ("gauge", "Speculative acceptance rate")}
-    )
+    accept_length: float
+    accept_rate: float
 
 
 @dataclass
 class LoRAMetrics:
     """LoRA adapter pool metrics."""
 
-    slots_used: int = field(metadata={"metric": ("gauge", "LoRA adapter slots in use")})
-    slots_total: int = field(metadata={"metric": ("gauge", "Total LoRA adapter slots")})
-    utilization: float = field(
-        metadata={"metric": ("gauge", "LoRA pool utilization ratio")}
-    )
+    slots_used: int
+    slots_total: int
+    utilization: float
 
 
 @dataclass
 class DisaggregationMetrics:
     """PD disaggregation metrics."""
 
-    mode: str  # "prefill", "decode", or "null" - not a metric
-    prefill_bootstrap_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Prefill bootstrap queue requests")}
-    )
-    prefill_inflight_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}
-    )
-    decode_prealloc_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Decode prealloc queue requests")}
-    )
-    decode_transfer_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Decode transfer queue requests")}
-    )
-    decode_retracted_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Decode retracted queue requests")}
-    )
-    kv_transfer_speed_gb_s: float = field(
-        default=0.0, metadata={"metric": ("gauge", "KV transfer speed in GB/s")}
-    )
-    kv_transfer_latency_ms: float = field(
-        default=0.0, metadata={"metric": ("gauge", "KV transfer latency in ms")}
-    )
+    mode: str  # "prefill", "decode", or "null"
+    prefill_bootstrap_queue_reqs: int = 0
+    prefill_inflight_queue_reqs: int = 0
+    decode_prealloc_queue_reqs: int = 0
+    decode_transfer_queue_reqs: int = 0
+    decode_retracted_queue_reqs: int = 0
+    kv_transfer_speed_gb_s: float = 0.0
+    kv_transfer_latency_ms: float = 0.0
 
 
 @dataclass
 class QueueMetrics:
     """Detailed queue breakdown."""
 
-    waiting: int = field(metadata={"metric": ("gauge", "Main waiting queue size")})
-    grammar: int = field(
-        metadata={"metric": ("gauge", "Grammar compilation queue size")}
-    )
-    paused: int = field(
-        metadata={"metric": ("gauge", "Requests paused by weight sync")}
-    )
-    retracted: int = field(metadata={"metric": ("gauge", "Retracted requests count")})
+    waiting: int
+    grammar: int
+    paused: int
+    retracted: int
 
 
 @dataclass
@@ -2123,46 +2074,21 @@ class GetLoadsReqOutput(BaseReq):
     dp_rank: int
     timestamp: float
 
-    num_running_reqs: int = field(
-        metadata={"metric": ("gauge", "Number of running requests")}
-    )
-    num_waiting_reqs: int = field(
-        metadata={"metric": ("gauge", "Number of waiting requests")}
-    )
-    num_waiting_uncached_tokens: int = field(
-        metadata={
-            "metric": (
-                "gauge",
-                "Number of uncached input tokens waiting for prefill compute",
-            )
-        }
-    )
-    num_used_tokens: int = field(
-        metadata={"metric": ("gauge", "Number of tokens in use")}
-    )
+    num_running_reqs: int
+    num_waiting_reqs: int
+    num_waiting_uncached_tokens: int
+    num_used_tokens: int
     # num_used_tokens plus pending tokens not already allocated in the KV pool.
     # Used for DP balance.
-    num_total_tokens: int = field(
-        metadata={"metric": ("gauge", "Used tokens plus pending unallocated tokens")}
-    )
-    max_total_num_tokens: int = field(
-        metadata={"metric": ("gauge", "Maximum token capacity")}
-    )
+    num_total_tokens: int
+    max_total_num_tokens: int
     # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
     # not just KV token usage. Rename requires API deprecation.
-    token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
-    gen_throughput: float = field(
-        metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
-    )
-    cache_hit_rate: float = field(
-        metadata={"metric": ("gauge", "Prefix cache hit rate")}
-    )
-    utilization: float = field(
-        metadata={"metric": ("gauge", "Overall utilization ratio")}
-    )
-    max_running_requests: int = field(
-        metadata={"metric": ("gauge", "Maximum running requests capacity")}
-    )
+    token_usage: float
+    gen_throughput: float
+    cache_hit_rate: float
+    utilization: float
+    max_running_requests: int
 
     memory: Optional[MemoryMetrics] = None
     speculative: Optional[SpeculativeMetrics] = None
@@ -2204,28 +2130,28 @@ class DumperControlReqOutput(BaseReq):
     error: str = ""
 
 
-def sock_send(
-    sender: Union[zmq.Socket, zmq.asyncio.Socket, SenderWrapper],
-    obj: Any,
-    flags: int = 0,
-) -> None:
-    sender.send_pyobj(obj, flags=flags)
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+    socket.send_pyobj(obj, flags=flags)
 
 
-def sock_recv(socket, flags=0):
+def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
     return socket.recv_pyobj(flags=flags)
 
 
-async def async_sock_send(
-    sender: Union[zmq.asyncio.Socket, SenderWrapper],
-    obj: Any,
-    flags: int = 0,
-) -> None:
-    await sender.send_pyobj(obj, flags=flags)
+async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:
+    await socket.send_pyobj(obj, flags=flags)
 
 
-async def async_sock_recv(socket, flags=0):
+async def async_sock_recv(socket: zmq.asyncio.Socket, flags: int = 0) -> Any:
     return await socket.recv_pyobj(flags=flags)
+
+
+# The following request types are either defined in other files,
+# or not subclasses of BaseReq/BaseBatchReq, so we skip the check for them.
+_IGNORE_REQ_TYPES_CHECK = (
+    GenerateReqInput.__name__,
+    EmbeddingReqInput.__name__,
+)
 
 
 def _check_all_req_types():
@@ -2237,6 +2163,8 @@ def _check_all_req_types():
     for class_type in all_classes:
         # check its name
         name = class_type[0]
+        if name in _IGNORE_REQ_TYPES_CHECK:
+            continue
         is_io_struct = (
             name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
         )
@@ -2252,3 +2180,27 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+# IPC struct types whose fields still use opaque annotations (Any, Dict[str, Any],
+# List[Any], etc.) instead of precise types.  Kept as an explicit registry so
+# opaque usage can be audited and gradually narrowed.
+# NOTE: GenerateReqInput and EmbeddingReqInput are standalone (not BaseReq/
+# BaseBatchReq subclasses) and are tracked separately.
+_REQ_TYPES_WITH_OPAQUE_FIELDS = (
+    TokenizedGenerateReqInput,  # mm_data_mooncake: Optional[List[Any]]
+    UpdateWeightFromDiskReqInput,  # manifest: Optional[Dict[str, Any]]
+    BackupDramReq,  # weight_pointer_map: Dict[str, Any]
+    GetWeightsByNameReqOutput,  # parameter: Optional[List[Any]]
+    CheckWeightsReqOutput,  # payload: Optional[Dict[str, Any]]
+    GetInternalStateReqOutput,  # internal_state: Dict[str, Any]
+    SetInternalStateReq,  # server_args: Dict[str, Any]
+    SetInternalStateReqOutput,  # server_args: Dict[str, Any]
+    VertexGenerateReqInput,  # instances, parameters: Dict[str, Any]
+    RpcReqInput,  # parameters: Optional[Dict[str, Any]]
+    LoadLoRAAdapterFromTensorsReqInput,  # config_dict, added_tokens_config: Dict[str, Any]
+    SetInjectDumpMetadataReqInput,  # dump_metadata: Dict[str, Any]
+    DumperControlReqInput,  # body: Dict[str, Any]
+    DumperControlReqOutput,  # response: List[Dict[str, Any]]
+    BatchTokenIDOutput,  # customized_info: Optional[Dict[str, List[Any]]]
+    BatchStrOutput,  # customized_info: Optional[Dict[str, List[Any]]]
+)
