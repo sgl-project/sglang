@@ -2323,16 +2323,23 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, base)
         self._insert(tree, allocator, req_to_token_pool, leaf)
 
+        # Insert-time SWA leaf capping may have already split base; assert the
+        # eviction-time split against the actual LRU target.
+        evict_target = tree.lru_lists[ComponentType.SWA].get_lru_no_lock()
+        evicted_len = (
+            len(evict_target.component_data[ComponentType.SWA].value) - retain_len
+        )
+        self.assertGreater(evicted_len, 0)
+
         before = tree.swa_evictable_size()
         result = self._evict_with_dense_swa_checkpoints(
             tree, EvictParams(num_tokens=0, swa_num_tokens=1)
         )
-        prefix_len = len(base) - retain_len
-        self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
-        self.assertEqual(tree.swa_evictable_size(), before - prefix_len)
+        self.assertEqual(result.swa_num_tokens_evicted, evicted_len)
+        self.assertEqual(tree.swa_evictable_size(), before - evicted_len)
 
         split_parent = next(iter(tree.root_node.children.values()))
-        self.assertEqual(len(split_parent.key), prefix_len)
+        self.assertEqual(len(split_parent.key), evicted_len)
         self.assertIsNone(split_parent.component_data[ComponentType.SWA].value)
         suffix = next(iter(split_parent.children.values()))
         self.assertEqual(len(suffix.key), retain_len)
@@ -2517,11 +2524,18 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, leaf)
         self._simulate_backup_tree(tree)
 
+        # Insert-time SWA leaf capping may have already split base; assert the
+        # eviction-time split against the actual LRU target.
+        evict_target = tree.lru_lists[ComponentType.SWA].get_lru_no_lock()
+        evicted_len = (
+            len(evict_target.component_data[ComponentType.SWA].value) - retain_len
+        )
+        self.assertGreater(evicted_len, 0)
+
         result = self._evict_with_dense_swa_checkpoints(
             tree, EvictParams(num_tokens=0, swa_num_tokens=1)
         )
-        prefix_len = len(base) - retain_len
-        self.assertEqual(result.swa_num_tokens_evicted, prefix_len)
+        self.assertEqual(result.swa_num_tokens_evicted, evicted_len)
 
         split_parent = next(iter(tree.root_node.children.values()))
         suffix = next(iter(split_parent.children.values()))
@@ -2529,7 +2543,7 @@ class UnifiedRadixCacheSuite:
         suffix_swa = suffix.component_data[ComponentType.SWA]
         self.assertIsNone(parent_swa.value)
         self.assertIsNotNone(parent_swa.host_value)
-        self.assertEqual(len(parent_swa.host_value), prefix_len)
+        self.assertEqual(len(parent_swa.host_value), evicted_len)
         self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(split_parent))
         self.assertIsNotNone(suffix_swa.value)
         self.assertIsNotNone(suffix_swa.host_value)
