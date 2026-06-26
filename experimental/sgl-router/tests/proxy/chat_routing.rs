@@ -1652,3 +1652,329 @@ async fn success_200_counted_once_per_request_in_responses_total() {
         ctx.metrics.render(),
     );
 }
+
+/// Regression for the production false-shedding leak: with admission ENABLED, a
+/// streaming request whose client disconnects mid-stream must release its
+/// per-worker admission slot (`Worker.active_requests`), not just the
+/// active-load registry. A leaked slot pins the worker at its cap, so the gate
+/// then sheds later requests with 503 while the engine is actually idle.
+///
+/// `streaming_active_load_drops_on_client_disconnect` covers the active-load
+/// *registry* on this path; this covers the *admission* counter the gate reads.
+#[tokio::test]
+async fn admission_slot_released_on_streaming_client_disconnect() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(100),
+    )
+    .await;
+
+    // cap=1, depth 0: if the slot leaks on disconnect, the next request is shed.
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
+        max_queued_requests: Some(0),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        Arc::clone(&registry),
+        policies,
+    ));
+    let w = registry.get(&WorkerId("w1".into())).unwrap();
+
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "tiny",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true,
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    // Request A claims the only slot; read one chunk so the stream is live.
+    let res_a = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+    use futures::StreamExt;
+    let mut data_stream = res_a.into_body().into_data_stream();
+    let _first = data_stream.next().await;
+    assert_eq!(
+        w.active_load(),
+        1,
+        "slot must be held while the stream is live"
+    );
+
+    // Client disconnects mid-stream.
+    drop(data_stream);
+
+    // The SSE pump should notice the receiver-drop and release the admission slot.
+    for _ in 0..100 {
+        if w.active_load() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        w.active_load(),
+        0,
+        "admission slot must be released when the streaming client disconnects",
+    );
+
+    // Behavioral check: a fresh request must be admitted, not falsely shed.
+    let res_b = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(
+        res_b.status(),
+        StatusCode::OK,
+        "next request must be admitted after the slot is released, not 503",
+    );
+    let _ = res_b.into_body().collect().await.unwrap();
+}
+
+/// Closer reproduction of the production false-shedding symptom: sustained
+/// CONCURRENT streaming load through the admission queue's hand-off path, with
+/// clients disconnecting mid-stream. Every slot claimed (directly or via
+/// hand-off to a parked waiter) must be released; if any leaks, the worker pins
+/// at its cap, later waiters never admit, and the gate sheds while the engine is
+/// idle. Asserts the worker drains to zero and all requests are admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_slots_not_leaked_under_concurrent_streaming_disconnects() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(40),
+    )
+    .await;
+
+    // cap=2 + a queue deep enough that all arrivals PARK (none shed) -> every
+    // admission after the first two goes through the FIFO hand-off path.
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(2).unwrap(),
+        max_queued_requests: Some(64),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        Arc::clone(&registry),
+        policies,
+    ));
+    let w = registry.get(&WorkerId("w1".into())).unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..24u32 {
+        let ctx2 = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "model": "tiny",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            // Each request must be admitted (parked then handed a slot); a leak
+            // would make a later waiter hang here forever.
+            let res =
+                tokio::time::timeout(Duration::from_secs(10), build_router(ctx2).oneshot(req))
+                    .await
+                    .expect("request must admit within timeout (a leaked slot would hang it)")
+                    .unwrap();
+            let status = res.status();
+            // Read one chunk, then disconnect mid-stream.
+            use futures::StreamExt;
+            let mut ds = res.into_body().into_data_stream();
+            let _ = ds.next().await;
+            drop(ds);
+            status
+        }));
+    }
+    for h in handles {
+        let status = h.await.expect("task panicked");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "every request must be admitted (no false shed)"
+        );
+    }
+
+    // All disconnected; every claimed/handed-off slot must have been released.
+    for _ in 0..200 {
+        if w.active_load() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        w.active_load(),
+        0,
+        "no admission slot may leak after concurrent streaming disconnects",
+    );
+    assert_eq!(
+        ctx.active_load.inflight_count(),
+        0,
+        "active-load registry must drain too"
+    );
+}
+
+/// Test-only `tracing` writer appending to a shared buffer.
+#[derive(Clone)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Process-wide capturing subscriber over a shared buffer. `set_global_default`
+/// can be installed only once, so a `OnceLock` guards it and the buffer
+/// accumulates every test's access log. Capture tests isolate their own lines by
+/// a unique `x-request-id` (see [`access_log_count`]), so concurrent tests
+/// writing to the shared buffer don't perturb the count. A *global* subscriber
+/// (vs a thread-local default) is required because under the parallel suite the
+/// handler's access-log events are not reliably emitted on the test's own thread.
+fn global_log_buf() -> Arc<std::sync::Mutex<Vec<u8>>> {
+    use tracing_subscriber::util::SubscriberInitExt;
+    static LOG_BUF: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    LOG_BUF
+        .get_or_init(|| {
+            let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let b = buf.clone();
+            let _ = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || LogCapture(b.clone()))
+                .finish()
+                .try_init();
+            buf
+        })
+        .clone()
+}
+
+fn make_chat_req(streaming: bool, request_id: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-request-id", request_id)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": streaming,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// Count access-log lines for one specific request id. Tagging the request with
+/// a unique id and filtering on it isolates this test's log lines from any other
+/// test's `chat_completions` events that share the captured `tracing` default
+/// under parallel execution.
+fn access_log_count(logs: &str, request_id: &str) -> usize {
+    logs.lines()
+        .filter(|l| l.contains("chat_completions") && l.contains(request_id))
+        .count()
+}
+
+/// A post-dispatch error (unreachable upstream → 502) must be logged EXACTLY
+/// once in the access log: the inner handler logs the rich line, and the
+/// `chat_completions` wrapper must not re-log it (the wrapper logs only the
+/// early `?`-short-circuits, which never reach the inner log).
+#[tokio::test]
+async fn post_dispatch_error_logged_once_in_access_log() {
+    let buf = global_log_buf();
+    let rid = "rid-post-dispatch-once";
+
+    // Worker is registered (healthy on add) but unreachable → forward fails with
+    // UpstreamUnreachable (502), a post-dispatch error.
+    let ctx = build_ctx_with_worker("http://127.0.0.1:1");
+    let res = build_router(ctx)
+        .oneshot(make_chat_req(false, rid))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let n = access_log_count(&logs, rid);
+    assert_eq!(
+        n, 1,
+        "post-dispatch error must be logged exactly once (no wrapper double-log); got {n}:\n{logs}"
+    );
+}
+
+/// A successful (200) request must be logged exactly once — by the inner
+/// handler, never additionally by the wrapper. Guards against a regression that
+/// makes the wrapper log unconditionally.
+#[tokio::test]
+async fn success_logged_once_in_access_log() {
+    let buf = global_log_buf();
+    let rid = "rid-success-once";
+
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let res = build_router(ctx)
+        .oneshot(make_chat_req(false, rid))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap();
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let n = access_log_count(&logs, rid);
+    assert_eq!(
+        n, 1,
+        "a success must be logged exactly once; got {n}:\n{logs}"
+    );
+}

@@ -13,6 +13,7 @@ use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::response::IntoResponse;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -89,12 +90,48 @@ impl Drop for RecordDurationOnDrop {
     }
 }
 
-/// POST /v1/chat/completions — parse model from body, select a healthy
-/// worker via the per-model policy, then proxy the request. If the
-/// request opts into streaming (`stream: true`), we pipe SSE bytes back;
-/// otherwise buffer.
+/// POST /v1/chat/completions handler. Thin wrapper over
+/// [`chat_completions_inner`] that surfaces early-error outcomes in the access
+/// log: a body-validation 400, an admission 503, a model-not-found, etc. return
+/// via `?` before the inner handler reaches its per-request access log, so
+/// without this they would be absent from the access log (visible only in the
+/// response-code metric, and for some variants a per-variant warning). The inner
+/// handler logs the success and post-dispatch outcomes — and returns its
+/// post-dispatch errors as a response rather than `Err`, so the wrapper logs
+/// each request exactly once (only the early `?` short-circuits land here).
 pub async fn chat_completions(
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = std::time::Instant::now();
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    let result = chat_completions_inner(ctx, headers, body).await;
+    if let Err(e) = &result {
+        tracing::info!(
+            request_id = %request_id,
+            method = "POST",
+            path = "/v1/chat/completions",
+            outcome = "error",
+            http_status = e.status_code().as_u16(),
+            latency_ms = start.elapsed().as_millis() as u64,
+            "chat_completions",
+        );
+    }
+    result
+}
+
+/// Parse model from body, select a healthy worker via the per-model policy, then
+/// proxy the request. If the request opts into streaming (`stream: true`), we
+/// pipe SSE bytes back; otherwise buffer. Early errors returned here are logged
+/// by the [`chat_completions`] wrapper; the success / post-dispatch outcomes are
+/// logged at the end of this function.
+async fn chat_completions_inner(
+    ctx: Arc<AppContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
@@ -620,7 +657,12 @@ pub async fn chat_completions(
             }
             Ok(response)
         }
-        (other, _) => other,
+        (Ok(response), None) => Ok(response),
+        // Post-dispatch errors were already logged with full fields by the
+        // access-log call above; return them as a response (not `Err`) so the
+        // `chat_completions` wrapper does not log them a second time. The wrapper
+        // logs only the early `?` short-circuits, which never reached that log.
+        (Err(e), _) => Ok(e.into_response()),
     }
 }
 
@@ -1266,5 +1308,60 @@ mod tests {
             ),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    /// Early-error short-circuits (e.g. a malformed body → 400) must still be
+    /// surfaced in the `chat_completions` access log. Before the fix they
+    /// returned via `?` ahead of the in-handler log and were invisible in the
+    /// logs (only countable via the response-code metric).
+    #[tokio::test]
+    async fn early_error_400_is_surfaced_in_access_log() {
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct VecWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for VecWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for VecWriter {
+            type Writer = VecWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(VecWriter(buf.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Valid JSON but not an object → `parse_probe` rejects with 400, an early
+        // `?` return that bypasses the in-handler access log.
+        let ctx = Arc::new(AppContext::stub());
+        let res = chat_completions(State(ctx), HeaderMap::new(), Bytes::from_static(b"[]")).await;
+        let status = match &res {
+            Ok(r) => r.status(),
+            Err(e) => e.status_code(),
+        };
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("chat_completions"),
+            "the 400 outcome must be surfaced in the access log; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains("http_status=400"),
+            "access log must record http_status=400; captured:\n{logs}"
+        );
     }
 }
