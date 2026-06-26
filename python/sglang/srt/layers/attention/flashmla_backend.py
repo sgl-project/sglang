@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.utils import (
     get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.layers.utils.dcp_utils import (
+from sglang.srt.layers.cp.dcp import (
     dcp_enabled,
     get_attention_dcp_rank,
     get_attention_dcp_world_size,

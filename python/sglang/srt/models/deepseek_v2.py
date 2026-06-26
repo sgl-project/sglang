@@ -122,9 +122,8 @@ from sglang.srt.layers.utils.cp_utils import (
     mla_use_prefill_cp,
     prepare_context_parallel_metadata,
 )
-from sglang.srt.layers.utils.dcp_utils import (
-    dcp_enabled,
-    get_attention_dcp_world_size,
+from sglang.srt.layers.cp.dcp import dcp_enabled, get_attention_dcp_world_size
+from sglang.srt.layers.cp.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (

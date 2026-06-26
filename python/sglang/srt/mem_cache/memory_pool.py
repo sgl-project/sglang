@@ -46,11 +46,9 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.utils.dcp_utils import (
-    dcp_enabled,
-    get_attention_dcp_rank,
-    get_attention_dcp_world_size,
-)
+# NOTE: DCP helpers (dcp_enabled / get_attention_dcp_*) are imported lazily inside
+# set_kv_buffer (MLA) to avoid an import cycle: importing layers.cp.dcp runs
+# layers/cp/__init__.py -> zigzag -> mem_cache.memory_pool.
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -2680,6 +2678,12 @@ class MLATokenToKVPool(KVCache):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
+        from sglang.srt.layers.cp.dcp import (
+            dcp_enabled,
+            get_attention_dcp_rank,
+            get_attention_dcp_world_size,
+        )
+
         if dcp_enabled():
             valid_mask = (
                 loc % get_attention_dcp_world_size() == get_attention_dcp_rank()

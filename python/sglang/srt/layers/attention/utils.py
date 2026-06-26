@@ -3,7 +3,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
-from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.triton_ops.cache_ops import (
     concat_and_cast_mha_k_kernel as concat_and_cast_mha_k_kernel,
 )
@@ -177,23 +176,6 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
         return concat_mla_absorb_q(q_nope, q_rope)
     else:
         return torch.cat([q_nope, q_rope], dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# Decode Context Parallel (DCP) helpers — moved to layers/cp/dcp/.
-#
-# Kept here as re-export shims for backwards compatibility. ``cp_lse_ag_out_rs``
-# here is the MHA (torch / natural-log / all-reduce) variant, now
-# ``cp_lse_ag_out_rs_mha``.
-# TODO(dcp-refactor P3a): delete once triton_backend imports from layers.cp.dcp.
-# ---------------------------------------------------------------------------
-from sglang.srt.layers.cp.dcp.comm import (  # noqa: E402,F401
-    cp_lse_ag_out_rs_mha as cp_lse_ag_out_rs,
-)
-from sglang.srt.layers.cp.dcp.kernels import (  # noqa: E402,F401
-    create_triton_kv_indices_for_dcp_triton,
-)
-from sglang.srt.layers.cp.dcp.layout import get_dcp_lens  # noqa: E402,F401
 
 
 @triton.jit
