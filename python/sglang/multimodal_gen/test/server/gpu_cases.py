@@ -20,6 +20,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionServerArgs,
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
+    JOY_ECHO_T2V_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
@@ -657,6 +658,20 @@ TWO_GPU_CASES = [
             prompt=T2V_PROMPT,
             output_size="832x480",
         ),
+    ),
+    DiffusionTestCase(
+        "joy_echo_t2v_2gpu",
+        DiffusionServerArgs(
+            model_path="jdopensource/JoyAI-Echo",
+            extras=["--ulysses-degree=2"],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        JOY_ECHO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_cfg_parallel",
