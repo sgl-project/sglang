@@ -180,101 +180,20 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
 
 
 # ---------------------------------------------------------------------------
-# Decode Context Parallel (DCP) helpers.
+# Decode Context Parallel (DCP) helpers — moved to layers/cp/dcp/.
 #
-# Not part of upstream main (PR #26000 centralized the other Triton utility
-# kernels into triton_ops/*). These three live here because they are DCP-only:
-#   - create_triton_kv_indices_for_dcp_triton: per-rank local KV indices
-#   - get_dcp_lens: per-rank visible KV length
-#   - cp_lse_ag_out_rs: merge DCP partial attention via natural-log LSE
+# Kept here as re-export shims for backwards compatibility. ``cp_lse_ag_out_rs``
+# here is the MHA (torch / natural-log / all-reduce) variant, now
+# ``cp_lse_ag_out_rs_mha``.
+# TODO(dcp-refactor P3a): delete once triton_backend imports from layers.cp.dcp.
 # ---------------------------------------------------------------------------
-@triton.jit
-def create_triton_kv_indices_for_dcp_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices_ptr,
-    dcp_kernel_lens_ptr,
-    kv_indptr,
-    kv_start_idx,
-    kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
-    dcp_size: tl.constexpr,
-    dcp_rank: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(axis=0)
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
-    kv_indices_offset = tl.load(kv_indptr + pid)
-
-    kv_start = 0
-    if kv_start_idx:
-        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
-
-    # First absolute token position in this range owned by dcp_rank.
-    # Triton follows C-style remainder for negative values, so avoid
-    # computing the offset as a negative remainder when kv_start > dcp_rank.
-    kv_start_mod = kv_start % dcp_size
-    first = kv_start + ((dcp_rank + dcp_size - kv_start_mod) % dcp_size)
-    local_len = tl.load(dcp_kernel_lens_ptr + pid).to(tl.int32)
-
-    num_loop = tl.cdiv(local_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
-        mask = offset < local_len
-        abs_pos = first + offset * dcp_size
-        data = tl.load(
-            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + abs_pos,
-            mask=mask,
-        )
-        tl.store(
-            kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask
-        )
-
-
-def get_dcp_lens(
-    lens: torch.Tensor,
-    dcp_size: int,
-    dcp_rank: int,
-    start: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if dcp_size == 1:
-        return lens
-    if start is None:
-        return lens // dcp_size + (dcp_rank < lens % dcp_size)
-
-    first = start + torch.remainder(dcp_rank - start, dcp_size)
-    remaining = start + lens - first
-    return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
-
-
-def cp_lse_ag_out_rs(
-    cp_attn_out: torch.Tensor,
-    cp_attn_lse: torch.Tensor,
-    cp_group: GroupCoordinator,
-    return_lse: bool = False,
-):
-    """Merge DCP partial attention outputs using natural-log LSE."""
-    if cp_group.world_size == 1:
-        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
-
-    cp_attn_lse = cp_attn_lse.contiguous()
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
-    global_lse = torch.logsumexp(lses, dim=0)
-    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
-    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
-
-    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
-    out = cp_group.all_reduce(out)
-
-    cp_num_heads = global_lse.shape[1] // cp_group.world_size
-    cp_rank = cp_group.rank_in_group
-    head_start = cp_num_heads * cp_rank
-    head_end = cp_num_heads * (cp_rank + 1)
-    out = out[:, head_start:head_end, :].contiguous()
-    if return_lse:
-        return out, global_lse[:, head_start:head_end].contiguous()
-    return out
+from sglang.srt.layers.cp.dcp.comm import (  # noqa: E402,F401
+    cp_lse_ag_out_rs_mha as cp_lse_ag_out_rs,
+)
+from sglang.srt.layers.cp.dcp.kernels import (  # noqa: E402,F401
+    create_triton_kv_indices_for_dcp_triton,
+)
+from sglang.srt.layers.cp.dcp.layout import get_dcp_lens  # noqa: E402,F401
 
 
 @triton.jit
