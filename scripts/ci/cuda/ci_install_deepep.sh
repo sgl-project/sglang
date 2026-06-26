@@ -106,9 +106,17 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
     sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
     popd
 else
+    # DeepEP d4f41e4 (v1.2.1-32) is the first pinned commit that ships EPv2's
+    # ElasticBuffer (EPv2 was introduced in DeepEP #605 / b306af0). It is a
+    # descendant of the previous pin 9af0e0d0 and still exports the legacy v1
+    # `Buffer`, so the existing DeepEP backend keeps working while the `epv2`
+    # MoE A2A backend can now import `ElasticBuffer`. EPv2 links NCCL's symmetric
+    # memory API (nccl::NCCLSymmetricMemoryContext); the build therefore needs an
+    # NCCL that ships the symmetric-memory headers (verified with
+    # nvidia-nccl-cu13>=2.30.7).
     git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
-    git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
+    git checkout d4f41e4e93602a15e95f55f6ee8df8f1aaa0e4bb && \
     popd
 fi
 
