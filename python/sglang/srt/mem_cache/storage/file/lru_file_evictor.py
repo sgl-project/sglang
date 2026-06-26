@@ -76,11 +76,8 @@ class LRUFileEvictor:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
-        # Maps a ``.bin`` filename to its relative hash-prefix shard subdir.
-        # Injected by HiCacheFile (its ``_shard_subdir``) so the evictor resolves
-        # the exact same on-disk paths the backend writes to, without importing
-        # the backend here -- HiCacheFile imports this evictor lazily, so a
-        # module-level back-import would be circular.
+        # Injected by HiCacheFile so the evictor resolves the same sharded paths;
+        # avoids a back-import (the backend imports this evictor lazily).
         self._shard_dir_fn = shard_dir_fn
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
@@ -302,10 +299,8 @@ class LRUFileEvictor:
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
-        # Files live in hash-prefix subdirs, so walk recursively rather than a
-        # single-level listdir. The LRU key stays the bare stem (filename without
-        # .bin); only discovery and the unlink path are shard-aware, never the
-        # index keys. os.walk on a missing dir yields nothing.
+        # Walk shard subdirs (the LRU key stays the bare stem; only discovery
+        # and unlink are shard-aware, not the index keys).
         entries = []
         for root, _dirs, files in os.walk(self.file_path):
             for fn in files:

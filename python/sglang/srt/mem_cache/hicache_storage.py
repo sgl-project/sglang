@@ -349,15 +349,11 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
-        # All LRU / size accounting and disk eviction lives in the evictor so
-        # this backend stays a thin raw-bytes store. Imported lazily: the storage
-        # package __init__ pulls in the backend factory, which imports this
-        # module, so a top-level import here would be circular.
+        # Lazy import: storage/__init__ pulls in the backend factory which imports
+        # this module, so a top-level import would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        # The evictor unlinks pages and so must resolve the same sharded paths
-        # the backend writes to. Inject the bucket helper rather than have the
-        # evictor import this module back (which would be circular).
+        # Inject _shard_subdir so the evictor resolves the same sharded paths.
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
@@ -371,18 +367,12 @@ class HiCacheFile(HiCacheStorage):
     def _shard_subdir(filename: str) -> str:
         """Map a ``.bin`` filename to its 2-level hash-prefix subdir ``<ab>/<cd>``.
 
-        Pages are fanned into ``<ab>/<cd>/<name>.bin`` so no single directory
-        accumulates millions of entries. A flat layout exhausts the ext4
-        directory index ("htree") at scale (~7.5M files), after which writes
-        fail with ENOSPC even though free bytes and inodes remain. Sharding caps
-        per-directory entries and also turns batched existence checks from one
-        ``O(total_files)`` scandir into ``O(keys)`` stats. The bucket is derived
-        purely from the leading hex of the filename (the content-hash prefix),
-        so get/set/exists and the evictor all resolve the same path -- the
-        evictor receives this exact helper (as ``shard_dir_fn``) to stay in sync.
+        A flat layout exhausts the ext4 directory index ("htree") at scale
+        (~7.5M files) and writes start failing with ENOSPC despite free
+        bytes/inodes. Sharding by the filename's content-hash prefix caps
+        per-directory entries; ``>= 4`` chars give 256x256 buckets, shorter
+        names fall back to a flat bucket.
         """
-        # First 4 hex chars give 256x256 buckets; short/atypical names fall
-        # back to a single flat bucket.
         if len(filename) >= 4:
             return os.path.join(filename[:2], filename[2:4])
         return ""
@@ -461,9 +451,8 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
-            # Create the hash-prefix subdir before writing the temp file; tmp
-            # and final live in the same shard dir so os.replace stays an atomic
-            # same-filesystem rename.
+            # tmp and final live in the same shard dir, so os.replace stays an
+            # atomic same-filesystem rename.
             os.makedirs(os.path.dirname(tensor_path), exist_ok=True)
             tmp_path = (
                 f"{tensor_path}.tmp."
@@ -512,10 +501,8 @@ class HiCacheFile(HiCacheStorage):
             for key in keys:
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
-        # Probe each target file in its hash-prefix shard directly: a per-target
-        # os.path.exists is O(len(target_files)) and shard-correct, versus
-        # scanning the whole flat file_path -- O(total_files) per call, i.e. a
-        # full cache-dir walk per request once millions of pages accumulate.
+        # Per-target os.path.exists in the shard is O(keys), versus an os.scandir
+        # of the whole flat dir (O(total files)) on every call.
         existing_files = set()
         for fname in target_files:
             if os.path.exists(self._sharded_path(fname)):
@@ -634,13 +621,9 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
-            # Files live in hash-prefix subdirs, so walk recursively rather than
-            # a single-level listdir. Walk bottom-up (topdown=False) so an empty
-            # shard subdir can be removed right after its pages are unlinked,
-            # otherwise eviction/clear would leak up to 256*256 empty dirs.
-            # Only unlink cache pages (*.bin) -- never non-.bin metadata such as
-            # a migration sentinel; a shard dir that still holds such a file
-            # fails rmdir and is kept. The root file_path itself is never removed.
+            # Walk shard subdirs bottom-up so emptied dirs can be reaped right
+            # after their pages are unlinked. Only *.bin is removed; a shard
+            # holding non-.bin files fails rmdir and is kept, as is file_path.
             for root, _dirs, files in os.walk(self.file_path, topdown=False):
                 for filename in files:
                     if not filename.endswith(".bin"):
