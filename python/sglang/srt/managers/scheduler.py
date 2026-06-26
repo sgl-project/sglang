@@ -3550,7 +3550,6 @@ class Scheduler(
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
-            and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
@@ -3929,7 +3928,7 @@ class Scheduler(
 
         # Delete requests in the running batch
         if self.ps.pp_size == 1:
-            inflight_batches = [self.running_batch, self.cur_batch]
+            inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
 
