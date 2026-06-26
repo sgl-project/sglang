@@ -2618,7 +2618,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
-        self.is_extend_intermediate = [False] * bs
+        self.is_extend_intermediate = [False] * len(self.reqs)
 
         # Must precede the spec early-return below so spec reqs also leave
         # the EXTEND_* phases.
