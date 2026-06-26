@@ -82,8 +82,42 @@ for target_dir in /home/runner/sglang-data /tmp; do
     [ -w "$target_dir" ] || { kv "dd_$target_dir" "skip (not writable by $(id -un))"; continue; }
     tmpfile="$target_dir/_runner_perf_diag.tmp"
     result=$(timeout 25 dd if=/dev/zero of="$tmpfile" bs=1M count=256 conv=fsync 2>&1 | tail -1)
-    rm -f "$tmpfile" 2>/dev/null
     kv "dd_${target_dir}" "$result"
+    # Sequential read back, bypassing the page cache (iflag=direct) so we
+    # measure the backing store, not RAM. Falls back to a cache-drop-free
+    # read if O_DIRECT is unsupported on the fs (common on some network FS).
+    if [ -f "$tmpfile" ]; then
+        rd=$(timeout 25 dd if="$tmpfile" of=/dev/null bs=1M iflag=direct 2>&1 | tail -1)
+        [ -n "$rd" ] && printf '%s' "$rd" | grep -q "copied" || \
+            rd=$(timeout 25 dd if="$tmpfile" of=/dev/null bs=1M 2>&1 | tail -1)
+        kv "ddread_${target_dir}" "$rd"
+    fi
+    rm -f "$tmpfile" 2>/dev/null
+done
+
+section "disk small-file metadata (create+fsync+stat+delete 500 x 4KiB)"
+# pip install and the HF cache touch thousands of tiny files; on a network/
+# distributed FS the per-op latency (not bandwidth) dominates and is what
+# slows 'Start CI container' / 'Install dependencies'. Sequential dd above
+# can look fast (~1 GB/s) while this is 10-100x slower than local ssd.
+for target_dir in /home/runner/sglang-data /tmp; do
+    [ -d "$target_dir" ] && [ -w "$target_dir" ] || { kv "smallfile_$target_dir" "skip (missing/ro)"; continue; }
+    d="$target_dir/_runner_perf_diag_sf.$$"
+    mkdir -p "$d" 2>/dev/null || { kv "smallfile_$target_dir" "skip (mkdir failed)"; continue; }
+    # Use shell builtins (printf redirect, [ -e ]) to avoid fork/exec overhead
+    # so the timing reflects filesystem metadata latency, not process spawn.
+    sf=$(timeout 90 bash -c '
+        d="$1"; t0=$(date +%s.%N)
+        for i in $(seq 1 500); do printf "xxxxxxxx" > "$d/f$i"; done
+        sync; t1=$(date +%s.%N)
+        ok=0; for i in $(seq 1 500); do [ -e "$d/f$i" ] && ok=$((ok+1)); done
+        t2=$(date +%s.%N)
+        rm -rf "$d"/* 2>/dev/null
+        t3=$(date +%s.%N)
+        awk -v a=$t0 -v b=$t1 -v c=$t2 -v e=$t3 "BEGIN{printf \"create=%.2fs stat=%.2fs bulk_delete=%.2fs (500x8B)\", b-a, c-b, e-c}"
+    ' _ "$d" 2>&1)
+    rm -rf "$d" 2>/dev/null
+    kv "smallfile_${target_dir}" "${sf:-timeout/err}"
 done
 
 section "network latency (3 probes)"
