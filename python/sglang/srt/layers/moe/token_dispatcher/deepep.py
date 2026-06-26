@@ -681,21 +681,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
-    def dispatch_a(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ):
-        buffer = self._get_buffer()
+    def dispatch_a(self, hidden_states, topk_output):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+            hidden_states.shape[0] * self._get_buffer().group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
-            hidden_states,
-            topk_ids,
+            hidden_states, topk_ids, topk_weights
         )
         return (
             hidden_states,
@@ -742,27 +736,36 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor] = None,
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
-
+    
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+    
+        # Build dispatch kwargs common to GPU and NPU
+        dispatch_kwargs = dict(
+            use_fp8=self.use_fp8,
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            **self.fp8_configs,
+        )
+        if self.use_nvfp4:
+            dispatch_kwargs["use_nvfp4"] = True
+        if input_global_scale is not None:
+            dispatch_kwargs["x_global_scale"] = input_global_scale
+    
+        # NPU requires topk_weights during dispatch
+        if _is_npu and topk_weights is not None:
+            dispatch_kwargs["topk_weights"] = topk_weights
+    
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                **self.fp8_configs,
+                **dispatch_kwargs,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
