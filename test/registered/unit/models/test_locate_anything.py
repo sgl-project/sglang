@@ -135,6 +135,31 @@ class TestBoxGrammarLogitProcessor(CustomTestCase):
         allowed = self._allowed_ids([self.BOX_START] + [self.COORD_START] * 4)
         self.assertEqual(allowed, {self.BOX_END})
 
+    def test_more_than_four_coords_must_close(self):
+        # The ">= 4 coords -> must close" branch must also fire if the model
+        # somehow emitted a 5th coordinate.
+        allowed = self._allowed_ids([self.BOX_START] + [self.COORD_START] * 5)
+        self.assertEqual(allowed, {self.BOX_END})
+
+    def test_coord_end_counts_as_a_coordinate(self):
+        # The coord range check is inclusive of coord_end (coord_start <= t <=
+        # coord_end); a body holding only coord_end must be treated as 1 coord.
+        allowed = self._allowed_ids([self.BOX_START, self.COORD_END])
+        self.assertNotIn(self.BOX_END, allowed)  # 1 coord -> need more
+        self.assertNotIn(self.NONE, allowed)
+        self.assertIn(self.COORD_START, allowed)
+
+    def test_missing_token_id_is_noop(self):
+        # If a client passes custom_params missing one of the five ids, the
+        # processor must skip that request rather than crash or partially mask.
+        proc = LocateAnythingBoxGrammarLogitProcessor()
+        logits = torch.randn(1, self.VOCAB)
+        original = logits.clone()
+        params = self._params([self.BOX_START])
+        del params[0]["none_token_id"]
+        out = proc(logits, params)
+        self.assertTrue(torch.equal(out, original))
+
     def test_closed_box_is_untouched(self):
         proc = LocateAnythingBoxGrammarLogitProcessor()
         logits = torch.randn(1, self.VOCAB)
@@ -151,6 +176,26 @@ class TestBoxGrammarLogitProcessor(CustomTestCase):
         logits = torch.randn(1, self.VOCAB)
         original = logits.clone()
         self.assertTrue(torch.equal(proc(logits, None), original))
+
+    def test_build_sampling_params_wires_config_token_ids(self):
+        config = _small_config()
+        params = LocateAnythingBoxGrammarLogitProcessor.build_sampling_params(config)
+        # Serialized processor + the 5 token ids the processor reads per request.
+        self.assertIn("custom_logit_processor", params)
+        self.assertEqual(
+            params["custom_logit_processor"],
+            LocateAnythingBoxGrammarLogitProcessor.to_str(),
+        )
+        self.assertEqual(
+            params["custom_params"],
+            {
+                "box_start_token_id": config.box_start_token_id,
+                "box_end_token_id": config.box_end_token_id,
+                "coord_start_token_id": config.coord_start_token_id,
+                "coord_end_token_id": config.coord_end_token_id,
+                "none_token_id": config.none_token_id,
+            },
+        )
 
 
 if __name__ == "__main__":

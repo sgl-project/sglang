@@ -269,7 +269,44 @@ class LocateAnythingBoxGrammarLogitProcessor(CustomLogitProcessor):
     ``box_start_token_id``, ``box_end_token_id``, ``coord_start_token_id``,
     ``coord_end_token_id``, ``none_token_id``) so the processor stays generic.
     The ``__req__`` entry supplies the generated-so-far token ids.
+
+    This processor is **opt-in**: it is never attached server-side. A client
+    enables it by passing both the serialized processor and the matching token
+    ids. :meth:`build_sampling_params` wires both from a
+    :class:`LocateAnythingConfig` so callers don't hand-build the id dict::
+
+        from sglang.srt.models.locate_anything import (
+            LocateAnythingBoxGrammarLogitProcessor,
+        )
+
+        extra = LocateAnythingBoxGrammarLogitProcessor.build_sampling_params(config)
+        # merge into the request's sampling_params, e.g.
+        #   sampling_params = {"max_new_tokens": 8192, **extra}
+
+    Passing the processor without ``custom_params`` (or vice versa) silently
+    no-ops — both must be present together.
     """
+
+    @classmethod
+    def build_sampling_params(
+        cls, config: "LocateAnythingConfig"
+    ) -> Dict[str, Any]:
+        """Build the sampling-param fields needed to enable constrained decoding.
+
+        Returns a dict with ``custom_logit_processor`` (the serialized
+        processor) and ``custom_params`` (the box/coord/none token ids read from
+        ``config``). Spread it into a request's ``sampling_params``.
+        """
+        return {
+            "custom_logit_processor": cls.to_str(),
+            "custom_params": {
+                "box_start_token_id": config.box_start_token_id,
+                "box_end_token_id": config.box_end_token_id,
+                "coord_start_token_id": config.coord_start_token_id,
+                "coord_end_token_id": config.coord_end_token_id,
+                "none_token_id": config.none_token_id,
+            },
+        }
 
     def __call__(
         self,
@@ -295,9 +332,12 @@ class LocateAnythingBoxGrammarLogitProcessor(CustomLogitProcessor):
             if None in (box_start, box_end, coord_start, coord_end, none_id):
                 continue
 
-            # Boxes are always generated (never in the prompt), so only the
-            # output tokens need scanning — this avoids an O(prompt_len) reverse
-            # scan per decode step over the long <IMG_CONTEXT> run.
+            # Only the generated tokens are scanned (not origin_input_ids),
+            # which avoids an O(prompt_len) reverse scan per decode step over the
+            # long <IMG_CONTEXT> run. Assumes the prompt contains no *unclosed*
+            # <box>: a closed <box>...</box> in a few-shot / multi-turn prompt is
+            # harmless (last_open finds no open box here), but an unclosed <box>
+            # left dangling in the prompt would not be constrained.
             output_ids = list(req.output_ids)
 
             # Find the last box_start; if a box_end follows it, no box is open.

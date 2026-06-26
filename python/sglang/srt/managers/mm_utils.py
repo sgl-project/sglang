@@ -1485,7 +1485,15 @@ def get_new_expanded_mm_items(original_mm_items):
             num_items = len(item.offsets)
 
             if item.is_image():
+                # MoonViT-style models (e.g. LocateAnything) carry per-image
+                # grids under `image_grid_hws` ([h, w]) rather than
+                # `image_grid_thw` ([t, h, w]); both encode dim-0 patch counts
+                # via prod over the last axis, so accept either key. (Use an
+                # explicit None check, not `a or b`: the value is a multi-element
+                # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
                     # No grid info — fall back to simple split by feature dim-0

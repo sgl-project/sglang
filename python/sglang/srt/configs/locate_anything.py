@@ -50,6 +50,9 @@ class LocateAnythingConfig(PretrainedConfig):
         self.image_token_index = image_token_index
         self.box_start_token_id = box_start_token_id
         self.box_end_token_id = box_end_token_id
+        # ref_*_token_id and mlp_connector_layers are kept for round-trip
+        # fidelity with the HF config; the box-grammar processor reads the box /
+        # coord / none ids, and the projector hardcodes its 2-layer structure.
         self.ref_start_token_id = ref_start_token_id
         self.ref_end_token_id = ref_end_token_id
         self.coord_start_token_id = coord_start_token_id
