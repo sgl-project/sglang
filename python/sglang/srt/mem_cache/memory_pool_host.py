@@ -2057,18 +2057,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
-        disable_token_granular_fallback: bool = False,
     ):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size
-        # The token-granular transfer fallback (transfer_cache_dsv4_mla) assumes
-        # the FP8 paged-row layout [value..][scale..]; it silently corrupts the
-        # unified_kv bf16 compressed region, where one row is a contiguous
-        # bf16 [head_dim]. Unified callers set this to hard-fail instead.
-        self.disable_token_granular_fallback = disable_token_granular_fallback
         self.dtype = torch.uint8
         self.device = device
         self.pin_memory = pin_memory
@@ -2239,14 +2233,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
-            if self.disable_token_granular_fallback:
-                raise NotImplementedError(
-                    f"{self.pool_name}: token-granular DSV4 transfer assumes the "
-                    "FP8 paged layout and is unsafe for the unified_kv bf16 "
-                    "region; expected page-aligned host/device indices "
-                    f"(host={host_indices.numel()}, device={device_indices.numel()}, "
-                    f"slot_page_size={self.slot_page_size})."
-                )
             # Whole C4 pages can use the normal HiCache page-row copy below.
             # Token-granular DSV4 C4 copy needs this helper because a token is
             # not one contiguous byte range in the paged row:
@@ -2320,14 +2306,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
-            if self.disable_token_granular_fallback:
-                raise NotImplementedError(
-                    f"{self.pool_name}: token-granular DSV4 transfer assumes the "
-                    "FP8 paged layout and is unsafe for the unified_kv bf16 "
-                    "region; expected page-aligned host/device indices "
-                    f"(host={host_indices.numel()}, device={device_indices.numel()}, "
-                    f"slot_page_size={self.slot_page_size})."
-                )
             # Same DSV4 C4 layout issue as backup: this is token-granular
             # preload, so it cannot use the normal HiCache page-row copy.
             transfer_cache_dsv4_mla(

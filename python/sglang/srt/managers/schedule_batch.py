@@ -1161,9 +1161,9 @@ class Req(ReqDllmMixin):
         # re-prefilled (repopulating this request's SWA ring), matching
         # non-HiCache radix reuse. No-op (returns 0) for every other layout.
         if tree_cache is not None:
-            holdback = tree_cache.swa_ring_holdback_tokens()
-            if holdback:
-                capped = max(0, input_len - holdback)
+            reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
+            if reprefill_tail:
+                capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
 
         # Disable prefix caching when embed overrides are present: same token IDs

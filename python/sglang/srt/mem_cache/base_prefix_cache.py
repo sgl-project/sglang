@@ -328,7 +328,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
-    def swa_ring_holdback_tokens(self) -> int:
+    def swa_reprefill_tail_tokens(self) -> int:
         # Only the unified_kv compress-only HiCache layout needs to hold back a
         # trailing sliding window for re-prefill; every other cache keeps SWA
         # content-stable and overrides this where relevant.

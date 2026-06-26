@@ -2492,36 +2492,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         swa = self.components.get(ComponentType.SWA)
         return swa.sliding_window_size if swa else None
 
-    def swa_ring_holdback_tokens(self) -> int:
-        """Trailing prefix tokens to exclude from a reused match so they are
-        re-prefilled instead of reused.
+    def swa_reprefill_tail_tokens(self) -> int:
+        """How many trailing prefix tokens to leave OUT of a cache match so the
+        request re-prefills them instead of reusing them. 0 = reuse everything.
 
-        In the unified_kv compress-only HiCache layout, SWA lives only in a
-        per-request ring (addressed by ``state_slot * ring + pos % ring``); it is
-        not content-stable and is never offloaded to / restored from host. A
-        reused or loaded-back prefix therefore carries *stale* SWA-ring entries
-        for its trailing sliding window (they belong to whichever request last
-        owned that ring slot). Holding back the last page-aligned sliding window
-        forces it into the extend segment, so this request re-prefills it and
-        repopulates its own SWA ring — exactly what plain (non-HiCache) radix
-        reuse does via the SWA match gate.
+        Only the unified_kv compress-only HiCache layout needs this: there SWA
+        lives in a per-request ring (``state_slot*ring + pos%ring``) that is not
+        content-stable and is never offloaded to host, so a reused prefix's
+        trailing sliding window would read stale ring slots left by another
+        request. Excluding that window forces this request to re-prefill it and
+        rewrite its own ring (what plain radix reuse already does). Every other
+        layout keeps SWA content-stable, so no re-prefill holdback is needed.
 
-        Returns 0 whenever SWA is content-stable and needs no holdback: no
-        HiCache controller, no SWA component, or SWA that is itself HiCached
-        (a host-backed SWA pool exists).
-
-        The returned value is the raw sliding-window size, not page-rounded: the
-        caller caps the *raw* match key, and the radix match then page-aligns
-        downward, so the reused prefix is the largest page boundary that still
-        leaves the whole trailing window in the extend segment. Rounding up here
-        would needlessly drop an extra page of reuse.
+        The raw sliding-window size is returned (not page-rounded): the caller
+        caps the raw match key and the radix match then page-aligns downward, so
+        reuse extends to the largest page boundary that still leaves the whole
+        window in the re-prefilled tail. Rounding up here would drop an extra
+        page of reuse for nothing.
         """
-        if self.cache_controller is None:
-            return 0
         swa = self.components.get(ComponentType.SWA)
-        if swa is None or getattr(swa, "_swa_kv_pool_host", None) is not None:
-            return 0
-        return swa.sliding_window_size or 0
+        unified_compress_only_hicache = (
+            self.cache_controller is not None
+            and swa is not None
+            and swa._swa_kv_pool_host is None
+        )
+        return swa.sliding_window_size if unified_compress_only_hicache else 0
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components

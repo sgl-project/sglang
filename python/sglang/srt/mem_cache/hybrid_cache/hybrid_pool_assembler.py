@@ -399,7 +399,6 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            disable_token_granular_fallback=is_unified_kv,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
@@ -489,7 +488,6 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
-            disable_token_granular_fallback=is_unified_kv,
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.

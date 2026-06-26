@@ -414,7 +414,15 @@ class DeepSeekV4UnifiedKVPool:
                 else nullcontext()
             ):
                 for ratio in stage_ratios:
-                    compress_pages = self.num_blocks * self.k_per_block[ratio]
+                    # Pad the compressed region by one extra page. The KV pool
+                    # reserves a null slot (token indices run 1..size), so the
+                    # top token maps to page `size // page_size == num_pages`,
+                    # one row past the unpadded region; HiCache load-back can
+                    # address it and overrun the page-row view. Mirrors the
+                    # standalone pools' `(size + page_size + 1)//page_size`
+                    # padding. One page == `2 * k_per_block[ratio]` rows for
+                    # page_size 256 (== page_size // ratio); 0 for ratio 0.
+                    compress_pages = (self.num_blocks + 2) * self.k_per_block[ratio]
                     bufs.append(
                         torch.zeros(
                             self.swa_pages + compress_pages,
