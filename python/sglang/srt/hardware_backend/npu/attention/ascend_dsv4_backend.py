@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+
+
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
     cache = _walsh_hadamard_matrix._cache
@@ -185,11 +187,15 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         req_to_token_pool,
         out_cache_loc_dsv4,
         is_graph: bool = False,
+        seq_lens_max_override: Optional[int] = None,
     ) -> dict:
         result: dict = {}
         req_pool = req_pool_indices
 
-        seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
+        if seq_lens_max_override is not None:
+            seq_lens_max = int(seq_lens_max_override)
+        else:
+            seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
 
         for ratio in self._dsv4_unique_compress_ratios:
@@ -741,7 +747,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                             valid.shape[0], *([1] * (kv_scale.dim() - 1))
                         )
                         kv_scale = kv_scale * scale_mask
-                elif not torch.all(valid):
+                else:
                     loc = loc[valid]
                     kv = kv[valid]
                     if kv_scale is not None:
@@ -959,6 +965,9 @@ class DeepseekV4AscendAttnBackend(
         speculative_step_id: int = 0,
     ):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
+        # DSV4 custom sparse attention uses page tables plus ori_mask_mode and
+        # never consumes ForwardMetadata.swa_mask.
+        self.use_graph_swa_mask = False
         cfg = model_runner.model_config
         self._dsv4_config = cfg
         tp_size = get_attention_tp_size()
@@ -1121,16 +1130,28 @@ class DeepseekV4AscendAttnBackend(
             tokens_per_bs = 1
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert seq_lens_cpu is not None, (
-            "V4 graph replay requires seq_lens_cpu - buffers.seq_lens is stale on "
-            "NPU (Graph.update only refreshes fm.actual_seq_lengths_kv inside the "
-            "captured graph, not the device-side buffers.seq_lens)."
-        )
-        live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
+        assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
+        if forward_mode.is_target_verify():
+            # In graph replay, buffers.seq_lens already contains the attention KV
+            # length (live length + draft tokens). Padded rows therefore show up as
+            # tokens_per_bs instead of 0. Use the CPU live lengths as the source of
+            # truth so padded rows stay masked out.
+            live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
+        elif seq_lens is not None and seq_lens.device.type != "cpu":
+            live_seq_lens = seq_lens[:bs].to(dtype=torch.int32)
+        else:
+            live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
         attn_seq_lens = live_seq_lens
         if forward_mode.is_target_verify():
+            valid_verify_rows = live_seq_lens > 0
             attn_seq_lens = live_seq_lens + int(tokens_per_bs)
+            attn_seq_lens = torch.where(valid_verify_rows, attn_seq_lens, live_seq_lens)
             fm.seq_lens_cpu_int = (seq_lens_cpu[:bs] + int(tokens_per_bs)).int()
+            fm.seq_lens_cpu_int = torch.where(
+                seq_lens_cpu[:bs] > 0,
+                fm.seq_lens_cpu_int,
+                seq_lens_cpu[:bs].int(),
+            )
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
         pool = self.token_to_kv_pool
@@ -1142,8 +1163,10 @@ class DeepseekV4AscendAttnBackend(
             and bool(self._dsv4_compress_ratios)
         )
         _compress_seq_lens = live_seq_lens
+        _compress_seq_lens_max = int(seq_lens_cpu[:bs].max()) if bs > 0 else 0
         if _verify_compress:
-            _compress_seq_lens = live_seq_lens + self.speculative_num_draft_tokens
+            _compress_seq_lens = live_seq_lens + int(tokens_per_bs)
+            _compress_seq_lens_max += int(tokens_per_bs)
 
         result = self._compute_compress_locs(
             pool=pool,
@@ -1157,6 +1180,7 @@ class DeepseekV4AscendAttnBackend(
             req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             is_graph=True,
+            seq_lens_max_override=_compress_seq_lens_max,
         )
 
         def _copy_2d(dst: torch.Tensor, src: torch.Tensor, val: int) -> None:
@@ -1193,18 +1217,25 @@ class DeepseekV4AscendAttnBackend(
                 _copy_1d(getattr(fm, key), result[key])
 
         if _verify_compress:
-            verify_seq_lens_cpu = seq_lens_cpu[:bs] + self.speculative_num_draft_tokens
+            verify_seq_lens_cpu = seq_lens_cpu[:bs] + int(tokens_per_bs)
+            verify_seq_lens_cpu = torch.where(
+                seq_lens_cpu[:bs] > 0,
+                verify_seq_lens_cpu,
+                seq_lens_cpu[:bs],
+            )
             self._fill_verify_positions_cmp_padding_one(
                 forward_batch.positions,
                 fm.positions_cmp_padding_c4,
                 4,
                 verify_seq_lens_cpu,
+                n_draft=tokens_per_bs,
             )
             self._fill_verify_positions_cmp_padding_one(
                 forward_batch.positions,
                 fm.positions_cmp_padding_c128,
                 128,
                 verify_seq_lens_cpu,
+                n_draft=tokens_per_bs,
             )
             fm.start_pos.copy_(live_seq_lens.to(torch.int32))
             valid = live_seq_lens[:bs] > 0
@@ -1611,24 +1642,28 @@ class DeepseekV4AscendAttnBackend(
         positions = forward_batch.positions
         t = positions.shape[0]
         bs = forward_batch.batch_size
+        n_draft = int(
+            getattr(
+                getattr(forward_batch, "spec_info", None),
+                "draft_token_num",
+                self.speculative_num_draft_tokens,
+            )
+        )
+        verify_seq_lens_cpu = forward_batch.seq_lens_cpu[:bs] + int(n_draft)
         padding_sizes = {}
         for ratio in (4, 128):
             if ratio not in self._dsv4_compress_ratios:
                 continue
-            should_compress = ((positions + 1) % ratio) == 0
-            vals = (positions[should_compress] - (ratio - 1)).to(torch.int64)
             padding_size = max(1, min(t, t // ratio + bs))
             padding_sizes[ratio] = padding_size
             padding = torch.zeros(padding_size, dtype=torch.int64, device=device)
-            if vals.numel() > 0:
-                assert vals.numel() <= padding.numel(), (
-                    f"verify positions_cmp_c{ratio} overflow: "
-                    f"{vals.numel()} > {padding.numel()}"
-                )
-                padding[: vals.numel()].copy_(vals)
+            self._fill_verify_positions_cmp_padding_one(
+                positions, padding, ratio, verify_seq_lens_cpu, n_draft=n_draft
+            )
             setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
         fm.start_pos = forward_batch.seq_lens.to(torch.int32)
-        fm.seqused = None
+        valid = forward_batch.seq_lens[:bs] > 0
+        fm.seqused = valid.to(torch.int32) * int(n_draft)
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
             for ratio in self._dsv4_unique_compress_ratios:
@@ -1716,12 +1751,15 @@ class DeepseekV4AscendAttnBackend(
         dst: torch.Tensor,
         ratio: int,
         seq_lens_cpu: torch.Tensor,
+        n_draft: Optional[int] = None,
     ) -> None:
         dst.zero_()
         if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
             return
 
-        n_draft = self.speculative_num_draft_tokens
+        if n_draft is None:
+            n_draft = self.speculative_num_draft_tokens
+        n_draft = int(n_draft)
         request_num = positions.shape[0] // n_draft
         if request_num == 0:
             return
@@ -1738,11 +1776,10 @@ class DeepseekV4AscendAttnBackend(
 
         if indices.numel() == 0:
             return
-        indices = (
-            indices[: dst.numel()]
-            .pin_memory()
-            .to(device=positions.device, non_blocking=True)
-        )
+        # This tiny H2D copy runs on the verify metadata path. Keep it blocking:
+        # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
+        # surface later as an unrelated CopyKernel stream failure.
+        indices = indices[: dst.numel()].to(device=positions.device)
         dst[: indices.numel()].copy_(torch.gather(positions, 0, indices))
 
     def update_verify_buffers_to_fill_after_draft(
@@ -1755,7 +1792,25 @@ class DeepseekV4AscendAttnBackend(
         if c4_positions is None or c128_positions is None:
             return
 
-        self._fill_verify_positions_cmp_padding(positions, c4_positions, c128_positions)
+        n_draft = int(
+            getattr(spec_info, "draft_token_num", self.speculative_num_draft_tokens)
+        )
+        seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)
+            if seq_lens_cpu is None:
+                raise RuntimeError(
+                    "DSV4 verify buffer refresh requires seq_lens_cpu_int on "
+                    "forward metadata or seq_lens_cpu on spec_info."
+                )
+            seq_lens_cpu = seq_lens_cpu + n_draft
+
+        self._fill_verify_positions_cmp_padding_one(
+            positions, c4_positions, 4, seq_lens_cpu, n_draft=n_draft
+        )
+        self._fill_verify_positions_cmp_padding_one(
+            positions, c128_positions, 128, seq_lens_cpu, n_draft=n_draft
+        )
 
 
 def _get_kv_indices(

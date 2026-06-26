@@ -58,6 +58,7 @@ if is_npu:
 
 logger = logging.getLogger(__name__)
 
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -82,6 +83,8 @@ def patch_model_npu(
         )
     else:
         yield model.forward
+
+
 
 
 class NPUGraphRunner(DecodeCudaGraphRunner):
@@ -270,7 +273,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     if output.next_token_logits is not None
                     else None
                 )
-            return LogitsProcessorOutput(
+            sliced_output = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
@@ -279,6 +282,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     else None
                 ),
             )
+            return sliced_output
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
