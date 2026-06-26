@@ -32,11 +32,13 @@ def get_compress_state_ring_size(
 ) -> int:
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
     # Online c128 keeps a single (max, sum, kv) state per index instead of a
-    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
-    # is incompatible with speculative decode for now.
+    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. The
+    # experimental MTP path uses request-scoped C128 state banks for EAGLE.
     if compress_ratio == 128 and ONLINE_C128:
         if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
-            raise AssertionError("online c128 does not support MTP")
+            raise AssertionError(
+                "online c128 MTP requires SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1"
+            )
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
@@ -494,15 +496,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
+        c128_ring_size = self.get_ring_size(128)
+        if ONLINE_C128:
+            # Request-scoped online C128 state is indexed by req_pool_idx.
+            # PD decode can allocate pre-transfer slots beyond
+            # max_num_reqs, so size to the actual req_to_token row count.
+            c128_state_pool_size = max(c128_state_pool_size, self.num_req_slots)
+        else:
+            # Offline C128 keeps a per-request raw state ring.
+            c128_state_pool_size = max(
+                c128_state_pool_size, self.num_req_slots * c128_ring_size
+            )
         self.c128_state_pool_size = c128_state_pool_size
         self.c4_state_dtype = c4_state_dtype
         self.c128_state_dtype = c128_state_dtype
         self.compression_ratios = compression_ratios
         self.online_mtp_max_draft_tokens = online_mtp_max_draft_tokens
+        self.online_c128_state_num_req_slots = c128_state_pool_size
         self.online_c128_mtp_pending_seq_lens: Optional[torch.Tensor] = None
         if ONLINE_C128 and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             self.online_c128_mtp_pending_seq_lens = torch.empty(
-                max_num_reqs, dtype=torch.int64, device=device
+                self.online_c128_state_num_req_slots, dtype=torch.int64, device=device
             )
 
         # Determine this PP stage's absolute layer range
@@ -602,11 +616,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 global_page_size=page_size,
             )
 
-        indexer_size = (
-            self.c4_logical_size
-            if (not _is_hip or envs.SGLANG_OPT_USE_COMPRESSOR_V2.get())
-            else c4_size
-        )
+        indexer_size = self.c4_logical_size
         self.c4_indexer_kv_pool = self._make_indexer_pool(
             indexer_size,
             c4_page_size,
@@ -731,12 +741,30 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for pool in pools:
                 if pool is None:
                     continue
+                if pool.ratio == 128:
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
                 data_lens.append(t.nbytes)
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
+        return data_ptrs, data_lens, item_lens
+
+    def get_c128_state_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            t = pool.kv_score_buffer.kv_score
+            assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
+            data_ptrs.append(t.data_ptr())
+            data_lens.append(t.nbytes)
+            item_lens.append(t[0].nbytes if ONLINE_C128 else t[0].nbytes * 128)
         return data_ptrs, data_lens, item_lens
 
     def _make_kv_pool(
@@ -909,9 +937,69 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 return int(pool.online_mtp_max_draft_tokens)
         return 0
 
+    def get_online_c128_state_num_req_slots(self) -> int:
+        return self.online_c128_state_num_req_slots
+
     def get_online_c128_mtp_pending_seq_lens(self) -> torch.Tensor:
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
+
+    def snapshot_c128_radix_state(
+        self, req_pool_idx: int, seq_len: int
+    ) -> Optional[List[torch.Tensor]]:
+        """Snapshot request-scoped C128 state for a radix cache node."""
+        if seq_len % 128 == 0:
+            return None
+
+        snapshots: List[torch.Tensor] = []
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            state = pool.kv_score_buffer.kv_score
+            if ONLINE_C128:
+                snapshots.append(state[req_pool_idx : req_pool_idx + 1].clone())
+            else:
+                start = req_pool_idx * pool.ring_size
+                state_len = seq_len % pool.ring_size
+                if state_len == 0:
+                    continue
+                snapshot = state.new_empty((pool.ring_size, state.shape[-1]))
+                half = snapshot.shape[-1] // 2
+                snapshot[:, :half].zero_()
+                snapshot[:, half:].fill_(float("-inf"))
+                positions = torch.arange(
+                    seq_len - state_len,
+                    seq_len,
+                    device=state.device,
+                    dtype=torch.long,
+                )
+                slots = positions % pool.ring_size
+                snapshot[slots] = state[start + slots]
+                snapshots.append(snapshot)
+        return snapshots or None
+
+    def restore_c128_radix_state(
+        self, req_pool_idx: int, snapshots: Optional[List[torch.Tensor]]
+    ) -> None:
+        """Restore radix-cached C128 state into the current request slot."""
+        if not snapshots:
+            return
+
+        snapshot_idx = 0
+        for pool in self.compress_state_pools:
+            if pool is None or pool.ratio != 128:
+                continue
+            snapshot = snapshots[snapshot_idx]
+            snapshot_idx += 1
+
+            state = pool.kv_score_buffer.kv_score
+            if ONLINE_C128:
+                state[req_pool_idx : req_pool_idx + 1].copy_(snapshot)
+            else:
+                start = req_pool_idx * pool.ring_size
+                state[start : start + pool.ring_size].copy_(snapshot)
+
+        assert snapshot_idx == len(snapshots)
 
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)

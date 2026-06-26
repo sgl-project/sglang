@@ -182,7 +182,7 @@ class SchedulePolicy:
             and get_global_server_args().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
-                match_prefix_for_req(self.tree_cache, r)
+                match_prefix_for_req(self.tree_cache, r, include_req=True)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
@@ -257,7 +257,9 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
+            match_result = match_prefix_for_req(
+                self.tree_cache, r, prefix_ids, include_req=True
+            )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from

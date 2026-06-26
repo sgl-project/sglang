@@ -22,7 +22,7 @@ The radix tree data structure for managing the hybrid (full and SWA) KV cache.
 import heapq
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from numpy import float64
@@ -80,6 +80,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each page
         self.hash_value: Optional[List[str]] = None
+        # C128 state snapshots keyed by the local token offset inside this node.
+        self.c128_state_snapshots: Optional[Dict[int, List[torch.Tensor]]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -386,6 +388,109 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.swa_lru_list = LRUList(is_swa_list=True)
         self._record_all_cleared_event()
 
+    def _dsv4_kv_pool(self):
+        if self.token_to_kv_pool_allocator is None:
+            return None
+        get_kvcache = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
+        if get_kvcache is None:
+            return None
+        kv_pool = get_kvcache()
+        if not hasattr(kv_pool, "snapshot_c128_radix_state") or not hasattr(
+            kv_pool, "restore_c128_radix_state"
+        ):
+            return None
+        return kv_pool
+
+    def _snapshot_c128_state_for_req(
+        self, req: Req, seq_len: int
+    ) -> Optional[List[torch.Tensor]]:
+        kv_pool = self._dsv4_kv_pool()
+        if kv_pool is None or req.req_pool_idx is None or seq_len <= 0:
+            return None
+        return kv_pool.snapshot_c128_radix_state(int(req.req_pool_idx), seq_len)
+
+    def _node_prefix_len(self, node: TreeNode) -> int:
+        prefix_len = 0
+        while node is not None and node is not self.root_node:
+            prefix_len += len(node.value)
+            node = node.parent
+        return prefix_len
+
+    def _get_c128_snapshot_at_node_end(
+        self, node: TreeNode
+    ) -> Optional[List[torch.Tensor]]:
+        if node.c128_state_snapshots is None:
+            return None
+        return node.c128_state_snapshots.get(len(node.value))
+
+    def _is_c128_restorable_node(self, node: TreeNode) -> bool:
+        if node is self.root_node:
+            return True
+        if self._get_c128_snapshot_at_node_end(node) is not None:
+            return True
+        return self._node_prefix_len(node) % 128 == 0
+
+    def _store_c128_snapshot_at_prefix_len(
+        self,
+        node: TreeNode,
+        prefix_len: int,
+        snapshot: Optional[List[torch.Tensor]],
+    ) -> None:
+        if snapshot is None or prefix_len <= 0:
+            return
+
+        path: List[TreeNode] = []
+        cur = node
+        while cur is not None and cur is not self.root_node:
+            path.append(cur)
+            cur = cur.parent
+
+        remaining = prefix_len
+        for cur in reversed(path):
+            if remaining <= len(cur.value):
+                if cur.c128_state_snapshots is None:
+                    cur.c128_state_snapshots = {}
+                cur.c128_state_snapshots[remaining] = snapshot
+                return
+            remaining -= len(cur.value)
+
+    def _store_c128_partial_snapshot_for_req(
+        self, req: Req, node: TreeNode, prefix_len: int
+    ) -> None:
+        if prefix_len % 128 == 0:
+            return
+        snapshot = self._snapshot_c128_state_for_req(req, prefix_len)
+        self._store_c128_snapshot_at_prefix_len(node, prefix_len, snapshot)
+
+    def _find_c128_restorable_node(self, node: TreeNode) -> TreeNode:
+        if self._dsv4_kv_pool() is None:
+            return node
+        while node is not self.root_node and not self._is_c128_restorable_node(node):
+            prefix_len = self._node_prefix_len(node)
+            aligned_prefix_len = prefix_len // 128 * 128
+            parent_prefix_len = prefix_len - len(node.value)
+            if aligned_prefix_len > parent_prefix_len:
+                split_len = aligned_prefix_len - parent_prefix_len
+                return self._split_node(node.key, node, split_len)
+            node = node.parent
+        return node
+
+    def restore_c128_state_for_reqs(self, reqs: List[Req]) -> None:
+        kv_pool = self._dsv4_kv_pool()
+        if kv_pool is None:
+            return
+        for req in reqs:
+            if req.req_pool_idx is None:
+                continue
+            node = getattr(req, "last_node", self.root_node)
+            prefix_len = len(getattr(req, "prefix_indices", []))
+            snapshot = self._get_c128_snapshot_at_node_end(node)
+            if node is self.root_node or not self._is_c128_restorable_node(node):
+                continue
+            assert self._node_prefix_len(node) == prefix_len
+            if snapshot is not None:
+                kv_pool.restore_c128_radix_state(int(req.req_pool_idx), snapshot)
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
@@ -468,6 +573,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     swa_evicted_seqlen=req.swa_evicted_seqlen,
                 )
             )
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            if len(match_result.device_indices) == page_aligned_len:
+                last_node = match_result.last_device_node
+                self._store_c128_partial_snapshot_for_req(
+                    req, last_node, page_aligned_len
+                )
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len]
@@ -551,6 +662,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
+        self._store_c128_partial_snapshot_for_req(req, new_last_node, len(new_indices))
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -960,6 +1072,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
 
+        if params.req is not None and len(value) > 0:
+            last_node = self._find_c128_restorable_node(last_node)
+            c128_prefix_len = self._node_prefix_len(last_node)
+            if c128_prefix_len < len(value):
+                value = value[:c128_prefix_len]
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -997,6 +1115,12 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 is_bigram=node.key.is_bigram,
             )
             node.value = torch.cat([node.value, child.value])
+            if child.c128_state_snapshots is not None:
+                offset = len(node.value) - len(child.value)
+                if node.c128_state_snapshots is None:
+                    node.c128_state_snapshots = {}
+                for rel_len, snapshot in child.c128_state_snapshots.items():
+                    node.c128_state_snapshots[offset + rel_len] = snapshot
             node.children = child.children
             for grandchild in node.children.values():
                 grandchild.parent = node
@@ -1075,6 +1199,19 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         child.key = child.key[split_len:]
         assert len(child.key) > 0, f"child.key should not be empty"
         child.value = child.value[split_len:].clone()
+        if child.c128_state_snapshots is not None:
+            parent_snapshots = {
+                rel_len: snapshot
+                for rel_len, snapshot in child.c128_state_snapshots.items()
+                if rel_len <= split_len
+            }
+            child_snapshots = {
+                rel_len - split_len: snapshot
+                for rel_len, snapshot in child.c128_state_snapshots.items()
+                if rel_len > split_len
+            }
+            new_node.c128_state_snapshots = parent_snapshots or None
+            child.c128_state_snapshots = child_snapshots or None
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size

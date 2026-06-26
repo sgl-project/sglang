@@ -929,7 +929,7 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator,
                 )
                 assert swa_allocator.__class__ == SWATokenToKVPoolAllocator
-                self.token_to_kv_pool.full_to_swa_index_mapping = (
+                self.token_to_kv_pool.register_mapping(
                     swa_allocator.full_to_swa_index_mapping
                 )
 
@@ -1074,6 +1074,7 @@ class ModelRunnerKVCacheMixin:
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
         )
+        config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 
