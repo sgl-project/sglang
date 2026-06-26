@@ -512,8 +512,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ok = (
                 weight is not None
                 and weight_scale is not None
-                and weight.dtype
-                in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+                and weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
                 and uses_per_token_a8w8
                 and self.head_v_dim == 128
                 and (self.num_v_heads // self.attn_tp_size) <= 128
@@ -543,9 +542,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dtype=self.out_proj.weight.dtype,
             device=x3.device,
         )
-        q_scale = torch.empty(
-            (num_tokens,), dtype=torch.float32, device=x3.device
-        )
+        q_scale = torch.empty((num_tokens,), dtype=torch.float32, device=x3.device)
         gated_rmsnorm_fp8_per_token_quant(
             q_fp8, q_scale, x3, z3, self.norm.weight, self.layer_norm_epsilon
         )
