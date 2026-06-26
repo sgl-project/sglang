@@ -1249,12 +1249,18 @@ class DeepseekSparseAttnBackend(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
+            # Fill the constant per-req qo lengths (num_draft_tokens) on-device;
+            # torch.tensor(list, device=cuda) does a pageable H2D copy that
+            # blocks the host on the whole queued stream.
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
-                ),
+                extend_seq_lens,
                 cache_seqlens,
                 self.speculative_num_draft_tokens * bs,
                 self.speculative_num_draft_tokens,
@@ -1284,11 +1290,16 @@ class DeepseekSparseAttnBackend(
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
+            # See target-verify note: fill on-device to avoid the blocking
+            # pageable H2D from torch.tensor(list, device=cuda).
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
-                ),
+                extend_seq_lens,
                 cache_seqlens,
                 self.speculative_num_draft_tokens * bs,
                 self.speculative_num_draft_tokens,
