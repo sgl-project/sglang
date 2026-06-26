@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations import (
     execute_overlapped_operations,
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -652,9 +653,23 @@ class TboForwardBatchPreparer:
             output_dict[key] = old_value[start_token_index:end_token_index]
 
         attention_tp_size = get_parallel().attn_tp_size
-        output_dict["tbo_padded_len"] = (
+        _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
+        # SGLANG_TBO_PAD_BUCKET: round the ubatch padded length up to the next
+        # power-of-2 (>=256) so the two micro-batches reuse a BOUNDED set of shapes.
+        # Otherwise tbo_padded_len varies continuously (it only pads to
+        # attn_tp_size), so shape-specialized kernels keep JIT/autotuning and
+        # accumulate ROCm HSA resources -> HSA_STATUS_ERROR_OUT_OF_RESOURCES under
+        # TBO + cuda-graph (DeepSeek-V4 + mori EP on MI355X). Mirrors ATOM's fixed
+        # graph_bs//N bucketing. The extra padding tokens are marked non-real via
+        # num_token_non_padded, so numerics are unaffected (gsm8k 0.9507/0.9500).
+        if envs.SGLANG_TBO_PAD_BUCKET.get() and _tbo_padded_len > 0:
+            _b = 1 << max(8, (_tbo_padded_len - 1).bit_length())  # next pow2, >=256
+            _tbo_padded_len = (
+                (_b + attention_tp_size - 1) // attention_tp_size
+            ) * attention_tp_size
+        output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
             "req_pool_indices",

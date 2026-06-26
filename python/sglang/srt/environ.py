@@ -579,6 +579,14 @@ class Envs:
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # Round each TBO ubatch's padded token length up to the next power-of-2
+    # (>=256) so the two micro-batches reuse a BOUNDED set of shapes. Without
+    # this, the per-batch tbo_padded_len varies continuously (it only pads to
+    # attn_tp_size), so shape-specialized kernels (Triton/aiter/rocBLAS JIT +
+    # autotune) keep allocating ROCm HSA module/queue resources and eventually
+    # hit HSA_STATUS_ERROR_OUT_OF_RESOURCES under TBO + cuda-graph (observed on
+    # DeepSeek-V4 + mori EP on MI355X). Mirrors ATOM's fixed graph_bs//N bucketing.
+    SGLANG_TBO_PAD_BUCKET = EnvBool(False)
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
