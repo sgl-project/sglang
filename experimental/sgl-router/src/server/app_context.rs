@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
+use crate::server::admission::AdmissionQueue;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
@@ -30,6 +31,10 @@ pub struct AppContext {
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
+    /// Router-side admission control. Gates the chat hot path: caps in-flight
+    /// requests per worker and parks (or sheds with 503) excess. A pass-through
+    /// when no per-worker cap is configured.
+    pub admission: Arc<AdmissionQueue>,
     ready: AtomicBool,
 }
 
@@ -74,6 +79,7 @@ impl AppContext {
         // after the policy registry, so inject it now. No-op for policies
         // that don't emit metrics.
         policies.attach_metrics(Arc::clone(&metrics));
+        let admission = Arc::new(AdmissionQueue::new(config.admission, Arc::clone(&metrics)));
         Self {
             config,
             tokenizers,
@@ -82,6 +88,7 @@ impl AppContext {
             policies,
             active_load,
             metrics,
+            admission,
             ready: AtomicBool::new(false),
         }
     }
@@ -98,6 +105,9 @@ impl AppContext {
 
     #[cfg(test)]
     pub fn stub() -> Self {
+        // Share one registry between `metrics` and `admission`, mirroring
+        // production, so admission metrics are visible via `ctx.metrics`.
+        let metrics = MetricsRegistry::new();
         Self {
             config: Config {
                 server: crate::config::ServerConfig {
@@ -120,13 +130,18 @@ impl AppContext {
                 ),
                 proxy: crate::config::ProxyConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
+                admission: crate::config::AdmissionConfig::default(),
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
-            metrics: MetricsRegistry::new(),
+            admission: Arc::new(AdmissionQueue::new(
+                crate::config::AdmissionConfig::Disabled,
+                Arc::clone(&metrics),
+            )),
+            metrics,
             ready: AtomicBool::new(false),
         }
     }

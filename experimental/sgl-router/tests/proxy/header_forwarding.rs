@@ -40,6 +40,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        admission: sgl_router::config::AdmissionConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());

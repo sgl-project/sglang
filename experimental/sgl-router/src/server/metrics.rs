@@ -32,6 +32,9 @@
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_backpressure_rejected_total` | Counter | `model_id` |
+//! | `sgl_router_queued_requests` | Gauge | (none) |
+//! | `sgl_router_admission_wait_seconds` | Histogram | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -87,6 +90,16 @@ const TTFT_BUCKETS: &[f64] = &[
     400.0,
 ];
 
+/// Histogram bucket upper bounds (seconds) for
+/// `sgl_router_admission_wait_seconds` — time a request spends parked in the
+/// admission wait queue. Extends the standard latency ladder out to 120 s: the
+/// wait queue can park for a long time under sustained saturation, and the
+/// request-duration ladder (capped at 30 s) would dump those into `+Inf`,
+/// hiding them from `histogram_quantile`.
+const ADMISSION_WAIT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
+
 /// Recordable outcome for a request — narrowed to a handful of variants so
 /// the label cardinality stays bounded.
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +135,39 @@ impl WorkerModeLabel {
             Self::Decode => "decode",
             Self::Plain => "plain",
         }
+    }
+}
+
+/// Routing context a handler attaches to its `Response` (via response
+/// extensions) so the outermost access-log/metrics middleware can record the
+/// per-worker labels it otherwise cannot see. Present on every routed request
+/// (the request reached a worker); absent on requests rejected before routing
+/// (a body-validation 400, an admission 503 shed, model-not-found), which the
+/// middleware records with an empty `worker_url`. Recording in one place — the
+/// middleware — is what makes `requests_total` cover EVERY request, so
+/// `sum by (outcome)` reflects all ingress, not just dispatched traffic.
+#[derive(Debug, Clone)]
+pub struct RequestLogContext {
+    pub worker_url: String,
+    pub model_id: String,
+    pub mode: WorkerModeLabel,
+}
+
+/// Derive the bounded [`RequestOutcome`] label from the client-visible HTTP
+/// status: 2xx is success, 504 is the stale-request cancellation, everything
+/// else (incl. forwarded 4xx/5xx and proxy-side 5xx) is an error. Shared by the
+/// middleware so every request — routed or rejected pre-routing — is labelled
+/// the same way.
+///
+/// The 504→`Cancelled` mapping conflates the router's own stale-request cancel
+/// with a genuine upstream 504 forwarded unchanged; the unambiguous signal for a
+/// real stale-cancel is `stale_requests_total{outcome="expired"}`, which only
+/// the janitor increments.
+pub fn outcome_from_status(status: u16) -> RequestOutcome {
+    match status {
+        200..=299 => RequestOutcome::Success,
+        504 => RequestOutcome::Cancelled,
+        _ => RequestOutcome::Error,
     }
 }
 
@@ -217,6 +263,14 @@ pub struct MetricsRegistry {
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    backpressure_rejected_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    /// Current admission wait-queue depth (parked requests). A single
+    /// router-wide gauge — the queue is shared across the router, so this is a
+    /// global count, not per-model.
+    queued_requests: AtomicI64,
+    /// Time a parked request waited before admission (seconds), per model.
+    /// Only parked-then-admitted requests are recorded.
+    admission_wait_seconds: Mutex<HashMap<String, Histogram>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -374,9 +428,15 @@ impl MetricsRegistry {
     }
 
     /// Bump `sgl_router_responses_total{status_code}` for the HTTP status the
-    /// client ultimately saw. Cardinality is bounded by the small set of
-    /// status codes the router returns (2xx success, 4xx client, 5xx
-    /// upstream/proxy, 504 stale-cancel).
+    /// client ultimately saw. Driven by the `access_log_and_record` middleware,
+    /// so it counts EVERY response across all routes — including error
+    /// short-circuits that never reach a handler's own bookkeeping (an admission
+    /// 503, a body-limit 413). For streaming responses the status is the one sent
+    /// with the headers, so a stream that fails mid-body after a 200 header is
+    /// counted as 200 (the breaker / duration metrics capture mid-stream
+    /// failures). Cardinality is bounded by the small set of status codes the
+    /// router returns (2xx success, 4xx client, 5xx upstream/proxy, 504
+    /// stale-cancel).
     pub fn record_response(&self, status_code: u16) {
         let mut guard = self.responses_total.lock();
         let counter = guard
@@ -455,6 +515,43 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_backpressure_rejected_total{model_id}` — a request the
+    /// admission gate shed with 503 because every worker was at its in-flight
+    /// cap and the wait queue was full.
+    pub fn record_backpressure_rejected(&self, model_id: &str) {
+        let mut guard = self.backpressure_rejected_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adjust `sgl_router_queued_requests` by `delta` (+1 when a request parks,
+    /// -1 when it leaves the wait queue). The gauge atomic is the source of
+    /// truth: applying balanced deltas keeps it exact under concurrency and
+    /// converges to 0 at idle, unlike storing a separately-computed depth
+    /// (which can publish a stale value when two parks/unparks interleave).
+    pub fn add_queued_requests(&self, delta: i64) {
+        self.queued_requests.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Observe the time (seconds) a request spent parked in the admission wait
+    /// queue before being admitted, for `sgl_router_admission_wait_seconds`.
+    /// Recorded only for parked-then-admitted requests, so the histogram's
+    /// `_count` is the number of requests that had to wait at all.
+    pub fn observe_admission_wait(&self, model_id: &str, seconds: f64) {
+        if !seconds.is_finite() {
+            return;
+        }
+        let mut guard = self.admission_wait_seconds.lock();
+        let hist = guard
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Histogram::new(ADMISSION_WAIT_BUCKETS));
+        hist.observe(seconds);
     }
 
     /// Render the registry as a Prometheus 0.0.4 exposition-format string
@@ -540,7 +637,7 @@ impl MetricsRegistry {
 
         // responses_total
         out.push_str(
-            "# HELP sgl_router_responses_total Chat-completions responses returned to clients, by HTTP status code (recorded after worker dispatch).\n",
+            "# HELP sgl_router_responses_total HTTP responses returned to clients across all routes, by status code (recorded at response-headers time, so a mid-stream failure after a 200 header counts as 200).\n",
         );
         out.push_str("# TYPE sgl_router_responses_total counter\n");
         let guard = self.responses_total.lock();
@@ -727,6 +824,56 @@ impl MetricsRegistry {
                 escape_label(model_id),
                 value,
             ));
+        }
+        drop(guard);
+
+        // backpressure_rejected_total
+        out.push_str(
+            "# HELP sgl_router_backpressure_rejected_total Requests rejected with 503 because every worker was at its in-flight cap and the admission wait queue was full.\n",
+        );
+        out.push_str("# TYPE sgl_router_backpressure_rejected_total counter\n");
+        let guard = self.backpressure_rejected_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_backpressure_rejected_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // queued_requests (router-wide gauge, no labels)
+        out.push_str(
+            "# HELP sgl_router_queued_requests Requests currently parked in the admission wait queue (router-wide).\n",
+        );
+        out.push_str("# TYPE sgl_router_queued_requests gauge\n");
+        out.push_str(&format!(
+            "sgl_router_queued_requests {}\n",
+            self.queued_requests.load(Ordering::Relaxed),
+        ));
+
+        // admission_wait_seconds histogram
+        out.push_str(
+            "# HELP sgl_router_admission_wait_seconds Time a request spent parked in the admission wait queue before admission, in seconds.\n",
+        );
+        out.push_str("# TYPE sgl_router_admission_wait_seconds histogram\n");
+        let guard = self.admission_wait_seconds.lock();
+        let mut models: Vec<&String> = guard.keys().collect();
+        models.sort();
+        for model_id in models {
+            let hist = guard.get(model_id).unwrap();
+            let label_body = format!("model_id=\"{}\"", escape_label(model_id));
+            render_histogram(
+                &mut out,
+                "sgl_router_admission_wait_seconds",
+                &label_body,
+                hist,
+            );
         }
         drop(guard);
 
@@ -1076,6 +1223,53 @@ mod tests {
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="assigned"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="remap"} 1"#));
         assert!(out.contains(r#"sgl_router_sticky_total{outcome="no_routing_key"} 1"#));
+    }
+
+    #[test]
+    fn backpressure_rejected_counter_increments_per_model() {
+        let reg = MetricsRegistry::new();
+        reg.record_backpressure_rejected("tiny");
+        reg.record_backpressure_rejected("tiny");
+        reg.record_backpressure_rejected("other");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_backpressure_rejected_total{model_id="tiny"} 2"#),
+            "{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_backpressure_rejected_total{model_id="other"} 1"#),
+            "{out}",
+        );
+    }
+
+    #[test]
+    fn queued_requests_gauge_tracks_balanced_deltas() {
+        let reg = MetricsRegistry::new();
+        reg.add_queued_requests(1);
+        reg.add_queued_requests(1);
+        reg.add_queued_requests(-1);
+        let out = reg.render();
+        assert!(
+            out.contains("# TYPE sgl_router_queued_requests gauge"),
+            "{out}"
+        );
+        assert!(out.contains("sgl_router_queued_requests 1\n"), "{out}");
+    }
+
+    #[test]
+    fn admission_wait_histogram_writes_buckets_sum_and_count() {
+        let reg = MetricsRegistry::new();
+        reg.observe_admission_wait("tiny", 0.3);
+        reg.observe_admission_wait("tiny", 1.5);
+        let out = reg.render();
+        assert!(
+            out.contains("# TYPE sgl_router_admission_wait_seconds histogram"),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"sgl_router_admission_wait_seconds_count{model_id="tiny"} 2"#),
+            "{out}",
+        );
     }
 
     #[test]

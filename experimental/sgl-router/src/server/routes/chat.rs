@@ -7,12 +7,13 @@ use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, RequestLogContext, StaleRequestOutcome, WorkerModeLabel,
 };
-use crate::workers::{LoadGuard, Worker};
+use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::response::IntoResponse;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -89,12 +90,34 @@ impl Drop for RecordDurationOnDrop {
     }
 }
 
-/// POST /v1/chat/completions — parse model from body, select a healthy
-/// worker via the per-model policy, then proxy the request. If the
-/// request opts into streaming (`stream: true`), we pipe SSE bytes back;
-/// otherwise buffer.
+/// POST /v1/chat/completions handler. Thin delegator to
+/// [`chat_completions_inner`]. Per-request logging and `requests_total` /
+/// `responses_total` counting happen once, centrally, in the outermost
+/// `access_log_and_record` middleware (see [`crate::server::app`]) — including
+/// the early `?` short-circuits this returns as `Err` (a body-validation 400,
+/// an admission 503 shed, model-not-found), which the middleware records as a
+/// pre-routing rejection. Routed requests carry a
+/// [`RequestLogContext`](crate::server::metrics::RequestLogContext) so the
+/// middleware can attach their per-worker labels.
 pub async fn chat_completions(
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    chat_completions_inner(ctx, headers, body).await
+}
+
+/// Parse model from body, select a healthy worker via the per-model policy, then
+/// proxy the request. If the request opts into streaming (`stream: true`), we
+/// pipe SSE bytes back; otherwise buffer. This function does not emit the
+/// per-request access-log line and does not count `requests_total` /
+/// `responses_total`: it attaches a [`RequestLogContext`] to routed responses and
+/// returns early errors via `?`, leaving all access logging and request/response
+/// counting to the outermost `access_log_and_record` middleware (see
+/// [`crate::server::app`]). It still records auxiliary metrics (TTFT, request
+/// duration, stale-request, ingress-tokenize errors) and emits diagnostic logs.
+async fn chat_completions_inner(
+    ctx: Arc<AppContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
@@ -182,12 +205,14 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
+    // Admission gate: pick a worker and claim an in-flight slot, parking until
+    // one frees if every candidate is at its cap. A pass-through (immediate
+    // dispatch, unconditional guard) when no per-worker cap is configured.
+    // Yields 503 `service_overloaded` when the wait queue is full.
+    let (worker, guard) = ctx
+        .admission
+        .acquire(&workers, policy.as_ref(), &selection_ctx, &model_str)
+        .await?;
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -260,7 +285,8 @@ pub async fn chat_completions(
     // 0 here: the active-load registry's decode axis is reserved for a
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
-    let guard = worker.load_guard();
+    // `guard` (this request's per-worker in-flight slot) was claimed by the
+    // admission gate above; it is held until the dispatch guards below drop.
     // Use the exact token count from the ingress tokenization when available;
     // fall back to the byte-count heuristic for load-only policies that don't
     // tokenize. The exact count makes the cache-aware load-imbalance fast-path
@@ -403,7 +429,7 @@ pub async fn chat_completions(
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
-        let prefill_holds: (LoadGuard, _) = (guard, active_guard);
+        let prefill_holds = (guard, active_guard);
         tokio::spawn(async move {
             // The tuple binding extends both guards' lifetime to the
             // end of this async block, which lasts until the prefill
@@ -506,7 +532,7 @@ pub async fn chat_completions(
         // lifetime to the end of the function — the `forward_json_to`
         // future does not need them (it does not return until the
         // body is buffered).
-        let _holds: (LoadGuard, _) = (guard, active_guard);
+        let _holds = (guard, active_guard);
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             &worker.breaker,
@@ -522,74 +548,34 @@ pub async fn chat_completions(
         }
     };
 
-    // Record the dispatch outcome AFTER we know whether the upstream
-    // accepted the request. A 504 from the stale-request branch counts as
-    // `cancelled` — semantically distinct from upstream errors that bubble
-    // through as `error`. The metric is per-worker so convergence tests
-    // can scrape `/metrics` and assert that ≥N requests landed on a
-    // single prefill worker.
-    let outcome = match &result {
-        Ok(_) => RequestOutcome::Success,
-        Err(ApiError::StaleRequestExpired { .. }) => {
-            // The janitor fired the stale-cancel and we observed it
-            // user-side; record both the per-request `cancelled` outcome
-            // AND the global `expired` count. The two views are useful for
-            // different alerts: per-worker request_total{cancelled} flags a
-            // worker that's hanging, while stale_requests_total{expired}
-            // tracks the global health of the janitor.
-            ctx.metrics
-                .record_stale_request(StaleRequestOutcome::Expired);
-            RequestOutcome::Cancelled
-        }
-        Err(_) => RequestOutcome::Error,
-    };
-    ctx.metrics
-        .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
+    // The stale-request janitor fired and we observed it user-side (a 504).
+    // Record the global `expired` count; the per-request `cancelled` outcome and
+    // the access-log line are emitted centrally by the `access_log_and_record`
+    // middleware, derived from the final HTTP status.
+    if matches!(&result, Err(ApiError::StaleRequestExpired { .. })) {
+        ctx.metrics
+            .record_stale_request(StaleRequestOutcome::Expired);
+    }
 
-    // Per-request access log — always on at INFO so incoming traffic and its
-    // status are visible without DEBUG. `request_id` is the client/gateway
-    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
-    // selected. The cache-aware routing rationale is logged separately at
-    // DEBUG by the policy.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
-    let http_status = match &result {
-        Ok(resp) => resp.status().as_u16(),
-        Err(e) => e.status_code().as_u16(),
-    };
-
-    // Record the client-visible HTTP status now that the outcome is known.
-    // For non-streaming requests the body is already buffered here, so
-    // `start.elapsed()` is true end-to-end latency — record it directly. For
-    // streaming, the body is still pending; the `RecordDurationOnDrop` guard
-    // packed into `stream_guards` records it at stream completion instead (so
-    // we don't capture only time-to-headers). `elapsed` still feeds the
-    // access-log `latency_ms` below for both.
-    let elapsed = start.elapsed();
+    // End-to-end latency for non-streaming requests: the body is already
+    // buffered here, so `start.elapsed()` is the true total. Streaming records
+    // at stream completion via the `RecordDurationOnDrop` guard packed into
+    // `stream_guards` (so it isn't just time-to-headers).
     if !streaming {
         ctx.metrics
-            .observe_request_duration(&metrics_model, elapsed.as_secs_f64());
+            .observe_request_duration(&metrics_model, start.elapsed().as_secs_f64());
     }
-    ctx.metrics.record_response(http_status);
-    let outcome_str = match outcome {
-        RequestOutcome::Success => "success",
-        RequestOutcome::Error => "error",
-        RequestOutcome::Cancelled => "cancelled",
+
+    // Routing context for the outermost middleware: it records
+    // `requests_total{worker_url,model_id,mode,outcome}` and the access-log line
+    // for this request. Attaching it here (rather than recording directly) keeps
+    // all request accounting at one site that also covers pre-routing
+    // rejections, so the by-outcome view reflects ALL ingress.
+    let log_ctx = RequestLogContext {
+        worker_url: metrics_worker_url,
+        model_id: metrics_model,
+        mode: metrics_mode,
     };
-    tracing::info!(
-        request_id = %request_id,
-        method = "POST",
-        path = "/v1/chat/completions",
-        model = %metrics_model,
-        worker = %metrics_worker_url,
-        outcome = outcome_str,
-        http_status,
-        stream = streaming,
-        latency_ms = elapsed.as_millis() as u64,
-        "chat_completions",
-    );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
     // external tests / sidecars can observe PD decode affinity without
@@ -599,7 +585,7 @@ pub async fn chat_completions(
     // resolved). A malformed URL was already rejected at the
     // request-side parse — we only reach this branch when the URL was
     // header-valid, so the second parse is safe.
-    match (result, decode_hint_url) {
+    let mut response = match (result, decode_hint_url) {
         (Ok(mut response), Some(url)) => {
             match HeaderValue::from_str(&url) {
                 Ok(v) => {
@@ -614,10 +600,19 @@ pub async fn chat_completions(
                     );
                 }
             }
-            Ok(response)
+            response
         }
-        (other, _) => other,
-    }
+        (Ok(response), None) => response,
+        // Post-dispatch error (a worker was selected). Materialize it so it can
+        // be tagged with the routing context for the middleware, instead of
+        // returning `Err` — early `?` short-circuits return `Err` and the
+        // middleware records those as pre-routing rejections (empty worker_url).
+        (Err(e), _) => e.into_response(),
+    };
+    // Tag the routed response so the middleware records its per-worker labels
+    // and logs it with the worker/model it was dispatched to.
+    response.extensions_mut().insert(log_ctx);
+    Ok(response)
 }
 
 /// Estimate prefill-token count from the raw request body for use as
@@ -1262,5 +1257,78 @@ mod tests {
             ),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    /// A request rejected BEFORE routing — here a body that is valid JSON but not
+    /// an object, which `parse_probe` 400s before any worker is selected — must
+    /// still be (a) logged by the outermost access-log middleware and (b) counted
+    /// in `requests_total`. Both happen in `access_log_and_record`, NOT the
+    /// handler (which returns the 400 via `?`), so this drives the request
+    /// through `build_router` to exercise that middleware. Before request
+    /// accounting moved to the middleware, pre-routing rejections were invisible
+    /// to `requests_total` (so `sum by (outcome)` undercounted) and absent from
+    /// the access log.
+    #[tokio::test]
+    async fn pre_routing_400_is_logged_and_counted() {
+        use std::sync::Mutex;
+        use tower::ServiceExt;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct VecWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for VecWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for VecWriter {
+            type Writer = VecWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(VecWriter(buf.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let ctx = Arc::new(AppContext::stub());
+        let app = crate::server::app::build_router(ctx.clone());
+        // Valid JSON but not an object → `parse_probe` rejects with 400 via `?`
+        // before any worker is selected.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from("[]"))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("http_request"),
+            "every request must be logged by the middleware; captured:\n{logs}"
+        );
+        assert!(
+            logs.contains("path=/v1/chat/completions") && logs.contains("status=400"),
+            "access log must record the path and 400 status; captured:\n{logs}"
+        );
+
+        let metrics = ctx.metrics.render();
+        assert!(
+            metrics
+                .lines()
+                .any(|l| l.starts_with("sgl_router_requests_total")
+                    && l.contains(r#"outcome="error""#)),
+            "a pre-routing 400 must be counted in requests_total{{outcome=error}}; got:\n{metrics}"
+        );
     }
 }

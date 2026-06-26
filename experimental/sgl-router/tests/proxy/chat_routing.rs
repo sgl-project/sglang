@@ -43,6 +43,7 @@ fn config_for(_worker_url: &str) -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        admission: sgl_router::config::AdmissionConfig::default(),
     }
 }
 
@@ -464,6 +465,57 @@ async fn non_streaming_upstream_500_preserved() {
     assert_eq!(got, upstream_body);
 }
 
+/// A response the router FORWARDS from a worker with a non-2xx status is an
+/// `Ok(Response)` at the router layer (only transport failures become `Err`).
+/// The per-worker `sgl_router_requests_total` outcome must be derived from the
+/// client-visible HTTP status, not from `Result::Ok`/`Err` — so a forwarded 5xx
+/// is counted `outcome="error"`, NOT credited as a success.
+#[tokio::test]
+async fn forwarded_5xx_records_outcome_error_not_success() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": {"type": "server_error", "message": "boom"}}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+
+    let m = ctx.metrics.render();
+    let error_line = format!(
+        r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="error"}} 1"#,
+        worker.url,
+    );
+    assert!(
+        m.contains(&error_line),
+        "a forwarded 5xx must be counted as outcome=\"error\"; got:\n{m}",
+    );
+    let success_line = format!(
+        r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}}"#,
+        worker.url,
+    );
+    assert!(
+        !m.contains(&success_line),
+        "a forwarded 5xx must NOT be credited as a success; got:\n{m}",
+    );
+}
+
 #[tokio::test]
 async fn non_streaming_upstream_4xx_body_passthrough() {
     // Regression: the worker's response bytes must reach the client
@@ -513,7 +565,7 @@ async fn oversized_request_body_returns_413() {
     // must NOT be forwarded to the upstream worker.
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
-    let app = build_router(ctx);
+    let app = build_router(ctx.clone());
 
     // One byte over the configured cap, so the test tracks the cap
     // (`MAX_CHAT_BODY_BYTES`) instead of a hardcoded size.
@@ -532,11 +584,22 @@ async fn oversized_request_body_returns_413() {
         res.status(),
     );
     // The worker must NOT have received the oversized payload.
-    let captured = worker.captured.lock().unwrap();
+    {
+        let captured = worker.captured.lock().unwrap();
+        assert!(
+            captured.last_body.is_none(),
+            "router must not forward oversized body to upstream; got body of {} bytes",
+            captured.last_body.as_ref().map(|b| b.len()).unwrap_or(0),
+        );
+    }
+    // The 413 is produced by the body-limit layer BEFORE the handler runs; the
+    // outermost `access_log_and_record` middleware must still count it.
     assert!(
-        captured.last_body.is_none(),
-        "router must not forward oversized body to upstream; got body of {} bytes",
-        captured.last_body.as_ref().map(|b| b.len()).unwrap_or(0),
+        ctx.metrics
+            .render()
+            .contains(r#"sgl_router_responses_total{status_code="413"} 1"#),
+        "body-limit 413 must be counted in responses_total: {}",
+        ctx.metrics.render(),
     );
 }
 
@@ -1354,7 +1417,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
         policies,
         active_load,
     ));
-    let app = build_router(ctx);
+    let app = build_router(ctx.clone());
 
     let req = Request::builder()
         .method("POST")
@@ -1387,6 +1450,17 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     assert!(
         body_str.contains("\"code\":\"stale_request_expired\""),
         "504 body must encode the same code in the JSON envelope: {body_str}",
+    );
+    // The stale-cancel is a routed request (a worker was selected), so it lands
+    // in requests_total with the worker's labels and outcome="cancelled" — the
+    // 504 → Cancelled mapping in `outcome_from_status`, distinct from "error".
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(&format!(
+            r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="cancelled"}}"#,
+            worker.url
+        )),
+        "stale 504 must be counted in requests_total as outcome=cancelled: {m}",
     );
 }
 
@@ -1426,5 +1500,600 @@ async fn non_streaming_error_path_drops_active_load_guard() {
         active_load.inflight_count(),
         0,
         "error path must drop the active-load guard",
+    );
+}
+
+/// End-to-end admission control: with a per-worker cap of 1, a second request
+/// parks at the router (does NOT 503) while the first holds the only slot
+/// mid-stream, and is admitted once the first stream completes and frees the
+/// slot. Exercises the real handler wiring (`acquire` + the `AdmissionGuard`
+/// firing on stream end), which the `AdmissionQueue` unit tests cannot reach.
+#[tokio::test]
+async fn admission_parks_second_request_until_first_stream_frees_the_slot() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(80),
+    )
+    .await;
+
+    // cap=1 per worker, bounded wait queue large enough that a parked request
+    // is not shed.
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
+        max_queued_requests: Some(4),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+
+    let make_req = || {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .unwrap();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // Request A claims the only slot. Hold its response (don't drain) so the
+    // slot stays occupied for the stream's lifetime.
+    let res_a = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+
+    // Request B must park (cap=1, A holds the slot). Spawn it and confirm it
+    // neither completes nor sheds while A is in flight.
+    let ctx_b = ctx.clone();
+    let b = tokio::spawn(async move { build_router(ctx_b).oneshot(make_req()).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        !b.is_finished(),
+        "B should park while A holds the only slot, not return"
+    );
+    assert!(
+        ctx.metrics
+            .render()
+            .contains("sgl_router_queued_requests 1\n"),
+        "B should be counted as parked: {}",
+        ctx.metrics.render(),
+    );
+
+    // Drain A: frees the slot and wakes B.
+    let _ = BodyExt::collect(res_a.into_body()).await.unwrap();
+
+    // B is now admitted and completes successfully.
+    let res_b = tokio::time::timeout(Duration::from_secs(2), b)
+        .await
+        .expect("B must be admitted once A frees the slot")
+        .expect("B task panicked");
+    assert_eq!(res_b.status(), StatusCode::OK);
+    let _ = BodyExt::collect(res_b.into_body()).await.unwrap();
+
+    // Wait queue fully drained.
+    assert!(
+        ctx.metrics
+            .render()
+            .contains("sgl_router_queued_requests 0\n"),
+        "queue should drain to 0: {}",
+        ctx.metrics.render(),
+    );
+}
+
+/// A request shed by the admission gate (503 `service_overloaded`) must show up
+/// in the dedicated `sgl_router_backpressure_rejected_total` counter, the general
+/// `sgl_router_responses_total{status_code="503"}` series, AND
+/// `sgl_router_requests_total{outcome="error"}` with an empty `worker_url`. The
+/// shed returns via `?` before reaching a worker, so only the outermost
+/// `access_log_and_record` middleware can count it — which is what makes
+/// `sum by (outcome)` include sheds instead of undercounting them.
+#[tokio::test]
+async fn admission_shed_503_is_counted_in_responses_total() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(80),
+    )
+    .await;
+
+    // cap=1, depth cap 0: once the single slot is taken, the next request is
+    // shed immediately (never parks).
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
+        max_queued_requests: Some(0),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+
+    let make_req = || {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "tiny",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .unwrap();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // A claims the only slot and holds it mid-stream (don't drain the body).
+    let res_a = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+
+    // B is shed: worker at cap, wait queue depth 0 -> 503 service_overloaded.
+    let res_b = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_b.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let m = ctx.metrics.render();
+    // The dedicated reject counter (was already wired).
+    assert!(
+        m.contains(r#"sgl_router_backpressure_rejected_total{model_id="tiny"} 1"#),
+        "shed must increment the dedicated reject counter: {m}",
+    );
+    // The general response-code series now sees the shed too (the fix).
+    assert!(
+        m.contains(r#"sgl_router_responses_total{status_code="503"} 1"#),
+        "shed 503 must be counted in responses_total: {m}",
+    );
+    // And the by-outcome request counter: the shed returns before routing, so the
+    // middleware records it with an empty worker_url and outcome="error". This is
+    // the line that makes `sum by (outcome)` include sheds.
+    assert!(
+        m.lines()
+            .any(|l| l.starts_with("sgl_router_requests_total{")
+                && l.contains(r#"worker_url="""#)
+                && l.contains(r#"outcome="error""#)),
+        "shed must be counted in requests_total with empty worker_url + outcome=error: {m}",
+    );
+
+    // Drain A to release resources cleanly.
+    let _ = BodyExt::collect(res_a.into_body()).await.unwrap();
+}
+
+/// Guards the refactor that moved status counting into the global middleware:
+/// a successful (200) response must be counted in `sgl_router_responses_total`
+/// exactly once per request — not double-counted (a leftover handler call) nor
+/// dropped (the middleware skipping the success path). Two requests => exactly 2.
+#[tokio::test]
+async fn success_200_counted_once_per_request_in_responses_total() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "tiny",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    for _ in 0..2 {
+        let res = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let _ = res.into_body().collect().await.unwrap();
+    }
+
+    assert!(
+        ctx.metrics
+            .render()
+            .contains(r#"sgl_router_responses_total{status_code="200"} 2"#),
+        "two successes must count to exactly 2 (no double- or under-count): {}",
+        ctx.metrics.render(),
+    );
+    // A routed success must carry its per-worker labels in requests_total — the
+    // handler attaches them via RequestLogContext and the middleware records
+    // them. Guards the label migration against regressing routed traffic to an
+    // empty worker_url (which would blank the per-worker convergence panels).
+    assert!(
+        ctx.metrics.render().contains(&format!(
+            r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}} 2"#,
+            worker.url
+        )),
+        "two routed successes must count to 2 with full per-worker labels: {}",
+        ctx.metrics.render(),
+    );
+}
+
+/// Infra paths (`/healthz`, `/readyz`, `/metrics`) are health/scrape probes, not
+/// API traffic: the middleware counts them in `responses_total{status_code}` (so
+/// a failing probe stays observable) but deliberately skips `requests_total` —
+/// otherwise probe successes would swamp the by-outcome view. A `/healthz` 200
+/// must therefore appear in `responses_total` yet leave `requests_total` empty.
+#[tokio::test]
+async fn infra_path_counted_in_responses_total_but_not_requests_total() {
+    let ctx = build_ctx_with_worker("http://placeholder:0");
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let res = build_router(ctx.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap();
+
+    let m = ctx.metrics.render();
+    // Counted in responses_total — a failing probe must stay observable there.
+    assert!(
+        m.contains(r#"sgl_router_responses_total{status_code="200"} 1"#),
+        "infra 200 must be counted in responses_total: {m}",
+    );
+    // ...but NOT in requests_total: when the only traffic is an infra probe, no
+    // request series may exist (the `# TYPE` line starts with `#`, not the metric
+    // name, so it is not matched here).
+    assert!(
+        !m.lines()
+            .any(|l| l.starts_with("sgl_router_requests_total{")),
+        "infra path must NOT be counted in requests_total: {m}",
+    );
+}
+
+/// Regression for the production false-shedding leak: with admission ENABLED, a
+/// streaming request whose client disconnects mid-stream must release its
+/// per-worker admission slot (`Worker.active_requests`), not just the
+/// active-load registry. A leaked slot pins the worker at its cap, so the gate
+/// then sheds later requests with 503 while the engine is actually idle.
+///
+/// `streaming_active_load_drops_on_client_disconnect` covers the active-load
+/// *registry* on this path; this covers the *admission* counter the gate reads.
+#[tokio::test]
+async fn admission_slot_released_on_streaming_client_disconnect() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(100),
+    )
+    .await;
+
+    // cap=1, depth 0: if the slot leaks on disconnect, the next request is shed.
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(1).unwrap(),
+        max_queued_requests: Some(0),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        Arc::clone(&registry),
+        policies,
+    ));
+    let w = registry.get(&WorkerId("w1".into())).unwrap();
+
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "tiny",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true,
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    // Request A claims the only slot; read one chunk so the stream is live.
+    let res_a = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+    use futures::StreamExt;
+    let mut data_stream = res_a.into_body().into_data_stream();
+    let _first = data_stream.next().await;
+    assert_eq!(
+        w.active_load(),
+        1,
+        "slot must be held while the stream is live"
+    );
+
+    // Client disconnects mid-stream.
+    drop(data_stream);
+
+    // The SSE pump should notice the receiver-drop and release the admission slot.
+    for _ in 0..100 {
+        if w.active_load() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        w.active_load(),
+        0,
+        "admission slot must be released when the streaming client disconnects",
+    );
+
+    // Behavioral check: a fresh request must be admitted, not falsely shed.
+    let res_b = build_router(ctx.clone()).oneshot(make_req()).await.unwrap();
+    assert_eq!(
+        res_b.status(),
+        StatusCode::OK,
+        "next request must be admitted after the slot is released, not 503",
+    );
+    let _ = res_b.into_body().collect().await.unwrap();
+}
+
+/// Closer reproduction of the production false-shedding symptom: sustained
+/// CONCURRENT streaming load through the admission queue's hand-off path, with
+/// clients disconnecting mid-stream. Every slot claimed (directly or via
+/// hand-off to a parked waiter) must be released; if any leaks, the worker pins
+/// at its cap, later waiters never admit, and the gate sheds while the engine is
+/// idle. Asserts the worker drains to zero and all requests are admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_slots_not_leaked_under_concurrent_streaming_disconnects() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(40),
+    )
+    .await;
+
+    // cap=2 + a queue deep enough that all arrivals PARK (none shed) -> every
+    // admission after the first two goes through the FIFO hand-off path.
+    let mut cfg = config_for(&worker.url);
+    cfg.admission = sgl_router::config::AdmissionConfig::Enabled {
+        max_concurrent_per_worker: std::num::NonZeroUsize::new(2).unwrap(),
+        max_queued_requests: Some(64),
+    };
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        Arc::clone(&registry),
+        policies,
+    ));
+    let w = registry.get(&WorkerId("w1".into())).unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..24u32 {
+        let ctx2 = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "model": "tiny",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": true,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            // Each request must be admitted (parked then handed a slot); a leak
+            // would make a later waiter hang here forever.
+            let res =
+                tokio::time::timeout(Duration::from_secs(10), build_router(ctx2).oneshot(req))
+                    .await
+                    .expect("request must admit within timeout (a leaked slot would hang it)")
+                    .unwrap();
+            let status = res.status();
+            // Read one chunk, then disconnect mid-stream.
+            use futures::StreamExt;
+            let mut ds = res.into_body().into_data_stream();
+            let _ = ds.next().await;
+            drop(ds);
+            status
+        }));
+    }
+    for h in handles {
+        let status = h.await.expect("task panicked");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "every request must be admitted (no false shed)"
+        );
+    }
+
+    // All disconnected; every claimed/handed-off slot must have been released.
+    for _ in 0..200 {
+        if w.active_load() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        w.active_load(),
+        0,
+        "no admission slot may leak after concurrent streaming disconnects",
+    );
+    assert_eq!(
+        ctx.active_load.inflight_count(),
+        0,
+        "active-load registry must drain too"
+    );
+}
+
+/// Test-only `tracing` writer appending to a shared buffer.
+#[derive(Clone)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Process-wide capturing subscriber over a shared buffer. `set_global_default`
+/// can be installed only once, so a `OnceLock` guards it and the buffer
+/// accumulates every test's access log. Capture tests isolate their own lines by
+/// a unique `x-request-id` (see [`access_log_count`]), so concurrent tests
+/// writing to the shared buffer don't perturb the count. A *global* subscriber
+/// (vs a thread-local default) is required because under the parallel suite the
+/// handler's access-log events are not reliably emitted on the test's own thread.
+fn global_log_buf() -> Arc<std::sync::Mutex<Vec<u8>>> {
+    use tracing_subscriber::util::SubscriberInitExt;
+    static LOG_BUF: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    LOG_BUF
+        .get_or_init(|| {
+            let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let b = buf.clone();
+            let _ = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || LogCapture(b.clone()))
+                .finish()
+                .try_init();
+            buf
+        })
+        .clone()
+}
+
+fn make_chat_req(streaming: bool, request_id: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-request-id", request_id)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": streaming,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+/// Count access-log lines for one specific request id. Tagging the request with
+/// a unique id and filtering on it isolates this test's log lines from any other
+/// test's `http_request` events that share the captured `tracing` default
+/// under parallel execution.
+fn access_log_count(logs: &str, request_id: &str) -> usize {
+    logs.lines()
+        .filter(|l| l.contains("http_request") && l.contains(request_id))
+        .count()
+}
+
+/// A post-dispatch error (unreachable upstream → 502) must be logged EXACTLY
+/// once in the access log. Logging happens once, centrally, in the
+/// `access_log_and_record` middleware (the handler no longer logs), so a routed
+/// error produces a single `http_request` line — not two.
+#[tokio::test]
+async fn post_dispatch_error_logged_once_in_access_log() {
+    let buf = global_log_buf();
+    let rid = "rid-post-dispatch-once";
+
+    // Worker is registered (healthy on add) but unreachable → forward fails with
+    // UpstreamUnreachable (502), a post-dispatch error.
+    let ctx = build_ctx_with_worker("http://127.0.0.1:1");
+    let res = build_router(ctx)
+        .oneshot(make_chat_req(false, rid))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let n = access_log_count(&logs, rid);
+    assert_eq!(
+        n, 1,
+        "post-dispatch error must be logged exactly once (no wrapper double-log); got {n}:\n{logs}"
+    );
+}
+
+/// A successful (200) request must be logged exactly once — by the
+/// `access_log_and_record` middleware. Guards against a regression that
+/// re-introduces handler-side logging on top of the middleware.
+#[tokio::test]
+async fn success_logged_once_in_access_log() {
+    let buf = global_log_buf();
+    let rid = "rid-success-once";
+
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let res = build_router(ctx)
+        .oneshot(make_chat_req(false, rid))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap();
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let n = access_log_count(&logs, rid);
+    assert_eq!(
+        n, 1,
+        "a success must be logged exactly once; got {n}:\n{logs}"
     );
 }
