@@ -435,12 +435,9 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    def _estimate_prefill_perf(
-        self, batch: Optional[ScheduleBatch]
-    ) -> Tuple[float, float, float]:
+    def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
-
         tokens = max(0, int(sum(batch.extend_lens)))
         if tokens == 0:
             return 0.0, 0.0, 0.0
@@ -489,14 +486,17 @@ class SchedulerMetricsReporter:
         )
         return flops, read_bytes, write_bytes
 
-    def _prefill_sol_suffix(
-        self, batch: Optional[ScheduleBatch], elapsed_s: float
-    ) -> str:
-        """Hook for model-specific speed-of-light metrics on prefill log lines."""
+    def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
+        """Hook: model-specific speed-of-light % suffix for the prefill log line.
+        ``batch`` carries the per-request extend/prefix lengths a subclass needs
+        for an exact attention pair-count. No model arch here, so returns "";
+        a subclass may override it."""
         return ""
 
-    def _decode_sol_suffix(self, batch: ScheduleBatch, elapsed_s: float) -> str:
-        """Hook for model-specific speed-of-light metrics on decode log lines."""
+    def _decode_sol_suffix(self, batch, elapsed_s: float) -> str:
+        """Hook: model-specific speed-of-light % suffix for the decode log line.
+        ``elapsed_s`` is per-iteration. No model arch here, so returns "";
+        a subclass may override it."""
         return ""
 
     def reset_metrics(self):
@@ -568,6 +568,11 @@ class SchedulerMetricsReporter:
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
+            # Prefer the SoL suffix when it carries content: it scores FLOPs against
+            # each forward's actual GPU span (device timer). The wall-clock est.
+            # TFLOPS below divides FLOPs by gap_latency -- the inter-log interval on
+            # the async scheduler loop, which is decoupled from this forward's
+            # execution -- so it disagrees with the SoL. Omit it when SoL is present.
             sol_suffix = self._prefill_sol_suffix(batch, gap_latency)
             if sol_suffix:
                 msg += sol_suffix
