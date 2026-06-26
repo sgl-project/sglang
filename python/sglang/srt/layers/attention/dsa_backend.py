@@ -623,6 +623,60 @@ class DeepseekSparseAttnBackend(
         else:
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
 
+    def _prepare_paged_mqa_ctx_lens_2d(
+        self,
+        metadata: DSAMetadata,
+        forward_mode: ForwardMode,
+        cache_seqlens_int32: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        existing_ctx_lens = metadata.paged_mqa_ctx_lens_2d
+        if existing_ctx_lens is None:
+            ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+                forward_mode,
+                cache_seqlens_int32,
+                seqlens_expanded,
+                batch_size,
+            )
+            object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", ctx_lens_2d)
+            return ctx_lens_2d
+
+        next_n = self.speculative_num_draft_tokens
+        if (
+            forward_mode.is_target_verify()
+            and next_n
+            and next_n >= 2
+            and is_sm100_supported()
+            and existing_ctx_lens.is_cuda
+            and existing_ctx_lens.dim() == 2
+            and existing_ctx_lens.size(0) == batch_size
+            and existing_ctx_lens.size(1) == next_n
+        ):
+            try:
+                from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+                    fill_paged_mqa_ctx_lens_target_verify,
+                )
+
+                fill_paged_mqa_ctx_lens_target_verify(
+                    cache_seqlens=cache_seqlens_int32,
+                    ctx_lens_2d=existing_ctx_lens,
+                    bs=batch_size,
+                    next_n=next_n,
+                )
+                return existing_ctx_lens
+            except Exception:
+                pass
+
+        ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+            forward_mode,
+            cache_seqlens_int32,
+            seqlens_expanded,
+            batch_size,
+        )
+        existing_ctx_lens.copy_(ctx_lens_2d)
+        return existing_ctx_lens
+
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
@@ -1497,18 +1551,14 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
             else:
                 schedule_seqlens_expanded = seqlens_expanded
-            seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
+            seqlens_32_2d = self._prepare_paged_mqa_ctx_lens_2d(
+                metadata,
                 forward_mode,
                 metadata.cache_seqlens_int32,
                 schedule_seqlens_expanded,
                 bs,
             )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
-            # `copy_` preserves the buffer's data_ptr that the captured graph captured.
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
-            else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -1689,19 +1739,17 @@ class DeepseekSparseAttnBackend(
         # the captured one).
         if is_cuda():
             if forward_mode.is_decode_or_idle():
-                seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
+                seqlens_expanded_for_schedule = metadata.cache_seqlens_int32
             else:
-                seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
-                    forward_mode,
-                    metadata.cache_seqlens_int32,
-                    metadata.dsa_seqlens_expanded,
-                    bs,
-                )
+                seqlens_expanded_for_schedule = metadata.dsa_seqlens_expanded
+            seqlens_32_2d = self._prepare_paged_mqa_ctx_lens_2d(
+                metadata,
+                forward_mode,
+                metadata.cache_seqlens_int32,
+                seqlens_expanded_for_schedule,
+                bs,
+            )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
-            else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
 
         self.forward_metadata = metadata
 
