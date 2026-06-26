@@ -93,7 +93,6 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -251,7 +250,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -979,6 +977,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            # Snapshot built -- publish a read-done event for the WAR barrier.
+            # Only plain DECODE: the captured decode graph reads only its static
+            # snapshot, so the forward is done reading the shared pool here. Spec
+            # verify (target_verify/dllm_extend) replays on this runner too, but
+            # those are NOT the step's last shared-buffer-reading phase (eagle
+            # publishes from draft_extend; ngram/dflash must not publish here),
+            # and some verify graphs may read beyond the snapshot in replay.
+            if forward_batch.forward_mode.is_decode():
+                read_done = self.device_module.Event()
+                read_done.record()
+                self.model_runner.war_fastpath_read_done_event = read_done
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):

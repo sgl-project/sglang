@@ -36,6 +36,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
@@ -205,12 +207,12 @@ class DataParallelController:
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if self.status[i]:
-                worker.send_pyobj(obj)
+                sock_send(worker, obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
         for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
+            sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
@@ -380,11 +382,11 @@ class DataParallelController:
             connected_clients = 0
             while connected_clients < expected_clients:
                 # Wait for client handshake
-                client_rank = rep_socket.recv().decode()
+                client_rank = sock_recv(rep_socket).decode()
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
-                rep_socket.send_pyobj(worker_ports)
+                sock_send(rep_socket, worker_ports)
                 connected_clients += 1
                 logger.debug(
                     f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
@@ -409,7 +411,7 @@ class DataParallelController:
         while True:
             # Wait for client handshake
             try:
-                client_rank = rep_socket.recv().decode()
+                client_rank = sock_recv(rep_socket).decode()
             except Exception:
                 logger.exception(
                     "Failed to recv/decode handshake in reply thread; continue"
@@ -418,7 +420,7 @@ class DataParallelController:
             logger.debug(f"Received handshake from node {client_rank}")
 
             # Send worker ports to client
-            rep_socket.send_pyobj(worker_ports)
+            sock_send(rep_socket, worker_ports)
             logger.debug(f"Sent worker ports to node {client_rank}")
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
@@ -431,10 +433,10 @@ class DataParallelController:
 
         try:
             # Send handshake with our node rank
-            req_socket.send(str(node_rank).encode())
+            sock_send(req_socket, str(node_rank).encode())
 
             # Receive worker ports
-            worker_ports = req_socket.recv_pyobj()
+            worker_ports = sock_recv(req_socket)
             logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
             return worker_ports
         except zmq.Again:
@@ -597,7 +599,7 @@ class DataParallelController:
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            sock_send(self.workers[req.routed_dp_rank], req)
             return True
         return False
 
@@ -608,7 +610,7 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                sock_send(self.workers[self.round_robin_counter], req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
@@ -626,13 +628,13 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -641,14 +643,14 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        self.workers[target_worker].send_pyobj(req)
+        sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)

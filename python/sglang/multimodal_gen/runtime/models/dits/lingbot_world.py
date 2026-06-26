@@ -282,54 +282,32 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
-        head_slice = None
-        if kv_cache.k.shape[2] != roped_key.shape[2]:
-            if sequence_shard_enabled:
-                head_start = get_tp_rank() * roped_key.shape[2]
-            else:
-                head_start = self.head_start
-            head_slice = slice(head_start, head_start + roped_key.shape[2])
-            cache_key = roped_key.new_zeros(
-                roped_key.shape[0],
-                roped_key.shape[1],
-                kv_cache.k.shape[2],
-                roped_key.shape[3],
-            )
-            cache_value = v.new_zeros(
-                v.shape[0],
-                v.shape[1],
-                kv_cache.v.shape[2],
-                v.shape[3],
-            )
-            cache_key[:, :, head_slice, :] = roped_key
-            cache_value[:, :, head_slice, :] = v
-        else:
-            cache_key = roped_key
-            cache_value = v
+        if (
+            not sequence_shard_enabled
+            and not update_cache_only
+            and kv_cache.can_direct_current_attention(roped_key.shape[1])
+        ):
+            return self.attn(roped_query, roped_key, v)
 
+        cache_head_start = (
+            get_tp_rank() * roped_key.shape[2]
+            if sequence_shard_enabled
+            else self.head_start
+        )
         cache_view = kv_cache.update_and_get_attention_kv(
-            key=cache_key,
-            value=cache_value,
+            key=roped_key,
+            value=v,
             current_chunk_start=current_start,
+            cache_head_start=cache_head_start,
             debug_name="LingBot KV cache",
         )
         if update_cache_only:
             return v
-        key = (
-            cache_view.k[:, :, head_slice, :]
-            if head_slice is not None
-            else cache_view.k
-        )
-        value = (
-            cache_view.v[:, :, head_slice, :]
-            if head_slice is not None
-            else cache_view.v
-        )
         attn_impl = self.ulysses_attn if sequence_shard_enabled else self.attn
         x = attn_impl(
             roped_query,
-            key,
-            value,
+            cache_view.k,
+            cache_view.v,
         )
         if sequence_shard_enabled:
             assert seq_splits is not None

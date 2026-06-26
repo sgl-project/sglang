@@ -112,9 +112,11 @@ class EagleDraftWorkerBase(ABC):
         gpu_only = batch.seq_lens_cpu is None
 
         batch.spec_info = draft_extend_input
-        # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
-        # gather requires input_ids to have a consistent integer dtype across ranks.
-        batch.input_ids = predict.to(torch.int64)
+        # Do NOT cast predict dtype here. The caller (e.g., _draft_extend_for_decode)
+        # may run this under a plan stream; casting inside the plan stream creates a
+        # cross-stream dependency that can lead to data races and break MTP acceptance.
+        # The caller should cast to int64 before entering the plan stream context.
+        batch.input_ids = predict
         maybe_detect_oob(
             batch.input_ids,
             0,
@@ -279,6 +281,14 @@ class BaseSpecWorker(ABC):
     @abstractmethod
     def draft_worker(self) -> EagleDraftWorkerBase:
         pass
+
+    @property
+    def war_fastpath_runner(self):
+        # The runner that runs the step's LAST shared-buffer-reading phase --
+        # it owns the read-done event the scheduler's WAR barrier waits on.
+        # Default is the target runner; override if the last phase runs
+        # elsewhere (eagle's draft_extend runs on the draft runner).
+        return self.target_worker.model_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
