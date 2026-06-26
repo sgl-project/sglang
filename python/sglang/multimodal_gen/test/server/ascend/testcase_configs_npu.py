@@ -6,6 +6,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionServerArgs,
     DiffusionTestCase,
     T2I_sampling_params,
+    TI2V_sampling_params,
 )
 
 MODELSCOPE_MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
@@ -21,16 +22,12 @@ FLUX_1_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.1-dev")
 FLUX_2_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-dev")
 FLUX_2_KLEIN_4B_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-klein-4B")
 GLM_IMAGE_WEIGHTS_PATH = use_modelscope("ZhipuAI/GLM-Image")
-HUNYUAN_3D_2_WEIGHTS_PATH = use_modelscope("Tencent-Hunyuan/Hunyuan3D-2")
 JOYAI_IMAGE_EDIT_WEIGHTS_PATH = use_modelscope(
     "jd-opensource/JoyAI-Image-Edit-Diffusers"
 )
-LTX_2_3_WEIGHTS_PATH = use_modelscope("Lightricks/LTX-2.3")
+LTX_2_WEIGHTS_PATH = use_modelscope("Lightricks/LTX-2")
 MOVA_360_WEIGHTS_PATH = use_modelscope("openmoss/MOVA-360p")
 QWEN_IMAGE_WEIGHTS_PATH = use_modelscope("Qwen/Qwen-Image")
-SANA_WM_MODEL_WEIGHTS_PATH = use_modelscope(
-    "Efficient-Large-Model/SANA-WM_bidirectional"
-)
 WAN2_1_T2V_1_3B_DIFFUSERS_WEIGHTS_PATH = use_modelscope(
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 )
@@ -134,17 +131,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
-    # === Image to Mesh (I2M) ===
-    # TODO: uncomment when Hunyuan3D-2 pipeline will be fixed
-    # DiffusionTestCase(
-    #     "hunyuan_3d_2_i2m_1npu",
-    #     DiffusionServerArgs(
-    #         model_path=HUNYUAN_3D_2_WEIGHTS_PATH,
-    #         extras=EXTRAS_DISABLE_WARMUP,
-    #     ),
-    #     HUNYUAN3D_SHAPE_sampling_params,
-    #     run_consistency_check=False,
-    # ),
 ]
 
 TWO_NPU_CASES: list[DiffusionTestCase] = [
@@ -185,37 +171,20 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
         ),
     ),
-    # TODO: fix fail
-    # DiffusionTestCase(
-    #     "ltx_2_3_two_stage_ti2v_2npu",
-    #     DiffusionServerArgs(
-    #         model_path=LTX_2_3_WEIGHTS_PATH,
-    #         cfg_parallel=True,
-    #         extras=[
-    #             "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
-    #         ],
-    #     ),
-    #     run_component_accuracy_check=False,
-    # ),
-    # === Text+Image to Video (TI2V)
-    # TODO: fix fail
-    # DiffusionTestCase(
-    #    "sana_wm_bidirectional_ti2v_2npu",
-    #    DiffusionServerArgs(
-    #        model_path=SANA_WM_MODEL_WEIGHTS_PATH,
-    #        num_gpus=2,
-    #        tp_size=2,
-    #        extras=EXTRAS_DISABLE_WARMUP,
-    #    ),
-    #     SANA_WM_TI2V_CI_sampling_params,
-    #     run_perf_check=False,
-    #     run_component_accuracy_check=False,
-    #     run_models_api_check=False,
-    #     run_t2v_input_reference_check=False,
-    # ),
-    # === Text to Video+Audio (TI2V)
+    # === Text+Image to Video+Audio (TI2V)
     DiffusionTestCase(
-        "mova_360p_t2va_2npu",
+        "ltx_2_ti2va_2npu",
+        DiffusionServerArgs(
+            model_path=LTX_2_WEIGHTS_PATH,
+            num_gpus=2,
+            ulysses_degree=2,
+            extras=EXTRAS_DISABLE_WARMUP,
+        ),
+        TI2V_sampling_params,
+        run_consistency_check=False,
+    ),
+    DiffusionTestCase(
+        "mova_360p_ti2va_2npu",
         DiffusionServerArgs(
             model_path=MOVA_360_WEIGHTS_PATH,
             num_gpus=2,
