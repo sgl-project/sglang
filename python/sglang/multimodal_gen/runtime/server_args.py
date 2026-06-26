@@ -821,21 +821,13 @@ class ServerArgs(DisaggServerArgsMixin):
         # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
         if cfg_unspecified:
             deployment_config = self.pipeline_config.get_model_deployment_config()
-            auto_cfg_parallel_degree = None
-            for num_gpus, cfg_degree in (
-                deployment_config.auto_cfg_parallel_degree_by_num_gpus
-            ):
-                if num_gpus == self.num_gpus:
-                    auto_cfg_parallel_degree = cfg_degree
-                    break
-            if auto_cfg_parallel_degree is None:
-                auto_cfg_parallel_degree = 2
+            auto_cfg_parallel_degree = deployment_config.get_auto_cfg_parallel_degree(
+                self.num_gpus
+            )
             if auto_cfg_parallel_degree < 1:
                 self.enable_cfg_parallel = False
             else:
-                cfg_group_size = (
-                    self.dp_size * self.tp_size * auto_cfg_parallel_degree
-                )
+                cfg_group_size = self.dp_size * self.tp_size * auto_cfg_parallel_degree
                 if (
                     self.performance_mode != "manual"
                     and deployment_config.auto_enable_cfg_parallel

@@ -765,21 +765,9 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            if q.device.type == "cuda":
-                q, k, v = async_a2a_communicate(
-                    [q, k, v],
-                    sp_size,
-                    get_sp_group().ulysses_group,
-                    self._get_usp_a2a_stream(),
-                    local_seq_2_local_head=True,
-                )
-                q = q.contiguous()
-                k = k.contiguous()
-                v = v.contiguous()
-            else:
-                q = _usp_input_all_to_all(q, head_dim=2)
-                k = _usp_input_all_to_all(k, head_dim=2)
-                v = _usp_input_all_to_all(v, head_dim=2)
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k = _usp_input_all_to_all(k, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
