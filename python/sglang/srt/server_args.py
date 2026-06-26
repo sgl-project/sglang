@@ -163,6 +163,7 @@ QUANTIZATION_CHOICES = [
     "w4afp8",
     "mxfp4",  # MOE-only.
     "auto-round",
+    "auto-round-int8",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
