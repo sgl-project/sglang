@@ -83,8 +83,16 @@ def fused_topk_npu(
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
-            # 1 for sigmoid, 0 for softmax
-            norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
+            # 1 for sigmoid, 0 for softmax.
+            # correction_bias implies sigmoid semantics (DeepSeek-style
+            # noaux_tc, e.g. mimo_v2 / deepseek_v2, whose config may lack a
+            # scoring_func field). Otherwise follow scoring_func to stay
+            # compatible with PR #29042's fix for softmax models.
+            norm_type=(
+                0
+                if (correction_bias is None and topk_config.scoring_func == "softmax")
+                else 1
+            ),
             routed_scaling_factor=(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
