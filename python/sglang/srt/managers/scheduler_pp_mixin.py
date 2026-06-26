@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_batches import SchedulerBatches
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -93,8 +94,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                self.batches.active_mb_id = mb_id
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
@@ -108,9 +108,7 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    self.mbs[mb_id] = self.get_next_batch_to_run()
-                self.running_mbs[mb_id] = self.running_batch
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                    self.cur_batch = self.get_next_batch_to_run()
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -139,14 +137,14 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                if self.mbs[next_mb_id] is not None:
+                if self.batches.cur_mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
+                            self.batches.cur_mbs[next_mb_id],
                             next_batch_result,
                         )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.batches.last_mbs[next_mb_id] = self.batches.cur_mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -221,8 +219,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                self.batches.active_mb_id = mb_id
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
@@ -249,10 +246,7 @@ class SchedulerPPMixin:
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
-                self.mbs[mb_id] = batch
-                self.running_mbs[mb_id] = self.running_batch
-
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch = batch
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
@@ -305,13 +299,13 @@ class SchedulerPPMixin:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
+                if self.batches.cur_mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     self._pp_process_batch_result(
-                        self.mbs[next_mb_id],
+                        self.batches.cur_mbs[next_mb_id],
                         next_batch_result,
                     )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.batches.last_mbs[next_mb_id] = self.batches.cur_mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -366,8 +360,7 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                self.running_batch = self.running_mbs[mb_id]
-                self.last_batch = self.last_mbs[mb_id]
+                self.batches.active_mb_id = mb_id
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
@@ -399,10 +392,7 @@ class SchedulerPPMixin:
 
                 # get batch to run and proxy tensors if needed
                 batch = self.get_next_disagg_decode_batch_to_run()
-                self.mbs[mb_id] = batch
-                self.running_mbs[mb_id] = self.running_batch
-
-                self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
+                self.cur_batch = batch
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None
@@ -486,14 +476,14 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
 
                 # post-process the coming microbatch
-                if self.mbs[next_mb_id] is not None:
-                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
+                if self.batches.cur_mbs[next_mb_id] is not None:
+                    if not self.batches.cur_mbs[next_mb_id].forward_mode.is_prebuilt():
                         d2h_event.synchronize()
                         self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
+                            self.batches.cur_mbs[next_mb_id],
                             next_batch_result,
                         )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self.batches.last_mbs[next_mb_id] = self.batches.cur_mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -543,12 +533,14 @@ class SchedulerPPMixin:
         self.require_attn_tp_allgather = (
             not self.server_args.enable_dsa_prefill_context_parallel
         )
-        self.mbs = [None] * self.pp_loop_size
-        self.last_mbs = [None] * self.pp_loop_size
-        self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False)
-            for _ in range(self.pp_loop_size)
-        ]
+        self.batches = SchedulerBatches(
+            cur_mbs=[None] * self.pp_loop_size,
+            last_mbs=[None] * self.pp_loop_size,
+            running_mbs=[
+                ScheduleBatch(reqs=[], batch_is_full=False)
+                for _ in range(self.pp_loop_size)
+            ],
+        )
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
@@ -917,7 +909,7 @@ class SchedulerPPMixin:
         ) = self._pp_send_recv_and_preprocess_output_tensors(
             next_first_rank_mb_id,
             next_mb_id,
-            self.mbs,
+            self.batches.cur_mbs,
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,

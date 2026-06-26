@@ -175,6 +175,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_batches import SchedulerBatches
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -317,7 +318,11 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
-        self.cur_batch: Optional[ScheduleBatch] = None
+        self.batches = SchedulerBatches(
+            cur_mbs=[None],
+            last_mbs=[None],
+            running_mbs=[ScheduleBatch(reqs=[], batch_is_full=False)],
+        )
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -967,14 +972,38 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    @property
+    def running_batch(self) -> ScheduleBatch:
+        return self.batches.running
+
+    @running_batch.setter
+    def running_batch(self, value: ScheduleBatch) -> None:
+        self.batches.running = value
+
+    @property
+    def cur_batch(self) -> Optional[ScheduleBatch]:
+        return self.batches.cur
+
+    @cur_batch.setter
+    def cur_batch(self, value: Optional[ScheduleBatch]) -> None:
+        self.batches.cur = value
+
+    @property
+    def last_batch(self) -> Optional[ScheduleBatch]:
+        return self.batches.last
+
+    @last_batch.setter
+    def last_batch(self, value: Optional[ScheduleBatch]) -> None:
+        self.batches.last = value
+
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
-        self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
-        self.cur_batch: Optional[ScheduleBatch] = None
+        self.cur_batch = None
         # The last forward batch
-        self.last_batch: Optional[ScheduleBatch] = None
+        self.last_batch = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
@@ -3592,8 +3621,8 @@ class Scheduler(
     def _pp_microbatches_drained(self) -> bool:
         if self.ps.pp_size == 1:
             return True
-        return all(x.is_empty() for x in self.running_mbs) and all(
-            mb is None or mb.is_empty() for mb in self.mbs
+        return all(x.is_empty() for x in self.batches.running_mbs) and all(
+            mb is None or mb.is_empty() for mb in self.batches.cur_mbs
         )
 
     def attach_hicache_storage_wrapped(
