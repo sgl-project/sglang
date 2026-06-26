@@ -6,6 +6,8 @@ from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from typing import Any, Optional
 
+import torch
+
 
 @functools.lru_cache(maxsize=1)
 def _default_hip() -> bool:
@@ -74,6 +76,13 @@ class EnvField:
         # (e.g. EnvBool(_default_hip)); evaluated only when the env is unset.
         return self.default() if callable(self.default) else self.default
 
+    # Env vars are constant for the lifetime of the process. Under torch.compile
+    # (e.g. Piecewise CUDA Graph) reads like `envs.X.get()` that survive into the
+    # traced forward would otherwise make Dynamo trace os.getenv / callable() and
+    # fail ("Failed to trace builtin operator"). assume_constant_result runs this
+    # eagerly once and bakes the result as a graph constant; eager (uncompiled)
+    # behavior is unchanged.
+    @torch._dynamo.assume_constant_result
     def get(self) -> Any:
         value = os.getenv(self.name)
 
