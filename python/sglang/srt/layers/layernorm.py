@@ -96,11 +96,16 @@ _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _aiter_per_1x128_quant = None
 _aiter_fp8_dtype = None
+_use_aiter_bpreshuffle_gfx95 = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+
+    from sglang.srt.layers.quantization.fp8_utils import (
+        _use_aiter_bpreshuffle_gfx95,
+    )
 
     # Cache the per-1x128 HIP quant functor and the FP8 dtype so the
     # keep_bf16 fallback path in ``_forward_with_allreduce_fusion_quant_per_group``
@@ -150,6 +155,14 @@ logger = logging.getLogger(__name__)
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+
+
+def _maybe_transpose_aiter_bpreshuffle_scale(scale: torch.Tensor) -> torch.Tensor:
+    if not _use_aiter_bpreshuffle_gfx95:
+        return scale
+    # Match aiter's transpose_scale=True layout: same logical shape, transposed
+    # physical storage for CK bpreshuffle consumers on ROCm >= 7.2.
+    return scale.transpose(0, 1).contiguous().view_as(scale)
 
 
 def _forward_with_allreduce_fusion(
@@ -270,6 +283,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
         )
         if result is not None:
             fp8_out, residual_out, scale_out = result
+            scale_out = _maybe_transpose_aiter_bpreshuffle_scale(scale_out)
             return (fp8_out, scale_out), residual_out
 
         # Fallback: fused AR+RMSNorm then separate per-group quant.
@@ -280,7 +294,9 @@ def _forward_with_allreduce_fusion_quant_per_group(
             return None
         bf16_out, residual_out = fused_result
         fp8_out, scale_out = _aiter_per_1x128_quant(
-            bf16_out, quant_dtype=_aiter_fp8_dtype
+            bf16_out,
+            quant_dtype=_aiter_fp8_dtype,
+            transpose_scale=_use_aiter_bpreshuffle_gfx95,
         )
         return (fp8_out, scale_out), residual_out
 
@@ -299,6 +315,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
     )
     if result is not None and len(result) == 4:
         fp8_out, residual_out, scale_out, bf16_out = result
+        scale_out = _maybe_transpose_aiter_bpreshuffle_scale(scale_out)
         return (bf16_out, fp8_out, scale_out), residual_out
 
     fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
@@ -307,7 +324,11 @@ def _forward_with_allreduce_fusion_quant_per_group(
     if fused_result is None:
         return None
     bf16_out, residual_out = fused_result
-    fp8_out, scale_out = _aiter_per_1x128_quant(bf16_out, quant_dtype=_aiter_fp8_dtype)
+    fp8_out, scale_out = _aiter_per_1x128_quant(
+        bf16_out,
+        quant_dtype=_aiter_fp8_dtype,
+        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+    )
     return (bf16_out, fp8_out, scale_out), residual_out
 
 

@@ -789,7 +789,18 @@ class GroupCoordinator:
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
+            token_num = input_.numel() // K
             use_1stage_ar = total_bytes <= 128 * 1024
+            if (
+                # Keep the default 128 KiB cutoff except for the measured TP=8
+                # K=7168 graph-replay crossover. K=4096 remains on the default
+                # rule because token_num=8/16 still favored 1-stage there.
+                self.world_size == 8
+                and 4096 < K <= 7168
+                and token_num >= 8
+                and use_1stage_ar
+            ):
+                use_1stage_ar = False
 
         try:
             return ca_comm.custom_fused_ar_rms_per_group_quant(
