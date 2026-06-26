@@ -987,6 +987,12 @@
                     ]
                   },
                   {
+                    "group": "DeepReinforce",
+                    "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
+                    ]
+                  },
+                  {
                     "group": "Llama",
                     "pages": [
                       "cookbook/autoregressive/Llama/Llama4",

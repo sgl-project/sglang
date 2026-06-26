@@ -1046,10 +1046,12 @@ export const Deployment = ({ config, benchmarks }) => {
         <div style={s.commandWrap}>
           <div style={s.commandHeader}>
             <div style={s.headerLeft}>
-              <div style={s.badge(Boolean(cell && cell.verified))}>
-                <span style={s.badgeDot(Boolean(cell && cell.verified))} />
-                {cell && cell.verified ? "Verified" : "Not Verified"}
-              </div>
+              {config.showVerificationBadge !== false && (
+                <div style={s.badge(Boolean(cell && cell.verified))}>
+                  <span style={s.badgeDot(Boolean(cell && cell.verified))} />
+                  {cell && cell.verified ? "Verified" : "Not Verified"}
+                </div>
+              )}
               <div style={s.runModeWrap} role="tablist" aria-label="Output format">
                 <span
                   style={s.runModeChip(runMode === "python")}
@@ -1089,8 +1091,8 @@ export const Deployment = ({ config, benchmarks }) => {
       {/* Benchmark card (only with a `benchmarks` prop + matched cell). */}
       {benchmarks && cell && renderBenchmarkCard(benchEntry)}
 
-      {/* Playground link — scrollIntoView, not an href, so the hash (which
-          carries the selection) isn't overwritten. */}
+      {/* Playground link — only shown when this cookbook defines playground features. */}
+      {config.playgroundFeatures && (
       <div
         style={{
           padding: "6px 12px",
@@ -1123,6 +1125,7 @@ export const Deployment = ({ config, benchmarks }) => {
           Open the Playground →
         </button>
       </div>
+      )}
 
       {/* cURL modal */}
       {modal === "curl" && (
