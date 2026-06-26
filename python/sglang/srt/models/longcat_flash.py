@@ -82,8 +82,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
-from sglang.srt.layers.rotary_embedding.rope_variant import (
-    LongcatExplicitInterleavedRotaryEmbedding,
+from sglang.srt.layers.rotary_embedding.factory import (
+    get_rope,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -347,12 +347,15 @@ def _enable_longcat_explicit_npu_rope(attn: DeepseekV2AttentionMLA) -> None:
     rotary_emb = attn.rotary_emb
     if rotary_emb is None:
         return
-    attn.rotary_emb = LongcatExplicitInterleavedRotaryEmbedding(
+    attn.rotary_emb = get_rope(
         head_size=rotary_emb.head_size,
         rotary_dim=rotary_emb.rotary_dim,
-        max_position_embeddings=rotary_emb.max_position_embeddings,
+        max_position=rotary_emb.max_position_embeddings,
         base=rotary_emb.base,
         is_neox_style=rotary_emb.is_neox_style,
+        rope_scaling={
+            "rope_type": "longcat_explicit_interleaved",
+        },
         dtype=rotary_emb.dtype,
     )
     attn.use_explicit_npu_interleaved_rope = True
