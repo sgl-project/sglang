@@ -1074,7 +1074,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
@@ -1305,6 +1307,16 @@ export const Playground = ({ config }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout under the playground command when the effective (post-
+    // override) command turns speculative decoding on without setting
+    // --max-running-requests (SGLang then caps it at 48).
+    mtpWarn: {
+      margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
+      fontSize: "12px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     diffLineUnchanged: { display: "block" },
     diffLineAdded: {
@@ -1652,6 +1664,12 @@ export const Playground = ({ config }) => {
   const playgroundVerified = !!(matchedCell && matchedCell.verified);
   const matchedSiblingCell = (matchedCell && matchedCell !== baseCell)
     ? matchedCell : null;
+  // MTP hint on the EFFECTIVE (post-override) command — fires when the user
+  // toggles speculative decoding on without setting --max-running-requests
+  // (NOT keyed on strategy). Mirrors the Deploy panel's hint.
+  const pgMtpHint =
+    pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
 
   // Submission snippets: proposed cell + existing cell at the same match.
   const proposedCellSnippet = baseCell
@@ -1901,6 +1919,11 @@ export const Playground = ({ config }) => {
               </span>
             )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
+          {pgMtpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
         </div>
       </div>
 

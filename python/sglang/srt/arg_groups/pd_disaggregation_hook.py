@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from typing import TYPE_CHECKING
@@ -10,7 +12,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
+def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
@@ -52,12 +54,20 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
         else:
             server_args.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
-            if server_args.enable_mamba_extra_buffer():
-                logger.warning(
-                    "Mamba extra_buffer is disabled because decode disaggregation "
-                    "currently forces chunk cache. Falling back to no_buffer."
+
+        # Default the number of *extra* decode req_to_token slots reserved for
+        # in-transfer (being-received-from-prefill) requests, on top of the
+        # max_running_requests-derived pool. Large batches get none; small
+        # per-worker batches reserve 2x the batch as cheap overlap headroom.
+        if server_args.disaggregation_decode_extra_slots is None:
+            extra_slots = 0
+            if server_args.max_running_requests is not None:
+                per_worker = server_args.max_running_requests // max(
+                    1, server_args.dp_size
                 )
-                server_args.mamba_scheduler_strategy = "no_buffer"
+                if per_worker <= 32:
+                    extra_slots = per_worker * 2
+            server_args.disaggregation_decode_extra_slots = extra_slots
 
     elif server_args.disaggregation_mode == "prefill":
         assert (

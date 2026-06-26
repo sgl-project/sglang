@@ -514,6 +514,49 @@ class SWAComponent(TreeComponent):
                 dec_swa = False
             cur = cur.parent
 
+    def release_window_lock(
+        self,
+        node: UnifiedTreeNode,
+        swa_uuid_for_lock: Optional[int] = None,
+    ) -> None:
+        """Early-release the SWA lock along [node, swa_uuid_for_lock] while
+        leaving Full and Mamba locks intact.
+
+        Called when a request's decode position has advanced past the sliding
+        window — the SWA portion of the tree lock is no longer needed but the
+        Full lock must stay so the request's prefix is protected.
+
+        Caller (UnifiedRadixCache.dec_swa_lock_only) must ensure this is
+        invoked at most once per (node, swa_uuid_for_lock) pair.
+        """
+        ct = self.component_type
+        root = self.cache.root_node
+
+        cur = node
+        while cur is not root:
+            cd = cur.component_data[ct]
+            # Acquire skips tombstoned nodes; release must skip them too. Same
+            # for nodes with lock_ref == 0 — acquire never credited them.
+            if cd.value is None or cd.lock_ref == 0:
+                if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
+                    break
+                cur = cur.parent
+                continue
+
+            cd.lock_ref -= 1
+            if cd.lock_ref == 0:
+                key_len = len(cur.key)
+                self.cache.component_protected_size_[ct] -= key_len
+                self.cache.component_evictable_size_[ct] += key_len
+                if self.cache._is_device_leaf(cur):
+                    self.cache._evict_component_and_detach_lru(
+                        cur, self, target=EvictLayer.DEVICE
+                    )
+
+            if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
+                break
+            cur = cur.parent
+
     def prepare_for_caching_req(
         self,
         req: Req,

@@ -31,6 +31,7 @@
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
+//! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -45,21 +46,45 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Chosen to
-/// span 0 → ~1k blocks: blocks are 32–64 tokens each, and our `MAX_CHAT_BODY_BYTES`
-/// cap (1 MiB ≈ 250 k tokens) implies an upper bound around 4–8 k blocks for
-/// a maximum-length context. The `+Inf` bucket catches everything beyond
-/// 1000.
+/// Histogram bucket upper bounds for `sgl_router_overlap_blocks`. Blocks are
+/// 32–64 tokens each, and the `MAX_CHAT_BODY_BYTES` cap bounds context length —
+/// putting the practical ceiling for a maximum-length context in the low tens
+/// of thousands of blocks. The ladder spans 0 → ~8k blocks at the resolution
+/// worth charting; the `+Inf` bucket catches the longer-context tail beyond
+/// 8000.
 const OVERLAP_BLOCKS_BUCKETS: &[f64] = &[
-    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0,
+    0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0, 2000.0, 4000.0, 8000.0,
 ];
 
 /// Histogram bucket upper bounds (seconds) for
-/// `sgl_router_request_duration_seconds` and `sgl_router_ttft_seconds`.
-/// Standard latency ladder spanning 5 ms → 30 s; the `+Inf` bucket catches
-/// anything slower (a request that outlives the upstream's own timeouts).
+/// `sgl_router_request_duration_seconds`. Standard latency ladder spanning
+/// 5 ms → 30 s; the `+Inf` bucket catches anything slower (a request that
+/// outlives the upstream's own timeouts).
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Histogram bucket upper bounds (seconds) for `sgl_router_ttft_seconds`.
+///
+/// From 0.1 s up these edges are IDENTICAL to the SGLang engine's
+/// `sglang:time_to_first_token_seconds` histogram (defined in
+/// `python/sglang/srt/observability/metrics_collector.py`). Matching edges is
+/// what makes a `histogram_quantile` comparison between the router and the
+/// engine meaningful: the quantile interpolates within the same bucket on both
+/// sides, so `quantile(router) - quantile(engine)` reflects real router
+/// overhead rather than grid skew. With mismatched grids the two interpolations
+/// run on different bucket widths and the difference can even go negative — the
+/// router P50 reading *below* the engine P50 despite the router sitting in
+/// front of it.
+///
+/// The four sub-100 ms edges have no engine counterpart (the engine's first
+/// bucket is `[0, 0.1]`, so it cannot resolve a sub-100 ms TTFT at all). They
+/// are router-only headroom: harmless for the comparison (they sit below the
+/// engine's range) while letting the router resolve a genuinely fast TTFT.
+const TTFT_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, // router-only sub-100 ms head
+    0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
+    400.0,
 ];
 
 /// Recordable outcome for a request — narrowed to a handful of variants so
@@ -191,6 +216,7 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -332,8 +358,9 @@ impl MetricsRegistry {
     /// the interval from request receipt to the first response chunk arriving
     /// from the upstream worker. Recorded only for successful *streaming*
     /// responses; non-streaming "first token" equals total latency, which
-    /// `sgl_router_request_duration_seconds` already captures. Shares the
-    /// latency bucket ladder ([`REQUEST_DURATION_BUCKETS`]).
+    /// `sgl_router_request_duration_seconds` already captures. Uses
+    /// [`TTFT_BUCKETS`], whose edges align with the engine's TTFT histogram so
+    /// the two are directly comparable in `histogram_quantile`.
     pub fn observe_ttft(&self, model_id: &str, seconds: f64) {
         // See `observe_request_duration` — drop non-finite before the map.
         if !seconds.is_finite() {
@@ -342,7 +369,7 @@ impl MetricsRegistry {
         let mut guard = self.ttft_seconds.lock();
         let hist = guard
             .entry(model_id.to_owned())
-            .or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS));
+            .or_insert_with(|| Histogram::new(TTFT_BUCKETS));
         hist.observe(seconds);
     }
 
@@ -403,6 +430,27 @@ impl MetricsRegistry {
         let mut guard = self.sticky_total.lock();
         let counter = guard
             .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_ingress_tokenize_errors_total{model_id}`.
+    ///
+    /// Recorded ONLY when the tokenization offload SHOULD have fired but the
+    /// router's chat encoder failed: a chat request (`messages`) on a model with
+    /// a chat encoder that did not yield engine-equivalent ids. That request
+    /// silently fell back to engine-side tokenization, defeating the offload —
+    /// the actionable "offload broken" signal. It stays at ~0 in healthy
+    /// operation and climbs only on a real tokenizer problem; successful
+    /// forwards and expected omissions (tools / multimodal / thinking, whose
+    /// ids are engine-equivalent but withheld by the safe-predicate) are NOT
+    /// counted. Pairs with the per-occurrence WARN log in `tokenize_text`.
+    pub fn record_ingress_tokenize_error(&self, model_id: &str) {
+        let mut guard = self.ingress_tokenize_errors_total.lock();
+        let counter = guard
+            .entry(model_id.to_owned())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -662,6 +710,26 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // ingress_tokenize_errors_total
+        out.push_str(
+            "# HELP sgl_router_ingress_tokenize_errors_total Chat requests on a chat-encoder model whose ingress tokenization failed, silently falling back to engine-side tokenization (the input_ids offload was defeated).\n",
+        );
+        out.push_str("# TYPE sgl_router_ingress_tokenize_errors_total counter\n");
+        let guard = self.ingress_tokenize_errors_total.lock();
+        let mut entries: Vec<(&String, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (model_id, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
+                escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
         out
     }
 }
@@ -727,6 +795,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_stale_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
+        assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
@@ -821,8 +890,31 @@ mod tests {
             out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.05"} 1"#),
             "expected le=0.05 bucket = 1; got:\n{out}",
         );
-        // le=0.25 is cumulative over both observations.
-        assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.25"} 2"#));
+        // le=0.2 (an engine-aligned edge) is cumulative over both observations.
+        assert!(out.contains(r#"sgl_router_ttft_seconds_bucket{model_id="tiny",le="0.2"} 2"#));
+    }
+
+    #[test]
+    fn ttft_buckets_align_with_engine_grid() {
+        // The engine's `sglang:time_to_first_token_seconds` edges from 0.1 s up.
+        // These MUST all appear verbatim in the router's TTFT histogram, else a
+        // `histogram_quantile` comparison silently interpolates on mismatched
+        // grids. The sub-100 ms head (0.005..0.05) is router-only and not
+        // asserted here.
+        let reg = MetricsRegistry::new();
+        reg.observe_ttft("m", 0.5);
+        let out = reg.render();
+        for le in [
+            "0.1", "0.2", "0.4", "0.6", "0.8", "1", "2", "4", "6", "8", "10", "20", "40", "60",
+            "80", "100", "200", "400",
+        ] {
+            assert!(
+                out.contains(&format!(
+                    r#"sgl_router_ttft_seconds_bucket{{model_id="m",le="{le}"}}"#
+                )),
+                "missing engine-aligned TTFT bucket le={le}; got:\n{out}",
+            );
+        }
     }
 
     #[test]
@@ -987,6 +1079,36 @@ mod tests {
     }
 
     #[test]
+    fn ingress_tokenize_error_counter_increments_per_model() {
+        let reg = MetricsRegistry::new();
+        reg.record_ingress_tokenize_error("tiny");
+        reg.record_ingress_tokenize_error("tiny");
+        reg.record_ingress_tokenize_error("other");
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="tiny"} 2"#),
+            "expected tiny=2; got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="other"} 1"#),
+            "expected other=1; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn ingress_tokenize_error_absent_until_recorded() {
+        // Healthy operation never calls the recorder, so no per-model series
+        // should exist — only the HELP/TYPE headers.
+        let reg = MetricsRegistry::new();
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
+        assert!(
+            !out.contains("sgl_router_ingress_tokenize_errors_total{"),
+            "no per-model series until an error is recorded; got:\n{out}",
+        );
+    }
+
+    #[test]
     fn label_values_escape_quotes_and_backslashes() {
         let reg = MetricsRegistry::new();
         reg.record_request(
@@ -1009,11 +1131,11 @@ mod tests {
     #[test]
     fn histogram_plus_inf_bucket_catches_overflow() {
         let reg = MetricsRegistry::new();
-        // 1001 is just above the last finite bucket (1000); it should land
+        // 8001 is just above the last finite bucket (8000); it should land
         // in +Inf only.
-        reg.observe_overlap_blocks("m", 1001);
+        reg.observe_overlap_blocks("m", 8001);
         let out = reg.render();
-        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="1000"} 0"#));
+        assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="8000"} 0"#));
         assert!(out.contains(r#"sgl_router_overlap_blocks_bucket{model_id="m",le="+Inf"} 1"#));
     }
 }

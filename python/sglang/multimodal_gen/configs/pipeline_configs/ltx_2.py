@@ -136,6 +136,8 @@ def sync_ltx23_runtime_vae_markers(
     for key in (
         "ltx_variant",
         "condition_encoder_subdir",
+        "video_encoder_variant",
+        "video_encoder_config",
         "video_decoder_variant",
         "video_decoder_config",
     ):
@@ -708,6 +710,11 @@ class LTX2PipelineConfig(PipelineConfig):
         )
 
         return latents, audio_latents
+
+
+@dataclasses.dataclass
+class LTX23PipelineConfig(LTX2PipelineConfig):
+    """Configuration overrides for LTX-2.3."""
 
 
 @dataclasses.dataclass
