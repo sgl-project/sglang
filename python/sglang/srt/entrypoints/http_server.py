@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import http.client
 import logging
 import os
 import tempfile
@@ -27,6 +28,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from pathlib import Path
 from typing import (
     Annotated,
     Any,
@@ -172,6 +174,13 @@ from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
     orjson_response,
+)
+from sglang.srt.utils.uds import (
+    format_listen_addr,
+    prepare_uds_path,
+    server_http_get,
+    server_http_post,
+    uvicorn_bind_kwargs,
 )
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
@@ -1964,7 +1973,6 @@ MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACX
 
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
-    url = server_args.url()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
@@ -1975,13 +1983,16 @@ def _execute_server_warmup(server_args: ServerArgs):
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(
-                url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
-            )
+            res = server_http_get(server_args, "/model_info", headers, 5, ssl_verify)
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
-        except (AssertionError, requests.exceptions.RequestException):
+        except (
+            AssertionError,
+            OSError,
+            http.client.HTTPException,
+            requests.exceptions.RequestException,
+        ):
             last_traceback = get_exception_traceback()
             pass
 
@@ -2061,12 +2072,13 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
+            res = server_http_post(
+                server_args,
+                request_name,
+                headers,
+                warmup_timeout if warmup_timeout > 0 else 600,
+                ssl_verify,
+                json_data,
             )
             assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
@@ -2089,14 +2101,14 @@ def _execute_server_warmup(server_args: ServerArgs):
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=(
-                    warmup_timeout if warmup_timeout > 0 else 1800
-                ),  # because of deep gemm precache is very long if not precache.
-                verify=ssl_verify,
+            res = server_http_post(
+                server_args,
+                request_name,
+                headers,
+                warmup_timeout if warmup_timeout > 0 else 1800,
+                # because of deep gemm precache is very long if not precache.
+                ssl_verify,
+                json_data,
             )
             if res.status_code == 200:
                 logger.info(
@@ -2176,6 +2188,7 @@ def _run_granian_server(
     host,
     port,
     log_level,
+    uds=None,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2207,8 +2220,6 @@ def _run_granian_server(
     )
     granian_kwargs = dict(
         target=target,
-        address=host,
-        port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
         log_level=log_level,
@@ -2220,6 +2231,13 @@ def _run_granian_server(
         backlog=backlog,
         backpressure=backpressure,
     )
+
+    # UDS and host/port are mutually exclusive (enforced in ServerArgs).
+    if uds:
+        granian_kwargs["uds"] = Path(uds)
+    else:
+        granian_kwargs["address"] = host
+        granian_kwargs["port"] = port
 
     if tokenizer_worker_num > 1:
         granian_kwargs["workers"] = tokenizer_worker_num
@@ -2318,6 +2336,16 @@ def _setup_and_run_http_server(
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
+        # Pre-bind UDS cleanup must run for BOTH the uvicorn path (below) and the
+        # Granian --enable-http2 path. Granian's underlying Rust listener
+        # (UnixListenerSpec::as_socket in src/net.rs) calls socket.bind() directly
+        # without removing a stale socket file, so we must do it here.
+        # UDS is rejected for multi-tokenizer mode and SSL in ServerArgs, so the
+        # pre-bind only matters for the single-tokenizer paths below.
+        if server_args.uds:
+            logger.info(f"Preparing to bind on {format_listen_addr(server_args)}")
+            prepare_uds_path(server_args.uds)
+
         if server_args.ssl_certfile:
             logger.info(
                 f"SSL enabled: certfile={server_args.ssl_certfile}, "
@@ -2329,12 +2357,13 @@ def _setup_and_run_http_server(
             if server_args.enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
-                    f"{server_args.host}:{server_args.port}"
+                    f"{format_listen_addr(server_args)}"
                 )
                 _run_granian_server(
                     host=server_args.host,
                     port=server_args.port,
                     log_level=server_args.log_level_http or server_args.log_level,
+                    uds=server_args.uds,
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
@@ -2345,8 +2374,7 @@ def _setup_and_run_http_server(
                 # Use Config/Server API for access to the SSLContext.
                 config = uvicorn.Config(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    **uvicorn_bind_kwargs(server_args),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2382,8 +2410,7 @@ def _setup_and_run_http_server(
                 # Default case, one tokenizer process
                 uvicorn.run(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    **uvicorn_bind_kwargs(server_args),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2413,7 +2440,7 @@ def _setup_and_run_http_server(
             if server_args.enable_http2:
                 logger.info(
                     f"Starting embedded Granian HTTP/2 server on "
-                    f"{server_args.host}:{server_args.port}"
+                    f"{format_listen_addr(server_args)}"
                 )
                 _run_granian_server(
                     host=server_args.host,

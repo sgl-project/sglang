@@ -26,6 +26,7 @@ import math
 import os
 import random
 import socket
+import sys
 import tempfile
 import uuid
 from functools import cached_property
@@ -529,6 +530,10 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     host: A[str, "The host of the HTTP server."] = "127.0.0.1"
     port: A[int, "The port of the HTTP server."] = 30000
+    uds: A[
+        Optional[str],
+        "Bind the public HTTP server to this Unix domain socket path instead of host/port. Mutually exclusive with --host / --port. Linux/macOS only.",
+    ] = None
     fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
     grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
@@ -2553,6 +2558,8 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Validate UDS after SSL since they interact (UDS rejects SSL).
+        self._validate_uds()
         # Validate transcription/ASR-specific server args (model-independent).
         self._handle_asr_validation()
 
@@ -2806,6 +2813,95 @@ class ServerArgs:
             raise ValueError(
                 "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
                 "to be specified."
+            )
+
+    def _validate_uds(self):
+        """Validate --uds and its mutually-exclusive combinations."""
+        if self.uds is None:
+            return
+        if sys.platform == "win32":
+            raise ValueError(
+                "--uds is only supported on Linux and macOS; "
+                f"current platform: {sys.platform}"
+            )
+        if self.uds == "":
+            raise ValueError("--uds must be a non-empty path; received an empty string")
+        if not os.path.isabs(self.uds):
+            raise ValueError(
+                f"--uds must be an absolute path; received {self.uds!r}. "
+                "Relative paths bind relative to the process working "
+                "directory, which is service-launcher-dependent and "
+                "surprising for operators."
+            )
+        # AF_UNIX sun_path is 108 bytes on Linux, 104 on macOS (including
+        # the null terminator). Use the conservative cross-platform limit
+        # so the operator gets a clear error instead of ENAMETOOLONG from
+        # bind().
+        sun_path_max = 103
+        uds_bytes = len(os.fsencode(self.uds))
+        if uds_bytes > sun_path_max:
+            raise ValueError(
+                f"--uds path is {uds_bytes} bytes which exceeds the AF_UNIX "
+                f"sun_path limit ({sun_path_max} usable bytes). "
+                "Shorten the path or place the socket in a shorter parent "
+                "directory (e.g. /run/sglang/ instead of "
+                "/var/lib/sglang/data/sockets/)."
+            )
+        # Parent directory must exist; bind() does not create it. Pre-check
+        # so the operator sees the dir name rather than a bare ENOENT.
+        uds_parent = os.path.dirname(self.uds)
+        if uds_parent and not os.path.isdir(uds_parent):
+            raise ValueError(
+                f"--uds parent directory does not exist: {uds_parent}. "
+                "Create the directory (e.g. via systemd RuntimeDirectory "
+                "or `mkdir -p`) before starting the server."
+            )
+        if self.grpc_mode:
+            raise ValueError(
+                "--uds is not supported in --grpc-mode; the gRPC server "
+                "binds via its own listener and does not consult --uds. "
+                "Drop one of --uds or --grpc-mode."
+            )
+        if self.tokenizer_worker_num > 1:
+            raise ValueError(
+                "--uds is only supported in single-tokenizer mode; "
+                f"received --tokenizer-worker-num={self.tokenizer_worker_num}. "
+                "Multi-tokenizer mode binds host/port independently per "
+                "worker; UDS would be silently ignored. Drop one of --uds "
+                "or --tokenizer-worker-num."
+            )
+        if self.ssl_certfile or self.ssl_keyfile:
+            raise ValueError(
+                "--uds combined with --ssl-certfile / --ssl-keyfile is "
+                "not supported: uvicorn wraps the UDS listener in TLS "
+                "but the in-process warmup self-call goes over plain "
+                "HTTP and would fail the TLS handshake, killing the "
+                "server at startup. Drop the SSL flags (UDS is local-only "
+                "so TLS provides little additional protection) or drop "
+                "--uds."
+            )
+        # Compare against dataclass defaults to detect "user explicitly set
+        # --host or --port alongside --uds". Argparse cannot distinguish
+        # `--host 127.0.0.1` (user typed the default explicitly) from
+        # `--host` omitted, so a user-supplied default value is silently
+        # tolerated here. That is intentional: internal services use these
+        # field values regardless of whether the user typed them.
+        uds_field_defaults = {
+            "host": ServerArgs.__dataclass_fields__["host"].default,
+            "port": ServerArgs.__dataclass_fields__["port"].default,
+        }
+        mismatches = []
+        if self.host != uds_field_defaults["host"]:
+            mismatches.append(f"--host={self.host}")
+        if self.port != uds_field_defaults["port"]:
+            mismatches.append(f"--port={self.port}")
+        if mismatches:
+            raise ValueError(
+                "--uds is mutually exclusive with --host / --port; "
+                f"received --uds={self.uds} together with "
+                f"{' '.join(mismatches)}. "
+                "Drop --host/--port (defaults are kept for internal "
+                "TCP services) or drop --uds."
             )
 
         if self.enable_http2:
