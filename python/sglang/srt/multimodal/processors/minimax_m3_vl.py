@@ -285,7 +285,15 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
-        tokenizer = _processor.tokenizer
+        # MINIMAX_M3_PROCESSOR_TOKENIZER_FALLBACK_FIX: some base images resolve the HF processor to a bare
+        # tokenizer (TokenizersBackend) instead of a full MiniMaxM3VLProcessor,
+        # so `.tokenizer` is absent. Fall back to the processor object itself --
+        # the TokenizersBackend has convert_tokens_to_ids (used by _token_id);
+        # do NOT unwrap to `._tokenizer`, which is the raw tokenizers.Tokenizer
+        # and lacks convert_tokens_to_ids. Text path + special token IDs work.
+        tokenizer = getattr(_processor, "tokenizer", None)
+        if tokenizer is None:
+            tokenizer = _processor
         assert tokenizer is not None, "tokenizer is required"
 
         self.IM_TOKEN_ID = self._token_id(tokenizer, self.IMAGE_TOKEN)
