@@ -533,12 +533,20 @@ _USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
 
 def is_dp_gatherv_active() -> bool:
     """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
-    enabled and the current parallel layout (attn_tp_size==1, tp_size==dp_size)
-    is supported. Env-gated by SGLANG_DP_USE_GATHERV; default off."""
+    enabled and applicable to the CURRENT forward. Requires:
+      - env SGLANG_DP_USE_GATHERV (default off),
+      - supported layout (attn_tp_size==1, tp_size==dp_size),
+      - SUM_LEN padding mode. The gatherv pair (all_gatherv + reduce_scatterv) is
+        only valid under SUM_LEN; under MAX_LEN the buffer is equal-padded and the
+        gather/combine use all_gather / (aiter) reduce_scatter instead. Reading the
+        per-forward padding via _DpGatheredBufferWrapper.is_dp_max_padding() (set by
+        set_dp_buffer_len) keeps callers that lack a ForwardBatch (e.g.
+        dp_reduce_scatter_tensor) consistent."""
     return (
         _USE_DP_GATHERV
         and get_attention_tp_size() == 1
         and get_tensor_model_parallel_world_size() == get_attention_dp_size()
+        and not _DpGatheredBufferWrapper.is_dp_max_padding()
     )
 
 
@@ -580,13 +588,11 @@ def _dp_gather_via_all_gatherv(
     else:
         local_real = local_tokens.new_zeros((local_rows, *local_tokens.shape[1:]))
         local_real[: local_tokens.shape[0]].copy_(local_tokens)
-    gathered = get_tp_group().all_gatherv(local_real, sizes=sizes)
-    if isinstance(gathered, list):
-        # all_gatherv may return a list of per-rank tensors; concatenate them
-        # along the token dim (taking [0] would drop all but rank 0's tokens).
-        gathered = torch.cat(gathered, dim=0)
-    # gathered rows == sum(sizes); must equal the buffer length.
-    global_tokens[: gathered.shape[0]].copy_(gathered)
+    # sum(sizes) == global_tokens.shape[0] is guaranteed by the caller (else it
+    # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
+    # the gather writes directly into it -- avoids the previous extra full-buffer
+    # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
+    get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
 def _dp_gather(

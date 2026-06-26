@@ -282,6 +282,13 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
             )
             roped_query, roped_key, v = qkv.chunk(3, dim=-1)
 
+        if (
+            not sequence_shard_enabled
+            and not update_cache_only
+            and kv_cache.can_direct_current_attention(roped_key.shape[1])
+        ):
+            return self.attn(roped_query, roped_key, v)
+
         cache_head_start = (
             get_tp_rank() * roped_key.shape[2]
             if sequence_shard_enabled

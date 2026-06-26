@@ -11,7 +11,9 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import (
+    get_world_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -885,7 +887,7 @@ class ModelRunnerKVCacheMixin:
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                             )
                         )
-                    elif self.page_size == 1:
+                    elif self.page_size == 1 and self.dcp_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -895,8 +897,8 @@ class ModelRunnerKVCacheMixin:
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
+                            self.max_total_num_tokens * self.dcp_size,
+                            page_size=self.page_size * self.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
