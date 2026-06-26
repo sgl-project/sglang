@@ -2998,7 +2998,7 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
-        if getattr(self.tp_worker.model_runner, "prefill_aware_swa", False):
+        if self.tp_worker.model_runner.prefill_aware_swa:
             for req in new_batch.reqs:
                 req.swa_evict_floor = req.fill_len
 
