@@ -1071,48 +1071,16 @@ class HiRadixCache(RadixCache):
             self._promote_parent(x, heap)
         return num_evicted
 
-    def _subtree_has_host_lock(self, node: TreeNode) -> bool:
-        """True if ``node`` or any descendant is pinned by an in-flight L3 op
-        (host_ref_counter > 0). Such a subtree must never be dropped, so we don't
-        select it for write_back eviction in the first place."""
-        stack = [node]
-        while stack:
-            n = stack.pop()
-            if n.host_ref_counter > 0:
-                return True
-            stack.extend(n.children.values())
-        return False
-
-    def _plan_write_back_eviction(self, num_tokens: int) -> List[TreeNode]:
-        heap = self._make_eviction_heap()
-        planned: set = set()
-        order: List[TreeNode] = []
-        selected = 0
-        while selected < num_tokens and heap:
-            _priority, x = heapq.heappop(heap)
-            if x.lock_ref > 0 or x in planned:
-                continue
-            if self._subtree_has_host_lock(x):
-                continue  # an L3 op holds part of its subtree -> not safe to evict
-            planned.add(x)
-            order.append(x)
-            selected += len(x.value)
-            p = x.parent
-            if (
-                p is not self.root_node
-                and p.lock_ref == 0
-                and p not in planned
-                and all(c.evicted or c in planned for c in p.children.values())
-            ):
-                heapq.heappush(heap, (self.eviction_strategy.get_priority(p), p))
-        return order
-
     def _evict_write_back(self, num_tokens: int) -> int:
-        """write_back eviction, plan-then-commit.
+        """eviction for write_back mode: demote already-backuped leaves, stage non-backuped ones to host if possible, otherwise drop them.
         note this path will be deprecated in the future.
         """
+        heap = self._make_eviction_heap()
         num_evicted = 0
-        for x in self._plan_write_back_eviction(num_tokens):
+        while num_evicted < num_tokens and heap:
+            _priority, x = heapq.heappop(heap)
+            if x.lock_ref > 0:
+                continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True) > 0:
@@ -1120,6 +1088,7 @@ class HiRadixCache(RadixCache):
                 num_evicted += self._evict_backuped(x)
             else:
                 num_evicted += self._drop_subtree_no_host(x)
+            self._promote_parent(x, heap)
         return num_evicted
 
     def _evict_backuped(self, node: TreeNode):
@@ -1158,6 +1127,12 @@ class HiRadixCache(RadixCache):
         if any(n.host_ref_counter > 0 for n in nodes):
             return 0
 
+        logger.warning(
+            "write_back: KV cache on device are dropped without backup due to host memory pressure, subtree root %d, num_nodes %d",
+            root.id,
+            len(nodes),
+        )
+
         freed_device = 0
         for n in nodes:
             if n.host_value is not None:
@@ -1171,11 +1146,11 @@ class HiRadixCache(RadixCache):
                 self.evictable_size_ -= len(n.value)
                 n.value = None
             self.ongoing_write_through.pop(n.id, None)
+            self.evictable_leaves.discard(n)
             self.evictable_host_leaves.discard(n)
 
         key = root.key.child_key(self.page_size)
-        removed = root.parent.children.pop(key, None)
-        assert removed is root, f"subtree root {root.id} not under parent"
+        root.parent.children.pop(key, None)
         self._update_leaf_status(root.parent)
         self._update_host_leaf_status(root.parent)
         return freed_device
