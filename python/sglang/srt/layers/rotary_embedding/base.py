@@ -66,7 +66,6 @@ class RotaryEmbedding(MultiPlatformOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        self.use_explicit_npu_interleaved_rope = False
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
@@ -211,104 +210,6 @@ class RotaryEmbedding(MultiPlatformOp):
     def get_sin_cached_total(self):
         return self.sin_cached_total
 
-    def sync_explicit_npu_interleaved_cache(self):
-        if not getattr(self, "use_explicit_npu_interleaved_rope", False):
-            return
-        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
-        cos_cached_total = cos.repeat(1, 2).contiguous()
-        sin_cached_total = sin.repeat(1, 2).contiguous()
-
-        # Lazily create these buffers only for models that actually use
-        # explicit NPU interleaved RoPE.
-        for name, value in (
-            ("cos_cached_total", cos_cached_total),
-            ("sin_cached_total", sin_cached_total),
-        ):
-            if name not in self._buffers:
-                # Some subclasses define plain attributes with the same names
-                # before RotaryEmbedding initialization. Remove them before
-                # turning them into buffers.
-                if hasattr(self, name):
-                    delattr(self, name)
-                self.register_buffer(name, value, persistent=False)
-            else:
-                setattr(self, name, value)
-
-    def update_and_get_cos_sin_cache(
-        self, positions, layer_id, dtype, offsets: Optional[torch.Tensor] = None
-    ):
-        if (
-            getattr(self, "cos_cached_total", None) is None
-            or getattr(self, "sin_cached_total", None) is None
-        ):
-            raise RuntimeError(
-                "Explicit NPU interleaved RoPE cache is not initialized. "
-                "Call sync_explicit_npu_interleaved_cache() before "
-                "update_and_get_cos_sin_cache()."
-            )
-        if layer_id == 0:
-            self.cos_cached = (
-                self.cos_cached_total[
-                    torch.add(positions, offsets) if offsets is not None else positions
-                ]
-                .unsqueeze(-2)
-                .unsqueeze(-2)
-                .to(dtype)
-            )
-            self.sin_cached = (
-                self.sin_cached_total[
-                    torch.add(positions, offsets) if offsets is not None else positions
-                ]
-                .unsqueeze(-2)
-                .unsqueeze(-2)
-                .to(dtype)
-            )
-        cos = self.cos_cached.to(positions.device)
-        sin = self.sin_cached.to(positions.device)
-        return cos, sin
-
-    def explicit_npu_interleave_rope(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        num_tokens, num_q_heads, _ = query.shape
-        num_k_heads = key.shape[1]
-
-        cos, sin = self.cos_cached.to(positions.device), self.sin_cached.to(
-            positions.device
-        )
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
-
-        query_rot = torch_npu.npu_interleave_rope(
-            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
-            cos,
-            sin,
-        )
-        key_rot = torch_npu.npu_interleave_rope(
-            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
-            cos,
-            sin,
-        )
-
-        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
-        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
-
-        if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
-        else:
-            query = query_rot
-            key = key_rot
-
-        return query, key
-
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -364,12 +265,6 @@ class RotaryEmbedding(MultiPlatformOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
         if (
-            getattr(self, "use_explicit_npu_interleaved_rope", False)
-            and self.rotary_dim == 64
-            and not self.is_neox_style
-        ):
-            return self.explicit_npu_interleave_rope(positions, query, key, offsets)
-        elif (
             query.dtype == torch.bfloat16
             and self.cos_sin_cache.dtype == torch.float
             or key.ndim == 3

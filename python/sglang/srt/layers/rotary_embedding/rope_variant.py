@@ -533,6 +533,115 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             return self.forward_native(positions, query, key, offsets)
 
 
+class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        self.cos_cached_total = None
+        self.sin_cached_total = None
+        self.cos_cached = None
+        self.sin_cached = None
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+        self.sync_explicit_npu_interleaved_cache()
+
+    def sync_explicit_npu_interleaved_cache(self):
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        cos_cached_total = cos.repeat(1, 2).contiguous()
+        sin_cached_total = sin.repeat(1, 2).contiguous()
+
+        for name, value in (
+            ("cos_cached_total", cos_cached_total),
+            ("sin_cached_total", sin_cached_total),
+        ):
+            if name not in self._buffers:
+                if hasattr(self, name):
+                    delattr(self, name)
+                self.register_buffer(name, value, persistent=False)
+            else:
+                setattr(self, name, value)
+
+    def get_cos_sin_cache(
+        self,
+        positions,
+        dtype,
+        offsets: Optional[torch.Tensor] = None,
+        layer_id: Optional[int] = None,
+    ):
+        if (
+            getattr(self, "cos_cached_total", None) is None
+            or getattr(self, "sin_cached_total", None) is None
+        ):
+            raise RuntimeError(
+                "Explicit NPU interleaved RoPE cache is not initialized. "
+                "Call sync_explicit_npu_interleaved_cache() before "
+                "get_cos_sin_cache()."
+            )
+        if layer_id == 0:
+            index = torch.add(positions, offsets) if offsets is not None else positions
+            self.cos_cached = self.cos_cached_total[index].unsqueeze(-2).unsqueeze(
+                -2
+            ).to(dtype)
+            self.sin_cached = self.sin_cached_total[index].unsqueeze(-2).unsqueeze(
+                -2
+            ).to(dtype)
+        cos = self.cos_cached.to(positions.device)
+        sin = self.sin_cached.to(positions.device)
+        return cos, sin
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.is_neox_style:
+            raise RuntimeError(
+                "LongcatExplicitInterleavedRotaryEmbedding only supports "
+                "interleaved RoPE on NPU."
+            )
+        del offsets
+        num_tokens, num_q_heads, _ = query.shape
+        num_k_heads = key.shape[1]
+
+        cos = self.cos_cached.to(positions.device)
+        sin = self.sin_cached.to(positions.device)
+        query_rot = query[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim]
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            key_pass = key[..., self.rotary_dim :]
+
+        query_rot = torch_npu.npu_interleave_rope(
+            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
+            cos,
+            sin,
+        )
+        key_rot = torch_npu.npu_interleave_rope(
+            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
+            cos,
+            sin,
+        )
+
+        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
+        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1)
+            key = torch.cat((key_rot, key_pass), dim=-1)
+        else:
+            query = query_rot
+            key = key_rot
+        return query, key
+
+
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
     def __init__(

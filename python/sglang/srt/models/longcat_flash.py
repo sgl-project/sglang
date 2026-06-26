@@ -82,6 +82,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.rotary_embedding.rope_variant import (
+    LongcatExplicitInterleavedRotaryEmbedding,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -340,6 +343,21 @@ class _LongcatDoubleStreamState:
         self.moe_alt_stream = None
 
 
+def _enable_longcat_explicit_npu_rope(attn: DeepseekV2AttentionMLA) -> None:
+    rotary_emb = attn.rotary_emb
+    if rotary_emb is None:
+        return
+    attn.rotary_emb = LongcatExplicitInterleavedRotaryEmbedding(
+        head_size=rotary_emb.head_size,
+        rotary_dim=rotary_emb.rotary_dim,
+        max_position_embeddings=rotary_emb.max_position_embeddings,
+        base=rotary_emb.base,
+        is_neox_style=rotary_emb.is_neox_style,
+        dtype=rotary_emb.dtype,
+    )
+    attn.use_explicit_npu_interleaved_rope = True
+
+
 class LongcatFlashDecoderLayer(nn.Module):
 
     def __init__(
@@ -394,9 +412,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         )
         if _is_npu:
             for attn in self.self_attn:
-                attn.use_explicit_npu_interleaved_rope = True
-                attn.rotary_emb.use_explicit_npu_interleaved_rope = True
-                attn.rotary_emb.sync_explicit_npu_interleaved_cache()
+                _enable_longcat_explicit_npu_rope(attn)
 
         self.input_layernorm = nn.ModuleList(
             [RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for i in range(2)]
