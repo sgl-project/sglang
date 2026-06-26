@@ -1206,7 +1206,7 @@ class AnthropicServing:
         # entirely when the backend doesn't provide one — empty strings
         # would fail downstream Anthropic signature verifiers.
         if choice.message.reasoning_content:
-            content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
+            content.append(ThinkingBlock(thinking=choice.message.reasoning_content, signature="sglang"))
 
         # Add text content
         if choice.message.content:
