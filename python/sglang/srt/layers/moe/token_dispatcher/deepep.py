@@ -584,6 +584,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
 
+        # Wrap x for NPU quantisation if a quant reference tensor exists
+        x = (x, self.npu_quant_tensor) if self.npu_quant_tensor is not None else x
+
         _deepep_precompile_tp_barrier()
         (
             recv_x,
