@@ -5617,6 +5617,11 @@ class ServerArgs:
             assert (
                 self.moe_runner_backend == "flashinfer_megamoe"
             ), "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
+            if self.quantization == "modelopt_fp4":
+                assert is_sm100_supported(), (
+                    "FlashInfer MegaMOE NVFP4 requires Blackwell (sm_100+) "
+                    "CUDA devices."
+                )
             logger.info(
                 f"FlashInfer MegaMOE is enabled. The expert parallel size is "
                 f"adjusted to be the same as the tensor parallel size[{self.tp_size}]."

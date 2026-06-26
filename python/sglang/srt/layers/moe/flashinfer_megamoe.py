@@ -22,7 +22,7 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -56,20 +56,91 @@ def _resolve_max_tokens_per_rank() -> int:
     return derived if derived > 0 else 1024
 
 
+def _layer_ep_world_rank(layer: FusedMoE) -> tuple[int, int]:
+    world_size = int(layer.moe_ep_size)
+    rank = int(layer.moe_ep_rank)
+    if world_size <= 0:
+        raise ValueError(f"moe_ep_size must be positive, got {world_size}.")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"moe_ep_rank must be in [0, {world_size}), got {rank}.")
+    return world_size, rank
+
+
+def _scalar_float(value: Any) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().to(torch.float32).max().item())
+    return float(value)
+
+
+def _local_expert_vector(value: torch.Tensor, num_local_experts: int) -> torch.Tensor:
+    value = value.detach().to(torch.float32)
+    if value.dim() == 0:
+        return value.expand(num_local_experts).contiguous()
+    if value.shape != (num_local_experts,):
+        raise ValueError(
+            f"expected per-local-expert vector of shape ({num_local_experts},), "
+            f"got {tuple(value.shape)}"
+        )
+    return value.contiguous()
+
+
+def _global_or_local_expert_vector(
+    value: torch.Tensor, layer: FusedMoE, *, name: str
+) -> torch.Tensor:
+    value = value.detach().to(torch.float32)
+    if value.dim() == 0:
+        return value.expand(layer.num_local_experts).contiguous()
+    if value.shape == (layer.num_local_experts,):
+        return value.contiguous()
+    if value.shape == (layer.num_experts,):
+        start = layer.moe_ep_rank * layer.num_local_experts
+        end = start + layer.num_local_experts
+        return value[start:end].contiguous()
+    raise ValueError(
+        f"{name} must be scalar, local shape ({layer.num_local_experts},), "
+        f"or global shape ({layer.num_experts},); got {tuple(value.shape)}"
+    )
+
+
+def _build_nvfp4_megamoe_scales(layer: FusedMoE) -> None:
+    gate_alpha = _local_expert_vector(layer.g1_alphas, layer.num_local_experts)
+    if layer.moe_runner_config.is_gated:
+        up_alpha = _local_expert_vector(layer.g1_alphas_up, layer.num_local_experts)
+        if not torch.allclose(gate_alpha, up_alpha):
+            raise ValueError(
+                "FlashInfer NVFP4 MegaMOE requires matching gate/up FC1 alpha "
+                "values because the kernel accepts one alpha per expert."
+            )
+        fc1_alpha = gate_alpha.contiguous()
+    else:
+        fc1_alpha = gate_alpha
+
+    fc2_input_scale = _global_or_local_expert_vector(
+        layer.w2_input_scale, layer, name="w2_input_scale"
+    )
+    fc2_weight_scale_2 = _local_expert_vector(
+        layer.w2_weight_scale_2, layer.num_local_experts
+    )
+
+    layer.flashinfer_megamoe_fc1_alpha = fc1_alpha
+    layer.flashinfer_megamoe_fc2_alpha = (
+        (fc2_input_scale * fc2_weight_scale_2).to(torch.float32).contiguous()
+    )
+    layer.flashinfer_megamoe_fc1_norm_const = (
+        (1 / fc2_input_scale).to(torch.float32).contiguous()
+    )
+
+
 def build_flashinfer_megamoe_layer(layer: FusedMoE) -> None:
     """Construct + cache a MoEEpMegaLayer from the layer's loaded FP4 weights.
 
-    SGLang loads FP4-packed expert weights (int8, k//2) plus fp32 block-32
-    scales. FlashInfer's pre-quantized weight path feeds (weight, scale)
-    straight into ``transform_weights_for_mega_moe`` without first calling
-    ``transform_sf_into_required_layout``, so we transform the scales here to
-    the UE8M0 (1, 32) layout -- mirroring ``build_mega_moe_experts_weights``.
+    SGLang loads FP4-packed expert weights plus raw block scales. FlashInfer's
+    current moe_ep API owns backend-specific weight preprocessing, including
+    DeepGEMM scale layout transforms.
     """
     if getattr(layer, "flashinfer_megamoe_layer", None) is not None:
         return
 
-    import torch.distributed as dist
-    from deep_gemm import transform_sf_into_required_layout
     from flashinfer.moe_ep import (
         BootstrapConfig,
         DeepGemmMegaMoeConfig,
@@ -79,50 +150,100 @@ def build_flashinfer_megamoe_layer(layer: FusedMoE) -> None:
         MoEWeightPack,
     )
 
-    w13 = layer.w13_weight.data
-    w2 = layer.w2_weight.data
-    w13_sf_fp32 = layer.w13_weight_scale_inv.data
-    w2_sf_fp32 = layer.w2_weight_scale_inv.data
+    world_size, rank = _layer_ep_world_rank(layer)
 
-    num_groups, n1, half_k1 = w13.shape
-    k1 = half_k1 * 2
-    _, n2, half_k2 = w2.shape
-    k2 = half_k2 * 2
-
-    w13_sf = transform_sf_into_required_layout(
-        w13_sf_fp32,
-        mn=n1,
-        k=k1,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
-    w2_sf = transform_sf_into_required_layout(
-        w2_sf_fp32,
-        mn=n2,
-        k=k2,
-        recipe=(1, 32),
-        num_groups=num_groups,
-        disable_ue8m0_cast=False,
-    )
-
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    rank = dist.get_rank() if dist.is_initialized() else 0
-
-    # The kernel hardcodes dist.group.WORLD, so EP == world (TP == EP == world).
     layer.flashinfer_megamoe_layer = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
         fleet_params=FleetParams(
             num_experts=layer.num_experts,
             max_tokens_per_rank=_resolve_max_tokens_per_rank(),
             token_hidden_size=layer.hidden_size,
-            weights=MoEWeightPack(w13=w13, w2=w2, w13_scale=w13_sf, w2_scale=w2_sf),
+            weights=MoEWeightPack(
+                w13=layer.w13_weight.data,
+                w2=layer.w2_weight.data,
+                w13_scale=layer.w13_weight_scale_inv.data,
+                w2_scale=layer.w2_weight_scale_inv.data,
+            ),
         ),
         backend=MegaConfig(
             megakernel=DeepGemmMegaMoeConfig(
                 intermediate_size=layer.intermediate_size_per_partition,
                 top_k=layer.top_k,
                 activation_clamp=layer.moe_runner_config.swiglu_limit,
+            ),
+            stage_inputs=True,
+            preprocess_weights=True,
+        ),
+    )
+
+
+def build_flashinfer_nvfp4_megamoe_layer(layer: FusedMoE) -> None:
+    if getattr(layer, "flashinfer_megamoe_layer", None) is not None:
+        return
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEWeightPack,
+        Nvfp4CutedslMegaMoeConfig,
+    )
+
+    if layer.hidden_size % 128 != 0:
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE requires hidden_size to be a multiple "
+            f"of 128, got {layer.hidden_size}."
+        )
+    if getattr(layer.quant_config, "use_per_token_activation", False):
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE does not support per-token activation "
+            "scaling. Use flashinfer_trtllm/flashinfer_trtllm_routed for "
+            "ModelOpt NVFP4 per-token activation."
+        )
+    if layer.intermediate_size_per_partition % 128 != 0:
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE requires intermediate_size_per_partition "
+            f"to be a multiple of 128, got {layer.intermediate_size_per_partition}."
+        )
+    if layer.num_experts % layer.moe_ep_size != 0:
+        raise ValueError(
+            "FlashInfer NVFP4 MegaMOE requires num_experts to be divisible by "
+            f"ep_size, got {layer.num_experts=} and {layer.moe_ep_size=}."
+        )
+
+    world_size, rank = _layer_ep_world_rank(layer)
+
+    _build_nvfp4_megamoe_scales(layer)
+
+    input_norm_const = _scalar_float(layer.w13_input_scale_quant)
+    layer.flashinfer_megamoe_input_norm_const = input_norm_const
+    gate_up_clamp = layer.moe_runner_config.swiglu_limit
+    max_tokens = _resolve_max_tokens_per_rank()
+
+    layer.flashinfer_megamoe_layer = MoEEpMegaLayer(
+        bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
+        fleet_params=FleetParams(
+            num_experts=layer.num_experts,
+            max_tokens_per_rank=max_tokens,
+            token_hidden_size=layer.hidden_size,
+            weights=MoEWeightPack(
+                w13=layer.w13_weight.data,
+                w2=layer.w2_weight.data,
+                w13_scale=layer.w13_weight_scale.data,
+                w2_scale=layer.w2_weight_scale.data,
+            ),
+        ),
+        backend=MegaConfig(
+            megakernel=Nvfp4CutedslMegaMoeConfig(
+                intermediate_size=layer.intermediate_size_per_partition,
+                top_k=layer.top_k,
+                gate_up_clamp=gate_up_clamp,
+                apply_topk_in_fc1=True,
+                input_norm_const=input_norm_const,
+                fc1_alpha=layer.flashinfer_megamoe_fc1_alpha,
+                fc2_alpha=layer.flashinfer_megamoe_fc2_alpha,
+                fc1_norm_const=layer.flashinfer_megamoe_fc1_norm_const,
             ),
             stage_inputs=True,
             preprocess_weights=True,
@@ -149,13 +270,20 @@ def _ensure_shared_workspace(mega) -> None:
         return
     fp = mega._fleet_params
     kc = mega._megakernel_config
+    mc = mega._mega_config
     key = (
+        getattr(kc, "kernel_name", kc.__class__.__name__),
         mega._bootstrap.world_size,
         fp.num_experts,
         fp.max_tokens_per_rank,
         fp.token_hidden_size,
         kc.top_k,
         kc.intermediate_size,
+        getattr(kc, "gate_up_clamp", None),
+        getattr(kc, "activation_clamp", None),
+        getattr(kc, "apply_topk_in_fc1", None),
+        getattr(kc, "fast_math", None),
+        mc.stage_inputs,
     )
     shared = _SHARED_MEGA_WORKSPACE.get(key)
     if shared is None:
@@ -184,6 +312,9 @@ def run_flashinfer_megamoe(
         hidden_states=x.to(torch.bfloat16),
         topk_ids=topk_ids.to(torch.int64),
         topk_weights=topk_weights.to(torch.float32),
+        fc1_alpha=getattr(layer, "flashinfer_megamoe_fc1_alpha", None),
+        fc2_alpha=getattr(layer, "flashinfer_megamoe_fc2_alpha", None),
+        fc1_norm_const=getattr(layer, "flashinfer_megamoe_fc1_norm_const", None),
     )
     y = mega.forward(t)
 

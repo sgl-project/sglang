@@ -318,21 +318,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-<<<<<<< HEAD
-        router_logits, _ = self.gate(hidden_states)
         if hidden_states.shape[0] > 0:
-            topk_output = self.topk(hidden_states, router_logits)
-        else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
-
-=======
-        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
->>>>>>> 229fc76c9f (Draft MegaMOE integration)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
