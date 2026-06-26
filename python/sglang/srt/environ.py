@@ -627,6 +627,12 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Double Sparsity dev-only score capture (None = off, production inert). When set
+    # to a dir AND the selector runs eager, the graph-safe selector dumps the per-rank
+    # pre/post-reduce score rows + the emitted selection so an offline validator can
+    # prove the cross-TP selected-index contract on the real served call.
+    SGLANG_DS_SCORE_CAPTURE_DIR = EnvStr(None)
+    SGLANG_DS_SCORE_CAPTURE_MAX = EnvInt(4000)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

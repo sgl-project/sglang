@@ -22,11 +22,91 @@ mask; it is the canonical projection the absorbed-latent build mirrors.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Dev-only score capture (SGLANG_DS_SCORE_CAPTURE_DIR, registered in environ.py so it
+# reaches TP workers; None default → production inert). When set AND the selector runs
+# eager (NOT under CUDA-graph capture — host dumps are not capture-safe), the graph-safe
+# selector dumps the per-rank pre-reduce, post-reduce, and authoritative (post-mask)
+# score rows + the emitted selection, so an offline validator can prove the cross-TP
+# selected-index contract on the REAL served call. When unset this is a single field
+# read with no clone / sync / alloc — production unchanged.
+_ds_capture_counter = 0
+
+
+def _ds_score_capture_dir() -> Optional[str]:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_DS_SCORE_CAPTURE_DIR.get()
+
+
+def _ds_score_capture_active(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    if not _ds_score_capture_dir():
+        return False
+    return not torch.cuda.is_current_stream_capturing()
+
+
+def _dump_ds_score_capture(
+    *,
+    pre_reduce,
+    post_reduce,
+    authoritative,
+    out_indices,
+    out_lengths,
+    req_pool_indices,
+    req_to_token,
+    seq_lens,
+    layer_id,
+    process_group,
+):
+    """Write one capture record per (tp_rank, layer, call). Eager-only (the caller
+    gates on _ds_score_capture_active). Carries the per-request emitted selection + the
+    score rows it was computed from, on CPU, for the offline cross-rank validator."""
+    global _ds_capture_counter
+    from sglang.srt.environ import envs
+
+    cap_dir = envs.SGLANG_DS_SCORE_CAPTURE_DIR.get()
+    if not cap_dir:
+        return
+    if _ds_capture_counter >= int(envs.SGLANG_DS_SCORE_CAPTURE_MAX.get()):
+        return
+    os.makedirs(cap_dir, exist_ok=True)
+    tp_rank = (
+        torch.distributed.get_rank(process_group)
+        if (process_group is not None and torch.distributed.is_initialized())
+        else 0
+    )
+    bs = out_indices.shape[0]
+    phys = []
+    for b in range(bs):
+        rp = int(req_pool_indices[b])
+        sel = out_indices[b].long().clamp_min(0)
+        phys.append(req_to_token[rp].long()[sel].cpu())
+    record = {
+        "tp_rank": tp_rank,
+        "layer_id": int(layer_id),
+        "req_pool_indices": req_pool_indices.detach().cpu(),
+        "seq_lens": seq_lens.detach().cpu(),
+        "pre_reduce": pre_reduce.detach().float().cpu(),
+        "post_reduce": post_reduce.detach().float().cpu(),
+        "authoritative": authoritative.detach().float().cpu(),
+        "selected_indices": out_indices.detach().cpu(),
+        "valid_lengths": out_lengths.detach().cpu(),
+        "phys_slots": torch.stack(phys, 0) if phys else torch.empty(0),
+        "score_dtype": str(authoritative.dtype),
+    }
+    fname = os.path.join(
+        cap_dir, f"cap_rank{tp_rank}_layer{int(layer_id)}_{_ds_capture_counter}.pt"
+    )
+    _ds_capture_counter += 1
+    torch.save(record, fname)
 
 
 SELECTED_PAD_VALUE = -1
@@ -83,7 +163,7 @@ def assert_rope_selection_supported(
 
     The caller invokes this only when ``rope_aware_score`` is on. rope-aware
     selection is validated ONLY for single-token MLA decode with q_pe/positions/
-    rotary_emb threaded (the loop14/15 config); every other runtime raises here
+    rotary_emb threaded; every other runtime raises here
     rather than silently scoring no-PE. (fp8-vs-bf16 resident KV is checked
     separately by :func:`assert_rope_fp8_resident` once the pool dtype is known.)
     """
@@ -116,7 +196,7 @@ def assert_rope_fp8_resident(resident_dtype) -> None:
 
     The resident post-RoPE k_pe slice + the fp8 absorbed identity are validated
     only for the fp8 KV layout; bf16 resident KV has a different byte layout
-    (DEC-1, fp8-only first ship).
+    (fp8-only first ship; bf16 KV fails closed).
     """
     if resident_dtype == torch.bfloat16:
         raise RuntimeError(
@@ -1069,6 +1149,8 @@ def retrieve_topk_graph_safe(
     # kernel-name matching. Host-side annotations: they mark eager decode and
     # the capture-time launches; CUDA-graph replay does not re-emit them.
     scores_view = scratch_scores[:bs, :max_seq_len]
+    _do_capture = _ds_score_capture_active(device)
+    _cap_pre = _cap_post = _cap_auth = None
     # Dead positions (past seq_len) only need -inf when a full-width consumer
     # reads them: the legacy torch.topk pipeline scans the whole scratch, the
     # recall oracle ranks the full score row, and the anchor force-include is
@@ -1161,6 +1243,8 @@ def retrieve_topk_graph_safe(
         radix_topk_scratch is not None and bf16_used and anchor_mode == "off"
     )
     topk_scores = scores_view
+    if _do_capture:
+        _cap_pre = scores_view.detach().float().clone()  # per-rank, pre-reduce
     if (
         process_group is not None
         and torch.distributed.is_available()
@@ -1179,6 +1263,8 @@ def retrieve_topk_graph_safe(
             topk_scores = reduced
         torch.cuda.nvtx.range_pop()
 
+    if _do_capture:
+        _cap_post = topk_scores.detach().float().clone()  # post-reduce, pre-mask
     if per_request_valid is not None:
         assert (
             scratch_pv_mask is not None
@@ -1218,6 +1304,11 @@ def retrieve_topk_graph_safe(
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
         )
+
+    if _do_capture:
+        _cap_auth = (
+            topk_scores.detach().float().clone()
+        )  # post-mask+include, topk input
 
     torch.cuda.nvtx.range_push("ds_topk_select")
     if radix_topk_scratch is not None:
@@ -1309,5 +1400,19 @@ def retrieve_topk_graph_safe(
         )
         out_indices[:bs, :max_top_k].copy_(a_idx)
         out_lengths[:bs].copy_(a_len)
+
+    if _do_capture:
+        _dump_ds_score_capture(
+            pre_reduce=_cap_pre,
+            post_reduce=_cap_post,
+            authoritative=_cap_auth,
+            out_indices=out_indices[:bs],
+            out_lengths=out_lengths[:bs],
+            req_pool_indices=req_pool_indices[:bs],
+            req_to_token=req_to_token,
+            seq_lens=seq_lens[:bs],
+            layer_id=layer_id,
+            process_group=process_group,
+        )
 
     return out_indices, out_lengths

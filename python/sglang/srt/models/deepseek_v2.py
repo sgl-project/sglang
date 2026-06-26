@@ -2565,7 +2565,7 @@ class DeepseekV2AttentionMLA(
                     if _rope_aware:
                         # Fail closed: rope-aware selection is validated ONLY for
                         # single-token MLA decode on fp8 KV with q_pe/positions/
-                        # rotary_emb present (the loop14/15 config). Non-validated
+                        # rotary_emb present. Non-validated
                         # runtimes raise rather than silently scoring no-PE. (bf16 KV is
                         # rejected in the latent-unpack branch below via
                         # assert_rope_fp8_resident; NSA and CPU/NPU cannot reach this DS
@@ -2600,7 +2600,7 @@ class DeepseekV2AttentionMLA(
                             _nblk = _lora // 128
                             if _rope_aware:
                                 # Fail closed on non-fp8 resident KV (bf16 has a
-                                # different byte layout; DEC-1 fp8-only first ship).
+                                # different byte layout; fp8-only first ship).
                                 assert_rope_fp8_resident(_nope_u8.dtype)
                             if _nope_u8.dtype == torch.bfloat16:
                                 # BF16 KV cache: the resident latent IS the
