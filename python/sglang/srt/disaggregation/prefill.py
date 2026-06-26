@@ -480,7 +480,9 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run(last_batch=self.last_batch)
+            batch = self.get_next_disagg_prefill_batch_to_run(
+                last_batch=self.last_batch
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -514,7 +516,9 @@ class SchedulerDisaggregationPrefillMixin:
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run(last_batch=self.last_batch)
+            batch = self.get_next_disagg_prefill_batch_to_run(
+                last_batch=self.last_batch
+            )
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -949,9 +953,7 @@ class SchedulerDisaggregationPrefillMixin:
                 chunked_req_to_exclude.add(last_batch.chunked_req)
 
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 

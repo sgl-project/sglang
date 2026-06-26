@@ -2672,9 +2672,7 @@ class Scheduler(
 
             # Filter batch
             last_bs = last_batch.batch_size()
-            last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
 
@@ -2699,9 +2697,7 @@ class Scheduler(
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
-            new_batch, running_batch = self.get_new_batch_prefill(
-                running_batch
-            )
+            new_batch, running_batch = self.get_new_batch_prefill(running_batch)
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -2721,10 +2717,7 @@ class Scheduler(
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
-            if (
-                not running_batch.is_empty()
-                and not running_batch.is_prefill_only
-            ):
+            if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
             else:
@@ -2922,9 +2915,9 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
-                        running_batch.batch_is_full = len(
-                            adder.can_run_list
-                        ) > 0 or (not running_batch.is_empty())
+                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                            not running_batch.is_empty()
+                        )
                     else:
                         running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
