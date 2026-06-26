@@ -589,12 +589,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             # (Buffer is the deep_ep / zbal buffer already imported)
             dispatch_config = Buffer.get_dispatch_config(self.group.size())
 
-        # Now set the quant type if the config supports it (safe for CUDA)
-        if dispatch_config is not None and hasattr(
-            dispatch_config, "normal_quant_type"
-        ):
-            dispatch_config.normal_quant_type = self.get_normal_quant_type()
-
         _deepep_precompile_tp_barrier()
         (
             recv_x,
@@ -615,7 +609,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
-            config=dispatch_config,
+            config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
