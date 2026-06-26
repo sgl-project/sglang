@@ -544,7 +544,7 @@ pub async fn chat_completions(
         Err(_) => RequestOutcome::Error,
     };
     ctx.metrics
-        .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
+        .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
     // Per-request access log — always on at INFO so incoming traffic and its
     // status are visible without DEBUG. `request_id` is the client/gateway
@@ -560,19 +560,24 @@ pub async fn chat_completions(
         Err(e) => e.status_code().as_u16(),
     };
 
-    // Record the client-visible HTTP status now that the outcome is known.
-    // For non-streaming requests the body is already buffered here, so
+    // Record end-to-end latency now that the outcome is known. For
+    // non-streaming requests the body is already buffered here, so
     // `start.elapsed()` is true end-to-end latency — record it directly. For
     // streaming, the body is still pending; the `RecordDurationOnDrop` guard
     // packed into `stream_guards` records it at stream completion instead (so
     // we don't capture only time-to-headers). `elapsed` still feeds the
     // access-log `latency_ms` below for both.
+    //
+    // The client-visible HTTP status is counted into
+    // `sgl_router_responses_total` by the global edge middleware
+    // (`count_requests` in server/app.rs), NOT here — the old per-handler
+    // recording skipped every early-exit path (validation 400, body-limit 413,
+    // admission 503) that returned before reaching this point.
     let elapsed = start.elapsed();
     if !streaming {
         ctx.metrics
             .observe_request_duration(&metrics_model, elapsed.as_secs_f64());
     }
-    ctx.metrics.record_response(http_status);
     let outcome_str = match outcome {
         RequestOutcome::Success => "success",
         RequestOutcome::Error => "error",

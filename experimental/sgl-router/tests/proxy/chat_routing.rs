@@ -288,7 +288,9 @@ async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
         "TTFT must NOT be recorded for a non-2xx streaming response; got:\n{m}",
     );
     assert!(
-        m.contains(r#"sgl_router_responses_total{status_code="500"} 1"#),
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="500"} 1"#
+        ),
         "the 500 status must be counted; got:\n{m}",
     );
     assert!(

@@ -18,10 +18,11 @@
 //!
 //! | Metric | Type | Labels |
 //! |---|---|---|
-//! | `sgl_router_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
+//! | `sgl_router_requests_total` | Counter | `route`, `method` |
+//! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
+//! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
-//! | `sgl_router_responses_total` | Counter | `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
@@ -203,14 +204,26 @@ impl ActiveLoadKind {
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
-    requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
+    // Edge counters — every request/response at the router HTTP boundary,
+    // counted ONCE at a global middleware: `requests_total` at request entry
+    // (before any worker pick / parking), `responses_total` at response. Their
+    // difference (`requests_total - responses_total`) is the set of requests
+    // the router received but never answered — parked-then-timed-out, shed, or
+    // client-cancelled-while-stalled. That gap is invisible to the per-worker
+    // counter below, which is recorded only after a request reaches dispatch.
+    requests_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
+    responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
+    // Per-worker dispatch outcomes (formerly `requests_total`). Recorded after
+    // a worker is selected and the upstream outcome is known, so it CANNOT see
+    // requests that never reached dispatch — use the edge `requests_total` for
+    // true intake. Kept per-worker for the routing-convergence tests.
+    worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
     // function of `model_id` here — a redundant label. Per-worker `mode` lives
-    // on `requests_total` / the worker gauges instead.
+    // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
-    responses_total: Mutex<HashMap<u16, Arc<AtomicU64>>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -225,6 +238,24 @@ struct RequestKey {
     model_id: String,
     mode: &'static str,
     outcome: &'static str,
+}
+
+/// Label set for the edge `sgl_router_requests_total` (intake) counter.
+/// `route` is the matched request path (a small, fixed set — `/v1/chat/
+/// completions`, `/v1/models`, ... — so cardinality is bounded).
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct EdgeKey {
+    route: String,
+    method: String,
+}
+
+/// Label set for the edge `sgl_router_responses_total` counter — `EdgeKey`
+/// plus the final HTTP status the client saw.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct EdgeResponseKey {
+    route: String,
+    method: String,
+    status_code: u16,
 }
 
 /// Per-worker state sampled from the [`crate::workers::WorkerRegistry`] at
@@ -302,8 +333,28 @@ impl MetricsRegistry {
         Arc::new(Self::default())
     }
 
-    /// Bump `sgl_router_requests_total` for the given worker / model / mode / outcome.
-    pub fn record_request(
+    /// Bump `sgl_router_requests_total{route,method}` — the edge intake counter.
+    /// Called once per request at the global middleware, BEFORE worker pick, so
+    /// it counts every request the router received (including those later
+    /// parked / shed / cancelled before a worker is ever dispatched to).
+    pub fn record_ingress(&self, route: &str, method: &str) {
+        let key = EdgeKey {
+            route: route.to_owned(),
+            method: method.to_owned(),
+        };
+        let mut guard = self.requests_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_worker_requests_total` for the given worker / model /
+    /// mode / outcome. Recorded after dispatch — see the edge `record_ingress`
+    /// for true intake.
+    pub fn record_worker_request(
         &self,
         worker_url: &str,
         model_id: &str,
@@ -316,7 +367,7 @@ impl MetricsRegistry {
             mode: mode.as_str(),
             outcome: outcome.as_str(),
         };
-        let mut guard = self.requests_total.lock();
+        let mut guard = self.worker_requests_total.lock();
         let counter = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -373,14 +424,22 @@ impl MetricsRegistry {
         hist.observe(seconds);
     }
 
-    /// Bump `sgl_router_responses_total{status_code}` for the HTTP status the
-    /// client ultimately saw. Cardinality is bounded by the small set of
-    /// status codes the router returns (2xx success, 4xx client, 5xx
-    /// upstream/proxy, 504 stale-cancel).
-    pub fn record_response(&self, status_code: u16) {
+    /// Bump `sgl_router_responses_total{route,method,status_code}` for the HTTP
+    /// status the client ultimately saw. Called once per request at the global
+    /// middleware (response side), so it captures EVERY outcome — including the
+    /// early-exit paths (400 validation, 413 body-limit, 503 shed) that the old
+    /// per-handler recording site silently skipped. Cardinality is bounded by
+    /// the fixed route set times the small set of status codes the router
+    /// returns.
+    pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
+        let key = EdgeResponseKey {
+            route: route.to_owned(),
+            method: method.to_owned(),
+            status_code,
+        };
         let mut guard = self.responses_total.lock();
         let counter = guard
-            .entry(status_code)
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -472,12 +531,37 @@ impl MetricsRegistry {
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
 
-        // requests_total
+        // requests_total — edge intake: every request seen at the router HTTP
+        // boundary, counted before worker dispatch. `requests_total -
+        // responses_total` exposes requests received but never answered.
         out.push_str(
-            "# HELP sgl_router_requests_total Total chat-completions requests dispatched to a worker.\n",
+            "# HELP sgl_router_requests_total Total requests received at the router HTTP edge, counted before worker dispatch (true intake).\n",
         );
         out.push_str("# TYPE sgl_router_requests_total counter\n");
         let guard = self.requests_total.lock();
+        let mut entries: Vec<(&EdgeKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.route, &a.0.method).cmp(&(&b.0.route, &b.0.method)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_requests_total{{route=\"{}\",method=\"{}\"}} {}\n",
+                escape_label(&key.route),
+                escape_label(&key.method),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // worker_requests_total — per-worker dispatch outcomes (formerly
+        // requests_total). Recorded after dispatch; cannot see pre-dispatch
+        // drops — use the edge requests_total above for intake.
+        out.push_str(
+            "# HELP sgl_router_worker_requests_total Chat-completions requests dispatched to a worker, by dispatch outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_requests_total counter\n");
+        let guard = self.worker_requests_total.lock();
         // Sort for stable output — easier for tests.
         let mut entries: Vec<(&RequestKey, u64)> = guard
             .iter()
@@ -493,7 +577,7 @@ impl MetricsRegistry {
         });
         for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_requests_total{{worker_url=\"{}\",model_id=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n",
+                "sgl_router_worker_requests_total{{worker_url=\"{}\",model_id=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n",
                 escape_label(&key.worker_url),
                 escape_label(&key.model_id),
                 key.mode,
@@ -538,21 +622,33 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // responses_total
+        // responses_total — edge: every response at the router boundary, by
+        // route/method/status. Recorded at the global middleware so early-exit
+        // outcomes (400/413/503 shed) are counted, unlike the old per-handler
+        // site which they skipped.
         out.push_str(
-            "# HELP sgl_router_responses_total Chat-completions responses returned to clients, by HTTP status code (recorded after worker dispatch).\n",
+            "# HELP sgl_router_responses_total Responses returned at the router HTTP edge, by route, method and HTTP status code.\n",
         );
         out.push_str("# TYPE sgl_router_responses_total counter\n");
         let guard = self.responses_total.lock();
-        let mut entries: Vec<(u16, u64)> = guard
+        let mut entries: Vec<(&EdgeResponseKey, u64)> = guard
             .iter()
-            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
-        entries.sort_by_key(|e| e.0);
-        for (status_code, value) in entries {
+        entries.sort_by(|a, b| {
+            (&a.0.route, &a.0.method, a.0.status_code).cmp(&(
+                &b.0.route,
+                &b.0.method,
+                b.0.status_code,
+            ))
+        });
+        for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_responses_total{{status_code=\"{}\"}} {}\n",
-                status_code, value,
+                "sgl_router_responses_total{{route=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
+                escape_label(&key.route),
+                escape_label(&key.method),
+                key.status_code,
+                value,
             ));
         }
         drop(guard);
@@ -918,16 +1014,35 @@ mod tests {
     }
 
     #[test]
-    fn record_response_counts_by_status_code() {
+    fn record_response_counts_by_route_method_status_code() {
         let reg = MetricsRegistry::new();
-        reg.record_response(200);
-        reg.record_response(200);
-        reg.record_response(502);
-        reg.record_response(504);
+        reg.record_response("/v1/chat/completions", "POST", 200);
+        reg.record_response("/v1/chat/completions", "POST", 200);
+        reg.record_response("/v1/chat/completions", "POST", 502);
+        reg.record_response("/v1/chat/completions", "POST", 504);
         let out = reg.render();
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="200"} 2"#));
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="502"} 1"#));
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="504"} 1"#));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 2"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="502"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="504"} 1"#
+        ));
+    }
+
+    #[test]
+    fn record_ingress_counts_by_route_method() {
+        let reg = MetricsRegistry::new();
+        reg.record_ingress("/v1/chat/completions", "POST");
+        reg.record_ingress("/v1/chat/completions", "POST");
+        reg.record_ingress("/v1/models", "GET");
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_requests_total{route="/v1/chat/completions",method="POST"} 2"#
+        ));
+        assert!(out.contains(r#"sgl_router_requests_total{route="/v1/models",method="GET"} 1"#));
     }
 
     #[test]
@@ -981,15 +1096,15 @@ mod tests {
     }
 
     #[test]
-    fn record_request_emits_labelled_counter_line() {
+    fn record_worker_request_emits_labelled_counter_line() {
         let reg = MetricsRegistry::new();
-        reg.record_request(
+        reg.record_worker_request(
             "http://worker-a:30000",
             "tiny",
             WorkerModeLabel::Prefill,
             RequestOutcome::Success,
         );
-        reg.record_request(
+        reg.record_worker_request(
             "http://worker-a:30000",
             "tiny",
             WorkerModeLabel::Prefill,
@@ -997,7 +1112,7 @@ mod tests {
         );
         let out = reg.render();
         assert!(
-            out.contains(r#"sgl_router_requests_total{worker_url="http://worker-a:30000",model_id="tiny",mode="prefill",outcome="success"} 2"#),
+            out.contains(r#"sgl_router_worker_requests_total{worker_url="http://worker-a:30000",model_id="tiny",mode="prefill",outcome="success"} 2"#),
             "render did not include the expected counter line; got:\n{out}",
         );
     }
@@ -1111,7 +1226,7 @@ mod tests {
     #[test]
     fn label_values_escape_quotes_and_backslashes() {
         let reg = MetricsRegistry::new();
-        reg.record_request(
+        reg.record_worker_request(
             r#"http://"weird":30000"#,
             r"back\slash",
             WorkerModeLabel::Plain,
