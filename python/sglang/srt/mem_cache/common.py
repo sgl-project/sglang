@@ -26,12 +26,14 @@ from sglang.srt.mem_cache.triton_ops.common import (
     write_req_to_token_pool_triton,
 )
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_hip, is_npu, support_triton
+from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 _is_npu = is_npu()
 
 _is_hip = is_hip()
+
+_is_cuda = is_cuda()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -243,7 +245,7 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
     """KV length reserved per request at each decode step.
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_info_v2.prepare_for_decode.
+    mode; see eagle_utils.eagle_prepare_for_decode.
     """
     return 2 * get_alloc_len_per_decode(server_args)
 
@@ -440,13 +442,13 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP (HIP-only) swaps in a PagedTokenToKVPoolAllocator whose page_size is
-    # server_args.page_size * dcp_size, so it can be > 1 even when
+    # DCP (HIP & CUDA only) swaps in a PagedTokenToKVPoolAllocator whose
+    # page_size is server_args.page_size * dcp_size, so it can be > 1 even when
     # tree_cache.page_size (== server_args.page_size) is 1. Only on the HIP DCP
     # path do we branch on the real allocator's page_size so the paged path is
     # taken; everywhere else tree_cache.page_size is authoritative and the two
     # are equal (dcp_size == 1), so behavior is unchanged.
-    if _is_hip and get_global_server_args().dcp_size > 1:
+    if (_is_hip or _is_cuda) and get_global_server_args().dcp_size > 1:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 
@@ -484,6 +486,8 @@ def alloc_for_extend(
     if _alloc_page_size(batch) == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
+        # Since tree_cache.page_size is (page_size * dcp_world_size), for dcp
+        # on cuda platform, always use alloc_paged_token_slots_extend
         # Paged allocation - build last_loc
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
