@@ -96,7 +96,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
-def _prefill_failure_msg(backend_name: str) -> str:
+def prefill_failure_msg(backend_name: str) -> str:
     """Render PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG with a backend-specific
     suggestion plugged into its {} placeholder. Empty hint when no backend
     is selected so the rest of the template still renders cleanly."""
@@ -243,7 +243,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if _prefill_backend_name in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
                 raise Exception(
                     f"Capture prefill CUDA graph failed: {e}\n"
-                    f"{_prefill_failure_msg(_prefill_backend_name)}"
+                    f"{prefill_failure_msg(_prefill_backend_name)}"
                 )
             raise
         if isinstance(self.backend, BreakableCudaGraphBackend):
@@ -334,7 +334,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         except RuntimeError as e:
             raise Exception(
                 f"Capture prefill CUDA graph failed: {e}\n"
-                f"{_prefill_failure_msg(_prefill_backend_name)}"
+                f"{prefill_failure_msg(_prefill_backend_name)}"
             )
 
         self.raw_num_tokens = 0
