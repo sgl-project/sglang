@@ -86,6 +86,11 @@ HIGH_THROUGHPUT_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
 }
 
+AIME25_ENV = {
+    "SGLANG_DEFAULT_THINKING": "1",
+    "SGLANG_DSV4_REASONING_EFFORT": "max",
+}
+
 AIME25_HARD_SUBSET_PATH = Path("/tmp/deepseek_v4_pro_aime25_hard_subset.jsonl")
 
 PERFORMANCE_BATCH_SIZES = {
@@ -100,6 +105,7 @@ PERFORMANCE_EXTRA_BENCH_ARGS = {
 
 
 def text_model_launch_settings(*args, **kwargs):
+    kwargs["env"] = {**AIME25_ENV, **(kwargs.get("env") or {})}
     settings = ModelLaunchSettings(*args, **kwargs)
     settings.extra_args = [
         arg for arg in settings.extra_args if arg != "--enable-multimodal"
@@ -143,11 +149,10 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
             dataset="aime25",
             baseline_accuracy=0.70,
             aime25_data_path=str(aime25_data_path),
-            max_tokens=65536,
+            max_tokens=400000,
             num_threads=16,
             temperature=1.0,
             top_p=1.0,
-            api="completion",
         )
         for variant in variants:
             try:
