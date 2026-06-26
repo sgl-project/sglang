@@ -1182,6 +1182,13 @@
                     ]
                   },
                   {
+                    "group": "JoyEcho",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/JoyEcho/JoyEcho"
+                    ]
+                  },
+                  {
                     "group": "Qwen-Image",
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
