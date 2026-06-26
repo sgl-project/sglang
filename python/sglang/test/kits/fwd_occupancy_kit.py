@@ -95,13 +95,9 @@ class FwdOccupancyMixin:
             )
 
     def _fwd_occupancy_fire(self, prompt: str, max_new_tokens: int):
-        """Fire one /generate, return (meta_info, wall_time).
-
-        ``meta_info`` is the full response meta_info dict (None on
-        failure), carrying prompt/completion tokens and -- with
-        ``--enable-metrics`` (mandatory here) -- ``decode_throughput``
-        (decode-stage tok/s). Must not be called concurrently -- that
-        would break the single-batch invariant."""
+        """Fire one /generate, return (meta_info, wall_time). Not
+        concurrent -- breaks the single-batch invariant. ``meta_info``
+        is None on failure."""
         t0 = time.perf_counter()
         try:
             resp = requests.post(
@@ -117,8 +113,7 @@ class FwdOccupancyMixin:
                 timeout=_GENERATE_REQUEST_TIMEOUT,
             )
         except requests.RequestException:
-            # Final stats-vs-threshold is the signal; individual fire
-            # failure isn't.
+            # Individual fire failure isn't the signal; stats-vs-threshold is.
             return None, 0.0
         elapsed = time.perf_counter() - t0
         try:
@@ -138,11 +133,7 @@ class FwdOccupancyMixin:
 
     def _fwd_occupancy_measure(self):
         """Background-fire one long single-batch request, scrape
-        /metrics on the foreground; return (non-NaN samples, perf).
-
-        ``perf`` aggregates the single request's reported token counts
-        and throughputs for the perf table (decoupled from the
-        occupancy gauge)."""
+        /metrics on the foreground; return (non-NaN samples, perf)."""
         samples = []
         request_done = threading.Event()
         result = {"meta_info": None, "elapsed": 0.0}
@@ -187,9 +178,8 @@ class FwdOccupancyMixin:
         self._fwd_occupancy_warmup()
         samples, perf = self._fwd_occupancy_measure()
 
-        # The 2048-token decode above populates the spec running average
-        # if a spec algorithm is enabled; absent otherwise (vanilla
-        # decode skips this check).
+        # avg_spec_accept_length is only present under a spec algorithm;
+        # absent otherwise (vanilla decode skips the accept-length check).
         try:
             info = requests.get(
                 self.base_url + "/server_info", timeout=_METRICS_REQUEST_TIMEOUT
@@ -198,10 +188,8 @@ class FwdOccupancyMixin:
         except (requests.RequestException, KeyError, IndexError):
             avg_accept = None
 
-        # Compute occupancy stats up front so both tables can be printed
-        # together, before any assertion. Reporting must never be skipped
-        # by an early assertion failure -- the numbers are exactly what's
-        # needed to triage that failure.
+        # Compute stats up front so both tables print before any
+        # assertion -- failing assertions must still surface the numbers.
         samples_sorted = sorted(samples)
         if samples_sorted:
             median = statistics.median(samples_sorted)
@@ -211,11 +199,7 @@ class FwdOccupancyMixin:
         else:
             median = peak = p10 = float("nan")
 
-        # --- Perf table ------------------------------------------------
-        # Request-level metrics (not the occupancy gauge), in their own
-        # table: token counts, decode-stage throughput from meta_info,
-        # mean inter-token latency, wall-clock throughput, and -- when a
-        # spec algorithm ran -- the spec accept length.
+        # Perf table: request-level throughput (not the occupancy gauge).
         perf_rows = [
             ["input tokens", perf["input_tokens"]],
             ["output tokens", perf["output_tokens"]],
@@ -234,10 +218,7 @@ class FwdOccupancyMixin:
             )
         )
 
-        # --- Occupancy table ------------------------------------------
-        # The occupancy gauge; median is the steady-state signal, peak /
-        # p10 are triage context. Printed unconditionally so a failing
-        # assertion still surfaces what was actually measured.
+        # Occupancy table.
         print(
             "\n"
             + tabulate.tabulate(
@@ -253,7 +234,7 @@ class FwdOccupancyMixin:
             )
         )
 
-        # --- Assertions (all reporting done above) --------------------
+        # All reporting done above.
         self.assertGreaterEqual(
             len(samples),
             self.fwd_occupancy_min_samples,
