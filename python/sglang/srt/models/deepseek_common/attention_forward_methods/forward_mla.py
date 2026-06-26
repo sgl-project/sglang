@@ -68,11 +68,87 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import BumpAllocator, get_current_device_stream_fast
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+
+_cute_rmsnorm = None
+_cute_rmsnorm_parallel = None
+_cute_rmsnorm_loaded = False
+_cute_rmsnorm_pdl = None
+
+
+def _get_cute_rmsnorm():
+    """Lazily load the vendored CuTe-DSL RMSNorm kernels (PDL-capable). Returns
+    (rmsnorm_cute, rmsnorm_fused_parallel_cute, enable_pdl); kernels are None
+    when unavailable."""
+    global _cute_rmsnorm, _cute_rmsnorm_parallel, _cute_rmsnorm_loaded
+    global _cute_rmsnorm_pdl
+    if not _cute_rmsnorm_loaded:
+        _cute_rmsnorm_loaded = True
+        if _is_cuda:
+            try:
+                from sglang.jit_kernel.cutedsl_norm import (
+                    rmsnorm_cute,
+                    rmsnorm_fused_parallel_cute,
+                )
+
+                _cute_rmsnorm = rmsnorm_cute
+                _cute_rmsnorm_parallel = rmsnorm_fused_parallel_cute
+                _cute_rmsnorm_pdl = torch.cuda.get_device_capability()[0] >= 9
+            except Exception as e:
+                logger.warning("CuTe-DSL RMSNorm unavailable, using nn.RMSNorm: %s", e)
+                _cute_rmsnorm = None
+                _cute_rmsnorm_parallel = None
+    return _cute_rmsnorm, _cute_rmsnorm_parallel, bool(_cute_rmsnorm_pdl)
+
+
+def _qk_rmsnorm(norm, x: torch.Tensor) -> torch.Tensor:
+    """Apply RMSNorm to a 2D [tokens, dim] tensor via the CuTe-DSL kernel when
+    available (bf16/CUDA), else fall back to the module."""
+    fn, _, enable_pdl = _get_cute_rmsnorm()
+    if fn is not None and x.dtype == torch.bfloat16:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        fn(
+            x,
+            norm.weight,
+            out,
+            eps=norm.variance_epsilon,
+            enable_pdl=enable_pdl,
+        )
+        return out
+    return norm(x)
+
+
+def _fused_qk_rmsnorm(q_norm, q: torch.Tensor, k_norm, k_nope: torch.Tensor):
+    """Normalize q and k_nope together in a single fused CuTe-DSL launch whose
+    two workloads stream concurrently on-SM (replaces the dual-CUDA-stream
+    overlap). Falls back to two sequential norms when the kernel is unavailable
+    or the dtypes/eps are unsupported."""
+    _, fn, enable_pdl = _get_cute_rmsnorm()
+    if (
+        fn is not None
+        and q.dtype == torch.bfloat16
+        and k_nope.dtype == torch.bfloat16
+        and q_norm.variance_epsilon == k_norm.variance_epsilon
+    ):
+        out_q = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        out_k = torch.empty(k_nope.shape, dtype=k_nope.dtype, device=k_nope.device)
+        fn(
+            q,
+            q_norm.weight,
+            out_q,
+            k_nope,
+            k_norm.weight,
+            out_k,
+            eps=q_norm.variance_epsilon,
+            enable_pdl=enable_pdl,
+        )
+        return out_q, out_k
+    return _qk_rmsnorm(q_norm, q), _qk_rmsnorm(k_norm, k_nope)
+
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -259,14 +335,12 @@ class DeepseekMLAForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
+            # overlap qk norm via a single fused kernel: q and k_nope norm
+            # stream concurrently within one launch (no second CUDA stream).
             if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = self.kv_a_layernorm(k_nope)
-                current_stream.wait_stream(self.alt_stream)
+                q, k_nope = _fused_qk_rmsnorm(
+                    self.q_a_layernorm, q, self.kv_a_layernorm, k_nope
+                )
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                     q, _, k_nope, *_ = fused_rms_mxfp4_quant(
@@ -323,8 +397,8 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.variance_epsilon,
                         )
                     else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                        q = _qk_rmsnorm(self.q_a_layernorm, q)
+                        k_nope = _qk_rmsnorm(self.kv_a_layernorm, k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
@@ -338,35 +412,40 @@ class DeepseekMLAForwardMixin:
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
             ):
-                current_stream = torch.cuda.current_stream()
+                current_stream = get_current_device_stream_fast()
                 self.alt_stream.wait_stream(current_stream)
+                # Run the indexer on alt_stream and keep q_b_proj on the main
+                # stream directly after the fused qk norm: norm and q_b_proj are
+                # then consecutive on one stream, so the norm -> q_b_proj PDL
+                # chain can fire (the GEMM prologue overlaps the norm epilogue).
                 with torch.cuda.stream(self.alt_stream):
-                    k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
-                # skip_topk (shared) layers carry no indexer weights in the
-                # checkpoint, so they must reuse the carried topk and never run
-                # the indexer. Do NOT widen this to `or prev_topk_indices is
-                # None` (the upstream gate): that recomputes with an
-                # uninitialized indexer whenever cross-layer propagation is
-                # unavailable (e.g. the TBO op path drops topk_indices),
-                # reintroducing the >index_topk garbling. The is_nextn clause is
-                # the sole intentional fallback (layer 78 has its own weights).
-                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
-                else:
-                    # skip_topk reuses prev layer's indices; mirror into this
-                    # layer's slot so the captured buffer matches what's used.
-                    topk_indices = maybe_capture_indexer_topk(
-                        self.layer_id, prev_topk_indices
-                    )
+                    # skip_topk (shared) layers carry no indexer weights in the
+                    # checkpoint, so they must reuse the carried topk and never
+                    # run the indexer. Do NOT widen this to `or prev_topk_indices
+                    # is None` (the upstream gate): that recomputes with an
+                    # uninitialized indexer whenever cross-layer propagation is
+                    # unavailable (e.g. the TBO op path drops topk_indices),
+                    # reintroducing the >index_topk garbling. The is_nextn clause
+                    # is the sole intentional fallback (layer 78 has its own
+                    # weights).
+                    if not self.skip_topk or (
+                        self.is_nextn and prev_topk_indices is None
+                    ):
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    else:
+                        # skip_topk reuses prev layer's indices; mirror into this
+                        # layer's slot so the captured buffer matches what's used.
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
