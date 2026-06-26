@@ -405,10 +405,10 @@ class _DeepEPDispatcherImplBase:
         # 2. Validate and adjust dtype according to hardware capabilities
         self._validate_and_adjust_dtype()
     
-        # 3. Apply quantisation flags based on the final dtype
+        # 3. Apply quantisation flags for low_latency_dispacth based on the final dtype
         self._apply_quantisation_flags()
 
-        # 4. Prepare NPU-specific quantisation tensor if on Ascend hardware
+        # 4. Prepare NPU-specific quantisation tensor for normal dispatch if on Ascend hardware
         if _is_npu:
             self.npu_quant_tensor = self._get_npu_quant_tensor()
         else:
@@ -431,6 +431,13 @@ class _DeepEPDispatcherImplBase:
         elif dtype == DeepEPOutputDtype.NVFP4:
             self.use_fp8 = False
             self.use_nvfp4 = True
+
+            if quant_type == "mxfp8":
+                fp8_configs = [(True, True)]
+            elif quant_type == "fp8":
+                fp8_configs = [(True, False)]
+            else:
+                fp8_configs = [(False, False)]
         else:
             raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
 
