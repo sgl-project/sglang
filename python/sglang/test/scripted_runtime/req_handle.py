@@ -45,7 +45,7 @@ class ScriptedReqHandle:
         if req is None or req.req_pool_idx is None:
             return 0
         page_size = self.context.scheduler.page_size
-        return (req.kv_allocated_len + page_size - 1) // page_size
+        return (req.kv.kv_allocated_len + page_size - 1) // page_size
 
     @property
     def lock_refs(self) -> int:

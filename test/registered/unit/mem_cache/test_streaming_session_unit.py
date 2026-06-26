@@ -57,13 +57,15 @@ class _FakeReq:
         )
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
-        self.kv_allocated_len = allocated
+        self.kv = SimpleNamespace(
+            kv_allocated_len=allocated,
+            swa_evicted_seqlen=0,
+        )
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
-        self.swa_evicted_seqlen = 0
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
@@ -86,7 +88,7 @@ class _FakeReq:
         assert not self.kv_overallocated_freed
         self.pop_overallocated_calls += 1
         self.kv_overallocated_freed = True
-        return self.kv_committed_len, self.kv_allocated_len
+        return self.kv_committed_len, self.kv.kv_allocated_len
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -112,7 +114,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=48,
-        kv_allocated_len=48,
+        kv=SimpleNamespace(kv_allocated_len=48, swa_evicted_seqlen=0),
         cache_protected_len=16,
     )
 
@@ -132,7 +134,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     slot = tree_cache.slots["session-a"]
     assert slot.req_pool_idx == 0
     assert slot.kv_committed_len == 48
-    assert slot.kv_allocated_len == 48
+    assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
 
 
@@ -179,7 +181,7 @@ def test_nth_mid_abort_nukes_session_slot():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=50,
-        kv_allocated_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
         last_node=None,
         cache_protected_len=0,
     )
@@ -230,14 +232,14 @@ def test_trim_overshoot_postcondition():
     req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
     req.origin_input_ids = list(range(26))
     req.output_ids = list(range(14))
-    req.swa_evicted_seqlen = 42
+    req.kv.swa_evicted_seqlen = 42
 
     tree_cache._trim_overshoot(req, finished_len=12)
 
     target = 38
     assert req.kv_committed_len == target
-    assert req.kv_allocated_len == target
-    assert req.swa_evicted_seqlen == target
+    assert req.kv.kv_allocated_len == target
+    assert req.kv.swa_evicted_seqlen == target
     assert len(req.output_ids) == 12
     # Tail [38, 44) freed by _free_kv_aligned.
     assert len(allocator.freed) == 1
