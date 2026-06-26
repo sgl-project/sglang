@@ -97,6 +97,12 @@ __device__ __forceinline__ float to_float<bf16_t>(bf16_t v) {
 }
 
 template <typename T>
+__device__ __forceinline__ T residual_gate_value(T residual, T update, T gate) {
+  const T product = dtype_trait<T>::from(to_float(update) * to_float(gate));
+  return dtype_trait<T>::from(to_float(residual) + to_float(product));
+}
+
+template <typename T>
 union Vec16 {
   static constexpr int kElems = 16 / sizeof(T);
   uint4 raw;
@@ -119,8 +125,7 @@ __global__ void residual_gate_add_vec_kernel(
     Vec16<T> o;
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      const float value = to_float(r.elems[i]) + to_float(u.elems[i]) * to_float(g.elems[i]);
-      o.elems[i] = dtype_trait<T>::from(value);
+      o.elems[i] = residual_gate_value(r.elems[i], u.elems[i], g.elems[i]);
     }
     reinterpret_cast<uint4*>(out)[v] = o.raw;
   }
@@ -157,8 +162,7 @@ __global__ void residual_gate_add_bcast_row_tile_kernel(
         Vec16<T> o;
 #pragma unroll
         for (int i = 0; i < kVec; ++i) {
-          const float value = to_float(r.elems[i]) + to_float(u.elems[i]) * to_float(g.elems[i]);
-          o.elems[i] = dtype_trait<T>::from(value);
+          o.elems[i] = residual_gate_value(r.elems[i], u.elems[i], g.elems[i]);
         }
         reinterpret_cast<uint4*>(out)[v] = o.raw;
       }
@@ -177,9 +181,8 @@ __global__ void residual_gate_add_scalar_kernel(
     int64_t D) {
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = begin + static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += stride) {
-    const float gate_value = kGate == GateMode::kFull ? to_float(gate[i]) : to_float(SGLANG_LDG(gate + (i % D)));
-    const float value = to_float(residual[i]) + to_float(update[i]) * gate_value;
-    out[i] = dtype_trait<T>::from(value);
+    const T gate_value = kGate == GateMode::kFull ? gate[i] : SGLANG_LDG(gate + (i % D));
+    out[i] = residual_gate_value(residual[i], update[i], gate_value);
   }
 }
 

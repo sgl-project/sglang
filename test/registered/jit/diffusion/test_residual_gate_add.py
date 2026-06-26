@@ -25,6 +25,13 @@ def _tol(dtype: torch.dtype) -> float:
     return 1e-5 if dtype == torch.float32 else 5e-2
 
 
+def _assert_matches_torch(out: torch.Tensor, ref: torch.Tensor) -> None:
+    if ref.dtype == torch.float32:
+        torch.testing.assert_close(out, ref, atol=_tol(ref.dtype), rtol=_tol(ref.dtype))
+    else:
+        torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
 @pytest.fixture(autouse=True)
 def cuda_setup():
     if not torch.cuda.is_available():
@@ -40,7 +47,7 @@ def test_residual_gate_add_matches_torch(residual_shape, gate_shape):
 
     out = residual_gate_add_cuda(residual, update, gate)
     ref = residual + update * gate
-    torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
+    _assert_matches_torch(out, ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -52,7 +59,7 @@ def test_residual_gate_add_dtypes(dtype, gate_shape):
 
     out = residual_gate_add_cuda(residual, update, gate)
     ref = residual + update * gate
-    torch.testing.assert_close(out, ref, atol=_tol(dtype), rtol=_tol(dtype))
+    _assert_matches_torch(out, ref)
 
 
 def test_can_use_residual_gate_add_cuda_rejects_unsupported_inputs():
@@ -87,7 +94,7 @@ def test_residual_gate_add_custom_op_torch_compile_fullgraph():
     compiled = torch.compile(fn, fullgraph=True)
     out = compiled(residual, update, gate)
     ref = residual + update * gate
-    torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
+    _assert_matches_torch(out, ref)
 
 
 if __name__ == "__main__":

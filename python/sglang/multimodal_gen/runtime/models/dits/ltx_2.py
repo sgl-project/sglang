@@ -14,7 +14,6 @@ from sglang.jit_kernel.diffusion.residual_gate_add import (
     can_use_residual_gate_add_cuda,
     residual_gate_add_cuda,
 )
-from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -74,7 +73,7 @@ def _ltx2_residual_gate_add(
             logger.warning_once(f"Disabling LTX2 residual-gate CUDA fast path: {exc}")
             _LTX2_RESIDUAL_GATE_CUDA_DISABLED = True
 
-    return fuse_scale_shift_kernel(update, gate, residual, scale_constant=0)
+    return residual + update * gate
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
