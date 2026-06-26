@@ -49,8 +49,7 @@ logger = init_logger(__name__)
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
 
-_LTX2_FUSED_ADA_VALUES_ALL_RUNTIME_DISABLED = False
-_LTX2_FUSED_ADA_VALUES_ALL_WARNING_EMITTED = False
+_LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -59,13 +58,10 @@ def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
     )
 
 
-def _ltx2_disable_fused_ada_values_all(exc: Exception) -> None:
-    global _LTX2_FUSED_ADA_VALUES_ALL_RUNTIME_DISABLED
-    global _LTX2_FUSED_ADA_VALUES_ALL_WARNING_EMITTED
-    _LTX2_FUSED_ADA_VALUES_ALL_RUNTIME_DISABLED = True
-    if not _LTX2_FUSED_ADA_VALUES_ALL_WARNING_EMITTED:
-        logger.warning("Disabling LTX2 fused Ada values fast path: %s", exc)
-        _LTX2_FUSED_ADA_VALUES_ALL_WARNING_EMITTED = True
+def _ltx2_disable_fused_ada_values(exc: Exception) -> None:
+    global _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED
+    _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = True
+    logger.warning_once(f"Disabling LTX2 fused Ada values fast path: {exc}")
 
 
 def _ltx2_try_fused_ada_values9(
@@ -74,7 +70,7 @@ def _ltx2_try_fused_ada_values9(
     timestep: torch.Tensor,
 ) -> tuple[torch.Tensor, ...] | None:
     if (
-        _LTX2_FUSED_ADA_VALUES_ALL_RUNTIME_DISABLED
+        _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED
         or get_tp_world_size() != 1
         or not timestep.is_cuda
         or timestep.dtype != torch.bfloat16
@@ -100,7 +96,7 @@ def _ltx2_try_fused_ada_values9(
 
         return ltx2_ada_values9(scale_shift_table, timestep)
     except Exception as exc:
-        _ltx2_disable_fused_ada_values_all(exc)
+        _ltx2_disable_fused_ada_values(exc)
         return None
 
 
