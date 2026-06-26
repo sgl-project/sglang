@@ -69,7 +69,11 @@ from sglang.srt.model_executor.runner_backend.utils import (
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    BREAKABLE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
     set_tc_piecewise_forward_context,
 )
 from sglang.srt.model_executor.runner_utils.buffers import (
@@ -90,6 +94,18 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _prefill_failure_msg(backend_name: str) -> str:
+    """Pick the right user-facing hint for a prefill CUDA-graph failure based
+    on which backend was active. Falls back to the generic prefill message
+    for unknown/disabled backends."""
+    if backend_name == Backend.BREAKABLE:
+        return BREAKABLE_CUDA_GRAPH_CAPTURE_FAILED_MSG
+    if backend_name == Backend.TC_PIECEWISE:
+        return TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG
+    return PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG
+
 
 # Names of the static prefill input tensors a Breakable-backed prefill
 # runner owns. Each is a 1-D int64 tensor of length max_bs; captured
@@ -222,10 +238,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
-            if _prefill_backend_name == Backend.TC_PIECEWISE:
+            if _prefill_backend_name in (Backend.TC_PIECEWISE, Backend.BREAKABLE):
                 raise Exception(
                     f"Capture prefill CUDA graph failed: {e}\n"
-                    f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                    f"{_prefill_failure_msg(_prefill_backend_name)}"
                 )
             raise
         if isinstance(self.backend, BreakableCudaGraphBackend):
@@ -295,6 +311,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 language_model.model, "layers"
             ):
                 self.layer_model = language_model.model
+            elif hasattr(language_model, "layers"):
+                self.layer_model = language_model
             else:
                 raise RuntimeError(
                     f"BCG could not resolve inner layer_model on "
@@ -314,7 +332,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         except RuntimeError as e:
             raise Exception(
                 f"Capture prefill CUDA graph failed: {e}\n"
-                f"{PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                f"{_prefill_failure_msg(_prefill_backend_name)}"
             )
 
         self.raw_num_tokens = 0
@@ -591,9 +609,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
-                input_embeds=(
-                    _slot("input_embeds") if registry.has_slot("input_embeds") else None
-                ),
+                input_embeds=None,
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=None,
@@ -755,9 +771,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
-        input_embeds = (
-            _slot("input_embeds") if registry.has_slot("input_embeds") else None
-        )
+        # input_embeds path is rejected by can_run_graph (multimodal-only); BCG
+        # mirrors PCG: only support input_ids, falling back to eager for
+        # input_embeds requests.
+        input_embeds = None
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")
         mrope_positions = (

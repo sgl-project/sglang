@@ -32,3 +32,15 @@ def enable_breakable_cuda_graph():
         yield
     finally:
         _in_breakable_cuda_graph = False
+
+
+BREAKABLE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
+    "Breakable CUDA graph failed.\n"
+    "Possible solutions:\n"
+    "1. switch to the tc_piecewise prefill CUDA graph backend by "
+    "--cuda-graph-backend-prefill=tc_piecewise\n"
+    "2. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled.\n"
+    "3. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+    "4. set --cuda-graph-max-bs-prefill to a smaller value (e.g., 2048)\n"
+    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+)

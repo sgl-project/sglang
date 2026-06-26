@@ -3150,6 +3150,25 @@ class ServerArgs:
             # tc_piecewise gate), causing q.view shape mismatches. Disable
             # until the MLA prefill path is BCG-aware.
             ("MLA attention", lambda: self.use_mla_backend()),
+            # CP all_gather replay size mismatch under BCG (see
+            # bug-bcg-cp-allgather-size). Disable until BCG learns to
+            # re-size the all_gather output buffer per replay.
+            ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
+            # LoRA's BCG capture path pushes total memory (CUDA-graph private
+            # pool + adapter weights) past the host headroom on tightly-budgeted
+            # devboxes, tripping earlyoom mid-capture. Mirrors PCG's existing
+            # LoRA auto-disable. Remove once BCG capture is memory-aware enough
+            # to handle LoRA without spilling.
+            ("LoRA", lambda: bool(self.lora_paths) or bool(self.enable_lora)),
+            # BCG captures every token bucket up to max_num_tokens, exceeding
+            # FlashInfer MoE A2A's smaller dispatch cap and tripping
+            # `runtime_max_tokens_per_rank exceeds max_num_tokens` at capture.
+            # Mirrors PCG's existing MoE-A2A auto-disable.
+            ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
+            # DP attention under BCG (lianmin report 2026-06-26): mirrors PCG's
+            # existing DP-attention auto-disable. Conservative landing until BCG
+            # × DP-attn capture/replay path is validated end-to-end.
+            ("DP attention", lambda: self.enable_dp_attention),
         ]
         for name, predicate in rules:
             if predicate():
