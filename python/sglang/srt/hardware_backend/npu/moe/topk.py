@@ -84,10 +84,8 @@ def fused_topk_npu(
             group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
             # 1 for sigmoid, 0 for softmax.
-            # correction_bias implies sigmoid semantics (DeepSeek-style
-            # noaux_tc, e.g. mimo_v2 / deepseek_v2, whose config may lack a
-            # scoring_func field). Otherwise follow scoring_func to stay
-            # compatible with PR #29042's fix for softmax models.
+            # correction_bias implies sigmoid (noaux_tc). For bias-less routing,
+            # fall back to scoring_func so sigmoid-without-bias isn't misclassified.
             norm_type=(
                 0
                 if (correction_bias is None and topk_config.scoring_func == "softmax")
