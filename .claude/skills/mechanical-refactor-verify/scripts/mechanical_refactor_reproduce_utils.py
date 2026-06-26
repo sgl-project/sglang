@@ -7,10 +7,10 @@ Use this for a single mechanical PR -- a relocation, a whole-file split, or a re
 formatter re-wraps lines, which reproduce-and-byte-diff certifies exactly.
 
 The ``Repro`` builder composes faithful relocation primitives (``move_symbol``,
-``extract_to_new_module``, ``extract_symbols_to_new_module``, ``lower_call_sites``,
-``requalify_call_sites``, ``remove_import``, ``remove_imported_name``, ``add_import``,
-``repath_import``, ``add_typechecking_import``) into a transform, so a move that a formatter
-re-wrapped can be reproduced and certified. Each primitive does only a relocation-faithful
+``extract_to_new_module``, ``extract_symbols_to_new_module``, ``extract_function``,
+``lower_call_sites``, ``requalify_call_sites``, ``remove_import``, ``remove_imported_name``,
+``add_import``, ``repath_import``, ``add_typechecking_import``) into a transform, so a move
+that a formatter re-wrapped can be reproduced and certified. Each primitive does only a relocation-faithful
 edit (it never changes logic), so a byte match after the formatter certifies the commit is
 exactly that relocation. The primitives are deliberately small and AST-driven; see
 how-to-guide.md.
@@ -676,6 +676,94 @@ class Repro:
             prefix = header.rstrip("\n") + "\n\n\n" if header.strip() else ""
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             dst_path.write_text(prefix + relocated + "\n")
+
+        self.ops.append(op)
+        return self
+
+    def extract_function(
+        self,
+        src: str,
+        dst: str,
+        *,
+        name: str,
+        signature: str,
+        body: str,
+        body_indent: int,
+        call: str,
+        return_text: str | None = None,
+        before: str | None = None,
+        into_class: str | None = None,
+    ) -> "Repro":
+        """Extract an inline block into a new ``name`` function. The block ``body`` is cut from
+        ``src`` *verbatim* (so the byte diff certifies the function body is exactly the source's),
+        re-indented from ``body_indent`` to a function-body indent, and wrapped under the
+        authored ``signature`` (with ``return_text`` appended when given); the def is inserted
+        into ``dst`` (above the sibling ``before`` or at the end of ``into_class`` / module), and
+        the block in ``src`` is replaced by the authored ``call``.
+
+        This is the certifiable core of an extract-function: the bulk (the relocated body) is
+        machine-checked, and only the small signature/return/call interface is authored. It is
+        faithful **only** when the body is moved unchanged -- a de-self (``self.x`` -> a
+        parameter), a control-flow restructure, or a bookkeeping consolidation must be done as a
+        separate semantic commit first, since those are not relocations (see
+        mental-model-prep-and-move.md)."""
+
+        def reindent(text: str, shift: int) -> str:
+            if shift <= 0:
+                return dedent(text, -shift)
+            pad = " " * shift
+            return "".join(
+                pad + line if line.strip() else line
+                for line in text.splitlines(keepends=True)
+            )
+
+        def op(root: Path) -> None:
+            src_path = root / src
+            src_text = src_path.read_text()
+            assert src_text.count(body) == 1, f"block not found uniquely in {src}"
+            src_path.write_text(src_text.replace(body, call, 1))
+
+            function = signature.rstrip("\n") + "\n" + reindent(body, 4 - body_indent)
+            if return_text is not None:
+                function = function.rstrip("\n") + "\n" + return_text
+            function = function.rstrip("\n") + "\n"
+
+            dst_path = root / dst
+            dst_lines = dst_path.read_text().splitlines(keepends=True)
+            dst_tree = ast.parse("".join(dst_lines))
+            container = dst_tree.body
+            if into_class is not None:
+                cls = _find_class(dst_tree, into_class)
+                assert cls is not None, f"class {into_class} not found in {dst}"
+                container = cls.body
+            anchor = None
+            if before is not None:
+                anchor = next(
+                    (
+                        node
+                        for node in container
+                        if isinstance(
+                            node,
+                            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                        )
+                        and node.name == before
+                    ),
+                    None,
+                )
+            if anchor is not None:
+                at = _def_span(anchor)[0] - 1
+                dst_path.write_text(
+                    "".join(dst_lines[:at] + [function, "\n"] + dst_lines[at:])
+                )
+            else:
+                at = (
+                    container[-1].end_lineno
+                    if into_class is not None
+                    else len(dst_lines)
+                )
+                dst_path.write_text(
+                    "".join(dst_lines[:at] + ["\n", function] + dst_lines[at:])
+                )
 
         self.ops.append(op)
         return self

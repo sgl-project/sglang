@@ -908,3 +908,82 @@ def test_extract_symbols_to_new_module_asserts_unknown_drop_assign(
     )
     with pytest.raises(AssertionError):
         _apply(r, tmp_path)
+
+
+# --- extract_function ----------------------------------------------------------
+
+
+def test_extract_function_relocates_body_and_replaces_with_call(tmp_path: Path) -> None:
+    """An inline block is cut verbatim, re-indented under the new signature, and the call site
+    replaced; the body lands at function-body indent."""
+    (tmp_path / "src.py").write_text(
+        "class Q:\n"
+        "    def run(self, n):\n"
+        "        total = 0\n"
+        "        for i in range(n):\n"
+        "            total += i * i\n"
+        "        return total\n"
+    )
+    (tmp_path / "dst.py").write_text("def existing():\n    return 0\n")
+    body = "        total = 0\n        for i in range(n):\n            total += i * i\n"
+    r = Repro("b", "t").extract_function(
+        "src.py",
+        "dst.py",
+        name="sum_squares",
+        signature="def sum_squares(n):",
+        body=body,
+        body_indent=8,
+        call="        total = sum_squares(n)\n",
+        return_text="    return total\n",
+    )
+    _apply(r, tmp_path)
+    src_out = (tmp_path / "src.py").read_text()
+    assert "        total = sum_squares(n)\n" in src_out
+    assert "for i in range(n)" not in src_out
+    assert (
+        "def sum_squares(n):\n"
+        "    total = 0\n"
+        "    for i in range(n):\n"
+        "        total += i * i\n"
+        "    return total\n"
+    ) in (tmp_path / "dst.py").read_text()
+
+
+def test_extract_function_inserts_before_named_sibling(tmp_path: Path) -> None:
+    """With before=, the new function lands immediately above that sibling at module level."""
+    (tmp_path / "src.py").write_text("x = compute()\n")
+    (tmp_path / "dst.py").write_text(
+        "def a():\n    return 1\n\n\ndef c():\n    return 3\n"
+    )
+    r = Repro("b", "t").extract_function(
+        "src.py",
+        "dst.py",
+        name="b",
+        signature="def b():",
+        body="x = compute()\n",
+        body_indent=0,
+        call="x = b()\n",
+        return_text="    return x\n",
+        before="c",
+    )
+    _apply(r, tmp_path)
+    dst_out = (tmp_path / "dst.py").read_text()
+    assert dst_out.index("def a") < dst_out.index("def b") < dst_out.index("def c")
+    assert "x = b()\n" == (tmp_path / "src.py").read_text()
+
+
+def test_extract_function_asserts_block_not_unique(tmp_path: Path) -> None:
+    """A block that occurs more than once in the source raises, so the cut is unambiguous."""
+    (tmp_path / "src.py").write_text("p = f()\np = f()\n")
+    (tmp_path / "dst.py").write_text("def z():\n    return 0\n")
+    r = Repro("b", "t").extract_function(
+        "src.py",
+        "dst.py",
+        name="g",
+        signature="def g():",
+        body="p = f()\n",
+        body_indent=0,
+        call="p = g()\n",
+    )
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
