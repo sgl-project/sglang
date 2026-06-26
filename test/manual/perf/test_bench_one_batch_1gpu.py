@@ -31,7 +31,7 @@ class TestBenchOneBatch1GPU(CustomTestCase):
         command = [
             "python3",
             "-m",
-            "sglang.bench_offline_throughput",
+            "sglang.benchmark.offline_throughput",
             "--num-prompts",
             "1",
             "--dataset-name",

@@ -66,7 +66,8 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "resident")
+LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = (*LTX2_TWO_STAGE_DEVICE_MODES, "snapshot")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
@@ -77,6 +78,13 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
     mode = mode.lower()
+    if mode == "snapshot":
+        logger.warning(
+            "ltx2_two_stage_device_mode=snapshot is deprecated and is treated "
+            "as original. Please use ltx2_two_stage_device_mode=original or "
+            "resident instead. This alias may be removed after two release cycles."
+        )
+        return "original"
     return mode
 
 
@@ -110,6 +118,9 @@ class Backend(str, Enum):
     def choices(cls) -> list[str]:
         """Get all available choices as strings for argparse."""
         return [backend.value for backend in cls]
+
+
+WARMUP_MODES = ("off", "request", "server")
 
 
 @dataclasses.dataclass
@@ -223,8 +234,20 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_layerwise_nvtx_marker: bool = False
 
     # warmup
+    # `warmup_mode` is the canonical knob: one of WARMUP_MODES
+    #   - "off":     no warmup.
+    #   - "server":  server-based warmup — a synthetic request right after the
+    #                server is ready, before real traffic
+    #   - "request": request-based warmup — warm on the first real request(s).
+    #                This is a BENCHMARK aid
+    # existing consumers keep working) and as deprecated CLI aliases. None means
+    # "derive the mode from the legacy booleans"; _adjust_warmup resolves it.
+    warmup_mode: str | None = None
+
+    # deprecated: warmup and server_warmup
     warmup: bool = False
     server_warmup: bool = False
+
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
@@ -482,7 +505,7 @@ class ServerArgs(DisaggServerArgsMixin):
         if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
             raise ValueError(
                 f"Invalid ltx2_two_stage_device_mode={mode!r}. "
-                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODE_CHOICES}."
             )
 
         self.ltx2_two_stage_device_mode = mode
@@ -490,9 +513,9 @@ class ServerArgs(DisaggServerArgsMixin):
     def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
         if not current_platform.is_cuda():
             logger.info(
-                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+                "Automatically set ltx2_two_stage_device_mode=original on non-CUDA platform"
             )
-            return "snapshot"
+            return "original"
 
         device_name = str(current_platform.get_device_name(0)).upper()
         device_total_memory_gb = (
@@ -510,22 +533,16 @@ class ServerArgs(DisaggServerArgsMixin):
             return "resident"
 
         logger.info(
-            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            "Automatically set ltx2_two_stage_device_mode=original for CUDA GPU (%s, %.2f GiB total)",
             device_name,
             device_total_memory_gb,
         )
-        return "snapshot"
+        return "original"
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
             self._is_ltx23_model_path(self.model_path)
             or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
-        )
-
-    def _uses_ltx23_snapshot_two_stage_residency(self) -> bool:
-        return (
-            self.ltx2_two_stage_device_mode == "snapshot"
-            and self._is_ltx23_two_stage_pipeline()
         )
 
     def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
@@ -689,6 +706,28 @@ class ServerArgs(DisaggServerArgsMixin):
         return None, None
 
     def _adjust_warmup(self):
+        #   --warmup-mode > --warmup/--server-warmup
+        mode_explicit = self.is_arg_explicitly_set("warmup_mode")
+        legacy_explicit = self.is_arg_explicitly_set(
+            "warmup"
+        ) or self.is_arg_explicitly_set("server_warmup")
+        if self.warmup_mode is not None:
+            if self.warmup_mode not in WARMUP_MODES:
+                raise ValueError(
+                    f"Invalid --warmup-mode {self.warmup_mode!r}; "
+                    f"expected one of {WARMUP_MODES}."
+                )
+            if mode_explicit and legacy_explicit:
+                logger.warning(
+                    "Both --warmup-mode and the deprecated --warmup/--server-warmup "
+                    "were set; --warmup-mode=%s takes precedence.",
+                    self.warmup_mode,
+                )
+            if mode_explicit or not legacy_explicit:
+                self.warmup = self.warmup_mode != "off"
+                self.server_warmup = self.warmup_mode == "server"
+
+        # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
             self.warmup = True
 
@@ -697,6 +736,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
         if not self.warmup:
             self.server_warmup = False
+
+        self.warmup_mode = (
+            "off" if not self.warmup else "server" if self.server_warmup else "request"
+        )
 
     @staticmethod
     def _require_port(port: int, name: str) -> None:
@@ -1252,18 +1295,31 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # warmup
         parser.add_argument(
+            "--warmup-mode",
+            type=str,
+            choices=list(WARMUP_MODES),
+            default=ServerArgs.warmup_mode,
+            help=(
+                "Warmup mode (canonical knob). One of: "
+                "`off` (no warmup); `request` (request-based: warm on real "
+                "incoming requests); `server` (server-based: a synthetic warmup "
+                "request right after the server is ready, before traffic). "
+                "Takes precedence over the deprecated --warmup/--server-warmup. "
+                "`sglang serve` defaults to `server`; other entrypoints default "
+                "to request-based when warmup is enabled. When enabled, look for "
+                "the line ending with `(with warmup excluded)` for actual "
+                "processing time."
+            ),
+        )
+        parser.add_argument(
             "--warmup",
             action=StoreBoolean,
             default=ServerArgs.warmup,
             help=(
-                "Perform warmup before normal traffic. `sglang serve` runs a "
-                "server warmup through the scheduler client after HTTP is ready. "
-                "Other client entrypoints run explicit `--warmup-resolutions` "
-                "through the scheduler client, otherwise they use request-based "
-                "warmup. Recommended to enable when benchmarking to ensure fair "
-                "comparison and best performance. When enabled, look for the "
-                "line ending with `(with warmup excluded)` for actual processing "
-                "time."
+                "[DEPRECATED: use --warmup-mode] Perform warmup before normal "
+                "traffic. Maps to --warmup-mode request (or server, combined "
+                "with --server-warmup). Recommended when benchmarking for fair "
+                "comparison and best performance."
             ),
         )
         parser.add_argument(
@@ -1283,7 +1339,10 @@ class ServerArgs(DisaggServerArgsMixin):
             "--server-warmup",
             action=StoreBoolean,
             default=ServerArgs.server_warmup,
-            help="Send a warmup request after server ready",
+            help=(
+                "[DEPRECATED: use --warmup-mode server] Send a synthetic warmup "
+                "request after the server is ready (server-based warmup)."
+            ),
         )
 
         # layerwise offload
@@ -1353,14 +1412,15 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
             type=str,
-            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
                 "LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'snapshot' keeps premerged stage2 with snapshot-based release, "
                 "'resident' keeps both transformers resident on GPU. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+                "'snapshot' is deprecated, treated as 'original', and may be "
+                "removed after two release cycles. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
         parser.add_argument(
@@ -1885,6 +1945,20 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
         # validate layerwise offload conflicts
+        if envs.SGLANG_CACHE_DIT_ENABLED and self.use_fsdp_inference:
+            if self.is_arg_explicitly_set("use_fsdp_inference"):
+                raise ValueError(
+                    "FSDP inference cannot be enabled together with cache-dit. "
+                    "cache-dit wraps known DiT block structures, while FSDP wraps "
+                    "and shards modules before cache-dit can inspect them. "
+                    "Please disable --use-fsdp-inference or disable "
+                    "SGLANG_CACHE_DIT_ENABLED."
+                )
+            logger.warning(
+                "cache-dit is enabled, automatically disabling use_fsdp_inference."
+            )
+            self.use_fsdp_inference = False
+
         if self.layerwise_offload_components:
             if self.dit_offload_prefetch_size < 0.0:
                 raise ValueError("dit_offload_prefetch_size must be non-negative")
