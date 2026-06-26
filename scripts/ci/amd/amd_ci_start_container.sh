@@ -20,7 +20,7 @@ fi
 
 
 # Default base tags (can be overridden by command line arguments)
-ROCM_VERSION="rocm700"
+ROCM_VERSION="rocm720"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
