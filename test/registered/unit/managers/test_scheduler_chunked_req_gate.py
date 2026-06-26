@@ -104,6 +104,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, partially_extended_req) -> Sche
         if partially_extended_req is not None
         else {}
     )
+    s._pending_chunked_abort_req = None
     return s
 
 
