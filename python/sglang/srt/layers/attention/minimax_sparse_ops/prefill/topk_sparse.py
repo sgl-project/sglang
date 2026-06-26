@@ -6,11 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import (
-    check_sparse_kv_fp8,
-    get_cu_seqblocks,
-    set_triton_allocator_if_available,
-)
+from ..common.utils import check_sparse_kv_fp8, get_cu_seqblocks, robust_allocator
 
 
 @triton.heuristics(
@@ -278,7 +274,7 @@ def flash_prefill_with_gqa_share_sparse(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
 ) -> torch.Tensor:
-    set_triton_allocator_if_available()
+    triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}

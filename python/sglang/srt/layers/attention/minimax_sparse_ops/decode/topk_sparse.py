@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import check_sparse_kv_fp8, set_triton_allocator_if_available
+from ..common.utils import check_sparse_kv_fp8, robust_allocator
 
 
 @triton.heuristics(
@@ -309,7 +309,7 @@ def flash_decode_with_gqa_share_sparse(
     sm_scale: Optional[float] = None,
     use_tma: bool = True,
 ) -> torch.Tensor:
-    set_triton_allocator_if_available()
+    triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     # shape
     batch_size, num_q_heads, head_dim = q.shape

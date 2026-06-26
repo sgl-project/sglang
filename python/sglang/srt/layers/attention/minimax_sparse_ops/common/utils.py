@@ -61,13 +61,6 @@ def robust_allocator(size: int, alignment: int, stream: int = None):
     return tensor
 
 
-def set_triton_allocator_if_available(allocator=robust_allocator):
-    """Install Triton's custom allocator when the runtime exposes the API."""
-    set_allocator = getattr(triton, "set_allocator", None)
-    if set_allocator is not None:
-        set_allocator(allocator)
-
-
 def tensor_cache(maxsize: int = 8):
     """
     Cache function results using identity comparison.

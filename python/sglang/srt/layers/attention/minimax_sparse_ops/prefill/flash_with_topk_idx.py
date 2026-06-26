@@ -6,11 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..common.utils import (
-    _bitonic_merge,
-    get_cu_seqblocks,
-    set_triton_allocator_if_available,
-)
+from ..common.utils import _bitonic_merge, get_cu_seqblocks, robust_allocator
 
 
 @triton.heuristics(
@@ -447,7 +443,7 @@ def flash_prefill_with_topk_index(
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
-    set_triton_allocator_if_available()
+    triton.set_allocator(robust_allocator)
     # dtype check
     assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
     assert k_cache.dtype == q.dtype

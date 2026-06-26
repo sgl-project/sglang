@@ -8,7 +8,7 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 
-from ..common.utils import _bitonic_merge, set_triton_allocator_if_available
+from ..common.utils import _bitonic_merge, robust_allocator
 
 
 @triton.heuristics(
@@ -773,7 +773,7 @@ def flash_decode_with_topk_idx(
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
-    set_triton_allocator_if_available()
+    triton.set_allocator(robust_allocator)
     # dtype check
     assert (
         q.dtype == torch.bfloat16
