@@ -49,6 +49,68 @@ DEFAULT_WORKSPACE_SIZE_MB = 512
 global_zero_init_workspace_buffer = None
 
 
+def draft_branch_num_pages(
+    seq_lens_cpu: torch.Tensor, num_steps: int, page_size: int
+) -> int:
+    """Max pages per (request, branch) row in the spec-v2 draft tree layout:
+    the request's full prefix pages plus the branch's private page run."""
+    seq_lens_cpu = seq_lens_cpu.to(torch.int64)
+    last_page_lens = seq_lens_cpu % page_size
+    branch_pages = (last_page_lens + num_steps + page_size - 1) // page_size
+    return int((seq_lens_cpu // page_size + branch_pages).max().item())
+
+
+def build_draft_branch_page_tables(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_pages: int,
+    topk: int,
+    num_steps: int,
+    page_size: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Expanded (bs*topk, num_pages) page table for draft decode with topk > 1.
+
+    Branch b of request r attends to the request's full prefix pages followed
+    by the branch's private page run at req_to_token row offset
+    prefix_base + b * num_new_pages * page_size — the layout written by
+    eagle_info_v2.prepare_for_v2_draft. The private first page duplicates the
+    prefix tail page, so the per-branch KV length at draft step i stays
+    seq_lens + i + 1 and the table is identical for all draft steps.
+    """
+    bs = seq_lens.numel()
+    device = seq_lens.device
+    seq_lens = seq_lens.to(torch.int64)
+    last_page_lens = seq_lens % page_size
+    prefix_bases = seq_lens - last_page_lens
+    num_prefix_pages = prefix_bases // page_size
+    branch_strides = (
+        (last_page_lens + num_steps + page_size - 1) // page_size
+    ) * page_size
+    cols = torch.arange(num_pages, device=device, dtype=torch.int64)
+    branch_ids = torch.arange(topk, device=device, dtype=torch.int64)
+    pages_into_branch = cols.view(1, 1, -1) - num_prefix_pages.view(bs, 1, 1)
+    branch_pos = (
+        prefix_bases.view(bs, 1, 1)
+        + branch_ids.view(1, topk, 1) * branch_strides.view(bs, 1, 1)
+        + pages_into_branch * page_size
+    )
+    token_pos = torch.where(
+        pages_into_branch >= 0, branch_pos, (cols * page_size).view(1, 1, -1)
+    )
+    token_pos.clamp_(min=0, max=req_to_token.shape[1] - 1)
+    rows = req_to_token[req_pool_indices.long()]
+    page_tables = (
+        torch.gather(rows.unsqueeze(1).expand(bs, topk, -1), 2, token_pos) // page_size
+    ).to(torch.int32)
+    page_tables = page_tables.reshape(bs * topk, num_pages)
+    if out is None:
+        return page_tables
+    out[: bs * topk, :num_pages].copy_(page_tables)
+    return out[: bs * topk, :num_pages]
+
+
 @dataclass
 class TRTLLMMHAMetadata:
     # Sequence lengths for the forward batch
@@ -65,6 +127,14 @@ class TRTLLMMHAMetadata:
     swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
+    # Draft tree mask for target verify with topk > 1, shape
+    # [bs, draft_token_num, draft_token_num] (QLEN_ONLY layout view)
+    tree_mask: torch.Tensor = None
+    # Tree verify on SWA layers: page-trimmed swa_page_table and clamped
+    # seqlens presenting only the in-window KV (lazily built once per
+    # forward by _swa_verify_views)
+    swa_verify_page_table: torch.Tensor = None
+    swa_verify_seqlens: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -125,7 +195,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.decode_cuda_graph_metadata = {}
 
         # Speculative decoding
-        # Only support topk <= 1 for now.
+        # Draft decode supports topk > 1 (tree draft, batch-expanded to
+        # bs*topk rows); target verify still requires topk <= 1 until the
+        # tree-mask path lands.
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
@@ -145,6 +217,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.max_context_len + self.page_size - 1
         ) // self.page_size
 
+        # topk > 1 draft decode runs as a bs*topk batch over per-branch page
+        # tables. The multi-step wrapper owns the shared table (it is
+        # identical for every draft step) and hands it to the per-step
+        # backends through these attributes.
+        self.draft_branch_page_tables: Optional[torch.Tensor] = None
+        self.draft_branch_page_table_buf: Optional[torch.Tensor] = None
+        # SWA hybrid + topk > 1: tree verify on SWA layers folds the sliding
+        # window into the packed custom mask (the trtllm custom-mask
+        # cubins have no SlidingWindow+Custom mask type), presenting only the
+        # in-window KV via a page-trimmed SWA table so the mask region stays
+        # ~window-sized. See _swa_verify_views.
+        self.sliding_window_size = model_runner.sliding_window_size
+
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
 
@@ -157,6 +242,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+
+        # Tree spec decoding (topk > 1): target verify consumes a draft-only
+        # QLEN_ONLY tree mask. The eagle workers read tree_mask_mode to pick
+        # the layout build_tree_kernel_efficient writes, and fill
+        # cuda_graph_custom_mask in place via
+        # get_verify_buffers_to_fill_after_draft.
+        self.cuda_graph_custom_mask: Optional[torch.Tensor] = None
+        if self.topk > 1:
+            if self.is_xqa_impl:
+                raise NotImplementedError(
+                    "trtllm_mha tree speculative decoding (topk > 1) requires "
+                    "the trtllm-gen kernels (SM100/SM103); the XQA path "
+                    "expects a different packed mask format"
+                )
+            from sglang.srt.speculative.eagle_utils import TreeMaskMode
+
+            self.tree_mask_mode = TreeMaskMode.QLEN_ONLY
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
@@ -299,6 +401,54 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         q_2d, q_scale = scaled_fp8_quant(q.reshape(-1, q.shape[-1]).contiguous(), None)
         return q_2d.reshape(q.shape), q_scale
 
+    def _layer_is_swa(self, layer: RadixAttention) -> bool:
+        if self._swa_kv_pool is None:
+            return False
+        _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+        return is_swa
+
+    def _swa_verify_max_pages(self) -> int:
+        """Static page bound for the trimmed SWA verify table: window + draft
+        tail + one page of trim alignment slack. Constant per server config
+        (window, draft tokens, page size), so CUDA-graph safe."""
+        nv = self.speculative_num_draft_tokens
+        return (
+            self.sliding_window_size + nv + self.page_size - 1
+        ) // self.page_size + 1
+
+    def _fill_swa_verify_views(self, metadata: TRTLLMMHAMetadata):
+        """Fill the trimmed (page_table, seqlens) for tree verify on SWA layers.
+
+        The window is folded into flashinfer's packed custom mask, whose
+        region covers the whole presented KV range, so present only the pages
+        from the window start of the shallowest draft row onward. Runs in the
+        metadata init/apply paths (NOT inside the captured forward): the
+        CUDA-graph capture warmup would otherwise pre-populate a lazy cache
+        and leave the gather out of the captured graph, replaying stale
+        capture-time trims.
+        """
+        if self._swa_kv_pool is None or self.topk <= 1:
+            return
+        window = self.sliding_window_size
+        nv = metadata.max_seq_len_q
+        seqlens_full = metadata.cache_seqlens_int32
+        first_keep_page = (
+            torch.clamp(seqlens_full - nv - window, min=0) // self.page_size
+        )
+        seqlens = (seqlens_full - first_keep_page * self.page_size).to(torch.int32)
+        cols = first_keep_page.to(torch.int64).unsqueeze(1) + torch.arange(
+            self._swa_verify_max_pages(), device=seqlens_full.device
+        )
+        cols.clamp_(max=metadata.swa_page_table.shape[1] - 1)
+        trimmed = torch.gather(metadata.swa_page_table, 1, cols)
+        if metadata.swa_verify_page_table is not None:
+            # CUDA-graph mode: write into the bound fixed-address buffers.
+            metadata.swa_verify_page_table.copy_(trimmed)
+            metadata.swa_verify_seqlens.copy_(seqlens)
+        else:
+            metadata.swa_verify_page_table = trimmed
+            metadata.swa_verify_seqlens = seqlens
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -331,21 +481,37 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
+            # Draft tree decode (topk > 1) expands to one row per
+            # (request, branch).
+            max_draft_rows = max_bs * self.topk if self.topk > 1 else max_bs
+            if max_draft_rows > max_bs:
+                self.decode_cuda_graph_metadata["cache_seqlens"] = torch.zeros(
+                    max_draft_rows, dtype=torch.int32, device=self.device
+                )
             self.decode_cuda_graph_metadata["cu_seqlens_q"] = torch.arange(
-                0, max_bs + 1, dtype=torch.int32, device=self.device
+                0, max_draft_rows + 1, dtype=torch.int32, device=self.device
             )
             self.decode_cuda_graph_metadata["cu_seqlens_k"] = torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
+                max_draft_rows + 1, dtype=torch.int32, device=self.device
             )
-            self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
-                self._alloc_swa_page_table(max_bs, max_num_pages)
-            )
+            if self.topk > 1:
+                # The per-branch page table buffer is shared across the
+                # per-step backends; the multi-step wrapper allocates and
+                # fills it (see TRTLLMHAAttnMultiStepDraftBackend).
+                self.decode_cuda_graph_metadata["page_table_draft_decode"] = None
+                self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = None
+            else:
+                self.decode_cuda_graph_metadata["page_table_draft_decode"] = (
+                    torch.zeros(
+                        max_bs,
+                        max_num_pages,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
+                self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
+                    self._alloc_swa_page_table(max_bs, max_num_pages)
+                )
 
             self.target_verify_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -369,6 +535,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
+            if self._swa_kv_pool is not None and self.topk > 1:
+                # Trimmed SWA verify views; refilled before each replay in
+                # the apply path (see _fill_swa_verify_views).
+                self.target_verify_metadata["swa_verify_page_table"] = torch.zeros(
+                    max_bs,
+                    self._swa_verify_max_pages(),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.target_verify_metadata["swa_verify_seqlens"] = torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                )
+
+            if self.topk > 1 and not self.skip_prefill:
+                # QLEN_ONLY tree mask written in place by the eagle worker
+                # after draft (see get_verify_buffers_to_fill_after_draft);
+                # the captured verify forward reads it at replay.
+                num_draft_tokens = self.speculative_num_draft_tokens
+                self.cuda_graph_custom_mask = torch.zeros(
+                    max_bs * num_draft_tokens * num_draft_tokens,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
 
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -404,25 +593,34 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
-                # Draft Decode (topk = 1)
+                # Draft Decode (one row per request, or per (request, branch)
+                # for tree draft with topk > 1)
+                rows = bs * self.topk if self.topk > 1 else bs
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
-                ][:bs]
+                ][:rows]
                 metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
-                    : bs + 1
+                    : rows + 1
                 ]
                 metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
-                    : bs + 1
+                    : rows + 1
                 ]
-                metadata.page_table = self.decode_cuda_graph_metadata[
-                    "page_table_draft_decode"
-                ][:bs, :]
-                self._bind_swa_page_table(
-                    metadata,
-                    self.decode_cuda_graph_metadata,
-                    "swa_page_table_draft_decode",
-                    bs,
-                )
+                if self.topk > 1:
+                    assert self.draft_branch_page_table_buf is not None, (
+                        "topk > 1 draft decode requires the multi-step wrapper "
+                        "to allocate the shared per-branch page table buffer"
+                    )
+                    metadata.page_table = self.draft_branch_page_table_buf[:rows, :]
+                else:
+                    metadata.page_table = self.decode_cuda_graph_metadata[
+                        "page_table_draft_decode"
+                    ][:bs, :]
+                    self._bind_swa_page_table(
+                        metadata,
+                        self.decode_cuda_graph_metadata,
+                        "swa_page_table_draft_decode",
+                        bs,
+                    )
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
                 # Normal Decode
@@ -446,7 +644,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
         elif forward_mode.is_target_verify():
-            # Target Verify (topk = 1)
+            # Target Verify (chain for topk = 1, tree mask for topk > 1)
             tokens_per_req = num_tokens // bs
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
@@ -459,12 +657,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.max_seq_len_q = tokens_per_req
             metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
+            if self.topk > 1:
+                metadata.tree_mask = self.cuda_graph_custom_mask[
+                    : bs * tokens_per_req * tokens_per_req
+                ].view(bs, tokens_per_req, tokens_per_req)
             self._bind_swa_page_table(
                 metadata,
                 self.target_verify_metadata,
                 "swa_page_table",
                 bs,
             )
+            if "swa_verify_page_table" in self.target_verify_metadata:
+                metadata.swa_verify_page_table = self.target_verify_metadata[
+                    "swa_verify_page_table"
+                ][:bs, :]
+                metadata.swa_verify_seqlens = self.target_verify_metadata[
+                    "swa_verify_seqlens"
+                ][:bs]
             self.target_verify_metadata[bs] = metadata
         elif forward_mode.is_draft_extend_v2():
             num_tokens_per_bs = num_tokens // bs
@@ -510,8 +719,27 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
-                # Here we only support topk = 1 for now.
                 metadata = self.decode_cuda_graph_metadata[bs]
+                if self.topk > 1:
+                    # Tree draft: one row per (request, branch). The shared
+                    # per-branch page table is filled once per draft phase by
+                    # the multi-step wrapper, so only the per-step sequence
+                    # lengths are updated here.
+                    metadata.cache_seqlens_int32.copy_(
+                        (seq_lens + self.speculative_step_id + 1).repeat_interleave(
+                            self.topk
+                        )
+                    )
+                    metadata.max_seq_len_k = int(seq_lens.max().item()) + (
+                        self.speculative_step_id + 1
+                    )
+                    metadata.cu_seqlens_k[1:].copy_(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        )
+                    )
+                    self.forward_metadata = metadata
+                    return
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
@@ -530,7 +758,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata, req_pool_indices, metadata.cache_seqlens_int32
             )
         elif forward_mode.is_target_verify():
-            # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
             metadata.cu_seqlens_k[1:].copy_(
@@ -539,6 +766,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._fill_page_table_device(
                 metadata, req_pool_indices, metadata.cache_seqlens_int32
             )
+            self._fill_swa_verify_views(metadata)
+            if self.topk > 1:
+                self._sync_verify_tree_mask(spec_info, metadata)
         elif forward_mode.is_draft_extend_v2():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -565,10 +795,48 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         self.forward_metadata = metadata
 
+    def _sync_verify_tree_mask(
+        self, spec_info: Optional[SpecInput], metadata: TRTLLMMHAMetadata
+    ) -> None:
+        """Copy the QLEN_ONLY tree mask into the CUDA-graph buffer unless the
+        producer already wrote it there in place (the eagle worker writes
+        through get_verify_buffers_to_fill_after_draft)."""
+        mask = getattr(spec_info, "custom_mask", None)
+        if mask is None or metadata.tree_mask is None:
+            return
+        if mask.data_ptr() != self.cuda_graph_custom_mask.data_ptr():
+            numel = metadata.tree_mask.numel()
+            self.cuda_graph_custom_mask[:numel].copy_(mask.reshape(-1)[:numel])
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [self.cuda_graph_custom_mask, None]
+
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        pass
+        """Re-sync mask-dependent state after the draft output is known.
+
+        The packed-mask conversion runs inside the captured verify forward and
+        reads the persistent QLEN_ONLY buffer at replay, so the CUDA-graph
+        path only needs a copy when the producer wrote a different tensor.
+        """
+        if self.topk <= 1:
+            return
+        metadata = self.forward_metadata
+        if metadata is None or metadata.tree_mask is None:
+            return
+        if cuda_graph_bs is not None:
+            self._sync_verify_tree_mask(spec_info, metadata)
+        else:
+            mask = getattr(spec_info, "custom_mask", None)
+            if mask is not None:
+                bs, num_draft_tokens = (
+                    metadata.tree_mask.shape[0],
+                    metadata.tree_mask.shape[1],
+                )
+                metadata.tree_mask = mask[
+                    : bs * num_draft_tokens * num_draft_tokens
+                ].view(bs, num_draft_tokens, num_draft_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -659,7 +927,39 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
                 # Draft Decode
-                # Here we only support topk = 1 for now.
+                if self.topk > 1:
+                    # Tree draft: one row per (request, branch) over the
+                    # per-branch page tables built by the multi-step wrapper
+                    # (they are identical for every draft step).
+                    assert self.draft_branch_page_tables is not None, (
+                        "topk > 1 draft decode requires the multi-step wrapper "
+                        "to build the per-branch page tables first"
+                    )
+                    metadata.cache_seqlens_int32 = (
+                        (seqlens_in_batch + (self.speculative_step_id + 1))
+                        .repeat_interleave(self.topk)
+                        .to(torch.int32)
+                    )
+                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                        self.speculative_step_id + 1
+                    )
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * self.topk + 1,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                    # Already in page units; skip the strided token->page
+                    # conversion below.
+                    metadata.page_table = self.draft_branch_page_tables
+                    self.forward_metadata = metadata
+                    return
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
@@ -682,12 +982,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
         elif forward_batch.forward_mode.is_target_verify():
-            # Only support topk = 1 for now.
+            # Chain verify for topk = 1; tree verify (topk > 1) additionally
+            # carries the QLEN_ONLY draft tree mask.
             tokens_per_req = forward_batch.input_ids.shape[0] // batch_size
             metadata.cache_seqlens_int32 = (forward_batch.seq_lens + tokens_per_req).to(
                 torch.int32
             )
             metadata.max_seq_len_q = tokens_per_req
+            metadata.max_seq_len_k = (
+                forward_batch.seq_lens_cpu.max().item() + tokens_per_req
+            )
+            if self.topk > 1:
+                metadata.tree_mask = forward_batch.spec_info.custom_mask[
+                    : batch_size * tokens_per_req * tokens_per_req
+                ].view(batch_size, tokens_per_req, tokens_per_req)
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 batch_size * tokens_per_req + 1,
@@ -746,6 +1054,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     forward_batch.out_cache_loc
                 )
             )
+
+        if forward_batch.forward_mode.is_target_verify():
+            self._fill_swa_verify_views(metadata)
 
         self.forward_metadata = metadata
 
@@ -900,13 +1211,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            seq_lens_arg = self.forward_metadata.cache_seqlens_int32
+            max_seq_len_arg = self.max_context_len
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self.forward_metadata.tree_mask is not None
+                and self._layer_is_swa(layer)
+            ):
+                # Tree verify on a SWA layer: flashinfer folds the window
+                # into the packed custom mask (no SlidingWindow+Custom cubin;
+                # proper kernel support is a planned follow-up), and the mask
+                # region covers all presented KV, so present only the
+                # in-window pages (filled by _fill_swa_verify_views in the
+                # metadata init/apply paths).
+                page_table = self.forward_metadata.swa_verify_page_table
+                seq_lens_arg = self.forward_metadata.swa_verify_seqlens
+                max_seq_len_arg = self._swa_verify_max_pages() * self.page_size
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
                 block_tables=page_table,
-                seq_lens=self.forward_metadata.cache_seqlens_int32,
-                max_seq_len=self.max_context_len,
+                seq_lens=seq_lens_arg,
+                max_seq_len=max_seq_len_arg,
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 window_left=layer.sliding_window_size,
@@ -914,6 +1241,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
+                # Tree verify (topk > 1): draft tree mask over the KV tail;
+                # None selects the causal chain-verify path.
+                mask=self.forward_metadata.tree_mask,
             )
         else:
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
@@ -957,12 +1287,61 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
             )
+        # Shared (max bs*topk, num_pages) per-branch page table for tree
+        # draft decode; identical across draft steps, so it is built once per
+        # draft phase and bound by every per-step backend.
+        self.draft_branch_page_table_buf: Optional[torch.Tensor] = None
+
+    def _update_draft_branch_page_tables(
+        self,
+        forward_batch: ForwardBatch,
+        seq_lens_cpu: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ):
+        bs = forward_batch.batch_size
+        num_pages = draft_branch_num_pages(
+            seq_lens_cpu[:bs], self.speculative_num_steps, self.page_size
+        )
+        page_tables = build_draft_branch_page_tables(
+            self.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices[:bs],
+            forward_batch.seq_lens[:bs],
+            num_pages,
+            self.topk,
+            self.speculative_num_steps,
+            self.page_size,
+            out=out,
+        )
+        for backend in self.attn_backends:
+            backend.draft_branch_page_tables = page_tables
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if (
+            self.topk > 1
+            and not forward_batch.forward_mode.is_idle()
+            and forward_batch.spec_info is not None
+        ):
+            self._update_draft_branch_page_tables(
+                forward_batch, forward_batch.seq_lens_cpu
+            )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self.topk > 1:
+            max_num_pages = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size + (
+                2 * (self.page_size - 1) + self.speculative_num_steps
+            ) // self.page_size
+            self.draft_branch_page_table_buf = torch.zeros(
+                max_num_tokens,
+                max_num_pages,
+                dtype=torch.int32,
+                device=self.kv_indptr.device,
+            )
+            for backend in self.attn_backends:
+                backend.draft_branch_page_table_buf = self.draft_branch_page_table_buf
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
@@ -984,6 +1363,19 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             forward_mode=ForwardMode.DECODE,
             encoder_lens=forward_batch.encoder_lens,
         )
+        if self.topk > 1:
+            # Fill the shared per-branch page table once per draft phase;
+            # per-step _apply only refreshes the per-step sequence lengths.
+            seq_lens_cpu = (
+                forward_batch.seq_lens.cpu()
+                if in_capture or forward_batch.seq_lens_cpu is None
+                else forward_batch.seq_lens_cpu
+            )
+            self._update_draft_branch_page_tables(
+                forward_batch,
+                seq_lens_cpu,
+                out=self.draft_branch_page_table_buf,
+            )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_out_graph(
                 inner_fb, in_capture=in_capture

@@ -102,7 +102,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        # Resolved after target and draft attention backends are initialized.
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
+
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
         # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
         self.index_share_for_mtp_iteration = (
