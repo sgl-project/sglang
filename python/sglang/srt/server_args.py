@@ -163,6 +163,7 @@ QUANTIZATION_CHOICES = [
     "w4afp8",
     "mxfp4",  # MOE-only.
     "auto-round",
+    "auto-round-int8",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
@@ -909,6 +910,13 @@ class ServerArgs:
         Arg(
             help="The moe data parallelism size.",
             aliases=["--moe-data-parallel-size"],
+        ),
+    ] = 1
+    dcp_size: A[
+        int,
+        Arg(
+            help="The decode context parallelism size.",
+            aliases=["--decode-context-parallel-size"],
         ),
     ] = 1
     enable_prefill_cp: A[
@@ -1829,6 +1837,23 @@ class ServerArgs:
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
     ] = None
+    # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
+    # ring + periodic flush to cut per-step HBM state traffic.
+    enable_linear_replayssm: A[
+        bool,
+        "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
+        "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
+        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
+        "is numerically correct, but KDA decode is SLOWER than the packed "
+        "baseline (the per-K g_cache is K x larger and the reconstruction "
+        "refolds the per-K decay every step), so it is not recommended for KDA "
+        "models. Requires the Triton linear-attn decode backend and "
+        "--mamba-scheduler-strategy no_buffer (the default).",
+    ] = False
+    linear_replayssm_cache_len: A[
+        int,
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
+    ] = 16
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -2122,8 +2147,8 @@ class ServerArgs:
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
                 "Defaults to auto. "
-                "'auto': choose trtllm on single-node systems and mnnvl on "
-                "SM100/SM103 multi-node systems. "
+                "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
+                "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
@@ -2703,7 +2728,20 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
-        if self.dcp_size > 1 and not is_hip():
+        if not self.dcp_size > 1:
+            return
+        if is_hip():
+            return
+        elif is_cuda():
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "Decode context parallel (--dcp-size / "
+                    "--decode-context-parallel-size > 1) on CUDA platform "
+                    "does not support any speculative algorithm, but got "
+                    f"dcp_size={self.dcp_size} on a CUDA platform with "
+                    "speculative decoding enabled."
+                )
+        else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
                 "--decode-context-parallel-size > 1) is currently only "
@@ -3578,8 +3616,7 @@ class ServerArgs:
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
 
-        model_config = self.get_model_config()
-        hf_config = model_config.hf_config
+        hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
@@ -4144,17 +4181,8 @@ class ServerArgs:
             "Gemma4ForCausalLM",
             "Gemma4UnifiedForConditionalGeneration",
         ):
-            is_gemma4_modelopt_fp4 = model_config.quantization == "modelopt_fp4"
-            is_gemma4_moe = getattr(
-                model_config.hf_text_config, "enable_moe_block", False
-            )
-            is_gemma4_modelopt_fp4_moe = is_gemma4_modelopt_fp4 and is_gemma4_moe
-            # TODO: switch Gemma4 modelopt_fp4 MoE back to trtllm_mha by default
-            # after the SM10X trtllm_mha accuracy issue is fixed.
             default_attention_backend = (
-                "trtllm_mha"
-                if is_sm100_supported() and not is_gemma4_modelopt_fp4_moe
-                else "triton"
+                "trtllm_mha" if is_sm100_supported() else "triton"
             )
             if self.is_attention_backend_not_set():
                 self.attention_backend = default_attention_backend
@@ -4179,7 +4207,7 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-                if is_gemma4_modelopt_fp4:
+                if self.get_model_config().quantization == "modelopt_fp4":
                     self.quantization = "modelopt_fp4"
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
@@ -4397,8 +4425,8 @@ class ServerArgs:
 
         # Auto-enable FlashInfer AllReduce Fusion on SM90/SM100, for models with
         # explicit support (DeepseekV3, GptOss, Glm4Moe, MistralLarge3,
-        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to trtllm on
-        # single-node systems and mnnvl on Blackwell multi-node systems.
+        # Qwen3/Qwen3-VL/Qwen3Next/Qwen3.5 MoE families). auto resolves to mnnvl on
+        # Blackwell (single- and multi-node) and trtllm on SM90 single-node systems.
         if (
             self.flashinfer_allreduce_fusion_backend is None
             and model_arch
@@ -5040,6 +5068,50 @@ class ServerArgs:
                 "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
                 f"got CUDA {cuda_version or 'unknown'}"
             )
+
+        # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
+        # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
+        # write-cursor buffers). The RADIX prefix cache is now supported (slice
+        # 2b: the decode kernel force-flushes the ring into temporal[slot] on
+        # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
+        # the COW copy-into-slot path resets the ring cursor) -- so the
+        # --disable-radix-cache requirement is dropped.
+        #
+        # Slice 2b only wires the no_buffer mamba scheduler strategy (the
+        # default). The extra_buffer strategy donates the track snapshot via
+        # `donate_mamba_ping_pong_slot` with a separate ping-pong slot swap that
+        # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
+        # cursor of the donated/kept slot would not be reset there. Handling
+        # that donation path is a follow-up; for now require no_buffer.
+        if self.enable_linear_replayssm:
+            if decode != "triton":
+                raise ValueError(
+                    "--enable-linear-replayssm requires the Triton "
+                    "linear-attn decode backend, got "
+                    f"--linear-attn-decode-backend={decode!r}."
+                )
+            if self.enable_mamba_extra_buffer():
+                raise ValueError(
+                    "--enable-linear-replayssm requires --mamba-scheduler-strategy "
+                    "no_buffer (the default); the extra_buffer ping-pong "
+                    "donation path is not yet supported (follow-up). Got "
+                    f"--mamba-scheduler-strategy={self.mamba_scheduler_strategy!r}."
+                )
+            if self.disaggregation_mode != "null":
+                # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
+                # is not wired for the ReplaySSM ring, so the flag would silently
+                # no-op there; disagg also runs a different cache/coordination
+                # flow that is not yet validated for ReplaySSM (follow-up).
+                raise ValueError(
+                    "--enable-linear-replayssm is not supported under PD "
+                    "disaggregation yet (follow-up). Got "
+                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                )
+            if self.linear_replayssm_cache_len < 1:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be >= 1, got "
+                    f"{self.linear_replayssm_cache_len}."
+                )
 
     def _handle_legacy_cp_arguments(self):
         legacy_mode_to_strategy = {
@@ -6226,7 +6298,7 @@ class ServerArgs:
                 )
                 self.enable_lmcache = False
 
-        if not self.pp_size > 1:
+        if self.pp_size > 1:
             logger.warning(
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )

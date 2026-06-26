@@ -1259,6 +1259,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
+    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
+        # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
+        # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
+        if server_args.dcp_size > 1:
+            os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
