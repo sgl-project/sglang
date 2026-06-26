@@ -130,10 +130,10 @@ class DeepEPV2Dispatcher(BaseDispatcher):
         group: torch.distributed.ProcessGroup,
         router_topk: int,
         permute_fusion: bool = False,
-        num_experts: int = None,
-        num_local_experts: int = None,
-        hidden_size: int = None,
-        params_dtype: torch.dtype = None,
+        num_experts: int | None = None,
+        num_local_experts: int | None = None,
+        hidden_size: int | None = None,
+        params_dtype: torch.dtype | None = None,
         async_finish: bool = False,
         **kwargs,
     ):
@@ -235,7 +235,8 @@ class DeepEPV2Dispatcher(BaseDispatcher):
                 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             ),
         )
-        event.current_stream_wait() if self.async_finish else ()
+        if self.async_finish:
+            event.current_stream_wait()
 
         if isinstance(recv_x, tuple):
             recv_x, recv_x_scale = recv_x
@@ -277,7 +278,8 @@ class DeepEPV2Dispatcher(BaseDispatcher):
             async_with_compute_stream=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-        event.current_stream_wait() if self.async_finish else ()
+        if self.async_finish:
+            event.current_stream_wait()
         self.handle = None
         self._current_use_fp8_dispatch = False
         return combined_hidden_states
