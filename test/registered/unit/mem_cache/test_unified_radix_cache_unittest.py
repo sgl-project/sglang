@@ -1253,7 +1253,9 @@ class UnifiedRadixCacheSuite:
 
         tokens = self._make_seq(1, 4)
         self._insert(tree, allocator, req_to_token_pool, tokens)
-        self._insert(tree, allocator, req_to_token_pool, tokens + self._make_seq(100, 1))
+        self._insert(
+            tree, allocator, req_to_token_pool, tokens + self._make_seq(100, 1)
+        )
 
         node = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
