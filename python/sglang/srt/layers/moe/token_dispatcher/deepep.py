@@ -317,7 +317,6 @@ class DeepEPConfig(BaseDispatcherConfig):
             self.normal_dispatch_config = None
             self.normal_combine_config = None
             self.num_sms = Buffer.num_sms
-        self.normal_quant_type = None
 
     @classmethod
     def get_instance(cls):
@@ -400,47 +399,59 @@ class _DeepEPDispatcherImplBase:
         self.set_deepep_dispatcher_dtype()
 
     def set_deepep_dispatcher_dtype(self) -> None:
+        # 1. Resolve the initial desired output dtype
         self.deepep_output_dtype = get_deepep_output_dtype(self)
-
-        # Configuration mapping for each dtype
-        config_map = {
-            DeepEPOutputDtype.BF16: {
-                "use_fp8": False,
-                "use_nvfp4": False,
-            },
-            DeepEPOutputDtype.FP8: {
-                "use_fp8": True,
-                "use_nvfp4": False,
-            },
-            # Needed for Ascend A2/A3 NPU case,
-            # despite the use_fp8 flag,
-            # quantization will be performed in int8
-            DeepEPOutputDtype.INT8: {
-                "use_fp8": True,
-                "use_nvfp4": False,
-            },
-            DeepEPOutputDtype.NVFP4: {
-                "use_fp8": False,
-                "use_nvfp4": True,
-            },
-        }
-
-        # Validate and apply hardware-specific adjustments
+    
+        # 2. Validate and adjust dtype according to hardware capabilities
         self._validate_and_adjust_dtype()
+    
+        # 3. Apply quantisation flags based on the final dtype
+        self._apply_quantisation_flags()
 
-        # Apply configuration
-        config = config_map[self.deepep_output_dtype]
-        self.use_fp8 = config["use_fp8"]
-        self.use_nvfp4 = config["use_nvfp4"]
+        # 4. Prepare NPU-specific quantisation tensor if on Ascend hardware
+        if _is_npu:
+            self.npu_quant_tensor = self._get_npu_quant_tensor()
+        else:
+            self.npu_quant_tensor = None  # Not used on GPU
+    
+    def _apply_quantisation_flags(self) -> None:
+        """Set use_fp8 and use_nvfp4 flags from the resolved output dtype."""
+        dtype = self.deepep_output_dtype
+    
+        if dtype == DeepEPOutputDtype.BF16:
+            self.use_fp8 = False
+            self.use_nvfp4 = False
+        elif dtype == DeepEPOutputDtype.FP8:
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+        elif dtype == DeepEPOutputDtype.INT8:
+            # Ascend A2/A3 uses int8 quantisation under the 'use_fp8' flag
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+        elif dtype == DeepEPOutputDtype.NVFP4:
+            self.use_fp8 = False
+            self.use_nvfp4 = True
+        else:
+            raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
 
-    def get_normal_quant_type(self) -> str:
-        quant_type_map = {
-            DeepEPOutputDtype.BF16: "bf16",
-            DeepEPOutputDtype.FP8: "fp8",
-            DeepEPOutputDtype.INT8: "int8",
-            DeepEPOutputDtype.NVFP4: "nvfp4",
-        }
-        return quant_type_map[self.deepep_output_dtype]
+    def _get_npu_quant_tensor(self):
+        """
+        Build a reference tensor of the quantisation data type used on NPU.
+        Returns None if no quantisation is required (e.g., bf16).
+        """
+        dtype = self.deepep_output_dtype
+        if dtype == DeepEPOutputDtype.BF16:
+            return None
+        elif dtype == DeepEPOutputDtype.INT8:
+            return torch.tensor([], dtype=torch.int8, device="npu")
+        elif dtype == DeepEPOutputDtype.FP8_e4m3fn:
+            return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
+        elif dtype == DeepEPOutputDtype.FP8_e5m2:
+             return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
+        elif dtype == DeepEPOutputDtype.FP4_e2m1fn_x2:
+            return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
+        else:
+            raise RuntimeError(f"Unexpected output dtype for NPU quant tensor: {dtype}")
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
