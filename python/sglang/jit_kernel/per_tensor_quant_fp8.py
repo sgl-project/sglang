@@ -22,6 +22,19 @@ def _jit_per_tensor_quant_fp8_module(is_static: bool, dtype: torch.dtype) -> Mod
     )
 
 
+@cache_once
+def _jit_per_tensor_quant_fp8_scale_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype)
+    return load_jit(
+        "per_tensor_quant_fp8_scale",
+        *args,
+        cuda_files=["gemm/per_tensor_quant_fp8.cuh"],
+        cuda_wrappers=[
+            ("per_tensor_quant_fp8_scale", f"per_tensor_quant_fp8_scale<{args}>")
+        ],
+    )
+
+
 @register_custom_op(
     op_name="per_tensor_quant_fp8",
     mutates_args=["output_q", "output_s"],
@@ -43,3 +56,17 @@ def per_tensor_quant_fp8(
     """
     module = _jit_per_tensor_quant_fp8_module(is_static, input.dtype)
     module.per_tensor_quant_fp8(input.view(-1), output_q.view(-1), output_s.view(-1))
+
+
+@register_custom_op(
+    op_name="per_tensor_quant_fp8_scale",
+    mutates_args=["output_s"],
+)
+def per_tensor_quant_fp8_scale(
+    input: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    """Compute the dynamic per-tensor FP8 scale without materializing FP8 output."""
+    output_s.zero_()
+    module = _jit_per_tensor_quant_fp8_scale_module(input.dtype)
+    module.per_tensor_quant_fp8_scale(input.view(-1), output_s.view(-1))
