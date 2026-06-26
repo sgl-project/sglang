@@ -1255,6 +1255,12 @@ class DeepseekSparseAttnBackend(
             )
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
         elif forward_mode.is_draft_extend_v2():
+            # V2 draft-extend processes the full padded tree width
+            # (speculative_num_draft_tokens) per req -- a static shape, like
+            # target-verify -- so graph replay stays host-sync-free. seq_lens
+            # already includes the draft KV written by prepare_for_draft_extend;
+            # the per-req accept length is handled downstream by output
+            # selection, not by reshaping the page table here.
             max_seqlen_k = metadata.page_table_1.shape[1]
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1262,32 +1268,26 @@ class DeepseekSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
 
-            extend_seq_lens = spec_info.num_accept_tokens[:bs]
-            extend_seq_lens_cpu = extend_seq_lens.tolist()
-
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
             page_indices = torch.repeat_interleave(
-                page_indices, repeats=extend_seq_lens, dim=0
+                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
-            metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
-                page_indices
-            )
+            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
+            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
             seqlens_expanded = seqlens_expand_triton(
-                extend_seq_lens,
+                torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
+                ),
                 cache_seqlens,
-                sum(extend_seq_lens_cpu),
+                self.speculative_num_draft_tokens * bs,
                 self.speculative_num_draft_tokens,
             )
-            metadata.dsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
-                seqlens_expanded
-            )
+            metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
             dsa_cache_seqlens = compute_dsa_seqlens(
                 seqlens_expanded, self.dsa_index_topk
             )
-            metadata.dsa_cache_seqlens_int32[: seqlens_expanded.shape[0]].copy_(
-                dsa_cache_seqlens
-            )
+            metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
         if is_cuda() and (
