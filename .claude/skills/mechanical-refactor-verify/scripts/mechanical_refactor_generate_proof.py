@@ -17,8 +17,8 @@ commit staged the whole module body (scaffolding plus def) as a trailing block i
 source, so the move cuts that tail into the new file (extract_to_new_module). A rename or a
 statement-level reorder relocates no def and is reported unsupported. Runnable directly:
 
-    python3 mechanical_refactor_reproduce_gen_utils.py <commit>
-    python3 mechanical_refactor_reproduce_gen_utils.py <base>..<tip> --match -move: --out DIR
+    python3 mechanical_refactor_generate_proof.py <commit>
+    python3 mechanical_refactor_generate_proof.py <base>..<tip> --match -move: --out DIR
 """
 
 import ast
@@ -826,8 +826,8 @@ def _main(argv: list[str]) -> int:
         argv = argv[:i] + argv[i + 2 :]
     if len(argv) != 1:
         print(
-            "usage: python3 mechanical_refactor_reproduce_gen_utils.py <commit>\n"
-            "       python3 mechanical_refactor_reproduce_gen_utils.py <base>..<tip> "
+            "usage: python3 mechanical_refactor_generate_proof.py <commit>\n"
+            "       python3 mechanical_refactor_generate_proof.py <base>..<tip> "
             "[--match REGEX] --out DIR",
             file=sys.stderr,
         )

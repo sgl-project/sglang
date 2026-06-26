@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mechanical_refactor_reproduce_gen_utils import (
+from mechanical_refactor_generate_proof import (
     infer_recipe,
     recipe_to_script,
 )
@@ -424,4 +424,4 @@ def test_recipe_to_script_is_self_contained_and_ordered(repo: Path) -> None:
     assert "r.run()" in script
     # importing nothing else from the skill keeps the script auditable in isolation
     assert "mechanical_refactor_verify_utils" not in script
-    assert "mechanical_refactor_reproduce_gen_utils" not in script
+    assert "mechanical_refactor_generate_proof" not in script

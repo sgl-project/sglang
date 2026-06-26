@@ -1,4 +1,4 @@
-# 如何证明 commit 是机械移动
+# How to prove a commit is a mechanical move
 
 The proof that a commit is a pure relocation: regenerate it from the base commit with
 faithful AST primitives, run the formatter, and diff byte-for-byte against the target. An
@@ -7,16 +7,16 @@ what counts as a clean move.
 
 ## Auto-generate the reproduce script from a commit (primary path)
 
-`mechanical_refactor_reproduce_gen_utils.py` infers the recipe from a commit's diff and
+`mechanical_refactor_generate_proof.py` infers the recipe from a commit's diff and
 before-state AST, then emits and runs a standalone, auditable reproduce script — no one
 hand-writes it.
 
 ```bash
 # one commit: print the inferred script and run it
-python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_reproduce_gen_utils.py <commit>
+python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_generate_proof.py <commit>
 
 # a range: write a self-contained folder (repro_scripts/<sha>.py + output.log + output.html)
-python3 .claude/skills/mechanical-refactor-verify/mechanical_refactor_reproduce_gen_utils.py \
+python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_generate_proof.py \
     <base>..<tip> --match -move: --out repro_out
 ```
 
@@ -57,7 +57,7 @@ and a bundled change surfaces as a residual diff.
 import sys
 from pathlib import Path
 
-sys.path.append(".claude/skills/mechanical-refactor-verify")
+sys.path.append(".claude/skills/mechanical-refactor-verify/scripts")
 from mechanical_refactor_reproduce_utils import Repro
 
 r = Repro(base="<base_sha>", target="<commit>")
@@ -96,7 +96,7 @@ files, diff, reporting) lives in the skill's utils.
 import sys
 from pathlib import Path
 
-sys.path.append(".claude/skills/mechanical-refactor-verify")
+sys.path.append(".claude/skills/mechanical-refactor-verify/scripts")
 from mechanical_refactor_reproduce_utils import verify_mechanical_refactor, git_add_and_commit
 
 BASE_COMMIT = "<base_sha>"

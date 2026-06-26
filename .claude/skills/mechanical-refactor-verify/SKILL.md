@@ -43,12 +43,12 @@ reproduce proof). A mechanical commit/PR contains **only** mechanical changes; s
   certified, what counts as a clean move (the whitelist and the not-allowed list), and exactly
   how reproduce-and-byte-diff establishes it. The code, tests, and other guides all implement
   this file; if any disagrees, this file wins.
-- [`mechanical_refactor_reproduce_gen_utils.py`](mechanical_refactor_reproduce_gen_utils.py) —
+- [`scripts/mechanical_refactor_generate_proof.py`](scripts/mechanical_refactor_generate_proof.py) —
   the **generator**: infers a reproduce recipe from a commit's diff and emits/runs a standalone,
   auditable script per commit, with a `PASS` / `RESIDUAL` / `UNSUPPORTED` verdict.
-- [`mechanical_refactor_reproduce_utils.py`](mechanical_refactor_reproduce_utils.py) — the
+- [`scripts/mechanical_refactor_reproduce_utils.py`](scripts/mechanical_refactor_reproduce_utils.py) — the
   **proof engine**: the `Repro` builder's faithful relocation primitives plus the worktree +
   pre-commit + byte-diff scaffold. Self-contained — only git and the standard library.
-- [`test_mechanical_refactor_reproduce_gen_utils.py`](test_mechanical_refactor_reproduce_gen_utils.py)
-  and [`test_mechanical_refactor_reproduce_utils.py`](test_mechanical_refactor_reproduce_utils.py)
+- [`scripts/test_mechanical_refactor_generate_proof.py`](scripts/test_mechanical_refactor_generate_proof.py)
+  and [`scripts/test_mechanical_refactor_reproduce_utils.py`](scripts/test_mechanical_refactor_reproduce_utils.py)
   — the tests for the generator and the proof engine.

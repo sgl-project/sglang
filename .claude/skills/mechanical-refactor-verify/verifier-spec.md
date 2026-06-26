@@ -3,7 +3,7 @@
 ## 1. What this file is
 
 - This file is the **single source of truth** for *what the skill certifies* and *how*. The
-  code (`mechanical_refactor_reproduce_utils.py`, `mechanical_refactor_reproduce_gen_utils.py`),
+  code (`scripts/mechanical_refactor_reproduce_utils.py`, `scripts/mechanical_refactor_generate_proof.py`),
   the tests, and the prose guides (`SKILL.md`, `how-to-guide.md`, `mental-model-prep-and-move.md`) all
   implement or describe this file. If any of them disagrees with it, **this file wins** and
   the others are the bug.
@@ -108,7 +108,7 @@ empty diff proves the commit is exactly that relocation.
 - The generator is run over a commit range:
 
   ```
-  python3 mechanical_refactor_reproduce_gen_utils.py <base>..<tip> --match -move: --out DIR
+  python3 scripts/mechanical_refactor_generate_proof.py <base>..<tip> --match -move: --out DIR
   ```
 
 - For each matched commit it:
