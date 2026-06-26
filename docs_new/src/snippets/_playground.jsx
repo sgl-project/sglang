@@ -13,6 +13,7 @@
 //   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
+//   indexCache  — DeepSeek-V4 C4 indexer topk reuse presets
 //   flagSelects — generic: a config-declared LIST of single-selects, each with
 //                 its own title + strip-prefixes + options (no per-feature code)
 //
@@ -648,6 +649,69 @@ export const Playground = ({ config }) => {
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
               <span style={s.axisTitle}>Speculative</span>
+              {visible.map((c) => (
+                <span key={c.value} style={s.field}>
+                  {renderChip(c.label, display, c.value,
+                    () => setValue(c.value),
+                    { disabled: c.disabled, disabledReason: c.disableReason })}
+                </span>
+              ))}
+            </div>
+          </div>
+        );
+      },
+    },
+
+    // ---- Axis: IndexCache ---------------------------------------------------
+    // Single-select. Adds model config overrides through --json-model-override-args.
+    indexCache: {
+      initState: () => "current",
+
+      deriveFromBase: (cell, fc, h) => {
+        const flags = (cell && cell.flags) || [];
+        const override = h.findFlagArg(flags, "--json-model-override-args");
+        if (!override) return "off";
+        for (const opt of (fc.options || [])) {
+          if (!opt.override) continue;
+          if (override.includes(opt.override)) return opt.id;
+        }
+        return "current";
+      },
+
+      revertHidden: (value, fc, base, h) => {
+        if (value !== "current" && h.isHidden(fc.options || [], value, base)) {
+          return "current";
+        }
+        return value;
+      },
+
+      apply: ({ flags, env, value, fc, h, derived }) => {
+        if (value === "current") return { flags, env };
+        if (derived && value === derived) return { flags, env };
+        flags = h.stripFlagsByFirstToken(flags, ["--json-model-override-args"]);
+        const opt = (fc.options || []).find((o) => o.id === value);
+        if (opt?.override) {
+          flags = h.insertBeforeTail(flags, [
+            `--json-model-override-args '${opt.override}'`,
+          ]);
+        }
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, derived }) => {
+        const opts = fc.options || [];
+        if (!opts.length) return null;
+        const display = (value !== "current") ? value
+                      : (derived ? derived : "current");
+        const hideCurrent = !!(derived && derived !== "current");
+        const visible = opts
+          .map((opt) => h.evaluateChip(opt, base))
+          .filter((c) => !c.hidden && !(hideCurrent && c.value === "current"));
+        if (visible.length === 0) return null;
+        return (
+          <div key={axisId} style={s.card}>
+            <div style={s.compactRow}>
+              <span style={s.axisTitle}>IndexCache</span>
               {visible.map((c) => (
                 <span key={c.value} style={s.field}>
                   {renderChip(c.label, display, c.value,

@@ -270,7 +270,17 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 5: "PD Disaggregation" -----
+    // ----- Card 5: "IndexCache" -----
+    indexCache: {
+      options: [
+        { id: "current", label: "Inherited from base" },
+        { id: "off",     label: "Off" },
+        { id: "freq4",   label: "index_topk_freq=4",
+          override: "{\"index_topk_freq\": 4}" },
+      ],
+    },
+
+    // ----- Card 6: "PD Disaggregation" -----
     pdDisagg: {
       modes: [
         { id: "off",     label: "Off" },
@@ -304,7 +314,7 @@ sgl-eval run aime25 \\
       },
     },
 
-    // ----- Card 6: "Hierarchical KV Cache" -----
+    // ----- Card 7: "Hierarchical KV Cache" -----
     hicache: {
       excludesHw: ["rtx6000"],
       backends: [
@@ -322,7 +332,7 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 7: "HiSparse" -----
+    // ----- Card 8: "HiSparse" -----
     // Decode-only: shown/emitted only when the live PD-Disagg mode is `decode`.
     hisparse: {
       requiredFlags: [

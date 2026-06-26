@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 import math
-from typing import Optional
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -69,6 +69,63 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "ascend",
     "intel_xpu",
 ]
+
+
+def get_dsv4_c4_layer_ids(compress_ratios: Iterable[int]) -> List[int]:
+    return [idx for idx, ratio in enumerate(compress_ratios) if ratio == 4]
+
+
+def compute_dsv4_index_topk_flags(
+    compress_ratios: List[int],
+    layer_id: int,
+    index_topk_freq: int = 1,
+    index_topk_pattern: Optional[Union[str, List[str]]] = None,
+) -> Tuple[bool, bool]:
+    c4_layer_ids = get_dsv4_c4_layer_ids(compress_ratios)
+    c4_layer_rank = c4_layer_ids.index(layer_id)
+
+    if index_topk_pattern is None:
+        if index_topk_freq <= 0:
+            raise ValueError(f"index_topk_freq must be positive, got {index_topk_freq}")
+        skip_topk = c4_layer_rank % index_topk_freq != 0
+        next_skip_topk = (
+            c4_layer_rank + 1 < len(c4_layer_ids)
+            and (c4_layer_rank + 1) % index_topk_freq != 0
+        )
+        return skip_topk, next_skip_topk
+
+    if isinstance(index_topk_pattern, str):
+        index_topk_pattern = list(index_topk_pattern)
+    invalid_pattern_values = set(index_topk_pattern) - {"F", "S"}
+    if invalid_pattern_values:
+        raise ValueError(
+            "index_topk_pattern only supports 'F' for full indexer "
+            f"layers and 'S' for shared layers, got "
+            f"{sorted(invalid_pattern_values)}"
+        )
+    if len(index_topk_pattern) == len(compress_ratios):
+        pattern_idx = layer_id
+        has_next_pattern = c4_layer_rank < len(c4_layer_ids) - 1
+        next_pattern_idx = c4_layer_ids[c4_layer_rank + 1] if has_next_pattern else None
+    elif len(index_topk_pattern) == len(c4_layer_ids):
+        pattern_idx = c4_layer_rank
+        has_next_pattern = c4_layer_rank < len(c4_layer_ids) - 1
+        next_pattern_idx = c4_layer_rank + 1 if has_next_pattern else None
+    else:
+        raise ValueError(
+            "index_topk_pattern length must either match "
+            f"num_hidden_layers ({len(compress_ratios)}) or "
+            f"the number of C4 layers ({len(c4_layer_ids)}), got "
+            f"{len(index_topk_pattern)}"
+        )
+
+    skip_topk = index_topk_pattern[pattern_idx] == "S"
+    next_skip_topk = (
+        index_topk_pattern[next_pattern_idx] == "S"
+        if next_pattern_idx is not None
+        else False
+    )
+    return skip_topk, next_skip_topk
 
 
 def awq_dequantize_func():
