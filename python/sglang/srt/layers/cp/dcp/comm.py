@@ -61,6 +61,17 @@ def get_attention_dcp_rank() -> int:
     return get_dcp_rank()
 
 
+def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
+    """All-gather each rank's LSE into a ``[world_size, *lse.shape]`` stack.
+
+    Shared prologue of both ``cp_lse_ag_out_rs_{mha,mla}``. Callers do their own
+    pre-processing (``contiguous()`` for MHA, fp32 cast for MLA) before calling.
+    """
+    return cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (cp_group.world_size,) + cp_attn_lse.shape
+    )
+
+
 def cp_lse_ag_out_rs_mha(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -72,9 +83,7 @@ def cp_lse_ag_out_rs_mha(
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 
     cp_attn_lse = cp_attn_lse.contiguous()
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
+    lses = _ag_lse(cp_attn_lse, cp_group)
     global_lse = torch.logsumexp(lses, dim=0)
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
@@ -115,9 +124,7 @@ def cp_lse_ag_out_rs_mla(
             cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
         )
         cp_attn_lse = cp_attn_lse.to(torch.float32)
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
+    lses = _ag_lse(cp_attn_lse, cp_group)
     out, _ = correct_attn_out(
         cp_attn_out, lses, cp_group.rank_in_group, ctx, new_output
     )
