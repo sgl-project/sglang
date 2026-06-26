@@ -223,7 +223,10 @@ def test_fused_dsa_target_verify_metadata(real_page_size, seq_dtype, next_n):
 
 @pytest.mark.parametrize("real_page_size", [1, 4])
 @pytest.mark.parametrize("seq_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("accept_lengths", [[1, 2, 3, 1, 2], [3, 1, 4, 2, 1]])
+@pytest.mark.parametrize(
+    "accept_lengths",
+    [[1, 2, 3, 1, 2], [3, 1, 4, 2, 1], [0, 2, 0, 1, 4]],
+)
 def test_fused_dsa_draft_extend_metadata(real_page_size, seq_dtype, accept_lengths):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -283,6 +286,7 @@ def test_fused_dsa_draft_extend_metadata(real_page_size, seq_dtype, accept_lengt
         max_seqlen_k=max_seqlen_k,
         dsa_index_topk=topk,
         real_page_size=real_page_size,
+        max_extend_len=next_n,
         max_total_len=bs * next_n,
     )
     torch.cuda.synchronize()
@@ -322,6 +326,55 @@ def test_fused_dsa_draft_extend_metadata(real_page_size, seq_dtype, accept_lengt
         ref_real = ref_real // real_page_size
         assert torch.equal(real_page_table[:, : ref_real.shape[1]], ref_real)
         assert torch.all(real_page_table[:, ref_real.shape[1] :] == -1)
+
+
+def test_fused_dsa_draft_extend_metadata_skewed_capacity():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+        fused_dsa_draft_extend_metadata,
+    )
+
+    device = "cuda"
+    bs = 5
+    accept_lengths = [5, 0, 0, 0, 0]
+    total_len = sum(accept_lengths)
+    max_seqlen_k = 17
+    topk = 23
+
+    seq_lens = torch.tensor([37, 12, 23, 4, 31], dtype=torch.int64, device=device)
+    extend_seq_lens = torch.tensor(accept_lengths, dtype=torch.int32, device=device)
+    req_pool_indices = torch.tensor([3, 0, 5, 2, 7], dtype=torch.int64, device=device)
+    req_to_token = torch.arange(8 * 32, dtype=torch.int32, device=device).view(8, 32)
+
+    page_table_1 = torch.full(
+        (total_len, max_seqlen_k), -1, dtype=torch.int32, device=device
+    )
+    fused_dsa_draft_extend_metadata(
+        seq_lens=seq_lens,
+        extend_seq_lens=extend_seq_lens,
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        cache_seqlens=torch.empty(bs, dtype=torch.int32, device=device),
+        cu_seqlens_k=torch.empty(bs + 1, dtype=torch.int32, device=device),
+        page_table_1=page_table_1,
+        seqlens_expanded=torch.empty(total_len, dtype=torch.int32, device=device),
+        dsa_cache_seqlens=torch.empty(total_len, dtype=torch.int32, device=device),
+        dsa_cu_seqlens_k=torch.empty(total_len + 1, dtype=torch.int32, device=device),
+        real_page_table=page_table_1,
+        bs=bs,
+        total_len=total_len,
+        max_seqlen_k=max_seqlen_k,
+        dsa_index_topk=topk,
+        real_page_size=1,
+        max_extend_len=max(accept_lengths),
+        max_total_len=total_len,
+    )
+    torch.cuda.synchronize()
+
+    ref_page = req_to_token[req_pool_indices[0], :max_seqlen_k].expand(total_len, -1)
+    assert torch.equal(page_table_1, ref_page)
 
 
 @pytest.mark.parametrize("real_page_size", [1, 4])
@@ -879,6 +932,7 @@ def test_fused_metadata_runtime_lengths_do_not_recompile():
             max_seqlen_k=max_seqlen_k,
             dsa_index_topk=topk,
             real_page_size=1,
+            max_extend_len=next_n,
             max_total_len=max_total_len,
         )
 

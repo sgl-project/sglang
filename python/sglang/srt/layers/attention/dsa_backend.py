@@ -1453,6 +1453,7 @@ class DeepseekSparseAttnBackend(
                         max_seqlen_k=max_seqlen_k,
                         dsa_index_topk=self.dsa_index_topk,
                         real_page_size=self.real_page_size,
+                        max_extend_len=self.speculative_num_draft_tokens,
                         max_total_len=bs * self.speculative_num_draft_tokens,
                     )
                     cache_seqlens = metadata.cache_seqlens_int32

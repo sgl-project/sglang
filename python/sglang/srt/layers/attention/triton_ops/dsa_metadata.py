@@ -405,6 +405,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -453,43 +454,53 @@ def _fused_dsa_draft_extend_metadata_kernel(
 
     num_col_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
     page_pid = pid - 1
-    out_row = page_pid // num_col_blocks
-    col_block = page_pid - out_row * num_col_blocks
+    req_row = page_pid // num_col_blocks
+    col_block = page_pid - req_row * num_col_blocks
     offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (out_row < total_len) & (offs_n < max_seqlen_k)
 
-    req_row = tl.full((), 0, tl.int32)
     prefix = tl.full((), 0, tl.int32)
     for i in tl.range(0, bs):
         qo_len = tl.load(extend_seq_lens + i * extend_seq_lens_stride).to(tl.int32)
-        in_row = (out_row >= prefix) & (out_row < prefix + qo_len)
-        req_row = tl.where(in_row, i, req_row)
-        prefix += qo_len
+        prefix += tl.where(i < req_row, qo_len, 0)
+
+    qo_len = tl.load(
+        extend_seq_lens + req_row * extend_seq_lens_stride,
+        mask=req_row < bs,
+        other=0,
+    ).to(tl.int32)
+    offs_r = tl.arange(0, BLOCK_ROWS)
+    out_rows = prefix + offs_r
+    row_mask = (req_row < bs) & (offs_r < qo_len) & (out_rows < total_len)
+    col_mask = offs_n < max_seqlen_k
+    has_rows = (req_row < bs) & (qo_len > 0)
+    mask = row_mask[:, None] & col_mask[None, :]
 
     req_idx = tl.load(
         req_pool_indices + req_row * req_pool_indices_stride,
-        mask=out_row < total_len,
+        mask=has_rows,
         other=0,
     )
     vals = tl.load(
         req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
-        mask=mask,
+        mask=col_mask & has_rows,
         other=0,
     ).to(tl.int32)
     tl.store(
-        page_table_1 + out_row * page_table_stride_0 + offs_n * page_table_stride_1,
-        vals,
+        page_table_1
+        + out_rows[:, None] * page_table_stride_0
+        + offs_n[None, :] * page_table_stride_1,
+        vals[None, :],
         mask=mask,
     )
 
     if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n % real_page_size) == 0)
+        real_mask = mask & ((offs_n[None, :] % real_page_size) == 0)
         real_cols = offs_n // real_page_size
         tl.store(
             real_page_table
-            + out_row * real_page_table_stride_0
-            + real_cols * real_page_table_stride_1,
-            vals // real_page_size,
+            + out_rows[:, None] * real_page_table_stride_0
+            + real_cols[None, :] * real_page_table_stride_1,
+            (vals // real_page_size)[None, :],
             mask=real_mask,
         )
 
@@ -511,6 +522,7 @@ def fused_dsa_draft_extend_metadata(
     max_seqlen_k: int,
     dsa_index_topk: int,
     real_page_size: int,
+    max_extend_len: int,
     max_total_len: int,
 ) -> None:
     assert seq_lens.is_cuda
@@ -527,6 +539,11 @@ def fused_dsa_draft_extend_metadata(
     if bs == 0 or total_len == 0:
         return
     assert total_len <= max_total_len
+    # Caller-owned graph metadata guarantees each request accepts at most
+    # max_extend_len tokens. Avoid checking extend_seq_lens.max() here because
+    # that would sync in the replay hot path.
+    assert max_extend_len > 0
+    assert total_len <= bs * max_extend_len
 
     has_real_page_table = real_page_size > 1
     if has_real_page_table:
@@ -537,9 +554,10 @@ def fused_dsa_draft_extend_metadata(
 
     block_bs = triton.next_power_of_2(bs)
     block_expanded = triton.next_power_of_2(max_total_len)
+    block_rows = triton.next_power_of_2(max_extend_len)
     block_n = 128
     num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
-    grid = (1 + total_len * num_col_blocks,)
+    grid = (1 + bs * num_col_blocks,)
 
     _fused_dsa_draft_extend_metadata_kernel[grid](
         seq_lens,
@@ -570,5 +588,6 @@ def fused_dsa_draft_extend_metadata(
         has_real_page_table,
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
+        BLOCK_ROWS=block_rows,
         BLOCK_N=block_n,
     )
