@@ -360,7 +360,7 @@ def init_process_sgl(
     if backend == "Engine":
         engine.init_weights_update_group(
             master_address="localhost",
-            master_port=str(port),
+            master_port=port,
             rank_offset=base_gpu_id,
             world_size=world_size,
             group_name="test_parameter_update_group",
@@ -371,7 +371,7 @@ def init_process_sgl(
             f"{url}/init_weights_update_group",
             json={
                 "master_address": "localhost",
-                "master_port": str(port),
+                "master_port": port,
                 "rank_offset": base_gpu_id,
                 "world_size": world_size,
                 "group_name": "test_parameter_update_group",
@@ -411,8 +411,8 @@ def init_process_sgl(
 
     # Get weights from the training engine and update the inference engine.
     names = [parameter_name for parameter_name in update_parameters]
-    dtypes = [torch.bfloat16 if backend == "Engine" else "bfloat16"] * len(names)
-    shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
+    dtypes = ["bfloat16"] * len(names)
+    shapes = [list(state_dict_key_to_shape[parameter_name]) for parameter_name in names]
 
     if pause_generation_mode in ["in_place", "retract"]:
         requests.post(

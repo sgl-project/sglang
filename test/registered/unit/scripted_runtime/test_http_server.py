@@ -6,6 +6,7 @@ import uuid
 
 import zmq
 
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
 from sglang.test.scripted_runtime.io_struct import (
@@ -54,8 +55,8 @@ class _PairSocketHarness:
         self._ctx.term()
 
     def _reply_once(self):
-        self.sent.append(self._peer_socket.recv_pyobj())
-        self._peer_socket.send_pyobj(self._reply)
+        self.sent.append(sock_recv(self._peer_socket))
+        sock_send(self._peer_socket, wrap_as_pickle(self._reply))
 
     def assert_no_sent_message(self, test_case: unittest.TestCase) -> None:
         test_case.assertFalse(self._peer_socket.poll(50))

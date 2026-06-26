@@ -11,7 +11,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    msgpack_encode,
     sock_recv,
+    wrap_as_pickle,
 )
 
 _WORK_REQ_TYPES = (
@@ -32,19 +34,16 @@ class ScriptedTokenizerRecvProxy:
     def recv_pyobj(self, flags: int = 0) -> Any:
         self._drain_underlying()
 
-        if self._buffer:
-            return self._buffer.popleft()
-
-        if flags & zmq.NOBLOCK:
-            raise zmq.ZMQError(zmq.EAGAIN, "Resource temporarily unavailable")
-        raise RuntimeError(
-            "ScriptedTokenizerRecvProxy.recv_pyobj: blocking recv is not supported"
-        )
+        return self._pop_buffered(flags, caller="recv_pyobj")
 
     def recv(self, flags: int = 0) -> bytes:
-        raise NotImplementedError(
-            "TODO: support ScriptedTokenizerRecvProxy.recv for msgpack IPC"
-        )
+        self._drain_underlying()
+
+        obj = self._pop_buffered(flags, caller="recv")
+        try:
+            return msgpack_encode(obj)
+        except TypeError:
+            return msgpack_encode(wrap_as_pickle(obj))
 
     def wait_until_arrived(
         self,
@@ -76,3 +75,13 @@ class ScriptedTokenizerRecvProxy:
             if isinstance(req, _WORK_REQ_TYPES):
                 self.work_reqs_seen += 1
             self._buffer.append(req)
+
+    def _pop_buffered(self, flags: int, *, caller: str) -> Any:
+        if self._buffer:
+            return self._buffer.popleft()
+
+        if flags & zmq.NOBLOCK:
+            raise zmq.ZMQError(zmq.EAGAIN, "Resource temporarily unavailable")
+        raise RuntimeError(
+            f"ScriptedTokenizerRecvProxy.{caller}: blocking recv is not supported"
+        )

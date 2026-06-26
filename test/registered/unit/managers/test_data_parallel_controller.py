@@ -12,15 +12,10 @@ is exercised as the real method, no mock.
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import msgspec
 import msgspec.structs
-
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
@@ -28,6 +23,11 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -39,6 +39,12 @@ _BASE_LOAD = msgspec.structs.replace(
 )
 
 
+class _Req(msgspec.Struct, kw_only=True):
+    routed_dp_rank: int | None = None
+    bootstrap_room: int | None = None
+    input_ids: list[int] = msgspec.field(default_factory=list)
+
+
 def _load(**overrides) -> LoadSnapshot:
     return msgspec.structs.replace(_BASE_LOAD, **overrides)
 
@@ -46,7 +52,12 @@ def _load(**overrides) -> LoadSnapshot:
 def _make_controller(dp_size: int) -> DataParallelController:
     """Bypass __init__; inject only the attrs dispatch methods read."""
     ctl = DataParallelController.__new__(DataParallelController)
-    ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(dp_size)]
+    ctl.workers = []
+    for i in range(dp_size):
+        worker = MagicMock(name=f"worker_{i}")
+        # Count dispatches independent of whether sock_send uses pickle or msgpack.
+        worker.send_pyobj = worker.send
+        ctl.workers.append(worker)
     ctl.status = [True] * dp_size
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
@@ -54,8 +65,8 @@ def _make_controller(dp_size: int) -> DataParallelController:
 
 
 def _req(routed_dp_rank=None, bootstrap_room=None, input_ids=None):
-    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
-    return SimpleNamespace(
+    """Req stand-in; avoid pinning scheduler tests to the full Req schema."""
+    return _Req(
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
         input_ids=input_ids or [],

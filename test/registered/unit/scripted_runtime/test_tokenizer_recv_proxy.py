@@ -1,19 +1,17 @@
 from __future__ import annotations
 
+import unittest
 from collections import deque
 from dataclasses import dataclass
 
 import zmq
 
+from sglang.srt.managers.io_struct import msgpack_decode, msgpack_encode, wrap_as_pickle
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
-    ScriptedTokenizerRecvProxy,
-)
+from sglang.test.scripted_runtime.tokenizer_recv_proxy import ScriptedTokenizerRecvProxy
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-import unittest
 
 
 @dataclass
@@ -40,7 +38,7 @@ class _FakeUnderlyingSocket:
     def feed_after_drain_cycles(self, obj: object, *, cycles: int) -> None:
         self._scheduled.append([cycles, obj])
 
-    def recv_pyobj(self, flags: int = 0) -> object:
+    def _pop_ready(self) -> object:
         if self._ready:
             return self._ready.popleft()
 
@@ -51,6 +49,12 @@ class _FakeUnderlyingSocket:
         self._ready.extend(ready_now)
 
         raise zmq.ZMQError(zmq.EAGAIN, "Resource temporarily unavailable")
+
+    def recv(self, flags: int = 0) -> bytes:
+        return msgpack_encode(wrap_as_pickle(self._pop_ready()))
+
+    def recv_pyobj(self, flags: int = 0) -> object:
+        return self._pop_ready()
 
 
 def _is_control(obj: object) -> bool:
@@ -63,6 +67,29 @@ def _is_start_req(rid: str):
 
 class TestScriptedTokenizerRecvProxyRecv(CustomTestCase):
 
+    def test_recv_drains_then_returns_msgpack_bytes_fifo(self):
+        underlying = _FakeUnderlyingSocket()
+        proxy = ScriptedTokenizerRecvProxy(underlying=underlying)
+        first, second = _ControlMsg("a"), _ControlMsg("b")
+        underlying.feed(first)
+        underlying.feed(second)
+
+        self.assertEqual(msgpack_decode(proxy.recv()), first)
+        self.assertEqual(msgpack_decode(proxy.recv()), second)
+
+    def test_recv_empty_noblock_raises_eagain(self):
+        proxy = ScriptedTokenizerRecvProxy(underlying=_FakeUnderlyingSocket())
+
+        with self.assertRaises(zmq.ZMQError) as ctx:
+            proxy.recv(zmq.NOBLOCK)
+        self.assertEqual(ctx.exception.errno, zmq.EAGAIN)
+
+    def test_recv_empty_blocking_raises_runtime_error(self):
+        proxy = ScriptedTokenizerRecvProxy(underlying=_FakeUnderlyingSocket())
+
+        with self.assertRaisesRegex(RuntimeError, "blocking recv is not supported"):
+            proxy.recv()
+
     def test_recv_pyobj_drains_then_pops_fifo(self):
         underlying = _FakeUnderlyingSocket()
         proxy = ScriptedTokenizerRecvProxy(underlying=underlying)
@@ -70,8 +97,8 @@ class TestScriptedTokenizerRecvProxyRecv(CustomTestCase):
         underlying.feed(first)
         underlying.feed(second)
 
-        self.assertIs(proxy.recv_pyobj(), first)
-        self.assertIs(proxy.recv_pyobj(), second)
+        self.assertEqual(proxy.recv_pyobj(), first)
+        self.assertEqual(proxy.recv_pyobj(), second)
 
     def test_recv_pyobj_empty_noblock_raises_eagain(self):
         proxy = ScriptedTokenizerRecvProxy(underlying=_FakeUnderlyingSocket())
@@ -105,7 +132,7 @@ class TestScriptedTokenizerRecvProxyWaitUntilArrived(CustomTestCase):
 
         proxy.wait_until_arrived(_is_control, timeout_s=1.0)
 
-        self.assertIs(proxy.recv_pyobj(), msg)
+        self.assertEqual(proxy.recv_pyobj(), msg)
 
     def test_wait_until_arrived_skips_stale_same_type_object(self):
         proxy, _, _ = self._proxy_with_stale_control()
@@ -120,8 +147,8 @@ class TestScriptedTokenizerRecvProxyWaitUntilArrived(CustomTestCase):
 
         proxy.wait_until_arrived(_is_control, timeout_s=2.0)
 
-        self.assertIs(proxy.recv_pyobj(), stale)
-        self.assertIs(proxy.recv_pyobj(), fresh)
+        self.assertEqual(proxy.recv_pyobj(), stale)
+        self.assertEqual(proxy.recv_pyobj(), fresh)
 
     def test_wait_until_arrived_rid_predicate_ignores_stale_other_rid(self):
         underlying = _FakeUnderlyingSocket()
@@ -134,8 +161,8 @@ class TestScriptedTokenizerRecvProxyWaitUntilArrived(CustomTestCase):
         underlying.feed(new)
         proxy.wait_until_arrived(_is_start_req("new"), timeout_s=1.0)
 
-        self.assertIs(proxy.recv_pyobj(), old)
-        self.assertIs(proxy.recv_pyobj(), new)
+        self.assertEqual(proxy.recv_pyobj(), old)
+        self.assertEqual(proxy.recv_pyobj(), new)
 
     def test_wait_until_arrived_rid_predicate_skips_stale_same_rid(self):
         underlying = _FakeUnderlyingSocket()
