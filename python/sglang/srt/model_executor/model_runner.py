@@ -526,7 +526,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_specific_adjustment()
 
         # Set the global server_args in the scheduler process
-        self.maybe_init_global_server_args(server_args)
+        self.init_global_server_args(server_args)
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -603,6 +603,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+
+        # Restore the target's global server_args (no-op for a target runner).
+        self.maybe_restore_global_server_args()
 
     def _build_model_config(
         self, server_args, model_path=None, model_revision=None, is_draft_model=False
@@ -1156,14 +1159,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"You can fix this by setting arguments `--tp` and `--ep` correctly."
                 )
 
-    def maybe_init_global_server_args(self, server_args: ServerArgs):
-        # Draft workers share the process with their target and must not clobber
-        # the global server_args with their own (possibly mutated) copy.
+    def init_global_server_args(self, server_args: ServerArgs):
+        # The global server_args is a process-wide singleton read during
+        # construction (initialize/capturers) and at runtime. A draft worker
+        # shares the process with its target and may be built from a mutated
+        # copy (DFLASH deep-copies and overrides the draft attention backend and
+        # context length), so it must read its own args while constructing but
+        # leave the target's args installed afterwards. Save the target's args
+        # here and restore them in maybe_restore_global_server_args().
         if self.is_draft_worker:
-            return
+            self._prev_global_server_args = get_global_server_args()
         set_global_server_args_for_scheduler(server_args)
         # FIXME: hacky set `use_mla_backend`
         get_global_server_args().use_mla_backend = self.use_mla_backend
+
+    def maybe_restore_global_server_args(self):
+        if self.is_draft_worker:
+            set_global_server_args_for_scheduler(self._prev_global_server_args)
 
     def init_torch_distributed(self):
         tic = time.perf_counter()
