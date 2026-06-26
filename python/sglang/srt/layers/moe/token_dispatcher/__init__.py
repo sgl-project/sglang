@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPV2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
     FlashinferDispatchOutput,
@@ -70,6 +71,7 @@ __all__ = [
     "StandardCombineInput",
     "DeepEPConfig",
     "DeepEPDispatcher",
+    "DeepEPV2Dispatcher",
     "DeepEPNormalDispatchOutput",
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",

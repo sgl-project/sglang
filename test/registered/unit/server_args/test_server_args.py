@@ -1085,6 +1085,36 @@ class TestDeepEPWaterfillArgs(CustomTestCase):
         self.assertFalse(server_args.disable_cuda_graph)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
 
+    def test_deepep_v2_uses_normal_mode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep_v2",
+            tp_size=4,
+            deepep_mode="auto",
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        # dummy-model path short-circuits __post_init__; invoke the handler directly.
+        server_args._handle_a2a_moe()
+
+        self.assertEqual(server_args.moe_a2a_backend, "deepep_v2")
+        self.assertEqual(server_args.deepep_mode, "normal")
+        self.assertEqual(server_args.ep_size, 4)
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    def test_deepep_v2_rejects_single_batch_overlap(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep_v2",
+            enable_single_batch_overlap=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "deepep_v2.*single-batch"):
+            server_args._handle_a2a_moe()
+
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
