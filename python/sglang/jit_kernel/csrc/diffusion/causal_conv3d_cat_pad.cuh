@@ -5,6 +5,9 @@
 // for 5D NCTHW tensors. It is a memory-bound copy/zero-fill kernel and is only
 // entered for contiguous CUDA tensors; unsupported cases fall back to Triton in
 // the Python caller.
+//
+// Developed with MIT HAN Lab Kernel Design Agents:
+// https://github.com/mit-han-lab/kernel-design-agents
 
 #pragma once
 
