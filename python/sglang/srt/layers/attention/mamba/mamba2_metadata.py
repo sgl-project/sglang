@@ -30,6 +30,16 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # GDN ReplaySSM (slice 1a): per-decode-row snapshot of the ring write
+    # cursor for THIS decode step (gathered from the persistent per-slot
+    # buffer, then advanced once for the next step). int32, length == batch.
+    replayssm_write_pos: Optional[torch.Tensor] = None
+    # GDN ReplaySSM (slice 2b): per-decode-row int32 flush flag for THIS decode
+    # step. !=0 forces the kernel to fold the partial ring + current token into
+    # the checkpoint (temporal[slot]) so the radix cache reads an up-to-date
+    # state. Fires on EXACTLY the rows the radix track snapshots, i.e. the same
+    # condition the track uses: seq_lens_cpu % mamba_track_interval == 0.
+    replayssm_force_flush: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None

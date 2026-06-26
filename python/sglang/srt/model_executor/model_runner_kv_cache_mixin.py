@@ -404,6 +404,8 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    enable_linear_replayssm=self.server_args.enable_linear_replayssm,
+                    linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
