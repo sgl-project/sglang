@@ -415,46 +415,45 @@ class _DeepEPDispatcherImplBase:
             self.npu_quant_tensor = None  # Not used on GPU
     
     def _apply_low_latency_quantization_flags(self) -> None:
-        """Set use_fp8 and use_nvfp4 flags from the resolved output dtype."""
+        """Set use_fp8, use_nvfp4, and fp8_configs from the resolved output dtype."""
         dtype = self.deepep_output_dtype
         self.fp8_configs = dict()
-
+    
         if dtype == DeepEPOutputDtype.BF16:
             self.use_fp8 = False
             self.use_nvfp4 = False
         elif dtype == DeepEPOutputDtype.FP8:
+            # GPU FP8
             self.use_fp8 = True
             self.use_nvfp4 = False
-            # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
-            # to return int32-packed UE8M0 scales that don't feed the flashinfer
-            # cutedsl kernel.
-            self.fp8_configs = (
-                dict(
-                    round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                    and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                    use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                    and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                )
-                if self.use_fp8
-                else dict()
+            # round_scale/use_ue8m0 are DeepGEMM-specific (Blackwell)
+            self.fp8_configs = dict(
+                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         elif dtype == DeepEPOutputDtype.INT8:
-            # Ascend A2/A3 uses int8 quantisation under the 'use_fp8' flag
+            # NPU int8 (mapped from FP8 on Ascend)
             self.use_fp8 = True
             self.use_nvfp4 = False
-            self.fp8_configs = [(False, False)]
+            self.fp8_configs = dict(round_scale=False, use_ue8m0=False)
         elif dtype == DeepEPOutputDtype.NVFP4:
+            # GPU NVFP4
             self.use_fp8 = False
             self.use_nvfp4 = True
         elif dtype in (
             DeepEPOutputDtype.MXFP8_e4m3fn,
             DeepEPOutputDtype.MXFP8_e5m2,
         ):
+            # NPU MXFP8
             self.use_fp8 = True
             self.use_nvfp4 = False
-            self.fp8_configs = [(True, True)]
+            self.fp8_configs = dict(round_scale=True, use_ue8m0=True)
         elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
-            raise ValueError(f"Ascend does not support {dtype} quantization in low_latency mode now")
+            raise ValueError(
+                "Ascend does not support MXFP4_e2m1fn_x2 quantization in low_latency mode"
+            )
         else:
             raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
 
