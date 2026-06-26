@@ -171,4 +171,9 @@ export const benchmarks = [
   { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "multi-2" } },
   { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced",        nodes: "multi-2" } },
   { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "multi-2" } },
+  // ---- NVFP4 (Blackwell Ultra) placeholder cells ----  benchmarks pending
+  { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "balanced",    nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced",    nodes: "single" } },
 ];

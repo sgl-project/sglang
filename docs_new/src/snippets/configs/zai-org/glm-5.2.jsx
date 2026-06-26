@@ -15,6 +15,8 @@ export const config = {
   quantizations: [
     { id: "fp8", label: "FP8" },
     { id: "bf16", label: "BF16" },
+    // NVFP4 (Blackwell-only) — placeholder, Blackwell-Ultra (b300/gb300) cells below.
+    { id: "nvfp4", label: "NVFP4" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -29,6 +31,9 @@ export const config = {
   modelNames: {
     "default|fp8": "zai-org/GLM-5.2-FP8",
     "default|bf16": "zai-org/GLM-5.2",
+    // Official NVIDIA NVFP4 build (Model Optimizer) — quantizes only the MoE-expert
+    // linears; the shared expert stays unquantized. Blackwell-only.
+    "default|nvfp4": "nvidia/GLM-5.2-NVFP4",
   },
 
   placeholders: {
@@ -626,6 +631,62 @@ sgl-eval run aime25 \\
         "--max-running-requests 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // NVFP4 (Blackwell Ultra) — PLACEHOLDER cells. b300 (8-GPU, TP8) and
+    // gb300 (4-GPU single node, TP4); low-latency + balanced only (no
+    // high-throughput / multi-node yet). The official NVIDIA NVFP4 build
+    // (nvidia/GLM-5.2-NVFP4, Model Optimizer) fits a single Blackwell-Ultra
+    // node. The verified launch recipe (TP / --quantization modelopt_fp4 /
+    // MTP) is still pending, so these are stubs marked verified:false: the
+    // NVFP4 chip appears (and greys out on H200/B200 + high-throughput /
+    // multi-node) but never advertises an untested command. Only the launch
+    // flags are a stub — replace them when measured end-to-end.
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "# TODO(nvfp4): placeholder — replace with the verified NVFP4 launch flags (TP / --quantization modelopt_fp4 / MTP)",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "# TODO(nvfp4): placeholder — replace with the verified NVFP4 launch flags (TP / --quantization modelopt_fp4 / MTP)",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "# TODO(nvfp4): placeholder — replace with the verified NVFP4 launch flags (TP / --quantization modelopt_fp4 / MTP)",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "# TODO(nvfp4): placeholder — replace with the verified NVFP4 launch flags (TP / --quantization modelopt_fp4 / MTP)",
       ],
     },
   ],
