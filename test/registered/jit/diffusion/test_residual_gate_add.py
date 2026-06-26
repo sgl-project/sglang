@@ -66,6 +66,15 @@ def test_can_use_residual_gate_add_cuda_rejects_unsupported_inputs():
     assert not can_use_residual_gate_add_cuda(residual, update[:, ::2], gate)
     assert not can_use_residual_gate_add_cuda(residual, update, gate[:, :, ::2])
 
+    # Only [1, ..., 1, D] row-broadcast gates are supported; a batched
+    # [B>1, 1, D] gate is not row-broadcast here and must fall back.
+    batched_residual = torch.randn((2, 8, 64), device="cuda", dtype=torch.bfloat16)
+    batched_update = torch.randn_like(batched_residual)
+    batched_gate = torch.randn((2, 1, 64), device="cuda", dtype=torch.bfloat16)
+    assert not can_use_residual_gate_add_cuda(
+        batched_residual, batched_update, batched_gate
+    )
+
 
 def test_residual_gate_add_custom_op_torch_compile_fullgraph():
     residual = torch.randn((1, 32, 128), device="cuda", dtype=torch.bfloat16)
