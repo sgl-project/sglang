@@ -927,61 +927,59 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(
+            hidden_states, gemm_output_zero_allocator
+        )
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
             else None
         )
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-        if use_flashinfer_trtllm_bypass:
-            topk_output = BypassedTopKOutput(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_config=self.topk.topk_config,
-            )
-        else:
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
-        has_shared_output = (
-            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
-        )
-        deferred_finalize = (
-            has_shared_output
-            and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
-        )
-        if deferred_finalize:
-            final_hidden_states = self.experts.forward_deferred_finalize(
-                hidden_states, topk_output
-            )
-        elif use_flashinfer_trtllm_bypass:
-            final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
-        else:
-            final_hidden_states = self.experts(hidden_states, topk_output)
-        if (
-            not _is_cuda
-            and not _is_musa
-            and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
-            final_hidden_states *= self.routed_scaling_factor
-
         with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            if use_flashinfer_trtllm_bypass:
+                topk_output = BypassedTopKOutput(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_config=self.topk.topk_config,
+                )
+            else:
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
+                )
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
+            deferred_finalize = (
+                shared_output is not None
+                and not self._shared_expert_tp1
+                and topk_output.format == TopKOutputFormat.BYPASSED
+                and self.experts.supports_deferred_finalize
             )
+            if deferred_finalize:
+                final_hidden_states = self.experts.forward_deferred_finalize(
+                    hidden_states, topk_output
+                )
+            elif use_flashinfer_trtllm_bypass:
+                final_hidden_states = self.experts.forward_impl(
+                    hidden_states, topk_output
+                )
+            else:
+                final_hidden_states = self.experts(hidden_states, topk_output)
+            if (
+                not _is_cuda
+                and not _is_musa
+                and not _use_aiter
+                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            ):
+                final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
 
