@@ -26,6 +26,11 @@ class FusedAGemmBackend(str, Enum):
     CUTEDSL = "cutedsl"
 
 
+_AUTO_BACKEND = (
+    FusedAGemmBackend.CUTEDSL if is_sm120_supported() else FusedAGemmBackend.JIT
+)
+
+
 def dsv3_fused_a_gemm(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -34,9 +39,7 @@ def dsv3_fused_a_gemm(
 ) -> torch.Tensor:
     backend = FusedAGemmBackend(backend)
     if backend == FusedAGemmBackend.AUTO:
-        backend = (
-            FusedAGemmBackend.CUTEDSL if is_sm120_supported() else FusedAGemmBackend.JIT
-        )
+        backend = _AUTO_BACKEND
 
     if backend == FusedAGemmBackend.AOT:
         from sgl_kernel import dsv3_fused_a_gemm as impl
