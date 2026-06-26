@@ -220,7 +220,7 @@ class FwdOccupancyMixin:
 
         # Occupancy table.
         print(
-            "\n"
+            "\n\n"
             + tabulate.tabulate(
                 [
                     ["samples (n)", len(samples)],
