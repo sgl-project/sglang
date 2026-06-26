@@ -337,9 +337,9 @@ jobs:
         run: |
           status_emoji() {
             case "$1" in
-              pass)   echo "鉁? ;;
-              fail)   echo "鉂? ;;
-              *)      echo "鉂? ;;
+              pass)   echo "✅" ;;
+              fail)   echo "❌" ;;
+              *)      echo "❓" ;;
             esac
           }
 
@@ -350,11 +350,11 @@ jobs:
 
           group_icon() {
             case "$1" in
-              success)   echo "鉁? ;;
-              failure)   echo "鉂? ;;
-              cancelled) echo "鈴笍" ;;
-              skipped)   echo "鈴笍" ;;
-              *)         echo "鉂? ;;
+              success)   echo "✅" ;;
+              failure)   echo "❌" ;;
+              cancelled) echo "⏭️" ;;
+              skipped)   echo "⏭️" ;;
+              *)         echo "❓" ;;
             esac
           }
 
@@ -382,7 +382,7 @@ jobs:
               echo "tc = d.get('test_case', '-')" >> /tmp/parse_metrics.py
               echo "tp = d.get('test_type', '-')" >> /tmp/parse_metrics.py
               echo "st = d.get('status', 'unknown')" >> /tmp/parse_metrics.py
-              echo "icon = '鉁? if st == 'pass' else '鉂?" >> /tmp/parse_metrics.py
+              echo "icon = '✅' if st == 'pass' else '❌'" >> /tmp/parse_metrics.py
               echo "metrics = d.get('metrics', {})" >> /tmp/parse_metrics.py
               echo "baselines = d.get('baselines', {})" >> /tmp/parse_metrics.py
               echo "mstr = ', '.join(f'{k}={v}' for k,v in metrics.items()) if metrics else '-'" >> /tmp/parse_metrics.py
