@@ -57,6 +57,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -520,8 +521,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         max_bs = self.max_bs
         num_tokens_per_bs = self.num_tokens_per_bs
         max_num_token = max_bs * num_tokens_per_bs
-        hidden_size = EagleDraftExtendInput.hidden_size_for(self.eagle_worker)
-        dtype = EagleDraftExtendInput.dtype_for(self.eagle_worker)
+        hidden_size = get_draft_input_from_target_hidden_dim(self.model_runner)
+        dtype = self.model_runner.model_config.dtype
         vocab_size = self._vocab_size()
 
         seq_lens_cpu = torch.full((max_bs,), self.seq_len_fill_value, dtype=torch.int32)
