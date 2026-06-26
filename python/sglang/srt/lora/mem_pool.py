@@ -382,6 +382,54 @@ class LoRAMemoryPool:
         cache[key] = out
         return out
 
+    def _column_parallel_out_partition(
+        self, module_name: str, base_model: torch.nn.Module, layer_idx: int
+    ):
+        """Actual per-rank output dim of a non-MoE column-parallel base module.
+
+        Reads ``output_size_per_partition`` from the matching base linear -- the
+        ground truth that ``set_lora_info`` validates against. Critically handles
+        the dense MLP ``gate_up_proj`` that is fully REPLICATED under
+        ``--moe-dense-tp-size 1`` (``output_size_per_partition == output_size``),
+        where dividing ``get_hidden_dim``'s output by the global ``tp_size``
+        undersizes LoRA-B and raises "LoRA B output dim != base partition prefix
+        dim". Returns ``None`` if no base module is found. Cached per
+        ``(module_name, layer_idx)``.
+        """
+        cache = getattr(self, "_col_parallel_out_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_col_parallel_out_cache", cache)
+        key = (module_name, layer_idx)
+        if key in cache:
+            return cache[key]
+
+        layer_markers = (f".layers.{layer_idx}.", f"layers.{layer_idx}.")
+
+        def _probe(m):
+            ops = getattr(m, "output_size_per_partition", None)
+            if ops is not None and ops > 0:
+                return ops
+            inner = getattr(m, "base_layer", None)
+            if inner is not None and inner is not m:
+                return _probe(inner)
+            return None
+
+        suffix = f".{module_name}"
+        found = None
+        for _name, module in base_model.named_modules():
+            if not _name.endswith(suffix):
+                continue
+            if not any(marker in _name for marker in layer_markers):
+                continue
+            r = _probe(module)
+            if r is not None:
+                found = r
+                break
+
+        cache[key] = found
+        return found
+
     def _get_standard_shape(
         self,
         module_name: str,
@@ -529,9 +577,25 @@ class LoRAMemoryPool:
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = self._column_parallel_lora_b_per_rank_dim(
-                module_name, output_dim, effective_tp_size
+            # If the base column-parallel module is fully REPLICATED (its actual
+            # output_size_per_partition still equals the full output_dim -- e.g. the
+            # dense MLP gate_up under --moe-dense-tp-size 1), its output is NOT
+            # sharded, so keep LoRA-B at the full output dim. Dividing by the global
+            # tp_size here undersizes B and crashes set_lora_info ("LoRA B output dim
+            # != base partition prefix dim"). Non-MoE only; MoE shards by moe_tp_size.
+            probed_out = (
+                None
+                if self.is_moe_module(module_name)
+                else self._column_parallel_out_partition(
+                    module_name, base_model, layer_idx
+                )
             )
+            if probed_out is not None and probed_out == output_dim:
+                pass  # replicated base: keep full B output dim
+            else:
+                output_dim = self._column_parallel_lora_b_per_rank_dim(
+                    module_name, output_dim, effective_tp_size
+                )
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
