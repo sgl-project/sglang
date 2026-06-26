@@ -262,8 +262,8 @@ class FutureMap:
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
-        # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
-        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
+        # schedule). Some spec inputs keep host-side planning lengths outside
+        # FutureMap; the hook below lets them skip the CPU mirror.
         draft_input = batch.spec_info
         if draft_input is None:
             return
@@ -278,6 +278,9 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
+
+        if not draft_input.future_map_updates_seq_lens_cpu():
+            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);

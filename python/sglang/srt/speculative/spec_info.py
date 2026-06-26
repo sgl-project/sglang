@@ -277,6 +277,12 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
+    def prepare_for_decode(self, batch: ScheduleBatch) -> bool:
+        return False
+
+    def future_map_updates_seq_lens_cpu(self) -> bool:
+        return True
+
     @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         pass

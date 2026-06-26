@@ -653,12 +653,9 @@ def commit_mamba_states_after_verify(
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
-    """eagle/ngram share a stateless free function; dflash keeps stateful
-    prep on its draft input -- the dispatcher routes.
-    """
-    if batch.spec_algorithm.is_dflash():
-        batch.spec_info.prepare_for_decode(batch)
-    else:
-        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+    if batch.spec_info is not None and batch.spec_info.prepare_for_decode(batch):
+        return
 
-        eagle_prepare_for_decode(batch)
+    from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+    eagle_prepare_for_decode(batch)
