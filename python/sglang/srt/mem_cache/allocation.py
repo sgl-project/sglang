@@ -365,6 +365,14 @@ def alloc_for_extend(
             batch.seq_lens_cpu,
         )
 
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+    for req, seq_len in zip(batch.reqs, batch.seq_lens_cpu.tolist()):
+        if req.kv is None:
+            req.kv = ReqKvInfo(kv_allocated_len=seq_len, swa_evicted_seqlen=0)
+        else:
+            req.kv.kv_allocated_len = seq_len
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
 
@@ -472,5 +480,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch.seq_lens_cpu + token_per_req,
             token_per_req,
         )
+
+    for req in batch.reqs:
+        req.kv.kv_allocated_len += token_per_req
 
     return out_cache_loc

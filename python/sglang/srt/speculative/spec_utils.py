@@ -15,18 +15,25 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+from sglang.srt.mem_cache.allocation import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+)
+from sglang.srt.mem_cache.allocation import (
+    assign_req_to_token_pool as assign_req_to_token_pool,
+)
+from sglang.srt.mem_cache.allocation import (
+    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
+)
+from sglang.srt.mem_cache.allocation import (
+    get_last_loc,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool as assign_req_to_token_pool,
-)
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     filter_finished_cache_loc_kernel as filter_finished_cache_loc_kernel,
@@ -57,6 +64,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -662,3 +671,46 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
         eagle_prepare_for_decode(batch)
+
+
+def alloc_for_spec_decode(
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    *,
+    reqs: list[Req],
+    req_pool_indices: torch.Tensor,
+    cur_kv_lens: torch.Tensor,
+    cur_kv_lens_cpu: torch.Tensor,
+    nxt_kv_lens: torch.Tensor,
+    nxt_kv_lens_cpu: torch.Tensor,
+    num_needed_tokens: int,
+) -> None:
+    if num_needed_tokens > 0:
+        if tree_cache.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
+            )
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache,
+                cur_kv_lens,
+                cur_kv_lens_cpu,
+                nxt_kv_lens,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+            )
+        # Updating req_to_token is a write to a shared tensor: it must not overlap
+        # with the previous batch's forward, which also reads req_to_token.
+        assign_req_to_token_pool_func(
+            req_pool_indices,
+            req_to_token_pool.req_to_token,
+            cur_kv_lens,
+            nxt_kv_lens,
+            out_cache_loc,
+            len(reqs),
+        )
+
+    for i, req in enumerate(reqs):
+        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
