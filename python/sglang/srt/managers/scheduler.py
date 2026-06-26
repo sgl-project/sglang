@@ -156,6 +156,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
+    RelayPayload,
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
@@ -453,6 +454,7 @@ class Scheduler(
             enable_metrics=self.server_args.enable_metrics,
             enable_kv_cache_events=bool(
                 self.server_args.kv_events_config
+                and self.ps.pp_rank == 0
                 and self.ps.attn_tp_rank == 0
                 and self.ps.attn_cp_rank == 0
             ),
@@ -610,6 +612,7 @@ class Scheduler(
                         f"Page size now falls back to {self.dllm_config.block_size}"
                     )
                     self.page_size = self.dllm_config.block_size
+                    self.server_args.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
         is_rank_zero = (
@@ -1210,6 +1213,8 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -1292,7 +1297,7 @@ class Scheduler(
             request_lengths = []
             for req in batch.reqs:
                 start = len(req.prefix_indices)
-                end = start + req.extend_input_len
+                end = start + req.extend_range.length
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
@@ -1761,7 +1766,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2447,8 +2452,8 @@ class Scheduler(
         req.tokenizer = self.tokenizer
 
         # Handle multimodal inputs
-        if recv_req.image_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.image_inputs)
+        if recv_req.mm_inputs is not None:
+            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.
@@ -2579,7 +2584,9 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(batch.req_pool_indices, last_tokens)
+        self.future_map.stash(
+            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+        )
         batch.input_ids = None
 
         if batch.return_logprob:
@@ -2620,7 +2627,7 @@ class Scheduler(
             # beyond what is already cached. A parked chunk (add_chunked_req
             # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
             # so there is nothing new to cache and stashing would be a no-op.
-            if self.chunked_req.fill_len > len(self.chunked_req.prefix_indices):
+            if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
@@ -2971,7 +2978,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_input_len
+                    self.chunked_req.extend_range.length
                     if self.chunked_req is not None
                     else 0
                 ),
@@ -3200,6 +3207,11 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in batch.reqs:
+                self.maybe_send_cached_prefix_chunk(req)
+
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
@@ -3247,12 +3259,7 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            stash_payload = (
-                                batch_result.next_draft_input
-                                if not batch.spec_algorithm.is_none()
-                                else batch_result.next_token_ids
-                            )
-                            self.future_map.stash(future_indices, stash_payload)
+                            self._relay_forward_payload(future_indices, batch_result)
                             # Result D2H on copy_stream overlaps the next forward
                             # instead of serializing on forward_stream; it's a leaf
                             # gated by copy_done, so nothing on forward_stream waits.
@@ -3274,10 +3281,7 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    self.future_map.stash(
-                        batch.req_pool_indices, batch_result.next_token_ids
-                    )
+                self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
@@ -3311,11 +3315,9 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                if isinstance(batch_result.next_token_ids, torch.Tensor):
+                if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
-                    self.future_map.stash(
-                        batch.req_pool_indices, batch_result.next_token_ids
-                    )
+                    self._relay_forward_payload(batch.req_pool_indices, batch_result)
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3324,11 +3326,12 @@ class Scheduler(
             # we can use the correct values in output processing.
             if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
-                    req.extend_input_len for req in batch.reqs
+                    req.extend_range.length if req.extend_range is not None else 0
+                    for req in batch.reqs
                 ]
-                batch_result.extend_logprob_start_len_per_req = [
-                    req.extend_logprob_start_len for req in batch.reqs
-                ]
+                batch_result.extend_logprob_start_len_per_req = (
+                    batch.extend_logprob_start_lens
+                )
             else:
                 batch_result.extend_input_len_per_req = None
                 batch_result.extend_logprob_start_len_per_req = None
@@ -3373,6 +3376,21 @@ class Scheduler(
             ActiveRanksOutput(status=dp_active_ranks.tolist())
         )
 
+    def _relay_forward_payload(
+        self, future_indices: torch.Tensor, batch_result: GenerationBatchResult
+    ) -> None:
+        """Stash this iter's relay payload for next iter's resolve_forward_inputs.
+        ngram is skipped: it relays its draft via batch.spec_info, not the FutureMap."""
+        if self.spec_algorithm.is_ngram():
+            return
+        if batch_result.next_draft_input is not None:
+            payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
+        elif batch_result.has_sampled_token_ids:
+            payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
+        else:
+            return
+        self.future_map.stash(future_indices, payload)
+
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult]:
@@ -3385,10 +3403,8 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            # Delay-sample is non-spec only; stash takes next_token_ids tensor.
-            self.future_map.stash(
-                batch_result.future_indices, batch_result.next_token_ids
-            )
+            # Delay-sample is non-spec only; relays the sampled bonus tokens.
+            self._relay_forward_payload(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
@@ -3779,9 +3795,13 @@ class Scheduler(
             for k, v in server_args_dict.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
+
+        server_args = dict(vars(get_global_server_args()))
+        # This field is not serializable.
+        server_args.pop("model_config", None)
         return SetInternalStateReqOutput(
-            updated=True,
-            server_args=vars(get_global_server_args()),
+            updated=if_success,
+            server_args=server_args,
         )
 
     def save_remote_model(self, **kwargs):
@@ -3810,7 +3830,7 @@ class Scheduler(
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
         barrier()
-        return RpcReqOutput(success, "" if not exec else str(exec))
+        return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
@@ -4032,14 +4052,16 @@ class Scheduler(
         success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
             recv_req
         )
-        return InitWeightsSendGroupForRemoteInstanceReqOutput(success, message)
+        return InitWeightsSendGroupForRemoteInstanceReqOutput(
+            success=success, message=message
+        )
 
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
-        return SendWeightsToRemoteInstanceReqOutput(success, message)
+        return SendWeightsToRemoteInstanceReqOutput(success=success, message=message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time
@@ -4065,7 +4087,9 @@ class Scheduler(
             # Radix-native: open is implicit; explicit open only permits id reuse.
             session_id = recv_req.session_id
             self.tree_cache.register_session(session_id)
-            output = OpenSessionReqOutput(session_id, session_id is not None)
+            output = OpenSessionReqOutput(
+                session_id=session_id, success=session_id is not None
+            )
         else:
             output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
