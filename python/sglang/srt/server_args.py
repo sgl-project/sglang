@@ -4906,10 +4906,15 @@ class ServerArgs:
                             f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {self.attention_backend}"
                         )
                     else:  # !FA4 + MHA
+                        # NVFP4 KV is uint8-packed; only a backend with an fp4
+                        # unpack/dequant path can read it. triton / torch_native /
+                        # flex_attention route the extend op to Triton's
+                        # extend_attention_fwd, whose `tl.dot` rejects the uint8
+                        # KV ("only int8 supported") and SIGQUITs the scheduler on
+                        # the first prefill (notably Gemma-4, whose default backend
+                        # is triton). Restrict KV4 MHA to the fp4-capable kernels so
+                        # an incompatible choice fails clearly at startup instead.
                         KV4_ATTENTION_MHA_BACKEND_CHOICES = [
-                            "triton",
-                            "torch_native",
-                            "flex_attention",
                             "trtllm_mha",
                         ]
                         if is_sm120_supported():
