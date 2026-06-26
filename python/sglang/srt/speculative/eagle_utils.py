@@ -6,12 +6,12 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.common import (
+from sglang.srt.mem_cache.allocation import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
-    get_alloc_reserve_per_decode,
     get_last_loc,
 )
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
