@@ -199,7 +199,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                # HiSparse allocates the indexer device buffer at
+                # index_buf_size = size * host_to_device_ratio (see
+                # HiSparseDSATokenToKVPool). The per-token budget must scale the
+                # indexer term by the same ratio, otherwise max_total_num_tokens
+                # is over-estimated and startup OOMs when ratio > 1.
+                indexer_ratio = 1
+                if mr.enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    indexer_ratio = parse_hisparse_config(
+                        mr.server_args
+                    ).host_to_device_ratio
+                cell_size += int(
+                    indexer_size_per_token * num_layers * element_size * indexer_ratio
+                )
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)
