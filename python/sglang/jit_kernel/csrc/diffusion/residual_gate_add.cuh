@@ -12,9 +12,10 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>   // For host dtype helpers and TensorView metadata
+#include <sgl_kernel/tensor.h>  // For host dtype helpers and TensorView metadata
+#include <sgl_kernel/utils.h>   // For RuntimeCheck and div_ceil
+
 #include <sgl_kernel/type.cuh>   // For dtype_trait conversions
-#include <sgl_kernel/utils.h>    // For RuntimeCheck and div_ceil
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel and CUDA dtype aliases
 
 #include <cstdint>
@@ -202,7 +203,7 @@ inline void launch_residual_gate_add(
   constexpr int kVec = 16 / sizeof(T);
 
   const bool vec_ok = aligned16(residual_ptr) && aligned16(update_ptr) && aligned16(gate_ptr) && aligned16(out_ptr) &&
-      (D % kVec == 0) && (mode == GateMode::kBcastRow || total % kVec == 0);
+                      (D % kVec == 0) && (mode == GateMode::kBcastRow || total % kVec == 0);
 
   int64_t done = 0;
   if (vec_ok) {
@@ -210,12 +211,7 @@ inline void launch_residual_gate_add(
     const int64_t row_vec = D / kVec;
     if (mode == GateMode::kFull) {
       host::LaunchKernel(static_cast<uint32_t>(grid_for(n_vec)), kBlockSize, out.device())(
-          residual_gate_add_vec_kernel<T, kVec>,
-          residual_ptr,
-          update_ptr,
-          gate_ptr,
-          out_ptr,
-          n_vec);
+          residual_gate_add_vec_kernel<T, kVec>, residual_ptr, update_ptr, gate_ptr, out_ptr, n_vec);
     } else {
       const int64_t rows = total / D;
       const int64_t col_blocks = host::div_ceil(row_vec, static_cast<int64_t>(kBcastColsVecPerBlock));
@@ -225,13 +221,7 @@ inline void launch_residual_gate_add(
           dim3(static_cast<uint32_t>(col_blocks), static_cast<uint32_t>(row_blocks)),
           dim3(kBcastColsVecPerBlock),
           out.device())(
-          residual_gate_add_bcast_row_tile_kernel<T, kVec>,
-          residual_ptr,
-          update_ptr,
-          gate_ptr,
-          out_ptr,
-          rows,
-          row_vec);
+          residual_gate_add_bcast_row_tile_kernel<T, kVec>, residual_ptr, update_ptr, gate_ptr, out_ptr, rows, row_vec);
     }
     done = n_vec * kVec;
   }
@@ -276,7 +266,8 @@ inline GateMode validate_residual_gate_add(
   host::RuntimeCheck(gate.device().device_type == kDLCUDA, "gate must be CUDA");
   host::RuntimeCheck(out.device().device_type == kDLCUDA, "out must be CUDA");
   host::RuntimeCheck(
-      residual.device().device_id == update.device().device_id && residual.device().device_id == gate.device().device_id &&
+      residual.device().device_id == update.device().device_id &&
+          residual.device().device_id == gate.device().device_id &&
           residual.device().device_id == out.device().device_id,
       "residual/update/gate/out must be on the same CUDA device");
   host::RuntimeCheck(residual.ndim() >= 2, "residual must be at least 2D");
@@ -318,11 +309,8 @@ inline GateMode validate_residual_gate_add(
 
 template <typename T>
 struct ResidualGateAddKernel {
-  static void run(
-      tvm::ffi::TensorView out,
-      tvm::ffi::TensorView residual,
-      tvm::ffi::TensorView update,
-      tvm::ffi::TensorView gate) {
+  static void
+  run(tvm::ffi::TensorView out, tvm::ffi::TensorView residual, tvm::ffi::TensorView update, tvm::ffi::TensorView gate) {
     const GateMode mode = validate_residual_gate_add<T>(out, residual, update, gate);
     launch_residual_gate_add<T>(out, residual, update, gate, mode);
   }
