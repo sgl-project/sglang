@@ -1,4 +1,11 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -54,6 +61,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub bootstrap_room_counter: AtomicU64,
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -185,6 +193,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            bootstrap_room_counter: AtomicU64::new(0),
         })
     }
 
@@ -236,6 +245,7 @@ impl PDRouter {
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
 
     fn inject_bootstrap_into_value(
+        &self,
         mut original: Value,
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
@@ -244,14 +254,33 @@ impl PDRouter {
             .as_object_mut()
             .ok_or_else(|| "Request must be a JSON object".to_string())?;
 
+        // Check if the worker exposes DP information.  When it does, encode the
+        // DP rank into bootstrap_room via  bootstrap_room = dp_rank + nonce * dp_size
+        // so the engine routes this request to the correct DP rank.
+        let (use_deterministic, dp_rank, dp_size) =
+            match (prefill_worker.dp_rank(), prefill_worker.dp_size()) {
+                (Some(rank), Some(size)) if size > 0 => (true, rank as u64, size as u64),
+                _ => (false, 0, 0),
+            };
+        // Note: dp_rank / dp_size are only meaningful when use_deterministic is true.
+
         if let Some(n) = batch_size {
             let mut hosts = Vec::with_capacity(n);
             let mut ports = Vec::with_capacity(n);
             let mut rooms = Vec::with_capacity(n);
-            for _ in 0..n {
+
+            // Fetch counter once for the entire batch, then derive per-item nonces.
+            let base_nonce = use_deterministic
+                .then(|| self.bootstrap_room_counter.fetch_add(1, Ordering::Relaxed));
+
+            for i in 0..n {
                 hosts.push(prefill_worker.bootstrap_host());
                 ports.push(prefill_worker.bootstrap_port());
-                rooms.push(super::pd_types::generate_room_id());
+                let room = match base_nonce {
+                    Some(nonce) => dp_rank + (nonce + i as u64) * dp_size,
+                    None => super::pd_types::generate_room_id(),
+                };
+                rooms.push(room);
             }
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -275,6 +304,12 @@ impl PDRouter {
                 Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
         } else {
+            let room = if use_deterministic {
+                let nonce = self.bootstrap_room_counter.fetch_add(1, Ordering::Relaxed);
+                dp_rank + nonce * dp_size
+            } else {
+                super::pd_types::generate_room_id()
+            };
             // Use static string keys to avoid per-request allocations
             obj.insert(
                 Self::BOOTSTRAP_HOST_KEY.to_string(),
@@ -287,10 +322,7 @@ impl PDRouter {
                     None => Value::Null,
                 },
             );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::from(super::pd_types::generate_room_id()),
-            );
+            obj.insert(Self::BOOTSTRAP_ROOM_KEY.to_string(), Value::from(room));
         }
         Ok(original)
     }
@@ -323,26 +355,12 @@ impl PDRouter {
         worker: &dyn Worker,
         json_request: Cow<'a, Value>,
     ) -> Result<PreparedWorkerRequest<'a>, String> {
-        let body = if worker.is_dp_aware() {
-            Cow::Owned(
-                worker
-                    .prepare_request(json_request.into_owned())
-                    .await
-                    .map_err(|err| {
-                        format!(
-                            "Failed to prepare request for worker {}: {}",
-                            worker.url(),
-                            err
-                        )
-                    })?,
-            )
-        } else {
-            json_request
-        };
-
+        // PD mode uses deterministic bootstrap_room for DP-rank routing.
+        // DPAwareWorker.prepare_request (which injects data_parallel_rank) is
+        // not needed here — the non-PD Router handles that path separately.
         Ok(PreparedWorkerRequest {
             endpoint_url: Self::worker_endpoint_url(worker, route),
-            body,
+            body: json_request,
         })
     }
 
@@ -420,7 +438,7 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
-                        json_request = match Self::inject_bootstrap_into_value(
+                        json_request = match self.inject_bootstrap_into_value(
                             json_request,
                             prefill.as_ref(),
                             context.batch_size,
@@ -1663,6 +1681,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            bootstrap_room_counter: AtomicU64::new(0),
         }
     }
 
@@ -1786,7 +1805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prepare_pd_worker_requests_uses_dp_aware_rank() {
+    async fn test_prepare_pd_worker_requests_dp_aware() {
         let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
             .worker_type(WorkerType::Prefill {
                 bootstrap_port: Some(8998),
@@ -1812,17 +1831,23 @@ mod tests {
             prefill_request.endpoint_url,
             "http://prefill:30000/v1/completions"
         );
-        assert_eq!(prefill_request.body["data_parallel_rank"], 2);
-        assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
-
         assert_eq!(
             decode_request.endpoint_url,
             "http://decode:30001/v1/completions"
         );
-        assert_eq!(decode_request.body["data_parallel_rank"], 1);
+
+        // PD mode does not inject data_parallel_rank (deterministic
+        // bootstrap_room alone handles DP routing).
+        assert!(prefill_request.body.get("data_parallel_rank").is_none());
+        assert!(decode_request.body.get("data_parallel_rank").is_none());
+
+        // disagg_prefill_dp_rank is still injected for KV-cache discovery.
+        assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
-        assert_eq!(decode_request.body["bootstrap_room"], 1234);
-        assert!(matches!(prefill_request.body, Cow::Owned(_)));
+
+        // Prefill body is borrowed (no allocation); decode body is owned
+        // because inject_prefill_dp_rank_for_decode forces an allocation.
+        assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Owned(_)));
     }
 
@@ -1860,6 +1885,85 @@ mod tests {
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
         assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
+    }
+
+    // ── Deterministic bootstrap_room (when worker exposes DP rank) ──
+
+    #[test]
+    fn test_deterministic_bootstrap_room_single() {
+        let router = create_test_pd_router();
+        let worker = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let request = json!({"prompt": "hello"});
+
+        let r1 = router
+            .inject_bootstrap_into_value(request.clone(), &worker, None)
+            .unwrap();
+        let r2 = router
+            .inject_bootstrap_into_value(request.clone(), &worker, None)
+            .unwrap();
+
+        let room1: u64 = serde_json::from_value(r1["bootstrap_room"].clone()).unwrap();
+        let room2: u64 = serde_json::from_value(r2["bootstrap_room"].clone()).unwrap();
+
+        // Both map to dp_rank=2 with dp_size=4
+        assert_eq!(room1 % 4, 2, "room1 % 4 should equal dp_rank 2");
+        assert_eq!(room2 % 4, 2, "room2 % 4 should equal dp_rank 2");
+        // Unique across requests (nonce increments)
+        assert_ne!(room1, room2, "consecutive rooms must differ");
+    }
+
+    #[test]
+    fn test_deterministic_bootstrap_room_batch() {
+        let router = create_test_pd_router();
+        let worker = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let request = json!({"prompt": "hello"});
+
+        let result = router
+            .inject_bootstrap_into_value(request.clone(), &worker, Some(3))
+            .unwrap();
+
+        let rooms: Vec<u64> = serde_json::from_value(result["bootstrap_room"].clone()).unwrap();
+
+        assert_eq!(rooms.len(), 3);
+        for (i, &room) in rooms.iter().enumerate() {
+            assert_eq!(
+                room % 4,
+                2,
+                "batch item {}: room {} % 4 should equal dp_rank 2",
+                i,
+                room
+            );
+        }
+        // All three are unique
+        let unique: std::collections::HashSet<u64> = rooms.into_iter().collect();
+        assert_eq!(unique.len(), 3, "all batch items must have unique rooms");
+    }
+
+    #[test]
+    fn test_deterministic_bootstrap_room_non_dp_worker() {
+        // When the worker is a BasicWorker (no dp_rank), fall back to random.
+        let router = create_test_pd_router();
+        let worker = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let request = json!({"prompt": "hello"});
+
+        let r = router
+            .inject_bootstrap_into_value(request, &worker, None)
+            .unwrap();
+        let room: u64 = serde_json::from_value(r["bootstrap_room"].clone()).unwrap();
+
+        assert!(room <= (i64::MAX as u64), "room must be in [0, 2^63-1]");
     }
 
     #[test]
