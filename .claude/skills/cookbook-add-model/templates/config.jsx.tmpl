@@ -1,0 +1,405 @@
+// TEMPLATE — instantiate via the cookbook-add-model skill. NOT a live cookbook.
+// Copy to docs_new/src/snippets/configs/<hf-org>/<model-slug>.jsx, then:
+//   1. replace every __TOKEN__,
+//   2. fill cells[] with your verified recipes (the examples below show the shape),
+//   3. DELETE the hardware / playground axes / quantizations your model lacks.
+//
+// Instantiation tokens (skill fills these; distinct from the engine's runtime
+// {{PLACEHOLDER}} which MUST survive verbatim into the output):
+//   __MODEL_DISPLAY__   display name, e.g. "DeepSeek-V4"
+//   __MODEL_SLUG__      file slug, e.g. "deepseek-v4"
+//   __HF_ORG__          HuggingFace org, e.g. "deepseek-ai"
+//   __HF_REPO__         HuggingFace repo, e.g. "DeepSeek-V4-Flash"
+//   __REASONING_PARSER__  e.g. "deepseek-v4"  (delete the parsers axis if none)
+//   __TOOLCALL_PARSER__   e.g. "deepseekv4"   (delete the parsers axis if none)
+//
+// Mintlify: single `export const config = {...}` literal — no spreads/calls/IIFE,
+// no `!(x in y)`. Cells are denormalized: no --nnodes/--node-rank/--dist-init-addr/
+// --host/--port literals (the engine injects them).
+
+export const config = {
+  modelName: "__MODEL_DISPLAY__",
+
+  // List ONLY hardware you ship a cell for; unlisted ids auto-grey-out. The full
+  // catalog is below — delete the families your model doesn't support (e.g. drop
+  // every `mi*` if there's no AMD recipe).
+  supportedHardware: [
+    "h100", "h200", "b200", "b300", "gb200", "gb300",
+    "mi300x", "mi325x", "mi350x", "mi355x",
+  ],
+
+  // OPTIONAL — declare GPUs the shared HARDWARE_CATALOG (in _deployment.jsx) doesn't
+  // carry (workstation / desktop / future chips). The engine merges these in, so a
+  // model-specific GPU is config data, never an engine-catalog edit. Add the id to
+  // supportedHardware above too. Delete if you only use catalog GPUs.
+  // hardware: [
+  //   { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "nvidia" },
+  // ],
+
+  // 2nd dim. Single-element `default` if the model has no variant axis; else list
+  // real variants (e.g. {id:"flash",...},{id:"pro",...}) and key modelNames/
+  // defaultAccuracy by them.
+  variants: [
+    { id: "default", label: "Default" },
+  ],
+  // 3rd dim. Keep only what your model ships (BF16 / FP8 / FP4 / …).
+  quantizations: [
+    { id: "bf16", label: "BF16" },
+    { id: "fp8",  label: "FP8"  },
+    { id: "fp4",  label: "FP4"  },
+  ],
+  // 4th dim. The count follows the model's operating points: 1 recipe → a
+  // single "balanced"; 2 → low-latency + high-throughput; 3 → the full trio
+  // (the ideal). Per-combination: a single-recipe combination (e.g. a CPU
+  // platform) parks under its semantically honest tier — no slant → balanced;
+  // the page's list is the union and the engine greys unused chips. Never
+  // invent a recipe just to fill chips.
+  strategies: [
+    { id: "low-latency",     label: "Low-Latency"     },
+    { id: "balanced",        label: "Balanced"        },
+    { id: "high-throughput", label: "High-Throughput" },
+  ],
+  // `multi-N` id carries the node count for `--nnodes N`.
+  nodesOptions: [
+    { id: "single",  label: "Single Node" },
+    { id: "multi-2", label: "Multi-Nodes" },
+  ],
+
+  // HF slug lookup. Key by `variant|quant` (or `hw|variant|quant` for a per-hw
+  // repackaging, e.g. an FP8 conversion only valid on one platform).
+  modelNames: {
+    "default|bf16": "__HF_ORG__/__HF_REPO__",
+    "default|fp8":  "__HF_ORG__/__HF_REPO__",
+    "default|fp4":  "__HF_ORG__/__HF_REPO__",
+  },
+
+  placeholders: {
+    HOST_IP:   { target: "command", label: "Bind host",        default: "0.0.0.0"        },
+    PORT:      { target: "command", label: "Bind port",        default: "30000"          },
+    NODE0_IP:  { target: "command", label: "Head node IP",     default: "<node0-ip>"     },
+    NODE_RANK: { target: "command", label: "This node rank",   default: "<node-rank>"    },
+    HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
+    CURL_HOST: { target: "curl",    label: "Server host",      default: "localhost"      },
+    CURL_PORT: { target: "curl",    label: "Server port",      default: "30000"          },
+  },
+
+  curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
+-H 'Content-Type: application/json' \\
+-d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
+
+  // OPTIONAL — powers the benchmark card's "⚡ Reproduce" modal. Delete the whole
+  // block (and the benchmarks file) if you have no measured numbers yet.
+  benchmarkCommands: {
+    speed:
+`python3 -m sglang.bench_serving \\
+  --backend sglang \\
+  --host {{CURL_HOST}} --port {{CURL_PORT}} \\
+  --model {{MODEL_NAME}} \\
+  --dataset-name {{DATASET}} \\
+  --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}}`,
+    // One entry per accuracy field. A value is a string, OR a {[variant]: string}
+    // object when the command differs per variant. Keys must match ACCURACY_LABELS
+    // in _deployment.jsx + the per-cell/defaultAccuracy keys.
+    accuracy: {
+      gsm8k_pct:
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run gsm8k \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --num-threads 32`,
+    },
+    // {{NUM_PROMPTS}} fallback per concurrency (else max(c*2, 200)).
+    numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
+  },
+
+  // OPTIONAL — per-variant accuracy applied to EVERY cell of a variant (hardware-
+  // independent, e.g. GPQA/AIME). Per-cell `accuracy` overrides. Keys must match
+  // the effective accuracy labels + benchmarkCommands.accuracy. Delete if no numbers yet.
+  defaultAccuracy: {
+    default: { gsm8k_pct: null },
+  },
+
+  // The eval set rendered in the benchmark card + "⚡ Reproduce" — the engine
+  // ships NO default; required whenever the benchmarks carry accuracy data
+  // (without it the accuracy rows silently don't render). [key, label, unit]
+  // tuples; keys must match benchmarks[].accuracy + defaultAccuracy +
+  // benchmarkCommands.accuracy. Delete only if there are no accuracy numbers.
+  accuracyLabels: [
+    ["gsm8k_pct", "GSM8K", "%"],
+  ],
+
+  // OPTIONAL — `# ...` hint lines prepended to multi-node commands, ONLY for hw
+  // whose fabric needs manual NIC env (e.g. gb200 NVL72/MNNVL). NOT every multi-N
+  // hw needs this — standard-IB DeepEP / Marlin multi-node don't. Delete if unused.
+  multiNodeHints: {
+    gb200: [
+      "The following env vars may be needed depending on your cluster:",
+      "  GLOO_SOCKET_IFNAME=<your-nic>",
+      "  NVSHMEM_ENABLE_NIC_PE_MAPPING=1",
+      "  NVSHMEM_HCA_LIST=<your-hca-list>",
+    ],
+  },
+
+  // Per-hw image for `docker run` framing. ASK the user which sglang build the recipes ran
+  // on; don't guess a supporting release. Default below is :dev (nightly) — replace the tag
+  // with the user's release if they give one. NVIDIA share one image; AMD uses ROCm tags.
+  // GB200/GB300/B300 may need a `-cu130` (CUDA 13) tag — confirm per release.
+  dockerImages: {
+    h100:  "lmsysorg/sglang:dev",
+    h200:  "lmsysorg/sglang:dev",
+    b200:  "lmsysorg/sglang:dev",
+    b300:  "lmsysorg/sglang:dev",
+    gb200: "lmsysorg/sglang:dev",
+    gb300: "lmsysorg/sglang:dev",
+    mi300x: "lmsysorg/sglang:dev-rocm720-mi30x",
+    mi325x: "lmsysorg/sglang:dev-rocm720-mi30x",
+    mi350x: "lmsysorg/sglang:dev-rocm720-mi35x",
+    mi355x: "lmsysorg/sglang:dev-rocm720-mi35x",
+  },
+
+  // Prefills the issue template's free-form `model` field on "Submit verified cell".
+  // Use the HF id (`<hf-org>/<model-slug>`). Do NOT delete this block when pruning —
+  // without it the engine falls back to "deepseek-ai/deepseek-v4" and mislabels submissions.
+  github: {
+    cookbookModel: "__HF_ORG__/__MODEL_SLUG__",
+  },
+
+  // Opt-OUT per axis: general axes (attention / moe-for-MoE / parsers /
+  // speculative / pdDisagg / hicache) ship on every cookbook — DELETE only the
+  // axes this model genuinely cannot use (e.g. hisparse on non-DSA models, moe
+  // on pure-dense models); prefer disable+disableReason for variant/hw subsets.
+  playgroundFeatures: {
+
+    // ----- Card: "Attention Parallelism" -----  KEEP if the model exposes TP/CP/DP
+    // knobs. DP-Attention is a combined knob: value = DP degree AND toggles `--enable-dp-attention`.
+    attention: {
+      knobs: [
+        { id: "tp", label: "TP", values: [
+          null, 1, 2, 4, 8,
+          { value: 16, disable: { nodes: ["single"] },
+            disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
+        ]},
+        { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
+        { id: "dpAttn", label: "DP-Attention",
+          values: [
+            null, false, 1, 2, 4, 8,
+            { value: 16, disable: { nodes: ["single"] },
+              disableReason: "DP-Attention=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
+          ],
+          labels: { "auto": "Auto", "false": "Off" } },
+      ],
+    },
+
+    // ----- Card: "MoE Parallelism" -----  KEEP if MoE + multiple `--moe-*-backend`
+    // choices. DELETE for dense models.
+    moe: {
+      backend: {
+        options: [
+          { id: null,               label: "Inherited" },
+          { id: "deepep",           label: "DeepEP",            flags: ["--moe-a2a-backend deepep"] },
+          // KEEP the MegaMoE option + the megamoeQuant block below ONLY for Blackwell
+          // MoE kernel-fusion models; DELETE both otherwise. requiresHw gates it to
+          // Blackwell (the engine hides it elsewhere); add excludesStrategy: [...] too
+          // for a strategy gate. Selecting MegaMoE reveals the Quantization sub-select.
+          { id: "megamoe",          label: "MegaMoE",           flags: ["--moe-a2a-backend megamoe"],
+            requiresHw: ["b200", "b300", "gb200", "gb300"] },
+          { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"] },
+          { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"] },
+        ],
+      },
+      // MegaMoE quantization sub-select — shown only when backend === "megamoe".
+      // W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env.
+      // DELETE this block if there's no MegaMoE backend option above.
+      megamoeQuant: {
+        stripEnv: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"],
+        options: [
+          { id: "w4a8", label: "W4A8",
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
+          { id: "w4a4", label: "W4A4",
+            env: [
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+            ] },
+        ],
+      },
+      ep: { label: "EP", values: [
+        null, 1, 2, 4, 8,
+        { value: 16, disable: { nodes: ["single"] },
+          disableReason: "EP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
+      ]},
+    },
+
+    // ----- Card: "Parsers" -----  KEEP if the model has reasoning / tool-call
+    // parsers (set the slugs below). DELETE the axis if neither applies.
+    parsers: {
+      items: [
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser __REASONING_PARSER__" },
+        { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser __TOOLCALL_PARSER__" },
+      ],
+    },
+
+    // ----- Card: "Speculative Decoding" -----  KEEP if the model has spec-decoding
+    // presets. Drop options the model doesn't support.
+    speculative: {
+      options: [
+        { id: "current", label: "Inherited from base" },
+        { id: "off",     label: "Off (greedy)" },
+        { id: "mtp",     label: "EAGLE / MTP",
+          flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+        { id: "ngram",   label: "NGRAM",
+          flags: ["--speculative-algorithm NGRAM",
+                  "--speculative-num-draft-tokens 16",
+                  "--speculative-ngram-max-bfs-breadth 10"],
+          disable: { dpAttnOn: [true] },
+          disableReason: "NGRAM is incompatible with DP-Attention. Turn DP-Attention off in the Attention card above to use NGRAM." },
+      ],
+    },
+
+    // ----- Card: "PD Disaggregation" -----  KEEP if the model supports prefill/
+    // decode disaggregation. Delete `router` if you have no router topology.
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        { id: "mooncake", label: "Mooncake",
+          env: ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1"],
+          envWhen: { hw: ["gb200", "gb300"] } },
+        { id: "nixl", label: "NiXL" },
+      ],
+      // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
+      ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
+      // Router fronting prefill + decode; substitute <prefill-host>/<decode-host>.
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:30000 \\
+  --decode http://<decode-host>:30001 \\
+  --host 0.0.0.0 --port 8000 \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
+    },
+
+    // ----- Card: "Hierarchical KV Cache" -----  KEEP if the model is large enough
+    // that hierarchical KV caching matters.
+    hicache: {
+      backends: [
+        { id: null,       label: "Auto" },
+        { id: "file",     label: "File" },
+        { id: "mooncake", label: "Mooncake" },
+        { id: "hf3fs",    label: "HF3FS" },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      writePolicies: [
+        { id: "auto",                    label: "Auto" },
+        { id: "write_through",           label: "Write-through" },
+        { id: "write_back",              label: "Write-back" },
+        { id: "write_through_selective", label: "Write-through (selective)" },
+      ],
+    },
+
+    // ----- Card: "HiSparse" -----  KEEP only for DSA-style sparse-attention models
+    // (DeepSeek-V3.2/V4, GLM-5). Decode-only: shown when live PD-Disagg mode is `decode`.
+    hisparse: {
+      requiredFlags: ["--disable-radix-cache"],
+      config: { top_k: 2048, device_buffer_size: 6144 },
+      hostRatios: [
+        { id: 5,  label: "5 (~1TB host)" },
+        { id: 10, label: "10 (~2TB host)" },
+      ],
+      defaultHostRatio: 10,
+    },
+  },
+
+  // EXAMPLE cells — one per hardware family to show the shape. REPLACE each with
+  // your model's verified recipe, or DELETE families you don't support. `match`
+  // MUST have exactly the 5 keys; env/flags are flat literals.
+  // Accuracy-degrading flags (W4A4-style runtime quant, lossy --kv-cache-dtype)
+  // default to Playground/tips — putting one in a cell needs explicit user
+  // confirmation (authoring-reference §2.2).
+  cells: [
+    // ==== NVIDIA Blackwell + FP4 (single node) ====
+    {
+      match: { hw: "b200", variant: "default", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true, // EXAMPLE — set false / replace with your verified recipe
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ==== NVIDIA Hopper + FP8 (single node, DP-attention + DeepEP) ====
+    {
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      verified: true, // EXAMPLE
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ==== NVIDIA Hopper + FP4 (single node, Marlin W4A16 — Hopper has no FP4 runner) ====
+    {
+      match: { hw: "h100", variant: "default", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: true, // EXAMPLE
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend marlin",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ==== AMD + BF16 (single node) — Triton attention + AITER; EP == TP for MoE ====
+    {
+      match: { hw: "mi300x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true, // EXAMPLE
+      env: ["SGLANG_USE_AITER=1", "SGLANG_ROCM_FUSED_DECODE_MLA=0"],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--ep 8",
+        "--attention-backend triton",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ==== Multi-node example (2 nodes, TP=16) — engine injects --nnodes/--node-rank/
+    // --dist-init-addr from match.nodes; do NOT add them here. ====
+    {
+      match: { hw: "b200", variant: "default", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
+      verified: true, // EXAMPLE
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 16",
+        "--dp 16",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+  ],
+};

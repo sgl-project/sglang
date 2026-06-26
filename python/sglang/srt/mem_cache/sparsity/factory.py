@@ -5,11 +5,11 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
-from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
+from sglang.srt.mem_cache.sparsity.algorithms.deepseek_dsa import DeepSeekDSAAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
+    DSABackendAdaptor,
     FlashAttentionAdaptor,
-    NSABackendAdaptor,
 )
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
@@ -22,7 +22,7 @@ _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
 _ALGORITHM_REGISTRY = {
     "quest": lambda config, device, **kw: QuestAlgorithm(config, device, **kw),
-    "deepseek_nsa": lambda config, device, **kw: DeepSeekNSAAlgorithm(
+    "deepseek_dsa": lambda config, device, **kw: DeepSeekDSAAlgorithm(
         config, device, **kw
     ),
 }
@@ -49,8 +49,8 @@ def _create_backend_adaptor(
     req_to_token_pool,
 ):
     """Create backend adaptor."""
-    if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
-        return NSABackendAdaptor(device, req_to_token_pool)
+    if isinstance(sparse_algorithm, DeepSeekDSAAlgorithm):
+        return DSABackendAdaptor(device, req_to_token_pool)
 
     if backend in ["fa3", "flashattention"]:
         return FlashAttentionAdaptor(device)

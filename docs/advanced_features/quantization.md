@@ -36,13 +36,14 @@ The following table summarizes quantization method support across NVIDIA and AMD
 | `quark_int4fp8_moe` | No | Yes | No | AMD-only; online INT4-to-FP8 MoE quantization (CDNA3/CDNA4) |
 | `awq_marlin` | Yes | No | No | Marlin kernels are CUDA-only |
 | `gptq_marlin` | Yes | No | No | Marlin kernels are CUDA-only |
-| `gguf` | Yes | No | WIP | CUDA-only kernels in sgl-kernel |
+| `gguf` | Yes | No | Yes | CUDA-only kernels in sgl-kernel; Pre-dequantized on Ascend |
 | `modelopt` / `modelopt_fp8` | Yes (Hopper/SM90+) | No | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); requires NVIDIA hardware |
 | `modelopt_fp4` | Yes (Blackwell/SM100+) | No | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); native FP4 on Blackwell (B200, GB200) |
 | `petit_nvfp4` | No | Yes (MI250/MI300X/MI325X) | No | Enables NVFP4 on ROCm via [Petit](https://github.com/causalflow-ai/petit-kernel); use `modelopt_fp4` on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/) and [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html). |
 | `bitsandbytes` | Yes | Experimental | No | Depends on bitsandbytes ROCm support |
 | `torchao` (`int4wo`, etc.) | Yes | Partial | No | `int4wo` not supported on AMD; other methods may work |
 | `modelslim` | No | No | Yes | Ascend quantization; Uses CANN kernels |
+| `mxfp8` (diffusion) | No | No | Yes (A2/A3) | Ascend NPU only; online MXFP8 quantization for diffusion models (e.g., Wan2.2); requires CANN ≥ 8.0.RC3 |
 
 On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../platforms/amd_gpu.md) for installation and configuration details.
 
@@ -74,11 +75,12 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 | Backend | Hardware | Description |
 |---------|----------|-------------|
 | `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutlass` on SM100 |
+| `cutlass` | SM100/120 | SGLang CUTLASS kernel |
 | `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS backend |
 | `flashinfer_cudnn` | SM100/120 (CUDA 13+, cuDNN 9.15+) | FlashInfer cuDNN backend; used on SM120 for performance |
 | `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend |
 
-When FlashInfer is unavailable for NVFP4, sgl-kernel CUTLASS is used as an automatic fallback.
+When FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback.
 
 ## Offline Quantization
 
@@ -588,6 +590,36 @@ python3 -m sglang.launch_server \
 SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will replace [MoE layers](https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/layers/moe/fused_moe_triton/layer.py#L271) originally in high precision (bfloat16, float16 or float32) to use weights dynamically quantized to int4, that are upcasted to float8 during inference to run compute in float8 precision with activations dynamically quantized on the fly to float8.
 
 Other layers (e.g. projections in the attention layers) have their weights quantized online to float8 directly.
+
+## Diffusion Model Quantization on Ascend NPU
+
+SGLang-Diffusion supports MXFP8 quantization for diffusion models (such as Wan2.2) on Ascend A5 NPUs, in both online and offline (ModelSlim) modes. This is separate from the LLM serving path and uses the `sglang serve` / `sglang generate` CLI.
+
+**Requirements:** Ascend A5, CANN ≥ 8.0.RC3
+
+### Online MXFP8
+
+Pass `--quantization mxfp8` to dynamically quantize FP16/BF16 transformer weights to MXFP8 at load time:
+
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --quantization mxfp8 \
+  --num-gpus 4
+```
+
+### Offline MXFP8 (ModelSlim)
+
+Pre-quantize with [msModelSlim](https://gitcode.com/Ascend/msmodelslim) and load the checkpoint directly — the quantization scheme is auto-detected from `quant_model_description.json`:
+
+```bash
+sglang generate \
+  --model-path /path/to/wan2_2_mxfp8_diffusers \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+For the full quantization + format conversion workflow and a complete list of supported schemes, see [Diffusion Quantization on Ascend NPU](../platforms/ascend/ascend_npu_quantization.md#diffusion-model-quantization-on-ascend-npu) and [SGLang-Diffusion Quantization](../diffusion/quantization.md#modelslim).
 
 ## Reference
 

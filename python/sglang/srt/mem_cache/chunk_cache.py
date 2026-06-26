@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.hisparse import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -19,7 +23,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -30,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 
 class ChunkCache(BasePrefixCache):
+    """
+    ChunkCache is used when radix cache is disabled.
+
+    That includes standard chunked-prefill setups and the decode side of P/D
+    disaggregation when decode radix cache is not enabled.
+    """
+
     def __init__(self, params: CacheInitParams):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
@@ -59,6 +69,7 @@ class ChunkCache(BasePrefixCache):
             device_indices=torch.empty((0,), dtype=torch.int64),
             last_device_node=None,
             last_host_node=None,
+            best_match_node=None,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -75,7 +86,7 @@ class ChunkCache(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, : req.extend_range.end
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
@@ -103,7 +114,14 @@ class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
 
     def __init__(self, params: CacheInitParams):
-        assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        # DeepSeek V4 HiSparse wraps SWATokenToKVPoolAllocator and exposes the same API.
+        assert isinstance(
+            params.token_to_kv_pool_allocator,
+            (
+                SWATokenToKVPoolAllocator,
+                DeepSeekV4HiSparseTokenToKVPoolAllocator,
+            ),
+        )
         super().__init__(params)
 
         self.sliding_window_size = params.sliding_window_size

@@ -11,6 +11,7 @@ from PIL import Image
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
@@ -309,7 +310,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 videos=videos,
             )
         else:
-            base_output = self.load_mm_data(
+            base_output = await self.load_mm_data(
                 prompt=prompt,
                 image_data=image_data,
                 video_data=video_data,
@@ -337,14 +338,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
                     mm_token_id=mm_token_id,
                 )
 
-        return {
-            "input_ids": input_ids_tensor.flatten().tolist(),
-            "mm_items": mm_items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.img_context_token_id,
-            "video_token_id": self.video_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids_tensor.flatten().tolist(),
+            mm_items=mm_items,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            im_token_id=self.img_context_token_id,
+            video_token_id=self.video_token_id,
+        )
 
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
@@ -422,7 +423,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt.count(self.VIDEO_PLACEHOLDER_TOKEN),
         )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
             video_data=video_data,
@@ -588,11 +589,21 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         items = []
         if image_tensor is not None:
-            items.append(
-                MultimodalDataItem(
-                    feature=image_tensor, modality=Modality.IMAGE, offsets=image_offsets
-                )
+            # Split per-image for better cache granularity
+            assert len(num_patches_list) == len(image_offsets), (
+                f"InternVL: num_patches_list ({len(num_patches_list)}) != "
+                f"image_offsets ({len(image_offsets)})"
             )
+            cumulative = 0
+            for i, num_patches in enumerate(num_patches_list):
+                items.append(
+                    MultimodalDataItem(
+                        feature=image_tensor[cumulative : cumulative + num_patches],
+                        modality=Modality.IMAGE,
+                        offsets=[image_offsets[i]],
+                    )
+                )
+                cumulative += num_patches
         if video_tensor is not None:
             items.append(
                 MultimodalDataItem(
@@ -600,14 +611,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 )
             )
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.img_context_token_id,
-            "video_token_id": self.video_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=items,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            im_token_id=self.img_context_token_id,
+            video_token_id=self.video_token_id,
+        )
 
     async def process_internlm2_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
@@ -633,7 +644,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt.count(self.IMG_CONTEXT),
         )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=prompt,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens_internlm2,  # expects <IMG_CONTEXT>
@@ -702,17 +713,27 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         items = []
         if pixel_values is not None:
-            items.append(
-                MultimodalDataItem(
-                    feature=pixel_values, modality=Modality.IMAGE, offsets=image_offsets
-                )
+            # Split per-image for better cache granularity
+            assert len(num_patches_list) == len(image_offsets), (
+                f"InternVL: num_patches_list ({len(num_patches_list)}) != "
+                f"image_offsets ({len(image_offsets)})"
             )
+            cumulative = 0
+            for i, num_patches in enumerate(num_patches_list):
+                items.append(
+                    MultimodalDataItem(
+                        feature=pixel_values[cumulative : cumulative + num_patches],
+                        modality=Modality.IMAGE,
+                        offsets=[image_offsets[i]],
+                    )
+                )
+                cumulative += num_patches
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.img_context_token_id,
-            "video_token_id": self.video_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=items,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            im_token_id=self.img_context_token_id,
+            video_token_id=self.video_token_id,
+        )

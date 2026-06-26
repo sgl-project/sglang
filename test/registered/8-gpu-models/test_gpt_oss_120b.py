@@ -48,7 +48,6 @@ class TestGptOss120B(unittest.TestCase):
             "--speculative-num-draft-tokens=4",
         ]
         eagle3_env = {
-            "SGLANG_ENABLE_SPEC_V2": "1",
             "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
         }
 

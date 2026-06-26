@@ -38,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+from sglang.srt.server_args import get_global_server_args
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -48,11 +49,15 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config, prefix)
+        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
+
+        # Input layer concats embeds + target_hidden before qkv (input dim 2x).
+        self.is_input_layer = layer_id == 0
+        hidden_size = 2 * self.hidden_size if self.is_input_layer else self.hidden_size
 
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
-            2 * self.hidden_size,
+            hidden_size,
             self.self_attn.head_dim,
             self.self_attn.total_num_heads,
             self.self_attn.total_num_kv_heads,
@@ -81,11 +86,16 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        residual = hidden_states
-        embeds = self.input_layernorm(embeds)
-        hidden_states = self.hidden_norm(hidden_states)
+        if self.is_input_layer:
+            # Input layer consumes target hidden states; no carried residual to fuse.
+            residual = hidden_states
+            hidden_states = self.hidden_norm(hidden_states)
+            embeds = self.input_layernorm(embeds)
+            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        else:
+            # Fuse the previous layer's MLP residual add into hidden_norm.
+            hidden_states, residual = self.hidden_norm(hidden_states, residual)
 
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -111,13 +121,17 @@ class LlamaModel(nn.Module):
         super().__init__()
         self.config = config
 
-        rope_scaling = config.rope_parameters
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_scaling = rope_parameters
+        else:
+            rope_scaling = getattr(config, "rope_scaling", None)
         self.is_mrope_enabled = (
             rope_scaling is not None and "mrope_section" in rope_scaling
         )
         # fix rope_scaling for qwen2.5-vl
         if self.is_mrope_enabled:
-            config.rope_parameters["rope_type"] = "default"
+            rope_scaling["rope_type"] = "default"
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
@@ -131,15 +145,42 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
+        # num_aux resolution: explicit attr > eagle_config layer_ids > default 3.
+        self.num_aux_hidden_states = getattr(config, "num_aux_hidden_states", None)
+        if self.num_aux_hidden_states is None:
+            eagle_config = getattr(config, "eagle_config", None) or {}
+            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+            self.num_aux_hidden_states = len(layer_ids) if layer_ids else 3
+
         self.fc = torch.nn.Linear(
-            self.hidden_size_in * 3,
+            self.hidden_size_in * self.num_aux_hidden_states,
             config.hidden_size,
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
+        # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy `use_aux_norm` flag.
+        use_fc_norm = getattr(config, "fc_norm", None) or getattr(
+            config, "use_aux_norm", False
+        )
+        if use_fc_norm:
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+                    for _ in range(self.num_aux_hidden_states)
+                ]
+            )
+        else:
+            self.fc_norm = None
+
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(config, i, quant_config, prefix)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
         self,
@@ -154,12 +195,13 @@ class LlamaModel(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert embeds is not None
-                embeds = torch.cat(
-                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
-                )
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if embeds is None:
                 embeds = self.embed_tokens(input_ids)
         else:
@@ -170,6 +212,12 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.fc_norm is not None:
+                chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
+                hidden_states = torch.cat(
+                    [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                    dim=-1,
+                )
             hidden_states = self.fc(hidden_states)
 
         # idle batch
@@ -177,20 +225,22 @@ class LlamaModel(nn.Module):
             return hidden_states, [hidden_states]
 
         residual = None
-        hidden_states, residual = self.midlayer(
-            positions,
-            embeds,
-            hidden_states,
-            forward_batch,
-            residual,
-        )
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions,
+                embeds,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
 
-        # For draft decode, we capture the hidden state before norm
-        return hidden_states_to_logits, [hidden_states_to_aux]
+        # Draft decode captures pre-norm hidden by default; `norm_output` opts for normed.
+        aux = hidden_states_to_logits if self.norm_output else hidden_states_to_aux
+        return hidden_states_to_logits, [aux]
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
@@ -205,12 +255,20 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        if self.config.num_hidden_layers != 1:
-            raise ValueError("EAGLE3 currently only supports 1 layer")
+        # Cache draft SWA size from server args once; consumed both by the post-init
+        # attention patch below and by `get_attention_sliding_window_size` later.
+        self._draft_window_size: Optional[int] = (
+            get_global_server_args().speculative_draft_window_size
+        )
 
         self.model = LlamaModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
         )
+        if self._draft_window_size is not None:
+            for layer in self.model.layers:
+                layer.self_attn.attn.sliding_window_size = self._draft_window_size
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         self.load_lm_head_from_target = False
@@ -248,7 +306,19 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
+        # Legacy weight names -> new module attribute names (backwards compat).
+        legacy_name_map = {
+            "midlayer": "layers.0",
+            "aux_norm_low": "fc_norm.0",
+            "aux_norm_mid": "fc_norm.1",
+            "aux_norm_high": "fc_norm.2",
+        }
+
         for name, loaded_weight in weights:
+            for legacy, new in legacy_name_map.items():
+                if legacy in name:
+                    name = name.replace(legacy, new)
+
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
@@ -281,6 +351,9 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
+
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        return self._draft_window_size
 
 
 EntryClass = [LlamaForCausalLMEagle3]

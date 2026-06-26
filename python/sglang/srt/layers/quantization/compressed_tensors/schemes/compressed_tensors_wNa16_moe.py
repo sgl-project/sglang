@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
+from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+    gptq_marlin_moe_repack,
+)
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4DynamicMoEMethod,
 )
@@ -16,8 +19,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
-from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+from sglang.srt.layers.quantization.marlin_utils import (
+    marlin_make_workspace,
+    marlin_moe_permute_scales,
+    moe_awq_to_marlin_zero_points,
+)
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
 
@@ -64,7 +70,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self.strategy = config.strategy
         self.group_size = config.group_size
         self.actorder = config.actorder
-        assert config.symmetric, "Only symmetric quantization is supported for MoE"
+        self.sym = config.symmetric
 
         if not (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
@@ -124,7 +130,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         # In the case where we have actorder/g_idx,
         # we do not partition the w2 scales
-        load_full_w2 = self.actorder and self.group_size != -1
+        load_full_w2 = (
+            self.actorder is not None
+            and self.actorder != "static"
+            and self.group_size != -1
+        )
 
         if load_full_w2:
             w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
@@ -171,6 +181,32 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        # add zero param
+        if not self.sym:
+            w13_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_zero_point", w13_qzeros)
+            set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+            w2_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_zero_point", w2_qzeros)
+            set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
@@ -230,6 +266,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # Also record the shapes of the scales.
         layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
         layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+
+        if not self.sym:
+            layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
+            layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
@@ -334,6 +374,25 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         )
         replace_tensor("w2_weight_scale", marlin_w2_scales)
 
+        # Repack zero
+        if not self.sym:
+            marlin_w13_zp = moe_awq_to_marlin_zero_points(
+                layer.w13_weight_zero_point,
+                size_k=layer.w13_weight_zero_point.shape[1],
+                size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w13_weight_zero_point", marlin_w13_zp)
+
+            marlin_w2_zp = moe_awq_to_marlin_zero_points(
+                layer.w2_weight_zero_point,
+                size_k=layer.w2_weight_zero_point.shape[1],
+                size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w2_weight_zero_point", marlin_w2_zp)
+
+        layer.workspace = marlin_make_workspace(layer.w13_weight_packed.device, 4)
         layer.is_marlin_converted = True
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
@@ -354,6 +413,25 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+
+    def get_marlin_quant_info(self, layer):
+        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+        return MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_weight_packed,
+            w2_qweight=layer.w2_weight_packed,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
+            w13_g_idx_sort_indices=getattr(layer, "w13_g_idx_sort_indices", None),
+            w2_g_idx_sort_indices=getattr(layer, "w2_g_idx_sort_indices", None),
+            weight_bits=self.num_bits,
+            w13_g_idx=getattr(layer, "w13_weight_g_idx", None),
+            w2_g_idx=getattr(layer, "w2_weight_g_idx", None),
+            is_k_full=self.is_k_full,
+            w13_qzeros=layer.w13_weight_zero_point if not self.sym else None,
+            w2_qzeros=layer.w2_weight_zero_point if not self.sym else None,
+        )
 
     def apply_weights(
         self,
@@ -399,9 +477,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
+            w1_zeros=layer.w13_weight_zero_point if not self.sym else None,
+            w2_zeros=layer.w2_weight_zero_point if not self.sym else None,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            clamp_limit=self.moe_runner_config.swiglu_limit,
+            workspace=layer.workspace,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -448,18 +530,10 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    def apply_weights(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+    def get_triton_quant_info(self, layer):
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
-        quant_info = TritonMoeQuantInfo(
+        return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight_packed,
             w2_weight=layer.w2_weight_packed,
             use_int4_w4a16=True,
@@ -467,6 +541,17 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             w2_scale=layer.w2_weight_scale,
             block_shape=[0, self.group_size],
         )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
 
@@ -585,6 +670,18 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
         )
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+        w13_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+        layer.register_parameter("w13_weight_shape", w13_weight_shape)
+        set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        w2_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False
+        )
+        layer.register_parameter("w2_weight_shape", w2_weight_shape)
+        set_weight_attrs(w2_weight_shape, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)

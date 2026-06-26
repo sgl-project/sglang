@@ -10,7 +10,7 @@ from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
 logger = logging.getLogger(__name__)
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 MODELS = [
     (

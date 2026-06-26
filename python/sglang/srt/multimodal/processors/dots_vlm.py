@@ -1,6 +1,7 @@
 import re
 from typing import Dict, List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.dots_ocr import DotsOCRForCausalLM
 from sglang.srt.models.dots_vlm import DotsVLMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
@@ -32,8 +33,16 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         merge_size = vision_config.spatial_merge_size
 
         self.IMAGE_FACTOR = patch_size * merge_size
-        self.MIN_PIXELS = _processor.image_processor.min_pixels
-        self.MAX_PIXELS = _processor.image_processor.max_pixels
+        self.MIN_PIXELS = getattr(
+            _processor.image_processor,
+            "min_pixels",
+            getattr(_processor.image_processor, "size", {}).get("shortest_edge"),
+        )
+        self.MAX_PIXELS = getattr(
+            _processor.image_processor,
+            "max_pixels",
+            getattr(_processor.image_processor, "size", {}).get("longest_edge"),
+        )
         self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
@@ -60,7 +69,7 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         ):
             image_data = sum(image_data, [])
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
@@ -72,10 +81,10 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         if combined_mm_item is None:
             return None
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": combined_mm_item,
-            "im_start_id": self.im_start_id,
-            "im_end_id": self.im_end_id,
-            "im_token_id": self.image_token_id,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=combined_mm_item,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.image_token_id,
+            im_start_id=self.im_start_id,
+            im_end_id=self.im_end_id,
+        )

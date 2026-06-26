@@ -1,185 +1,19 @@
 #include "common.h"
 #include "gemm.h"
-#include "vec.h"
-namespace {
+#include "moe.h"
 
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-// no remainder
-#pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d += Vec::size()) {
-    Vec data = Vec::loadu(input + d);
-    data.store(out + d);
-  }
-}
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    bVec x = bVec::loadu(input + d);
-    fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x);
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d]);
-  }
-}
-
-template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec weight_vec = fVec(weight);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) * weight_vec;
-    fVec data1 = fVec::loadu(input + d + fVec::size()) * weight_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * weight);
-  }
-}
-
-// acc from [topk, K] to [K]
-template <typename scalar_t>
-inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  if (topk == 1) {
-    // do copy for topk = 1
-    copy_stub(out, input, K);
-  } else {
-    // do sum for topk != 1
-    int64_t d;
-#pragma GCC unroll 4
-    for (d = 0; d <= K - kVecSize; d += kVecSize) {
-      fVec sum_fvec0 = fVec(0.f);
-      fVec sum_fvec1 = fVec(0.f);
-      for (int t = 0; t < topk; ++t) {
-        bVec x_bvec = bVec::loadu(input + t * K + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
-        sum_fvec0 += x_fvec0;
-        sum_fvec1 += x_fvec1;
-      }
-      bVec out_bvec = convert_from_float_ext<scalar_t>(sum_fvec0, sum_fvec1);
-      out_bvec.store(out + d);
-    }
-    for (; d < K; ++d) {
-      float sum_val = 0.f;
-      for (int t = 0; t < topk; ++t) {
-        sum_val += static_cast<float>(input[t * K + d]);
-      }
-      out[d] = static_cast<scalar_t>(sum_val);
-    }
-  }
-}
-
-// out = input + input2 * scale
-template <typename scalar_t>
-inline void add_mul_stub(
-    scalar_t* __restrict__ out,
-    const scalar_t* __restrict__ input,
-    const scalar_t* __restrict__ input2,
-    float scale,
-    int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec s_vec = fVec(scale);
-
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    bVec x_bvec = bVec::loadu(input + d);
-    fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x_bvec);
-
-    bVec y_bvec = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-    x0 = x0 + y0 * s_vec;
-    x1 = x1 + y1 * s_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
-  }
-}
-
-template <typename scalar_t>
-inline void silu_and_mul_stub(
-    scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  const fVec one = fVec(1.f);
-
-  // no remainder
-#pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d += bVec::size()) {
-    bVec x = bVec::loadu(input + d);
-    fVec x0, x1;
-    std::tie(x0, x1) = at::vec::convert_to_float(x);
-    bVec y = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y);
-    x0 = x0 / (one + x0.neg().exp_u20());
-    x1 = x1 / (one + x1.neg().exp_u20());
-    x0 = x0 * y0;
-    x1 = x1 * y1;
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-}
-
-}  // anonymous namespace
-
-// TODO: stride access
 template <int64_t N>
 inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m, int64_t ldn) {
-  if (bias_ptr) {
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
-#if defined(CPU_CAPABILITY_AVX512)
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = Vec::size();
+  static_assert(N % kVecSize == 0, "copy_bias requires N to be a multiple of Vectorized<float>::size()");
+  const bool has_bias = bias_ptr != nullptr;
+  const Vec zero_vec(0.f);
+  for (int i = 0; i < m; ++i) {
 #pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 bias_vec = _mm512_loadu_ps(bias_ptr + j);
-        _mm512_storeu_ps(y_buf + i * ldn + j, bias_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        y_buf[i * ldn + j] = bias_ptr[j];
-      }
-    }
-  } else {  // initialize to zero
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 zero_vec = _mm512_setzero_ps();
-        _mm512_storeu_ps(y_buf + i * ldn + j, zero_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        y_buf[i * ldn + j] = 0;
-      }
+    for (int j = 0; j < N; j += kVecSize) {
+      Vec vec = has_bias ? Vec::loadu(bias_ptr + j) : zero_vec;
+      vec.store(y_buf + i * ldn + j);
     }
   }
 }

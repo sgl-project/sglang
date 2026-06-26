@@ -1,13 +1,14 @@
 import json
+from types import SimpleNamespace
 from typing import Dict, List, TypedDict
 
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_str
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_config
 
 
@@ -59,7 +60,13 @@ def get_model_config(
         assert len(block_shape) == 2
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
-        config = config.get_text_config()
+        text_config = config.get_text_config()
+        # Some models (e.g. MiniMax-M3) carry text_config as a plain dict; wrap
+        # it so downstream attribute access works uniformly.
+        if isinstance(text_config, dict):
+            config = SimpleNamespace(**text_config)
+        else:
+            config = text_config
 
     hidden_size = config.hidden_size
     if architecture == "DbrxForCausalLM":
@@ -76,6 +83,7 @@ def get_model_config(
         "Qwen3NextForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "InternS2PreviewForConditionalGeneration",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -84,6 +92,7 @@ def get_model_config(
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
         "MistralLarge3ForCausalLM",
@@ -129,11 +138,34 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture == "HYV3ForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.expert_hidden_dim
     elif architecture == "NemotronHForCausalLM":
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         hidden_size = getattr(config, "moe_latent_size", None) or hidden_size
+    elif architecture == "Gemma4ForConditionalGeneration":
+        E = config.num_experts // ep_size
+        topk = config.top_k_experts
+        intermediate_size = config.moe_intermediate_size
+    elif architecture == "Lfm2MoeForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+    elif architecture == "MiniMaxM3SparseForConditionalGeneration":
+        # Serving fuses the shared expert into the routed-expert tensor by
+        # default (E = num_local_experts + 1), so tune for that shape unless
+        # fusion is explicitly disabled.
+        E = config.num_local_experts // ep_size + (
+            0 if disable_shared_experts_fusion else 1
+        )
+        topk = config.num_experts_per_tok + (
+            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
+        )
+        intermediate_size = config.intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
@@ -144,12 +176,25 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
+    # gfx942 (MI300X) remaps MXFP8 [1,32]->[128,128] at load; tune must match.
+    # sm100/gfx95 run native [1,32] and must not remap (mirrors fp8.py).
+    if (
+        architecture == "MiniMaxM3SparseForConditionalGeneration"
+        and is_hip()
+        and not is_gfx95_supported()
+        and block_shape == [1, 32]
+    ):
+        block_shape = [128, 128]
+
+    # text_config may not carry torch_dtype; fall back to bf16.
+    torch_dtype = getattr(config, "torch_dtype", None) or torch.bfloat16
+
     return {
         "num_experts": E,
         "topk": topk,
         "hidden_size": hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
+        "dtype": torch_dtype,
         "block_shape": block_shape,
         "architecture": architecture,
     }

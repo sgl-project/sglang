@@ -19,10 +19,17 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_linear_ramp_mask,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cuda,
+    is_npu,
+    is_xpu,
+    support_triton,
+)
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
@@ -30,6 +37,94 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
+
+if _is_xpu:
+    from sgl_kernel import multimodal_rotary_embedding
+
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def apply_interleaved_rope_kernel(
+    x_ptr,
+    out_ptr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    stride_x_m,
+    stride_x_s,
+    stride_out_s,
+    section_1_end,
+    section_2_end,
+    BLOCK_S: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    start_s = tl.program_id(0) * BLOCK_S
+    s_offsets = start_s + tl.arange(0, BLOCK_S)
+
+    dim_offset = tl.program_id(1) * BLOCK_SIZE
+    dim_indices = dim_offset + tl.arange(0, BLOCK_SIZE)
+
+    mask_s = s_offsets < S
+    mask_d = dim_indices < D
+    mask = mask_s[:, None] & mask_d[None, :]
+
+    val_ptr = (
+        x_ptr + 0 * stride_x_m + s_offsets[:, None] * stride_x_s + dim_indices[None, :]
+    )
+    val = tl.load(val_ptr, mask=mask, other=0.0)
+
+    cond_a = (dim_indices[None, :] % 3 == 1) & (
+        dim_indices[None, :] < section_1_end * 3
+    )
+    val_a_ptr = (
+        x_ptr + 1 * stride_x_m + s_offsets[:, None] * stride_x_s + dim_indices[None, :]
+    )
+    val_a = tl.load(val_a_ptr, mask=mask & cond_a, other=0.0)
+
+    cond_b = (dim_indices[None, :] % 3 == 2) & (
+        dim_indices[None, :] < section_2_end * 3
+    )
+    val_b_ptr = (
+        x_ptr + 2 * stride_x_m + s_offsets[:, None] * stride_x_s + dim_indices[None, :]
+    )
+    val_b = tl.load(val_b_ptr, mask=mask & cond_b, other=0.0)
+
+    val = tl.where(cond_a, val_a, val)
+    val = tl.where(cond_b, val_b, val)
+
+    out_ptr = out_ptr + s_offsets[:, None] * stride_out_s + dim_indices[None, :]
+    tl.store(out_ptr, val, mask=mask)
+
+
+def apply_interleaved_rope_triton(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
+    x = x.contiguous()
+    M, S, D = x.shape
+
+    out = torch.empty((S, D), dtype=x.dtype, device=x.device)
+
+    BLOCK_S = 64
+    BLOCK_SIZE = 128
+
+    grid = (triton.cdiv(S, BLOCK_S), triton.cdiv(D, BLOCK_SIZE))
+
+    section_1_end = mrope_section[1]
+    section_2_end = mrope_section[2]
+
+    apply_interleaved_rope_kernel[grid](
+        x,
+        out,
+        S,
+        D,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        section_1_end,
+        section_2_end,
+        BLOCK_S=BLOCK_S,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
@@ -52,12 +147,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
         mrope_interleaved: bool = False,
+        mrope_interleaved_glm: bool = False,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         self.mrope_section = mrope_section
         self.mrope_interleaved = mrope_interleaved
+        self.mrope_interleaved_glm = mrope_interleaved_glm
         if self.mrope_section:
             expected_sum = rotary_dim // 2
             actual_sum = sum(self.mrope_section)
@@ -86,6 +183,37 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
+        # MRoPE axis_map interleaving pattern depends on mrope_section sizes.
+        # The algorithm cycles through axes [0(T), 1(H), 2(W)] round-robin,
+        # skipping any axis that has exhausted its allocated pairs.
+        #
+        # For GLM-V (mrope_section=[8,12,12]):
+        #   T(8) < H(12) = W(12), so T exhausts first at pair 24.
+        #   Result: [0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 1,1,2, 1,1,2, 2,2]
+        #   After T runs out, only H and W fill the remaining slots.
+        #
+        # For Qwen3-VL (mrope_section=[24,20,20]):
+        #   T(24) > H(20) = W(20), so H and W exhaust first near the tail.
+        #   Result: [0,1,2, 0,1,2, ...repeated evenly..., 0,1, 0,1, 0,0]
+        #   After H/W run out, T fills the remaining slots.
+
+        if self.mrope_interleaved_glm:
+            num_pairs = rotary_dim // 2
+            axis_map = torch.empty(num_pairs, dtype=torch.long)
+            assert sum(self.mrope_section) == num_pairs
+            counts = [0, 0, 0]
+            current_ax = 0
+
+            for i in range(num_pairs):
+                current_ax = i % 3
+                while counts[current_ax] >= self.mrope_section[current_ax]:
+                    current_ax = (current_ax + 1) % 3
+
+                axis_map[i] = current_ax
+                counts[current_ax] += 1
+            self.register_buffer("axis_map", axis_map, persistent=False)
+        else:
+            self.axis_map = None
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
@@ -98,8 +226,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            cos = apply_interleaved_rope(cos, self.mrope_section)
-            sin = apply_interleaved_rope(sin, self.mrope_section)
+            if support_triton(get_global_server_args().attention_backend):
+                cos = apply_interleaved_rope_triton(cos, self.mrope_section)
+                sin = apply_interleaved_rope_triton(sin, self.mrope_section)
+            else:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
         else:
             cos = torch.cat(
                 [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
@@ -214,7 +346,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.head_size,
             self.rotary_dim,
             self.mrope_interleaved,
+            self.mrope_interleaved_glm,
             self.is_neox_style,
+            self.axis_map,
         )
         return query, key
 
@@ -242,6 +376,31 @@ class MRotaryEmbedding(RotaryEmbedding):
             rotary_mode=rotary_mode,
         )
         return query_out, key_out
+
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert positions.ndim in (1, 2)
+        if positions.ndim == 2 and self.mrope_section:
+            multimodal_rotary_embedding(
+                query,
+                key,
+                self.cos_sin_cache,
+                positions,
+                self.mrope_section,
+                self.head_size,
+                self.rotary_dim,
+                self.mrope_interleaved,
+                self.mrope_interleaved_glm,
+                self.is_neox_style,
+                self.axis_map,
+            )
+            return query, key
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     @staticmethod
     def get_rope_index(

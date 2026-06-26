@@ -257,11 +257,12 @@ def validate_scale_shift(t: torch.Tensor, B: int, S: int, D: int):
         (t.shape[0] not in (1, B)) or (t.shape[1] not in (1, S) or t.shape[2] != D)
     ):
         failed = True
-    elif t.ndim == 4 and (t.shape[0] != B or t.shape[2] != 1 or t.shape[3] != D):
+    elif t.ndim == 4:
         F = t.shape[1]
-        if S % F != 0:
+        if t.shape[0] != B or t.shape[2] != 1 or t.shape[3] != D:
+            failed = True
+        elif S % F != 0:
             raise ValueError(f"Validate failed: S({S}) must be divisible by F({F}).")
-        failed = True
     if failed:
         raise ValueError(f"Validate failed: unsupported tensor shape: {t.shape}.")
     if t.stride()[-1] != 1:
@@ -298,6 +299,15 @@ def fused_norm_scale_shift(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
+    from sglang.jit_kernel.diffusion.norm_scale_shift_native import (
+        try_fused_norm_scale_shift as _try_qwen_native_norm_scale_shift,
+    )
+
+    native_y = _try_qwen_native_norm_scale_shift(
+        x, weight, bias, scale, shift, norm_type, eps
+    )
+    if native_y is not None:
+        return native_y
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Tensor Validation
     BSD = x.shape
@@ -375,6 +385,15 @@ def fused_scale_residual_norm_scale_shift(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
+    from sglang.jit_kernel.diffusion.norm_scale_shift_native import (
+        try_fused_scale_residual_norm_scale_shift as _try_qwen_native_residual_path,
+    )
+
+    native_out = _try_qwen_native_residual_path(
+        residual, x, gate, weight, bias, scale, shift, norm_type, eps
+    )
+    if native_out is not None:
+        return native_out
     # Tensor Validation
     BSD = x.shape
     validate_x(x, *BSD)

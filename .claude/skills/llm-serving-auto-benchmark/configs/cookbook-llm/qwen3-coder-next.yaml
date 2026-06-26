@@ -1,0 +1,124 @@
+schema_version: 1
+source:
+  kind: llm_serving_cookbook
+  source_recipe_file: qwen3-coder-next.yaml
+  translation: SGLang flags preserve the source recipe where applicable, with sequence limits raised when needed for the default dataset; vLLM and TensorRT-LLM use framework-native serving flags for the same model and dataset shape.
+model:
+  name: Qwen/Qwen3-Coder-Next
+  tokenizer: Qwen/Qwen3-Coder-Next
+  precision: auto
+  quantization: model default
+hardware:
+  gpu_count: 2
+  multi_node: false
+dataset:
+  kind: random
+  num_prompts: 80
+  scenario_names:
+  - chat
+  - summarization
+  input_len:
+  - 1000
+  - 8000
+  output_len:
+  - 1000
+  - 1000
+benchmark:
+  endpoint: /v1/completions
+  backend: openai-compatible
+  tokenizer: Qwen/Qwen3-Coder-Next
+  max_concurrency:
+  - null
+  - 8
+  - 16
+  extra_request_body:
+    temperature: 0.0
+  qps:
+    lower: 0.25
+    upper: 12.0
+    tolerance: 0.1
+  sla:
+    max_p99_ttft_ms: 1500
+    max_p99_tpot_ms: 30
+    min_success_rate: 0.99
+  output_dir: ./auto_benchmark_results/cookbook-llm/qwen3-coder-next
+search:
+  tier: 2
+  max_candidates_per_framework: 8
+  candidate_generation: baseline_first_bounded_product
+  resume: true
+frameworks:
+  sglang:
+    enabled: true
+    server_command: python -m sglang.launch_server
+    base_server_flags:
+      tp_size: 2
+      model_path: Qwen/Qwen3-Coder-Next
+      mem_fraction_static: 0.82
+      schedule_policy: lpm
+    search_space:
+      prefill_attention_backend:
+      - fa3
+      - flashinfer
+      decode_attention_backend:
+      - fa3
+      - flashinfer
+      chunked_prefill_size:
+      - 4096
+      - 8192
+      max_running_requests:
+      - 64
+      - 96
+      - 128
+  vllm:
+    enabled: true
+    server_command: vllm serve
+    config_source: framework_generic_translation
+    base_server_flags:
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.9
+      max_model_len: 12288
+      dtype: auto
+      enable_chunked_prefill: true
+      kv_cache_dtype: auto
+    search_space:
+      max_num_seqs:
+      - 64
+      - 96
+      - 128
+      max_num_batched_tokens:
+      - 8192
+      - 16384
+      max_num_partial_prefills:
+      - 1
+      max_long_partial_prefills:
+      - 1
+      long_prefill_token_threshold:
+      - 0
+      - 4096
+      enable_prefix_caching:
+      - true
+      block_size:
+      - 16
+  tensorrt_llm:
+    enabled: true
+    server_command: trtllm-serve serve
+    backend_policy: fixed_pytorch
+    config_source: framework_generic_translation
+    base_server_flags:
+      backend: pytorch
+      tp_size: 2
+      pp_size: 1
+      kv_cache_free_gpu_memory_fraction: 0.75
+      max_seq_len: 12288
+    search_space:
+      max_batch_size:
+      - 64
+      - 96
+      - 128
+      max_num_tokens:
+      - 8192
+      - 16384
+      max_seq_len:
+      - 12288
+      - 16384

@@ -16,6 +16,15 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
+template <typename scalar_t>
+inline void convert_from_float_and_store(scalar_t* out, const Vectorized<float>& a) {
+  float out_buffer[at::vec::Vectorized<float>::size()];
+  a.store(out_buffer);
+  for (int i = 0; i < 16; i++) {
+    out[i] = (scalar_t)out_buffer[i];
+  }
+}
+
 // allow f16, bf16
 template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
 inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const scalar_t* __restrict__ data) {
@@ -43,6 +52,11 @@ template <>
 inline Vectorized<at::BFloat16>
 convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
   return (__m512i)(_mm512_cvtne2ps_pbh(__m512(b), __m512(a)));
+}
+
+template <>
+inline void convert_from_float_and_store<at::BFloat16>(at::BFloat16* out, const Vectorized<float>& a) {
+  _mm256_storeu_si256((__m256i*)out, (__m256i)(_mm512_cvtneps_pbh(__m512(a))));
 }
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
@@ -273,6 +287,77 @@ inline void quantize_row_int8<at::BFloat16>(
 // transpose utils
 // taken from my PR in ggml: https://github.com/ggml-org/llama.cpp/pull/8998
 #if defined(CPU_CAPABILITY_AVX512)
+inline void transpose_16x16_16bit(__m256i* v) {
+  __m256i v1[16];
+  v1[0] = _mm256_unpacklo_epi16(v[0], v[1]);
+  v1[1] = _mm256_unpackhi_epi16(v[0], v[1]);
+  v1[2] = _mm256_unpacklo_epi16(v[2], v[3]);
+  v1[3] = _mm256_unpackhi_epi16(v[2], v[3]);
+  v1[4] = _mm256_unpacklo_epi16(v[4], v[5]);
+  v1[5] = _mm256_unpackhi_epi16(v[4], v[5]);
+  v1[6] = _mm256_unpacklo_epi16(v[6], v[7]);
+  v1[7] = _mm256_unpackhi_epi16(v[6], v[7]);
+  v1[8] = _mm256_unpacklo_epi16(v[8], v[9]);
+  v1[9] = _mm256_unpackhi_epi16(v[8], v[9]);
+  v1[10] = _mm256_unpacklo_epi16(v[10], v[11]);
+  v1[11] = _mm256_unpackhi_epi16(v[10], v[11]);
+  v1[12] = _mm256_unpacklo_epi16(v[12], v[13]);
+  v1[13] = _mm256_unpackhi_epi16(v[12], v[13]);
+  v1[14] = _mm256_unpacklo_epi16(v[14], v[15]);
+  v1[15] = _mm256_unpackhi_epi16(v[14], v[15]);
+
+  v[0] = _mm256_unpacklo_epi32(v1[0], v1[2]);
+  v[1] = _mm256_unpackhi_epi32(v1[0], v1[2]);
+  v[2] = _mm256_unpacklo_epi32(v1[1], v1[3]);
+  v[3] = _mm256_unpackhi_epi32(v1[1], v1[3]);
+  v[4] = _mm256_unpacklo_epi32(v1[4], v1[6]);
+  v[5] = _mm256_unpackhi_epi32(v1[4], v1[6]);
+  v[6] = _mm256_unpacklo_epi32(v1[5], v1[7]);
+  v[7] = _mm256_unpackhi_epi32(v1[5], v1[7]);
+  v[8] = _mm256_unpacklo_epi32(v1[8], v1[10]);
+  v[9] = _mm256_unpackhi_epi32(v1[8], v1[10]);
+  v[10] = _mm256_unpacklo_epi32(v1[9], v1[11]);
+  v[11] = _mm256_unpackhi_epi32(v1[9], v1[11]);
+  v[12] = _mm256_unpacklo_epi32(v1[12], v1[14]);
+  v[13] = _mm256_unpackhi_epi32(v1[12], v1[14]);
+  v[14] = _mm256_unpacklo_epi32(v1[13], v1[15]);
+  v[15] = _mm256_unpackhi_epi32(v1[13], v1[15]);
+
+  v1[0] = _mm256_unpacklo_epi64(v[0], v[4]);
+  v1[1] = _mm256_unpackhi_epi64(v[0], v[4]);
+  v1[2] = _mm256_unpacklo_epi64(v[1], v[5]);
+  v1[3] = _mm256_unpackhi_epi64(v[1], v[5]);
+  v1[4] = _mm256_unpacklo_epi64(v[2], v[6]);
+  v1[5] = _mm256_unpackhi_epi64(v[2], v[6]);
+  v1[6] = _mm256_unpacklo_epi64(v[3], v[7]);
+  v1[7] = _mm256_unpackhi_epi64(v[3], v[7]);
+  v1[8] = _mm256_unpacklo_epi64(v[8], v[12]);
+  v1[9] = _mm256_unpackhi_epi64(v[8], v[12]);
+  v1[10] = _mm256_unpacklo_epi64(v[9], v[13]);
+  v1[11] = _mm256_unpackhi_epi64(v[9], v[13]);
+  v1[12] = _mm256_unpacklo_epi64(v[10], v[14]);
+  v1[13] = _mm256_unpackhi_epi64(v[10], v[14]);
+  v1[14] = _mm256_unpacklo_epi64(v[11], v[15]);
+  v1[15] = _mm256_unpackhi_epi64(v[11], v[15]);
+
+  v[0] = _mm256_permute2x128_si256(v1[0], v1[8], 0x20);
+  v[1] = _mm256_permute2x128_si256(v1[1], v1[9], 0x20);
+  v[2] = _mm256_permute2x128_si256(v1[2], v1[10], 0x20);
+  v[3] = _mm256_permute2x128_si256(v1[3], v1[11], 0x20);
+  v[4] = _mm256_permute2x128_si256(v1[4], v1[12], 0x20);
+  v[5] = _mm256_permute2x128_si256(v1[5], v1[13], 0x20);
+  v[6] = _mm256_permute2x128_si256(v1[6], v1[14], 0x20);
+  v[7] = _mm256_permute2x128_si256(v1[7], v1[15], 0x20);
+  v[8] = _mm256_permute2x128_si256(v1[0], v1[8], 0x31);
+  v[9] = _mm256_permute2x128_si256(v1[1], v1[9], 0x31);
+  v[10] = _mm256_permute2x128_si256(v1[2], v1[10], 0x31);
+  v[11] = _mm256_permute2x128_si256(v1[3], v1[11], 0x31);
+  v[12] = _mm256_permute2x128_si256(v1[4], v1[12], 0x31);
+  v[13] = _mm256_permute2x128_si256(v1[5], v1[13], 0x31);
+  v[14] = _mm256_permute2x128_si256(v1[6], v1[14], 0x31);
+  v[15] = _mm256_permute2x128_si256(v1[7], v1[15], 0x31);
+}
+
 inline void transpose_16x16_32bit(__m512i* v) {
   __m512i v1[16];
   v1[0] = _mm512_unpacklo_epi32(v[0], v[1]);

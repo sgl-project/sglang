@@ -159,6 +159,8 @@ class VideoSparseAttentionMetadata(AttentionMetadata):
     reverse_tile_partition_indices: torch.LongTensor
     variable_block_sizes: torch.LongTensor
     non_pad_index: torch.LongTensor
+    untile_combined_index: torch.LongTensor
+    tile_buf: torch.Tensor | None = None
 
     # adaption for FastWan2.1-T2V-1.3B-Diffusers
     # Sequence lengths for the forward batch
@@ -211,6 +213,7 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         non_pad_index = get_non_pad_index(
             variable_block_sizes, math.prod(VSA_TILE_SIZE)
         )
+        untile_combined_index = non_pad_index[reverse_tile_partition_indices]
 
         return VideoSparseAttentionMetadata(
             current_timestep=current_timestep,
@@ -222,6 +225,7 @@ class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             reverse_tile_partition_indices=reverse_tile_partition_indices,
             variable_block_sizes=variable_block_sizes,
             non_pad_index=non_pad_index,
+            untile_combined_index=untile_combined_index,
         )
 
 
@@ -244,58 +248,52 @@ class VideoSparseAttentionImpl(AttentionImpl):
     def tile(
         self,
         x: torch.Tensor,
-        num_tiles: list[int],
-        tile_partition_indices: torch.LongTensor,
-        non_pad_index: torch.LongTensor,
+        attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
+        num_tiles = attn_metadata.num_tiles
         t_padded_size = num_tiles[0] * VSA_TILE_SIZE[0]
         h_padded_size = num_tiles[1] * VSA_TILE_SIZE[1]
         w_padded_size = num_tiles[2] * VSA_TILE_SIZE[2]
-
-        x_padded = torch.zeros(
-            (
-                x.shape[0],
-                t_padded_size * h_padded_size * w_padded_size,
-                x.shape[-2],
-                x.shape[-1],
-            ),
-            device=x.device,
-            dtype=x.dtype,
+        target_shape = (
+            x.shape[0],
+            t_padded_size * h_padded_size * w_padded_size,
+            x.shape[-2],
+            x.shape[-1],
         )
-        x_padded[:, non_pad_index] = x[:, tile_partition_indices]
-        return x_padded
+
+        buf = attn_metadata.tile_buf
+        if (
+            buf is None
+            or buf.shape != target_shape
+            or buf.dtype != x.dtype
+            or buf.device != x.device
+        ):
+            buf = torch.zeros(target_shape, device=x.device, dtype=x.dtype)
+            attn_metadata.tile_buf = buf
+
+        buf[:, attn_metadata.non_pad_index] = x[:, attn_metadata.tile_partition_indices]
+        return buf
 
     def untile(
         self,
         x: torch.Tensor,
-        reverse_tile_partition_indices: torch.LongTensor,
-        non_pad_index: torch.LongTensor,
+        untile_combined_index: torch.LongTensor,
     ) -> torch.Tensor:
-        x = x[:, non_pad_index][:, reverse_tile_partition_indices]
-        return x
+        return x[:, untile_combined_index]
 
     def preprocess_qkv(
         self,
         qkv: torch.Tensor,
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
-        return self.tile(
-            qkv,
-            attn_metadata.num_tiles,
-            attn_metadata.tile_partition_indices,
-            attn_metadata.non_pad_index,
-        )
+        return self.tile(qkv, attn_metadata)
 
     def postprocess_output(
         self,
         output: torch.Tensor,
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
-        return self.untile(
-            output,
-            attn_metadata.reverse_tile_partition_indices,
-            attn_metadata.non_pad_index,
-        )
+        return self.untile(output, attn_metadata.untile_combined_index)
 
     def forward(  # type: ignore[override]
         self,

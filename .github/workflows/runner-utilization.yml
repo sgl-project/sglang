@@ -19,9 +19,24 @@ on:
         required: false
         type: string
 
+# Sandbox PRs (e.g. tom/kv_canary) push dozens of times in a row. Without this
+# group, every push spawns another 24h API scan that races the previous ones
+# and drains the shared 15k/hr installation token quota. Cancel-in-progress
+# keeps at most one Runner Utilization run per ref alive at a time.
+concurrency:
+  group: runner-utilization-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   report:
     name: Generate Report
+    # Skip fork PRs entirely, and require the `run-ci` label on same-repo PRs
+    # so unlabeled iteration pushes (e.g. long-lived sandbox branches) don't
+    # fire the 24h API scan. schedule and workflow_dispatch always run.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -32,12 +47,22 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Unit-test report logic
+        # Pure-logic tests (stdlib only, no API calls) — guards the
+        # queue-time accounting and status/link rendering before the
+        # (API-heavy) report runs.
+        run: |
+          python -m unittest discover -s scripts/ci/utils \
+            -p 'test_runner_utilization_report.py' -v
+
       - name: Generate Utilization Report
         timeout-minutes: 30
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # PR-trigger is just a script smoke check; scan a 20-minute window
+          # (0.34h) to bound API cost. schedule / dispatch run the full report.
           python scripts/ci/utils/runner_utilization_report.py \
             --repo ${{ github.repository }} \
-            --hours ${{ inputs.hours || '24' }} \
+            --hours ${{ (github.event_name == 'pull_request' && '0.34') || inputs.hours || '24' }} \
             ${{ inputs.filter && format('--filter {0}', inputs.filter) || '' }}

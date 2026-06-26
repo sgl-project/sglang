@@ -1,0 +1,770 @@
+---
+title: "Ascend NPU Performance Testing"
+metatags:
+  description: "Performance testing for SGLang on Ascend NPUs for text generation, multimodal, and embedding models in both online and offline serving modes."
+---
+
+This page walks through performance testing your SGLang deployment on Ascend NPUs. We cover three model types — text generation (`Qwen/Qwen2.5-7B-Instruct`), multimodal vision (`Qwen/Qwen2.5-VL-7B-Instruct`), and embedding (`Qwen/Qwen3-Embedding-8B`) — in both online and offline serving modes. You can use [Evalscope](https://evalscope.readthedocs.io/en/latest/), [AISBench](https://ais-bench-benchmark.readthedocs.io/en/latest/), or SGLang's built-in benchmarking tools.
+
+<Note>The benchmark output examples in this guide are for illustration only. Actual performance depends on your hardware (e.g., Atlas 800I A2 vs A3), model version, SGLang version, and deployment configuration. Always run benchmarks on your own hardware to obtain accurate performance data.</Note>
+
+## 1. Prepare
+
+### 1.1 Start SGLang server
+
+Launch the server with the appropriate flags for each model type. Make sure SGLang is installed first — see [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) for environment setup.
+
+<Tabs>
+  <Tab title="Text Generation">
+
+```shell Command
+# The model will be automatically downloaded by sglang or set --model-path to the local path if the model is already downloaded.
+sglang serve --model-path Qwen/Qwen2.5-7B-Instruct
+```
+
+  </Tab>
+  <Tab title="Multimodal">
+
+```shell Command
+# The model will be automatically downloaded by sglang or set --model-path to the local path if the model is already downloaded.
+sglang serve --model-path Qwen/Qwen2.5-VL-7B-Instruct --mm-attention-backend ascend_attn
+```
+
+  </Tab>
+  <Tab title="Embedding">
+
+```shell Command
+# The model will be automatically downloaded by sglang or set --model-path to the local path if the model is already downloaded.
+sglang serve --model-path Qwen/Qwen3-Embedding-8B --is-embedding
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>Add `&` at the end of the command to run the server in the background, or open a new terminal to run the benchmark commands in the following sections.</Tip>
+
+<Note>The server binds to `http://127.0.0.1:30000` by default. All online benchmarks below assume the server is running at that address. The `--is-embedding` flag is required for embedding models.</Note>
+
+### 1.2 Install benchmarking tools
+
+`bench_serving` and `bench_offline_throughput` are built into SGLang and require no extra installation. For Evalscope and AISBench, set up each in its own virtual environment:
+
+<Tabs>
+  <Tab title="Evalscope">
+
+```shell Command
+python3 -m venv .evalscope_venv
+source .evalscope_venv/bin/activate
+pip install evalscope[perf] -U
+```
+
+  </Tab>
+  <Tab title="AISBench">
+
+```shell Command
+python3 -m venv .aisbench_venv
+source .aisbench_venv/bin/activate
+
+git clone https://github.com/AISBench/benchmark.git
+cd benchmark/
+pip3 install -e ./ --use-pep517
+
+pip3 install -r requirements/api.txt
+pip3 install -r requirements/extra.txt
+```
+
+Run `ais_bench -h` to verify.
+
+<Note>AISBench requires Python 3.10-3.12. After installation, all AISBench commands must be run from the `benchmark/` directory (the cloned repo root). Set `stream=True` and `ignore_eos=True` in the model config for accurate results.</Note>
+
+  </Tab>
+</Tabs>
+
+## 2. Online Service: Text Generation Model
+
+Test `Qwen/Qwen2.5-7B-Instruct` via the online serving endpoint.
+
+<Note>Before running any benchmark in this section, make sure the SGLang text-generation server is running at `http://127.0.0.1:30000`. See [Start SGLang server](#1-1-start-sglang-server) for the launch command.</Note>
+
+<Tip>For performance testing, prefer random datasets (`--dataset random`, `--dataset-name random`) over real datasets. Random datasets let you pin `--min-prompt-length` / `--max-prompt-length` and `--min-tokens` / `--max-tokens` to fixed values, producing consistent, repeatable results. Real datasets (ShareGPT, openqa, etc.) have variable input lengths that add noise and make cross-run comparisons unreliable.</Tip>
+
+### 2.1 Using Evalscope
+
+<Note>Prerequisites: [Evalscope installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang server running at `http://127.0.0.1:30000`.</Note>
+
+Run the following command to run a performance test against the server:
+
+```shell Command
+evalscope perf \
+  --parallel 10 \
+  --number 20 \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --url http://127.0.0.1:30000/v1/chat/completions \
+  --api openai \
+  --dataset random \
+  --max-tokens 1024 \
+  --min-tokens 1024 \
+  --prefix-length 0 \
+  --min-prompt-length 1024 \
+  --max-prompt-length 1024 \
+  --tokenizer-path Qwen/Qwen2.5-7B-Instruct \
+  --extra-args '{"ignore_eos": true}'
+```
+
+<Tip>If the model has already been downloaded, you can point `--tokenizer-path` to the local model path instead of the model id.</Tip>
+
+Example output (for illustration only — actual results depend on your hardware and configuration):
+
+```text
+Benchmarking summary:
+┌────────────────────────────┬─────────────┐
+│ Metric                     │       Value │
+├────────────────────────────┼─────────────┤
+│ ── General ──              │             │
+│ Test Duration (s)          │       89.34 │
+│ Concurrency                │          10 │
+│ Request Rate (req/s)       │       -1.00 │
+│ Total / Success / Failed   │ 20 / 20 / 0 │
+│ Req Throughput (req/s)     │        0.22 │
+│ ── Latency ──              │             │
+│ Avg Latency (s)            │       44.67 │
+│ TTFT (ms)                  │      578.51 │
+│ TPOT (ms)                  │       43.10 │
+│ ITL (ms)                   │       43.12 │
+│ ── Tokens ──               │             │
+│ Avg Input Tokens           │     1024.00 │
+│ Avg Output Tokens          │     1024.00 │
+│ Output Throughput (tok/s)  │      229.24 │
+│ Total Throughput (tok/s)   │      458.49 │
+│ ── Speculative Decoding ── │             │
+│ Decoded Tok/Iter           │        1.00 │
+│ Spec. Accept Rate          │        0.00 │
+└────────────────────────────┴─────────────┘
+
+Percentile results:
+┌────────────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Metric         │      1% │      5% │     10% │     25% │     50% │     75% │     90% │     95% │     99% │
+├────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┤
+│ Latency (s)    │   44.47 │   44.47 │   44.47 │   44.47 │   44.86 │   44.86 │   44.86 │   44.86 │   44.86 │
+│ TTFT (ms)      │  138.12 │  142.07 │  426.17 │  426.87 │  783.67 │  785.26 │  786.85 │  787.97 │  787.97 │
+│ ITL (ms)       │   41.84 │   42.14 │   42.22 │   42.36 │   42.57 │   42.80 │   42.99 │   49.24 │   49.84 │
+│ TPOT (ms)      │   42.71 │   42.71 │   42.71 │   43.05 │   43.08 │   43.43 │   43.43 │   43.71 │   43.71 │
+│ Input tokens   │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │
+│ Output tokens  │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │ 1024.00 │
+│ Output (tok/s) │   22.83 │   22.83 │   22.83 │   22.83 │   23.02 │   23.03 │   23.03 │   23.03 │   23.03 │
+│ Total (tok/s)  │   45.65 │   45.65 │   45.65 │   45.65 │   46.05 │   46.05 │   46.05 │   46.05 │   46.05 │
+│ Decode (tok/s) │   22.88 │   23.03 │   23.03 │   23.07 │   23.21 │   23.42 │   23.42 │   23.42 │   23.42 │
+└────────────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+...
+```
+
+<Note>See the [Evalscope Performance Testing Guide](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/quick_start.html) for full details.</Note>
+
+### 2.2 Using AISBench
+
+<Note>Prerequisites: [AISBench installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .aisbench_venv/bin/activate`). All commands must be run from the `benchmark/` directory. SGLang server running at `http://127.0.0.1:30000`. Set `stream=True` and `ignore_eos=True` in the model config for accurate results.</Note>
+
+Two files need to be configured for performance testing.
+
+First, describe the model and server settings in `ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py`:
+
+```python vllm_api_stream_chat.py
+# more details: https://ais-bench-benchmark.readthedocs.io/en/latest/base_tutorials/scenes_intro/performance_benchmark.html
+from ais_bench.benchmark.models import VLLMCustomAPIChat
+from ais_bench.benchmark.utils.postprocess.model_postprocessors import extract_non_reasoning_content
+
+models = [
+    dict(
+        attr="service",
+        type=VLLMCustomAPIChat,
+        abbr="vllm-api-stream-chat",
+        path="Qwen/Qwen2.5-7B-Instruct",
+        model="Qwen/Qwen2.5-7B-Instruct",
+        stream=True,
+        request_rate=0,
+        use_timestamp=False,
+        retry=2,
+        api_key="",
+        host_ip="127.0.0.1",
+        host_port=30000,
+        url="",
+        max_out_len=512,
+        batch_size=32,
+        trust_remote_code=False,
+        generation_kwargs=dict(
+            temperature=0.01,
+            ignore_eos=True,
+        ),
+        pred_postprocessor=dict(type=extract_non_reasoning_content),
+    )
+]
+```
+
+<Tip>If the model has already been downloaded, point `path` to the local model path instead of the model id.</Tip>
+
+Second, configure random prompt lengths in `ais_bench/datasets/synthetic/synthetic_config.py`:
+
+```python synthetic_config.py
+# more details: https://ais-bench-benchmark.readthedocs.io/en/latest/advanced_tutorials/synthetic_dataset.html
+synthetic_config = {
+    "Type":"tokenid",
+    "RequestCount": 10,
+    "TrustRemoteCode": False,
+    "StringConfig" : {
+        "Input" : {
+            "Method": "uniform",
+            "Params": {"MinValue": 1, "MaxValue": 200}
+        },
+        "Output" : {
+            "Method": "gaussian",
+            "Params": {"Mean": 100, "Var": 200, "MinValue": 1, "MaxValue": 100}
+        }
+    },
+    "TokenIdConfig" : {
+        "RequestSize": 10,
+        "PrefixLen": 0
+    }
+}
+```
+
+Run with a synthetic dataset:
+
+```shell Command
+ais_bench --models vllm_api_stream_chat --datasets synthetic_gen_string -m perf
+```
+
+Example output (for illustration only — actual results depend on your hardware and configuration):
+
+```text
+╒══════════════════════════╤═════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════╕
+│ Performance Parameters   │ Stage   │ Average         │ Min             │ Max             │ Median          │ P75             │ P90             │ P99             │  N  │
+╞══════════════════════════╪═════════╪═════════════════╪═════════════════╪═════════════════╪═════════════════╪═════════════════╪═════════════════╪═════════════════╪═════╡
+│ E2EL                     │ total   │ 3896.4 ms       │ 3081.6 ms       │ 4175.3 ms       │ 4013.8 ms       │ 4123.4 ms       │ 4137.1 ms       │ 4171.5 ms       │ 10  │
+├──────────────────────────┼─────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────┤
+│ TTFT                     │ total   │ 411.6 ms        │ 346.7 ms        │ 439.7 ms        │ 416.3 ms        │ 426.6 ms        │ 434.4 ms        │ 439.2 ms        │ 10  │
+├──────────────────────────┼─────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────┤
+│ TPOT                     │ total   │ 38.3 ms         │ 37.4 ms         │ 39.0 ms         │ 38.3 ms         │ 38.7 ms         │ 38.9 ms         │ 39.0 ms         │ 10  │
+├──────────────────────────┼─────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────┤
+│ ITL                      │ total   │ 38.7 ms         │ 0.0 ms          │ 156.5 ms        │ 38.9 ms         │ 39.0 ms         │ 39.2 ms         │ 117.1 ms        │ 10  │
+├──────────────────────────┼─────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────┤
+│ InputTokens              │ total   │ 123.4           │ 34.0            │ 228.0           │ 130.5           │ 170.5           │ 217.2           │ 226.92          │ 10  │
+├──────────────────────────┼─────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────┤
+│ OutputTokens             │ total   │ 92.1            │ 69.0            │ 100.0           │ 95.0            │ 99.75           │ 100.0           │ 100.0           │ 10  │
+├──────────────────────────┼─────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────┤
+│ OutputTokenThroughput    │ total   │ 23.5937 token/s │ 22.3912 token/s │ 24.2616 token/s │ 23.7399 token/s │ 23.9919 token/s │ 24.2027 token/s │ 24.2557 token/s │ 10  │
+╘══════════════════════════╧═════════╧═════════════════╧═════════════════╧═════════════════╧═════════════════╧═════════════════╧═════════════════╧═════════════════╧═════╛
+╒══════════════════════════╤═════════╤══════════════════╕
+│ Common Metric            │ Stage   │ Value            │
+╞══════════════════════════╪═════════╪══════════════════╡
+│ Benchmark Duration       │ total   │ 4175.4485 ms     │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Total Requests           │ total   │ 10               │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Failed Requests          │ total   │ 0                │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Success Requests         │ total   │ 10               │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Concurrency              │ total   │ 9.3317           │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Max Concurrency          │ total   │ 32               │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Request Throughput       │ total   │ 2.395 req/s      │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Total Input Tokens       │ total   │ 1234             │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Prefill Token Throughput │ total   │ 299.8329 token/s │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Total Generated Tokens   │ total   │ 921              │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Input Token Throughput   │ total   │ 295.5371 token/s │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Output Token Throughput  │ total   │ 220.5751 token/s │
+├──────────────────────────┼─────────┼──────────────────┤
+│ Total Token Throughput   │ total   │ 516.1122 token/s │
+╘══════════════════════════╧═════════╧══════════════════╛
+```
+
+<Note>See the [AISBench Documentation](https://ais-bench-benchmark.readthedocs.io/en/latest/) for details.</Note>
+
+### 2.3 Using bench_serving
+
+SGLang's built-in `bench_serving` requires no extra installation. Make sure the server is running at `http://127.0.0.1:30000` before running the benchmark.
+
+<Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for all backends, datasets, and advanced options.</Note>
+
+```shell Command
+python -m sglang.bench_serving \
+  --backend sglang-oai \
+  --base-url http://127.0.0.1:30000 \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --random-range-ratio 1 \
+  --num-prompts 100 \
+  --max-concurrency 32
+```
+
+<Note>
+`--dataset-name random` samples token IDs from the ShareGPT dataset to generate realistic input; the first run downloads ShareGPT from Hugging Face automatically.
+
+1. If you have network issues, set `export HF_ENDPOINT=https://hf-mirror.com` to use domestic mirror.
+2. If downloading still fails, manually download the dataset file `ShareGPT_V3_unfiltered_cleaned_split.json` locally, upload it to your server, then specify the file directory via `--dataset-path` to run offline.
+</Note>
+
+<Tip>Set `--random-range-ratio 1` for fixed input/output lengths (recommended for consistent comparisons) or `0` (default) for uniform distribution. Add `--request-rate` to control the request rate. For all backends, datasets, and advanced options, see the full [Bench Serving Guide](/docs/developer_guide/bench_serving).</Tip>
+
+Example output (for illustration only — actual results depend on your hardware and configuration):
+
+```text
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai
+Traffic request rate:                    inf
+Max request concurrency:                 32
+Successful requests:                     100
+Benchmark duration (s):                  47.51
+Total input tokens:                      102400
+Total input text tokens:                 102400
+Total generated tokens:                  51200
+Total generated tokens (retokenized):    51195
+Request throughput (req/s):              2.10
+Input token throughput (tok/s):          2155.35
+Output token throughput (tok/s):         1077.68
+Peak output token throughput (tok/s):    1587.00
+Peak concurrent requests:                64
+Total token throughput (tok/s):          3233.03
+Concurrency:                             26.93
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   12793.49
+Median E2E Latency (ms):                 12940.17
+P90 E2E Latency (ms):                    13049.86
+P99 E2E Latency (ms):                    13051.61
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1423.99
+Median TTFT (ms):                        1489.29
+P99 TTFT (ms):                           2325.56
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          22.25
+Median TPOT (ms):                        22.22
+P99 TPOT (ms):                           25.08
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           22.26
+Median ITL (ms):                         20.74
+P95 ITL (ms):                            21.40
+P99 ITL (ms):                            23.62
+Max ITL (ms):                            2229.30
+==================================================
+```
+
+#### SGLang Serving Benchmark Result — Complete Reference
+
+The output format is **hardcoded in `bench_serving.py`. All formatting decisions — including column widths, alignment, and decimal precision — are statically defined in the source and cannot be changed via command-line arguments.
+
+##### Test Configuration
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>Backend</code></td>
+      <td>The serving backend under test (e.g., <code>sglang</code>, <code>vllm</code>).</td>
+    </tr>
+    <tr>
+      <td><code>Traffic request rate</code></td>
+      <td>Request generation rate in req/s. <code>inf</code> means maximum rate (concurrency-bounded). <code>trace</code> indicates trace timestamp mode. A fixed value enforces constant inter-arrival time.</td>
+    </tr>
+    <tr>
+      <td><code>Max request concurrency</code></td>
+      <td>Maximum number of concurrent requests from the client side. Displays <code>not set</code> when unspecified.</td>
+    </tr>
+  </tbody>
+</table>
+
+##### Core Statistics & Throughput Metrics
+
+<table>
+  <thead>
+    <tr>
+      <th>Parameter</th>
+      <th>Description</th>
+      <th>Format Specification</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>Successful requests</code></td><td>Total number of successfully completed requests (HTTP 200, no generation errors).</td><td>Integer, no decimal places</td></tr>
+    <tr><td><code>Benchmark duration (s)</code></td><td>Total elapsed time from first request sent to last response fully received (seconds).</td><td>2 decimal places</td></tr>
+    <tr><td><code>Total input tokens</code></td><td>Total number of input (prompt) tokens across all requests, counted by server-side tokenizer.</td><td>Integer, no decimal places</td></tr>
+    <tr><td><code>Total input text tokens</code></td><td>Same as <code>Total input tokens</code>. For multimodal inputs, this may differ.</td><td>Integer, no decimal places</td></tr>
+    <tr><td><code>Total generated tokens</code></td><td>Total number of output tokens actually generated by the server (server-side tokenizer count).</td><td>Integer, no decimal places</td></tr>
+    <tr><td><code>Total generated tokens (retokenized)</code></td><td>Output text re-tokenized by the client using its own tokenizer. A large discrepancy indicates tokenizer mismatch or special tokens in output.</td><td>Integer, no decimal places</td></tr>
+    <tr><td><code>Request throughput (req/s)</code></td><td>Number of successful requests processed per second. Formula: <code>Successful requests / Benchmark duration (s)</code>.</td><td>2 decimal places</td></tr>
+    <tr><td><code>Input token throughput (tok/s)</code></td><td>Number of input tokens processed per second. Formula: <code>Total input tokens / Benchmark duration (s)</code>.</td><td>2 decimal places</td></tr>
+    <tr><td><code>Output token throughput (tok/s)</code></td><td>Number of output tokens generated per second. Formula: <code>Total generated tokens / Benchmark duration (s)</code>.</td><td>2 decimal places</td></tr>
+    <tr><td><code>Peak output token throughput (tok/s)</code></td><td>Observed instantaneous peak output token generation rate during the test (computed over a sliding window).</td><td>2 decimal places</td></tr>
+    <tr><td><code>Peak concurrent requests</code></td><td>Maximum number of requests being processed simultaneously on the server side. May exceed client-side <code>Max request concurrency</code> due to queueing.</td><td>Integer, no decimal places</td></tr>
+    <tr><td><code>Total token throughput (tok/s)</code></td><td>Sum of input and output token throughputs. Formula: <code>Input token throughput + Output token throughput</code>.</td><td>2 decimal places</td></tr>
+    <tr><td><code>Concurrency</code></td><td>Average number of concurrent requests during the test (Little's Law). Formula: <code>Sum of all E2E latencies / Benchmark duration</code>.</td><td>2 decimal places</td></tr>
+  </tbody>
+</table>
+
+##### End-to-End Latency (E2E Latency)
+
+<table>
+  <thead><tr><th>Statistic</th><th>Description</th><th>Format</th></tr></thead>
+  <tbody>
+    <tr><td><code>Mean E2E Latency (ms)</code></td><td>Arithmetic mean</td><td>2 decimal places</td></tr>
+    <tr><td><code>Median E2E Latency (ms)</code></td><td>50th percentile</td><td>2 decimal places</td></tr>
+    <tr><td><code>P90 E2E Latency (ms)</code></td><td>90th percentile (90% of requests have latency ≤ this value)</td><td>2 decimal places</td></tr>
+    <tr><td><code>P99 E2E Latency (ms)</code></td><td>99th percentile</td><td>2 decimal places</td></tr>
+  </tbody>
+</table>
+
+##### Time to First Token (TTFT)
+
+<table>
+  <thead><tr><th>Statistic</th><th>Description</th><th>Format</th></tr></thead>
+  <tbody>
+    <tr><td><code>Mean TTFT (ms)</code></td><td>Arithmetic mean</td><td>2 decimal places</td></tr>
+    <tr><td><code>Median TTFT (ms)</code></td><td>50th percentile</td><td>2 decimal places</td></tr>
+    <tr><td><code>P99 TTFT (ms)</code></td><td>99th percentile</td><td>2 decimal places</td></tr>
+  </tbody>
+</table>
+
+##### Time per Output Token (TPOT) – Excluding First Token
+Formula: <code>(E2E Latency - TTFT) / (Number of output tokens - 1)</code>
+
+<table>
+  <thead><tr><th>Statistic</th><th>Description</th><th>Format</th></tr></thead>
+  <tbody>
+    <tr><td><code>Mean TPOT (ms)</code></td><td>Arithmetic mean</td><td>2 decimal places</td></tr>
+    <tr><td><code>Median TPOT (ms)</code></td><td>50th percentile</td><td>2 decimal places</td></tr>
+    <tr><td><code>P99 TPOT (ms)</code></td><td>99th percentile</td><td>2 decimal places</td></tr>
+  </tbody>
+</table>
+
+##### Inter-Token Latency (ITL)
+
+<table>
+  <thead><tr><th>Statistic</th><th>Description</th><th>Format</th></tr></thead>
+  <tbody>
+    <tr><td><code>Mean ITL (ms)</code></td><td>Average inter-token interval</td><td>2 decimal places</td></tr>
+    <tr><td><code>Median ITL (ms)</code></td><td>50th percentile inter-token interval</td><td>2 decimal places</td></tr>
+    <tr><td><code>P95 ITL (ms)</code></td><td>95th percentile (used to detect stalls)</td><td>2 decimal places</td></tr>
+    <tr><td><code>P99 ITL (ms)</code></td><td>99th percentile</td><td>2 decimal places</td></tr>
+    <tr><td><code>Max ITL (ms)</code></td><td>Maximum observed inter-token interval; useful for identifying severe blocking events</td><td>2 decimal places</td></tr>
+  </tbody>
+</table>
+
+
+## 3. Online Service: Multimodal Model
+
+Test `Qwen/Qwen2.5-VL-7B-Instruct` for vision-language tasks.
+
+<Note>Before running any benchmark in this section, make sure the SGLang multimodal server is running at `http://127.0.0.1:30000`. See [Start SGLang server](#1-1-start-sglang-server) and use the Multimodal tab for the launch command.</Note>
+
+<Tip>For consistent, repeatable results, set `--random-range-ratio 1` to fix input/output lengths, or `0` (default) for uniform distribution.</Tip>
+
+### 3.1 Using Evalscope
+
+<Note>Prerequisites: [Evalscope installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang multimodal server running at `http://127.0.0.1:30000`.</Note>
+
+Evalscope's `perf` tool uses the OpenAI-compatible `/v1/chat/completions` endpoint. Use `--dataset random_vl` for randomized multimodal data with image generation:
+
+```shell Command
+evalscope perf \
+  --parallel 10 \
+  --number 20 \
+  --model Qwen/Qwen2.5-VL-7B-Instruct \
+  --url http://127.0.0.1:30000/v1/chat/completions \
+  --api openai \
+  --dataset random_vl \
+  --min-tokens 1024 \
+  --max-tokens 1024 \
+  --prefix-length 0 \
+  --min-prompt-length 1024 \
+  --max-prompt-length 1024 \
+  --image-width 512 \
+  --image-height 512 \
+  --image-format RGB \
+  --image-num 1 \
+  --tokenizer-path Qwen/Qwen2.5-VL-7B-Instruct \
+  --extra-args '{"ignore_eos": true}'
+```
+
+<Tip>If the model has already been downloaded, you can point `--tokenizer-path` to the local model path instead of the model id.</Tip>
+
+### 3.2 Using AISBench
+
+<Note>Prerequisites: [AISBench installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .aisbench_venv/bin/activate`). All commands run from the `benchmark/` directory. SGLang multimodal server running at `http://127.0.0.1:30000`. AISBench does not include a built-in multimodal dataset — you must provide your own.</Note>
+
+First, edit `ais_bench/benchmark/configs/models/vllm_api/vllm_api_stream_chat.py` to configure the vision model:
+
+```python vllm_api_stream_chat.py
+from ais_bench.benchmark.models import VLLMCustomAPIChat
+from ais_bench.benchmark.utils.postprocess.model_postprocessors import extract_non_reasoning_content
+
+models = [
+    dict(
+        attr="service",
+        type=VLLMCustomAPIChat,
+        abbr="vllm-api-stream-chat",
+        path="Qwen/Qwen2.5-VL-7B-Instruct",
+        model="Qwen/Qwen2.5-VL-7B-Instruct",
+        stream=True,
+        request_rate=0,
+        use_timestamp=False,
+        retry=2,
+        api_key="",
+        host_ip="127.0.0.1",
+        host_port=30000,
+        url="",
+        max_out_len=256,
+        batch_size=16,
+        trust_remote_code=False,
+        generation_kwargs=dict(
+            temperature=0.01,
+            ignore_eos=True,
+        ),
+        pred_postprocessor=dict(type=extract_non_reasoning_content),
+    )
+]
+```
+
+<Tip>If the model has already been downloaded, point `path` to the local model path instead of the model id.</Tip>
+
+Next, download a multimodal dataset such as mmstar:
+
+```shell Command
+# Download the mmstar dataset (from within the benchmark/ directory)
+cd ais_bench/datasets
+mkdir mmstar
+cd mmstar
+wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
+```
+
+Run the performance test:
+
+```shell Command
+ais_bench --models vllm_api_stream_chat --datasets mmstar_gen -m perf
+```
+
+Example output (for illustration only — actual results depend on your hardware and configuration):
+
+```text
+╒══════════════════════════╤═════════╤═════════════════╤════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤═════════════════╤══════╕
+│ Performance Parameters   │ Stage   │ Average         │ Min            │ Max             │ Median          │ P75             │ P90             │ P99             │  N   │
+╞══════════════════════════╪═════════╪═════════════════╪════════════════╪═════════════════╪═════════════════╪═════════════════╪═════════════════╪═════════════════╪══════╡
+│ E2EL                     │ total   │ 6190.9 ms       │ 5071.4 ms      │ 8464.8 ms       │ 6126.6 ms       │ 6475.2 ms       │ 6833.5 ms       │ 7897.9 ms       │ 1500 │
+├──────────────────────────┼─────────┼─────────────────┼────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼──────┤
+│ TTFT                     │ total   │ 693.3 ms        │ 96.0 ms        │ 2161.5 ms       │ 747.4 ms        │ 870.9 ms        │ 1032.3 ms       │ 1620.8 ms       │ 1500 │
+├──────────────────────────┼─────────┼─────────────────┼────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼──────┤
+│ TPOT                     │ total   │ 21.6 ms         │ 17.8 ms        │ 32.1 ms         │ 21.3 ms         │ 23.1 ms         │ 24.5 ms         │ 29.1 ms         │ 1500 │
+├──────────────────────────┼─────────┼─────────────────┼────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼──────┤
+│ ITL                      │ total   │ 25.5 ms         │ 0.0 ms         │ 1951.1 ms       │ 18.8 ms         │ 19.7 ms         │ 37.3 ms         │ 121.8 ms        │ 1500 │
+├──────────────────────────┼─────────┼─────────────────┼────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼──────┤
+│ InputTokens              │ total   │ 0.0             │ 0.0            │ 0.0             │ 0.0             │ 0.0             │ 0.0             │ 0.0             │ 1500 │
+├──────────────────────────┼─────────┼─────────────────┼────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼──────┤
+│ OutputTokens             │ total   │ 256.0           │ 256.0          │ 256.0           │ 256.0           │ 256.0           │ 256.0           │ 256.0           │ 1500 │
+├──────────────────────────┼─────────┼─────────────────┼────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼─────────────────┼──────┤
+│ OutputTokenThroughput    │ total   │ 41.6779 token/s │ 30.243 token/s │ 50.4791 token/s │ 41.7847 token/s │ 44.6424 token/s │ 45.6484 token/s │ 46.0932 token/s │ 1500 │
+╘══════════════════════════╧═════════╧═════════════════╧════════════════╧═════════════════╧═════════════════╧═════════════════╧═════════════════╧═════════════════╧══════╛
+╒═════════════════════════╤═════════╤══════════════════╕
+│ Common Metric           │ Stage   │ Value            │
+╞═════════════════════════╪═════════╪══════════════════╡
+│ Benchmark Duration      │ total   │ 582099.6816 ms   │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Total Requests          │ total   │ 1500             │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Failed Requests         │ total   │ 0                │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Success Requests        │ total   │ 1500             │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Concurrency             │ total   │ 15.9532          │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Max Concurrency         │ total   │ 16               │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Request Throughput      │ total   │ 2.5769 req/s     │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Total Input Tokens      │ total   │ 0                │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Total Generated Tokens  │ total   │ 384000           │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Input Token Throughput  │ total   │ 0.0 token/s      │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Output Token Throughput │ total   │ 659.6808 token/s │
+├─────────────────────────┼─────────┼──────────────────┤
+│ Total Token Throughput  │ total   │ 659.6808 token/s │
+╘═════════════════════════╧═════════╧══════════════════╛
+```
+
+<Note>See the [AISBench Documentation](https://ais-bench-benchmark.readthedocs.io/en/latest/) for details.</Note>
+
+### 3.3 Using bench_serving (image dataset)
+
+Set `--dataset-name image` for image datasets. `bench_serving` will generate random prompts with image inputs. Make sure the server is running at `http://127.0.0.1:30000` before running the benchmark.
+
+<Note>See the [Bench Serving Guide](/docs/developer_guide/bench_serving) for the full list of image-related flags.</Note>
+
+```shell Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --base-url http://127.0.0.1:30000 \
+  --model Qwen/Qwen2.5-VL-7B-Instruct \
+  --dataset-name image \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --random-range-ratio 1 \
+  --num-prompts 32 \
+  --max-concurrency 16 \
+  --image-count 1 \
+  --image-resolution 720p
+```
+
+Example output (for illustration only — actual results depend on your hardware and configuration):
+
+```text
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     32
+Benchmark duration (s):                  51.74
+Total input tokens:                      73464
+Total input text tokens:                 35128
+Total input vision tokens:               38336
+Total generated tokens:                  16384
+Total generated tokens (retokenized):    9300
+Request throughput (req/s):              0.62
+Input token throughput (tok/s):          1419.96
+Output token throughput (tok/s):         316.68
+Peak output token throughput (tok/s):    800.00
+Peak concurrent requests:                32
+Total token throughput (tok/s):          1736.64
+Concurrency:                             15.98
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   25841.84
+Median E2E Latency (ms):                 25842.85
+P90 E2E Latency (ms):                    26296.42
+P99 E2E Latency (ms):                    26303.13
+---------------Time to First Token----------------
+Mean TTFT (ms):                          12211.59
+Median TTFT (ms):                        14405.77
+P99 TTFT (ms):                           15837.60
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          26.67
+Median TPOT (ms):                        21.75
+P99 TPOT (ms):                           41.89
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           26.67
+Median ITL (ms):                         20.34
+P95 ITL (ms):                            20.85
+P99 ITL (ms):                            21.70
+Max ITL (ms):                            11309.91
+==================================================
+```
+
+## 4. Online Service: Embedding Model
+
+Test `Qwen/Qwen3-Embedding-8B` on the embedding API endpoint.
+
+<Note>Before running any benchmark in this section, make sure the SGLang embedding server is running with `--is-embedding` at `http://127.0.0.1:30000`. See [Start SGLang server](#1-1-start-sglang-server) and use the Embedding tab for the launch command. AISBench does not support embedding endpoints — use `bench_serving` or Evalscope instead.</Note>
+
+### 4.1 Using Evalscope
+
+<Note>Prerequisites: [Evalscope installed](#1-2-install-benchmarking-tools) and its virtual environment activated (`source .evalscope_venv/bin/activate`). SGLang embedding server running with `--is-embedding` at `http://127.0.0.1:30000`.</Note>
+
+Evalscope supports embedding evaluation. For performance testing the embedding API directly:
+
+```shell Command
+evalscope perf \
+  --parallel 10 \
+  --number 20 \
+  --model Qwen/Qwen3-Embedding-8B \
+  --url http://127.0.0.1:30000/v1/embeddings \
+  --api openai_embedding \
+  --dataset random_embedding \
+  --min-prompt-length 1024 \
+  --max-prompt-length 1024 \
+  --tokenizer-path Qwen/Qwen3-Embedding-8B
+```
+
+<Tip>If the model has already been downloaded, you can point `--tokenizer-path` to the local model path instead of the model id.</Tip>
+
+<Note>Evalscope's embedding performance testing support may vary by version. If the `perf` command does not accept the embeddings endpoint, use [`bench_serving` with `--backend sglang-embedding`](#4-2-using-bench_serving-embedding-backend) as the primary option.</Note>
+
+### 4.2 Using bench_serving (embedding backend)
+
+`bench_serving` is built into SGLang. Use `--backend sglang-embedding` to target the `/v1/embeddings` endpoint. Make sure the server is running with `--is-embedding` at `http://127.0.0.1:30000`.
+
+```shell Command
+python -m sglang.bench_serving \
+  --backend sglang-embedding \
+  --base-url http://127.0.0.1:30000 \
+  --model Qwen/Qwen3-Embedding-8B \
+  --dataset-name random \
+  --random-input-len 512 \
+  --random-output-len 0 \
+  --num-prompts 1000 \
+  --max-concurrency 64 \
+  --request-rate 32
+```
+
+<Note>`--dataset-name random` samples token IDs from the ShareGPT dataset; the first run downloads ShareGPT from Hugging Face automatically. Set `export HF_ENDPOINT=https://hf-mirror.com` if network is not available. Set `--random-output-len 0` for embedding benchmarks — no output tokens are generated.</Note>
+
+Example output (for illustration only — actual results depend on your hardware and configuration):
+
+```text
+============ Serving Benchmark Result ============
+Backend:                                 sglang-embedding
+Traffic request rate:                    32.0
+Max request concurrency:                 64
+Successful requests:                     1000
+Benchmark duration (s):                  31.86
+Total input tokens:                      257891
+Total input text tokens:                 257891
+Request throughput (req/s):              31.39
+Input token throughput (tok/s):          8094.67
+Peak concurrent requests:                62
+Concurrency:                             6.67
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   212.34
+Median E2E Latency (ms):                 160.97
+P90 E2E Latency (ms):                    267.31
+P99 E2E Latency (ms):                    1445.94
+==================================================
+```
+
+## 5. Offline Performance Testing
+
+SGLang's `Engine` API runs inference in-process, without an HTTP server, letting you measure maximum throughput. `bench_offline_throughput` is built into SGLang and requires no extra installation or running server.
+
+<Note>`bench_offline_throughput` currently only supports text-generation (LLM) benchmarks. Multimodal and embedding models are not supported.</Note>
+
+### 5.1 Using bench_offline_throughput
+
+`bench_offline_throughput` uses the `Engine` API internally and measures pure inference throughput without HTTP overhead:
+
+```shell Command
+python -m sglang.bench_offline_throughput \
+  --model-path Qwen/Qwen2.5-7B-Instruct \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --num-prompts 500
+```
+
+<Note>`--dataset-name random` samples token IDs from the ShareGPT dataset; the first run downloads ShareGPT from Hugging Face automatically. Set `export HF_ENDPOINT=https://hf-mirror.com` if network is not available.</Note>
+
+<Tip>`--dataset-name random` with `--random-input-len` and `--random-output-len` gives you full control over input/output token counts. Fixed-length random data eliminates variance from real datasets, making throughput comparisons across runs deterministic and reliable.</Tip>
+
+## See also
+
+- [Bench Serving Guide](/docs/developer_guide/bench_serving) — all backends, datasets, and advanced options for `bench_serving`
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — environment setup for Ascend NPUs
+- [Evalscope Performance Testing Guide](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/quick_start.html) — full Evalscope documentation
+- [AISBench Documentation](https://ais-bench-benchmark.readthedocs.io/en/latest/) — full AISBench documentation

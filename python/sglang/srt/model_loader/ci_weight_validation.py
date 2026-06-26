@@ -1426,7 +1426,10 @@ def _validate_sharded_model(
     for group_key, group_info in shard_groups.items():
         total_shards = group_info["total"]
         found_shards = set(group_info["found_shards"])
-        expected_shards = set(range(1, total_shards + 1))
+        # Shards may be 0-indexed (e.g. inclusionAI/Ring-2.5-1T) or 1-indexed
+        # (e.g. deepseek-ai/DeepSeek-V3); both are valid HF conventions.
+        min_idx = min(found_shards) if found_shards else 1
+        expected_shards = set(range(min_idx, min_idx + total_shards))
 
         # Check for missing shards
         missing_shards = expected_shards - found_shards

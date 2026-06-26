@@ -1,0 +1,365 @@
+---
+title: "Qwen3-Next-80B-A3B-Instruct"
+metatags:
+  description: "Best Practice for Qwen3-Next-80B-A3B-Instruct on Ascend NPU"
+---
+
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-Next-80B-A3B-Instruct on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-Next-80B-A3B-Instruct Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_next_80b_a3b_instruct).
+</Note>
+
+### Low Latency
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 20ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-20ms) |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 6K+1.5K | 15.62ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in6k-out1k5-bs16) |
+
+### High Throughput
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-Next-80B-A3B-Instruct | Atlas 800I A3 | 2 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-next-80b-a3b-instruct-w8a8-2p-in3k5-out1k5-50ms) |
+
+## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
+
+### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN3K5 OUT1K5 20ms
+
+**Model**: Qwen3-Next-80B-A3B-Instruct
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 2
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 20ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=2000
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_WARMUP_TIMEOUT=3600
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+export ZBCCL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export ZBCCL_ENABLE_GRAPH=1
+export ZBCCL_LOCAL_MEM_SIZE=60416
+export ZBCCL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --page-size 128 \
+    --tp-size 2 \
+    --watchdog-timeout 9000 \
+    --mem-fraction-static 0.85 \
+    --disable-radix-cache \
+    --max-prefill-tokens 28672 \
+    --context-length 26384 \
+    --max-total-tokens 122304 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --chunked-prefill-size -1 \
+    --max-running-requests 2 \
+    --cuda-graph-bs 2 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 1 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 1 \
+    --random-range-ratio 1
+```
+
+### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN3K5 OUT1K5 50ms
+
+**Model**: Qwen3-Next-80B-A3B-Instruct
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 2
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=64
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_WARMUP_TIMEOUT=3600
+export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=59648
+export STREAMS_PER_DEVICE=32
+export ZBAL_ENABLE_GRAPH=1
+export ZBAL_HCCL_OP=allreduce,_allgather_base,allgather,broadcast,scatter,reduce_scatter,_reduce_scatter_base,alltoall_base
+export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --page-size 128 \
+    --tp-size 4 \
+    --watchdog-timeout 9000 \
+    --mem-fraction-static 0.75 \
+    --disable-radix-cache \
+    --max-prefill-tokens 14080 \
+    --context-length 26384 \
+    --chunked-prefill-size -1 \
+    --max-running-requests 300 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 300 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 300 \
+    --random-range-ratio 1
+```
+
+### Qwen3-Next-80B-A3B-Instruct W8A8 2P IN6K OUT1K5 BS16
+
+**Model**: Qwen3-Next-80B-A3B-Instruct
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 2
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 6K+1.5K
+
+**TPOT**: 15.62ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_USE_FIA=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=2000
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+export SGLANG_NPU_USE_MULTI_STREAM=0
+export SGLANG_WARMUP_TIMEOUT=3600
+export STREAMS_PER_DEVICE=32
+export TASK_QUEUE_ENABLE=1
+export ZBCCL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
+export ZBCCL_ENABLE_GRAPH=1
+export ZBCCL_LOCAL_MEM_SIZE=60416
+export ZBCCL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --page-size 128 \
+    --tp-size 4 \
+    --watchdog-timeout 9000 \
+    --mem-fraction-static 0.85 \
+    --disable-radix-cache \
+    --max-prefill-tokens 28672 \
+    --context-length 81920 \
+    --max-total-tokens 122304 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    --enable-dp-lm-head \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-draft-model-quantization unquant \
+    --chunked-prefill-size -1 \
+    --max-running-requests 16 \
+    --cuda-graph-bs 2 4 8 \
+    --mamba-ssm-dtype bfloat16 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 16 \
+    --random-input-len 6144 \
+    --random-output-len 1500 \
+    --num-prompts 16 \
+    --random-range-ratio 1
+```

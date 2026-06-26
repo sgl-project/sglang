@@ -33,10 +33,13 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
-    WatchLoadUpdateReq,
+    sock_recv,
+    sock_send,
 )
+from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -53,12 +56,19 @@ from sglang.srt.utils.common import (
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
-from sglang.srt.utils.network import NetworkAddress, bind_port, get_zmq_socket
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    bind_port,
+    get_zmq_socket,
+    get_zmq_socket_on_host,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 
 class LoadBalanceMethod(Enum):
@@ -83,14 +93,20 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.last_timestamp = [0.0] * dp_size
 
-    def update_budget(self, load_update: WatchLoadUpdateReq):
-        """Update the budget."""
-        for load in load_update.loads:
-            self.total_requests[load.dp_rank] = load.num_reqs
-            self.total_tokens[load.dp_rank] = load.num_tokens
+    def update_budget(self, loads):
+        """Update budget from shm snapshots, skipping stale reads."""
+        for load in loads:
+            if load.timestamp == self.last_timestamp[load.dp_rank]:
+                continue
+            self.last_timestamp[load.dp_rank] = load.timestamp
+            self.total_requests[load.dp_rank] = (
+                load.num_running_reqs + load.num_waiting_reqs
+            )
+            self.total_tokens[load.dp_rank] = load.num_total_tokens
 
-    def dispatch(self, method: LoadBalanceMethod):
+    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
@@ -104,6 +120,7 @@ class DPBudget:
 
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
+        self.total_tokens[target_rank] += estimated_tokens
         return target_rank
 
 
@@ -124,9 +141,6 @@ class DataParallelController:
         )
         self.run_scheduler_process_func = run_scheduler_process_func
 
-        # For DP balance
-        self.global_balance_id = 0
-
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
@@ -143,9 +157,19 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
+        self.refresh_load_budget_on_dispatch = self.load_balance_method in (
+            LoadBalanceMethod.TOTAL_REQUESTS,
+            LoadBalanceMethod.TOTAL_TOKENS,
+        )
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            server_args,
+            port_args,
+            caller="DataParallelController",
+        )
+        self._last_refresh_time = 0.0
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -157,7 +181,13 @@ class DataParallelController:
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
-            self.control_message_step = server_args.tp_size
+            # When local control broadcast is enabled, send control messages to
+            # every DP group leader (attn_tp_rank=0) so each leader broadcasts
+            # within its own attn_tp_group instead of the full tp_group.
+            # Otherwise fall back to the original behaviour: send to only the
+            # first leader, which then broadcasts over the full tp_group.
+            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
+            self.control_message_step = 1 if local_ctrl else server_args.tp_size
         else:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
@@ -177,20 +207,37 @@ class DataParallelController:
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if self.status[i]:
-                worker.send_pyobj(obj)
+                sock_send(worker, obj)
 
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
         for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
-
-    def handle_load_update_req(self, obj):
-        self.dp_budget.update_budget(obj)
+            sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
 
-    def dispatching_with_trace(self, req: Req):
+    def refresh_load_budget(self):
+        # Throttle to at most once per 20ms.  When a burst of requests
+        # arrives, dispatching_with_trace() calls this before every
+        # dispatch.  Each call reads the latest scheduler snapshot and
+        # overwrites the speculative +1 increments that DPBudget.dispatch()
+        # added for previously dispatched requests in this burst.  Without
+        # throttling, the budget resets to the (stale) scheduler-reported
+        # value on every request, causing the entire burst to land on a
+        # single DP rank.  The 20ms interval lets the burst complete
+        # using speculative counters, then refreshes from the real
+        # scheduler load for the next batch.
+        now = time.perf_counter()
+        if now - self._last_refresh_time < 0.02:
+            return
+        self._last_refresh_time = now
+        self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
+
+    def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
+        if refresh_load_budget and self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
+
         req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
 
         req.time_stats.set_dp_dispatch_time()
@@ -198,12 +245,16 @@ class DataParallelController:
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
+        if self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
         for req in batch_req:
-            self.dispatching_with_trace(req)
+            self.dispatching_with_trace(req, refresh_load_budget=False)
 
     def dispatch_batch_embedding(self, batch_req: BatchTokenizedEmbeddingReqInput):
+        if self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
         for req in batch_req:
-            self.dispatching_with_trace(req)
+            self.dispatching_with_trace(req, refresh_load_budget=False)
 
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -213,7 +264,7 @@ class DataParallelController:
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
-                (WatchLoadUpdateReq, self.handle_load_update_req),
+                (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
@@ -229,6 +280,7 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            tmp_port_args.instance_id = port_args.instance_id
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -330,11 +382,11 @@ class DataParallelController:
             connected_clients = 0
             while connected_clients < expected_clients:
                 # Wait for client handshake
-                client_rank = rep_socket.recv().decode()
+                client_rank = sock_recv(rep_socket).decode()
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
-                rep_socket.send_pyobj(worker_ports)
+                sock_send(rep_socket, worker_ports)
                 connected_clients += 1
                 logger.debug(
                     f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
@@ -343,7 +395,33 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
-            rep_socket.close()
+            if self.server_args.elastic_ep_backend is None:
+                rep_socket.close()
+            else:
+                threading.Thread(
+                    target=self._reply_ports_as_server,
+                    args=(rep_socket, worker_ports),
+                    daemon=True,
+                ).start()
+
+    def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: List[int]):
+        """
+        Runs as a background thread to broadcast worker ports for recovered EP ranks
+        """
+        while True:
+            # Wait for client handshake
+            try:
+                client_rank = sock_recv(rep_socket).decode()
+            except Exception:
+                logger.exception(
+                    "Failed to recv/decode handshake in reply thread; continue"
+                )
+                continue
+            logger.debug(f"Received handshake from node {client_rank}")
+
+            # Send worker ports to client
+            sock_send(rep_socket, worker_ports)
+            logger.debug(f"Sent worker ports to node {client_rank}")
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
@@ -355,10 +433,10 @@ class DataParallelController:
 
         try:
             # Send handshake with our node rank
-            req_socket.send(str(node_rank).encode())
+            sock_send(req_socket, str(node_rank).encode())
 
             # Receive worker ports
-            worker_ports = req_socket.recv_pyobj()
+            worker_ports = sock_recv(req_socket)
             logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
             return worker_ports
         except zmq.Again:
@@ -372,14 +450,26 @@ class DataParallelController:
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
     ):
+        if server_args.dist_init_addr is None:
+            bind_host = "127.0.0.1"
+        else:
+            bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
+
         # Pre-allocate worker ports on node 0 to avoid conflicts
         worker_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
-                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
-                worker_ports.append(port_and_socket[0])
-                self.workers[dp_rank] = port_and_socket[1]
-                logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
+                worker_port, worker_socket = get_zmq_socket_on_host(
+                    self.context, zmq.PUSH, host=bind_host
+                )
+                worker_ports.append(worker_port)
+                self.workers[dp_rank] = worker_socket
+                logger.debug(
+                    "Assigned port %s to worker %s on host %s",
+                    worker_port,
+                    dp_rank,
+                    bind_host,
+                )
 
         broadcasted_ports = self._broadcast_worker_ports(
             server_args, worker_ports if worker_ports else None
@@ -427,7 +517,7 @@ class DataParallelController:
 
                 if server_args.enable_dp_attention:
                     # dp attention has different sharding logic
-                    _, _, dp_rank = compute_dp_attention_world_info(
+                    _, _, dp_rank, _ = compute_dp_attention_world_info(
                         server_args.enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,
@@ -441,6 +531,7 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.instance_id = port_args.instance_id
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -489,8 +580,9 @@ class DataParallelController:
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                        server_args, gpu_id
+                    with (
+                        memory_saver_adapter.configure_subprocess(),
+                        numa_utils.configure_subprocess(server_args, gpu_id),
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
@@ -507,7 +599,7 @@ class DataParallelController:
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            sock_send(self.workers[req.routed_dp_rank], req)
             return True
         return False
 
@@ -518,7 +610,7 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                sock_send(self.workers[self.round_robin_counter], req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
@@ -531,41 +623,34 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        # Set default bootstrap_room if in FAKE auto mode and room is None
-        if (
-            req.bootstrap_room is None
-            and self.server_args.disaggregation_transfer_backend == "fake"
-        ):
-            req.bootstrap_room = self.round_robin_counter
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
-
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
-        self.workers[target_worker].send_pyobj(req)
+        estimated_tokens = len(req.input_ids)
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+        )
+        sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
@@ -584,7 +669,11 @@ def run_data_parallel_controller_process(
 
     configure_logger(server_args)
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill DP Controller"
@@ -596,11 +685,15 @@ def run_data_parallel_controller_process(
         controller = DataParallelController(
             server_args, port_args, run_scheduler_process_func
         )
+        scheduler_pids = [
+            proc.pid for proc in controller.scheduler_procs if proc is not None
+        ]
         pipe_writer.send(
             {
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
         if server_args.node_rank == 0:

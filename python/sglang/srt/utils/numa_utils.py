@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-import psutil
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -24,14 +24,23 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
-    numa_node = get_numa_node_if_available(server_args, gpu_id)
-    if numa_node is not None and envs.SGLANG_NUMA_BIND_V2.get():
-        numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
-        executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
-        with _mp_set_executable(executable=executable, debug_str=debug_str):
-            yield
-    else:
-        yield
+    if envs.SGLANG_NUMA_BIND_V2.get():
+        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        if numa_node is not None:
+            numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
+            if numactl_args is not None:
+                executable, debug_str = _create_numactl_executable(
+                    numactl_args=numactl_args
+                )
+                debug_str += (
+                    f", logical_gpu_id={gpu_id}, "
+                    f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                )
+                with _mp_set_executable(executable=executable, debug_str=debug_str):
+                    yield
+                    return
+    yield
 
 
 def _create_numactl_executable(numactl_args: str):
@@ -53,7 +62,7 @@ def _mp_set_executable(executable: str, debug_str: str):
 
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     multiprocessing.spawn.set_executable(executable)
-    logger.info(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
+    logger.debug(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
     try:
         yield
     finally:
@@ -61,7 +70,22 @@ def _mp_set_executable(executable: str, debug_str: str):
             os.fsdecode(multiprocessing.spawn.get_executable()) == executable
         ), f"{multiprocessing.spawn.get_executable()=}"
         multiprocessing.spawn.set_executable(old_executable)
-        logger.info(f"mp.set_executable revert to {old_executable}")
+        logger.debug(f"mp.set_executable revert to {old_executable}")
+
+
+def _get_nvml_device_index(device_id: int) -> int:
+    # _get_nvml_device_index is an internal PyTorch helper, so fall back to
+    # device_id directly if the helper is unavailable.
+    get_nvml_device_index = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if get_nvml_device_index is None:
+        logger.warning(
+            "torch.cuda._get_nvml_device_index is unavailable; falling back to "
+            f"device_id={device_id} as the NVML device index. This may select "
+            "the wrong physical GPU when CUDA_VISIBLE_DEVICES reorders devices "
+            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')})."
+        )
+        return device_id
+    return get_nvml_device_index(device_id)
 
 
 def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:
@@ -111,9 +135,74 @@ def numa_bind_to_node(node: int):
 
     if libnuma is None or libnuma.numa_available() < 0:
         logger.warning("numa not available on this system, skip bind action")
+        return
+
+    node_cpus = _node_cpus(node)
+    if node_cpus:
+        allowed_cpus = os.sched_getaffinity(0)
+        target_cpus = node_cpus & allowed_cpus
+        if not target_cpus:
+            _handle_numa_bind_failure(node, allowed_cpus)
+            return
+        os.sched_setaffinity(0, target_cpus)
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
-        libnuma.numa_set_preferred(ctypes.c_int(node))
+    libnuma.numa_set_preferred(ctypes.c_int(node))
+
+
+class _Bitmask(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_ulong), ("maskp", ctypes.POINTER(ctypes.c_ulong))]
+
+
+def _node_cpus(node: int) -> set:
+    libnuma = get_libnuma()
+    if libnuma is None or libnuma.numa_available() < 0:
+        return set()
+    libnuma.numa_allocate_cpumask.restype = ctypes.POINTER(_Bitmask)
+    libnuma.numa_node_to_cpus.argtypes = [ctypes.c_int, ctypes.POINTER(_Bitmask)]
+    libnuma.numa_node_to_cpus.restype = ctypes.c_int
+    libnuma.numa_bitmask_isbitset.argtypes = [ctypes.POINTER(_Bitmask), ctypes.c_uint]
+    libnuma.numa_bitmask_isbitset.restype = ctypes.c_int
+    libnuma.numa_bitmask_free.argtypes = [ctypes.POINTER(_Bitmask)]
+    mask = libnuma.numa_allocate_cpumask()
+    try:
+        if libnuma.numa_node_to_cpus(node, mask) != 0:
+            return set()
+        return {
+            i
+            for i in range(mask.contents.size)
+            if libnuma.numa_bitmask_isbitset(mask, i)
+        }
+    finally:
+        libnuma.numa_bitmask_free(mask)
+
+
+def _numactl_cpu_mem_args(node: int, gpu_id: int) -> Optional[str]:
+    node_cpus = _node_cpus(node)
+    if not node_cpus:
+        return f"--cpunodebind={node} --membind={node}"
+    allowed_cpus = os.sched_getaffinity(0)
+    target_cpus = node_cpus & allowed_cpus
+    if not target_cpus:
+        _handle_numa_bind_failure(node, allowed_cpus, gpu_id)
+        return None
+    if target_cpus == node_cpus:
+        return f"--cpunodebind={node} --membind={node}"
+    cpu_list = ",".join(str(c) for c in sorted(target_cpus))
+    return f"--physcpubind={cpu_list} --membind={node}"
+
+
+def _handle_numa_bind_failure(
+    node: int, allowed_cpus, gpu_id: Optional[int] = None
+) -> None:
+    gpu_str = f" for GPU {gpu_id}" if gpu_id is not None else ""
+    msg = (
+        f"NUMA node {node} has no CPU cores allowed by the current affinity "
+        f"{sorted(allowed_cpus)}, skipping NUMA binding{gpu_str}."
+    )
+    logger.warning(msg)
+    if envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.get():
+        raise RuntimeError(msg)
 
 
 def _can_set_mempolicy() -> bool:
@@ -142,18 +231,6 @@ def _is_numa_available() -> bool:
     if not os.path.isdir("/sys/devices/system/node/node1"):
         return False
 
-    # Check if affinity is already constrained
-    pid = os.getpid()
-    process = psutil.Process(pid)
-    cpu_affinity = process.cpu_affinity()
-    all_cpus = list(range(psutil.cpu_count()))
-    constrained_affinity = cpu_affinity != all_cpus
-    if constrained_affinity:
-        logger.warning(
-            "NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration."
-        )
-        return False
-
     if not shutil.which("numactl") and envs.SGLANG_NUMA_BIND_V2.get():
         logger.debug(
             "numactl command not found, skipping NUMA node configuration for GPU. Install numactl (e.g., apt-get install numactl) to enable automatic NUMA binding."
@@ -174,7 +251,7 @@ def _query_numa_node_for_gpu(device_id: int):
     Get the NUMA node affinity list for a GPU device.
 
     Args:
-        device_id: GPU device index.
+        device_id: CUDA logical device index (post-CUDA_VISIBLE_DEVICES).
     Returns:
         List of NUMA node IDs that have affinity with the device.
     """
@@ -187,7 +264,11 @@ def _query_numa_node_for_gpu(device_id: int):
     try:
         pynvml.nvmlInit()
 
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        # device_id is a CUDA logical index. Convert it to the corresponding
+        # NVML index so reordered CUDA_VISIBLE_DEVICES maps to the right GPU.
+        # _get_nvml_device_index takes CUDA_VISIBLE_DEVICES into account.
+        nvml_device_id = _get_nvml_device_index(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
         numa_node_count = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
 
         c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8

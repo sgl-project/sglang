@@ -12,7 +12,7 @@ from typing import Callable, List, Optional
 
 import psutil
 
-from sglang.srt.utils.common import pyspy_dump_schedulers
+from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
 
@@ -193,9 +193,6 @@ class SubprocessWatchdog:
             target=self._monitor_loop, daemon=True, name="subprocess-watchdog"
         )
         self._thread.start()
-        logger.info(
-            f"SubprocessWatchdog started, monitoring {len(self._processes)} process(es)"
-        )
 
     def stop(self) -> None:
         self._stop_event.set()

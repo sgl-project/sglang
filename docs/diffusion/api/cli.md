@@ -73,16 +73,21 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
+- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
 - `--num-gpus {N}`: number of GPUs to use
+- `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and keeps safe offload defaults, using FSDP only for validated DiT-offload replacement paths; use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
 - `--tp-size {N}`: tensor parallelism size, mainly for encoders
 - `--sp-degree {N}`: sequence parallelism size
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
+- `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
 - `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
+- `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 
 ### Sampling and output
 
 - `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`
+- `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
@@ -96,6 +101,8 @@ For quantized transformer checkpoints, prefer:
 - `--model-path` for the base pipeline
 - `--transformer-path` for a quantized `transformers` transformer component folder
 - `--transformer-weights-path` for a quantized safetensors file, directory, or repo
+- `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
+- `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
 See [Quantization](../quantization.md) for supported quantization families and examples.
 
@@ -153,6 +160,21 @@ HTTP server-only arguments are ignored by `sglang generate`.
 
 For diffusers pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../performance/cache/cache_dit.md).
 
+### Layerwise Offload
+
+Use layerwise offload when a large component does not fit comfortably in GPU memory. By default, `--dit-layerwise-offload` only applies to legacy DiT components. Use `--layerwise-offload-components` to select pipeline component names explicitly (`--layerwise-offload-modules` is accepted as an alias):
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --dit-layerwise-offload \
+  --layerwise-offload-components transformer text_encoder \
+  --dit-offload-prefetch-size 0 \
+  --prompt "A quiet city street after rain"
+```
+
+The values must match keys in the selected pipeline's `pipeline.modules`, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Use `all` to select every layerwise-offloadable component. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+
 ## Serve
 
 `sglang serve` starts the HTTP server and keeps the model loaded for repeated requests.
@@ -193,6 +215,28 @@ sglang serve \
 ```
 
 The component key must match the key in the model's `model_index.json`, and the path must be either a Hugging Face repo ID or a complete component directory.
+
+## Component Attention Backend Overrides
+
+Use `--component-attention-backends` when one pipeline component needs a different native attention backend from the global `--attention-backend`.
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.3 \
+  --attention-backend fa \
+  --component-attention-backends text_encoder=torch_sdpa
+```
+
+The component key must match a pipeline module key such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`. Component overrides take precedence over the global `--attention-backend` only while that component is being constructed.
+
+You can also pass dotted CLI entries:
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --component-attention-backends.text_encoder torch_sdpa \
+  --component-attention-backends.transformer fa
+```
 
 ## Diffusers Backend
 

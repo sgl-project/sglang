@@ -1,5 +1,8 @@
 from safetensors.torch import load_file as safetensors_load_file
 
+from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
+    LTX2ConnectorConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -14,7 +17,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
 class AdapterLoader(ComponentLoader):
@@ -48,12 +51,13 @@ class AdapterLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         target_device = get_local_torch_device()
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-
-        from types import SimpleNamespace
+        default_dtype = resolve_precision(
+            server_args, "connectors", precision_attr="dit_precision"
+        )
 
         with set_default_torch_dtype(default_dtype), skip_init_modules():
-            connector_cfg = SimpleNamespace(**config)
+            connector_cfg = LTX2ConnectorConfig()
+            connector_cfg.update_model_arch(config)
             model = model_cls(connector_cfg).to(
                 device=target_device, dtype=default_dtype
             )

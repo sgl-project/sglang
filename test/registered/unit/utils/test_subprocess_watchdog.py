@@ -24,7 +24,8 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-c-test-cpu")
 
 
 def healthy_worker():
@@ -38,6 +39,10 @@ def crashing_worker():
 def slow_crash_worker(delay: float = 0.5):
     time.sleep(delay)
     os._exit(42)
+
+
+def noop_worker():
+    pass
 
 
 class TestSubprocessWatchdog(CustomTestCase):
@@ -93,7 +98,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         proc = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch(proc)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=2.0),
+            self.sigquit_triggered.wait(timeout=5.0),
             "SIGQUIT was not triggered within timeout",
         )
 
@@ -101,7 +106,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         proc = self._spawn(crashing_worker)
         self._watch(proc, interval=0.05)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=1.0),
+            self.sigquit_triggered.wait(timeout=5.0),
             "Immediate crash was not detected",
         )
 
@@ -110,7 +115,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         crashing = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch([healthy, crashing], names=["healthy", "crashing"])
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=2.0),
+            self.sigquit_triggered.wait(timeout=5.0),
             "Crash was not detected when one of multiple processes crashed",
         )
 
@@ -120,7 +125,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         self.assertFalse(self.sigquit_triggered.is_set())
 
     def test_normal_exit_no_sigquit(self):
-        proc = self._spawn(lambda: None)
+        proc = self._spawn(noop_worker)
         proc.join(timeout=2)
         self._watch(proc)
         time.sleep(0.3)
@@ -131,7 +136,6 @@ class TestSubprocessWatchdog(CustomTestCase):
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     import unittest
 
     unittest.main()

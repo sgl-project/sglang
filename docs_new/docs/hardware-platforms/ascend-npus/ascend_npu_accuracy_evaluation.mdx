@@ -1,0 +1,277 @@
+---
+title: "Ascend NPU Accuracy Evaluation"
+metatags:
+  description: "Complete guide for SGLang model accuracy evaluation on Ascend NPU using EvalScope, covering text/multimodal scenarios."
+---
+
+# Ascend NPU Accuracy Evaluation
+
+This document describes how to perform accuracy evaluation for SGLang models running on Ascend NPU using a tool: **EvalScope**. The following scenarios are covered:
+
+- **Online Testing**: Evaluate via API interface after starting SGLang server
+- **Text Models**: Using Qwen2.5-7B-Instruct as example
+- **Multimodal Models**: Using Qwen2.5-VL-7B-Instruct as example
+
+---
+
+## Environment Setup
+
+<Warning>
+Ensure sufficient disk space before proceeding. The Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
+First, launch the SGLang environment using the provided container image:
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```shell Command
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
+
+docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci8 --device=/dev/davinci9 --device=/dev/davinci10 --device=/dev/davinci11 \
+    --device=/dev/davinci12 --device=/dev/davinci13 --device=/dev/davinci14 --device=/dev/davinci15 \
+    --device=/dev/davinci_manager \
+    --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin \
+    --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule \
+    --volume ~/.cache/:/root/.cache/ \
+    --entrypoint=bash \
+    $IMAGE
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```shell Command
+export IMAGE=quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
+
+docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci_manager \
+    --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin \
+    --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule \
+    --volume ~/.cache/:/root/.cache/ \
+    --entrypoint=bash \
+    $IMAGE
+```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Using EvalScope
+
+[EvalScope](https://github.com/modelscope/evalscope) is a comprehensive model evaluation framework from ModelScope, supporting both accuracy evaluation and performance stress testing.
+
+### Install EvalScope
+
+```shell Command
+# Method1 Installing via pip
+pip install evalscope
+
+# Method2 Installing from source
+git clone https://github.com/modelscope/evalscope.git
+cd evalscope/
+pip install -e .
+```
+
+### Online Text Model Testing
+
+This section covers online evaluation scenarios where the SGLang server is already running.
+
+#### Start SGLang Server
+
+```shell Command
+# Set HuggingFace mirror (if network access is restricted)
+export HF_ENDPOINT=https://hf-mirror.com
+
+# Start text model server
+sglang serve --model-path /home/weights/Qwen2.5-7B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000 &
+```
+For more details of SGLang server, refer to the [Ascend NPU Quick Start](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
+
+#### Execute Accuracy Evaluation
+
+EvalScope connects to the SGLang server via OpenAI-compatible API. The following example uses the GSM8K dataset:
+
+```shell Command
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets gsm8k \
+ --limit 10
+```
+
+Upon completion, results similar to the following will be displayed:
+
+```
++---------------------+-----------+----------+----------+-------+---------+---------+
+| Model               | Dataset   | Metric   | Subset   |   Num |   Score | Cat.0   |
++=====================+===========+==========+==========+=======+=========+=========+
+| Qwen2.5-7B-Instruct | gsm8k     | mean_acc | main     |     5 |     1.0 | default |
++---------------------+-----------+----------+----------+-------+---------+---------+
+```
+
+> **Note**: Output format may vary slightly across different EvalScope versions. The above example is from EvalScope 1.6.x. Ensure the `--model` parameter matches the model name returned by the SGLang server's `/v1/models` endpoint. When starting the server with an HF path (e.g., `Qwen/Qwen2.5-7B-Instruct`), use that path directly. For local paths, pass the full path or the model name returned by `/v1/models`.
+
+#### Common Datasets for Online Evaluation
+
+```shell Command
+# MMLU
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets mmlu
+
+# CEval (Chinese evaluation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets ceval
+
+# MATH-500
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets math_500
+
+# HumanEval (code generation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets humaneval
+```
+
+### Online Multimodal Model Testing
+
+#### Start Multimodal Model Server
+
+```shell Command
+# Start multimodal model server (Qwen2.5-VL-7B-Instruct)
+# Multimodal models require both --attention-backend and --mm-attention-backend
+sglang serve --model-path /home/weights/Qwen2.5-VL-7B-Instruct \
+    --attention-backend ascend \
+    --mm-attention-backend ascend_attn \
+    --host 0.0.0.0 --port 30000 &
+```
+
+#### Execute Multimodal Accuracy Evaluation
+
+```shell Command
+# MMBench (multimodal evaluation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-VL-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets mm_bench
+
+# MMMU (multimodal comprehensive understanding)
+evalscope eval \
+ --model /home/weights/Qwen2.5-VL-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets mmmu
+
+# HallusionBench (hallucination evaluation)
+evalscope eval \
+ --model /home/weights/Qwen2.5-VL-7B-Instruct \
+ --api-url http://localhost:30000/v1 \
+ --api-key EMPTY \
+ --eval-type openai_api \
+ --datasets hallusion_bench
+```
+
+For more details, refer to the [EvalScope documentation](https://evalscope.readthedocs.io/).
+
+---
+
+## Troubleshooting
+
+### SGLang Server Startup Failure
+
+1. Verify device mapping: A2 uses `davinci[0-7]`, A3 uses `davinci[0-15]`
+2. Confirm image tag matches device type: A2 uses `...-910b`, A3 uses `...-a3`
+3. Check NPU status with `npu-smi info`
+4. First run requires model download; set `HF_ENDPOINT=https://hf-mirror.com` if network access is restricted
+
+### EvalScope Connection Failure to Server
+
+1. Confirm SGLang server started successfully (look for `Application startup complete` in logs)
+2. Verify `--api-url` points to the correct port (SGLang defaults to `30000`)
+3. Ensure URL ends with `/v1`, e.g., `http://localhost:30000/v1`
+
+### EvalScope SSL certificate verification failed
+When using EvalScope commands without specifying a dataset or model path, it will attempt to download automatically, which may encounter an SSL certificate verification error:
+```
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 605, in get
+    return self.request("GET", url, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 592, in request
+    resp = self.send(prep, **send_kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py", line 706, in send
+    r = adapter.send(request, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/requests/adapters.py", line 676, in send
+    raise SSLError(e, request=request)
+requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/gsm8k (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
+[ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
+```
+You can navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify` to `False` to resolve this.
+
+### EvalScope Request Retry Timeout
+If EvalScope keeps retrying requests with errors like:
+```
+2026-06-22 03:09:03 - evalscope - WARNING: Attempt 4 / 5 failed: ....... Retrying...
+2026-06-22 03:09:14 - evalscope - INFO: Evaluating[ceval]   0%| 0/520 [Elapsed: 02:00 < Remaining: ?, ?it/s]
+2026-06-22 03:09:19,557 - openai._base_client - INFO: Retrying request to /chat/completions in 0.447260 seconds
+2026-06-22 03:09:26,088 - openai._base_client - INFO: Retrying request to /chat/completions in 0.992551 seconds
+```
+This is usually caused by the HTTP proxy intercepting requests to the local SGLang server. Disable the proxy with:
+```shell Command
+unset http_proxy
+unset https_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
+```
+
+### Download Dataset Error
+For this error
+```
+root@localhost:/home/# wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
+--2026-05-12 12:08:01--  https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv
+Connecting to 141.5.152.215:6688... connected.
+ERROR: cannot verify www.modelscope.cn's certificate, issued by ‘CN=Huawei Web Secure Internet Gateway CA V2,OU=IT,O=Huawei,L=Shenzhen,ST=GuangDong,C=CN’:
+  Self-signed certificate encountered.
+To connect to www.modelscope.cn insecurely, use `--no-check-certificate'.
+```
+You can add `--no-check-certificate'
+```
+wget https://www.modelscope.cn/datasets/evalscope/MMStar/resolve/master/MMStar.tsv --no-check-certificate
+```
+
+For additional assistance, refer to [SGLang GitHub Issues](https://github.com/sgl-project/sglang/issues).

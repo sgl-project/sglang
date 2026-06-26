@@ -30,7 +30,7 @@ from sglang.srt.debug_utils.comparator.output_types import (
 from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper, _RecomputeStatus
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 
 _FIXED_EXP_NAME = "my_exp_name"
 
@@ -285,7 +285,7 @@ class TestEntrypointGroupingRaw:
         assert summary.total == 2
         assert summary.passed == 2
 
-    def test_text_output_smoke(self, tmp_path, capsys):
+    def test_text_output_format(self, tmp_path, capsys):
         """Text output format renders without errors and contains Config/Summary sections."""
         baseline_path, target_path = _create_dumps(tmp_path, ["tensor_a"])
         argv = _make_argv(

@@ -649,7 +649,10 @@ def _install_sglang_stubs(monkeypatch):
     entry_mod = types.ModuleType("sglang.srt.entrypoints")
     http_server_mod = types.ModuleType("sglang.srt.entrypoints.http_server")
     server_args_mod = types.ModuleType("sglang.srt.server_args")
+    # sglang.srt.utils was refactored from a module into a package; launch_server.py
+    # imports from sglang.srt.utils.network, so the stub must model the submodule.
     utils_mod = types.ModuleType("sglang.srt.utils")
+    network_mod = types.ModuleType("sglang.srt.utils.network")
 
     def launch_server(_args):
         return None
@@ -684,7 +687,8 @@ def _install_sglang_stubs(monkeypatch):
 
     http_server_mod.launch_server = launch_server
     server_args_mod.ServerArgs = ServerArgs
-    utils_mod.is_port_available = is_port_available
+    network_mod.is_port_available = is_port_available
+    utils_mod.network = network_mod
 
     # Also stub external deps imported at module top-level
     def _dummy_get(*_a, **_k):
@@ -706,6 +710,7 @@ def _install_sglang_stubs(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args_mod)
     monkeypatch.setitem(sys.modules, "sglang.srt.utils", utils_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.utils.network", network_mod)
 
 
 def test_router_defaults_and_start(monkeypatch):

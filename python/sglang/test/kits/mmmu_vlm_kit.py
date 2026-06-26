@@ -13,6 +13,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    dump_metric,
     popen_launch_server,
 )
 
@@ -197,11 +198,7 @@ class MMMUMixin:
             # Run evaluation
             self.run_mmmu_eval(self.model, output_path)
 
-            # Get the result file
-            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
 
             if not result_files:
                 raise FileNotFoundError(f"No JSON result files found in {output_path}")
@@ -215,6 +212,12 @@ class MMMUMixin:
             # Process the result
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
             print(f"Model {self.model} achieved accuracy: {mmmu_accuracy:.4f}")
+
+            dump_metric(
+                "mmmu_score",
+                mmmu_accuracy,
+                labels={"model": self.model, "eval": "mmmu", "api": "lmms-eval"},
+            )
 
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
@@ -382,11 +385,7 @@ class MMMUMultiModelTestBase(CustomTestCase):
             # Run evaluation
             self.run_mmmu_eval(model.model, output_path)
 
-            # Get the result file
-            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
 
             if not result_files:
                 raise FileNotFoundError(f"No JSON result files found in {output_path}")
@@ -401,6 +400,12 @@ class MMMUMultiModelTestBase(CustomTestCase):
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
             print(
                 f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}"
+            )
+
+            dump_metric(
+                "mmmu_score",
+                mmmu_accuracy,
+                labels={"model": model.model, "eval": "mmmu", "api": "lmms-eval"},
             )
 
             # Capture server output if requested

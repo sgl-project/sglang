@@ -2,349 +2,53 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.attention.triton_ops.cache_ops import (
+    concat_and_cast_mha_k_kernel as concat_and_cast_mha_k_kernel,
+)
+from sglang.srt.layers.attention.triton_ops.cache_ops import (
+    concat_and_cast_mha_k_triton as concat_and_cast_mha_k_triton,
+)
+from sglang.srt.layers.attention.triton_ops.cache_ops import (
+    launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,
+)
+from sglang.srt.layers.attention.triton_ops.cache_ops import (
+    reshape_and_cache_flash as reshape_and_cache_flash,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    create_flashinfer_kv_indices_triton as create_flashinfer_kv_indices_triton,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
+)
+from sglang.srt.layers.attention.triton_ops.kv_indices import (
+    get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
+)
+from sglang.srt.layers.attention.triton_ops.pad import (
+    pad_sequence_with_mask as pad_sequence_with_mask,
+)
+from sglang.srt.layers.attention.triton_ops.pad import (
+    pad_sequence_with_mask_kernel as pad_sequence_with_mask_kernel,
+)
+from sglang.srt.layers.attention.triton_ops.pad import (
+    seqlens_expand_kernel as seqlens_expand_kernel,
+)
+from sglang.srt.layers.attention.triton_ops.pad import (
+    seqlens_expand_triton as seqlens_expand_triton,
+)
+from sglang.srt.layers.attention.triton_ops.rope_cache import (
+    fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
+)
 from sglang.srt.utils import is_cuda
-
-_FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
-FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import concat_mla_absorb_q
-
-
-@triton.jit
-def create_flashinfer_kv_indices_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices_ptr,
-    page_kernel_lens_ptr,
-    kv_indptr,
-    kv_start_idx,
-    kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(axis=0)
-
-    # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
-    kv_indices_offset = tl.load(kv_indptr + pid)
-
-    kv_start = 0
-    kv_end = 0
-    if kv_start_idx:
-        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
-        kv_end = kv_start
-    kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for i in range(num_loop):
-        # index into req_to_token_ptr needs to be int64
-        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
-        mask = offset < kv_end - kv_start
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
-            mask=mask,
-        )
-        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
-
-
-def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
-    num_page_per_block = _FLASHMLA_CREATE_KV_BLOCK_SIZE // page_size
-    return num_page_per_block
-
-
-@triton.jit
-def create_flashmla_kv_indices_triton(
-    req_to_token_ptr,  # [max_batch, max_context_len]
-    req_pool_indices_ptr,
-    page_kernel_lens_ptr,
-    kv_start_idx,
-    kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
-    kv_indices_ptr_stride: tl.constexpr,
-    PAGED_SIZE: tl.constexpr = 64,
-):
-    NUM_PAGE_PER_BLOCK: tl.constexpr = (
-        FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON // PAGED_SIZE
-    )
-    pid = tl.program_id(axis=0)
-
-    # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
-
-    kv_start = 0
-    kv_end = 0
-    if kv_start_idx:
-        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
-        kv_end = kv_start
-
-    kv_end += tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
-
-    num_paged = tl.cdiv(kv_end - kv_start, PAGED_SIZE)
-    num_pages_loop = tl.cdiv(kv_end - kv_start, FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON)
-
-    for i in range(num_pages_loop):
-        # index into req_to_token_ptr needs to be int64
-        paged_offset = (
-            tl.arange(0, NUM_PAGE_PER_BLOCK).to(tl.int64) + i * NUM_PAGE_PER_BLOCK
-        ) * PAGED_SIZE
-        paged_offset_out = tl.arange(0, NUM_PAGE_PER_BLOCK) + i * NUM_PAGE_PER_BLOCK
-
-        mask = paged_offset < num_paged * PAGED_SIZE
-        mask_out = paged_offset_out < num_paged
-
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + paged_offset,
-            mask=mask,
-        )
-        tl.store(
-            kv_indices_ptr + pid * kv_indices_ptr_stride + paged_offset_out,
-            data // PAGED_SIZE,
-            mask=mask_out,
-        )
-
-
-@triton.jit
-def concat_and_cast_mha_k_kernel(
-    k_ptr,
-    k_nope_ptr,
-    k_rope_ptr,
-    head_cnt: tl.constexpr,
-    k_stride0: tl.constexpr,
-    k_stride1: tl.constexpr,
-    nope_stride0: tl.constexpr,
-    nope_stride1: tl.constexpr,
-    rope_stride0: tl.constexpr,
-    nope_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-):
-    pid_loc = tl.program_id(0)
-    head_range = tl.arange(0, head_cnt)
-
-    k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
-
-    nope_offs = tl.arange(0, nope_dim)
-
-    src_nope_ptr = (
-        k_nope_ptr
-        + pid_loc * nope_stride0
-        + head_range[:, None] * nope_stride1
-        + nope_offs[None, :]
-    )
-    dst_nope_ptr = k_head_ptr + nope_offs[None, :]
-
-    src_nope = tl.load(src_nope_ptr)
-    tl.store(dst_nope_ptr, src_nope)
-
-    rope_offs = tl.arange(0, rope_dim)
-    src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
-    dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
-    src_rope = tl.load(src_rope_ptr)
-    tl.store(dst_rope_ptr, src_rope)
-
-
-def concat_and_cast_mha_k_triton(
-    k: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
-):
-    # The source data type will be implicitly converted to the target data type.
-    assert (
-        len(k.shape) == 3 and len(k_nope.shape) == 3 and len(k_rope.shape) == 3
-    ), f"shape should be 3d, but got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[0] == k_nope.shape[0] and k.shape[0] == k_rope.shape[0]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[1] == k_nope.shape[1] and 1 == k_rope.shape[1]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-    assert (
-        k.shape[-1] == k_nope.shape[-1] + k_rope.shape[-1]
-    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
-
-    nope_dim = k_nope.shape[-1]
-    rope_dim = k_rope.shape[-1]
-    grid = (k.shape[0],)
-
-    concat_and_cast_mha_k_kernel[grid](
-        k,
-        k_nope,
-        k_rope,
-        k.shape[1],
-        k.stride(0),
-        k.stride(1),
-        k_nope.stride(0),
-        k_nope.stride(1),
-        k_rope.stride(0),
-        nope_dim,
-        rope_dim,
-    )
-
-
-@triton.jit
-def pad_sequence_with_mask_kernel(
-    input_ptr,  # (total_tokens, hidden)
-    offsets_ptr,  # (B,)
-    lengths_ptr,  # (B,)
-    output_ptr,  # (B, max_len, hidden)
-    mask_ptr,  # (B, max_len)
-    max_len,
-    hidden_dim,
-    BLOCK_M: tl.constexpr,  # seq block
-    BLOCK_D: tl.constexpr,  # hidden block
-):
-    b = tl.program_id(0)  # batch index
-    m = tl.program_id(1)  # seq block index
-
-    offset = tl.load(offsets_ptr + b)
-    length = tl.load(lengths_ptr + b)
-
-    seq_ids = m * BLOCK_M + tl.arange(0, BLOCK_M)
-    hid_ids = tl.arange(0, BLOCK_D)
-
-    seq_mask = seq_ids < max_len
-    valid_token = seq_ids < length
-
-    # input index
-    in_token = offset + seq_ids
-    in_ptr = input_ptr + in_token[:, None] * hidden_dim + hid_ids[None, :]
-
-    # output index
-    out_ptr = (
-        output_ptr
-        + b * max_len * hidden_dim
-        + seq_ids[:, None] * hidden_dim
-        + hid_ids[None, :]
-    )
-
-    values = tl.load(
-        in_ptr,
-        mask=valid_token[:, None] & (hid_ids[None, :] < hidden_dim),
-        other=0.0,
-    )
-
-    tl.store(
-        out_ptr,
-        values,
-        mask=seq_mask[:, None] & (hid_ids[None, :] < hidden_dim),
-    )
-
-    # attention mask
-    if tl.program_id(2) == 0:
-        mask_out_ptr = mask_ptr + b * max_len + seq_ids
-        tl.store(mask_out_ptr, valid_token, mask=seq_mask)
-
-
-def pad_sequence_with_mask(
-    input_emb,  # (total_tokens, hidden)
-    offsets,  # (B,)
-    lengths,  # (B,)
-    max_len,
-):
-    B = offsets.shape[0]
-    hidden_dim = input_emb.shape[1]
-
-    output = torch.zeros(
-        (B, max_len, hidden_dim),
-        device=input_emb.device,
-        dtype=input_emb.dtype,
-    )
-    attn_mask = torch.empty(
-        (B * max_len),
-        device=input_emb.device,
-        dtype=torch.bool,
-    )
-
-    BLOCK_D = triton.next_power_of_2(hidden_dim)
-    BLOCK_M = triton.next_power_of_2(max_len)
-
-    grid = (
-        B,
-        triton.cdiv(max_len, BLOCK_M),
-        1,
-    )
-
-    pad_sequence_with_mask_kernel[grid](
-        input_emb,
-        offsets,
-        lengths,
-        output,
-        attn_mask,
-        max_len,
-        hidden_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_D=BLOCK_D,
-    )
-
-    return B, output, attn_mask
-
-
-@triton.jit
-def seqlens_expand_kernel(
-    extend_seq_lens_ptr,  # [N]
-    seq_lens_ptr,  # [N]
-    offsets_ptr,  # [N+1]
-    output_ptr,  # [sum(extend_seq_lens)]
-    N,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    if pid >= N:
-        return
-
-    qo_len = tl.load(extend_seq_lens_ptr + pid)
-    kv_len = tl.load(seq_lens_ptr + pid)
-
-    start = kv_len - qo_len + 1
-    out_offset = tl.load(offsets_ptr + pid)
-
-    offs = tl.arange(0, BLOCK)
-    mask = offs < qo_len
-
-    values = start + offs
-    tl.store(output_ptr + out_offset + offs, values, mask=mask)
-
-
-def seqlens_expand_triton(
-    extend_seq_lens: torch.Tensor,
-    seq_lens: torch.Tensor,
-    total_len: int,
-    max_q_len: int,
-):
-    """
-    extend_seq_lens: [N], int32, CUDA
-    seq_lens:        [N], int32, CUDA
-    """
-    assert extend_seq_lens.is_cuda
-    assert seq_lens.is_cuda
-
-    N = extend_seq_lens.numel()
-
-    offsets = torch.zeros(N + 1, device=extend_seq_lens.device, dtype=torch.int32)
-    offsets[1:] = torch.cumsum(extend_seq_lens, dim=0)
-    output = torch.empty(total_len, device=extend_seq_lens.device, dtype=torch.int32)
-
-    BLOCK = triton.next_power_of_2(max_q_len)
-    grid = (N,)
-
-    seqlens_expand_kernel[grid](
-        extend_seq_lens,
-        seq_lens,
-        offsets,
-        output,
-        N,
-        BLOCK=BLOCK,
-    )
-
-    return output
+    from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
 
 
 # When num_kv_heads=1, we have tensors with degenerate strides,
@@ -462,6 +166,7 @@ def mla_quantize_and_rope_for_fp8(
         # Quantization scales (set to 1.0 for no additional scaling)
         quant_scale_q=1.0,
         quant_scale_kv=1.0,
+        enable_pdl=is_arch_support_pdl(),
     )
 
     return q_out, k_nope_out, k_rope_out
@@ -472,6 +177,104 @@ def concat_mla_absorb_q_general(q_nope, q_rope):
         return concat_mla_absorb_q(q_nope, q_rope)
     else:
         return torch.cat([q_nope, q_rope], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Decode Context Parallel (DCP) helpers.
+#
+# Not part of upstream main (PR #26000 centralized the other Triton utility
+# kernels into triton_ops/*). These three live here because they are DCP-only:
+#   - create_triton_kv_indices_for_dcp_triton: per-rank local KV indices
+#   - get_dcp_lens: per-rank visible KV length
+#   - cp_lse_ag_out_rs: merge DCP partial attention via natural-log LSE
+# ---------------------------------------------------------------------------
+@triton.jit
+def create_triton_kv_indices_for_dcp_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    dcp_kernel_lens_ptr,
+    kv_indptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    kv_indices_offset = tl.load(kv_indptr + pid)
+
+    kv_start = 0
+    if kv_start_idx:
+        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
+
+    # First absolute token position in this range owned by dcp_rank.
+    # Triton follows C-style remainder for negative values, so avoid
+    # computing the offset as a negative remainder when kv_start > dcp_rank.
+    kv_start_mod = kv_start % dcp_size
+    first = kv_start + ((dcp_rank + dcp_size - kv_start_mod) % dcp_size)
+    local_len = tl.load(dcp_kernel_lens_ptr + pid).to(tl.int32)
+
+    num_loop = tl.cdiv(local_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+        mask = offset < local_len
+        abs_pos = first + offset * dcp_size
+        data = tl.load(
+            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + abs_pos,
+            mask=mask,
+        )
+        tl.store(
+            kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask
+        )
+
+
+def get_dcp_lens(
+    lens: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    start: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if dcp_size == 1:
+        return lens
+    if start is None:
+        return lens // dcp_size + (dcp_rank < lens % dcp_size)
+
+    first = start + torch.remainder(dcp_rank - start, dcp_size)
+    remaining = start + lens - first
+    return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
+
+
+def cp_lse_ag_out_rs(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    return_lse: bool = False,
+):
+    """Merge DCP partial attention outputs using natural-log LSE."""
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).view(
+        (cp_group.world_size,) + cp_attn_lse.shape
+    )
+    global_lse = torch.logsumexp(lses, dim=0)
+    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+
+    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    out = cp_group.all_reduce(out)
+
+    cp_num_heads = global_lse.shape[1] // cp_group.world_size
+    cp_rank = cp_group.rank_in_group
+    head_start = cp_num_heads * cp_rank
+    head_end = cp_num_heads * (cp_rank + 1)
+    out = out[:, head_start:head_end, :].contiguous()
+    if return_lse:
+        return out, global_lse[:, head_start:head_end].contiguous()
+    return out
 
 
 @triton.jit
@@ -658,6 +461,270 @@ def launch_reshape_and_cache_flash(
         HAS_SWA=(swa_slot_mapping is not None),
         USE_SCALE=(k_scale is not None),
     )
+
+
+@triton.jit
+def reshape_and_cache_shuffle_5d(
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    swa_slot_mapping_ptr,
+    key_stride_token,
+    value_stride_token,
+    num_heads,
+    head_size,
+    block_size,
+    X: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+):
+    """Scatter per-token (num_tokens, num_heads, head_size) K/V into the
+    SHUFFLE 5D "vectorized" KV cache layout used by aiter CK
+    `mha_batch_prefill_func` and aiter `pa_decode_gluon`.
+
+    K cache shape: (num_blocks, num_heads, head_size // X, block_size, X)
+    V cache shape: (num_blocks, num_heads, block_size // X, head_size, X)
+    where X = 16 // element_size (=8 for bf16/fp16, =16 for fp8).
+    block_size must be divisible by X, and head_size must be divisible by X.
+
+    Each program handles one token and a HEAD_BLOCK-wide slice of heads.
+    """
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if HAS_SWA:
+        slot_idx = tl.load(swa_slot_mapping_ptr + slot_idx)
+    if slot_idx < 0:
+        return
+
+    block_idx = slot_idx // block_size
+    slot_in_page = slot_idx % block_size
+    page_outer = slot_in_page // X
+    page_inner = slot_in_page % X
+
+    head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    head_mask = head_idx < num_heads
+    d = tl.arange(0, BLOCK_D)
+    d_mask = d < head_size
+    d_outer = d // X
+    d_inner = d % X
+
+    src_off = token_idx * key_stride_token + head_idx[:, None] * head_size + d[None, :]
+    src_mask = head_mask[:, None] & d_mask[None, :]
+    k = tl.load(key_ptr + src_off, mask=src_mask)
+    src_off_v = (
+        token_idx * value_stride_token + head_idx[:, None] * head_size + d[None, :]
+    )
+    v = tl.load(value_ptr + src_off_v, mask=src_mask)
+
+    layer_stride = num_heads * head_size * block_size
+    head_stride = head_size * block_size
+
+    k_tgt = (
+        block_idx * layer_stride
+        + head_idx[:, None] * head_stride
+        + d_outer[None, :] * block_size * X
+        + slot_in_page * X
+        + d_inner[None, :]
+    )
+    tl.store(key_cache_ptr + k_tgt, k, mask=src_mask)
+
+    v_tgt = (
+        block_idx * layer_stride
+        + head_idx[:, None] * head_stride
+        + page_outer * head_size * X
+        + d[None, :] * X
+        + page_inner
+    )
+    tl.store(value_cache_ptr + v_tgt, v, mask=src_mask)
+
+
+def launch_reshape_and_cache_shuffle_5d(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    swa_slot_mapping=None,
+):
+    """Launcher for reshape_and_cache_shuffle_5d.
+
+    Args:
+        key/value: (num_tokens, num_heads, head_size) source tensors
+        key_cache: (num_blocks, num_heads, head_size//X, block_size, X)
+        value_cache: (num_blocks, num_heads, block_size//X, head_size, X)
+        slot_mapping: per-token destination slot in [0, num_blocks*block_size)
+    """
+    num_tokens, num_heads, head_size = key.shape
+    assert value.shape == key.shape, "K/V must share token-major shape"
+    assert key_cache.dim() == 5 and value_cache.dim() == 5
+    num_blocks, kc_H, kc_D_over_X, block_size, X = key_cache.shape
+    assert kc_H == num_heads and kc_D_over_X * X == head_size
+    vb_blocks, vc_H, vc_page_over_X, vc_D, vc_X = value_cache.shape
+    assert (
+        vc_H == num_heads
+        and vc_page_over_X * X == block_size
+        and vc_D == head_size
+        and vc_X == X
+    )
+    assert block_size % X == 0 and head_size % X == 0
+
+    HEAD_BLOCK = min(4, triton.next_power_of_2(num_heads))
+    BLOCK_D = triton.next_power_of_2(head_size)
+    grid = (num_tokens, triton.cdiv(num_heads, HEAD_BLOCK))
+
+    reshape_and_cache_shuffle_5d[grid](
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        swa_slot_mapping if swa_slot_mapping is not None else slot_mapping,
+        key.stride(0),
+        value.stride(0),
+        num_heads,
+        head_size,
+        block_size,
+        X=X,
+        HEAD_BLOCK=HEAD_BLOCK,
+        BLOCK_D=BLOCK_D,
+        HAS_SWA=(swa_slot_mapping is not None),
+    )
+
+
+@triton.jit
+def gather_shuffle_5d_to_linear(
+    key_cache_ptr,
+    value_cache_ptr,
+    key_out_ptr,  # (T, num_heads, head_size), store dtype
+    value_out_ptr,  # (T, num_heads, head_size), store dtype
+    slot_mapping_ptr,  # (T,) absolute pool slot id per token
+    key_out_stride_token,
+    value_out_stride_token,
+    num_heads,
+    head_size,
+    block_size,
+    X: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Inverse of :func:`reshape_and_cache_shuffle_5d`.
+
+    Gather one token's K/V from the SHUFFLE 5D paged cache into the
+    canonical (T, H, D) layout that aiter's ``mha_batch_prefill_func``
+    expects in LINEAR mode. Source addressing is identical to the
+    writer kernel so any bit-exact round-trip is guaranteed.
+    """
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+
+    block_idx = slot_idx // block_size
+    slot_in_page = slot_idx % block_size
+    page_outer = slot_in_page // X
+    page_inner = slot_in_page % X
+
+    head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    head_mask = head_idx < num_heads
+    d = tl.arange(0, BLOCK_D)
+    d_mask = d < head_size
+    d_outer = d // X
+    d_inner = d % X
+
+    layer_stride = num_heads * head_size * block_size
+    head_stride = head_size * block_size
+
+    src_mask = head_mask[:, None] & d_mask[None, :]
+    k_src = (
+        block_idx * layer_stride
+        + head_idx[:, None] * head_stride
+        + d_outer[None, :] * block_size * X
+        + slot_in_page * X
+        + d_inner[None, :]
+    )
+    k = tl.load(key_cache_ptr + k_src, mask=src_mask)
+    v_src = (
+        block_idx * layer_stride
+        + head_idx[:, None] * head_stride
+        + page_outer * head_size * X
+        + d[None, :] * X
+        + page_inner
+    )
+    v = tl.load(value_cache_ptr + v_src, mask=src_mask)
+
+    dst_k = (
+        token_idx * key_out_stride_token + head_idx[:, None] * head_size + d[None, :]
+    )
+    tl.store(key_out_ptr + dst_k, k, mask=src_mask)
+    dst_v = (
+        token_idx * value_out_stride_token + head_idx[:, None] * head_size + d[None, :]
+    )
+    tl.store(value_out_ptr + dst_v, v, mask=src_mask)
+
+
+def launch_gather_shuffle_5d_to_linear(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
+    """Inverse of :func:`launch_reshape_and_cache_shuffle_5d`.
+
+    Returns ``(key_out, value_out)`` each shaped
+    ``(T, num_heads, head_size)`` in ``key_cache.dtype`` /
+    ``value_cache.dtype``. The caller is responsible for passing the
+    right per-tensor descales downstream when ``store_dtype`` is fp8.
+
+    Args:
+        key_cache:   (num_blocks, num_heads, head_size // X, block_size, X)
+        value_cache: (num_blocks, num_heads, block_size // X, head_size, X)
+        slot_mapping: (T,) per-token absolute slot id in
+            ``[0, num_blocks * block_size)``
+    """
+    assert key_cache.dim() == 5 and value_cache.dim() == 5
+    num_blocks, num_heads, kc_D_over_X, block_size, X = key_cache.shape
+    vc_blocks, vc_H, vc_page_over_X, vc_D, vc_X = value_cache.shape
+    assert vc_blocks == num_blocks and vc_H == num_heads
+    assert vc_page_over_X * X == block_size and vc_X == X
+    head_size = kc_D_over_X * X
+    assert vc_D == head_size
+
+    num_tokens = slot_mapping.numel()
+    key_out = torch.empty(
+        (num_tokens, num_heads, head_size),
+        dtype=key_cache.dtype,
+        device=key_cache.device,
+    )
+    value_out = torch.empty(
+        (num_tokens, num_heads, head_size),
+        dtype=value_cache.dtype,
+        device=value_cache.device,
+    )
+
+    HEAD_BLOCK = min(4, triton.next_power_of_2(num_heads))
+    BLOCK_D = triton.next_power_of_2(head_size)
+    grid = (num_tokens, triton.cdiv(num_heads, HEAD_BLOCK))
+
+    gather_shuffle_5d_to_linear[grid](
+        key_cache,
+        value_cache,
+        key_out,
+        value_out,
+        slot_mapping,
+        key_out.stride(0),
+        value_out.stride(0),
+        num_heads,
+        head_size,
+        block_size,
+        X=X,
+        HEAD_BLOCK=HEAD_BLOCK,
+        BLOCK_D=BLOCK_D,
+    )
+    return key_out, value_out
 
 
 @triton.jit
@@ -1391,3 +1458,16 @@ def fused_qk_rope_reshape_and_cache(
     if zeros_out is not None:
         return q_out.view(-1, qh * d), k_out, key_cache, value_cache, zeros_out
     return q_out.view(-1, qh * d), k_out, key_cache, value_cache
+
+
+def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
+    """Safety guard: a preallocated cuda-graph buffer must hold the runtime write.
+
+    The kv_indices / page_table scatter kernels bound writes only per-row, not
+    against the destination buffer, so an undersized buffer silently overflows
+    into the adjacent row. Fail fast on the host-known extent instead. All args
+    are host ints, so this is always-on (no device sync, unlike async probes).
+    """
+    assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
+        f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
+    )

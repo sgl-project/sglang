@@ -1,0 +1,522 @@
+---
+title: DeepSeek-Math-V2
+metatags:
+    description: "Deploy DeepSeek-Math-V2 with SGLang - advanced mathematical reasoning model with gold-level IMO/CMO performance and theorem-proving capabilities."
+---
+
+import { DeepSeekMathV2Deployment } from '/src/snippets/autoregressive/deepseek-math-v2-deployment.jsx';
+
+## 1. Model Introduction
+
+[DeepSeek-Math-V2](https://huggingface.co/deepseek-ai/DeepSeek-Math-V2) is DeepSeek's advanced mathematical reasoning model with strong theorem-proving capabilities. The model demonstrates exceptional performance on mathematical competitions, achieving gold-level scores on IMO 2025 and CMO 2024, and a near-perfect 118/120 on Putnam 2024 with scaled test-time compute.
+
+**Key Features:**
+
+- **Strong Theorem-Proving**: Gold-level performance on IMO 2025 and CMO 2024
+- **Self-Verifiable Reasoning**: Implements self-verifiable mathematical reasoning for improved accuracy
+- **Competition-Level Math**: Near-perfect score (118/120) on Putnam 2024
+- **Large MoE Model**: ~671B total parameters, requires high-memory GPUs (B200 183GB or B300 275GB)
+
+**Available Models:**
+
+- **BF16 (Full Weights)**: [deepseek-ai/DeepSeek-Math-V2](https://huggingface.co/deepseek-ai/DeepSeek-Math-V2) - Full precision weights
+
+**License:**
+To use DeepSeek-Math-V2, you must agree to DeepSeek's Community License. See [LICENSE](https://huggingface.co/deepseek-ai/DeepSeek-Math-V2/blob/main/LICENSE) for details.
+
+## 2. SGLang Installation
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and deployment strategy.
+
+<DeepSeekMathV2Deployment />
+
+### 3.2 Configuration Tips
+
+**Hardware Requirements:**
+
+- **B200 (183GB)**: BF16 tp=8
+- **B300 (275GB)**: BF16 tp=8
+
+**DP Attention:**
+
+- Enable DP attention for high-throughput scenarios
+- The `--dp` value commonly matches the `--tp` value
+- Trade-off: Higher throughput at the cost of slightly increased latency
+
+## 4. Model Invocation
+
+### 4.1 Deployment Command
+
+Deploy the model using the command generated above. Example for B200:
+
+```shell Command
+sglang serve --model-path deepseek-ai/DeepSeek-Math-V2 \
+  --tp 8 \
+  --ep 8 \
+  --reasoning-parser deepseek-r1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 4.2 Mathematical Reasoning
+
+DeepSeek-Math-V2 excels at mathematical problem-solving with step-by-step reasoning.
+
+**Streaming with Thinking Process:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# Mathematical reasoning problem
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-Math-V2",
+    messages=[
+        {"role": "user", "content": "Prove that for any positive integer n, the sum 1 + 2 + 3 + ... + n = n(n+1)/2"}
+    ],
+    max_tokens=4096,
+    stream=True
+)
+
+# Process the stream
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+We need to prove that for any positive integer n, the sum 1 + 2 + 3 + ... + n = n(n+1)/2.
+
+This is a classic formula for the sum of the first n natural numbers. We can prove by induction.
+
+Base case: n=1, LHS = 1, RHS = 1*(1+1)/2 = 1*2/2 = 1. Holds.
+
+Inductive step: Assume true for n = k, i.e., 1 + 2 + ... + k = k(k+1)/2. Then for n = k+1, sum = 1 + 2 + ... + k + (k+1) = [k(k+1)/2] + (k+1) = (k(k+1) + 2(k+1))/2 = (k+1)(k+2)/2 = (k+1
+)((k+1)+1)/2. So holds for k+1. By induction, holds for all positive integers n.
+
+...
+=============== Content =================
+We can prove the well-known formula for the sum of the first \(n\) positive integers in several ways. Two of the most elementary are presented below.
+
+---
+
+### 1. Proof by mathematical induction
+
+**Base case (\(n=1\))**:
+\[
+1 = \frac{1\cdot(1+1)}{2}= \frac{1\cdot2}{2}=1,
+\]
+so the formula holds for \(n=1\).
+
+**Inductive hypothesis:**
+Assume that for some positive integer \(k\) the formula is true, i.e.
+\[
+1+2+\dots+k = \frac{k(k+1)}{2}.
+\]
+
+**Inductive step (\(k \to k+1\))**:
+Consider the sum up to \(k+1\):
+\[
+\begin{aligned}
+1+2+\dots+k+(k+1) &= \bigl(1+2+\dots+k\bigr) + (k+1) \\[4pt]
+&= \frac{k(k+1)}{2} + (k+1) \qquad\text{(by the induction hypothesis)}\\[4pt]
+&= (k+1)\left(\frac{k}{2}+1\right)\\[4pt]
+&= (k+1)\frac{k+2}{2}\\[4pt]
+&= \frac{(k+1)(k+2)}{2}\\[4pt]
+&= \frac{(k+1)\bigl((k+1)+1\bigr)}{2}.
+\end{aligned}
+\]
+Thus the formula also holds for \(n=k+1\).
+
+By the principle of mathematical induction,
+\[
+1+2+3+\dots+n = \frac{n(n+1)}{2}
+\]
+for every positive integer \(n\).
+
+---
+
+### 2. Proof by pairing (Gauss’s trick)
+
+Let
+\[
+S = 1 + 2 + 3 + \dots + n.
+\]
+
+Write the same sum in reverse order:
+\[
+S = n + (n-1) + (n-2) + \dots + 1.
+\]
+
+Add the two equalities term‑by‑term:
+\[
+\begin{aligned}
+2S &= (1+n) + \bigl(2+(n-1)\bigr) + \bigl(3+(n-2)\bigr) + \dots + (n+1)\\
+    &= \underbrace{(n+1)+(n+1)+\dots+(n+1)}_{n\ \text{times}}\\
+    &= n\,(n+1).
+\end{aligned}
+\]
+
+Therefore
+\[
+S = \frac{n(n+1)}{2}.
+\]
+
+Both proofs are rigorous and show that the formula holds for all positive integers \(n\).
+```
+
+### 4.3 Competition-Level Problems
+
+**Example: IMO-style Problem:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+# IMO-style problem
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-Math-V2",
+    messages=[
+        {"role": "user", "content": "Let a, b, c be positive real numbers such that abc = 1. Prove that (a-1+1/b)(b-1+1/c)(c-1+1/a) <= 1."}
+    ],
+    max_tokens=8192,
+    stream=True
+)
+
+# Process the stream
+thinking_started = False
+has_thinking = False
+has_answer = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        if delta.content:
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+We need to prove that for positive real numbers a,b,c with abc = 1, we have:
+
+\[
+(a - 1 + \frac{1}{b})(b - 1 + \frac{1}{c})(c - 1 + \frac{1}{a}) \le 1.
+\]
+
+We can rewrite the expressions: Since abc=1, we have 1/b = ac, 1/c = ab, 1/a = bc. Wait careful: abc=1 => 1/b = ac? Actually 1/b = ac? Let's check: abc=1 => ac = 1/b? Multiply both sides by something: abc=1 => (ac) b = 1 => ac = 1/b. Yes, because (ac) * b = 1 => ac = 1/b. Similarly, ab = 1/c, bc = 1/a. So we can rewrite:
+
+...
+=============== Content =================
+
+We are given positive real numbers \(a,b,c\) with \(abc=1\). We must prove
+
+\[
+\Bigl(a-1+\frac1b\Bigr)\Bigl(b-1+\frac1c\Bigr)\Bigl(c-1+\frac1a\Bigr)\le 1 .
+\]
+
+---
+
+### 1.  A convenient substitution
+
+Because \(abc=1\), we can write
+
+\[
+a=\frac{x}{y},\qquad b=\frac{y}{z},\qquad c=\frac{z}{x}
+\]
+
+with positive numbers \(x,y,z\).
+(For instance, take \(x=1,\;y=\frac1a,\;z=\frac1{ab}\); then indeed \(a=\frac{x}{y},\;b=\frac{y}{z}\) and, using \(abc=1\), we obtain \(c=\frac{z}{x}=\frac1{ab}=c\).)
+
+---
+
+### 2.  Rewriting the factors
+
+\[
+\begin{aligned}
+a-1+\frac1b &=\frac{x}{y}-1+\frac{z}{y}= \frac{x+z-y}{y},\\[2mm]
+b-1+\frac1c &=\frac{y}{z}-1+\frac{x}{z}= \frac{x+y-z}{z},\\[2mm]
+c-1+\frac1a &=\frac{z}{x}-1+\frac{y}{x}= \frac{y+z-x}{x}.
+\end{aligned}
+\]
+
+Hence the product becomes
+
+\[
+P=\Bigl(a-1+\frac1b\Bigr)\Bigl(b-1+\frac1c\Bigr)\Bigl(c-1+\frac1a\Bigr)
+   =\frac{(x+z-y)(x+y-z)(y+z-x)}{xyz}.
+\]
+
+---
+
+### 3.  Reducing to a known inequality
+
+We have to show \(P\le1\), i.e.
+
+\[
+(x+z-y)(x+y-z)(y+z-x)\le xyz .
+\tag{1}
+\]
+
+Set
+
+\[
+p=x+y+z,\qquad q=xy+yz+zx,\qquad r=xyz .
+\]
+
+Notice that
+
+\[
+x+z-y=p-2y,\quad x+y-z=p-2z,\quad y+z-x=p-2x .
+\]
+
+Therefore
+
+\[
+\begin{aligned}
+(x+z-y)(x+y-z)(y+z-x)
+&=(p-2x)(p-2y)(p-2z)\\
+&=p^{3}-2p^{2}(x+y+z)+4p(xy+yz+zx)-8xyz\\
+&=-p^{3}+4pq-8r .
+\end{aligned}
+\]
+
+Inequality (1) is thus equivalent to
+
+\[
+-p^{3}+4pq-8r\le r\quad\Longleftrightarrow\quad 4pq-p^{3}\le 9r .
+\tag{2}
+\]
+
+---
+
+### 4.  Applying Schur’s inequality
+
+Schur’s inequality of third degree states that for any non‑negative \(x,y,z\)
+
+\[
+p^{3}+9r\ge 4pq .
+\]
+
+Rearranged, this is exactly \(4pq-p^{3}\le 9r\), which is (2).
+Since our \(x,y,z\) are positive, Schur’s inequality applies and (2) holds.
+
+Consequently (1) is true, and we obtain \(P\le1\).
+
+---
+
+### 5.  Equality case
+
+Equality in Schur’s inequality for positive numbers occurs only when \(x=y=z\).
+Then \(a=b=c=1\), and indeed the product equals \(1\).
+
+---
+
+Thus for all positive \(a,b,c\) with \(abc=1\),
+
+\[
+\Bigl(a-1+\frac1b\Bigr)\Bigl(b-1+\frac1c\Bigr)\Bigl(c-1+\frac1a\Bigr)\le 1 .
+\]
+
+∎
+```
+
+## 5. Benchmark
+
+### 5.1 Accuracy Benchmark
+
+#### 5.1.1 GSM8K Benchmark
+
+**Benchmark Command:**
+
+```shell Command
+python3 benchmark/gsm8k/bench_sglang.py --num-questions 200 --port 30000
+```
+
+**Test Results:**
+
+```text Output
+Accuracy: 0.975
+Invalid: 0.000
+Latency: 34.358 s
+Output throughput: 540.162 token/s
+```
+
+### 5.2 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (8x, 183GB each)
+- Model: DeepSeek-Math-V2
+- Tensor Parallelism: 8
+- SGLang Version: 0.5.8
+
+#### 5.2.1 Latency Benchmark
+
+**Benchmark Command:**
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model deepseek-ai/DeepSeek-Math-V2 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+**Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  53.34
+Total input tokens:                      1972
+Total input text tokens:                 1972
+Total generated tokens:                  2784
+Total generated tokens (retokenized):    2778
+Request throughput (req/s):              0.19
+Input token throughput (tok/s):          36.97
+Output token throughput (tok/s):         52.19
+Peak output token throughput (tok/s):    56.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          89.16
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   5330.72
+Median E2E Latency (ms):                 5879.28
+P90 E2E Latency (ms):                    8320.33
+P99 E2E Latency (ms):                    9921.29
+---------------Time to First Token----------------
+Mean TTFT (ms):                          183.38
+Median TTFT (ms):                        177.92
+P99 TTFT (ms):                           217.64
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          17.96
+Median TPOT (ms):                        18.39
+P99 TPOT (ms):                           19.03
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           18.57
+Median ITL (ms):                         18.63
+P95 ITL (ms):                            19.26
+P99 ITL (ms):                            19.48
+Max ITL (ms):                            24.93
+==================================================
+```
+
+#### 5.2.2 Throughput Benchmark
+
+**Benchmark Command:**
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model deepseek-ai/DeepSeek-Math-V2 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+**Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  217.36
+Total input tokens:                      301701
+Total input text tokens:                 301701
+Total generated tokens:                  188375
+Total generated tokens (retokenized):    187456
+Request throughput (req/s):              4.60
+Input token throughput (tok/s):          1388.05
+Output token throughput (tok/s):         866.67
+Peak output token throughput (tok/s):    2589.00
+Peak concurrent requests:                109
+Total token throughput (tok/s):          2254.72
+Concurrency:                             89.81
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   19521.73
+Median E2E Latency (ms):                 12076.76
+P90 E2E Latency (ms):                    47248.87
+P99 E2E Latency (ms):                    86862.79
+---------------Time to First Token----------------
+Mean TTFT (ms):                          790.40
+Median TTFT (ms):                        456.81
+P99 TTFT (ms):                           4223.33
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          106.52
+Median TPOT (ms):                        107.24
+P99 TPOT (ms):                           238.33
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           100.29
+Median ITL (ms):                         38.34
+P95 ITL (ms):                            237.00
+P99 ITL (ms):                            347.49
+Max ITL (ms):                            3642.56
+==================================================
+```

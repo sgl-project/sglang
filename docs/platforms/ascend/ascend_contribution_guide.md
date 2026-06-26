@@ -38,7 +38,7 @@ If you add a new feature or fix a bug, please add corresponding unit tests to en
 SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
-If you need to use model which is not in ```python/sglang/test/ascend/test_ascend_utils.py`` list. Follow these steps:
+If you need to use model which is not in `python/sglang/test/ascend/test_ascend_utils.py` list. Follow these steps:
 1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
 2. Make sure your model is pre-cached on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
 If this is not the case, use following command on CI server:
@@ -73,7 +73,7 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
 - [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_eval_accuracy_large.py)
-- [test_moe_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_moe_eval_accuracy_large.py)
+- [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/registered/core/test_gpt_oss_1gpu.py)
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.md).
@@ -90,10 +90,10 @@ Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com
 
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-- `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
-- `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
-- `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
-- `/rerun-stage <stage-name>`: Reruns a specific test stage without waiting for its dependencies. This is useful when you want to quickly validate a fix for a specific test failure instead of waiting ~30 minutes for preceding stages to complete.
+- `/tag-run-ci-label`: Adds the "run-ci" label. Only **future** commits trigger CI; the current commit is unaffected.
+- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, flaky, or skipped**.
+- `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won't.
+- `/rerun-stage <stage-name>`: Reruns a single test stage without waiting for its dependencies. Useful for quickly validating a specific test fix instead of waiting ~30 minutes for preceding stages.
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
@@ -113,7 +113,7 @@ Each CI workflow has a default limit defined in its workflow configuration file.
 
 ```yaml
 cool-down-minutes:
-  description: "Default cooldown period in minutes; 0 disables rate limiting"
+  description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
   type: number
   default: 120
 ```
@@ -133,7 +133,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - Reuse server launches in your unit tests to make tests run faster.
 - When supporting new hardware or features, follow these guidelines:
   - Do not drastically change existing code.
-  - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).
+  - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_npu.py`).
   - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
 
 ## How to update sgl-kernel

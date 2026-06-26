@@ -25,6 +25,9 @@ Use `bench_serving` by default unless there are specific needs.
   python3 -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
+  - Pass `--enable-multi-batch` and set `--batch-size` to a multiple of the server's `--max-running-requests` to stabilize throughput measurements. Surplus requests are queued by the scheduler and promoted batch-by-batch, amortizing per-request prefill and first-step transients into steady-state decode. Under this flag, only `overall_throughput` is authoritative; `input_throughput`, `output_throughput`, `last_ttft`, and ITL include cross-batch queueing in their denominators and should be treated as informational.
+  - Pass `--lora-name <name>` to route every prompt through a pre-loaded LoRA adapter. Requires the server to be launched with `--enable-lora --lora-paths <name>=<path>`.
+
 **`bench_offline_throughput`** directly instantiates the `Engine` object in-process (no HTTP server) and submits all requests at once via `engine.generate()`. The engine's scheduler handles batching and execution. This measures maximum achievable throughput without any network overhead.
 
   ```bash
@@ -54,7 +57,10 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
 
-The `SGLANG_TORCH_PROFILER_DIR` environment variable must be set on both the server and client side; otherwise, the trace file will not be generated correctly. A secure way to do this is by setting it in your shell's resource file (e.g., `~/.bashrc` for bash).
+For `bench_serving --profile`, the output directory is selected on the client side from `--profile-output-dir` or `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`), then sent in the `/start_profile` request.
+If you call `/start_profile` directly and do not provide `output_dir`, the server uses its own `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`).
+
+Setting `SGLANG_TORCH_PROFILER_DIR` on both server and client is still recommended to avoid confusion about where traces are written.
 
 For more details, please refer to [Bench Serving Guide](./bench_serving.md).
 
@@ -155,7 +161,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 **Parameters:**
 
 - `output_dir` (optional): Directory where profile traces will be saved. If not specified, uses `SGLANG_TORCH_PROFILER_DIR` environment variable, or `/tmp` as the default
-- `num_steps` (optional): Number of steps to profile. If not specified, profiling continues until manually stopped with `/end_profile`
+- `num_steps` (optional): Number of steps to profile. If not specified, profiling continues until manually stopped with `/stop_profile`
 - `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
 - `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
 - `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
@@ -179,17 +185,17 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 **Continuous profiling (manual stop):**
 
 ```bash
-# Start profiling without num_steps - must manually stop with /end_profile
+# Start profiling without num_steps - must manually stop with /stop_profile
 curl -X POST http://127.0.0.1:30000/start_profile
 ```
 
-#### Using `/end_profile` endpoint
+#### Using `/stop_profile` endpoint
 
-The `/end_profile` endpoint stops an ongoing profiling session and saves the trace file.
+The `/stop_profile` endpoint stops an ongoing profiling session and saves the trace file.
 
 ```bash
 # Stop profiling and save traces
-curl -X POST http://127.0.0.1:30000/end_profile
+curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
 This is only needed when you start profiling without specifying `num_steps`. If `num_steps` is specified, profiling will automatically stop after that many steps.
@@ -212,7 +218,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 python -m sglang.bench_serving --backend sglang --num-prompts 100
 
 # Terminal 2: Stop profiling when done
-curl -X POST http://127.0.0.1:30000/end_profile
+curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
 ### Profiler Trace Merger for Distributed Traces
@@ -406,10 +412,10 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    ```bash
    # Terminal 2: Only needed if num_steps was not specified
-   curl -X POST http://127.0.0.1:30000/end_profile
+   curl -X POST http://127.0.0.1:30000/stop_profile
    ```
 
-The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/end_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.
+The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/stop_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.
 
 **Method 2: Simpler approach without `/start_profile` API**
 

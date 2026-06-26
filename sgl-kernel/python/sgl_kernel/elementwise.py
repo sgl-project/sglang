@@ -113,14 +113,13 @@ def rmsnorm(
     # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
     #      https://github.com/flashinfer-ai/flashinfer/pull/2733
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
-    else:
         return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
+    else:
+        return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
 
 
 def fused_add_rmsnorm(
@@ -153,16 +152,14 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
-    else:
         _flashinfer_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    else:
+        _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
 
 def gemma_rmsnorm(
@@ -196,16 +193,14 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
-    else:
         return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
+    else:
+        return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
 
 
 def gemma_fused_add_rmsnorm(
@@ -238,18 +233,16 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
-    else:
         _flashinfer_norm.gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )
+    else:
+        _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
@@ -331,6 +324,85 @@ if torch.version.hip is not None:
         return out
 
 
+def dsv4_fused_q_norm_rope(
+    q_input: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float = 1e-6,
+    q_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """DeepSeek-V4 fused Q RMSNorm (no weight) + RoPE.
+
+    Parameters
+    ----------
+    q_input  : (B, num_q_heads, head_dim) bfloat16
+    freqs_cis: (max_pos, rope_dim) float32, re/im interleaved
+    positions: (B,) int32
+    eps      : RMSNorm epsilon
+    q_output : optional pre-allocated output tensor
+    """
+    if q_output is None:
+        q_output = torch.empty_like(q_input)
+    torch.ops.sgl_kernel.dsv4_fused_q_norm_rope.default(
+        q_input, q_output, freqs_cis, positions, eps
+    )
+    return q_output
+
+
+def dsv4_fused_k_norm_rope_flashmla(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    eps: float = 1e-6,
+    page_size: int = 1,
+) -> None:
+    """DeepSeek-V4 fused K RMSNorm + RoPE + FlashMLA FP8 store.
+
+    Parameters
+    ----------
+    kv       : (B, 512) bfloat16
+    kv_weight: (512,) bfloat16
+    freqs_cis: (max_pos, 64) float32
+    positions: (B,) int32
+    out_loc  : (B,) int32  cache slot ids
+    kvcache  : (npages, page_bytes) uint8
+    eps      : RMSNorm epsilon
+    page_size: page size (power of 2)
+    """
+    torch.ops.sgl_kernel.dsv4_fused_k_norm_rope_flashmla.default(
+        kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, page_size
+    )
+
+
+def dsv4_fused_q_indexer_rope_hadamard_quant(
+    q_input: torch.Tensor,
+    q_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    weights_out: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """DeepSeek-V4 fused Q indexer: RoPE + Hadamard + FP8 quant.
+
+    Parameters
+    ----------
+    q_input    : (B, num_heads, 128) bfloat16
+    q_fp8      : (B, num_heads, 128) fp8_e4m3 output
+    weight     : (B, num_heads) bfloat16
+    weights_out: (B, num_heads, 1) float32 output
+    weight_scale: scalar
+    freqs_cis  : (max_pos, 64) float32
+    positions  : (B,) int32
+    """
+    torch.ops.sgl_kernel.dsv4_fused_q_indexer_rope_hadamard_quant.default(
+        q_input, q_fp8, weight, weights_out, weight_scale, freqs_cis, positions
+    )
+
+
 def rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -341,22 +413,6 @@ def rotary_embedding(
 ):
     torch.ops.sgl_kernel.rotary_embedding.default(
         positions, query, key, head_size, cos_sin_cache, is_neox
-    )
-
-
-def downcast_fp8(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_out: torch.Tensor,
-    v_out: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    loc: torch.Tensor,
-    mult: int = 1,
-    offset: int = 0,
-) -> None:
-    torch.ops.sgl_kernel.downcast_fp8(
-        k, v, k_out, v_out, k_scale, v_scale, loc, mult, offset
     )
 
 

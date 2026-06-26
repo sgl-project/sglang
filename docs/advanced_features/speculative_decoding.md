@@ -23,6 +23,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 
 - **Best speed/quality (recommended)**: Use **EAGLE-3** with `--speculative-algorithm EAGLE3`.
 - **Strong default / broad compatibility**: Use **EAGLE-2** with `--speculative-algorithm EAGLE`.
+- **Workload acceptance changes over time**: Use [**Adaptive speculative decoding**](adaptive_speculative_decoding.md) on top of **EAGLE** with `--speculative-eagle-topk 1`.
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
@@ -75,6 +76,7 @@ To enable EAGLE speculative decoding the following parameters are relevant:
 
 These parameters are mostly the same for EAGLE-2 and EAGLE-3. `--speculative-token-map` is ignored for EAGLE-3 models.
 For `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`: leave all three unset to use auto-tuning, or set all three explicitly when tuning.
+If you use EAGLE with `--speculative-eagle-topk 1` and your acceptance rate varies across requests, see [Adaptive Speculative Decoding](adaptive_speculative_decoding.md).
 
 You can find the best combinations of these parameters with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py).
 
@@ -387,13 +389,11 @@ Enable it with:
 
 | Parameter | Description | Default |
 |---|---|---|
-| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. If omitted, defaults to `--speculative-ngram-max-match-window-size`. | `12` (with default ngram settings) |
-| `--speculative-ngram-min-match-window-size` | Minimum matching window size. | `1` |
-| `--speculative-ngram-max-match-window-size` | Maximum matching window size. | `12` |
+| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. If omitted, defaults to `min(--speculative-ngram-max-trie-depth, 12)`. | `12` (with default ngram settings) |
 | `--speculative-ngram-min-bfs-breadth` | Minimum BFS breadth. | `1` |
 | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
 | `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
-| `--speculative-ngram-max-trie-depth` | The max trie depth for ngram speculative decoding. | `18` |
+| `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` |
 | `--speculative-ngram-capacity` | Cache capacity (number of entries). | `10,000,000` |
 
 Notes:
@@ -408,7 +408,6 @@ python3 -m sglang.launch_server \
     --model Qwen/Qwen2.5-7B-Instruct \
     --speculative-algorithm NGRAM \
     --speculative-num-draft-tokens 16 \
-    --speculative-ngram-max-match-window-size 12 \
     --speculative-ngram-max-bfs-breadth 10 \
     --mem-fraction-static 0.7 \
     --cuda-graph-max-bs 8 \
@@ -464,12 +463,10 @@ Below is a comprehensive list of all speculative decoding parameters available i
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `--speculative-ngram-min-match-window-size` | `int` | `1` | Minimum ngram matching window |
-| `--speculative-ngram-max-match-window-size` | `int` | `12` | Maximum ngram matching window |
 | `--speculative-ngram-min-bfs-breadth` | `int` | `1` | Minimum BFS breadth |
 | `--speculative-ngram-max-bfs-breadth` | `int` | `10` | Maximum BFS breadth |
 | `--speculative-ngram-match-type` | `str` | `"BFS"` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion |
-| `--speculative-ngram-max-trie-depth` | `int` | `18` | Max trie depth for ngram speculative decoding |
+| `--speculative-ngram-max-trie-depth` | `int` | `18` | Maximum suffix length stored and matched by the ngram trie |
 | `--speculative-ngram-capacity` | `int` | `10,000,000` | Cache capacity |
 
 ### Environment variables

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
-from sglang.srt.distributed import get_moe_expert_parallel_rank, get_tp_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         assert (
             not config.actorder
         ), "Actorder is not supported by flashinfer_trtllm backend"
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        self.moe_ep_rank = get_parallel().moe_ep_rank
 
         if self.quant_config.quant_format != CompressionFormat.pack_quantized.value:
             raise ValueError(

@@ -1,0 +1,434 @@
+name: PR Test (sgl-router)
+
+# Trigger contract — modeled on `pr-test.yml`:
+#
+#   * No `paths:` filter at the trigger level. The workflow ALWAYS
+#     fires on every PR synchronize / push, so the run record always
+#     appears as a check on the PR (no more "workflow silently didn't
+#     fire" mystery debugging). Path-based skip decisions are made
+#     inside the `sgl-router-gate` job below, where we can log the
+#     reason. Same for the `run-ci` label gate — moved off the
+#     workflow trigger and into the gate job so its outcome is
+#     observable.
+#
+#   * `push` on `main` keeps firing so post-merge runs still record
+#     against the default branch.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: sgl-router-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}
+  cancel-in-progress: true
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  # Stage 0 — decide whether to run the heavy tiers. Always runs
+  # (cheap, ubuntu-latest), and emits a single `should_run` output
+  # consumed by every tier below. Reasons it might evict downstream
+  # work:
+  #   * `pull_request` event without the `run-ci` label (budget gate)
+  #   * No files matching the sgl-router paths changed in this PR
+  # Either outcome is logged on the gate job's page, so operators can
+  # see *why* the tiers were skipped instead of guessing.
+  sgl-router-gate:
+    name: gate
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      paths_changed: ${{ steps.paths.outputs.sgl_router }}
+      has_run_ci_label: ${{ steps.label.outputs.has_run_ci }}
+    steps:
+      - uses: actions/checkout@v4
+      # `dorny/paths-filter` computes the diff against the PR base
+      # (for pull_request) or the push's `before` SHA (for push) and
+      # exposes `sgl_router=true|false` on whether any tracked path
+      # changed. Replaces the old workflow-level `paths:` filter so
+      # the gate is observable.
+      - name: Detect sgl-router path changes
+        id: paths
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            sgl_router:
+              - 'experimental/sgl-router/**'
+              - '.github/workflows/pr-test-sgl-router.yml'
+              - 'scripts/ci/cuda/ci_install_dependency.sh'
+      # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs
+      # that happen to touch the sgl-router dir) still need the
+      # opt-in label before consuming the H100 / kind tiers below.
+      # `push` events on main and `workflow_dispatch` skip this gate.
+      - name: Check run-ci label
+        id: label
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event (${{ github.event_name }}); label gate bypassed."
+            exit 0
+          fi
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci') }}" == "true" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "PR has run-ci label; downstream tiers will run."
+          else
+            echo "has_run_ci=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR is missing the 'run-ci' label; skipping sgl-router tiers. Apply the label to opt in."
+          fi
+      - name: Decide
+        id: decide
+        run: |
+          paths='${{ steps.paths.outputs.sgl_router }}'
+          label='${{ steps.label.outputs.has_run_ci }}'
+          if [[ "$paths" == "true" && "$label" == "true" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Both path filter and run-ci label match; running tiers."
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping tiers (paths_changed=$paths, has_run_ci=$label)."
+          fi
+
+  sgl-router-lint:
+    name: tier-1 — lint
+    needs: sgl-router-gate
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # Scoped per-job (not workflow-wide) to avoid SMG's documented breakage
+      # of self-hosted-runner pip installs that compile Rust extensions.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # Supply-chain guard: deny.toml allowlists the dynamo git source but
+      # cannot pin a SHA. Bumps to this constant must be a deliberate PR.
+      DYNAMO_TOKENIZERS_EXPECTED_REV: "1efdd4dcb901caeae636131321094090d252c8d6"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify dynamo-* SHA pin
+        run: |
+          set -euo pipefail
+          revs=$(grep -E '^dynamo-[a-z]+[[:space:]]*=.*\brev[[:space:]]*=' experimental/sgl-router/Cargo.toml \
+            | sed -E 's/.*rev[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          if [ -z "${revs:-}" ]; then
+            echo "::error::no dynamo-* git deps with rev= found in experimental/sgl-router/Cargo.toml"
+            exit 1
+          fi
+          count=0
+          while IFS= read -r r; do
+            count=$((count + 1))
+            if [ "$r" != "$DYNAMO_TOKENIZERS_EXPECTED_REV" ]; then
+              echo "::error::dynamo-* SHA pin mismatch in experimental/sgl-router/Cargo.toml"
+              echo "  expected: $DYNAMO_TOKENIZERS_EXPECTED_REV"
+              echo "  actual:   $r"
+              echo "All revs found:"
+              echo "$revs" | sed 's/^/  /'
+              exit 1
+            fi
+          done <<< "$revs"
+          echo "dynamo-* SHA pin OK: $count entries all at $DYNAMO_TOKENIZERS_EXPECTED_REV"
+
+      # sccache install is best-effort: the GitHub release CDN intermittently
+      # returns 5xx and the action's built-in retry is shallow. If it fails,
+      # we unset RUSTC_WRAPPER below and proceed without compile caching —
+      # rust-cache still covers the bulk of warm-cache wins.
+      - name: Configure sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.12.0"
+          disable_annotations: true
+
+      - name: Disable sccache if install failed
+        if: steps.sccache.outcome != 'success'
+        run: |
+          echo "::warning::sccache install failed (${{ steps.sccache.outcome }}); proceeding without compile caching"
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-router
+          shared-key: "sgl-router-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo check
+        working-directory: experimental/sgl-router
+        run: cargo check --all-targets
+
+      - name: cargo clippy
+        working-directory: experimental/sgl-router
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo fmt
+        working-directory: experimental/sgl-router
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          cargo +nightly fmt -- --check
+
+      # cargo-deny 0.19.6+ required for CVSS 4.0 parsing.
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny@0.19.6
+
+      - name: cargo deny check
+        working-directory: experimental/sgl-router
+        run: cargo deny check licenses bans sources advisories
+
+      - name: Show sccache stats
+        if: always() && steps.sccache.outcome == 'success'
+        run: sccache --show-stats
+
+  sgl-router-build-and-test:
+    name: tier-2 — build + test
+    needs: [sgl-router-gate, sgl-router-lint]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OS deps (libssl, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      # sccache install is best-effort: the GitHub release CDN intermittently
+      # returns 5xx and the action's built-in retry is shallow. If it fails,
+      # we unset RUSTC_WRAPPER below and proceed without compile caching —
+      # rust-cache still covers the bulk of warm-cache wins.
+      - name: Configure sccache
+        id: sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.12.0"
+          disable_annotations: true
+
+      - name: Disable sccache if install failed
+        if: steps.sccache.outcome != 'success'
+        run: |
+          echo "::warning::sccache install failed (${{ steps.sccache.outcome }}); proceeding without compile caching"
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-router
+          shared-key: "sgl-router-cache"
+          cache-all-crates: true
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo build (record wall time)
+        working-directory: experimental/sgl-router
+        run: |
+          START=$(date +%s)
+          cargo build --release --all-targets
+          END=$(date +%s)
+          BUILD_SECONDS=$((END - START))
+          echo "tier_2_build_duration_seconds=${BUILD_SECONDS}" >> "$GITHUB_ENV"
+          echo "::notice title=Tier-2 build duration::${BUILD_SECONDS}s"
+
+      - name: cargo test
+        working-directory: experimental/sgl-router
+        # Skip the tokenizer parity_matrix test here: ubuntu-latest has
+        # no HuggingFace cache, so the matrix would hard-fail (see the
+        # test docstring). The e2e job runs it after pytest populates
+        # the Qwen3-0.6B tokenizer.json. Filter is matched against the
+        # full test path `tokenizer::parity::parity_matrix`; substring
+        # `parity_matrix` is unique to that test.
+        run: cargo test --release -- --skip parity_matrix
+
+      # Regenerate the cross-impl block-hash parity fixture and fail if it
+      # differs from the committed file.  The Python script replicates
+      # SGLang's `radix_cache.hash_page` algorithm verbatim (no
+      # `import sglang`); a diff here means EITHER the Rust port's algorithm
+      # drifted from the script, OR the script drifted from SGLang's actual
+      # code — in both cases the operator must investigate and re-commit
+      # the fixture in the same PR as the algorithm change.
+      #
+      # `set -euo pipefail` makes a Python-side failure (syntax error,
+      # missing import) cause this step to fail instead of falling
+      # through to a no-diff "pass" when no fixture was actually
+      # regenerated.
+      - name: kv_events hash parity fixture (drift check)
+        working-directory: experimental/sgl-router
+        run: |
+          set -euo pipefail
+          python3 tests/scripts/generate_kv_events_hash_parity.py
+          if ! git diff --exit-code -- tests/fixtures/kv_events_hash_parity.json; then
+            echo "::error::kv_events hash parity fixture drifted." \
+              "Re-run experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py" \
+              "and commit the updated tests/fixtures/kv_events_hash_parity.json."
+            exit 1
+          fi
+
+      - name: Show sccache stats
+        if: always() && steps.sccache.outcome == 'success'
+        run: sccache --show-stats
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Tier-2 results" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Build duration: \`${tier_2_build_duration_seconds:-(not recorded)}\` s" >> "$GITHUB_STEP_SUMMARY"
+
+  sgl-router-docker-build-test:
+    name: tier-3 — docker (placeholder)
+    needs: [sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Placeholder
+        run: |
+          echo "docker-build-test not implemented yet."
+          exit 0
+
+  # tier-3 k8s integration is decoupled from tier-3 e2e: each runs on a
+  # different runner type (ubuntu kind cluster vs H100), each manages its
+  # own test scope (k8s_integration/ vs everything-else-in-e2e), and
+  # each is allowed to fail without blocking the other. They both still
+  # gate on tier-2's build+test passing — a Rust compile failure blocks
+  # the GPU/cluster runners from spinning up.
+  sgl-router-k8s-integration:
+    name: tier-3 — k8s integration
+    needs: [sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Install kind
+        run: |
+          curl -Lo /tmp/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x /tmp/kind && sudo mv /tmp/kind /usr/local/bin/kind
+      - name: Install kubectl
+        run: |
+          curl -Lo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+          chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl
+      - name: Build router image
+        run: docker build -t sgl-router:e2e -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.router .
+      - name: Build fake_worker image
+        run: |
+          docker build -t sgl-router-fake-worker:e2e \
+            -f experimental/sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
+            experimental/sgl-router/tests/e2e/k8s_integration/
+      - name: Bootstrap kind + deploy
+        run: bash experimental/sgl-router/tests/e2e/k8s_integration/setup.sh
+      - name: Set up Python
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install -r experimental/sgl-router/tests/e2e/k8s_integration/requirements.txt
+      - name: Run E2E
+        run: /tmp/e2e-venv/bin/pytest experimental/sgl-router/tests/e2e/k8s_integration/ -v --tb=short
+      - name: Dump cluster + router diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          kubectl -n sgl-router-test get pods -o wide
+          kubectl -n sgl-router-test describe pod -l app=sgl-router
+          kubectl -n sgl-router-test describe pod -l app=sglang
+          kubectl -n sgl-router-test logs deploy/sgl-router --tail=300
+          kubectl -n sgl-router-test logs deploy/sgl-router --tail=300 --previous
+          kubectl -n sgl-router-test get events --sort-by=.lastTimestamp
+          kubectl -n sgl-router-test get endpointslices -o wide
+          kubectl -n sgl-router-test get svc
+          true
+
+  sgl-router-e2e:
+    name: tier-3 — e2e
+    needs: [sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    runs-on: 2-gpu-h100
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-router
+          shared-key: "sgl-router-cache"
+      - name: cargo build (release)
+        working-directory: experimental/sgl-router
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build --release
+
+      # Install SGLang from the local checkout in editable mode (no PyPI
+      # version pin) — mirrors `pr-test-rust.yml` so the router e2e runs
+      # against whatever SGLang version is on the branch. Replaces the
+      # previous `pip install sglang[srt]==X.Y.Z` pin, which forced the
+      # e2e to test against a stale wheel and would silently miss any
+      # new ServerArgs field (e.g. `disaggregation_mode` /
+      # `disaggregation_bootstrap_port`) added in the branch.
+      - name: Install SGLang dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Install e2e test dependencies
+        run: |
+          python3 -m pip install -r experimental/sgl-router/tests/e2e/requirements.txt
+
+      # IMPORTANT: --ignore=tests/e2e/k8s_integration. The k8s integration
+      # suite is owned by the `sgl-router-k8s-integration` job which has
+      # kind + kubectl installed and a real cluster running. The e2e GPU
+      # runner has neither, so pytest's recursive collection of
+      # tests/e2e/ would ERROR every k8s test at setup. Both tiers must
+      # be allowed to fail independently — k8s flakes (cluster boot,
+      # image pull) must not surface as e2e failures on H100, and e2e
+      # flakes (model load, HF auth) must not surface as k8s failures.
+      - name: Run e2e
+        working-directory: experimental/sgl-router
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python3 -m pytest tests/e2e/ -v -s --tb=short \
+            --ignore=tests/e2e/k8s_integration
+
+      - name: Tokenizer parity matrix (uses HF cache populated by e2e)
+        working-directory: experimental/sgl-router
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --release --test component tokenizer::parity
+
+  sgl-router-finish:
+    name: finish
+    needs:
+      - sgl-router-gate
+      - sgl-router-lint
+      - sgl-router-build-and-test
+      - sgl-router-docker-build-test
+      - sgl-router-k8s-integration
+      - sgl-router-e2e
+    # `always()` lets `finish` run after upstream `skipped` outcomes
+    # (when the gate decided to skip). The downstream-skipped path is
+    # an explicit success — the workflow was correctly bypassed for a
+    # PR that didn't need full CI. The downstream-failure /
+    # downstream-cancelled path is a real fail. We also accept the
+    # gate's `skipped` (impossible today, kept for symmetry) and
+    # require the gate itself to have succeeded.
+    if: |
+      always() &&
+      needs.sgl-router-gate.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required checks completed
+        run: echo "OK"

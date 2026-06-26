@@ -1,4 +1,4 @@
-"""MI35x Kimi-K2.5-MXFP4 aiter MLA backend accuracy tests (4-GPU)
+"""MI35x Kimi-K2.5-MXFP4 aiter MLA backend accuracy tests (8-GPU)
 
 Tests Kimi-K2.5-MXFP4 with the aiter unified attention backend on MI35x,
 covering both default and FP8 KV cache configurations.
@@ -7,21 +7,10 @@ The FP8 KV cache variant validates the fix for assertion failure
 `q_scale.has_value() && kv_scale.has_value()` in aiter ASM MLA decode
 when layer.k_scale is None (the RadixAttention default).
 
-NOTE: TP must be <= 4 for Kimi-K2.5 with the aiter MLA kernel.
-Kimi-K2.5 has num_attention_heads=64; with tp_size=8 that gives
-64/8 = 8 heads per GPU, but the aiter ASM MLA kernel requires
-heads_per_gpu % 16 == 0. With tp_size=4: 64/4 = 16 heads, which
-satisfies the constraint. (DeepSeek-R1/V3 has 128 heads so TP=8
-yields 128/8 = 16 heads and works fine.)
-
 Registry: nightly-amd-8-gpu-mi35x-kimi-k25-mxfp4-aiter-mla suite
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from dataclasses import dataclass
 from typing import List, Optional
@@ -42,26 +31,13 @@ register_amd_ci(
     nightly=True,
 )
 
-KIMI_K25_MXFP4_LOCAL_PATH = "/data/models/amd/Kimi-K2.5-MXFP4"
-KIMI_K25_MXFP4_HF_MODEL_ID = "moonshotai/Kimi-K2.5-MXFP4"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    env_path = os.environ.get("KIMI_K25_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(KIMI_K25_MXFP4_LOCAL_PATH):
-        return KIMI_K25_MXFP4_LOCAL_PATH
-    return KIMI_K25_MXFP4_HF_MODEL_ID
-
 
 @dataclass
 class ModelConfig:
     """Configuration for a model variant to test."""
 
     model_path: str
-    tp_size: int = 4
+    tp_size: int = 8
     accuracy_threshold: float = 0.92
     other_args: Optional[List[str]] = None
     env_vars: Optional[dict] = None
@@ -82,12 +58,9 @@ class ModelConfig:
 
 def get_kimi_k25_mxfp4_models() -> List[ModelConfig]:
     """Get Kimi-K2.5-MXFP4 model configurations for MI35x."""
-    model_path = get_model_path()
     common_kwargs = {
-        "model_path": model_path,
-        # TP=4 required: Kimi-K2.5 has 64 attn heads; aiter ASM MLA needs
-        # heads_per_gpu % 16 == 0 -> 64/4=16 works, 64/8=8 does not.
-        "tp_size": 4,
+        "model_path": "moonshotai/Kimi-K2.5-MXFP4",
+        "tp_size": 8,
         "accuracy_threshold": 0.92,
         "timeout": 3600,
     }
@@ -140,18 +113,6 @@ class TestKimiK25MXFP4AiterMlaEvalMI35x(unittest.TestCase):
 
     def test_kimi_k25_mxfp4_accuracy(self):
         """Test Kimi-K2.5-MXFP4 with GSM8K completion benchmark (default & fp8kv)."""
-        model_path = get_model_path()
-        is_local_path = model_path.startswith("/")
-        if is_local_path and not os.path.exists(model_path):
-            print(f"\nSKIPPING: Local model not found at {model_path}")
-            self.skipTest(f"Local model not found at {model_path}")
-            return
-
-        if is_local_path:
-            print(f"Using local model: {model_path}")
-        else:
-            print(f"Using HuggingFace model: {model_path}")
-
         from types import SimpleNamespace
 
         from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k

@@ -1,0 +1,422 @@
+---
+title: "Qwen3-30B-A3B"
+metatags:
+  description: "Best Practice for Qwen3-30B-A3B on Ascend NPU"
+---
+
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-30B-A3B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-30B-A3B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b).
+</Note>
+
+### Low Latency
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 10ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-10ms) |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 6K+1.5K | 10.25ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in6k-out1k5-bs16) |
+
+### High Throughput
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1K+100 | 10000ms | BF16 | [Optimal Configuration](#qwen3-30b-a3b-bf16-1p-in1k-out100) |
+| Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) |
+
+## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
+
+### Qwen3-30B-A3B BF16 1P IN1K OUT100
+
+**Model**: Qwen3-30B-A3B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 1
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: BF16
+
+**Dataset**: 1K+100
+
+**TPOT**: 10000ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_LAUNCH_BLOCKING=0
+export DP_ROUND_ROBIN=1
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_ALGO="level0:NA;level1:ring"
+export HCCL_SOCKET_IFNAME=<network-interface>
+export INF_NAN_MODE_FORCE_DISABLE=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_USE_MAX_DP_ATT=1
+export STREAMS_PER_DEVICE=32
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --nnodes 1 \
+    --node-rank 0 \
+    --attention-backend ascend \
+    --device npu \
+    --max-running-requests 168 \
+    --disable-radix-cache \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 8300 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --tp-size 2 \
+    --enable-dp-attention \
+    --dp-size 2 \
+    --mem-fraction-static 0.85 \
+    --cuda-graph-bs 1 2 4 8 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80 84 \
+    --dtype bfloat16
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 162 \
+    --random-input-len 1000 \
+    --random-output-len 100 \
+    --num-prompts 624 \
+    --random-range-ratio 1
+```
+
+### Qwen3-30B-A3B W8A8 1P IN3K5 OUT1K5 10ms
+
+**Model**: Qwen3-30B-A3B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 1
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 10ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_LAUNCH_BLOCKING=0
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=400
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --nnodes 1 \
+    --node-rank 0 \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --max-running-requests 162 \
+    --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 35000 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --tp-size 2 \
+    --mem-fraction-static 0.87 \
+    --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
+    --dtype bfloat16
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 1 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 1 \
+    --random-range-ratio 1
+```
+
+### Qwen3-30B-A3B W8A8 1P IN3K5 OUT1K5 50ms
+
+**Model**: Qwen3-30B-A3B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 1
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 3.5K+1.5K
+
+**TPOT**: 50ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export ASCEND_LAUNCH_BLOCKING=0
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=400
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --nnodes 1 \
+    --node-rank 0 \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --max-running-requests 162 \
+    --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 35000 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --tp-size 2 \
+    --mem-fraction-static 0.87 \
+    --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
+    --dtype bfloat16
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 160 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --num-prompts 640 \
+    --random-range-ratio 1
+```
+
+### Qwen3-30B-A3B W8A8 1P IN6K OUT1K5 BS16
+
+**Model**: Qwen3-30B-A3B
+
+**Hardware**: Atlas 800I A3
+
+**Cards**: 1
+
+**Deploy Mode**: PD Mixed
+
+**Quantization**: W8A8 INT8
+
+**Dataset**: 6K+1.5K
+
+**TPOT**: 10.25ms
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+#   DRAFT_MODEL_PATH: path to the draft model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+DRAFT_MODEL_PATH=/path/to/draft-model-weights
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export GLOO_SOCKET_IFNAME=<network-interface>
+export HCCL_BUFFSIZE=400
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=<network-interface>
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_SET_CPU_AFFINITY=1
+export TRANSFORMERS_VERBOSITY=error
+
+python3 -m sglang.launch_server \
+    --model-path $MODEL_PATH \
+    --host 127.0.0.1 --port 6688 \
+    --trust-remote-code \
+    --nnodes 1 \
+    --node-rank 0 \
+    --attention-backend ascend \
+    --device npu \
+    --quantization modelslim \
+    --max-running-requests 16 \
+    --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --speculative-num-steps 4 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 5 \
+    --chunked-prefill-size -1 \
+    --max-prefill-tokens 35000 \
+    --tp-size 2 \
+    --mem-fraction-static 0.6 \
+    --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
+    --dtype bfloat16
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset.
+
+```shell Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 16 \
+    --random-input-len 6144 \
+    --random-output-len 1500 \
+    --num-prompts 16 \
+    --random-range-ratio 1
+```

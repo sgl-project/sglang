@@ -17,7 +17,7 @@ import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Union
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from sglang.srt.utils import ConcurrentCounter
 from sglang.srt.utils.aio_rwlock import RWLock
@@ -41,6 +41,16 @@ class LoRARef:
     def __post_init__(self):
         if self.lora_id is None:
             raise ValueError("lora_id cannot be None")
+
+    @staticmethod
+    def deterministic_id(lora_name: str, lora_path: str) -> str:
+        """Stable ``lora_id`` for ``--lora-paths`` adapters.
+
+        Each node in a multi-node launch parses ``--lora-paths`` independently;
+        ``uuid4`` would mint a different id per node for the same adapter,
+        breaking cross-node lookups when the master broadcasts a request id.
+        """
+        return uuid5(NAMESPACE_URL, f"{lora_name}\0{lora_path}").hex
 
     def __str__(self) -> str:
         parts = [

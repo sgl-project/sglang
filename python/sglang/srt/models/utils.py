@@ -13,6 +13,7 @@
 # ==============================================================================
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -20,14 +21,19 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -48,6 +54,13 @@ class WeightsMapper:
     orig_to_new_substr: WeightsMapping = field(default_factory=dict)
     orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
     orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
+
+    def __or__(self, other: WeightsMapper) -> WeightsMapper:
+        return WeightsMapper(
+            orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
+            orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
+            orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
+        )
 
     def _map_name(self, key: str) -> Optional[str]:
         for substr, new_key in sorted(
@@ -106,15 +119,186 @@ class WeightsMapper:
         }
 
 
+class AutoWeightsLoader:
+    ROTARY_EMBEDS_UNUSED_WEIGHTS = [
+        "rotary_pos_emb.inv_freq",
+        "rotary_emb.inv_freq",
+        "rotary_emb.cos_cached",
+        "rotary_emb.sin_cached",
+    ]
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        *,
+        skip_prefixes: list[str] | None = None,
+        skip_substrs: list[str] | None = None,
+        ignore_unexpected_prefixes: list[str] | None = None,
+        ignore_unexpected_suffixes: list[str] | None = None,
+    ) -> None:
+        self.module = module
+        self.skip_prefixes = list(skip_prefixes or [])
+        self.skip_substrs = [
+            *(skip_substrs or []),
+            *self.ROTARY_EMBEDS_UNUSED_WEIGHTS,
+        ]
+        self.ignore_unexpected_prefixes = list(ignore_unexpected_prefixes or [])
+        self.ignore_unexpected_suffixes = list(ignore_unexpected_suffixes or [])
+
+    def _groupby_prefix(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, Iterable[tuple[str, torch.Tensor]]]]:
+        weights_by_parts = (
+            (weight_name.split(".", 1), weight_data)
+            for weight_name, weight_data in weights
+        )
+        for prefix, group in itertools.groupby(weights_by_parts, key=lambda x: x[0][0]):
+            yield (
+                prefix,
+                (
+                    ("" if len(parts) == 1 else parts[1], weight_data)
+                    for parts, weight_data in group
+                ),
+            )
+
+    @staticmethod
+    def _get_qualname(prefix: str, rest: str) -> str:
+        if prefix == "":
+            return rest
+        if rest == "":
+            return prefix
+        return f"{prefix}.{rest}"
+
+    def _can_skip(self, qualname: str) -> bool:
+        return any(qualname.startswith(p) for p in self.skip_prefixes) or any(
+            sub in qualname for sub in self.skip_substrs
+        )
+
+    def _can_ignore_unexpected(self, qualname: str) -> bool:
+        return any(
+            qualname.startswith(p) for p in self.ignore_unexpected_prefixes
+        ) or any(qualname.endswith(s) for s in self.ignore_unexpected_suffixes)
+
+    def _load_param(
+        self,
+        base_prefix: str,
+        param: torch.nn.Parameter,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[str]:
+        for weight_name, weight_data in weights:
+            weight_qualname = self._get_qualname(base_prefix, weight_name)
+            if self._can_skip(weight_qualname):
+                continue
+            if weight_name != "":
+                if self._can_ignore_unexpected(weight_qualname):
+                    continue
+                raise ValueError(
+                    f"Attempted to load nested weight {weight_qualname!r} "
+                    f"into parameter {base_prefix!r}"
+                )
+
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, weight_data)
+            yield weight_qualname
+
+    def _load_module(
+        self,
+        base_prefix: str,
+        module: torch.nn.Module,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[str]:
+        if module.__class__.__name__ == "PPMissingLayer":
+            return
+
+        if module is not self.module:
+            module_load_weights = getattr(module, "load_weights", None)
+            if callable(module_load_weights):
+                loaded = module_load_weights(weights)
+                if loaded is not None:
+                    yield from (
+                        self._get_qualname(base_prefix, loaded_name)
+                        for loaded_name in loaded
+                    )
+                return
+
+        child_modules = dict(module.named_children())
+        child_params = dict(module.named_parameters(recurse=False))
+        child_buffers = dict(module.named_buffers(recurse=False))
+        for child_prefix, child_weights in self._groupby_prefix(weights):
+            prefix = self._get_qualname(base_prefix, child_prefix)
+            if child_prefix in child_modules:
+                if self._can_skip(prefix + "."):
+                    continue
+                yield from self._load_module(
+                    prefix,
+                    child_modules[child_prefix],
+                    child_weights,
+                )
+                continue
+
+            if child_prefix in child_params:
+                if self._can_skip(prefix):
+                    continue
+                yield from self._load_param(
+                    prefix, child_params[child_prefix], child_weights
+                )
+                continue
+
+            if child_prefix in child_buffers:
+                if self._can_skip(prefix):
+                    continue
+                yield from self._load_param(
+                    prefix, child_buffers[child_prefix], child_weights
+                )
+                continue
+
+            if self._can_skip(prefix) or self._can_skip(prefix + "."):
+                continue
+            if self._can_ignore_unexpected(prefix) or self._can_ignore_unexpected(
+                prefix + "."
+            ):
+                continue
+            raise ValueError(
+                f"No module or parameter named {prefix!r} in {self.module._get_name()}."
+            )
+
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        mapper: WeightsMapper | None = None,
+    ) -> set[str]:
+        if mapper is not None:
+            weights = mapper.apply(weights)
+        weights = (
+            (name, weight) for name, weight in weights if not self._can_skip(name)
+        )
+        return set(self._load_module("", self.module, weights))
+
+
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    """Enable fused set_kv_buffer on CUDA with bfloat16 KV cache and HIP with bf16/fp16/fp8 KV cache.
+
+    SHUFFLE 5D pools on HIP also work — the underlying triton kernel
+    (`fused_qk_rope_reshape_and_cache`) natively supports the 5D
+    SHUFFLE layout (key_cache.ndim==5, value_cache.ndim==5). We just need
+    the per-layer arg builder to pass the raw 5D buffers without the
+    `.view(-> 4D NHD)` reshape, and let the rotary forward pass
+    `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
+    """
+    pool = get_token_to_kv_pool()
     return (
         _is_cuda
-        and hasattr(forward_batch.token_to_kv_pool, "dtype")
-        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and pool.dtype == torch.bfloat16
+        and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
-    ) or (_is_hip and not is_prefill_context_parallel_enabled())
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+    ) or (
+        _is_hip
+        and not is_prefill_context_parallel_enabled()
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+    )
 
 
 def create_fused_set_kv_buffer_arg(
@@ -125,7 +309,7 @@ def create_fused_set_kv_buffer_arg(
     from sglang.jit_kernel.rope import FusedSetKVBufferArg
 
     layer_id = layer.layer_id
-    token_to_kv_pool = forward_batch.token_to_kv_pool
+    token_to_kv_pool = get_token_to_kv_pool()
 
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
@@ -145,16 +329,26 @@ def create_fused_set_kv_buffer_arg(
             if layer.sliding_window_size > 0
             else None
         )
+        # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
+        # fused_qk_rope_reshape_and_cache via flash_layout=False. For the
+        # legacy NHD 3D pool we reshape to the (num_blocks, page_size, H, D)
+        # paged view the kernel expects under flash_layout=True.
+        if k_buffer.ndim == 5:
+            key_cache = k_buffer
+            value_cache = v_buffer
+        else:
+            key_cache = k_buffer.view(
+                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            )
+            value_cache = v_buffer.view(
+                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            )
         return {
             "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
             "k_scale": layer.k_scale,
             "v_scale": layer.v_scale,
-            "key_cache": k_buffer.view(
-                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
-            ),
-            "value_cache": v_buffer.view(
-                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
-            ),
+            "key_cache": key_cache,
+            "value_cache": value_cache,
             "slot_mapping": forward_batch.out_cache_loc,
             "swa_slot_mapping": slot_mapping_swa,
         }
@@ -189,7 +383,6 @@ def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class RotaryPosMixin:
-
     @staticmethod
     @lru_cache(maxsize=1024)
     def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
@@ -224,6 +417,29 @@ class RotaryPosMixin:
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
 
+def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Reshape a (..., H*D) tensor into (..., H, D) ahead of QK RMSNorm.
+
+    On CUDA with the inductor piecewise-cuda-graph compiler, return a
+    stride-preserving view so inductor can fuse this reshape with the
+    subsequent RMSNorm (and any upstream/downstream FP8 quant) into a
+    single triton kernel -- the original motivation of #21734.
+
+    Everywhere else (ROCm, or CUDA with the eager PCG fallback), use the
+    flat 2D reshape that forces a copy when the input is a non-contiguous
+    QKV-split stride-trick view. ROCm's RMSNorm kernels assume contiguous
+    inputs and fault on strided tensors (root cause of the #21734 revert
+    in #23159).
+    """
+
+    if (
+        _is_cuda
+        and get_global_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
+    ):
+        return x.view(*x.shape[:-1], -1, head_dim)
+    return x.reshape(-1, head_dim)
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -253,11 +469,14 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and get_global_server_args().cuda_graph_config.prefill.tc_compiler
+        != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -273,20 +492,234 @@ def apply_qk_norm(
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
         with torch.cuda.stream(alt_stream):
-            k_by_head = k.reshape(-1, head_dim)
+            k_by_head = _reshape_for_qk_norm(k, head_dim)
             k_by_head = k_norm(k_by_head)
         current_stream.wait_stream(alt_stream)
     else:
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
-        k_by_head = k.reshape(-1, head_dim)
+        k_by_head = _reshape_for_qk_norm(k, head_dim)
         k_by_head = k_norm(k_by_head)
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)
     return q, k
+
+
+# ---------------------------------------------------------------------------
+# Fused QK GemmaRMSNorm Triton kernel
+# grid = q_rows (the larger dimension in GQA).  Every block computes Q norm
+# for its row; the first k_rows blocks also compute K norm.  No torch.cat,
+# no tl.where for weight selection, no output slice.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_qk_gemma_rmsnorm_kernel(
+    Q_ptr,
+    K_ptr,
+    Q_out_ptr,
+    K_out_ptr,
+    QW_ptr,
+    KW_ptr,
+    q_stride,
+    k_stride,
+    k_rows,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    EPS: tl.constexpr,
+    FP16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_HD)
+    mask = cols < HEAD_DIM
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+
+    # Q norm (every block) — use q_stride to handle non-contiguous input
+    q_off = pid * q_stride + cols
+    q = tl.load(Q_ptr + q_off, mask=mask, other=0.0).to(tl.float32)
+    w_q = tl.load(QW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    q_var = tl.sum(q * q, axis=0) / HEAD_DIM
+    q_normed = (q * tl.rsqrt(q_var + EPS) * (w_q + 1.0)).to(out_dtype)
+    # output is always contiguous
+    q_out_off = pid * HEAD_DIM + cols
+    tl.store(Q_out_ptr + q_out_off, q_normed, mask=mask)
+
+    # K norm (first k_rows blocks only) — use k_stride for input
+    if pid < k_rows:
+        k_off = pid * k_stride + cols
+        k = tl.load(K_ptr + k_off, mask=mask, other=0.0).to(tl.float32)
+        w_k = tl.load(KW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        k_var = tl.sum(k * k, axis=0) / HEAD_DIM
+        k_normed = (k * tl.rsqrt(k_var + EPS) * (w_k + 1.0)).to(out_dtype)
+        k_out_off = pid * HEAD_DIM + cols
+        tl.store(K_out_ptr + k_out_off, k_normed, mask=mask)
+
+
+def fused_qk_gemma_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused QK GemmaRMSNorm — single Triton kernel for both q_norm and k_norm.
+
+    grid = q_rows; every block processes its Q row, and the first k_rows
+    blocks also process K.  No torch.cat, no slice, no tl.where.
+    Passes input strides to the kernel so non-contiguous tensors (e.g. from
+    qkv.split()) are read correctly without an extra .contiguous() copy.
+    """
+    q_flat = q.reshape(-1, head_dim)
+    k_flat = k.reshape(-1, head_dim)
+
+    q_rows = q_flat.shape[0]
+    k_rows = k_flat.shape[0]
+
+    q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
+
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+
+    _fused_qk_gemma_rmsnorm_kernel[(q_rows,)](
+        q_flat,
+        k_flat,
+        q_out,
+        k_out,
+        q_weight,
+        k_weight,
+        q_flat.stride(0),
+        k_flat.stride(0),
+        k_rows,
+        HEAD_DIM=head_dim,
+        BLOCK_HD=BLOCK_HD,
+        EPS=eps,
+        FP16=(q.dtype == torch.float16),
+    )
+
+    return q_out, k_out
+
+
+# ---------------------------------------------------------------------------
+# Fused QK GemmaRMSNorm + gate extraction kernel
+# For models with attn_output_gate (e.g. Qwen3.5) where q and gate are
+# interleaved per head: [q_h0, gate_h0, q_h1, gate_h1, ...].
+# Reads q from the interleaved buffer, normalizes it, and copies gate to a
+# contiguous output — all in a single kernel launch.  Eliminates two
+# elementwise copy kernels that would otherwise be needed to deinterleave.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_qk_gemma_rmsnorm_gate_kernel(
+    QG_ptr,
+    K_ptr,
+    Q_out_ptr,
+    K_out_ptr,
+    Gate_out_ptr,
+    QW_ptr,
+    KW_ptr,
+    qg_token_stride,
+    qg_head_stride,
+    k_token_stride,
+    k_head_stride,
+    num_heads,
+    num_kv_heads,
+    k_rows,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    EPS: tl.constexpr,
+    FP16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_HD)
+    mask = cols < HEAD_DIM
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+
+    token_idx = pid // num_heads
+    head_idx = pid % num_heads
+
+    base = token_idx * qg_token_stride + head_idx * qg_head_stride
+
+    # Q norm
+    q = tl.load(QG_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+    w_q = tl.load(QW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    q_var = tl.sum(q * q, axis=0) / HEAD_DIM
+    q_normed = (q * tl.rsqrt(q_var + EPS) * (w_q + 1.0)).to(out_dtype)
+    out_off = pid * HEAD_DIM + cols
+    tl.store(Q_out_ptr + out_off, q_normed, mask=mask)
+
+    # Gate copy
+    gate = tl.load(QG_ptr + base + HEAD_DIM + cols, mask=mask, other=0.0)
+    tl.store(Gate_out_ptr + out_off, gate, mask=mask)
+
+    # K norm (first k_rows blocks only)
+    if pid < k_rows:
+        token_idx_k = pid // num_kv_heads
+        head_idx_k = pid % num_kv_heads
+        k_off = token_idx_k * k_token_stride + head_idx_k * k_head_stride + cols
+        k = tl.load(K_ptr + k_off, mask=mask, other=0.0).to(tl.float32)
+        w_k = tl.load(KW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        k_var = tl.sum(k * k, axis=0) / HEAD_DIM
+        k_normed = (k * tl.rsqrt(k_var + EPS) * (w_k + 1.0)).to(out_dtype)
+        k_out_off = pid * HEAD_DIM + cols
+        tl.store(K_out_ptr + k_out_off, k_normed, mask=mask)
+
+
+def fused_qk_gemma_rmsnorm_with_gate(
+    q_gate: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    head_dim: int,
+    num_heads: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused QK GemmaRMSNorm + gate extraction from interleaved q_gate buffer.
+
+    q_gate: (seq, q_size*2) where q and gate are interleaved per head,
+            i.e. [q_h0, gate_h0, q_h1, gate_h1, ...] with q_size = num_heads * head_dim.
+            Can be a non-contiguous view from qkv.split().
+    k: (seq, kv_size) — same as fused_qk_gemma_rmsnorm.
+
+    Returns (q_out, k_out, gate_out) all contiguous with shape
+    (seq*num_heads, head_dim), (seq*num_kv_heads, head_dim), (seq*num_heads, head_dim).
+    """
+    seq_len = q_gate.shape[0]
+    qg_3d = q_gate.view(seq_len, num_heads, 2 * head_dim)
+    num_kv_heads = k.shape[-1] // head_dim
+    k_3d = k.view(seq_len, num_kv_heads, head_dim)
+
+    q_rows = seq_len * num_heads
+    k_rows = seq_len * num_kv_heads
+
+    q_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+    k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
+    gate_out = torch.empty(q_rows, head_dim, dtype=q_gate.dtype, device=q_gate.device)
+
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+
+    _fused_qk_gemma_rmsnorm_gate_kernel[(q_rows,)](
+        qg_3d,
+        k_3d,
+        q_out,
+        k_out,
+        gate_out,
+        q_weight,
+        k_weight,
+        qg_3d.stride(0),
+        qg_3d.stride(1),
+        k_3d.stride(0),
+        k_3d.stride(1),
+        num_heads,
+        num_kv_heads,
+        k_rows,
+        HEAD_DIM=head_dim,
+        BLOCK_HD=BLOCK_HD,
+        EPS=eps,
+        FP16=(q_gate.dtype == torch.float16),
+    )
+
+    return q_out, k_out, gate_out
 
 
 # Register the inplace op

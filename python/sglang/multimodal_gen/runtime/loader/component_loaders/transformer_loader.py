@@ -1,3 +1,4 @@
+import copy
 import logging
 from typing import Any
 
@@ -26,28 +27,86 @@ _is_npu = is_npu()
 logger = init_logger(__name__)
 
 
+def _server_args_for_transformer_component(
+    server_args: ServerArgs, component_name: str
+) -> ServerArgs:
+    """Mask global quantized override flags for secondary transformer components."""
+    if component_name not in ("transformer_2", "unconditional_transformer"):
+        return server_args
+
+    # Some pipelines have secondary DiT components with their own quantized
+    # weight file. Keep the mapping model-owned and the loader generic.
+    component_weights_paths = getattr(
+        server_args, "component_transformer_weights_paths", {}
+    )
+    component_weights_path = component_weights_paths.get(component_name)
+    if component_weights_path is not None:
+        component_server_args = copy.copy(server_args)
+        component_server_args.transformer_weights_path = component_weights_path
+        component_server_args.nunchaku_config = None
+        logger.info(
+            "Using transformer_weights_path override for %s: %s",
+            component_name,
+            component_weights_path,
+        )
+        return component_server_args
+
+    if (
+        server_args.transformer_weights_path is None
+        and server_args.nunchaku_config is None
+    ):
+        return server_args
+
+    component_server_args = copy.copy(server_args)
+    component_server_args.transformer_weights_path = None
+    component_server_args.nunchaku_config = None
+    logger.info(
+        "Ignoring global transformer_weights_path for %s; keep it on the base "
+        "checkpoint unless a per-component override path is provided.",
+        component_name,
+    )
+    return component_server_args
+
+
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
-    component_names = ["transformer", "audio_dit", "video_dit"]
+    component_names = [
+        "transformer",
+        "unconditional_transformer",
+        "audio_dit",
+        "video_dit",
+    ]
     expected_library = "diffusers"
+
+    def should_raise_customized_load_error(
+        self, server_args: ServerArgs, component_name: str
+    ) -> bool:
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+        return component_server_args.transformer_weights_path is not None
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
+        component_server_args = _server_args_for_transformer_component(
+            server_args, component_name
+        )
+
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
         safetensors_list = resolve_transformer_safetensors_to_load(
-            server_args, component_model_path
+            component_server_args, component_model_path
         )
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
         component_name = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "video_dit"):
+        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
             pipeline_dit_config_attr = "dit_config"
         elif component_name in ("audio_dit",):
             pipeline_dit_config_attr = "audio_dit_config"
@@ -61,7 +120,7 @@ class TransformerLoader(ComponentLoader):
 
         quant_spec = resolve_transformer_quant_load_spec(
             hf_config=config,
-            server_args=server_args,
+            server_args=component_server_args,
             safetensors_list=safetensors_list,
             component_model_path=component_model_path,
             model_cls=model_cls,
@@ -83,10 +142,10 @@ class TransformerLoader(ComponentLoader):
         }
         if (
             init_params["quant_config"] is None
-            and server_args.transformer_weights_path is not None
+            and component_server_args.transformer_weights_path is not None
         ):
             logger.warning(
-                f"transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
+                "transformer_weights_path provided, but quantization config not resolved, which is unexpected and likely to cause errors"
             )
         else:
             logger.debug("quantization config: %s", init_params["quant_config"])
@@ -99,9 +158,9 @@ class TransformerLoader(ComponentLoader):
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
             hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=server_args.dit_cpu_offload,
-            pin_cpu_memory=server_args.pin_cpu_memory,
-            fsdp_inference=server_args.use_fsdp_inference,
+            cpu_offload=component_server_args.dit_cpu_offload,
+            pin_cpu_memory=component_server_args.pin_cpu_memory,
+            fsdp_inference=component_server_args.use_fsdp_inference,
             param_dtype=quant_spec.param_dtype,
             reduce_dtype=torch.float32,
             output_dtype=None,
@@ -111,9 +170,6 @@ class TransformerLoader(ComponentLoader):
         # post-hooks (e.g., patch scales (nunchaku))
         for post_load_hook in quant_spec.post_load_hooks:
             post_load_hook(model)
-
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
         # considering the existent of mixed-precision models (e.g., nunchaku)
         if (

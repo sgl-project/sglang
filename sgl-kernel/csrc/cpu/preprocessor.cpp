@@ -282,8 +282,6 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     int64_t merge_size,
     bool disable_grouping,
     at::ScalarType out_dtype) {
-  RECORD_FUNCTION("sgl_kernel::image_preprocess_cpu", std::vector<c10::IValue>({}));
-
   // TODO: lift C++ kernel limitations
   TORCH_CHECK(interpolation == "bicubic", "image_preprocess_cpu: support only bicubic mode.");
   TORCH_CHECK(do_rescale && do_normalize, "image_preprocess_cpu: support only do_rescale and do_normalize.");

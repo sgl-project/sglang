@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List
 
 from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
 
@@ -11,6 +11,8 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     in_channels: int = 3
     latent_channels: int = 128
     out_channels: int = 3
+    temporal_compression_ratio: int = 8
+    spatial_compression_ratio: int = 32
     block_out_channels: List[int] = field(
         default_factory=lambda: [256, 512, 1024, 2048]
     )
@@ -50,7 +52,17 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     decoder_causal: bool = False
     decoder_spatial_padding_mode: str = "reflect"
 
+    # Native LTX variant metadata.
+    ltx_variant: str = "ltx_2"
+    condition_encoder_subdir: str = ""
+    video_decoder_variant: str = "ltx_2"
+    video_decoder_config: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class LTXVideoVAEConfig(VAEConfig):
     arch_config: LTXVideoVAEArchConfig = field(default_factory=LTXVideoVAEArchConfig)
+    auto_parallel_decode_min_latent_elements_per_rank: int = 1024
+
+    def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        return True

@@ -19,7 +19,14 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
+    enable_diffusers_decoder_spatial_parallel,
+    spatial_parallel_diffusers_decode,
+)
 
 
 class AutoencoderKLFlux2(ParallelTiledVAE):
@@ -49,6 +56,9 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         down_block_types: Tuple[str, ...] = arch_config.down_block_types
         up_block_types: Tuple[str, ...] = arch_config.up_block_types
         block_out_channels: Tuple[int, ...] = arch_config.block_out_channels
+        decoder_block_out_channels: Optional[Tuple[int, ...]] = getattr(
+            arch_config, "decoder_block_out_channels", None
+        )
         layers_per_block: int = arch_config.layers_per_block
         act_fn: str = arch_config.act_fn
         latent_channels: int = arch_config.latent_channels
@@ -79,7 +89,7 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
             in_channels=latent_channels,
             out_channels=out_channels,
             up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
+            block_out_channels=decoder_block_out_channels or block_out_channels,
             layers_per_block=layers_per_block,
             norm_num_groups=norm_num_groups,
             act_fn=act_fn,
@@ -107,6 +117,13 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
 
         self.use_slicing = False
         self.use_tiling = False
+        self._spatial_parallel_decode_enabled = False
+        self._spatial_parallel_upsample_count = 0
+        if can_install_spatial_shard_parallel_decode(self.config):
+            self._spatial_parallel_upsample_count = (
+                enable_diffusers_decoder_spatial_parallel(self.decoder)
+            )
+            self._spatial_parallel_decode_enabled = True
 
         # only relevant if vae tiling is enabled
         self.tile_sample_min_size = self.config.sample_size
@@ -263,7 +280,12 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         if self.post_quant_conv is not None:
             z = self.post_quant_conv(z)
 
-        dec = self.decoder(z)
+        if self._spatial_parallel_decode_enabled:
+            dec = spatial_parallel_diffusers_decode(
+                self.decoder, z, self._spatial_parallel_upsample_count
+            )
+        else:
+            dec = self.decoder(z)
 
         if not return_dict:
             return (dec,)

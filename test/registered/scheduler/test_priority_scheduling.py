@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     send_concurrent_generate_requests_with_custom_params,
 )
 
-register_cuda_ci(est_time=130, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=149, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -41,8 +41,6 @@ class TestPriorityScheduling(CustomTestCase):
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
                 "--enable-priority-scheduling",  # Enable priority scheduling
-                # Disable PCG to avoid padding in flashinfer backend. Ref: https://github.com/sgl-project/sglang/pull/21452
-                "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -200,21 +198,24 @@ class TestPriorityScheduling(CustomTestCase):
     def test_priority_scheduling_preemption_below_threshold_validation(self):
         """Verify running requests are not preempted by requests with priorities below preemption threshold"""
 
-        responses = asyncio.run(
-            send_concurrent_generate_requests_with_custom_params(
+        # Stagger sends so priority=0 occupies the running queue before
+        # priority=5 arrives -- asyncio.gather gives no arrival-order guarantee.
+        # ignore_eos on both: priority=0 stays running when priority=5 arrives
+        # (exercises the no-preempt path), and priority=5's runtime must exceed
+        # the stagger so its server-side e2e_latency stays > priority=0's.
+        async def _send(priority, **sampling):
+            return await send_concurrent_generate_requests_with_custom_params(
                 self.base_url,
-                [
-                    {
-                        "priority": 0,
-                        "sampling_params": {"max_new_tokens": 10000},
-                    },
-                    {
-                        "priority": 5,
-                        "sampling_params": {"max_new_tokens": 10000},
-                    },
-                ],
+                [{"priority": priority, "sampling_params": sampling}],
             )
-        )
+
+        async def _run():
+            first = asyncio.create_task(_send(0, max_new_tokens=1000, ignore_eos=True))
+            await asyncio.sleep(1.0)
+            second = asyncio.create_task(_send(5, max_new_tokens=1000, ignore_eos=True))
+            return (await first) + (await second)
+
+        responses = asyncio.run(_run())
 
         expected_status_and_error_messages = [
             (200, None),
@@ -249,7 +250,6 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
                 "--enable-priority-scheduling",  # Enable priority scheduling
-                "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
