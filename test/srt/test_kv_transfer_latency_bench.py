@@ -1,6 +1,8 @@
 import csv
 import json
+from pathlib import Path
 
+from scripts.playground.disaggregation.kv_transfer_bench import kv_auto_experiment as auto
 from scripts.playground.disaggregation.kv_transfer_bench import kv_transfer_latency as bench
 from scripts.playground.disaggregation.kv_transfer_bench.kv_transfer_latency import (
     TargetInfo,
@@ -276,3 +278,169 @@ def test_wait_until_unix_ns_sleeps_until_deadline(monkeypatch):
     bench._wait_until_unix_ns(1_050_000_000)
 
     assert sleeps == [0.05, 0.01]
+
+
+def test_auto_parser_accepts_multi_hca_suites():
+    args = auto.build_parser().parse_args(["--suite", "multi-hca-bg"])
+    assert args.suite == "multi-hca-bg"
+
+    args = auto.build_parser().parse_args(["--suite", "multi-hca-portcap-bg"])
+    assert args.suite == "multi-hca-portcap-bg"
+
+    args = auto.build_parser().parse_args(["--suite", "multi-hca-bgcap-only"])
+    assert args.suite == "multi-hca-bgcap-only"
+
+    args = auto.build_parser().parse_args(["--suite", "multi-hca-compare-4x100"])
+    assert args.suite == "multi-hca-compare-4x100"
+
+    args = auto.build_parser().parse_args(["--suite", "ratelimit-empty"])
+    assert args.suite == "ratelimit-empty"
+
+
+def test_multi_hca_bg_uses_one_logical_flow_over_device_group():
+    runs = auto.multi_hca_matrix_runs()
+    run = next(r for r in runs if r.run == "200_2x100_bg50_multi_hca_portcap_moonbg")
+
+    assert run.shards == 1
+    assert run.max_bytes == "2GB"
+    assert run.sizes == auto.DENSE_SIZES_1
+    assert run.bg_rate_gbps == 100.0
+    assert run.fg_rate_gbps == 100.0
+    assert len(run.lanes) == 1
+    assert run.lanes[0].ib_device == "mlx5_bond_0,mlx5_bond_1"
+    assert run.capfill_rate_gbps == 100.0
+    assert [endpoint.ib_device for endpoint in run.capfill_lanes] == [
+        "mlx5_bond_0",
+        "mlx5_bond_1",
+    ]
+
+
+def test_multi_hca_2x200_needs_no_port_cap_fillers():
+    runs = auto.multi_hca_matrix_runs()
+    run = next(r for r in runs if r.run == "400_2x200_bg50_multi_hca_portcap_moonbg")
+
+    assert run.bg_rate_gbps == 200.0
+    assert run.fg_rate_gbps == 200.0
+    assert run.capfill_rate_gbps == 0.0
+    assert run.capfill_lanes == ()
+
+
+def test_bgcap_only_leaves_foreground_uncapped():
+    runs = auto.multi_hca_bgcap_only_runs()
+    run = next(r for r in runs if r.run == "400_4x100_bg50_multi_hca_bgcap_only")
+
+    assert run.shards == 1
+    assert run.max_bytes == "2GB"
+    assert run.sizes == auto.DENSE_SIZES_1
+    assert run.bg_rate_gbps == 200.0
+    assert run.fg_rate_gbps is None
+    assert run.capfill_rate_gbps == 0.0
+    assert run.capfill_lanes == ()
+    assert run.lanes[0].ib_device == "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
+
+
+def test_multi_hca_monitor_devices_expand_and_dedupe_groups():
+    endpoints = [
+        auto.Endpoint(0, 0, "src0", "tgt0", "mlx5_bond_0,mlx5_bond_1"),
+        auto.Endpoint(1, 1, "src1", "tgt1", "mlx5_bond_1,mlx5_bond_2"),
+    ]
+
+    assert auto.monitor_ib_devices(endpoints) == [
+        "mlx5_bond_0",
+        "mlx5_bond_1",
+        "mlx5_bond_2",
+    ]
+
+
+def test_4x100_compare_suite_contains_split_and_multi_hca_cases():
+    runs = {run.run: run for run in auto.multi_hca_compare_4x100_runs()}
+
+    split = runs["400_4x100_bg50_cap100_moonbg_split"]
+    multi = runs["400_4x100_bg50_multi_hca_portcap_moonbg"]
+
+    assert split.shards == 4
+    assert len(split.lanes) == 4
+    assert split.bg_rate_gbps == 50.0
+    assert split.fg_rate_gbps == 50.0
+
+    assert multi.shards == 1
+    assert len(multi.lanes) == 1
+    assert multi.bg_rate_gbps == 200.0
+    assert multi.fg_rate_gbps == 200.0
+    assert multi.capfill_rate_gbps == 100.0
+    assert [endpoint.ib_device for endpoint in multi.capfill_lanes] == [
+        "mlx5_bond_0",
+        "mlx5_bond_1",
+        "mlx5_bond_2",
+        "mlx5_bond_3",
+    ]
+    assert multi.lanes[0].ib_device == "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
+
+
+def test_ratelimit_empty_suite_defines_split_and_multi_hca_bg0_baselines():
+    runs = {run.run: run for run in auto.ratelimit_empty_runs()}
+
+    assert sorted(runs) == [
+        "200_1x200_bg0_ratelimit_multihca",
+        "200_1x200_bg0_ratelimit_split",
+        "400_2x200_bg0_ratelimit_multihca",
+        "400_2x200_bg0_ratelimit_split",
+        "400_4x100_bg0_ratelimit_multihca",
+        "400_4x100_bg0_ratelimit_split",
+        "800_4x200_bg0_ratelimit_multihca",
+        "800_4x200_bg0_ratelimit_split",
+    ]
+
+    split_4x200 = runs["800_4x200_bg0_ratelimit_split"]
+    assert split_4x200.shards == 4
+    assert len(split_4x200.lanes) == 4
+    assert split_4x200.max_bytes == "512MB"
+    assert split_4x200.sizes == auto.DENSE_SIZES_4
+    assert split_4x200.bg_rate_gbps == 0.0
+    assert split_4x200.fg_rate_gbps == 200.0
+
+    multi_4x200 = runs["800_4x200_bg0_ratelimit_multihca"]
+    assert multi_4x200.shards == 1
+    assert len(multi_4x200.lanes) == 1
+    assert multi_4x200.lanes[0].ib_device == (
+        "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
+    )
+    assert multi_4x200.max_bytes == "2GB"
+    assert multi_4x200.sizes == auto.DENSE_SIZES_1
+    assert multi_4x200.bg_rate_gbps == 0.0
+    assert multi_4x200.fg_rate_gbps == 800.0
+
+    split_4x100 = runs["400_4x100_bg0_ratelimit_split"]
+    multi_4x100 = runs["400_4x100_bg0_ratelimit_multihca"]
+    assert split_4x100.fg_rate_gbps == 100.0
+    assert multi_4x100.fg_rate_gbps == 400.0
+
+    split_2x200 = runs["400_2x200_bg0_ratelimit_split"]
+    multi_2x200 = runs["400_2x200_bg0_ratelimit_multihca"]
+    assert split_2x200.shards == 2
+    assert split_2x200.max_bytes == "1GB"
+    assert split_2x200.sizes == auto.DENSE_SIZES_2
+    assert split_2x200.fg_rate_gbps == 200.0
+    assert multi_2x200.fg_rate_gbps == 400.0
+
+    split_1x200 = runs["200_1x200_bg0_ratelimit_split"]
+    multi_1x200 = runs["200_1x200_bg0_ratelimit_multihca"]
+    assert split_1x200.shards == 1
+    assert split_1x200.fg_rate_gbps == 200.0
+    assert multi_1x200.shards == 1
+    assert multi_1x200.fg_rate_gbps == 200.0
+
+
+def test_ratelimit_empty_runs_do_not_start_background_targets():
+    args = auto.build_parser().parse_args(["--suite", "ratelimit-empty", "--dry-run"])
+    runner = auto.Runner(args)
+    run = next(
+        r
+        for r in auto.ratelimit_empty_runs()
+        if r.run == "400_4x100_bg0_ratelimit_multihca"
+    )
+
+    script = runner.remote_target_script(run, list(run.lanes), Path("/tmp/bg0"), run.max_bytes)
+
+    assert "target-bg" not in script
+    assert "target-bond0" in script

@@ -33,6 +33,10 @@ DENSE_SIZES_1 = (
     "1MB,2MB,4MB,8MB,16MB,24MB,32MB,48MB,64MB,96MB,128MB,"
     "192MB,256MB,384MB,512MB,768MB,1GB,1.25GB,1.5GB,1.75GB,2GB"
 )
+DENSE_SIZES_2 = (
+    "512KB,1MB,2MB,4MB,8MB,12MB,16MB,24MB,32MB,48MB,64MB,"
+    "96MB,128MB,192MB,256MB,384MB,512MB,640MB,768MB,896MB,1GB"
+)
 DENSE_SIZES_4 = (
     "256KB,512KB,1MB,2MB,4MB,6MB,8MB,12MB,16MB,24MB,32MB,"
     "48MB,64MB,96MB,128MB,192MB,256MB,320MB,384MB,448MB,512MB"
@@ -40,14 +44,40 @@ DENSE_SIZES_4 = (
 
 
 Endpoint = namedtuple("Endpoint", "lane gpu_id src_host tgt_host ib_device")
-MatrixRun = namedtuple(
-    "MatrixRun",
-    "run lanes shards max_bytes sizes protocol lane_cap_gbps bg_rate_gbps fg_rate_gbps",
-)
 CompetitionCase = namedtuple(
     "CompetitionCase",
     "run flow_sizes protocol ib_device lane_cap_gbps mode",
 )
+
+PHYSICAL_LANE_GBPS = 200.0
+
+
+class MatrixRun:
+    def __init__(
+        self,
+        run: str,
+        lanes: Iterable[Endpoint],
+        shards: int,
+        max_bytes: str,
+        sizes: str,
+        protocol: str,
+        lane_cap_gbps: float,
+        bg_rate_gbps: float,
+        fg_rate_gbps: Optional[float],
+        capfill_lanes: Iterable[Endpoint] = (),
+        capfill_rate_gbps: float = 0.0,
+    ):
+        self.run = run
+        self.lanes = tuple(lanes)
+        self.shards = shards
+        self.max_bytes = max_bytes
+        self.sizes = sizes
+        self.protocol = protocol
+        self.lane_cap_gbps = lane_cap_gbps
+        self.bg_rate_gbps = bg_rate_gbps
+        self.fg_rate_gbps = fg_rate_gbps
+        self.capfill_lanes = tuple(capfill_lanes)
+        self.capfill_rate_gbps = capfill_rate_gbps
 
 
 def q(value: object) -> str:
@@ -248,53 +278,57 @@ fi
             "set -euo pipefail",
             f"mkdir -p {q(str(out_dir / 'raw'))}",
         ]
-        roles = ("target", "target-bg") if isinstance(run, MatrixRun) else ("target",)
-        for endpoint in targets:
-            for role in roles:
-                suffix = f"{role}-bond{endpoint.lane}"
-                if isinstance(run, CompetitionCase):
-                    suffix = f"target-flow{endpoint.lane}"
-                name = f"kv_{run.run}_{suffix.replace('-', '_')}"
-                info_file = f"/tmp/kv-transfer-bench/{suffix}.json"
-                log_file = out_dir / "raw" / f"{suffix}.log"
-                env = [
-                    "-e MOONCAKE_PROTOCOL=" + q(run.protocol),
-                    "-e IB_DEVICE=" + q(endpoint.ib_device),
-                ]
-                if run.protocol == "rdma":
-                    env.extend(["-e MC_USE_IPV6=1", "-e MC_GID_INDEX=3"])
-                if run.protocol == "tcp":
-                    env.append("-e MC_FORCE_TCP=1")
-                lines.append(
-                    "nohup docker run --rm "
-                    f"--name {q(name)} --gpus all --network host --ipc host --privileged "
-                    "--ulimit memlock=-1:-1 "
-                    + " ".join(env)
-                    + f" -v {q(self.args.bench_dir)}:/workspace/kv_transfer_bench:ro"
-                    + f" -v {q(str(out_dir / 'raw'))}:/tmp/kv-transfer-bench"
-                    + " -v /dev/infiniband:/dev/infiniband"
-                    + f" {q(self.args.image)} bash -lc "
-                    + q(
-                        "cd /workspace/kv_transfer_bench && "
-                        f"python3 kv_transfer_latency.py --role target "
-                        f"--host {endpoint.tgt_host} --gpu-id {endpoint.gpu_id} "
-                        f"--ib-device {endpoint.ib_device} --protocol {run.protocol} "
-                        f"--max-bytes {max_bytes} --target-info-file {info_file}"
-                    )
-                    + f" > {q(str(log_file))} 2>&1 &"
+        target_specs = []
+        if isinstance(run, MatrixRun):
+            for endpoint in targets:
+                target_specs.append((endpoint, f"target-bond{endpoint.lane}"))
+                if run.bg_rate_gbps > 0:
+                    target_specs.append((endpoint, f"target-bg-bond{endpoint.lane}"))
+            for endpoint in run.capfill_lanes:
+                target_specs.append((endpoint, f"target-cap-bond{endpoint.lane}"))
+        else:
+            for endpoint in targets:
+                target_specs.append((endpoint, f"target-flow{endpoint.lane}"))
+
+        for endpoint, suffix in target_specs:
+            name = f"kv_{run.run}_{suffix.replace('-', '_')}"
+            info_file = f"/tmp/kv-transfer-bench/{suffix}.json"
+            log_file = out_dir / "raw" / f"{suffix}.log"
+            env = [
+                "-e MOONCAKE_PROTOCOL=" + q(run.protocol),
+                "-e IB_DEVICE=" + q(endpoint.ib_device),
+            ]
+            if run.protocol == "rdma":
+                env.extend(["-e MC_USE_IPV6=1", "-e MC_GID_INDEX=3"])
+            if run.protocol == "tcp":
+                env.append("-e MC_FORCE_TCP=1")
+            lines.append(
+                "nohup docker run --rm "
+                f"--name {q(name)} --gpus all --network host --ipc host --privileged "
+                "--ulimit memlock=-1:-1 "
+                + " ".join(env)
+                + f" -v {q(self.args.bench_dir)}:/workspace/kv_transfer_bench:ro"
+                + f" -v {q(str(out_dir / 'raw'))}:/tmp/kv-transfer-bench"
+                + " -v /dev/infiniband:/dev/infiniband"
+                + f" {q(self.args.image)} bash -lc "
+                + q(
+                    "cd /workspace/kv_transfer_bench && "
+                    f"python3 kv_transfer_latency.py --role target "
+                    f"--host {endpoint.tgt_host} --gpu-id {endpoint.gpu_id} "
+                    f"--ib-device {endpoint.ib_device} --protocol {run.protocol} "
+                    f"--max-bytes {max_bytes} --target-info-file {info_file}"
                 )
-        for endpoint in targets:
-            for role in roles:
-                suffix = f"{role}-bond{endpoint.lane}"
-                if isinstance(run, CompetitionCase):
-                    suffix = f"target-flow{endpoint.lane}"
-                log_file = out_dir / "raw" / f"{suffix}.log"
-                lines.append(f"until grep -q 'target_ready=true' {q(str(log_file))}; do sleep 1; done")
+                + f" > {q(str(log_file))} 2>&1 &"
+            )
+
+        for _, suffix in target_specs:
+            log_file = out_dir / "raw" / f"{suffix}.log"
+            lines.append(f"until grep -q 'target_ready=true' {q(str(log_file))}; do sleep 1; done")
         lines.append(f"grep '^TARGET_INFO_JSON=' {q(str(out_dir / 'raw'))}/target*.log")
         return "\n".join(lines) + "\n"
 
     def start_remote_monitor(self, run: Union[MatrixRun, CompetitionCase], out_dir: Path, endpoints: Iterable[Endpoint]) -> None:
-        devices = " ".join(endpoint.ib_device for endpoint in endpoints if run.protocol == "rdma")
+        devices = " ".join(monitor_ib_devices(endpoints)) if run.protocol == "rdma" else ""
         if not devices:
             return
         raw_dir = out_dir / "raw"
@@ -365,41 +399,84 @@ echo $! > {q(str(monitor_pid))}
         print(f"\n=== RUN {spec.run} ===", flush=True)
         self.cleanup_run(spec.run, out_dir)
         self.run_remote(self.remote_target_script(spec, list(spec.lanes), out_dir, spec.max_bytes))
-        self.start_remote_monitor(spec, out_dir, spec.lanes)
+        monitor_endpoints = list(spec.lanes) + list(spec.capfill_lanes)
+        self.start_remote_monitor(spec, out_dir, monitor_endpoints)
         if self.args.dry_run:
             fg_jsons = {endpoint.gpu_id: self.fake_target_json(endpoint, spec.max_bytes) for endpoint in spec.lanes}
-            bg_jsons = {endpoint.gpu_id: self.fake_target_json(endpoint, spec.max_bytes) for endpoint in spec.lanes}
+            bg_jsons = {}
+            if spec.bg_rate_gbps > 0:
+                bg_jsons = {
+                    endpoint.gpu_id: self.fake_target_json(endpoint, spec.max_bytes)
+                    for endpoint in spec.lanes
+                }
+            capfill_jsons = {
+                endpoint.gpu_id: self.fake_target_json(endpoint, spec.max_bytes)
+                for endpoint in spec.capfill_lanes
+            }
         else:
             fg_jsons = self.fetch_target_jsons(out_dir, "target-bond*.log")
-            bg_jsons = self.fetch_target_jsons(out_dir, "target-bg-bond*.log")
+            bg_jsons = {}
+            if spec.bg_rate_gbps > 0:
+                bg_jsons = self.fetch_target_jsons(out_dir, "target-bg-bond*.log")
+            capfill_jsons = {}
+            if spec.capfill_lanes:
+                capfill_jsons = self.fetch_target_jsons(out_dir, "target-cap-bond*.log")
+
+        capfill_procs = []
+        if spec.capfill_rate_gbps > 0:
+            for endpoint in spec.capfill_lanes:
+                target_json = capfill_jsons[endpoint.gpu_id]
+                env = self.container_env(spec.protocol, endpoint.ib_device, target_json)
+                env["FLOW_ID"] = f"capfill-bond{endpoint.lane}"
+                inner = (
+                    f"python3 kv_transfer_latency.py --role initiator --host {endpoint.src_host} "
+                    f"--gpu-id {endpoint.gpu_id} --ib-device {endpoint.ib_device} "
+                    f"--protocol {spec.protocol} --sizes {spec.max_bytes} "
+                    f"--background-bytes {spec.max_bytes} "
+                    f"--background-duration-seconds {self.args.bg_duration_seconds} "
+                    f"--rate-limit-gbps {spec.capfill_rate_gbps} --chunk-size {self.args.chunk_size} "
+                    f"--flow-id capfill-bond{endpoint.lane} "
+                    f"--summary-csv /tmp/kv-transfer-bench/capfill-bond{endpoint.lane}-summary.csv "
+                    f"--samples-jsonl /tmp/kv-transfer-bench/capfill-bond{endpoint.lane}-samples.jsonl"
+                )
+                capfill_procs.append(
+                    self.start_local_docker(
+                        name=f"kv_{spec.run}_capfill_init_bond{endpoint.lane}",
+                        env=env,
+                        out_dir=raw,
+                        inner_cmd=inner,
+                        log_path=raw / f"capfill-init-bond{endpoint.lane}.log",
+                    )
+                )
 
         bg_procs = []
-        for endpoint in spec.lanes:
-            target_json = bg_jsons[endpoint.gpu_id]
-            env = self.container_env(spec.protocol, endpoint.ib_device, target_json)
-            env["FLOW_ID"] = f"bg-bond{endpoint.lane}"
-            inner = (
-                f"python3 kv_transfer_latency.py --role initiator --host {endpoint.src_host} "
-                f"--gpu-id {endpoint.gpu_id} --ib-device {endpoint.ib_device} "
-                f"--protocol {spec.protocol} --sizes {spec.max_bytes} "
-                f"--background-bytes {spec.max_bytes} "
-                f"--background-duration-seconds {self.args.bg_duration_seconds} "
-                f"--rate-limit-gbps {spec.bg_rate_gbps} --chunk-size {self.args.chunk_size} "
-                f"--flow-id bg-bond{endpoint.lane} "
-                f"--summary-csv /tmp/kv-transfer-bench/bgmoon-bond{endpoint.lane}-summary.csv "
-                f"--samples-jsonl /tmp/kv-transfer-bench/bgmoon-bond{endpoint.lane}-samples.jsonl"
-            )
-            bg_procs.append(
-                self.start_local_docker(
-                    name=f"kv_{spec.run}_bgmoon_init_bond{endpoint.lane}",
-                    env=env,
-                    out_dir=raw,
-                    inner_cmd=inner,
-                    log_path=raw / f"bgmoon-init-bond{endpoint.lane}.log",
+        if spec.bg_rate_gbps > 0:
+            for endpoint in spec.lanes:
+                target_json = bg_jsons[endpoint.gpu_id]
+                env = self.container_env(spec.protocol, endpoint.ib_device, target_json)
+                env["FLOW_ID"] = f"bg-bond{endpoint.lane}"
+                inner = (
+                    f"python3 kv_transfer_latency.py --role initiator --host {endpoint.src_host} "
+                    f"--gpu-id {endpoint.gpu_id} --ib-device {endpoint.ib_device} "
+                    f"--protocol {spec.protocol} --sizes {spec.max_bytes} "
+                    f"--background-bytes {spec.max_bytes} "
+                    f"--background-duration-seconds {self.args.bg_duration_seconds} "
+                    f"--rate-limit-gbps {spec.bg_rate_gbps} --chunk-size {self.args.chunk_size} "
+                    f"--flow-id bg-bond{endpoint.lane} "
+                    f"--summary-csv /tmp/kv-transfer-bench/bgmoon-bond{endpoint.lane}-summary.csv "
+                    f"--samples-jsonl /tmp/kv-transfer-bench/bgmoon-bond{endpoint.lane}-samples.jsonl"
                 )
-            )
+                bg_procs.append(
+                    self.start_local_docker(
+                        name=f"kv_{spec.run}_bgmoon_init_bond{endpoint.lane}",
+                        env=env,
+                        out_dir=raw,
+                        inner_cmd=inner,
+                        log_path=raw / f"bgmoon-init-bond{endpoint.lane}.log",
+                    )
+                )
 
-        if not self.args.dry_run:
+        if not self.args.dry_run and (bg_procs or capfill_procs):
             time.sleep(self.args.bg_warmup_seconds)
 
         fg_procs = []
@@ -412,7 +489,7 @@ echo $! > {q(str(monitor_pid))}
                 f"--gpu-id {endpoint.gpu_id} --ib-device {endpoint.ib_device} "
                 f"--protocol {spec.protocol} --sizes {q(spec.sizes)} "
                 f"--warmup {self.args.warmup} --repeat {self.args.repeat} "
-                f"--rate-limit-gbps {spec.fg_rate_gbps} --chunk-size {self.args.chunk_size} "
+                f"{rate_limit_arg(spec.fg_rate_gbps)}--chunk-size {self.args.chunk_size} "
                 f"--flow-id fg-bond{endpoint.lane} "
                 f"--summary-csv /tmp/kv-transfer-bench/shard-bond{endpoint.lane}-dense-summary.csv "
                 f"--samples-jsonl /tmp/kv-transfer-bench/shard-bond{endpoint.lane}-dense-samples.jsonl"
@@ -430,7 +507,7 @@ echo $! > {q(str(monitor_pid))}
         self.wait_all(fg_procs, "foreground")
         self.aggregate_matrix(out_dir, spec.shards)
         self.cleanup_run(spec.run, out_dir)
-        self.wait_terminate(bg_procs)
+        self.wait_terminate(bg_procs + capfill_procs)
 
     def container_env(self, protocol: str, ib_device: str, target_json: str) -> Dict[str, str]:
         env = {
@@ -634,6 +711,115 @@ def one_lane_endpoint(src_host: str, tgt_host: str, ib_device: str) -> Endpoint:
     return Endpoint(lane=0, gpu_id=0, src_host=src_host, tgt_host=tgt_host, ib_device=ib_device)
 
 
+def rate_limit_arg(rate_gbps: Optional[float]) -> str:
+    if rate_gbps is None:
+        return ""
+    return f"--rate-limit-gbps {rate_gbps} "
+
+
+def monitor_ib_devices(endpoints: Iterable[Endpoint]) -> List[str]:
+    devices: List[str] = []
+    seen = set()
+    for endpoint in endpoints:
+        for raw_device in endpoint.ib_device.split(","):
+            device = raw_device.strip()
+            if not device or device in seen:
+                continue
+            devices.append(device)
+            seen.add(device)
+    return devices
+
+
+def multi_hca_endpoint(lanes: Iterable[int]) -> Endpoint:
+    lane_list = tuple(lanes)
+    ib_device = ",".join(f"mlx5_bond_{lane}" for lane in lane_list)
+    return Endpoint(
+        lane=0,
+        gpu_id=0,
+        src_host=SRC_IPS[lane_list[0]],
+        tgt_host=TGT_IPS[lane_list[0]],
+        ib_device=ib_device,
+    )
+
+
+def capfill_rate_for_lane_cap(lane_cap_gbps: float) -> float:
+    return max(0.0, PHYSICAL_LANE_GBPS - lane_cap_gbps)
+
+
+def capfill_endpoints(lanes: Iterable[int], lane_cap_gbps: float) -> Tuple[Endpoint, ...]:
+    if capfill_rate_for_lane_cap(lane_cap_gbps) <= 0:
+        return ()
+    return tuple(bond_endpoint(lane) for lane in lanes)
+
+
+def multi_hca_run(
+    *,
+    prefix: str,
+    lanes: Iterable[int],
+    lane_cap_gbps: float,
+    bg_percent: int,
+    suffix: str = "multi_hca_portcap_moonbg",
+) -> MatrixRun:
+    lane_list = tuple(lanes)
+    total_cap_gbps = lane_cap_gbps * len(lane_list)
+    bg_rate = total_cap_gbps * bg_percent / 100
+    fg_rate = total_cap_gbps - bg_rate
+    capfill_rate = capfill_rate_for_lane_cap(lane_cap_gbps)
+    return MatrixRun(
+        run=f"{prefix}_bg{bg_percent}_{suffix}",
+        lanes=(multi_hca_endpoint(lane_list),),
+        shards=1,
+        max_bytes="2GB",
+        sizes=DENSE_SIZES_1,
+        protocol="rdma",
+        lane_cap_gbps=lane_cap_gbps,
+        bg_rate_gbps=bg_rate,
+        fg_rate_gbps=fg_rate,
+        capfill_lanes=capfill_endpoints(lane_list, lane_cap_gbps),
+        capfill_rate_gbps=capfill_rate,
+    )
+
+
+def multi_hca_bgcap_only_run(
+    *,
+    prefix: str,
+    lanes: Iterable[int],
+    total_cap_gbps: float,
+    bg_percent: int,
+) -> MatrixRun:
+    lane_list = tuple(lanes)
+    bg_rate = total_cap_gbps * bg_percent / 100
+    return MatrixRun(
+        run=f"{prefix}_bg{bg_percent}_multi_hca_bgcap_only",
+        lanes=(multi_hca_endpoint(lane_list),),
+        shards=1,
+        max_bytes="2GB",
+        sizes=DENSE_SIZES_1,
+        protocol="rdma",
+        lane_cap_gbps=total_cap_gbps / len(lane_list),
+        bg_rate_gbps=bg_rate,
+        fg_rate_gbps=None,
+        capfill_lanes=(),
+        capfill_rate_gbps=0.0,
+    )
+
+
+def split_4x100_run(bg_percent: int) -> MatrixRun:
+    bg_rate = 100 * bg_percent / 100
+    fg_rate = 100 - bg_rate
+    return MatrixRun(
+        run=f"400_4x100_bg{bg_percent}_cap100_moonbg_split",
+        lanes=tuple(bond_endpoint(lane) for lane in (0, 1, 2, 3)),
+        shards=4,
+        max_bytes="512MB",
+        sizes=DENSE_SIZES_4,
+        protocol="rdma",
+        lane_cap_gbps=100,
+        bg_rate_gbps=bg_rate,
+        fg_rate_gbps=fg_rate,
+    )
+
+
 def matrix_runs(args: Optional[argparse.Namespace] = None) -> List[MatrixRun]:
     runs: List[MatrixRun] = []
     for bg in (1, 10, 50, 90):
@@ -693,6 +879,135 @@ def matrix_runs(args: Optional[argparse.Namespace] = None) -> List[MatrixRun]:
     return runs
 
 
+def multi_hca_matrix_runs() -> List[MatrixRun]:
+    runs: List[MatrixRun] = []
+    specs = [
+        ("200_2x100", (0, 1), 100),
+        ("200_4x50", (0, 1, 2, 3), 50),
+        ("400_4x100", (0, 1, 2, 3), 100),
+        ("400_2x200", (0, 1), 200),
+    ]
+    for prefix, lanes, lane_cap_gbps in specs:
+        for bg_percent in (1, 10, 50, 90):
+            runs.append(
+                multi_hca_run(
+                    prefix=prefix,
+                    lanes=lanes,
+                    lane_cap_gbps=lane_cap_gbps,
+                    bg_percent=bg_percent,
+                )
+            )
+    return runs
+
+
+def multi_hca_compare_4x100_runs() -> List[MatrixRun]:
+    runs: List[MatrixRun] = []
+    for bg_percent in (1, 10, 50, 90):
+        runs.append(split_4x100_run(bg_percent))
+        runs.append(
+            multi_hca_run(
+                prefix="400_4x100",
+                lanes=(0, 1, 2, 3),
+                lane_cap_gbps=100,
+                bg_percent=bg_percent,
+            )
+        )
+    return runs
+
+
+def multi_hca_bgcap_only_runs() -> List[MatrixRun]:
+    return [
+        multi_hca_bgcap_only_run(
+            prefix="400_4x100",
+            lanes=(0, 1, 2, 3),
+            total_cap_gbps=400,
+            bg_percent=bg_percent,
+        )
+        for bg_percent in (1, 10, 50, 90)
+    ]
+
+
+def split_empty_sizes_and_max_bytes(shards: int) -> Tuple[str, str]:
+    if shards == 1:
+        return DENSE_SIZES_1, "2GB"
+    if shards == 2:
+        return DENSE_SIZES_2, "1GB"
+    if shards == 4:
+        return DENSE_SIZES_4, "512MB"
+    raise ValueError(f"unsupported split shard count: {shards}")
+
+
+def ratelimit_empty_split_run(
+    *,
+    prefix: str,
+    lanes: Iterable[int],
+    per_lane_rate_gbps: float,
+) -> MatrixRun:
+    lane_list = tuple(lanes)
+    sizes, max_bytes = split_empty_sizes_and_max_bytes(len(lane_list))
+    return MatrixRun(
+        run=f"{prefix}_bg0_ratelimit_split",
+        lanes=tuple(bond_endpoint(lane) for lane in lane_list),
+        shards=len(lane_list),
+        max_bytes=max_bytes,
+        sizes=sizes,
+        protocol="rdma",
+        lane_cap_gbps=per_lane_rate_gbps,
+        bg_rate_gbps=0.0,
+        fg_rate_gbps=per_lane_rate_gbps,
+        capfill_lanes=(),
+        capfill_rate_gbps=0.0,
+    )
+
+
+def ratelimit_empty_multihca_run(
+    *,
+    prefix: str,
+    lanes: Iterable[int],
+    total_rate_gbps: float,
+) -> MatrixRun:
+    lane_list = tuple(lanes)
+    return MatrixRun(
+        run=f"{prefix}_bg0_ratelimit_multihca",
+        lanes=(multi_hca_endpoint(lane_list),),
+        shards=1,
+        max_bytes="2GB",
+        sizes=DENSE_SIZES_1,
+        protocol="rdma",
+        lane_cap_gbps=total_rate_gbps / len(lane_list),
+        bg_rate_gbps=0.0,
+        fg_rate_gbps=total_rate_gbps,
+        capfill_lanes=(),
+        capfill_rate_gbps=0.0,
+    )
+
+
+def ratelimit_empty_runs() -> List[MatrixRun]:
+    runs: List[MatrixRun] = []
+    specs = [
+        ("800_4x200", (0, 1, 2, 3), 200.0, 800.0),
+        ("400_4x100", (0, 1, 2, 3), 100.0, 400.0),
+        ("400_2x200", (0, 1), 200.0, 400.0),
+        ("200_1x200", (0,), 200.0, 200.0),
+    ]
+    for prefix, lanes, per_lane_rate_gbps, total_rate_gbps in specs:
+        runs.append(
+            ratelimit_empty_split_run(
+                prefix=prefix,
+                lanes=lanes,
+                per_lane_rate_gbps=per_lane_rate_gbps,
+            )
+        )
+        runs.append(
+            ratelimit_empty_multihca_run(
+                prefix=prefix,
+                lanes=lanes,
+                total_rate_gbps=total_rate_gbps,
+            )
+        )
+    return runs
+
+
 def competition_cases() -> List[CompetitionCase]:
     cases: List[CompetitionCase] = []
     two_flow_other_sizes = ("256MB", "512MB", "1GB", "2GB", "4GB")
@@ -730,6 +1045,38 @@ def selected_matrix_runs(args: argparse.Namespace) -> List[MatrixRun]:
     return runs
 
 
+def selected_multi_hca_matrix_runs(args: argparse.Namespace) -> List[MatrixRun]:
+    runs = multi_hca_matrix_runs()
+    if args.only:
+        requested = set(args.only)
+        runs = [run for run in runs if run.run in requested]
+    return runs
+
+
+def selected_multi_hca_compare_4x100_runs(args: argparse.Namespace) -> List[MatrixRun]:
+    runs = multi_hca_compare_4x100_runs()
+    if args.only:
+        requested = set(args.only)
+        runs = [run for run in runs if run.run in requested]
+    return runs
+
+
+def selected_multi_hca_bgcap_only_runs(args: argparse.Namespace) -> List[MatrixRun]:
+    runs = multi_hca_bgcap_only_runs()
+    if args.only:
+        requested = set(args.only)
+        runs = [run for run in runs if run.run in requested]
+    return runs
+
+
+def selected_ratelimit_empty_runs(args: argparse.Namespace) -> List[MatrixRun]:
+    runs = ratelimit_empty_runs()
+    if args.only:
+        requested = set(args.only)
+        runs = [run for run in runs if run.run in requested]
+    return runs
+
+
 def selected_competition_cases(args: argparse.Namespace) -> List[CompetitionCase]:
     cases = competition_cases()
     if args.only:
@@ -744,7 +1091,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--suite",
-        choices=("fixed-missing", "competition", "all", "list"),
+        choices=(
+            "fixed-missing",
+            "multi-hca-bg",
+            "multi-hca-portcap-bg",
+            "multi-hca-bgcap-only",
+            "multi-hca-compare-4x100",
+            "ratelimit-empty",
+            "competition",
+            "all",
+            "list",
+        ),
         default="list",
     )
     parser.add_argument("--only", action="append", help="Run only this run name. Can be repeated.")
@@ -779,18 +1136,53 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     runner = Runner(args)
+    listed = set()
+
+    def print_list_item(name: str) -> None:
+        if name in listed:
+            return
+        listed.add(name)
+        print(name)
 
     if args.suite in ("list", "fixed-missing", "all"):
         for run in selected_matrix_runs(args):
             if args.suite == "list":
-                print(run.run)
+                print_list_item(run.run)
+            else:
+                runner.run_matrix(run)
+
+    if args.suite in ("list", "multi-hca-bg", "multi-hca-portcap-bg"):
+        for run in selected_multi_hca_matrix_runs(args):
+            if args.suite == "list":
+                print_list_item(run.run)
+            else:
+                runner.run_matrix(run)
+
+    if args.suite in ("list", "multi-hca-compare-4x100"):
+        for run in selected_multi_hca_compare_4x100_runs(args):
+            if args.suite == "list":
+                print_list_item(run.run)
+            else:
+                runner.run_matrix(run)
+
+    if args.suite in ("list", "multi-hca-bgcap-only"):
+        for run in selected_multi_hca_bgcap_only_runs(args):
+            if args.suite == "list":
+                print_list_item(run.run)
+            else:
+                runner.run_matrix(run)
+
+    if args.suite in ("list", "ratelimit-empty"):
+        for run in selected_ratelimit_empty_runs(args):
+            if args.suite == "list":
+                print_list_item(run.run)
             else:
                 runner.run_matrix(run)
 
     if args.suite in ("list", "competition", "all"):
         for case in selected_competition_cases(args):
             if args.suite == "list":
-                print(case.run)
+                print_list_item(case.run)
             else:
                 runner.run_competition(case)
 
