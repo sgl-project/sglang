@@ -12,6 +12,7 @@ __all__ = [
     "register_cpu_ci",
     "register_cuda_ci",
     "register_amd_ci",
+    "register_musa_ci",
     "register_npu_ci",
     "register_xpu_ci",
     "register_musa_ci",
@@ -95,6 +96,19 @@ def register_amd_ci(
     return None
 
 
+def register_musa_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 def register_npu_ci(
     est_time: float,
     suite: Optional[str] = None,
@@ -138,6 +152,7 @@ REGISTER_MAPPING = {
     "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
     "register_amd_ci": HWBackend.AMD,
+    "register_musa_ci": HWBackend.MUSA,
     "register_npu_ci": HWBackend.NPU,
     "register_xpu_ci": HWBackend.XPU,
     "register_musa_ci": HWBackend.MUSA,

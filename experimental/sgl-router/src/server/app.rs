@@ -53,5 +53,9 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
+        .route(
+            "/flush_cache",
+            post(crate::server::routes::cache::flush_cache),
+        )
         .with_state(ctx)
 }

@@ -25,6 +25,7 @@ class CacheInitParams:
     tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     attn_cp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False
 
@@ -32,6 +33,7 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
 
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1

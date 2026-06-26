@@ -10,7 +10,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
 )
 from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
@@ -55,6 +57,8 @@ class FunctionCallParser:
     """
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+        "apertus2509": Apertus2509Detector,
+        "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,

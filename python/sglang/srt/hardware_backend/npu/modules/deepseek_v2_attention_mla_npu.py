@@ -403,9 +403,7 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    if m.skip_topk:
-        topk_indices = prev_topk_indices
-    else:
+    if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
             q_lora,
@@ -415,6 +413,8 @@ def forward_dsa_prepare_npu(
             layer_scatter_modes,
             dynamic_scale,
         )
+    else:
+        topk_indices = prev_topk_indices
 
     return (
         q_pe,
@@ -459,7 +459,7 @@ def forward_dsa_core_npu(
 
     if (
         forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
         attn_output = attn_output.transpose(0, 1)
