@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
-from tvm_ffi.module import Module
 
 from sglang.jit_kernel.dsv4.utils import make_name
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
 
 
 @cache_once

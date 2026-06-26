@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,7 +11,9 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import (
+    get_world_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
@@ -82,23 +85,39 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
-        # Use the snapshot taken at the end of this runner's weight-load phase,
-        # not the current free memory: draft-model weights loaded after that
-        # point are charged to the non-static slack, not the static budget.
-        post_model_load_memory = getattr(self, "post_model_load_memory", None)
-        if post_model_load_memory is None:
-            post_model_load_memory = get_available_gpu_memory(
-                self.device,
-                self.gpu_id,
-                distributed=get_world_group().world_size > 1,
-                cpu_group=get_world_group().cpu_group,
-            )
+        # KV pool budget = currently-free GPU memory minus the non-static runtime
+        # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
+        # already resident (model weights, etc.) is thus charged against it.
+        available_gpu_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
 
-        rest_memory = post_model_load_memory - pre_model_load_memory * (
+        rest_memory = available_gpu_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
+
+        # Loaded weights (target + draft) can exceed the static budget
+        if rest_memory <= 0:
+            minimum_mem_fraction_static = (
+                1 - available_gpu_memory / pre_model_load_memory
+            )
+            suggested_mem_fraction_static = (
+                math.ceil(minimum_mem_fraction_static * 1000) / 1000
+            )
+            raise ValueError(
+                f"Loaded weights leave no GPU memory for the KV cache under "
+                f"--mem-fraction-static={self.mem_fraction_static}. "
+                f"Raise --mem-fraction-static above "
+                f"{suggested_mem_fraction_static:.3f} "
+                f"(minimum viable = 1 - available/pre = "
+                f"{minimum_mem_fraction_static:.4f}). If using speculative "
+                f"decoding, draft weights are now counted."
+            )
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
@@ -227,17 +246,18 @@ class ModelRunnerKVCacheMixin:
         ):
             return kv_cache_dim
 
-        # On HIP with TileLang backend, keep the default MLA KV cache dimension.
-        # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
+        # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
+        # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
         if _is_hip and (
-            self.server_args.dsa_prefill_backend == "tilelang"
-            or self.server_args.dsa_decode_backend == "tilelang"
+            self.server_args.dsa_prefill_backend in ("tilelang", "aiter")
+            or self.server_args.dsa_decode_backend in ("tilelang", "aiter")
         ):
             return kv_cache_dim
 
         quant_block_size = DSATokenToKVPool.quant_block_size
         rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
-        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
+        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
+        # (excluding TRTLLM and HIP raw-layout kernels).
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
@@ -327,13 +347,8 @@ class ModelRunnerKVCacheMixin:
                     HybridMambaDecodeReqToTokenPool,
                 )
 
-                # subscribe memory for pre-allocated requests
-                # if max_num_reqs <= 32, we pre-allocate 2x requests
-
-                pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-                pre_alloc_size = (
-                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
-                )
+                # Extra slots for pre-allocated requests
+                pre_alloc_size = self.server_args.disaggregation_decode_extra_slots
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
@@ -564,9 +579,9 @@ class ModelRunnerKVCacheMixin:
                             self.model_config.hf_text_config.swa_num_key_value_heads
                             // get_attention_tp_size(),
                         ),
-                        "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                        "swa_head_dim": self.model_config.swa_head_dim,
+                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                        "v_head_dim": self.model_config.v_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -687,9 +702,9 @@ class ModelRunnerKVCacheMixin:
                             self.model_config.hf_text_config.swa_num_key_value_heads
                             // get_attention_tp_size(),
                         ),
-                        "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                        "swa_head_dim": self.model_config.swa_head_dim,
+                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                        "v_head_dim": self.model_config.v_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -872,7 +887,7 @@ class ModelRunnerKVCacheMixin:
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                             )
                         )
-                    elif self.page_size == 1:
+                    elif self.page_size == 1 and self.dcp_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -882,8 +897,8 @@ class ModelRunnerKVCacheMixin:
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
+                            self.max_total_num_tokens * self.dcp_size,
+                            page_size=self.page_size * self.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
@@ -1002,10 +1017,6 @@ class ModelRunnerKVCacheMixin:
                 requested_per_worker,
                 max_num_reqs,
             )
-        logger.info(
-            f"Max concurrent requests (per dp worker) from the finalized token capacity: "
-            f"max_num_reqs={max_num_reqs}."
-        )
         return max_num_reqs
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
