@@ -1126,11 +1126,6 @@ class KVCache(abc.ABC):
             else cp_group.pynccl_comm
         )
         if comm is not None:
-            # PyNcclCommunicator defaults to disabled=True (it is only enabled
-            # inside CUDA-graph capture via change_state). Without re-enabling it
-            # here, comm.broadcast() is a silent no-op and non-owner CP ranks read
-            # stale remote buffers, corrupting layer-split attention. Mirror the
-            # standard usage in parallel_state.py.
             with comm.change_state(enable=True):
                 comm.broadcast(tensor, src=owner_rank)
         else:
@@ -2242,7 +2237,7 @@ class HybridLinearKVPool(KVCache):
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
-    def prefetch_full_attention_kv_buffer(self, layer_id: int) -> None:
+    def prefetch_glm_full_attention_kv_buffer(self, layer_id: int) -> None:
         if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
             return
         if layer_id not in self.full_attention_layer_id_mapping:

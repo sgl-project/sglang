@@ -50,7 +50,7 @@ def dsa_enable_prefill_cp():
     return is_dsa_enable_prefill_cp()
 
 
-def maybe_prefetch_next_full_attention_kv(
+def maybe_prefetch_next_glm_full_attention_kv(
     forward_batch: ForwardBatch,
     next_full_attention_layer_id: Optional[int],
 ) -> None:
@@ -58,7 +58,7 @@ def maybe_prefetch_next_full_attention_kv(
         return
 
     prefetch_full_attention_kv = getattr(
-        get_token_to_kv_pool(), "prefetch_full_attention_kv_buffer", None
+        get_token_to_kv_pool(), "prefetch_glm_full_attention_kv_buffer", None
     )
     if prefetch_full_attention_kv is not None:
         prefetch_full_attention_kv(next_full_attention_layer_id)
@@ -133,12 +133,12 @@ class DSACPLayerCommunicator(LayerCommunicator):
             context=self._context,
         )
 
-    def maybe_prefetch_next_full_attention_kv(
+    def maybe_prefetch_next_glm_full_attention_kv(
         self,
         forward_batch: ForwardBatch,
         next_full_attention_layer_id: Optional[int],
     ) -> None:
-        maybe_prefetch_next_full_attention_kv(
+        maybe_prefetch_next_glm_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
 

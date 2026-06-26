@@ -952,7 +952,7 @@ class Glm4MoeDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        self.layer_communicator.maybe_prefetch_next_full_attention_kv(
+        self.layer_communicator.maybe_prefetch_next_glm_full_attention_kv(
             forward_batch, next_full_attention_layer_id
         )
 

@@ -726,7 +726,7 @@ class LayerCommunicator:
             context=self._context,
         )
 
-    def maybe_prefetch_next_full_attention_kv(
+    def maybe_prefetch_next_glm_full_attention_kv(
         self,
         forward_batch: ForwardBatch,
         next_full_attention_layer_id: Optional[int],
