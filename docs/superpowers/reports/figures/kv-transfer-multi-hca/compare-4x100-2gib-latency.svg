@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="540" viewBox="0 0 980 540" role="img" aria-labelledby="title desc">
+  <title id="title">4x100 2GiB foreground p50 latency: split vs multi-HCA</title>
+  <desc id="desc">p50 latency in milliseconds; y-axis uses a log scale so bg1/bg10/bg50/bg90 remain visible together.</desc>
+  <style>
+    .title { font: 700 18px "Segoe UI", Arial, sans-serif; fill: #1F2430; }
+    .subtitle { font: 400 12px "Segoe UI", Arial, sans-serif; fill: #6F768A; }
+    .tick { font: 400 11px "Consolas", "Segoe UI", monospace; fill: #6F768A; }
+    .axis-label { font: 600 12px "Segoe UI", Arial, sans-serif; fill: #1F2430; }
+    .legend { font: 500 12px "Segoe UI", Arial, sans-serif; fill: #1F2430; }
+  </style>
+  <rect width="980" height="540" fill="#FCFCFD" />
+  <rect x="92" y="118" width="840" height="344" fill="#FFFFFF" />
+  <text x="92" y="24" class="title">4x100 2GiB foreground p50 latency: split vs multi-HCA</text>
+  <text x="92" y="38" class="subtitle">p50 latency in milliseconds; y-axis uses a log scale so bg1/bg10/bg50/bg90 remain visible together.</text>
+  <line x1="92" x2="120" y1="78" y2="78" stroke="#2E4780" stroke-width="2.2"  />
+<circle cx="106" cy="78" r="4.2" fill="#A3BEFA" stroke="#2E4780" stroke-width="1" />
+<text x="128" y="82" class="legend">split 4 shards</text>
+<line x1="242.2" x2="270.2" y1="78" y2="78" stroke="#804126" stroke-width="2.2" stroke-dasharray="7 4" />
+<circle cx="256.2" cy="78" r="4.2" fill="#F0986E" stroke="#804126" stroke-width="1" />
+<text x="278.2" y="82" class="legend">multi-HCA single flow</text>
+  <line x1="92" x2="932" y1="431.05038721365594" y2="431.05038721365594" stroke="#E6E8F0" stroke-width="1" />
+<text x="80" y="435.05038721365594" text-anchor="end" class="tick">40</text>
+<line x1="92" x2="932" y1="343.81164528615943" y2="343.81164528615943" stroke="#E6E8F0" stroke-width="1" />
+<text x="80" y="347.81164528615943" text-anchor="end" class="tick">80</text>
+<line x1="92" x2="932" y1="256.57290335866276" y2="256.57290335866276" stroke="#E6E8F0" stroke-width="1" />
+<text x="80" y="260.57290335866276" text-anchor="end" class="tick">160</text>
+<line x1="92" x2="932" y1="169.3341614311663" y2="169.3341614311663" stroke="#E6E8F0" stroke-width="1" />
+<text x="80" y="173.3341614311663" text-anchor="end" class="tick">320</text>
+  <line x1="92" x2="92" y1="118" y2="462" stroke="#D7DBE7" stroke-width="1.2" />
+  <line x1="92" x2="932" y1="462" y2="462" stroke="#D7DBE7" stroke-width="1.2" />
+  <line x1="92" x2="92" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="92" y="490" text-anchor="middle" class="tick">bg1</text>
+<line x1="372" x2="372" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="372" y="490" text-anchor="middle" class="tick">bg10</text>
+<line x1="652" x2="652" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="652" y="490" text-anchor="middle" class="tick">bg50</text>
+<line x1="932" x2="932" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="932" y="490" text-anchor="middle" class="tick">bg90</text>
+  <text x="18" y="290" class="axis-label" transform="rotate(-90 18 290)" text-anchor="middle">p50 latency ms (log)</text>
+  <path d="M 92.00 420.65 L 372.00 408.65 L 652.00 334.75 L 932.00 132.26" fill="none" stroke="#2E4780" stroke-width="2.2"  />
+<circle cx="92.00" cy="420.65" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>split 4 shards bg1: 43.444</title></circle>
+<circle cx="372.00" cy="408.65" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>split 4 shards bg10: 47.794</title></circle>
+<circle cx="652.00" cy="334.75" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>split 4 shards bg50: 85.970</title></circle>
+<circle cx="932.00" cy="132.26" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>split 4 shards bg90: 429.604</title></circle>
+<path d="M 92.00 337.19 L 372.00 325.95 L 652.00 289.87 L 932.00 132.27" fill="none" stroke="#804126" stroke-width="2.2" stroke-dasharray="7 4" />
+<circle cx="92.00" cy="337.19" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>multi-HCA single flow bg1: 84.318</title></circle>
+<circle cx="372.00" cy="325.95" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>multi-HCA single flow bg10: 92.195</title></circle>
+<circle cx="652.00" cy="289.87" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>multi-HCA single flow bg50: 122.811</title></circle>
+<circle cx="932.00" cy="132.27" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>multi-HCA single flow bg90: 429.572</title></circle>
+</svg>

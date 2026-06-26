@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="540" viewBox="0 0 980 540" role="img" aria-labelledby="title desc">
+  <title id="title">portcap multi-HCA 2GiB foreground cap utilization</title>
+  <desc id="desc">bandwidth_GBps_p50 converted to Gbps and divided by foreground rate limit; bg90 converges because foreground cap is low.</desc>
+  <style>
+    .title { font: 700 18px "Segoe UI", Arial, sans-serif; fill: #1F2430; }
+    .subtitle { font: 400 12px "Segoe UI", Arial, sans-serif; fill: #6F768A; }
+    .tick { font: 400 11px "Consolas", "Segoe UI", monospace; fill: #6F768A; }
+    .axis-label { font: 600 12px "Segoe UI", Arial, sans-serif; fill: #1F2430; }
+    .legend { font: 500 12px "Segoe UI", Arial, sans-serif; fill: #1F2430; }
+  </style>
+  <rect width="980" height="540" fill="#FCFCFD" />
+  <rect x="92" y="118" width="836" height="344" fill="#FFFFFF" />
+  <text x="92" y="24" class="title">portcap multi-HCA 2GiB foreground cap utilization</text>
+  <text x="92" y="38" class="subtitle">bandwidth_GBps_p50 converted to Gbps and divided by foreground rate limit; bg90 converges because foreground cap is low.</text>
+  <line x1="92" x2="120" y1="78" y2="78" stroke="#2E4780" stroke-width="2.2"  />
+<circle cx="106" cy="78" r="4.2" fill="#A3BEFA" stroke="#2E4780" stroke-width="1" />
+<text x="128" y="82" class="legend">2x100</text>
+<line x1="176.5" x2="204.5" y1="78" y2="78" stroke="#736422" stroke-width="2.2" stroke-dasharray="7 4" />
+<circle cx="190.5" cy="78" r="4.2" fill="#FFE15B" stroke="#736422" stroke-width="1" />
+<text x="212.5" y="82" class="legend">4x50</text>
+<line x1="253.7" x2="281.7" y1="78" y2="78" stroke="#804126" stroke-width="2.2" stroke-dasharray="2 4" />
+<circle cx="267.7" cy="78" r="4.2" fill="#F0986E" stroke="#804126" stroke-width="1" />
+<text x="289.7" y="82" class="legend">4x100</text>
+<line x1="338.2" x2="366.2" y1="78" y2="78" stroke="#386411" stroke-width="2.2" stroke-dasharray="9 3 2 3" />
+<circle cx="352.2" cy="78" r="4.2" fill="#A3D576" stroke="#386411" stroke-width="1" />
+<text x="374.2" y="82" class="legend">2x200</text>
+  <line x1="92" x2="928" y1="462" y2="462" stroke="#E6E8F0" stroke-width="1" />
+<text x="80" y="466" text-anchor="end" class="tick">0.0</text>
+<line x1="92" x2="928" y1="305.6363636363636" y2="305.6363636363636" stroke="#E6E8F0" stroke-width="1" />
+<text x="80" y="309.6363636363636" text-anchor="end" class="tick">50</text>
+<line x1="92" x2="928" y1="149.2727272727273" y2="149.2727272727273" stroke="#E6E8F0" stroke-width="1" />
+<text x="80" y="153.2727272727273" text-anchor="end" class="tick">100</text>
+  <line x1="92" x2="92" y1="118" y2="462" stroke="#D7DBE7" stroke-width="1.2" />
+  <line x1="92" x2="928" y1="462" y2="462" stroke="#D7DBE7" stroke-width="1.2" />
+  <line x1="92" x2="92" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="92" y="490" text-anchor="middle" class="tick">bg1</text>
+<line x1="370.6666666666667" x2="370.6666666666667" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="370.6666666666667" y="490" text-anchor="middle" class="tick">bg10</text>
+<line x1="649.3333333333334" x2="649.3333333333334" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="649.3333333333334" y="490" text-anchor="middle" class="tick">bg50</text>
+<line x1="928" x2="928" y1="462" y2="468" stroke="#D7DBE7" />
+<text x="928" y="490" text-anchor="middle" class="tick">bg90</text>
+  <text x="18" y="290" class="axis-label" transform="rotate(-90 18 290)" text-anchor="middle">foreground cap utilization</text>
+  <path d="M 92.00 197.43 L 370.67 184.09 L 649.33 149.38 L 928.00 149.30" fill="none" stroke="#2E4780" stroke-width="2.2"  />
+<circle cx="92.00" cy="197.43" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>2x100 bg1: 84.600</title></circle>
+<circle cx="370.67" cy="184.09" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>2x100 bg10: 88.865</title></circle>
+<circle cx="649.33" cy="149.38" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>2x100 bg50: 99.966</title></circle>
+<circle cx="928.00" cy="149.30" r="4.5" fill="#A3BEFA" stroke="#2E4780" stroke-width="1.2"><title>2x100 bg90: 99.991</title></circle>
+<path d="M 92.00 252.42 L 370.67 250.73 L 649.33 195.58 L 928.00 149.30" fill="none" stroke="#736422" stroke-width="2.2" stroke-dasharray="7 4" />
+<circle cx="92.00" cy="252.42" r="4.5" fill="#FFE15B" stroke="#736422" stroke-width="1.2"><title>4x50 bg1: 67.017</title></circle>
+<circle cx="370.67" cy="250.73" r="4.5" fill="#FFE15B" stroke="#736422" stroke-width="1.2"><title>4x50 bg10: 67.556</title></circle>
+<circle cx="649.33" cy="195.58" r="4.5" fill="#FFE15B" stroke="#736422" stroke-width="1.2"><title>4x50 bg50: 85.193</title></circle>
+<circle cx="928.00" cy="149.30" r="4.5" fill="#FFE15B" stroke="#736422" stroke-width="1.2"><title>4x50 bg90: 99.991</title></circle>
+<path d="M 92.00 346.83 L 370.67 347.71 L 649.33 307.03 L 928.00 149.33" fill="none" stroke="#804126" stroke-width="2.2" stroke-dasharray="2 4" />
+<circle cx="92.00" cy="346.83" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>4x100 bg1: 36.828</title></circle>
+<circle cx="370.67" cy="347.71" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>4x100 bg10: 36.545</title></circle>
+<circle cx="649.33" cy="307.03" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>4x100 bg50: 49.553</title></circle>
+<circle cx="928.00" cy="149.33" r="4.5" fill="#F0986E" stroke="#804126" stroke-width="1.2"><title>4x100 bg90: 99.982</title></circle>
+<path d="M 92.00 290.01 L 370.67 299.86 L 649.33 252.28 L 928.00 149.32" fill="none" stroke="#386411" stroke-width="2.2" stroke-dasharray="9 3 2 3" />
+<circle cx="92.00" cy="290.01" r="4.5" fill="#A3D576" stroke="#386411" stroke-width="1.2"><title>2x200 bg1: 54.995</title></circle>
+<circle cx="370.67" cy="299.86" r="4.5" fill="#A3D576" stroke="#386411" stroke-width="1.2"><title>2x200 bg10: 51.846</title></circle>
+<circle cx="649.33" cy="252.28" r="4.5" fill="#A3D576" stroke="#386411" stroke-width="1.2"><title>2x200 bg50: 67.062</title></circle>
+<circle cx="928.00" cy="149.32" r="4.5" fill="#A3D576" stroke="#386411" stroke-width="1.2"><title>2x200 bg90: 99.983</title></circle>
+</svg>
