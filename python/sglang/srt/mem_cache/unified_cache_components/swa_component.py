@@ -108,14 +108,8 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # unified_kv keeps SWA in a per-request ring that the attention kernels
-        # address by formula (req_pool_idx * ring + pos % ring) and never back up
-        # to host (no SWA host pool). The radix SWA value here is pure bookkeeping
-        # — it is not where unified attention reads/writes SWA. On reuse the ring
-        # holds approximate (stale) SWA for the boundary window regardless, just
-        # like plain radix reuse, which tolerates it. So in this mode SWA must not
-        # gate the match: gating would cap the device match below the FULL prefix
-        # that load_back restored, breaking the cache_protected_len invariant.
+        # unified_kv never caches the SWA ring (per-request, not content-stable),
+        # so SWA bookkeeping must not gate the match here.
         swa_device_only_hicache = (
             self._swa_kv_pool_host is None and self.cache.cache_controller is not None
         )
@@ -127,13 +121,6 @@ class SWAComponent(TreeComponent):
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
                 if swa_device_only_hicache and (node.backuped or not node.evicted):
-                    # unified device-only SWA: don't gate on SWA bookkeeping.
-                    # - host-aware match: a FULL-backed (backuped) node is a valid
-                    #   boundary so load_back can trigger.
-                    # - device match: a FULL-resident (not evicted) node with an
-                    #   SWA tombstone (e.g. its window was loaded back, or SWA fell
-                    #   out of window) stays a valid boundary so the device match
-                    #   follows FULL. SWA is read approximately from the ring.
                     return True
                 return False
             state["len"] += len(node.key)
@@ -617,10 +604,7 @@ class SWAComponent(TreeComponent):
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
-        # unified_kv keeps SWA in a per-request ring that is not
-        # content-addressable, so no host SWA pool is attached. Without a host
-        # pool the component stays device-only: evicted windows tombstone and are
-        # recomputed on the next prefill rather than loaded back from host.
+        # No host SWA pool (unified_kv device-only ring).
         if self._swa_kv_pool_host is None:
             return None
 

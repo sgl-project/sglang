@@ -268,15 +268,9 @@ def _deepseek_v4_num_host_pages(
 
 
 def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int]:
-    """Resolve ``(device_buffers, item_bytes)`` for a DeepSeek V4 C4/C128 main-KV
+    """
+    Resolve ``(device_buffers, item_bytes)`` for a DeepSeek V4 C4/C128 main-KV
     HiCache pool, hiding the device KV layout from the stack builder.
-
-    - unified_kv: the compressed family lives in the ``[swa_pages:]`` tail of the
-      shared per-layer unified buffer (bf16 rows). ``unified_region_buffers``
-      returns ``narrow`` views that share storage, so the page index
-      (``loc // ratio`` from the compressed start) and the existing paged-row
-      transfer kernels work unchanged.
-    - separate pools (legacy): the standalone FP8 paged c4/c128 buffer.
     """
     if getattr(kvcache, "_unified_kv", False):
         return kvcache.unified_region_buffers(ratio)
@@ -307,12 +301,6 @@ def build_deepseek_v4_hicache_stack(
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
-    # unified_kv (MI355) stores SWA in a per-request ring (state_slot*ring +
-    # pos%ring) that is neither content-addressable nor persistent, so it cannot
-    # be backed up/restored like the standalone swa_kv_pool. We run SWA
-    # device-only (evicted windows tombstone and recompute) and HiCache only the
-    # content-stable compressed families. The compress-state pools are likewise
-    # not consulted by the unified attention kernels, so they are not cached.
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     swa_layer_mapping = (
         {}
@@ -431,9 +419,6 @@ def build_deepseek_v4_hicache_stack(
             ]
         )
 
-        # Compress-state pools are anchored on SWA indices and are not consulted
-        # by the unified_kv attention kernels, so they are only cached in the
-        # standalone-pool layout.
         if not is_unified_kv:
             c4_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
@@ -789,8 +774,6 @@ class _DeepSeekV4Strategy(StackStrategy):
         component_host_pools = {
             ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
         }
-        # unified_kv runs SWA device-only (no host pool); leaving the SWA
-        # component's host pool unset (None) keeps its HiCache hooks inert.
         if PoolName.SWA in host_pool_group.entry_map:
             component_host_pools[ComponentType.SWA] = host_pool_group.get_pool(
                 PoolName.SWA

@@ -2493,22 +2493,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return swa.sliding_window_size if swa else None
 
     def swa_reprefill_tail_tokens(self) -> int:
-        """How many trailing prefix tokens to leave OUT of a cache match so the
-        request re-prefills them instead of reusing them. 0 = reuse everything.
-
-        Only the unified_kv compress-only HiCache layout needs this: there SWA
-        lives in a per-request ring (``state_slot*ring + pos%ring``) that is not
-        content-stable and is never offloaded to host, so a reused prefix's
-        trailing sliding window would read stale ring slots left by another
-        request. Excluding that window forces this request to re-prefill it and
-        rewrite its own ring (what plain radix reuse already does). Every other
-        layout keeps SWA content-stable, so no re-prefill holdback is needed.
-
-        The raw sliding-window size is returned (not page-rounded): the caller
-        caps the raw match key and the radix match then page-aligns downward, so
-        reuse extends to the largest page boundary that still leaves the whole
-        window in the re-prefilled tail. Rounding up here would drop an extra
-        page of reuse for nothing.
+        """
+        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
+        (state_slot/pos), not content-stable and never offloaded to host, so a
+        reused prefix's trailing sliding window would read another request's
+        stale ring slots. Re-prefilling that window rewrites this request's ring
+        (what plain radix reuse does via its SWA match gate). 0 for every other
+        layout.
         """
         swa = self.components.get(ComponentType.SWA)
         unified_compress_only_hicache = (
