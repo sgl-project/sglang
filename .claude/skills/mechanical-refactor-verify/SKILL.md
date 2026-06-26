@@ -1,6 +1,6 @@
 ---
 name: mechanical-refactor-verify
-description: Make mechanical refactoring (file splits, function moves, module extractions, renames) machine-checkable instead of eyeballed. Reproduce a relocation commit byte-for-byte from faithful primitives, and split an extraction into a verifiable prep + move. Use when doing or reviewing such changes.
+description: Make mechanical refactoring (file splits, function moves, module extractions, renames) machine-checkable instead of eyeballed. Reproduce a relocation commit byte-for-byte from faithful primitives, and split an extraction into a verifiable prepare + move + postpare. Use when doing or reviewing such changes.
 user_invocable: true
 argument: "[reproduce <base>..<tip>] to certify relocation commits, or omit for the full workflow guide"
 ---
@@ -21,10 +21,14 @@ write the script by hand — the generator infers the recipe and emits it.
 
 A move is certifiable only when its body is byte-identical and its only other changes are
 mechanical move artifacts. A reshape that is not a pure relocation — de-self'ing a method, a
-rename, a statement reorder — must not ride along; split it into a **prep** commit (the small
-human-reviewed reshape) followed by a **move** commit (the pure relocation, certified by the
-reproduce proof). A mechanical commit/PR contains **only** mechanical changes; semantic changes
-(new logic, API/signature redesign, behavior change) go in their own commit/PR.
+rename, a statement reorder — must not ride along. Split a relocation into up to three commits:
+an optional **prepare** (a minimal in-place reshape), the **move** (the pure relocation,
+certified by the reproduce proof), and an optional **postpare** (a minimal tail fixup the move
+cannot do mechanically, e.g. a module path inside a string literal). Both ends are minimal and
+relocate nothing. An extraction's bulk — the relocated body — goes in the move
+(`extract_function`), not a prep. A **large semantic refactor** (consolidating bookkeeping,
+deduplicating logic, redesigning an API, restructuring control flow) is its **own commit**,
+reviewed for equivalence — never folded into a prepare or dressed up as a move.
 
 ## Files
 
@@ -34,7 +38,7 @@ reproduce proof). A mechanical commit/PR contains **only** mechanical changes; s
   command, what its inference covers, the `UNSUPPORTED` cases, and the `Repro` primitives for
   hand-writing a transform when inference falls short.
 - [`mental-model-prep-and-move.md`](mental-model-prep-and-move.md) — how to **make an extraction verifiable** by splitting
-  it into prep + move: the two-commit recipe, the class-extraction and new-module
+  it into prepare + move + postpare: the phase recipe, the class-extraction and new-module
   (trailing-block) techniques, what counts as mechanical, and the anti-patterns.
 
 ### Read these only when you need the internals

@@ -30,13 +30,22 @@ list is what they refuse to do, so it surfaces as a residual diff.
 
 - A line **relocated in order**, modulo one **uniform** leading-indentation shift of the
   whole block (the unavoidable reindent of relocation).
-- When the destination module is **new**, the relocated block may include the module
-  **scaffolding** the prep commit staged in the source's tail — module-level imports, a
-  `logger`, an `if TYPE_CHECKING:` guard, module constants — because the move *relocates*
-  that scaffolding, it does not author it (§2.4).
+- **Defs/classes gathered from scattered positions** in one source into a **new module**,
+  each cut verbatim and assembled under an **authored header** — the module-level imports, a
+  `logger`, an `if TYPE_CHECKING:` guard, platform constants — reproduced from the target.
+  The defs are the proven relocation (the byte diff certifies the bodies); the small header is
+  authored, the same way an import is (§2.4). A module-level constant that moved into that
+  header (e.g. `_is_hip = is_hip()`) is dropped from the source too.
+- The **body of an extracted function** — an inline block relocated verbatim into a new def,
+  with the `def` **signature**, an optional `return`, and the **call** that replaces the block
+  authored. The body is the proven relocation; the small interface is authored (§2.4). This is
+  faithful **only** when the body moves unchanged — a de-self, a control-flow restructure, or a
+  bookkeeping consolidation is semantic and goes in its own commit first.
 - **Import statements** — added, removed, or repathed; single-line or parenthesised
-  multi-line. The symbol's home changed, so importers adjust. A move to a new module may
-  also add `from __future__ import annotations`.
+  multi-line. The symbol's home changed, so importers adjust. An import diff is always
+  harmless, so it is realised directly from the target (a wholly new module's statement is
+  reproduced verbatim, preserving its wrapping); a move to a new module may also add
+  `from __future__ import annotations`.
 - A one-sided **`@staticmethod` / `@classmethod`** — a method became a free function or
   vice versa.
 - A **`self` type annotation dropped** from the moved definition — relocating
@@ -64,15 +73,19 @@ list is what they refuse to do, so it surfaces as a residual diff.
 - A **signature change** other than dropping the `self` annotation — a real parameter's
   type, name, default, or position changing.
 - A **rename** of the moved symbol (even a privacy flip `_foo` → `foo`).
-- **New module-level scaffolding the move authors fresh** — a `logger`, a module constant, a
-  `TYPE_CHECKING` guard the move *introduces* (as opposed to relocates from the source tail,
-  §2.1).
-- A **constant re-derived** in the destination module (`_flag = compute_flag()`).
+- **Scaffolding or a constant the move authors into an existing module** — a `logger`, a
+  module constant, a `TYPE_CHECKING` guard, or a re-derived `_flag = compute_flag()`
+  introduced into a module that already exists. (A *new* module's header is authored from the
+  target, §2.1; an existing module's body is not a place to author fresh code.)
+- A **changed body in an extracted function** — a de-self (`self.x` → a parameter), a
+  control-flow restructure (an `if/elif/else` chain becoming early `return`s), or a
+  bookkeeping consolidation folded into the extraction. The body is no longer the source's, so
+  it is a semantic rewrite, not a relocation (it goes in its own commit, §2.4).
 
-A rename, fresh scaffolding, or a statement reorder is reshape work, so it belongs in the
-**prep** commit, not the move (§2.4, `mental-model-prep-and-move.md`). The reproduce proof reports such a
-commit as a residual diff (or, when no definition relocated at all, as unsupported) — it does
-not certify it.
+A rename, fresh scaffolding, a statement reorder, or an extraction whose body changed is
+reshape work, so it does not ride in the move (§2.4, `mental-model-prep-and-move.md`). The
+reproduce proof reports such a commit as a residual diff (or, when no definition relocated at
+all, as unsupported) — it does not certify it.
 
 ### 2.3 Blank lines are ignored
 
@@ -81,21 +94,39 @@ not certify it.
   both the reproduced and target sides, so a blank-line-only difference cannot appear in the
   byte diff.
 
-### 2.4 Why the bar is this strict — prep is human-reviewed, move is machine-checked
+### 2.4 The three phases — prepare, move, postpare
 
-- A behaviour-preserving extraction is **two commits**:
-    - a **prep** commit — the in-place reshape (de-self a method, retype `self`, stage the
-      new module's scaffolding, rename, reorder statements). A human reviews it, so it must
-      be **small** and contain **no cross-file relocation**: the code stays where it is.
-    - a **move** commit — the pure relocation, certified by this spec.
-- The whitelist in §2.1 is exactly what a relocation *forces* and a human should not have to
-  re-read. It is **not** a licence to fold reshape work into the move. If the move's diff
-  contains anything outside the whitelist, the reshape leaked in and belongs in prep.
-- **Extracting to a new module** is staged this way: prep inlines the future module's whole
-  body — scaffolding plus the def — as a trailing block in the source file (a human reviews
-  that the body is unchanged and the scaffolding is right); the move then cuts that tail into
-  the new file. The new file therefore contains only relocated lines plus `from __future__
-  import annotations`, so it stays a clean move.
+A behaviour-preserving relocation is up to **three commits**, in this order:
+
+- an **(optional) prepare** commit — a **minimal** in-place reshape that the relocation needs
+  (de-self a method, retype `self`). A human reviews it, so it must be small and contain **no
+  cross-file def relocation and no body relocation**: the code stays where it is.
+- a **move** commit — the pure relocation, certified by this spec. This carries the **bulk**.
+- an **(optional) postpare** commit — a **minimal** tail fixup the relocation cannot do
+  mechanically: a module path inside a **string literal**, a doc reference. A human reviews it.
+
+Both ends are optional and minimal; neither prepare nor postpare ever relocates a def across
+files or moves a body. The whitelist in §2.1 is exactly what a relocation *forces*; it is
+**not** a licence to fold reshape work into the move.
+
+**A semantic refactor is not prepare.** A large behaviour-affecting rewrite — consolidating
+bookkeeping, deduplicating logic, redesigning an API, restructuring control flow — is its
+**own commit**, reviewed for **equivalence** (tests, or a written argument), never bundled into
+a prepare so it rides under the "small reshape" label. Prepare is for the *minimal* reshape a
+relocation forces, nothing more.
+
+**Extract-function puts the bulk in the move.** An extraction's big part — the relocated body
+— belongs in a certified move (the `extract_function` primitive cuts the inline block verbatim
+and authors only the signature/return/call). The faithful split is: a semantic commit for any
+de-self / restructure / consolidation **first** (reviewed for equivalence), then a move that
+relocates the now-unchanged body. An extraction that changes the body *as* it extracts (the
+two entangled) is a semantic commit, not a certifiable move — do not force it.
+
+**Extracting to a new module** no longer needs the body staged at the source tail first: the
+move gathers the defs from wherever they sit (`extract_symbols_to_new_module`) and assembles
+the new file under an authored header (imports, a logger, platform constants, a
+`TYPE_CHECKING` block) reproduced from the target. The defs are the proven relocation; only
+the small header is authored.
 
 ## 3. The proof — reproduce: regenerate the move and byte-diff
 
@@ -150,13 +181,22 @@ so a byte match after the formatter certifies the commit is *exactly* that reloc
   `@classmethod`, dedent, paste at a class end or at module level.
 - `extract_to_new_module` — cut the contiguous tail of the source (the moved defs plus the
   scaffolding that leads into them) and write it as a new module, prepending
-  `from __future__ import annotations` when the move adds it. The formatter sorts the imports
-  and normalises blank lines.
+  `from __future__ import annotations` when the move adds it.
+- `extract_symbols_to_new_module` — cut the named defs/classes from **scattered** positions
+  (not just a tail) and assemble the new module under an authored `header` reproduced from the
+  target; `drop_assigns` deletes a module-level constant that relocated into the header.
+- `extract_function` — cut an inline block verbatim, re-indent it under an authored
+  `signature` (with an optional `return`), insert the def, and replace the block with an
+  authored `call`. Faithful only when the body is unchanged.
 - `lower_call_sites` — `Owner.m(receiver, rest)` → `receiver.m(rest)`.
 - `requalify_call_sites` — `Owner.m(args)` → `m(args)`.
 - `remove_import` — function-scoped or module-level, all occurrences, with the trailing
   blank.
-- `add_import` — let the formatter's import sorter place it.
+- `remove_imported_name` — drop a single name from a `from m import a, b` (or a plain
+  `import x`), realising a lost import directly instead of relying on the formatter to prune
+  it (this repo's ruff has no F811).
+- `add_import` — let the formatter's import sorter place it; a wholly new module's statement is
+  added verbatim from the target so its wrapping is preserved.
 - `add_typechecking_import` — append an import inside the destination's `if TYPE_CHECKING:`
   block (a moved annotation needs its type imported there); the sorter orders the block.
 - `repath_import` — repath a function-scoped `from old import ... name ...` to
@@ -166,12 +206,14 @@ so a byte match after the formatter certifies the commit is *exactly* that reloc
 
 - A **rename** (even a privacy flip) and a **statement-level reorder** are not pure
   relocations; the generator infers no recipe and reports them `UNSUPPORTED`. They belong in
-  prep (§2.4) and are reviewed there, not machine-certified.
-- A **new-file extract whose source is not a staged trailing block** — a method still inside
-  the class, or a constant sitting far above the moved defs — is reported `UNSUPPORTED`:
-  finish the prep so the whole module body sits together at the source tail first.
-- An **extract from multiple sources into one new file** is not yet inferred — split it so
-  each new module is filled from a single source, or hand-write the `Repro`.
+  prepare (§2.4) and are reviewed there, not machine-certified.
+- A **new-module extract whose symbols are not all top-level in the source** — a method still
+  inside a class — is reported `UNSUPPORTED`: prepare must lift it out (de-self) first.
+- An **extract from multiple sources into one new file**, and an **inline-block
+  extract-function**, are not auto-inferred — split so each new module is filled from a single
+  source, or hand-write the `Repro` (compose `extract_function` for a disciplined extraction).
+- A **non-mechanical reference update** the move cannot derive — a module path inside a string
+  literal — surfaces as a residual; it is a one-line **postpare** (or prepare), not a move.
 
 For an inference gap (not a property violation), write the `Repro` by hand (see
 `how-to-guide.md`); the same byte-diff then certifies it.

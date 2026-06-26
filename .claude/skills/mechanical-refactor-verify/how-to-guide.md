@@ -28,23 +28,29 @@ inference covers:
 - a **method moved to a module-level free function** — call sites requalified
   (`Owner.m(…)` → `m(…)`);
 - a **free-function-source move to an existing module** — the call stays bare, callers
-  repath their import (`repath_import` for a function-scoped import; module-level imports
-  fall out of the import sorter);
-- a **new-file extract** — the prep commit staged the whole module body (scaffolding plus
-  the defs and classes) as a trailing block in the source, so the move cuts that tail into
-  the new file (`extract_to_new_module`), adding `from __future__ import annotations` and the
-  consumer import.
+  repath their import (`repath_import` for a function-scoped import; a module-level repoint is
+  realised as remove-old + add-new);
+- a **new-module extract of scattered defs** — the defs are cut from wherever they sit
+  (`extract_symbols_to_new_module`) and assembled under an authored header reproduced from the
+  target (imports, a logger, constants, a `TYPE_CHECKING` block); a constant that relocated
+  into the header is dropped from the source. A contiguous-tail source still uses
+  `extract_to_new_module`.
 
-Import **removals are not inferred** — ruff's `F401 --fix` prunes the now-unused imports
-during pre-commit, the same way the commit was originally made.
+The **module-level import diff is realised directly** from the target — gained names are added
+(a wholly new module's statement verbatim, so its wrapping is kept), lost names removed with
+`remove_imported_name`. This is deterministic and does not rely on the formatter pruning (this
+repo's ruff has no F811).
 
-It reports `UNSUPPORTED` (review as prep, or hand-write the `Repro`) for:
+It reports `UNSUPPORTED` (review as prepare, or hand-write the `Repro`) for:
 
 - a commit that relocates **no definition** — a rename (even a privacy flip `_foo` → `foo`)
-  or a statement-level reorder; these are reshapes that belong in prep;
-- a **new-file extract whose source is not a staged trailing block** — a method still inside
-  the class, or a constant far above the moved defs; finish the prep first;
-- an **extract drawing from more than one source file** into one new module.
+  or a statement-level reorder; these are reshapes that belong in prepare;
+- a **new-module extract whose symbols are not all top-level in the source** — a method still
+  inside a class; prepare must de-self it out first;
+- an **extract drawing from more than one source file** into one new module, and an
+  **inline-block extract-function** — compose `extract_function` by hand for a disciplined
+  extraction (the body must be unchanged; a de-self / restructure is a separate semantic
+  commit).
 
 ## The `Repro` builder — relocation primitives
 
@@ -77,9 +83,19 @@ Primitives:
 - `extract_to_new_module(src, dst, *, symbols, future_import)` — cut the contiguous tail of
   the source (the moved defs/classes plus the scaffolding that leads into them) and write it
   as a new module, prepending `from __future__ import annotations` when the move adds it.
+- `extract_symbols_to_new_module(src, dst, *, symbols, header, order, drop_assigns)` — cut the
+  named defs/classes from scattered positions and assemble the new module under an authored
+  `header` reproduced from the target; `drop_assigns` deletes a relocated module-level constant
+  from the source.
+- `extract_function(src, dst, *, name, signature, body, body_indent, call, return_text, before,
+  into_class)` — cut an inline `body` verbatim into a new `name` def under an authored
+  `signature`/`return`, replacing the block with `call`. Faithful only when the body is
+  unchanged; compose it by hand (no auto-inference).
 - `lower_call_sites` — `Owner.m(receiver, rest)` → `receiver.m(rest)`.
 - `requalify_call_sites` — `Owner.m(args)` → `m(args)`.
 - `remove_import` — function-scoped or module-level, all occurrences, with the trailing blank.
+- `remove_imported_name(rel, *, module, name, asname)` — drop a single name from a
+  `from m import a, b` (or a plain `import x`), realising a lost import directly.
 - `add_import` — the formatter's import sorter places it.
 - `add_typechecking_import(rel, import_stmt)` — append an import inside the destination's
   `if TYPE_CHECKING:` block (for a moved annotation's type).

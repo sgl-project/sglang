@@ -13,9 +13,17 @@ contains the reshape **and** an indentation shift **and** a cross-file relocatio
 neither a human nor a tool can mechanically confirm "the body that landed is the body
 that left" — you have to re-read the logic to be sure.
 
-**Rule:** split each mechanical move into two consecutive commits, each carrying one
-kind of operation with its own check. The **move** commit is then certifiable by the
-reproduce proof (see `SKILL.md`); the **prep** commit is small and covered by tests.
+**Rule:** split a mechanical relocation into up to **three** commits — an optional
+**prepare** (a minimal in-place reshape), the **move** (the pure relocation, certified by the
+reproduce proof; see `SKILL.md`), and an optional **postpare** (a minimal tail fixup the move
+cannot do mechanically, e.g. a module path inside a string literal). Both ends are minimal and
+covered by tests; the move carries the bulk. See `verifier-spec.md` §2.4. ("prep" below is the
+prepare phase.)
+
+**A large semantic refactor is not one of these phases.** Consolidating bookkeeping,
+deduplicating logic, restructuring control flow, or redesigning an API is its **own commit**,
+reviewed for **equivalence** (tests or a written argument) — never folded into a prepare under
+the "small reshape" label. Prepare is for the *minimal* reshape a relocation forces.
 
 **Prep is human-reviewed, so it stays small and relocates nothing.** The code keeps its
 place — prep only changes its *shape* (de-self a method, retype `self`) so a human can
@@ -155,38 +163,37 @@ primitive, so the whole commit reports `PASS` (`mechanical_refactor_generate_pro
 <commit>`). The split still pays off: because prep left the body untouched, the move is a
 clean cut/paste.
 
-## Extracting to a new module: prep stages the module body as a trailing block
+## Extracting to a new module: the move gathers scattered defs under an authored header
 
-When the destination module does not exist yet, **prep inlines the whole future module — its
-scaffolding *and* its body — as a trailing block at the bottom of the source file**, below the
-class. The move then cuts that contiguous tail into the new file. Staging it this way (rather
-than authoring the new file in prep) keeps the move a *pure relocation*: every line in the new
-file demonstrably came from the source the commit before.
+When the destination module does not exist yet, the **move gathers the defs straight from
+wherever they sit** in the source — no prep is needed to stage them at the tail first. The
+reproduce proof replays this with `extract_symbols_to_new_module`: each def/class is cut from
+the source **verbatim** (the byte diff certifies the body), and the new file is assembled under
+an **authored header** — the module-level imports, a `logger`, platform constants, an
+`if TYPE_CHECKING:` block — reproduced from the target. The header is small authored
+boilerplate, the same harmless category as an import; the defs are the proven relocation. A
+module-level constant that moved into the header (e.g. `_is_hip = is_hip()`) is dropped from
+the source too. So a pure new-module extraction is **one move commit, no prep** (the proof
+reports `PASS`). The only thing that lands outside it is a non-mechanical reference the move
+cannot derive — e.g. a module path inside a string literal — which is a one-line **postpare**.
 
-### Commit 1 — prep: inline the module body as a trailing block (no relocation)
+If a symbol is **not top-level** in the source (a method still inside a class), prepare must
+de-self it out first (Case 1); the proof reports `UNSUPPORTED` until then.
 
-In the **source file**, after the class, build the future module exactly as it will look:
+## Extract-function: the bulk goes in the move
 
-- the module scaffolding: the module-level imports the moved code uses, a
-  `logger = logging.getLogger(__name__)`, any module-level constants the body reads, an
-  `if TYPE_CHECKING:` block;
-- the moved functions and classes themselves, with their bodies **unchanged**;
-- rewrite the call sites to the now-module-level names (`self.foo(...)` → `foo(...)`).
+Turning an inline block into a new function is an extraction, so its **bulk — the relocated
+body — belongs in a certified move**, not buried in a prep. The `extract_function` primitive
+cuts the inline block **verbatim** into the new def (the byte diff certifies the body) and
+authors only the small interface: the `def` signature, an optional `return`, and the `call`
+that replaces the block.
 
-Nothing relocates across files yet — a human reviews that the body is unchanged and the
-scaffolding is right. If a constant must be **re-derived** for the new module (e.g. the source
-cached `_is_hip = is_hip()` and the new module needs `_use_aiter = ... and is_hip()`), that
-re-derivation is a prep decision — a human confirms it is equivalent — so it lands in prep.
-
-### Commit 2 — move: cut the trailing block into the new file
-
-Cut the contiguous tail (scaffolding plus the staged defs/classes) verbatim into the new
-module, adding `from __future__ import annotations` at its top and the consumer import in the
-source. The new file therefore contains **only relocated lines plus imports** — nothing the
-move authored. The reproduce proof replays this with `extract_to_new_module` and reports
-`PASS`. If the staged block is not a clean tail — a method still inside the class, a constant
-sitting far above — the proof reports `UNSUPPORTED`: finish the prep so the whole module body
-sits together at the source tail first.
+This is faithful **only when the body moves unchanged**. If the extraction also de-selfs
+(`self.x` → a parameter), restructures control flow (an `if/elif/else` chain becoming early
+`return`s), or folds in a bookkeeping change, those are **semantic** and must be a separate
+commit reviewed for equivalence **first** — then the move relocates the now-unchanged body. An
+extraction that rewrites the body *as* it extracts (the two entangled) is a semantic commit,
+not a certifiable move; do not dress it up as one.
 
 ## A move never renames
 
@@ -242,11 +249,13 @@ See `.claude/skills/large-class-style/SKILL.md`.
 
 ## Naming
 
-A move that is split uses two consecutive commits with reserved suffixes:
+A split relocation uses consecutive commits with reserved suffixes:
 
 ```
-<id>-prep    # commit 1: in-place reshape (Case 1 de-self, or Case 2 retype-self)
-<id>-move    # commit 2: pure relocation
+<id>-prepare    # optional: minimal in-place reshape (Case 1 de-self, or Case 2 retype-self)
+<id>-move       # pure relocation, certified by the reproduce proof
+<id>-postpare   # optional: minimal tail fixup the move cannot do (e.g. a string-literal path)
 ```
 
-Use a short kebab identifier for `<id>`.
+Both ends are optional and minimal. A large semantic refactor is a separate commit, not one of
+these phases. Use a short kebab identifier for `<id>`.
