@@ -224,14 +224,6 @@ class Mamba2Metadata(ForwardMetadata):
         num_decodes = batch_size - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
-        # ``has_initial_states`` marks prefills that must seed their conv/SSM scan
-        # from the state already in their slot (a radix prefix-cache hit, or a
-        # prior chunk of the same request). This is independent of
-        # ``mamba_track_mask``, which only marks requests that *snapshot* their
-        # state into the prefix cache this step. Gating the restore on the track
-        # mask wrongly zeroed the restored state for cache-hit requests whose
-        # new-token count < mamba_cache_chunk_size, corrupting long-prefill
-        # accuracy (#29330, regressed in #24955).
         has_initial_states = context_lens_tensor > 0
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
