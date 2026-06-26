@@ -12,7 +12,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_cpu_ci(est_time=9, suite="base-b-test-cpu")
+register_cpu_ci(est_time=9, suite="base-c-test-cpu")
 
 
 class TestSchedulerPauseGeneration(unittest.TestCase):
@@ -43,6 +43,10 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
                 full_evictable_size=0,
             )
         )
+        # pause_generation zeros gen_throughput and flushes KV events.
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        scheduler.kv_events_publisher = MagicMock()
         return scheduler
 
     def test_inplace_only_sets_flag(self):

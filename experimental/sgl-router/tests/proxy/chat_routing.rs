@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{Worker, WorkerRegistry};
 
@@ -29,18 +30,17 @@ fn config_for(_worker_url: &str) -> Config {
             port: 0,
         },
         observability: ObservabilityConfig::default(),
-        models: vec![ModelConfig {
+        model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
-        }],
-        discovery: DiscoveryConfig {
-            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-                urls: vec!["http://placeholder:0".into()],
-            }),
+            sticky: None,
         },
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            urls: vec!["http://placeholder:0".into()],
+        }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
     }
@@ -200,6 +200,101 @@ async fn streaming_first_chunk_before_completion() {
     // before yielding will at minimum still pass through bytes.
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     assert!(bytes.windows(5).any(|w| w == b"first"));
+}
+
+/// A successful (2xx) streaming request records both TTFT (fired by the SSE
+/// pump on the first chunk) and end-to-end request_duration (recorded by the
+/// drop-guard when the stream completes). End-to-end coverage of the chat
+/// handler installing the hooks — the sse-level unit tests only cover the
+/// pump primitive in isolation.
+#[tokio::test]
+async fn streaming_2xx_request_records_ttft_and_duration() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    // Draining drives the pump to completion: fires the TTFT hook on the
+    // first chunk and drops the duration guard at stream end.
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
+    // The duration guard records from the pump task; give it a beat to drop,
+    // matching the active-load streaming tests' synchronization.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(r#"sgl_router_ttft_seconds_count{model_id="tiny"} 1"#),
+        "TTFT must be recorded once for a 2xx streaming request; got:\n{m}",
+    );
+    assert!(
+        m.contains(r#"sgl_router_request_duration_seconds_count{model_id="tiny"} 1"#),
+        "request_duration must be recorded at stream completion; got:\n{m}",
+    );
+}
+
+/// A non-2xx streaming response must NOT record TTFT (the error body is not a
+/// generated token — the gate lives in `Proxy::forward_streaming_to`), but it
+/// MUST still record request_duration (latency of a failed request matters)
+/// and the response status. Guards the 2xx-gating decision end-to-end.
+#[tokio::test]
+async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error": "boom"}),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let _ = res.into_body().collect().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let m = ctx.metrics.render();
+    assert!(
+        !m.contains("sgl_router_ttft_seconds_count{"),
+        "TTFT must NOT be recorded for a non-2xx streaming response; got:\n{m}",
+    );
+    assert!(
+        m.contains(r#"sgl_router_responses_total{status_code="500"} 1"#),
+        "the 500 status must be counted; got:\n{m}",
+    );
+    assert!(
+        m.contains(r#"sgl_router_request_duration_seconds_count{model_id="tiny"} 1"#),
+        "request_duration must be recorded even for a failed streaming request; got:\n{m}",
+    );
 }
 
 #[tokio::test]
@@ -420,8 +515,9 @@ async fn oversized_request_body_returns_413() {
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
-    // 2 MiB body — the configured limit is 1 MiB.
-    let big = vec![b'x'; 2 * 1024 * 1024];
+    // One byte over the configured cap, so the test tracks the cap
+    // (`MAX_CHAT_BODY_BYTES`) instead of a hardcoded size.
+    let big = vec![b'x'; MAX_CHAT_BODY_BYTES + 1];
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -619,7 +715,7 @@ async fn no_healthy_workers_returns_503() {
     );
 }
 
-/// A worker is registered for a model that is NOT in `cfg.models` (so the
+/// A worker is registered for a model that is NOT the configured `cfg.model` (so the
 /// policy registry has no entry for it).  The handler returns 404
 /// `model_not_found` rather than 500 — clients can recover by sending a
 /// different model name; an internal_error would mask the misconfiguration.
@@ -803,6 +899,7 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
             "/v1/chat/completions",
             &headers,
             body,
+            None,
             None,
         )
         .await;

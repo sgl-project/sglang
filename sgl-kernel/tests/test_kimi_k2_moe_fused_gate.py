@@ -6,21 +6,26 @@ from sgl_kernel import kimi_k2_moe_fused_gate
 
 from sglang.srt.layers.moe.topk import kimi_k2_biased_topk_impl
 
+# (num_experts, topk, routed_scaling_factor)
+_CONFIGS = [
+    (384, 6, 2.872),  # Kimi K2
+    (256, 8, 1.0),  # MiMo V2.5
+]
+
 
 @pytest.mark.parametrize(
     "seq_length",
     list(range(1, 10))
     + [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
 )
-@pytest.mark.parametrize("topk", [6])  # Kimi K2 uses topk=6
+@pytest.mark.parametrize("config", _CONFIGS, ids=["kimi384", "mimo256"])
 @pytest.mark.parametrize("dtype", [torch.float32])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 def test_kimi_k2_moe_fused_gate(
-    seq_length, topk, dtype, apply_routed_scaling_factor_on_output
+    seq_length, config, dtype, apply_routed_scaling_factor_on_output
 ):
-    num_experts = 384  # Kimi K2: only support 384 experts
+    num_experts, topk, routed_scaling_factor = config
     renormalize = True
-    routed_scaling_factor = 2.872  # Kimi K2's routed scaling factor
 
     torch.manual_seed(seq_length)
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")
@@ -65,13 +70,12 @@ def test_kimi_k2_moe_fused_gate(
 
 
 @pytest.mark.parametrize("seq_length", [1024, 4096])
-@pytest.mark.parametrize("num_experts", [384])
-@pytest.mark.parametrize("topk", [6])
-def test_kimi_k2_specific_case(seq_length, num_experts, topk):
-    """Test specifically for Kimi K2 configuration: 384 experts, topk=6"""
+@pytest.mark.parametrize("config", _CONFIGS, ids=["kimi384", "mimo256"])
+def test_kimi_k2_specific_case(seq_length, config):
+    """Test specifically for supported configurations: 256 / 384 experts"""
+    num_experts, topk, routed_scaling_factor = config
     dtype = torch.float32
     renormalize = True
-    routed_scaling_factor = 2.872
 
     torch.manual_seed(42)
     tensor = torch.rand((seq_length, num_experts), dtype=dtype, device="cuda")

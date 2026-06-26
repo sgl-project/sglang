@@ -8,6 +8,8 @@
 #   - artifact_version: actions/download-artifact major version
 #   - install_timeout: install-step wall-clock cap (minutes), enforced via
 #     `timeout-minutes:` on the install step in _pr-test-stage.yml
+#   - grace_blackwell (optional): exported as GRACE_BLACKWELL for the install
+#     step. Used by GB300 DeePEP setup.
 #   - runs_on: GHA runner label for the stage's `runs-on:`. The literal
 #     `$b200_runner` is substituted at workflow-load time with the dynamic
 #     b200 runner tag from check-changes (see runner_configs.py --map).
@@ -23,6 +25,7 @@ runner_configs:
   1-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 1-gpu-h100 }
   2-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 2-gpu-h100 }
   4-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: $b200_runner }
+  4-gpu-gb300:       { install: *deepep,  artifact_version: v6, install_timeout: "20", grace_blackwell: "1", runs_on: 4-gpu-gb300 }
   4-gpu-h100:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 4-gpu-h100 }
   8-gpu-h200:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h200 }
   8-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b200 }
