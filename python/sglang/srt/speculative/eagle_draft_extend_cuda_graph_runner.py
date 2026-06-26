@@ -96,7 +96,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.tp_size
-        self.dp_size = model_runner.dp_size
+        self.attn_dp_size = model_runner.attn_dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -193,10 +193,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
                     global_num_tokens_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
+                        (self.attn_dp_size,), dtype=torch.int32
                     )
                     global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
+                        (self.attn_dp_size,), dtype=torch.int32
                     )
                 else:
                     assert self.require_attn_tp_gather
@@ -339,7 +339,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         num_tokens_for_logprob = num_tokens
 
         if self.require_mlp_tp_gather:
-            global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_cpu = [num_tokens] * self.attn_dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
         else:
