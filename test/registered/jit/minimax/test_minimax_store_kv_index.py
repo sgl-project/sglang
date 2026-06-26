@@ -9,10 +9,11 @@ import pytest
 import torch
 
 from sglang.jit_kernel.minimax_store_kv_index import store_kv_index
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-b200")
+register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 dev = "cuda"
 HEAD_DIM = 128
