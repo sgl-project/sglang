@@ -1467,7 +1467,7 @@ def build_inner_fb_view(
         batch_size=bs,
         forward_mode=forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
-        global_forward_mode=getattr(forward_batch, "global_forward_mode", None),
+#        global_forward_mode=getattr(forward_batch, "global_forward_mode", None),
         input_ids=getattr(forward_batch, "input_ids", None),
         positions=getattr(forward_batch, "positions", None),
         mrope_positions=getattr(forward_batch, "mrope_positions", None),

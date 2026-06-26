@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Optional
 
@@ -18,7 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-
+logger = logging.getLogger(__name__)
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
@@ -201,6 +202,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
+            # state table holds one slot per RAW token; block 0 is the skip sentinel reserved by NPUCompressStatePool
             state_table = (
                 req_to_token_pool.req_to_token_c4_state
                 if ratio == 4
@@ -256,6 +258,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 if ratio == 4
                 else req_to_token_pool.req_to_token_c128
             )
+            # graph: keep shape aligned with the preallocated buffer; eager: clamp >=1 so kernels see a column
             if is_graph:
                 n_c_tokens = seq_lens_max // ratio
             else:
@@ -323,9 +326,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         page_table = getattr(fm, f"c{ratio}_state_page_table", None)
         start_pos = getattr(fm, "start_pos", None)
         seqused = getattr(fm, "seqused", None)
-        cu_seqlens = getattr(fm, "actual_seq_lengths_q_cmp", None)
-        if cu_seqlens is None:
-            cu_seqlens = getattr(fm, "actual_seq_lengths_q_pa", None)
+        cu_seqlens = getattr(fm, "actual_seq_lengths_q_pa", None)
         assert positions_cmp is not None and page_table is not None, (
             "fused compressor needs backend metadata "
             "(positions_cmp_padding / c*_state_page_table) — make sure "
@@ -364,6 +365,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             cache_mode=1,
         )
 
+        # prefill output may be padded; trim to loc length
         loc = getattr(fm, f"c{ratio}_loc", None)
         is_prefill = (
             forward_batch.forward_mode.is_prefill()
@@ -818,6 +820,7 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
                 c4_indexer, q, li_cmp_kv, li_kv_scale, weights, forward_batch
             )
 
+        # bf16 fallback: per-request einsum + topk, slow but architecture-faithful
         seqlens_cpu = forward_batch.seq_lens_cpu
         end_pos = forward_batch.seq_lens.cumsum(dim=0)
         page_table = self.forward_metadata.c4_page_table
@@ -972,7 +975,7 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_config = cfg
         tp_size = get_attention_tp_size()
         self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
-        self._dsv4_kv_head_num = 1
+        self._dsv4_kv_head_num = 1  # V4 MQA / latent
         self._dsv4_head_dim = cfg.head_dim
         hf = getattr(cfg, "hf_config", cfg)
         self._dsv4_index_topk = hf.index_topk
@@ -1015,6 +1018,7 @@ class DeepseekV4AscendAttnBackend(
             (max_bs, max_pages), dtype=torch.int32, device=device
         )
 
+        # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
         for key in (
             "kernel_metadata_c1a",
             "kernel_metadata_c4a",
@@ -1062,8 +1066,8 @@ class DeepseekV4AscendAttnBackend(
             dtype=torch.int32,
             device=device,
         )
-        metadata.actual_seq_lengths_q_cmp = metadata.actual_seq_lengths_q_pa.clone()
 
+        # init >=1 so the captured kernel records valid attention work; replay overwrites in-place
         metadata.actual_seq_lengths_kv = torch.ones(
             bs,
             dtype=torch.int32,
@@ -1288,6 +1292,7 @@ class DeepseekV4AscendAttnBackend(
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
         _copy_2d(fm.swa_page_table, swa_src, -1)
+        # base replay 0-pads the tail but page 0 is a real page; restore the -1 sentinel beyond valid pages
         if bs > 0:
             _spec = int(getattr(self, "speculative_num_draft_tokens", 0) or 0)
             max_len = int(seq_lens_cpu[:bs].max()) + _spec
@@ -1312,6 +1317,7 @@ class DeepseekV4AscendAttnBackend(
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
 
+        # -1 sentinel; the indexer overwrites valid rows each step
         fm.c4_topk_indices.fill_(-1)
 
         self.forward_metadata = fm
@@ -1325,7 +1331,6 @@ class DeepseekV4AscendAttnBackend(
         if forward_batch.forward_mode.is_idle():
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
-            fm.actual_seq_lengths_q_cmp = None
             fm.kernel_metadata = {}
             return
 
@@ -1383,12 +1388,6 @@ class DeepseekV4AscendAttnBackend(
         else:
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
-
-        fm.actual_seq_lengths_q_cmp = (
-            fm.actual_seq_lengths_q_pa.clone()
-            if fm.actual_seq_lengths_q_pa is not None
-            else None
-        )
 
         fm.swa_page_table = (
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
@@ -1475,6 +1474,7 @@ class DeepseekV4AscendAttnBackend(
             )
 
             if actual_seq_lengths_q_pa is not None:
+                # the indexer metadata op wants a fresh contiguous tensor without the leading 0
                 actual_q = actual_seq_lengths_q_pa[1:].clone()
             else:
                 actual_q = actual_seq_lengths_kv
@@ -1521,8 +1521,10 @@ class DeepseekV4AscendAttnBackend(
             raise ValueError(
                 f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
             )
+        # idle ranks only feed the MoE collectives; skip attn + store_cache and return zeros
         if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(q)
+        # MQALayer prepass already stores K and passes save_kv_cache=False; True callers still get the write
         if save_kv_cache:
             self.store_cache(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
@@ -1619,6 +1621,7 @@ class DeepseekV4AscendAttnBackend(
             cmp_kv=cmp_kv,
             cmp_block_table=cmp_block_table,
         )
+        # c4 attends via indexer topk; c128 reads the full compressed history
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
@@ -2015,20 +2018,6 @@ class DeepseekV4AscendMultiStepDraftBackend:
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
-
-        self.common_template(forward_batch, call_fn)
-
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
 
         self.common_template(forward_batch, call_fn)
 
