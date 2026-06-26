@@ -146,8 +146,8 @@ if not _is_hip:
 
 from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_helpers import (
     is_cp_kv_layer_split_deepseek_v4_pool,
-    maybe_finish_cp_kv_swa_for_read,
-    maybe_start_cp_kv_swa_for_read,
+    maybe_prefetch_cp_kv_swa,
+    maybe_wait_cp_kv_swa_prefetch,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -1150,9 +1150,7 @@ class MQALayer(MqaAttentionBase):
                 )
                 kv = None
 
-        maybe_start_cp_kv_swa_for_read(
-            get_token_to_kv_pool(), self.layer_id, forward_batch
-        )
+        maybe_prefetch_cp_kv_swa(get_token_to_kv_pool(), self.layer_id, forward_batch)
 
         del qkv_a
 
@@ -1271,7 +1269,7 @@ class MQALayer(MqaAttentionBase):
                     x_quant=x_quant,
                 )
             kv = None
-            maybe_start_cp_kv_swa_for_read(
+            maybe_prefetch_cp_kv_swa(
                 get_token_to_kv_pool(), self.layer_id, forward_batch
             )
         else:
@@ -1285,7 +1283,7 @@ class MQALayer(MqaAttentionBase):
             )
 
         if not has_tokens:
-            maybe_finish_cp_kv_swa_for_read(
+            maybe_wait_cp_kv_swa_prefetch(
                 get_token_to_kv_pool(), self.layer_id, forward_batch
             )
             assert (
@@ -1298,7 +1296,7 @@ class MQALayer(MqaAttentionBase):
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
-        maybe_finish_cp_kv_swa_for_read(
+        maybe_wait_cp_kv_swa_prefetch(
             get_token_to_kv_pool(), self.layer_id, forward_batch
         )
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (

@@ -19,7 +19,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestCpKvLayerSplitOwnership(CustomTestCase):
-    def test_owner_boundaries_for_contiguous_blocks(self):
+    def test_owner_boundaries_for_balanced_contiguous_blocks(self):
         self.assertEqual(layers_per_cp_rank(60, 4), 15)
         self.assertEqual(layers_per_cp_rank(61, 4), 16)
 
@@ -27,6 +27,15 @@ class TestCpKvLayerSplitOwnership(CustomTestCase):
         self.assertEqual(kv_layer_owner(14, 4, 60), 0)
         self.assertEqual(kv_layer_owner(15, 4, 60), 1)
         self.assertEqual(kv_layer_owner(59, 4, 60), 3)
+
+        self.assertEqual(kv_layer_owner(0, 4, 10), 0)
+        self.assertEqual(kv_layer_owner(2, 4, 10), 0)
+        self.assertEqual(kv_layer_owner(3, 4, 10), 1)
+        self.assertEqual(kv_layer_owner(5, 4, 10), 1)
+        self.assertEqual(kv_layer_owner(6, 4, 10), 2)
+        self.assertEqual(kv_layer_owner(7, 4, 10), 2)
+        self.assertEqual(kv_layer_owner(8, 4, 10), 3)
+        self.assertEqual(kv_layer_owner(9, 4, 10), 3)
 
     def test_owned_range_respects_pipeline_stage_slice(self):
         # GPU runs layers [20, 40); CP rank 1 owns global KV layers [15, 30).
@@ -36,8 +45,19 @@ class TestCpKvLayerSplitOwnership(CustomTestCase):
 
     def test_uneven_model_layers_are_accounted_once(self):
         counts = [num_owned_kv_layers(r, 4, 61, 0, 61) for r in range(4)]
-        self.assertEqual(counts, [16, 16, 16, 13])
+        self.assertEqual(counts, [16, 15, 15, 15])
         self.assertEqual(sum(counts), 61)
+
+        counts = [num_owned_kv_layers(r, 4, 10, 0, 10) for r in range(4)]
+        self.assertEqual(counts, [3, 3, 2, 2])
+        self.assertEqual(sum(counts), 10)
+
+    def test_more_cp_ranks_than_layers_leave_tail_ranks_empty(self):
+        counts = [num_owned_kv_layers(r, 4, 2, 0, 2) for r in range(4)]
+        self.assertEqual(counts, [1, 1, 0, 0])
+
+        self.assertEqual(owned_kv_layer_range(2, 4, 2, 0, 2), (0, 0))
+        self.assertEqual(build_owned_layer_local_index_map(2, 4, 2, 0, 2), {})
 
     def test_owned_layer_local_index_map_respects_stage_slice(self):
         full = build_owned_layer_local_index_map(1, 4, 60, 0, 60)
