@@ -40,11 +40,13 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_xpu,
     next_power_of_2,
 )
 
 _is_cuda = is_cuda()
 _is_gfx942 = is_gfx942_supported()
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
@@ -202,7 +204,7 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        if self.use_mla:
+        if self.use_mla and not _is_xpu:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
                 self.device_core_count,
@@ -541,7 +543,7 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped on the draft-extend path).
         # Triton extend kernel receives extend K/V as separate tensors, so
         # kv_indptr/kv_indices must cover only the prefix portion.
         # extend_seq_lens_tensor is only attached to spec_info at real

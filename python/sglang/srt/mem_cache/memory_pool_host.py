@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    sync_fixed_hicache_size,
     synchronized,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -1435,7 +1436,9 @@ class MambaPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
 
