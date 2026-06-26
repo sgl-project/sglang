@@ -56,13 +56,10 @@ def enable_tc_piecewise_cuda_graph():
     try:
         yield
     except Exception as exc:
-        logger.error(
-            "%s\n%s",
-            type(exc).__name__ + ": " + str(exc),
-            PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
-                backend=Backend.TC_PIECEWISE, suggestions=TCPCG_FAILURE_HINT
-            ),
+        msg = PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
+            backend=Backend.TC_PIECEWISE, suggestions=TCPCG_FAILURE_HINT
         )
+        logger.error(f"{type(exc).__name__}: {exc}\n{msg}")
         raise
     finally:
         _in_tc_piecewise_cuda_graph = False

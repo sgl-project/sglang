@@ -42,13 +42,10 @@ def enable_breakable_cuda_graph():
     try:
         yield
     except Exception as exc:
-        logger.error(
-            "%s\n%s",
-            type(exc).__name__ + ": " + str(exc),
-            PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
-                backend=Backend.BREAKABLE, suggestions=BCG_FAILURE_HINT
-            ),
+        msg = PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
+            backend=Backend.BREAKABLE, suggestions=BCG_FAILURE_HINT
         )
+        logger.error(f"{type(exc).__name__}: {exc}\n{msg}")
         raise
     finally:
         _in_breakable_cuda_graph = False
