@@ -169,8 +169,8 @@ def run_evalscope(
 
         if "accuracy" not in metrics:
             accuracy_patterns = [
-                r"mean_acc\s*.*?鈹俓s*\d+\s*鈹俓s*([\d.]+)\s*鈹?,
-                r"鈹俓s+([\d.]+)\s+鈹俓s+\S+\s+鈹俓s*$",
+                r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
+                r"│\s+([\d.]+)\s+│\s+\S+\s+│\s*$",
                 r"accuracy\s*[:=]?\s*([\d.]+)",
                 r"Accuracy\s*[:=]?\s*([\d.]+)",
                 r"score\s*[:=]?\s*([\d.]+)",
