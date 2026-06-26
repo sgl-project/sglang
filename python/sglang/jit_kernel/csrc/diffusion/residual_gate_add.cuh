@@ -6,6 +6,9 @@
 // The production shapes come from LTX-2.3 HQ residual/gate updates.  This is
 // intentionally narrow: contiguous residual/update/out tensors, with either a
 // full contiguous gate or a row-broadcast [1, 1, D] gate.
+//
+// Developed with MIT HAN Lab Kernel Design Agents:
+// https://github.com/mit-han-lab/kernel-design-agents
 
 #pragma once
 
