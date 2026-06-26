@@ -25,6 +25,11 @@ import tabulate
 _FWD_OCCUPANCY_RE = re.compile(
     r"^sglang:fwd_occupancy(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
 )
+# num_running_reqs across all dp ranks; samples taken while this > 1
+# are co-batched with foreign traffic and discarded (single-batch gate).
+_NUM_RUNNING_REQS_RE = re.compile(
+    r"^sglang:num_running_reqs(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
+)
 _GENERATE_REQUEST_TIMEOUT = 600
 _METRICS_REQUEST_TIMEOUT = 10
 # How long to wait for background requests (e.g. a sibling test method's
@@ -61,16 +66,19 @@ class FwdOccupancyMixin:
     )
 
     def _scrape_fwd_occupancy(self):
-        """Max non-NaN gauge value across exposed labels (e.g. dp ranks);
-        None on transient scrape failure."""
+        """(max non-NaN fwd_occupancy across labels, total running reqs).
+
+        Both come from the same /metrics pull. ``running`` (None on scrape
+        failure) is the single-batch gate: samples collected while it > 1
+        were co-batched with foreign traffic and must be discarded."""
         try:
             resp = requests.get(
                 self.base_url + "/metrics", timeout=_METRICS_REQUEST_TIMEOUT
             )
         except requests.RequestException:
-            return None
+            return None, None
         if resp.status_code != 200:
-            return None
+            return None, None
         vals = []
         for raw in _FWD_OCCUPANCY_RE.findall(resp.text):
             try:
@@ -79,7 +87,14 @@ class FwdOccupancyMixin:
                 continue
             if v == v:  # NaN filter (gauge resets to NaN on window boundary)
                 vals.append(v)
-        return max(vals) if vals else None
+        occ = max(vals) if vals else None
+        running = 0
+        for raw in _NUM_RUNNING_REQS_RE.findall(resp.text):
+            try:
+                running += int(float(raw))
+            except ValueError:
+                continue
+        return occ, running
 
     def _assert_metrics_device_timer_enabled(self):
         """Fail loudly on missing flag/env -- otherwise a NaN-only gauge
@@ -162,7 +177,11 @@ class FwdOccupancyMixin:
 
     def _fwd_occupancy_measure(self):
         """Background-fire one long single-batch request, scrape
-        /metrics on the foreground; return (non-NaN samples, perf)."""
+        /metrics on the foreground; return (non-NaN samples, perf).
+
+        The single-batch invariant is hard: if any other request is ever
+        co-batched with ours (running > 1) the gauge is corrupted, so we
+        abort immediately rather than emit a bogus number."""
         samples = []
         request_done = threading.Event()
         result = {"meta_info": None, "elapsed": 0.0}
@@ -180,8 +199,16 @@ class FwdOccupancyMixin:
         firer.start()
 
         while not request_done.is_set():
-            v = self._scrape_fwd_occupancy()
-            if v is not None:
+            v, running = self._scrape_fwd_occupancy()
+            if v is not None and running is not None:
+                if running > 1:
+                    firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
+                    raise AssertionError(
+                        f"single-batch invariant violated: {running} reqs running "
+                        f"during measurement (expected 1). fwd_occupancy is a bs=1 "
+                        "metric and concurrent traffic corrupts it -- a sibling "
+                        "process/test is hitting this shared server."
+                    )
                 samples.append(v)
             time.sleep(self.fwd_occupancy_scrape_interval)
 
