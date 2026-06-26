@@ -447,6 +447,48 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    def test_add_one_req_rejects_second_chunked_prefill_when_one_in_flight(self):
+        # A request whose input exceeds rem_chunk_tokens is admitted as a chunked
+        # prefill. At most one chunked prefill may be in flight at a time (asserted
+        # downstream as `assert self.chunked_req is None`). When has_chunked_req is
+        # True, add_one_req must reject a second one instead of creating it.
+        self.mock_token_allocator.available_size.return_value = 1000
+
+        def make_req(rid):
+            req = self.create_mock_req(rid, priority=0, max_new_tokens=16)
+            req.host_hit_length = 0
+            req.prefix_indices = []
+            # input (100) > rem_chunk_tokens (32) -> takes the chunked-prefill path
+            req.full_untruncated_fill_ids = list(range(100))
+            req.last_node = MagicMock()
+            req.sampling_params.ignore_eos = False
+            return req
+
+        # Baseline: with no chunked req in flight the request IS admitted as a
+        # chunked prefill (confirms rem_chunk_tokens is large enough to chunk).
+        adder_ok = self.create_adder(
+            self.create_running_batch([]),
+            rem_input_tokens=10000,
+            rem_chunk_tokens=32,
+        )
+        adder_ok.add_one_req(
+            make_req("ok"), has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertIsNotNone(adder_ok.new_chunked_req)
+
+        # Guard: a chunked prefill is already in flight -> the same request is
+        # rejected (OTHER) and no second chunked prefill is created.
+        adder_guard = self.create_adder(
+            self.create_running_batch([]),
+            rem_input_tokens=10000,
+            rem_chunk_tokens=32,
+        )
+        result = adder_guard.add_one_req(
+            make_req("guard"), has_chunked_req=True, truncation_align_size=None
+        )
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertIsNone(adder_guard.new_chunked_req)
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,

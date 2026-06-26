@@ -993,6 +993,11 @@ class PrefillAdder:
                     req.retracted_stain,
                 )
             else:
+                # Only one chunked prefill may be in flight at a time (asserted
+                # downstream). Reject a second one explicitly instead of relying
+                # on the chunk budget to make this branch unreachable.
+                if has_chunked_req:
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
