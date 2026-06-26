@@ -1,7 +1,9 @@
-"""Cross-framework comparison benchmark for diffusion serving.
+"""Diffusion serving benchmark for SGLang-Diffusion nightly CI.
 
-Launches servers (SGLang, vLLM-Omni, LightX2V) for each test case, sends a
-single request, measures end-to-end latency, and writes comparison-results.json.
+Launches an SGLang-Diffusion server for each test case, sends a single
+request, measures end-to-end latency, and writes comparison-results.json.
+The runner still supports extra frameworks via --frameworks, but the nightly
+config tracks SGLang-Diffusion only.
 
 Usage:
     # Full run (requires GPU)
@@ -964,7 +966,7 @@ def run_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cross-framework diffusion serving comparison benchmark"
+        description="SGLang-Diffusion serving benchmark (nightly CI)"
     )
     parser.add_argument(
         "--config",
