@@ -167,6 +167,7 @@ from sglang.srt.managers.prefill_delayer import (
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
+    NextBatchPlan,
     Req,
     ScheduleBatch,
 )
@@ -1528,7 +1529,11 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run(last_batch=self.last_batch)
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -1569,7 +1574,11 @@ class Scheduler(
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run(last_batch=self.last_batch)
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
@@ -2604,14 +2613,14 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(
-        self, last_batch: Optional[ScheduleBatch]
-    ) -> Optional[ScheduleBatch]:
+        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
-        self._abort_on_running_timeout(self.running_batch)
+        self._abort_on_running_timeout(running_batch)
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -2640,13 +2649,13 @@ class Scheduler(
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
-                if self.running_batch.is_empty():
-                    self.running_batch = new_batch
+                if running_batch.is_empty():
+                    running_batch = new_batch
                 else:
-                    self.running_batch.merge_batch(new_batch)
-                self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+                    running_batch.merge_batch(new_batch)
+                running_batch.hisparse_coordinator = self.hisparse_coordinator
             # Reset batch_is_full so the scheduler can schedule more prefills.
-            self.running_batch.batch_is_full = False
+            running_batch.batch_is_full = False
 
         if (
             not self.enable_hisparse
@@ -2667,31 +2676,31 @@ class Scheduler(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
             if last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
+                running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
             if not last_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = last_batch
+                if running_batch.is_empty():
+                    running_batch = last_batch
                 else:
                     # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(last_batch)
+                    running_batch.merge_batch(last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
         # for load reporting (num_running_reqs via /v1/loads).
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
-        if self.running_batch.is_prefill_only:
-            self.running_batch.filter_batch()
-            if self.running_batch.is_empty():
-                self.running_batch.batch_is_full = False
+        if running_batch.is_prefill_only:
+            running_batch.filter_batch()
+            if running_batch.is_empty():
+                running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
-            new_batch = self.get_new_batch_dllm(self.running_batch)
+            new_batch = self.get_new_batch_dllm(running_batch)
         else:
-            new_batch, self.running_batch = self.get_new_batch_prefill(
-                self.running_batch
+            new_batch, running_batch = self.get_new_batch_prefill(
+                running_batch
             )
 
         need_mlp_sync = self.require_mlp_sync
@@ -2713,11 +2722,11 @@ class Scheduler(
         else:
             # Run decode (skip for prefill-only batches)
             if (
-                not self.running_batch.is_empty()
-                and not self.running_batch.is_prefill_only
+                not running_batch.is_empty()
+                and not running_batch.is_prefill_only
             ):
-                self.running_batch = self.update_running_batch(self.running_batch)
-                ret = self.running_batch if not self.running_batch.is_empty() else None
+                running_batch = self.update_running_batch(running_batch)
+                ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
 
@@ -2734,7 +2743,7 @@ class Scheduler(
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
-        return ret
+        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
