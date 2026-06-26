@@ -1147,70 +1147,100 @@ class HiRadixCache(RadixCache):
         start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
-        while node.evicted:
-            assert (
-                node.backuped
-            ), "No backup available on evicted nodes, should not happen"
-            nodes_to_load.insert(0, node)
-            node = node.parent
-        else:
-            ancester_node = node
+        protected_host_nodes = []
+        ancester_node = None
+        ancestor_locked = False
 
-        # protect the ancestor nodes from eviction
-        result = self.inc_lock_ref(ancester_node)
-        delta = result.delta
+        try:
+            while node.evicted:
+                node.protect_host()
+                protected_host_nodes.append(node)
+                self.evictable_host_leaves.discard(node)
+                if not node.backuped:
+                    logger.warning(
+                        "load_back: skip evicted node %d without host backup "
+                        "(last_hit_node=%d)",
+                        node.id,
+                        last_hit_node.id,
+                    )
+                    return None
+                nodes_to_load.insert(0, node)
+                node = node.parent
+            else:
+                ancester_node = node
 
-        # load it all or not at all
-        host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
-            len(host_indices) > mem_quota + delta if mem_quota is not None else False
-        ):
-            # skip loading back if the total size is too small or exceeding the memory quota
-            self.dec_lock_ref(ancester_node)
-            return None
+            # protect the ancestor nodes from eviction
+            result = self.inc_lock_ref(ancester_node)
+            ancestor_locked = True
+            delta = result.delta
 
-        device_indices = self.cache_controller.load(
-            host_indices=host_indices,
-            node_id=last_hit_node.id,
-            **self._get_extra_pools(),
-        )
-        if device_indices is None:
-            self.evict(EvictParams(num_tokens=len(host_indices)))
+            # load it all or not at all
+            host_values = [n.host_value for n in nodes_to_load]
+            if any(v is None for v in host_values):
+                logger.warning(
+                    "load_back: host backup disappeared while protecting node %d",
+                    last_hit_node.id,
+                )
+                return None
+            host_lengths = [len(v) for v in host_values]
+            host_indices = torch.cat(host_values)
+            if len(host_indices) < self.load_back_threshold or (
+                len(host_indices) > mem_quota + delta
+                if mem_quota is not None
+                else False
+            ):
+                # skip loading back if the total size is too small or exceeding the memory quota
+                return None
+
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
                 **self._get_extra_pools(),
             )
-        self.dec_lock_ref(ancester_node)
-        if device_indices is None:
-            # no sufficient GPU memory to load back KV caches
-            logger.warning(
-                "load_back: FAILED to load %d tokens for node %d "
-                "even after eviction (evictable_size=%d)",
-                len(host_indices),
-                last_hit_node.id,
-                self.evictable_size_,
-            )
-            return None
+            if device_indices is None:
+                self.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices,
+                    node_id=last_hit_node.id,
+                    **self._get_extra_pools(),
+                )
+            if device_indices is None:
+                # no sufficient GPU memory to load back KV caches
+                logger.warning(
+                    "load_back: FAILED to load %d tokens for node %d "
+                    "even after eviction (evictable_size=%d)",
+                    len(host_indices),
+                    last_hit_node.id,
+                    self.evictable_size_,
+                )
+                return None
 
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
-        offset = 0
-        for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)].clone()
-            offset += len(node.host_value)
-            # Block promoted from host to GPU -- emit store(GPU) so downstream
-            # indexers see it as device-local again.
-            self._record_store_event(node, medium=StorageMedium.GPU)
-        self.evictable_size_ += len(device_indices)
-        self.inc_lock_ref(last_hit_node)
+            self.ongoing_load_back[last_hit_node.id] = last_hit_node
+            offset = 0
+            for node, node_len in zip(nodes_to_load, host_lengths):
+                node.value = device_indices[offset : offset + node_len].clone()
+                offset += node_len
+                # Block promoted from host to GPU -- emit store(GPU) so downstream
+                # indexers see it as device-local again.
+                self._record_store_event(node, medium=StorageMedium.GPU)
+            self.evictable_size_ += len(device_indices)
+            self.inc_lock_ref(last_hit_node)
 
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_load_back_duration(
+                    time.perf_counter() - start_time
+                )
+                self.metrics_collector.increment_load_back_num_tokens(
+                    len(device_indices)
+                )
 
-        return device_indices
+            return device_indices
+        finally:
+            if ancestor_locked:
+                self.dec_lock_ref(ancester_node)
+            for protected_node in protected_host_nodes:
+                protected_node.release_host()
+                self._update_host_leaf_status(protected_node)
 
     def init_load_back(
         self,
