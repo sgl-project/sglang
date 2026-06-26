@@ -37,6 +37,10 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.epv2 import (
+        EpV2CombineInput,
+        EpV2DispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -94,6 +98,7 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    hidden_states_scale_tma_aligned: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -185,6 +190,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         K = hidden_states_shape[1]
         scale_block_size = 128
 
+        if all_tokens == 0:
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            return torch.empty(
+                (0, K), device=hidden_states_device, dtype=torch.bfloat16
+            )
+
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
         )
@@ -200,7 +212,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if (
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and not runner_input.hidden_states_scale_tma_aligned
+        ):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -217,6 +232,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
+            use_contig_swizzle = self.use_swizzle and not running_state.get(
+                "epv2_disable_contig_swizzle", False
+            )
 
             down_input_fp8 = torch.empty(
                 (all_tokens, N // 2),
@@ -239,7 +257,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 swiglu_limit=swiglu_limit_arg,
-                swizzle=self.use_swizzle,
+                swizzle=use_contig_swizzle,
             )
             del gateup_output
         else:
@@ -937,3 +955,227 @@ def _apply_swiglu_limit(
     out = torch.cat([gate, up], dim=-1)
     assert out.shape == (num_tokens, hidden_size_x2)
     return out
+
+
+@register_pre_permute("epv2", "deep_gemm")
+def pre_permute_epv2_to_deep_gemm(
+    dispatch_output: EpV2DispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        ep_expand_init_m_indices_from_psum,
+        ep_scatter,
+        ep_scatter_from_psum,
+    )
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        num_recv_tokens_per_expert,
+        psum_num_recv_tokens_per_expert,
+        is_expanded,
+        hidden_states_scale_tma_aligned,
+        epv2_use_masked,
+        epv2_expected_m,
+        epv2_masked_max_m,
+        epv2_total_expanded,
+        epv2_expert_alignment,
+    ) = dispatch_output
+    if hidden_states_scale is None:
+        raise RuntimeError(
+            "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
+            "Use --epv2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
+        )
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        # The MegaMoE memory optimization enables a swizzled activation kernel
+        # for its gran=8 interleaved gate/up layout. EPv2's contiguous adapter
+        # is validated with the non-swizzled activation layout; using the
+        # swizzled reader here mixes gate/up pairs and breaks generation.
+        running_state["epv2_disable_contig_swizzle"] = True
+    assert runner_config.activation == "silu"
+
+    if is_expanded:
+        if psum_num_recv_tokens_per_expert is None:
+            raise RuntimeError(
+                "EPv2 expanded layout requires native expert prefix sums."
+            )
+        all_tokens = hidden_states.shape[0]
+        running_state["all_tokens"] = all_tokens
+        running_state["hidden_states_shape"] = hidden_states.shape
+        running_state["hidden_states_device"] = hidden_states.device
+        running_state["hidden_states_dtype"] = hidden_states.dtype
+        running_state["topk_ids"] = None
+        running_state["topk_weights"] = topk_weights
+        running_state["epv2_expanded"] = True
+
+        if epv2_use_masked:
+            # Masked-GEMM bridge: repack the expanded expert-packed buffer into a
+            # regular [E_local, max_m, hidden] slab so DeepGEMM's masked grouped
+            # GEMM bounds compute by per-expert real counts (masked_m), decoupled
+            # from the dispatch capacity. Static shapes -> cuda-graph safe.
+            from sglang.srt.layers.moe.ep_moe.kernels import expand_to_masked_slab
+
+            num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
+            slab, slab_scale, masked_m = expand_to_masked_slab(
+                hidden_states,
+                hidden_states_scale,
+                psum_num_recv_tokens_per_expert,
+                num_local_experts,
+                epv2_masked_max_m,
+                epv2_expert_alignment,
+            )
+            running_state["epv2_masked"] = True
+            running_state["epv2_psum"] = psum_num_recv_tokens_per_expert
+            running_state["epv2_total_expanded"] = epv2_total_expanded
+            running_state["epv2_expert_alignment"] = epv2_expert_alignment
+            return DeepGemmRunnerInput(
+                hidden_states=slab,
+                hidden_states_scale=slab_scale,
+                use_masked_gemm=True,
+                masked_m=masked_m,
+                expected_m=epv2_expected_m,
+                hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
+            )
+
+        # do_cpu_sync=False -> recv buffer is worst-case sized; ep_expand_init only
+        # writes real-token slots, so pre-fill the tail with -1 to skip padding rows.
+        m_indices = torch.full(
+            (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
+        )
+        ep_expand_init_m_indices_from_psum(psum_num_recv_tokens_per_expert, m_indices)
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=False,
+            m_indices=m_indices,
+            hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
+        )
+
+    if psum_num_recv_tokens_per_expert is not None:
+        all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
+        num_recv_tokens_per_expert_gpu = None
+    else:
+        num_recv_tokens_per_expert = [
+            ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
+        ]
+        all_tokens = sum(num_recv_tokens_per_expert)
+        num_recv_tokens_per_expert_gpu = torch.tensor(
+            num_recv_tokens_per_expert, dtype=torch.int32, pin_memory=True, device="cpu"
+        ).cuda(non_blocking=True)
+    K = hidden_states.shape[1]
+    running_state["all_tokens"] = all_tokens
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    input_tensor = torch.zeros(
+        (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        input_tensor_scale = torch.zeros(
+            (ceil_div(K // 128, 4), all_tokens),
+            device=hidden_states.device,
+            dtype=torch.int,
+        ).transpose(0, 1)
+    else:
+        input_tensor_scale = torch.zeros(
+            (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
+        )
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    output_index = torch.empty_like(topk_ids)
+    if psum_num_recv_tokens_per_expert is not None:
+        expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
+        ep_scatter_from_psum(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            psum_num_recv_tokens_per_expert,
+            expert_start_loc,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    else:
+        expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+        ep_scatter(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            num_recv_tokens_per_expert_gpu,
+            expert_start_loc,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    dispose_tensor(hidden_states)
+    dispose_tensor(hidden_states_scale)
+    running_state["output_index"] = output_index
+
+    return DeepGemmRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "epv2")
+def post_permute_deep_gemm_to_epv2(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> EpV2CombineInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
+    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2CombineInput
+
+    if running_state.get("epv2_expanded", False):
+        hidden_states = runner_output.hidden_states
+        topk_weights = running_state["topk_weights"]
+        if running_state.get("epv2_masked", False):
+            # Masked path: GEMM output is the [E_local, max_m, hidden] slab. Repack
+            # it back to expanded row order (padding rows zeroed) before combine.
+            from sglang.srt.layers.moe.ep_moe.kernels import masked_slab_to_expand
+
+            hidden_states = masked_slab_to_expand(
+                hidden_states,
+                running_state["epv2_psum"],
+                running_state["epv2_total_expanded"],
+                running_state["epv2_expert_alignment"],
+                topk_weights=topk_weights,
+            )
+            return EpV2CombineInput(hidden_states, None, None)
+        if topk_weights is not None:
+            # Expanded combine does not consume top-k weights, so apply them to
+            # each expert slot before combine. Keep this out-of-place until the
+            # runner/communication buffer reuse contract is explicitly audited.
+            hidden_states = hidden_states * topk_weights.to(
+                hidden_states.dtype
+            ).unsqueeze(-1)
+        return EpV2CombineInput(hidden_states, None, None)
+
+    hidden_states = runner_output.hidden_states
+    topk_ids = running_state["topk_ids"]
+    topk_weights = running_state["topk_weights"]
+    output_index = running_state["output_index"]
+    gather_out = torch.empty(
+        running_state["hidden_states_shape"],
+        device=running_state["hidden_states_device"],
+        dtype=torch.bfloat16,
+    )
+    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+    return EpV2CombineInput(
+        hidden_states=gather_out,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
