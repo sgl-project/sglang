@@ -7,6 +7,10 @@ asserts median above a threshold. Single-batch is where CPU overhead
 dominates -- overlap scheduler / cuda graph regressions surface here
 before batched throughput moves.
 
+The gauge is meaningless if any other request shares the batch, so the
+kit waits for an idle server before measuring and aborts if concurrent
+traffic appears mid-window.
+
 Prerequisites on the consuming server:
     env:          SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
     server flag:  --enable-metrics
@@ -25,16 +29,11 @@ import tabulate
 _FWD_OCCUPANCY_RE = re.compile(
     r"^sglang:fwd_occupancy(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
 )
-# num_running_reqs across all dp ranks; samples taken while this > 1
-# are co-batched with foreign traffic and discarded (single-batch gate).
 _NUM_RUNNING_REQS_RE = re.compile(
     r"^sglang:num_running_reqs(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE
 )
 _GENERATE_REQUEST_TIMEOUT = 600
 _METRICS_REQUEST_TIMEOUT = 10
-# How long to wait for background requests (e.g. a sibling test method's
-# long-running batch) to drain before starting the single-batch
-# measurement. The gauge is meaningless if other reqs share the batch.
 _IDLE_WAIT_TIMEOUT = 60
 _IDLE_POLL_INTERVAL = 0.5
 
@@ -46,31 +45,19 @@ class FwdOccupancyMixin:
     fwd_occupancy_min_samples: int = 5
     fwd_occupancy_scrape_interval: float = 0.5
 
-    # Spec-decoding accept-length floor. Only enforced when the server
-    # is running with a spec algorithm (avg_spec_accept_length present
-    # in /server_info); silently skipped otherwise. EAGLE3 3/1/4 on
-    # 5090 + Llama-3.1-8B measured ~2.0 in CI; 1.8 leaves a small
-    # buffer while still catching silent fallback to vanilla (~1.0).
+    # Spec accept-length floor, only enforced under a spec algorithm.
     fwd_occupancy_acc_length_threshold: float = 1.8
 
-    # Warmup: one short request to fill cuda graphs + get the
-    # device-timer past its first NaN window.
     fwd_occupancy_warmup_max_new_tokens: int = 64
     fwd_occupancy_warmup_settle_seconds: float = 1.0
-
-    # Measurement: one long single-batch request -- max_new_tokens must
-    # span several decode_log_interval windows for enough samples.
     fwd_occupancy_max_new_tokens: int = 2048
     fwd_occupancy_prompt: str = (
         "Human: Give me a fully functional FastAPI server. Show the python code.\n\nAssistant:"
     )
 
-    def _scrape_fwd_occupancy(self):
-        """(max non-NaN fwd_occupancy across labels, total running reqs).
-
-        Both come from the same /metrics pull. ``running`` (None on scrape
-        failure) is the single-batch gate: samples collected while it > 1
-        were co-batched with foreign traffic and must be discarded."""
+    def _scrape(self):
+        """Return (max non-NaN occupancy across labels, total running reqs),
+        (None, None) on scrape failure."""
         try:
             resp = requests.get(
                 self.base_url + "/metrics", timeout=_METRICS_REQUEST_TIMEOUT
@@ -79,45 +66,37 @@ class FwdOccupancyMixin:
             return None, None
         if resp.status_code != 200:
             return None, None
-        vals = []
-        for raw in _FWD_OCCUPANCY_RE.findall(resp.text):
-            try:
-                v = float(raw)
-            except ValueError:
-                continue
-            if v == v:  # NaN filter (gauge resets to NaN on window boundary)
-                vals.append(v)
+        vals = [
+            float(v)
+            for v in _FWD_OCCUPANCY_RE.findall(resp.text)
+            if float(v) == float(v)  # NaN filter (gauge resets at window boundary)
+        ]
         occ = max(vals) if vals else None
-        running = 0
-        for raw in _NUM_RUNNING_REQS_RE.findall(resp.text):
-            try:
-                running += int(float(raw))
-            except ValueError:
-                continue
+        try:
+            running = sum(
+                int(float(v)) for v in _NUM_RUNNING_REQS_RE.findall(resp.text)
+            )
+        except ValueError:
+            running = 0
         return occ, running
 
     def _assert_metrics_device_timer_enabled(self):
-        """Fail loudly on missing flag/env -- otherwise a NaN-only gauge
-        looks like a real occupancy regression."""
+        """Fail loudly on missing flag/env -- a NaN-only gauge looks like a
+        real occupancy regression."""
         resp = requests.get(
             self.base_url + "/metrics", timeout=_METRICS_REQUEST_TIMEOUT
         )
-        if resp.status_code != 200:
-            raise AssertionError(
-                f"/metrics returned {resp.status_code}; the test class's "
-                "server must be launched with --enable-metrics"
-            )
-        if "sglang:fwd_occupancy" not in resp.text:
-            raise AssertionError(
-                "sglang:fwd_occupancy gauge not exposed; set "
-                "SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 in the server's env "
-                "and pass --enable-metrics"
-            )
+        assert (
+            resp.status_code == 200
+        ), f"/metrics returned {resp.status_code}; launch with --enable-metrics"
+        assert "sglang:fwd_occupancy" in resp.text, (
+            "sglang:fwd_occupancy not exposed; set "
+            "SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 and pass --enable-metrics"
+        )
 
-    def _fwd_occupancy_fire(self, prompt: str, max_new_tokens: int):
-        """Fire one /generate, return (meta_info, wall_time). Not
-        concurrent -- breaks the single-batch invariant. ``meta_info``
-        is None on failure."""
+    def _fire(self, prompt: str, max_new_tokens: int):
+        """Fire one /generate, return (meta_info, wall_time); (None, 0.0) on
+        failure. Not concurrent -- breaks the single-batch invariant."""
         t0 = time.perf_counter()
         try:
             resp = requests.post(
@@ -133,69 +112,55 @@ class FwdOccupancyMixin:
                 timeout=_GENERATE_REQUEST_TIMEOUT,
             )
         except requests.RequestException:
-            # Individual fire failure isn't the signal; stats-vs-threshold is.
             return None, 0.0
         elapsed = time.perf_counter() - t0
         try:
-            meta_info = resp.json().get("meta_info", {})
+            return resp.json().get("meta_info", {}), elapsed
         except ValueError:  # non-JSON body
-            meta_info = {}
-        return meta_info, elapsed
+            return {}, elapsed
 
-    def _fwd_occupancy_warmup(self):
+    def _warmup(self):
         """Fill cuda graphs + step the device-timer past its first NaN
-        window before measurement starts."""
-        self._fwd_occupancy_fire(
+        window."""
+        self._fire(
             "warmup " + self.fwd_occupancy_prompt,
             self.fwd_occupancy_warmup_max_new_tokens,
         )
         time.sleep(self.fwd_occupancy_warmup_settle_seconds)
 
     def _wait_for_idle(self):
-        """Block until no running/waiting reqs remain. The gauge is a
-        single-batch signal; concurrent traffic from a sibling test method
-        (e.g. a long-running eval batch) silently corrupts it. Fails
-        loudly instead of emitting a bogus regression."""
+        """Block until the server holds no running/waiting reqs. The gauge is
+        a single-batch signal; concurrent traffic corrupts it."""
         deadline = time.perf_counter() + _IDLE_WAIT_TIMEOUT
-        num_reqs = -1
         while time.perf_counter() < deadline:
             try:
                 resp = requests.get(
                     self.base_url + "/get_load", timeout=_METRICS_REQUEST_TIMEOUT
                 )
                 resp.raise_for_status()
-                load = resp.json()
+                if sum(dp.get("num_reqs", 0) for dp in resp.json()) == 0:
+                    return
             except (requests.RequestException, ValueError):
-                # Transient scrape failure -- retry, don't assume idle.
-                time.sleep(_IDLE_POLL_INTERVAL)
-                continue
-            num_reqs = sum(dp.get("num_reqs", 0) for dp in load)
-            if num_reqs == 0:
-                return
+                pass  # transient scrape failure -- retry, don't assume idle
             time.sleep(_IDLE_POLL_INTERVAL)
         raise AssertionError(
-            f"server not idle after {_IDLE_WAIT_TIMEOUT}s ({num_reqs} reqs still "
-            "running/waiting); fwd_occupancy is a single-batch metric and cannot "
-            "be measured with concurrent traffic -- another test method's "
-            "batch may still be draining on this shared server"
+            f"server not idle after {_IDLE_WAIT_TIMEOUT}s; fwd_occupancy is a "
+            "single-batch metric -- concurrent traffic must drain first"
         )
 
-    def _fwd_occupancy_measure(self):
-        """Background-fire one long single-batch request, scrape
-        /metrics on the foreground; return (non-NaN samples, perf).
-
-        The single-batch invariant is hard: if any other request is ever
-        co-batched with ours (running > 1) the gauge is corrupted, so we
-        abort immediately rather than emit a bogus number."""
+    def _measure(self):
+        """Background-fire one long single-batch request, scrape /metrics on
+        the foreground; return (non-NaN samples, perf). Aborts immediately if
+        any foreign request shares the batch (single-batch is a hard
+        invariant)."""
         samples = []
         request_done = threading.Event()
         result = {"meta_info": None, "elapsed": 0.0}
 
         def fire_one():
             try:
-                result["meta_info"], result["elapsed"] = self._fwd_occupancy_fire(
-                    self.fwd_occupancy_prompt,
-                    self.fwd_occupancy_max_new_tokens,
+                result["meta_info"], result["elapsed"] = self._fire(
+                    self.fwd_occupancy_prompt, self.fwd_occupancy_max_new_tokens
                 )
             finally:
                 request_done.set()
@@ -204,47 +169,41 @@ class FwdOccupancyMixin:
         firer.start()
 
         while not request_done.is_set():
-            v, running = self._scrape_fwd_occupancy()
-            if v is not None and running is not None:
+            occ, running = self._scrape()
+            if occ is not None and running is not None:
                 if running > 1:
-                    # Don't wait the full request timeout for our own
-                    # request to drain -- the daemon thread dies with the
-                    # process; surface the violation immediately.
                     request_done.set()
                     raise AssertionError(
                         f"single-batch invariant violated: {running} reqs running "
-                        f"during measurement (expected 1). fwd_occupancy is a bs=1 "
-                        "metric and concurrent traffic corrupts it -- a sibling "
+                        f"(expected 1). fwd_occupancy is a bs=1 metric -- a sibling "
                         "process/test is hitting this shared server."
                     )
-                samples.append(v)
+                samples.append(occ)
             time.sleep(self.fwd_occupancy_scrape_interval)
 
         firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
+        return samples, self._perf(result)
 
+    def _perf(self, result):
         meta = result["meta_info"] or {}
         elapsed = result["elapsed"]
-        completion_tokens = meta.get("completion_tokens", 0) or 0
-        decode_throughput = meta.get("decode_throughput", 0.0) or 0.0
-        perf = {
+        out = meta.get("completion_tokens", 0) or 0
+        decode_tps = meta.get("decode_throughput", 0.0) or 0.0
+        return {
             "input_tokens": meta.get("prompt_tokens", 0) or 0,
-            "output_tokens": completion_tokens,
-            "decode_throughput": decode_throughput,
-            "mean_itl_ms": (
-                (1000.0 / decode_throughput) if decode_throughput > 0 else 0.0
-            ),
-            "wall_throughput": (completion_tokens / elapsed if elapsed > 0 else 0.0),
+            "output_tokens": out,
+            "decode_tps": decode_tps,
+            "mean_itl_ms": (1000.0 / decode_tps) if decode_tps > 0 else 0.0,
+            "wall_tps": (out / elapsed) if elapsed > 0 else 0.0,
         }
-        return samples, perf
 
     def test_fwd_occupancy(self):
         self._assert_metrics_device_timer_enabled()
-        self._fwd_occupancy_warmup()
+        self._warmup()
         self._wait_for_idle()
-        samples, perf = self._fwd_occupancy_measure()
+        samples, perf = self._measure()
 
-        # avg_spec_accept_length is only present under a spec algorithm;
-        # absent otherwise (vanilla decode skips the accept-length check).
+        # avg_spec_accept_length is only present under a spec algorithm.
         try:
             info = requests.get(
                 self.base_url + "/server_info", timeout=_METRICS_REQUEST_TIMEOUT
@@ -253,37 +212,33 @@ class FwdOccupancyMixin:
         except (requests.RequestException, KeyError, IndexError):
             avg_accept = None
 
-        # Compute stats up front so both tables print before any
-        # assertion -- failing assertions must still surface the numbers.
+        # Stats + tables printed before assertions so failures still surface them.
         samples_sorted = sorted(samples)
         if samples_sorted:
             median = statistics.median(samples_sorted)
             peak = samples_sorted[-1]
-            p10_idx = min(len(samples_sorted) - 1, max(0, len(samples_sorted) // 10))
-            p10 = samples_sorted[p10_idx]
+            p10 = samples_sorted[
+                min(len(samples_sorted) - 1, len(samples_sorted) // 10)
+            ]
         else:
             median = peak = p10 = float("nan")
 
-        # Perf table: request-level throughput (not the occupancy gauge).
         perf_rows = [
             ["input tokens", perf["input_tokens"]],
             ["output tokens", perf["output_tokens"]],
-            ["decode tps", f"{perf['decode_throughput']:.2f}"],
+            ["decode tps", f"{perf['decode_tps']:.2f}"],
             ["mean itl (ms)", f"{perf['mean_itl_ms']:.2f}"],
-            ["wall tps", f"{perf['wall_throughput']:.2f}"],
+            ["wall tps", f"{perf['wall_tps']:.2f}"],
         ]
         if avg_accept is not None:
             perf_rows.append(["avg spec accept", f"{avg_accept:.3f}"])
         print(
             "\n"
             + tabulate.tabulate(
-                perf_rows,
-                headers=["perf metric", "value"],
-                tablefmt="github",
+                perf_rows, headers=["perf metric", "value"], tablefmt="github"
             )
         )
 
-        # Occupancy table.
         print(
             "\n\n"
             + tabulate.tabulate(
@@ -299,28 +254,22 @@ class FwdOccupancyMixin:
             )
         )
 
-        # All reporting done above.
         self.assertGreaterEqual(
             len(samples),
             self.fwd_occupancy_min_samples,
-            f"only {len(samples)} non-NaN occupancy samples collected "
-            f"(need >= {self.fwd_occupancy_min_samples}); the measurement "
-            "window may be too short or the gauge stuck at NaN",
+            f"only {len(samples)} non-NaN samples (need >= "
+            f"{self.fwd_occupancy_min_samples}); window too short or gauge at NaN",
         )
-
         self.assertGreater(
             median,
             self.fwd_occupancy_threshold,
-            f"sglang:fwd_occupancy median={median:.2f} did not exceed "
-            f"threshold {self.fwd_occupancy_threshold} "
+            f"median={median:.2f} <= threshold {self.fwd_occupancy_threshold} "
             f"(peak={peak:.2f}, p10={p10:.2f}, n={len(samples)})",
         )
-
         if avg_accept is not None:
             self.assertGreater(
                 avg_accept,
                 self.fwd_occupancy_acc_length_threshold,
-                f"avg_spec_accept_length={avg_accept:.3f} did not exceed "
-                f"threshold {self.fwd_occupancy_acc_length_threshold} -- spec "
-                "barely accepted, possibly degraded to vanilla decode",
+                f"avg_spec_accept_length={avg_accept:.3f} <= "
+                f"{self.fwd_occupancy_acc_length_threshold} -- spec barely accepted",
             )
