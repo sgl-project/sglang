@@ -183,10 +183,10 @@ class DeepEPOutputDtype(Enum):
     BF16 = "bf16"
     INT8 = "int8" # NPU only
     FP8 = "fp8"
-    FP8_e4m3fn = "fp8_e4m3fn" # NPU only
-    FP8_e5m2 = "fp8_FP8_e5m2" # NPU only
+    MXFP8_e4m3fn = "mxfp8_e4m3fn" # NPU only
+    MXFP8_e5m2 = "mxfp8_e5m2" # NPU only
     NVFP4 = "nvfp4"
-    FP4_e2m1fn_x2 = "fp4_e2m1fn_x2" # NPU only
+    MXFP4_e2m1fn_x2 = "mxfp4_e2m1fn_x2" # NPU only
 
 
 def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
