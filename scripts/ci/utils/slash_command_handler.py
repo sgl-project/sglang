@@ -4,7 +4,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 import requests
 from github import Auth, Github
@@ -731,6 +731,7 @@ _LEGACY_SUITE_TO_RUNNER_CONFIG = {
     "nightly-precision-8-gpu-h200": "8-gpu-h200",
     "nightly-8-gpu-h20": "8-gpu-h20",
     "nightly-8-gpu-b200": "8-gpu-b200",
+    "nightly-4-gpu-gb300-deepseek-v4-pro-fp4": "4-gpu-gb300-nightly",
     "weekly-8-gpu-h200": "8-gpu-h200",
 }
 
@@ -742,6 +743,7 @@ def _dispatch_err(suite, msg):
         "runner_label": None,
         "install_script": "",
         "install_timeout": "",
+        "test_timeout": "60",
         "grace_blackwell": "0",
         "rdma_devices": "",
         "is_cpu": False,
@@ -783,6 +785,7 @@ def _resolve_runner_config(rc, full_path, suite):
         "runner_label": runs_on,
         "install_script": install_script,
         "install_timeout": str(cfg["install_timeout"]),
+        "test_timeout": str(cfg.get("test_timeout", "60")),
         "grace_blackwell": str(cfg.get("grace_blackwell", "0")),
         "rdma_devices": cfg.get("rdma_devices", ""),
         "is_cpu": False,
@@ -810,7 +813,7 @@ def detect_suite(file_path_from_test):
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
-    install_timeout, grace_blackwell, rdma_devices, is_cpu, error.
+    install_timeout, test_timeout, grace_blackwell, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
@@ -846,6 +849,7 @@ def detect_suite(file_path_from_test):
                 "runner_label": "ubuntu-latest",
                 "install_script": "",
                 "install_timeout": "",
+                "test_timeout": "60",
                 "grace_blackwell": "0",
                 "rdma_devices": "",
                 "is_cpu": True,
@@ -952,6 +956,7 @@ def _resolve_test_spec(test_spec):
                 "runs_on": info["runner_label"],
                 "install_script": info["install_script"],
                 "install_timeout": info["install_timeout"],
+                "test_timeout": info["test_timeout"],
                 "grace_blackwell": info["grace_blackwell"],
                 "rdma_devices": info["rdma_devices"],
                 "error": None,
@@ -964,7 +969,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     """
     Dispatch a single workflow run for a batch of resolved test specs that
     share the same dispatch shape (mode + runs_on + install_script +
-    install_timeout + grace_blackwell + rdma_devices).
+    install_timeout + test_timeout + grace_blackwell + rdma_devices).
 
     Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
     """
@@ -973,6 +978,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     runs_on = batch[0]["runs_on"]
     install_script = batch[0]["install_script"]
     install_timeout = batch[0]["install_timeout"]
+    test_timeout = batch[0]["test_timeout"]
     grace_blackwell = batch[0]["grace_blackwell"]
     rdma_devices = batch[0]["rdma_devices"]
 
@@ -1006,6 +1012,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "runs_on": runs_on or "",
             "install_script": install_script,
             "install_timeout": install_timeout or "20",
+            "test_timeout": test_timeout or "60",
             "grace_blackwell": grace_blackwell or "0",
             "rdma_devices": rdma_devices,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
@@ -1209,6 +1216,7 @@ def handle_rerun_test(
             r["runs_on"],
             r["install_script"],
             r["install_timeout"],
+            r["test_timeout"],
             r["grace_blackwell"],
             r["rdma_devices"],
         )
