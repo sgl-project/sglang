@@ -102,24 +102,18 @@ union Vec16 {
   T elems[kElems];
 };
 
-template <typename T, GateMode kGate, int kVec>
+template <typename T, int kVec>
 __global__ void residual_gate_add_vec_kernel(
     const T* __restrict__ residual,
     const T* __restrict__ update,
     const T* __restrict__ gate,
     T* __restrict__ out,
-    int64_t n_vec,
-    int64_t row_vec) {
+    int64_t n_vec) {
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t v = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; v < n_vec; v += stride) {
     const Vec16<T> r{.raw = reinterpret_cast<const uint4*>(residual)[v]};
     const Vec16<T> u{.raw = reinterpret_cast<const uint4*>(update)[v]};
-    Vec16<T> g;
-    if constexpr (kGate == GateMode::kFull) {
-      g.raw = reinterpret_cast<const uint4*>(gate)[v];
-    } else {
-      g.raw = SGLANG_LDG(reinterpret_cast<const uint4*>(gate) + (v % row_vec));
-    }
+    const Vec16<T> g{.raw = reinterpret_cast<const uint4*>(gate)[v]};
 
     Vec16<T> o;
 #pragma unroll
@@ -145,23 +139,28 @@ __global__ void residual_gate_add_bcast_row_tile_kernel(
   }
 
   const Vec16<T> g{.raw = SGLANG_LDG(reinterpret_cast<const uint4*>(gate) + col_vec)};
-  const int64_t row_base = static_cast<int64_t>(blockIdx.y) * kBcastRowsPerBlock;
 
+  // Grid-stride over row tiles so the launch stays valid even when the number
+  // of row tiles exceeds the gridDim.y hardware limit.
+  const int64_t row_tile_stride = static_cast<int64_t>(gridDim.y) * kBcastRowsPerBlock;
+  for (int64_t row_base = static_cast<int64_t>(blockIdx.y) * kBcastRowsPerBlock; row_base < rows;
+       row_base += row_tile_stride) {
 #pragma unroll
-  for (int row_offset = 0; row_offset < kBcastRowsPerBlock; ++row_offset) {
-    const int64_t row = row_base + row_offset;
-    if (row < rows) {
-      const int64_t v = row * row_vec + col_vec;
-      const Vec16<T> r{.raw = reinterpret_cast<const uint4*>(residual)[v]};
-      const Vec16<T> u{.raw = reinterpret_cast<const uint4*>(update)[v]};
+    for (int row_offset = 0; row_offset < kBcastRowsPerBlock; ++row_offset) {
+      const int64_t row = row_base + row_offset;
+      if (row < rows) {
+        const int64_t v = row * row_vec + col_vec;
+        const Vec16<T> r{.raw = reinterpret_cast<const uint4*>(residual)[v]};
+        const Vec16<T> u{.raw = reinterpret_cast<const uint4*>(update)[v]};
 
-      Vec16<T> o;
+        Vec16<T> o;
 #pragma unroll
-      for (int i = 0; i < kVec; ++i) {
-        const float value = to_float(r.elems[i]) + to_float(u.elems[i]) * to_float(g.elems[i]);
-        o.elems[i] = dtype_trait<T>::from(value);
+        for (int i = 0; i < kVec; ++i) {
+          const float value = to_float(r.elems[i]) + to_float(u.elems[i]) * to_float(g.elems[i]);
+          o.elems[i] = dtype_trait<T>::from(value);
+        }
+        reinterpret_cast<uint4*>(out)[v] = o.raw;
       }
-      reinterpret_cast<uint4*>(out)[v] = o.raw;
     }
   }
 }
@@ -211,17 +210,17 @@ inline void launch_residual_gate_add(
     const int64_t row_vec = D / kVec;
     if (mode == GateMode::kFull) {
       host::LaunchKernel(static_cast<uint32_t>(grid_for(n_vec)), kBlockSize, out.device())(
-          residual_gate_add_vec_kernel<T, GateMode::kFull, kVec>,
+          residual_gate_add_vec_kernel<T, kVec>,
           residual_ptr,
           update_ptr,
           gate_ptr,
           out_ptr,
-          n_vec,
-          row_vec);
+          n_vec);
     } else {
       const int64_t rows = total / D;
       const int64_t col_blocks = host::div_ceil(row_vec, static_cast<int64_t>(kBcastColsVecPerBlock));
-      const int64_t row_blocks = host::div_ceil(rows, static_cast<int64_t>(kBcastRowsPerBlock));
+      const int64_t row_tiles = host::div_ceil(rows, static_cast<int64_t>(kBcastRowsPerBlock));
+      const int64_t row_blocks = row_tiles > kMaxGrid ? kMaxGrid : row_tiles;
       host::LaunchKernel(
           dim3(static_cast<uint32_t>(col_blocks), static_cast<uint32_t>(row_blocks)),
           dim3(kBcastColsVecPerBlock),
