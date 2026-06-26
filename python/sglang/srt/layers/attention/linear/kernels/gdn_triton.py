@@ -141,9 +141,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-        if is_npu() or is_cpu():
+        if is_npu():
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
+
         return chunk_gated_delta_rule(
             q=q,
             k=k,
