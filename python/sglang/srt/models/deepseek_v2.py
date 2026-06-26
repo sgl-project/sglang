@@ -201,8 +201,11 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
+
+    from sglang.jit_kernel.dsv3_router_gemm import (
+        dsv3_router_gemm as _jit_dsv3_router_gemm,
+    )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -213,7 +216,7 @@ elif _is_npu:
         forward_mla_prepare_npu,
     )
 elif _is_musa:
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
 else:
     pass
 
@@ -494,28 +497,16 @@ class MoEGate(nn.Module):
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE: For some unknown reason, router_gemm seems degrade accept length.
             if (
                 _is_cuda
                 and hidden_states.shape[0] <= 16
-                and hidden_states.shape[1] == 7168
+                and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-                if _device_sm in [100, 103] and self.weight.shape[0] == 256:
-                    # TODO: will check the dtype to be bf16
-                    # router gemm output float32
-                    logits = torch.empty(
-                        hidden_states.shape[0],
-                        self.weight.shape[0],
-                        device=hidden_states.device,
-                        dtype=torch.float32,
-                    )
-                    flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
-                else:
-                    logits = dsv3_router_gemm(
-                        hidden_states, self.weight, out_dtype=torch.float32
-                    )
+                logits = _jit_dsv3_router_gemm(
+                    hidden_states, self.weight, out_dtype=torch.float32
+                )
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -2944,24 +2935,6 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
-
-
-@register_custom_op(
-    op_name="flashinfer_dsv3_router_gemm",
-    mutates_args=[],
-    fake_impl=lambda logits, hidden_states, weight: None,
-)
-def flashinfer_dsv3_router_gemm(
-    logits: torch.Tensor,
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> None:
-    _raw_dsv3_router_gemm(
-        hidden_states,
-        weight.t(),
-        logits,
-        launch_with_pdl=True,
-    )
 
 
 @register_custom_op(out_shape="hidden_states")
