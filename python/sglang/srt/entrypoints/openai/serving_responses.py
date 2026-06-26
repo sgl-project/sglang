@@ -270,27 +270,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                     assert len(tool_list) == 0
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
-                    # Calculate default max tokens from context length minus prompt length
-                    if isinstance(engine_prompt, list):
-                        prompt_length = len(engine_prompt)
-                    elif isinstance(engine_prompt, str):
-                        prompt_length = len(tokenizer.encode(engine_prompt))
-                    else:
-                        prompt_length = 0
-
-                    context_len = (
-                        self.tokenizer_manager.model_config.context_len
-                        if hasattr(self.tokenizer_manager.model_config, "context_len")
-                        else 4096
-                    )
-                    # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
-                    # that the tokenizer_manager adds during validation
-                    num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
-                    default_max_tokens = max(
-                        context_len - prompt_length - num_reserved_tokens, 512
-                    )  # Ensure minimum 512 tokens
+                    # Leave the default budget unset so the scheduler clamps
+                    # max_new_tokens against the real (post-expansion) input
+                    # length, mirroring the Chat Completions path. Pre-computing
+                    # it here under-counted multimodal prompts (image tokens are
+                    # only expanded engine-side), so default_max_tokens was
+                    # overestimated and triggered spurious context-length 400s.
+                    # See issue #29287.
                     sampling_params = request.to_sampling_params(
-                        default_max_tokens,
+                        None,
                         self.default_sampling_params,
                         stop=(
                             processed_messages.stop
