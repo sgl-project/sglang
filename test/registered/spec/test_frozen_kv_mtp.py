@@ -171,18 +171,7 @@ class TestFrozenKVMTP(CustomTestCase):
                 self._run_gsm8k_mtp(topk)
 
     def test_eager_path_no_crash(self) -> None:
-        """Regression for #28264: eager draft path must not crash with stale out_cache_loc.
-
-        EagleDraftInputV2Mixin.prepare_for_decode() allocates new target KV
-        slots but never assigns them to batch.out_cache_loc, leaving it shaped
-        [prefill_len] from the extend step.  On the first decode call
-        EagerRunner.load_batch computes raw_num_tokens = input_ids.shape[0] = bs
-        and CudaGraphBufferRegistry.fill_from tries to copy out_cache_loc[:bs]
-        <- stale out_cache_loc, causing a shape-mismatch RuntimeError.
-
-        The fix resets forward_batch.out_cache_loc to zeros of shape [batch_size]
-        in FrozenKVMTPDraftWorker.draft() after _expand_for_topk_draft().
-        """
+        """Regression for #28264: stale out_cache_loc on eager draft path."""
         process = None
         data = None
         avg_accept = None
@@ -193,8 +182,6 @@ class TestFrozenKVMTP(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
                 other_args=self._server_args_eager(),
             )
-            # Multi-token prompt ensures prefill_len >> 1 so the stale shape
-            # mismatch ([1] vs [prefill_len]) would trigger without the fix.
             resp = requests.post(
                 self.base_url + "/generate",
                 json={
@@ -215,9 +202,8 @@ class TestFrozenKVMTP(CustomTestCase):
 
         self.assertIn("text", data, "Response missing 'text' field")
         self.assertGreater(len(data.get("text", "")), 0, "Expected non-empty output")
-        # With num_steps=1, topk=1 the bonus token is always accepted: floor is 1.0.
-        if avg_accept is not None:
-            self.assertGreaterEqual(avg_accept, 1.0, "Accept length below minimum")
+        self.assertIsNotNone(avg_accept)
+        self.assertGreaterEqual(avg_accept, 1.0, "Accept length below minimum")
 
 
 if __name__ == "__main__":
