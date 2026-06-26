@@ -552,6 +552,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
+        # Snapshot built -- the forward is done reading the shared pool. Publish
+        # a read-done event the scheduler's WAR barrier waits on.
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done
+
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)

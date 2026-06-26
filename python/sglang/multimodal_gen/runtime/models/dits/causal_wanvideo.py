@@ -183,46 +183,20 @@ class CausalWanSelfAttention(nn.Module):
                 block_mask=block_mask,
             )[:, :, :-padded_length].transpose(2, 1)
         else:
-            head_slice = None
-            if kv_cache.k.shape[2] != roped_key.shape[2]:
-                head_slice = slice(self.head_start, self.head_start + self.num_heads)
-                cache_key = roped_key.new_zeros(
-                    roped_key.shape[0],
-                    roped_key.shape[1],
-                    kv_cache.k.shape[2],
-                    roped_key.shape[3],
-                )
-                cache_value = v.new_zeros(
-                    v.shape[0],
-                    v.shape[1],
-                    kv_cache.v.shape[2],
-                    v.shape[3],
-                )
-                cache_key[:, :, head_slice, :] = roped_key
-                cache_value[:, :, head_slice, :] = v
-            else:
-                cache_key = roped_key
-                cache_value = v
+            if kv_cache.can_direct_current_attention(roped_key.shape[1]):
+                return self.attn(roped_query, roped_key, v)
+
             cache_view = kv_cache.update_and_get_attention_kv(
-                key=cache_key,
-                value=cache_value,
+                key=roped_key,
+                value=v,
                 current_chunk_start=current_start,
+                cache_head_start=self.head_start,
                 debug_name="CausalWan KV cache",
-            )
-            key = (
-                cache_view.k[:, :, head_slice, :]
-                if head_slice is not None
-                else cache_view.k
-            )
-            value = (
-                cache_view.v[:, :, head_slice, :]
-                if head_slice is not None
-                else cache_view.v
             )
             x = self.attn(
                 roped_query,
-                key,
-                value,
+                cache_view.k,
+                cache_view.v,
             )
 
         return x
@@ -285,6 +259,7 @@ class CausalWanTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("to_out", prefix),
             )
+            # megatron-style tp shards the weight (qkv) column-wise, effectively splitting the attention heads
             tp_size = get_tp_world_size()
             self.local_num_heads = divide(num_heads, tp_size)
             head_start = get_tp_rank() * self.local_num_heads

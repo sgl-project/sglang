@@ -75,6 +75,7 @@ class InsertResult:
 
     prefix_len: int
     total_len: int = 0
+    last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
 

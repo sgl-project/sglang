@@ -112,7 +112,9 @@ def run_gsm8k_benchmark(
 class TestDeepSeekR1MXFP4TP2MI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = os.environ.get("DEEPSEEK_R1_MXFP4_MODEL_PATH", "amd/DeepSeek-R1-MXFP4-Preview")
+        cls.model = os.environ.get(
+            "DEEPSEEK_R1_MXFP4_MODEL_PATH", "amd/DeepSeek-R1-MXFP4-Preview"
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 

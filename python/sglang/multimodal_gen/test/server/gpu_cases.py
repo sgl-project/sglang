@@ -9,6 +9,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
     MODELOPT_NVFP4_B200_ENV_VARS,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
     MODELOPT_WAN22_FP8_MODEL,
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
     MODELOPT_TI2I_CI_sampling_params,
@@ -463,6 +465,11 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
+            # Pin CI's shared T2V_PROMPT ("A curious raccoon") instead of relying on
+            # prompt=None / unconditional generation — the latter drifts as the
+            # pipeline evolves, which is why this (previously planner-invisible) case
+            # diverged from its stale sglang_generated GT.
+            T2V_sampling_params,
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
@@ -541,6 +548,15 @@ else:
             model_path="Comfy-Org/Ideogram-4",
             modality="image",
             sampling_params=IDEOGRAM4_CI_sampling_params,
+            extras=[],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
+            "qwen_image_2512_modelopt_nvfp4_t2i",
+            model_path=MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
+            modality="image",
+            sampling_params=MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
             extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
