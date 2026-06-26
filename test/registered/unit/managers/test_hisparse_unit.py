@@ -9,6 +9,7 @@ Tests cover:
 
 import os
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import torch
