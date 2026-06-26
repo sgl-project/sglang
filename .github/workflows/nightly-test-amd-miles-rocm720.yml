@@ -4,11 +4,6 @@ on:
   schedule:
     # Runs after the 12:00 UTC miles image build has pushed the dated image.
     - cron: "30 17 * * *"
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/nightly-test-amd-miles-rocm720.yml"
   workflow_dispatch:
     inputs:
       image_tag:
