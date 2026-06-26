@@ -117,7 +117,9 @@ class TestTRTLLMMHASpecDecode(unittest.TestCase):
 
         metadata = backend.decode_cuda_graph_metadata[bs]
         expected_seqlens = torch.tensor([12] * topk + [22] * topk, dtype=torch.int32)
-        self.assertEqual(metadata.cache_seqlens_int32.tolist(), expected_seqlens.tolist())
+        self.assertEqual(
+            metadata.cache_seqlens_int32.tolist(), expected_seqlens.tolist()
+        )
         self.assertEqual(metadata.max_seq_len_k, 22)
         self.assertEqual(
             metadata.cu_seqlens_k[1:].tolist(),
