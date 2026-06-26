@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.self_benchmark import (
+    SELF_BENCHMARK_DUMMY_TOKEN_ID,
     BenchmarkPhase,
     BenchmarkPoint,
     BenchmarkPointResult,
@@ -39,7 +40,10 @@ class _FakeForwardMode:
 
 def _make_scheduler(output_path: str):
     return types.SimpleNamespace(
+        instance_id="test-run",
         server_args=types.SimpleNamespace(
+            model_path="test-model",
+            served_model_name=None,
             benchmark_mode="agg",
             benchmark_prefill_granularity=2,
             benchmark_prefill_kv_read_granularity=1,
@@ -47,8 +51,9 @@ def _make_scheduler(output_path: str):
             benchmark_decode_batch_granularity=2,
             benchmark_warmup_iterations=0,
             benchmark_output_path=output_path,
-            benchmark_timeout=300,
             chunked_prefill_size=None,
+            node_rank=0,
+            nnodes=1,
         ),
         enable_fpm=True,
         max_req_input_len=16,
@@ -58,7 +63,16 @@ def _make_scheduler(output_path: str):
         max_prefill_tokens=64,
         page_size=1,
         disaggregation_mode=DisaggregationMode.NULL,
-        ps=types.SimpleNamespace(dp_rank=0),
+        ps=types.SimpleNamespace(
+            dp_rank=0,
+            dp_size=1,
+            tp_rank=0,
+            tp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+        ),
         result_queue=deque(),
         waiting_queue=[],
         running_batch=None,
@@ -75,11 +89,34 @@ class _FakeReq:
         return self._finished
 
 
+def _prepare_decode_scheduler(scheduler):
+    scheduler.is_generation = True
+    scheduler.model_config = types.SimpleNamespace(
+        is_encoder_decoder=False,
+        hf_eos_token_id=None,
+        vocab_size=32000,
+    )
+    scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: True)
+    scheduler.server_args.allow_auto_truncate = False
+    scheduler.server_args.disaggregation_bootstrap_port = None
+    scheduler.tokenizer = None
+    scheduler.running_batch = types.SimpleNamespace(is_empty=lambda: True)
+    scheduler.init_req_max_new_tokens = lambda req: None
+    return scheduler
+
+
 class TestSelfBenchmark(CustomTestCase):
     def test_prefill_point_collects_fpm_and_writes_output(self):
         with TemporaryDirectory() as tmpdir:
             output_path = f"{tmpdir}/benchmark.json"
             benchmark = SelfBenchmark(_make_scheduler(output_path))
+            with open(benchmark._output_path) as f:
+                running_output = json.load(f)
+            self.assertEqual(running_output["scope"], "local_diagnostics")
+            self.assertEqual(running_output["status"], "running")
+            self.assertFalse(running_output["valid"])
+            self.assertEqual(running_output["run_id"], "test-run")
+
             point = BenchmarkPoint(point_type="prefill", isl=10)
             benchmark.phase = BenchmarkPhase.SWEEP
             benchmark._grid = [point]
@@ -102,8 +139,14 @@ class TestSelfBenchmark(CustomTestCase):
             benchmark.maybe_schedule_next()
 
             self.assertFalse(benchmark.active)
-            with open(output_path) as f:
+            with open(benchmark._output_path) as f:
                 output = json.load(f)
+            self.assertEqual(output["scope"], "local_diagnostics")
+            self.assertEqual(output["status"], "complete")
+            self.assertTrue(output["valid"])
+            self.assertEqual(output["run_id"], "test-run")
+            self.assertEqual(output["identity"]["model_path"], "test-model")
+            self.assertEqual(output["identity"]["disaggregation_mode"], "null")
             self.assertEqual(output["config"]["mode"], "agg")
             self.assertEqual(output["results"][0]["point"]["point_type"], "prefill")
             self.assertEqual(
@@ -127,35 +170,106 @@ class TestSelfBenchmark(CustomTestCase):
 
             self.assertEqual(calls, ["done"])
             self.assertFalse(benchmark.active)
-            with open(output_path) as f:
+            with open(benchmark._output_path) as f:
                 output = json.load(f)
             self.assertIn("results", output)
 
-    def test_timeout_finishes_even_with_unfinished_current_point(self):
+    def test_output_invalidation_replaces_stale_result_for_worker_path(self):
         with TemporaryDirectory() as tmpdir:
             output_path = f"{tmpdir}/benchmark.json"
+            stale_path = (
+                f"{tmpdir}/benchmark_role-null_node-0_dp-0_tp-0_atp-0_acp-0.json"
+            )
+            with open(stale_path, "w") as f:
+                json.dump({"valid": True, "run_id": "old-run"}, f)
+
             scheduler = _make_scheduler(output_path)
-            calls = []
-            scheduler.on_self_benchmark_finished = lambda: calls.append("done")
+            scheduler.instance_id = "new-run"
             benchmark = SelfBenchmark(scheduler)
-            point = BenchmarkPoint(point_type="prefill", isl=10)
-            benchmark.phase = BenchmarkPhase.SWEEP
-            benchmark._grid = [point]
-            benchmark._grid_index = 0
-            benchmark._current = BenchmarkPointResult(point=point)
-            benchmark._active_reqs = [_FakeReq(finished=False)]
-            benchmark._deadline_monotonic = 0
 
-            benchmark.maybe_schedule_next()
-
-            self.assertEqual(calls, ["done"])
-            self.assertFalse(benchmark.active)
-            self.assertIsNone(benchmark._current)
-            self.assertEqual(benchmark._active_reqs, [])
-            with open(output_path) as f:
+            self.assertEqual(benchmark._output_path, stale_path)
+            with open(benchmark._output_path) as f:
                 output = json.load(f)
-            self.assertTrue(output["timed_out"])
-            self.assertEqual(output["results"], [])
+            self.assertFalse(output["valid"])
+            self.assertEqual(output["status"], "running")
+            self.assertEqual(output["run_id"], "new-run")
+
+    def test_output_path_is_role_and_rank_qualified(self):
+        with TemporaryDirectory() as tmpdir:
+            output_path = f"{tmpdir}/benchmark.json"
+            prefill_scheduler = _make_scheduler(output_path)
+            prefill_scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+            decode_scheduler = _make_scheduler(output_path)
+            decode_scheduler.disaggregation_mode = DisaggregationMode.DECODE
+
+            prefill_benchmark = SelfBenchmark(prefill_scheduler)
+            decode_benchmark = SelfBenchmark(decode_scheduler)
+
+            self.assertIn("role-prefill", prefill_benchmark._output_path)
+            self.assertIn("role-decode", decode_benchmark._output_path)
+            self.assertNotEqual(
+                prefill_benchmark._output_path, decode_benchmark._output_path
+            )
+
+    def test_finish_waits_for_inflight_scheduler_state(self):
+        cases = [
+            ("result_queue", lambda s: s.result_queue.append(object())),
+            ("waiting_queue", lambda s: s.waiting_queue.append(object())),
+            ("chunked_req", lambda s: setattr(s, "chunked_req", object())),
+            (
+                "running_batch",
+                lambda s: setattr(
+                    s,
+                    "running_batch",
+                    types.SimpleNamespace(is_empty=lambda: False),
+                ),
+            ),
+            (
+                "disagg_prefill_bootstrap_queue",
+                lambda s: setattr(
+                    s,
+                    "disagg_prefill_bootstrap_queue",
+                    types.SimpleNamespace(queue=[object()]),
+                ),
+            ),
+            (
+                "disagg_prefill_inflight_queue",
+                lambda s: setattr(s, "disagg_prefill_inflight_queue", [object()]),
+            ),
+            (
+                "disagg_decode_prealloc_queue",
+                lambda s: setattr(
+                    s,
+                    "disagg_decode_prealloc_queue",
+                    types.SimpleNamespace(queue=[object()]),
+                ),
+            ),
+            (
+                "disagg_decode_transfer_queue",
+                lambda s: setattr(
+                    s,
+                    "disagg_decode_transfer_queue",
+                    types.SimpleNamespace(queue=[object()]),
+                ),
+            ),
+        ]
+
+        for name, mark_inflight in cases:
+            with self.subTest(name=name):
+                scheduler = _make_scheduler("/tmp/unused.json")
+                calls = []
+                scheduler.on_self_benchmark_finished = lambda: calls.append("done")
+                mark_inflight(scheduler)
+                benchmark = SelfBenchmark(scheduler)
+                benchmark.phase = BenchmarkPhase.SWEEP
+                benchmark._grid = []
+                benchmark._grid_index = 0
+                benchmark._write_results = False
+
+                benchmark.maybe_schedule_next()
+
+                self.assertEqual(calls, [])
+                self.assertTrue(benchmark.active)
 
     def test_decode_point_ignores_setup_prefill_until_decode_pass(self):
         benchmark = SelfBenchmark(_make_scheduler("/tmp/unused.json"))
@@ -263,6 +377,56 @@ class TestSelfBenchmark(CustomTestCase):
             80,
         )
 
+    def test_synthetic_decode_models_prefill_to_decode_boundary(self):
+        scheduler = _prepare_decode_scheduler(_make_scheduler("/tmp/unused.json"))
+        benchmark = SelfBenchmark(scheduler)
+        captured = {}
+        fake_batch = object()
+
+        def fake_build_synthetic_decode_batch(reqs, context_length):
+            captured["reqs"] = reqs
+            captured["context_length"] = context_length
+            return fake_batch
+
+        benchmark._build_synthetic_decode_batch = fake_build_synthetic_decode_batch
+
+        injected = benchmark._inject_synthetic_decode(context_length=8, batch_size=2)
+
+        self.assertEqual(injected, 2)
+        self.assertIs(scheduler.running_batch, fake_batch)
+        self.assertEqual(captured["context_length"], 8)
+        self.assertEqual(benchmark._active_reqs, captured["reqs"])
+
+        for req in captured["reqs"]:
+            self.assertEqual(req.sampling_params.max_new_tokens, 2)
+            self.assertEqual(list(req.output_ids), [SELF_BENCHMARK_DUMMY_TOKEN_ID])
+            self.assertEqual(
+                list(req.fill_ids),
+                list(req.origin_input_ids) + [SELF_BENCHMARK_DUMMY_TOKEN_ID],
+            )
+            self.assertEqual(req.seqlen, 9)
+            self.assertEqual(req.kv_committed_len, 8)
+            self.assertEqual(req.kv_allocated_len, 8)
+            self.assertEqual(req.already_computed, 8)
+            self.assertFalse(req.finished())
+
+    def test_synthetic_decode_skips_if_two_tokens_cannot_be_generated(self):
+        scheduler = _prepare_decode_scheduler(_make_scheduler("/tmp/unused.json"))
+        scheduler.init_req_max_new_tokens = lambda req: setattr(
+            req.sampling_params, "max_new_tokens", 1
+        )
+        benchmark = SelfBenchmark(scheduler)
+
+        def fail_build_synthetic_decode_batch(_reqs, _context_length):
+            raise AssertionError("synthetic decode batch should not be built")
+
+        benchmark._build_synthetic_decode_batch = fail_build_synthetic_decode_batch
+
+        injected = benchmark._inject_synthetic_decode(context_length=8, batch_size=2)
+
+        self.assertEqual(injected, 0)
+        self.assertEqual(benchmark._active_reqs, [])
+
     def test_prefill_grid_is_not_capped_at_chunked_prefill_size(self):
         scheduler = _make_scheduler("/tmp/unused.json")
         scheduler.server_args.benchmark_mode = "prefill"
@@ -276,6 +440,22 @@ class TestSelfBenchmark(CustomTestCase):
         self.assertGreater(len(prefill_points), 0)
         self.assertEqual(max(p.isl for p in prefill_points), 62)
         self.assertTrue(all(p.kv_read_tokens == 0 for p in prefill_points))
+
+    def test_prefill_grid_is_capped_by_forward_token_budget(self):
+        scheduler = _make_scheduler("/tmp/unused.json")
+        scheduler.server_args.benchmark_mode = "prefill"
+        scheduler.max_req_input_len = 40960
+        scheduler.max_total_num_tokens = 40960
+        scheduler.max_prefill_tokens = 1024
+
+        benchmark = SelfBenchmark(scheduler)
+
+        prefill_points = [p for p in benchmark._grid if p.point_type == "prefill"]
+        self.assertGreater(len(prefill_points), 0)
+        self.assertEqual(max(p.isl for p in prefill_points), 1024)
+        self.assertTrue(
+            all(p.isl <= scheduler.max_prefill_tokens for p in prefill_points)
+        )
 
     def test_prefill_kv_read_grid_crosses_with_isl(self):
         scheduler = _make_scheduler("/tmp/unused.json")

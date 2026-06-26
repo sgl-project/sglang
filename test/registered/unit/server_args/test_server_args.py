@@ -517,6 +517,34 @@ class TestContextParallelServerArgs(CustomTestCase):
                 )
 
 
+class TestBenchmarkArgs(unittest.TestCase):
+    def test_benchmark_mode_requires_forward_pass_metrics(self):
+        with self.assertRaisesRegex(
+            ValueError, "--benchmark-mode requires --enable-forward-pass-metrics"
+        ):
+            ServerArgs(model_path="dummy", benchmark_mode="agg")
+
+    def test_benchmark_mode_accepts_explicit_forward_pass_metrics(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            benchmark_mode="agg",
+            enable_forward_pass_metrics=True,
+        )
+
+        self.assertTrue(server_args.enable_forward_pass_metrics)
+
+    def test_benchmark_mode_rejects_ray(self):
+        with self.assertRaisesRegex(
+            ValueError, "--benchmark-mode is not supported with --use-ray"
+        ):
+            ServerArgs(
+                model_path="dummy",
+                benchmark_mode="agg",
+                enable_forward_pass_metrics=True,
+                use_ray=True,
+            )
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
