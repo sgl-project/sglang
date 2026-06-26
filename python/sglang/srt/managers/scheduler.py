@@ -454,6 +454,7 @@ class Scheduler(
             enable_metrics=self.server_args.enable_metrics,
             enable_kv_cache_events=bool(
                 self.server_args.kv_events_config
+                and self.ps.pp_rank == 0
                 and self.ps.attn_tp_rank == 0
                 and self.ps.attn_cp_rank == 0
             ),
