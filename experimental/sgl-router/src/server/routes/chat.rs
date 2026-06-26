@@ -560,19 +560,14 @@ pub async fn chat_completions(
         Err(e) => e.status_code().as_u16(),
     };
 
-    // Record end-to-end latency now that the outcome is known. For
-    // non-streaming requests the body is already buffered here, so
-    // `start.elapsed()` is true end-to-end latency — record it directly. For
-    // streaming, the body is still pending; the `RecordDurationOnDrop` guard
-    // packed into `stream_guards` records it at stream completion instead (so
-    // we don't capture only time-to-headers). `elapsed` still feeds the
-    // access-log `latency_ms` below for both.
+    // Record end-to-end latency now that the outcome is known. Non-streaming:
+    // body is buffered here, so `start.elapsed()` is true e2e — record directly.
+    // Streaming: body still pending, so the `RecordDurationOnDrop` guard in
+    // `stream_guards` records it at stream completion (not just time-to-headers).
+    // `elapsed` still feeds the access-log `latency_ms` for both.
     //
-    // The client-visible HTTP status is counted into
-    // `sgl_router_responses_total` by the global edge middleware
-    // (`count_requests` in server/app.rs), NOT here — the old per-handler
-    // recording skipped every early-exit path (validation 400, body-limit 413,
-    // admission 503) that returned before reaching this point.
+    // HTTP status is counted into `responses_total` by the edge middleware
+    // (app.rs), not here — the old per-handler site skipped early exits.
     let elapsed = start.elapsed();
     if !streaming {
         ctx.metrics

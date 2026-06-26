@@ -204,19 +204,14 @@ impl ActiveLoadKind {
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
-    // Edge counters — every request/response at the router HTTP boundary,
-    // counted ONCE at a global middleware: `requests_total` at request entry
-    // (before any worker pick / parking), `responses_total` at response. Their
-    // difference (`requests_total - responses_total`) is the set of requests
-    // the router received but never answered — parked-then-timed-out, shed, or
-    // client-cancelled-while-stalled. That gap is invisible to the per-worker
-    // counter below, which is recorded only after a request reaches dispatch.
+    // Edge counters (recorded at the app.rs middleware): intake at entry,
+    // responses at exit. `requests_total - responses_total` = received but
+    // never answered, which `worker_requests_total` (post-dispatch) can't see.
     requests_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
     responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
     // Per-worker dispatch outcomes (formerly `requests_total`). Recorded after
-    // a worker is selected and the upstream outcome is known, so it CANNOT see
-    // requests that never reached dispatch — use the edge `requests_total` for
-    // true intake. Kept per-worker for the routing-convergence tests.
+    // dispatch, so blind to pre-dispatch drops; kept per-worker for the
+    // routing-convergence tests.
     worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
@@ -240,17 +235,15 @@ struct RequestKey {
     outcome: &'static str,
 }
 
-/// Label set for the edge `sgl_router_requests_total` (intake) counter.
-/// `route` is the matched request path (a small, fixed set — `/v1/chat/
-/// completions`, `/v1/models`, ... — so cardinality is bounded).
+/// Labels for the edge `requests_total` (intake) counter. `route` is the matched
+/// template (small fixed set), so cardinality is bounded.
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 struct EdgeKey {
     route: String,
     method: String,
 }
 
-/// Label set for the edge `sgl_router_responses_total` counter — `EdgeKey`
-/// plus the final HTTP status the client saw.
+/// Labels for the edge `responses_total` counter: `EdgeKey` + final HTTP status.
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 struct EdgeResponseKey {
     route: String,
@@ -333,10 +326,8 @@ impl MetricsRegistry {
         Arc::new(Self::default())
     }
 
-    /// Bump `sgl_router_requests_total{route,method}` — the edge intake counter.
-    /// Called once per request at the global middleware, BEFORE worker pick, so
-    /// it counts every request the router received (including those later
-    /// parked / shed / cancelled before a worker is ever dispatched to).
+    /// Bump the edge intake counter `requests_total{route,method}`. Called at the
+    /// middleware before worker pick, so it sees pre-dispatch drops.
     pub fn record_ingress(&self, route: &str, method: &str) {
         let key = EdgeKey {
             route: route.to_owned(),
@@ -351,8 +342,7 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Bump `sgl_router_worker_requests_total` for the given worker / model /
-    /// mode / outcome. Recorded after dispatch — see the edge `record_ingress`
+    /// Bump `worker_requests_total`. Recorded after dispatch — see `record_ingress`
     /// for true intake.
     pub fn record_worker_request(
         &self,
@@ -424,13 +414,9 @@ impl MetricsRegistry {
         hist.observe(seconds);
     }
 
-    /// Bump `sgl_router_responses_total{route,method,status_code}` for the HTTP
-    /// status the client ultimately saw. Called once per request at the global
-    /// middleware (response side), so it captures EVERY outcome — including the
-    /// early-exit paths (400 validation, 413 body-limit, 503 shed) that the old
-    /// per-handler recording site silently skipped. Cardinality is bounded by
-    /// the fixed route set times the small set of status codes the router
-    /// returns.
+    /// Bump the edge counter `responses_total{route,method,status_code}`. Called
+    /// at the middleware, so it captures every outcome — incl. early-exit
+    /// 400/413/503 that the old per-handler site skipped.
     pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
         let key = EdgeResponseKey {
             route: route.to_owned(),
@@ -531,9 +517,7 @@ impl MetricsRegistry {
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
 
-        // requests_total — edge intake: every request seen at the router HTTP
-        // boundary, counted before worker dispatch. `requests_total -
-        // responses_total` exposes requests received but never answered.
+        // requests_total — edge intake (every request, counted before dispatch)
         out.push_str(
             "# HELP sgl_router_requests_total Total requests received at the router HTTP edge, counted before worker dispatch (true intake).\n",
         );
@@ -554,9 +538,7 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // worker_requests_total — per-worker dispatch outcomes (formerly
-        // requests_total). Recorded after dispatch; cannot see pre-dispatch
-        // drops — use the edge requests_total above for intake.
+        // worker_requests_total — per-worker dispatch outcomes (formerly requests_total)
         out.push_str(
             "# HELP sgl_router_worker_requests_total Chat-completions requests dispatched to a worker, by dispatch outcome.\n",
         );
@@ -622,10 +604,7 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // responses_total — edge: every response at the router boundary, by
-        // route/method/status. Recorded at the global middleware so early-exit
-        // outcomes (400/413/503 shed) are counted, unlike the old per-handler
-        // site which they skipped.
+        // responses_total — edge, by route/method/status (incl. early-exit 400/413/503)
         out.push_str(
             "# HELP sgl_router_responses_total Responses returned at the router HTTP edge, by route, method and HTTP status code.\n",
         );

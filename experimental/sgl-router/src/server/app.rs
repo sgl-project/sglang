@@ -11,19 +11,11 @@ use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 
-/// Middleware: count every request at the router HTTP edge. Increments
-/// `sgl_router_requests_total{route,method}` at ENTRY — before routing into the
-/// handler, before any worker pick or admission parking — so it counts the true
-/// intake, including requests that later stall, get shed, or are cancelled
-/// before a worker is ever dispatched to. On the way out it records
-/// `sgl_router_responses_total{route,method,status_code}` for every response,
-/// so early-exit outcomes (400 validation, 413 body-limit, 503 shed) are
-/// counted too. `requests_total - responses_total` is then the set of requests
-/// the router received but never answered — the silent-overload gap the
-/// per-worker `worker_requests_total` (recorded only after dispatch) can't see.
-///
-/// `route` is the matched route template (e.g. `/v1/chat/completions`), not the
-/// raw URI, so an unmatched/garbage path can't blow up label cardinality.
+/// Edge counters: `requests_total{route,method}` at entry (true intake, incl.
+/// requests parked/shed/cancelled before dispatch), `responses_total{...,
+/// status_code}` on exit (incl. early-exit 400/413/503). Their difference =
+/// received-but-not-answered, invisible to post-dispatch `worker_requests_total`.
+/// `route` is the matched template (not raw URI) to bound label cardinality.
 async fn count_requests(State(ctx): State<Arc<AppContext>>, req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_owned();
     let route = req
@@ -84,9 +76,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/flush_cache",
             post(crate::server::routes::cache::flush_cache),
         )
-        // Global edge counter — runs after routing (so MatchedPath is set) for
-        // every route. from_fn_with_state carries its own ctx handle, so this
-        // is independent of the router's `.with_state` below.
+        // After routing, so MatchedPath is set for every route.
         .layer(middleware::from_fn_with_state(ctx.clone(), count_requests))
         .with_state(ctx)
 }
