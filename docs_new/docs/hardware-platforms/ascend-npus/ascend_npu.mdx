@@ -41,7 +41,7 @@ You can install SGLang using any of the methods below. Please go through `System
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Triton</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>3.2.1.dev20260530</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 \`<br/>`--extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \`<br/>`--trusted-host triton-ascend.osinfra.cn`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pip install triton-ascend==3.2.1.dev20260530 \`<br/>`--extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \`<br/>`--trusted-host mirrors.huaweicloud.com`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang NPU Kernel</td>
@@ -124,6 +124,17 @@ If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid.
 pip install memfabric-hybrid==1.0.8
 ```
 
+#### MemFabric-zbal
+
+MemFabric-zbal is a Zero Buffer Acceleration Library of high-performance operators for LLM inference and training on Ascend,
+accelerating computation by eliminating intermediate memory buffers; it is required only on **aarch64** clusters and is
+installed in addition to MemFabric-Hybrid.
+
+```bash Command
+# Only needed on aarch64 (arm64) hosts
+pip install memfabric-zbal==1.1.1
+```
+
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 ```bash Command
@@ -143,7 +154,7 @@ We provide our own implementation of Triton for Ascend.
 ```bash Command
 pip install triton-ascend==3.2.1.dev20260530 \
   --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly \
-  --trusted-host triton-ascend.osinfra.cn
+  --trusted-host mirrors.huaweicloud.com
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
@@ -185,7 +196,7 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 1. Download SGLang image
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.13.post1-cann9.0.0-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
 
 <Tabs>
@@ -193,7 +204,7 @@ We publish both **stable releases** and **daily builds**. Choose a stable releas
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
@@ -204,7 +215,7 @@ docker pull quay.io/ascend/sglang:main-cann9.0.0-a3
 
 ```bash Command
 # Stable release
-docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+docker pull quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-910b
 
 # Daily build
 docker pull quay.io/ascend/sglang:main-cann9.0.0-910b

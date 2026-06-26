@@ -136,6 +136,8 @@ def sync_ltx23_runtime_vae_markers(
     for key in (
         "ltx_variant",
         "condition_encoder_subdir",
+        "video_encoder_variant",
+        "video_encoder_config",
         "video_decoder_variant",
         "video_decoder_config",
     ):
