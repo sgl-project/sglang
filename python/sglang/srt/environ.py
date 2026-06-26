@@ -1,9 +1,27 @@
+import functools
 import os
 import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from typing import Any, Optional
+
+
+@functools.lru_cache(maxsize=1)
+def _default_hip() -> bool:
+    """Lazy ROCm/HIP detection for platform-conditional env defaults.
+
+    Avoids importing torch at environ import time (this module is intentionally
+    stdlib-only and loaded very early). Resolved on first EnvField.get() that uses
+    it as a default, by which point torch is already imported in any real run;
+    falls back to False if torch is unavailable.
+    """
+    try:
+        import torch
+
+        return torch.version.hip is not None
+    except Exception:
+        return False
 
 
 @contextmanager
@@ -51,6 +69,11 @@ class EnvField:
     def parse(self, value: str) -> Any:
         raise NotImplementedError()
 
+    def _resolve_default(self) -> Any:
+        # Support a callable default for lazily/platform-computed defaults
+        # (e.g. EnvBool(_default_hip)); evaluated only when the env is unset.
+        return self.default() if callable(self.default) else self.default
+
     def get(self) -> Any:
         value = os.getenv(self.name)
 
@@ -61,15 +84,16 @@ class EnvField:
 
         # Not set, return default
         if value is None:
-            return self.default
+            return self._resolve_default()
 
         try:
             return self.parse(value)
         except ValueError as e:
+            default = self._resolve_default()
             warnings.warn(
-                f'Invalid value for {self.name}: {e}, using default "{self.default}"'
+                f'Invalid value for {self.name}: {e}, using default "{default}"'
             )
-            return self.default
+            return default
 
     def is_set(self):
         return self.name in os.environ
@@ -309,6 +333,7 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
+    SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
 
@@ -442,6 +467,11 @@ class Envs:
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
+    # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
+    # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
+    # explicitly to force on/off on any platform.
+    SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
@@ -594,6 +624,7 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
 
@@ -663,6 +694,10 @@ class Envs:
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Use the fully-vectorized ViT position-embedding interpolation (no per-image
+    # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
+    # set False to fall back to the per-image loop.
+    SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
