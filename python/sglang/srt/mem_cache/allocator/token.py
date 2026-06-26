@@ -74,11 +74,3 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
-
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
-
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
-        )

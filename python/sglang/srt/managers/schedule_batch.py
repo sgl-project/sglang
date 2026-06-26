@@ -1484,7 +1484,7 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
+        self.kv_cache_cpu = token_to_kv_pool_allocator.get_kvcache().get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
 
@@ -1493,7 +1493,7 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
-        token_to_kv_pool_allocator.load_cpu_copy(
+        token_to_kv_pool_allocator.get_kvcache().load_cpu_copy(
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
         del self.kv_cache_cpu

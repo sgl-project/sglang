@@ -633,7 +633,9 @@ class TestMamba(unittest.TestCase):
         mamba_pool.mamba_cache.temporal[:, mamba_indices] = 6.0
 
         # --- Round-trip with Mamba indices provided ---
-        cpu_copy = allocator.get_cpu_copy(kv_indices, mamba_indices=mamba_indices)
+        cpu_copy = allocator.get_kvcache().get_cpu_copy(
+            kv_indices, mamba_indices=mamba_indices
+        )
         kv_cpu, mamba_cpu = cpu_copy
         self.assertIsNotNone(
             mamba_cpu, "mamba_cpu should be saved when mamba_indices given"
@@ -647,7 +649,9 @@ class TestMamba(unittest.TestCase):
             conv[:, mamba_indices] = 0.0
         mamba_pool.mamba_cache.temporal[:, mamba_indices] = 0.0
 
-        allocator.load_cpu_copy(cpu_copy, kv_indices, mamba_indices=mamba_indices)
+        allocator.get_kvcache().load_cpu_copy(
+            cpu_copy, kv_indices, mamba_indices=mamba_indices
+        )
 
         # Verify KV restored.
         for layer_id in range(hybrid_pool.full_kv_pool.layer_num):
@@ -676,7 +680,9 @@ class TestMamba(unittest.TestCase):
         )
 
         # --- Without mamba_indices: mamba_cpu must be None ---
-        cpu_copy_no_mamba = allocator.get_cpu_copy(kv_indices, mamba_indices=None)
+        cpu_copy_no_mamba = allocator.get_kvcache().get_cpu_copy(
+            kv_indices, mamba_indices=None
+        )
         _, mamba_cpu_none = cpu_copy_no_mamba
         self.assertIsNone(
             mamba_cpu_none, "mamba_cpu should be None when mamba_indices=None"

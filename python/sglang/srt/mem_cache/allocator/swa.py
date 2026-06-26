@@ -136,8 +136,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        assert self._kvcache.full_to_swa_index_mapping is not None
-        return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
+        # The allocator owns full_to_swa_index_mapping (it writes it on every
+        # alloc/free), so index it directly instead of round-tripping through the
+        # pool, which would only index this very same tensor.
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def alloc(self, need_size: int):
         assert self.page_size == 1
@@ -377,11 +379,3 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
-
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
-
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        return self._kvcache.load_cpu_copy(
-            kv_cache_cpu, indices, mamba_indices=mamba_indices
-        )

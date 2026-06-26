@@ -174,7 +174,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return last_locs
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self._kvcache._translate_loc_to_hisparse_device(last_locs)
+        # full_to_hisparse_device_index_mapping is owned and written by this
+        # allocator; index it directly rather than round-tripping through the pool.
+        return self.full_to_hisparse_device_index_mapping[last_locs]
 
     def alloc_extend(
         self,
@@ -236,7 +238,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def free_hisparse(self, free_indices: torch.Tensor):
-        hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
+        hisparse_indices = self.full_to_hisparse_device_index_mapping[free_indices]
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
@@ -461,9 +463,11 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (last_locs - 3) // self.compress_ratio
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self.hisparse_kvcache._translate_loc_to_hisparse_device(
+        # Index the allocator-owned mapping directly (mirrors the pool's
+        # _translate_loc_to_hisparse_device, which reads this same tensor).
+        return self.full_to_hisparse_device_index_mapping[
             self.get_last_loc_compressed(last_locs)
-        )
+        ]
 
     def alloc_extend(
         self,
@@ -505,6 +509,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert logical_indices is not None, "Logical allocation failed in alloc_extend"
 
+        # Kept as a pool call on purpose: full->compressed is genuine C4-layout
+        # arithmetic ((i+1) % compress_ratio), a pool responsibility, not the
+        # pointless owned-mapping round-trips removed elsewhere in this allocator.
         compressed_logical_indices = (
             self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
         )
@@ -537,14 +544,18 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def free_compressed(self, compressed_indices: torch.Tensor):
-        hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(
+        # Index the allocator-owned mapping directly; the .to(int32) matches the
+        # pool's translate_loc_to_hisparse_device, which reads this same tensor.
+        hisparse_indices = self.full_to_hisparse_device_index_mapping[
             compressed_indices
-        )
+        ].to(torch.int32)
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[compressed_indices] = 0
 
     def free_hisparse(self, free_indices: torch.Tensor):
+        # full->compressed is genuine C4-layout arithmetic; kept as a pool call
+        # (see alloc_extend) rather than an owned-mapping round-trip.
         compressed_indices = (
             self.hisparse_kvcache.translate_loc_from_full_to_compressed(free_indices)
         )
