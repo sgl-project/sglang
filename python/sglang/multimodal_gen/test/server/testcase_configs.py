@@ -488,6 +488,11 @@ MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params = replace(
+    MODELOPT_T2I_CI_sampling_params,
+    extras={"num_inference_steps": 50, "seed": 0},
+)
+
 MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
@@ -636,6 +641,7 @@ MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
 )
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL = "lmsys/qwen-image-2512-modelopt-nvfp4-sglang"
 MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
 MODELOPT_NVFP4_B200_ENV_VARS = {}
 MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}

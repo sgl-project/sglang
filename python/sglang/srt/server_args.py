@@ -911,6 +911,13 @@ class ServerArgs:
             aliases=["--moe-data-parallel-size"],
         ),
     ] = 1
+    dcp_size: A[
+        int,
+        Arg(
+            help="The decode context parallelism size.",
+            aliases=["--decode-context-parallel-size"],
+        ),
+    ] = 1
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -2703,7 +2710,20 @@ class ServerArgs:
                 "--decode-context-parallel-size) must be >= 1, but got "
                 f"dcp_size={self.dcp_size}."
             )
-        if self.dcp_size > 1 and not is_hip():
+        if not self.dcp_size > 1:
+            return
+        if is_hip():
+            return
+        elif is_cuda():
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "Decode context parallel (--dcp-size / "
+                    "--decode-context-parallel-size > 1) on CUDA platform "
+                    "does not support any speculative algorithm, but got "
+                    f"dcp_size={self.dcp_size} on a CUDA platform with "
+                    "speculative decoding enabled."
+                )
+        else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "
                 "--decode-context-parallel-size > 1) is currently only "
@@ -6216,7 +6236,7 @@ class ServerArgs:
                 )
                 self.enable_lmcache = False
 
-        if not self.pp_size > 1:
+        if self.pp_size > 1:
             logger.warning(
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
