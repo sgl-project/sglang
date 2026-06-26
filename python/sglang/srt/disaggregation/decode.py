@@ -59,7 +59,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1299,15 +1299,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        # TODO(th4): co-locate this req.kv bookkeeping with the real KV
-        # allocation; the pool alloc above and the kv_allocated_len assignment
-        # below should become a single owned-kv allocation step.
-        if req.kv is None:
-            from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-            req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-        else:
-            req.kv.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
 
         if prefix_len > 0:
@@ -1353,14 +1344,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
-            device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
+            kv_loc = alloc_for_decode_prealloc_hisparse(
+                self.token_to_kv_pool_allocator, req=req, fill_len=fill_len
             )
 
             # Allocate host indices for the RDMA transfer target.
@@ -1371,41 +1356,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 0,
                 coordinator.host_token_len(fill_len),
             )
-        elif self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:
-            device = self.token_to_kv_pool_allocator.device
-            last_loc = (
-                prefix_indices[-1:].to(dtype=torch.int64, device=device)
-                if prefix_len > 0
-                else torch.tensor([-1], dtype=torch.int64, device=device)
+            kv_loc = alloc_for_decode_prealloc(
+                self.token_to_kv_pool_allocator,
+                req=req,
+                fill_len=fill_len,
+                delta_len=delta_len,
+                prefix_len=prefix_len,
+                total_prefix_len=total_prefix_len,
+                prefix_indices=prefix_indices,
+                uses_swa_tail=self._uses_swa_tail_prealloc() and prefix_len == 0,
+                swa_tail_len=self._swa_tail_len(fill_len),
             )
-            if self._uses_swa_tail_prealloc() and prefix_len == 0:
-                # Tail-only SWA allocation: only valid when prefix_len == 0.
-                # When prefix_len > 0 (radix cache hit), we fall back to
-                # alloc_extend which allocates SWA at full page count; the
-                # SWA budget in that case may slightly under-estimate.
-                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                    prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=fill_len,
-                    swa_tail_len=self._swa_tail_len(fill_len),
-                )
-                req.kv.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
-            else:
-                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                    prefix_lens=torch.tensor(
-                        [total_prefix_len], dtype=torch.int64, device=device
-                    ),
-                    prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                    seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                    last_loc=last_loc,
-                    extend_num_tokens=delta_len,
-                )
 
         assert kv_loc is not None, (
             f"KV cache is full! Bug in memory estimation. "
@@ -1443,6 +1405,81 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.scheduler.enable_hisparse:
             return host_indices
         return kv_loc
+
+
+def alloc_for_decode_prealloc_hisparse(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: Req,
+    fill_len: int,
+) -> torch.Tensor:
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+
+    device = allocator.device
+    return allocator.alloc_logical_only(
+        prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+        prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+        seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+        seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+        last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+        extend_num_tokens=fill_len,
+    )
+
+
+def alloc_for_decode_prealloc(
+    allocator: BaseTokenToKVPoolAllocator,
+    *,
+    req: Req,
+    fill_len: int,
+    delta_len: int,
+    prefix_len: int,
+    total_prefix_len: int,
+    prefix_indices: Optional[torch.Tensor],
+    uses_swa_tail: bool,
+    swa_tail_len: int,
+) -> torch.Tensor:
+    if req.kv is None:
+        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
+    else:
+        req.kv.kv_allocated_len = fill_len
+
+    if allocator.page_size == 1:
+        return allocator.alloc(delta_len)
+
+    device = allocator.device
+    last_loc = (
+        prefix_indices[-1:].to(dtype=torch.int64, device=device)
+        if prefix_len > 0
+        else torch.tensor([-1], dtype=torch.int64, device=device)
+    )
+    if uses_swa_tail:
+        # Tail-only SWA allocation: only valid when prefix_len == 0.
+        # When prefix_len > 0 (radix cache hit), we fall back to
+        # alloc_extend which allocates SWA at full page count; the
+        # SWA budget in that case may slightly under-estimate.
+        kv_loc = allocator.alloc_extend_swa_tail(
+            prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+            prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+            seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+            swa_tail_len=swa_tail_len,
+        )
+        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+        return kv_loc
+
+    return allocator.alloc_extend(
+        prefix_lens=torch.tensor([total_prefix_len], dtype=torch.int64, device=device),
+        prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
+        seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+        seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+        last_loc=last_loc,
+        extend_num_tokens=delta_len,
+    )
 
 
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
