@@ -99,6 +99,51 @@ class SchedulerMlxOverlapMixin:
         self.last_batch = pending.schedule_batch
         self.process_batch_result(pending.batch_copy, result)
 
+    def _mlx_reject_unfittable_prefills(self: Scheduler) -> None:
+        """Reject a queued prefill whose activation peak no longer fits live GPU memory,
+        before it can abort the scheduler with an uncatchable command-buffer OOM.
+
+        Reuses the prompt-length rejection path: ``set_finish_with_abort`` truncates the
+        request to a 1-token prefill that streams a clear HTTP 400 (only effective before
+        the batch is built, which is why this runs here, last before scheduling). The fit
+        check reads live device + system memory, so it reflects whatever is resident now
+        (including concurrent decode caches); that makes it the backstop for concurrency
+        the startup chunk sizing (modelled on max-running-requests=1) does not cover.
+
+        NOTE: overlap loop only (the MLX default). Under --disable-overlap-schedule the
+        startup chunk cap is the sole guard.
+        """
+        runner = getattr(self.tp_worker, "_mlx_runner", None)
+        if runner is None or runner.max_safe_prefill_chunk is None:
+            return  # explicit pool / no auto-sizing -> startup sizing already governs
+        chunk_cap = runner.max_safe_prefill_chunk
+        for req in self.waiting_queue:
+            if req.finished():
+                continue  # already aborted (e.g. by the prompt-length check)
+            prompt_len = len(req.origin_input_ids)
+            if prompt_len <= 0:
+                continue
+            # Worst single chunk: up to chunk_cap new tokens attending to the whole
+            # prompt's resident context (the last chunk's footprint dominates).
+            new_tokens = min(chunk_cap, prompt_len)
+            fits, estimate, headroom = runner.prefill_fits_live_memory(
+                new_tokens, prompt_len
+            )
+            if fits:
+                continue
+            mib = 1024 * 1024
+            msg = (
+                f"Prefill rejected under GPU memory pressure: this {prompt_len}-token "
+                f"prompt needs ~{estimate / mib:.0f} MiB of Metal activation memory for "
+                f"its largest {new_tokens}-token chunk, but only ~{headroom / mib:.0f} MiB "
+                "is free right now. Serving it could abort the server with an "
+                "unrecoverable Metal out-of-memory error, so it was declined. Retry when "
+                "memory frees, shorten the prompt, lower concurrent load, or restart with "
+                "a higher --mem-fraction-static."
+            )
+            logger.warning("MLX prefill admission: %s (rid=%s)", msg, req.rid)
+            req.set_finish_with_abort(msg)
+
     @DynamicGradMode()
     def event_loop_overlap_mlx(self: Scheduler):
         """MLX-specific overlap loop modelled on ``mlx_lm.generate.generate_step``.
@@ -188,6 +233,11 @@ class SchedulerMlxOverlapMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # MLX prefill admission gate (proactive OOM guard): reject queued prefills
+            # that would overflow live GPU memory before they can crash the scheduler.
+            if self.waiting_queue:
+                self._mlx_reject_unfittable_prefills()
 
             # 1. If pending_curr is a pure decode AND no new prefill is waiting,
             #    build pending_next on top of it NOW — before we block on curr.
