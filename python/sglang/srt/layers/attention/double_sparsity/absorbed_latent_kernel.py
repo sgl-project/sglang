@@ -398,6 +398,14 @@ def absorbed_score_paged_fp8(
     # HAS_ROPE=False makes the kernel never dereference it, so the no-rope launch is
     # byte-identical. q_pe is [bs, H, rope_dim] post-RoPE; k_pe is the resident
     # [max_tokens, rope_dim] bf16 RoPE key.
+    # rope inputs are a PAIR: exactly-one-present is a wiring bug — fail closed rather
+    # than silently launching no-PE (which would drop the rope term unnoticed).
+    if (q_pe is None) != (k_pe is None):
+        raise ValueError(
+            "absorbed_score_paged_fp8: q_pe and k_pe must be provided together; got "
+            f"q_pe={'set' if q_pe is not None else 'None'}, "
+            f"k_pe={'set' if k_pe is not None else 'None'}."
+        )
     has_rope = q_pe is not None and k_pe is not None
     if has_rope:
         rope_dim = int(q_pe.shape[-1])

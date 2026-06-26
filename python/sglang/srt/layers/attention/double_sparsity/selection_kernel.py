@@ -70,6 +70,62 @@ def project_query_onto_channels(
     return gathered * channel_weights.unsqueeze(0)
 
 
+def assert_rope_selection_supported(
+    *,
+    is_nextn: bool,
+    dcp_world_size: int,
+    forward_mode_is_decode: bool,
+    q_pe,
+    positions,
+    rotary_emb,
+) -> None:
+    """Fail closed for rope-aware DS selection on non-validated runtimes.
+
+    The caller invokes this only when ``rope_aware_score`` is on. rope-aware
+    selection is validated ONLY for single-token MLA decode with q_pe/positions/
+    rotary_emb threaded (the loop14/15 config); every other runtime raises here
+    rather than silently scoring no-PE. (fp8-vs-bf16 resident KV is checked
+    separately by :func:`assert_rope_fp8_resident` once the pool dtype is known.)
+    """
+    if is_nextn:
+        raise RuntimeError(
+            "Double Sparsity 'rope_aware_score' is not supported on MTP/nextn "
+            "layers (not validated); set rope_aware_score=false or disable MTP."
+        )
+    if dcp_world_size > 1:
+        raise RuntimeError(
+            "Double Sparsity 'rope_aware_score' is not supported with decode "
+            "context parallel (DCP world size > 1; not validated); set "
+            "rope_aware_score=false."
+        )
+    if not forward_mode_is_decode:
+        raise RuntimeError(
+            "Double Sparsity 'rope_aware_score' is validated only for single-token "
+            "decode (speculative/extend not supported). Set rope_aware_score=false."
+        )
+    if q_pe is None or positions is None or rotary_emb is None:
+        raise RuntimeError(
+            "Double Sparsity 'rope_aware_score' requires q_pe, positions, and "
+            "rotary_emb at the selection site; one is None (the rope query is not "
+            "threaded on this path)."
+        )
+
+
+def assert_rope_fp8_resident(resident_dtype) -> None:
+    """Fail closed when rope-aware selection sees a non-fp8 resident KV latent.
+
+    The resident post-RoPE k_pe slice + the fp8 absorbed identity are validated
+    only for the fp8 KV layout; bf16 resident KV has a different byte layout
+    (DEC-1, fp8-only first ship).
+    """
+    if resident_dtype == torch.bfloat16:
+        raise RuntimeError(
+            "Double Sparsity 'rope_aware_score' is validated only for fp8 KV "
+            "cache; the resident KV here is bf16. Pin --kv-cache-dtype fp8_e4m3 "
+            "or set rope_aware_score=false."
+        )
+
+
 def ds_scorer_is_graph_safe(config) -> bool:
     """``True`` iff the configured selector variants are all on the graph-safe
     path, so the selector can run under CUDA-graph capture.

@@ -283,6 +283,60 @@ class TestRopeAwareCrossTPReduce(unittest.TestCase):
             )
 
 
+class TestRopeSelectionSiteGuards(unittest.TestCase):
+    """Selection-site fail-closed preconditions, unit-tested directly via the pure
+    helpers _select_topk_indices delegates to (AC-5, selection-site layer). CPU-only.
+    """
+
+    def _ok_kwargs(self):
+        # The validated config: all preconditions satisfied -> must NOT raise.
+        return dict(
+            is_nextn=False,
+            dcp_world_size=1,
+            forward_mode_is_decode=True,
+            q_pe=torch.zeros(1, 2, ROPE),
+            positions=torch.zeros(1, dtype=torch.int64),
+            rotary_emb=object(),  # any non-None stand-in
+        )
+
+    def test_supported_config_does_not_raise(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            assert_rope_selection_supported,
+        )
+
+        assert_rope_selection_supported(**self._ok_kwargs())  # no raise
+
+    def test_each_unsupported_precondition_raises(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            assert_rope_selection_supported,
+        )
+
+        for override in (
+            {"is_nextn": True},
+            {"dcp_world_size": 2},
+            {"forward_mode_is_decode": False},
+            {"q_pe": None},
+            {"positions": None},
+            {"rotary_emb": None},
+        ):
+            kwargs = self._ok_kwargs()
+            kwargs.update(override)
+            with self.assertRaises(
+                RuntimeError, msg=f"override {override} did not raise"
+            ):
+                assert_rope_selection_supported(**kwargs)
+
+    def test_fp8_resident_required(self):
+        from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+            assert_rope_fp8_resident,
+        )
+
+        # bf16 resident KV must raise; fp8 must not.
+        with self.assertRaises(RuntimeError):
+            assert_rope_fp8_resident(torch.bfloat16)
+        assert_rope_fp8_resident(torch.float8_e4m3fn)  # no raise
+
+
 def _dequant(latent_fp8, scales, phys):
     g = latent_fp8[phys].to(torch.float32)
     s = scales[phys].to(torch.float32)
@@ -381,7 +435,7 @@ class TestRopeAwareKernel(unittest.TestCase):
                 / len(_topk_set(e_on[b], sl))
             )
         self.assertGreaterEqual(
-            min(recalls), 0.999, f"top-{TOPK} recall={min(recalls)} (plan ~0.9995)"
+            min(recalls), 0.9995, f"top-{TOPK} recall={min(recalls)} (plan ~0.9995)"
         )
 
     def test_non_power_of_two_rope_dim_rejected(self):
@@ -421,6 +475,58 @@ class TestRopeAwareKernel(unittest.TestCase):
             for b in range(BS)
         )
         self.assertTrue(differ, "rope-ON and rope-OFF selections are identical")
+
+    def test_off_selected_indices_match_no_rope(self):
+        # AC-1: with the flag off, the SELECTED top-k indices are identical to a
+        # no-rope launch (the byte-identical scores produce an identical selection).
+        k_off = self._kernel()
+        k_off2 = self._kernel(q_pe=None, k_pe=None)
+        for b in range(BS):
+            sl = int(self.seq_lens[b])
+            self.assertEqual(_topk_set(k_off[b], sl), _topk_set(k_off2[b], sl))
+
+    def test_half_wired_rope_pair_rejected(self):
+        # AC-5: a half-wired rope pair (exactly one of q_pe/k_pe) must raise, not
+        # silently launch no-PE.
+        with self.assertRaises(ValueError):
+            self._kernel(q_pe=self.q_pe)  # k_pe missing
+        with self.assertRaises(ValueError):
+            self._kernel(k_pe=self.k_pe)  # q_pe missing
+
+    def test_padded_heads_no_rope_leak(self):
+        # AC-2 negative: with a non-power-of-two head count (6 -> H_POW2=8, 2 pad
+        # heads), the rope-ON kernel still matches the eager 6-head reference — the
+        # pad heads contribute zero rope (h_mask), no leak into the head-max.
+        h6 = 6
+        torch.manual_seed(1)
+        v6 = torch.randn(BS, h6, LORA, device=self.dev)
+        q_pe6 = torch.randn(BS, h6, ROPE, device=self.dev)
+        k_on = self.fn(
+            v6,
+            self.latent_fp8,
+            self.scales,
+            self.rpi,
+            self.rtt,
+            self.seq_lens,
+            SEQ,
+            head_agg="max",
+            q_pe=q_pe6,
+            k_pe=self.k_pe,
+        )
+        e_on = _eager_score(
+            v6,
+            self.latent_fp8,
+            self.scales,
+            q_pe6,
+            self.k_pe,
+            self.rtt,
+            self.rpi,
+            self.seq_lens,
+            True,
+            self.dev,
+        )
+        cos = min(_cos(k_on[b], e_on[b]) for b in range(BS))
+        self.assertGreaterEqual(cos, 0.999, f"padded-head rope leak: cos={cos}")
 
 
 @unittest.skipUnless(_HAS_CUDA, "rope-aware DS graph audit requires CUDA")

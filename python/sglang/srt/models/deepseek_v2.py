@@ -2521,6 +2521,8 @@ class DeepseekV2AttentionMLA(
                         radix_topk_scratch as _radix_topk_scratch,
                     )
                     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                        assert_rope_fp8_resident,
+                        assert_rope_selection_supported,
                         retrieve_topk_graph_safe,
                     )
 
@@ -2564,35 +2566,21 @@ class DeepseekV2AttentionMLA(
                         # Fail closed: rope-aware selection is validated ONLY for
                         # single-token MLA decode on fp8 KV with q_pe/positions/
                         # rotary_emb present (the loop14/15 config). Non-validated
-                        # runtimes raise here rather than silently scoring no-PE.
-                        # (bf16 KV is rejected in the latent-unpack branch below; NSA
-                        # and CPU/NPU cannot reach this DS graph-safe path by
-                        # construction.)
-                        if self.is_nextn:
-                            raise RuntimeError(
-                                "Double Sparsity 'rope_aware_score' is not supported "
-                                "on MTP/nextn layers (not validated); set "
-                                "rope_aware_score=false or disable MTP."
-                            )
-                        if get_attention_dcp_world_size() > 1:
-                            raise RuntimeError(
-                                "Double Sparsity 'rope_aware_score' is not supported "
-                                "with decode context parallel (DCP world size > 1; "
-                                "not validated); set rope_aware_score=false."
-                            )
-                        if not forward_batch.forward_mode.is_decode_or_idle():
-                            raise RuntimeError(
-                                "Double Sparsity 'rope_aware_score' is validated only "
-                                "for single-token decode; got forward_mode "
-                                f"{forward_batch.forward_mode!r} (speculative/extend "
-                                "not supported). Set rope_aware_score=false."
-                            )
-                        if q_pe is None or positions is None or self.rotary_emb is None:
-                            raise RuntimeError(
-                                "Double Sparsity 'rope_aware_score' requires q_pe, "
-                                "positions, and rotary_emb at the selection site; one "
-                                "is None (the rope query is not threaded on this path)."
-                            )
+                        # runtimes raise rather than silently scoring no-PE. (bf16 KV is
+                        # rejected in the latent-unpack branch below via
+                        # assert_rope_fp8_resident; NSA and CPU/NPU cannot reach this DS
+                        # graph-safe path by construction.) The checks live in pure,
+                        # unit-tested helpers in selection_kernel.
+                        assert_rope_selection_supported(
+                            is_nextn=self.is_nextn,
+                            dcp_world_size=get_attention_dcp_world_size(),
+                            forward_mode_is_decode=(
+                                forward_batch.forward_mode.is_decode_or_idle()
+                            ),
+                            q_pe=q_pe,
+                            positions=positions,
+                            rotary_emb=self.rotary_emb,
+                        )
                     if _selector.absorbed_w_sel is not None:
                         from sglang.srt.model_executor.forward_context import (
                             get_token_to_kv_pool as _get_token_to_kv_pool,
@@ -2610,14 +2598,11 @@ class DeepseekV2AttentionMLA(
                             ]
                             _lora = int(_selector.absorbed_w_sel.shape[-1])
                             _nblk = _lora // 128
+                            if _rope_aware:
+                                # Fail closed on non-fp8 resident KV (bf16 has a
+                                # different byte layout; DEC-1 fp8-only first ship).
+                                assert_rope_fp8_resident(_nope_u8.dtype)
                             if _nope_u8.dtype == torch.bfloat16:
-                                if _rope_aware:
-                                    raise RuntimeError(
-                                        "Double Sparsity 'rope_aware_score' is "
-                                        "validated only for fp8 KV cache; the resident "
-                                        "KV here is bf16. Pin --kv-cache-dtype "
-                                        "fp8_e4m3 or set rope_aware_score=false."
-                                    )
                                 # BF16 KV cache: the resident latent IS the
                                 # dequantized k_nope (no fp8 bytes / per-block
                                 # scales). Pass the bf16 k_nope directly; the score
