@@ -49,8 +49,7 @@ def make_backend(
     sglang_backend,
 ):
 
-    # NPU returns NPUPiecewiseBackend, OOT platforms their own; CUDA/ROCm and
-    # unspecified platforms return None and fall back to CUDAPiecewiseBackend.
+    # Unspecified platforms return None and fall back to CUDAPiecewiseBackend.
     backend_cls = current_platform.get_piecewise_backend_cls() or CUDAPiecewiseBackend
     return backend_cls(
         graph,

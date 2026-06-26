@@ -17,6 +17,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import (
     DeviceCapability,
     DeviceMixin,
@@ -71,9 +72,12 @@ class NpuDeviceMixin(DeviceMixin):
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         return torch.npu.mem_get_info(device_id)
 
-    # get_torch_distributed_backend_str is intentionally NOT overridden: the
-    # DeviceMixin default looks up device_type="npu" in
-    # _DEVICE_TO_DISTRIBUTED_BACKEND, which already encodes the hccl/zbal split.
+    def get_torch_distributed_backend_str(self) -> str:
+        # zbal is the Ascend zero-bubble balanced backend; it replaces hccl when
+        # a local memory budget is configured. Mirrors the "npu" entry in the
+        # base DeviceMixin's _DEVICE_TO_DISTRIBUTED_BACKEND, but resolved at call
+        # time so a late SGLANG_ZBAL_LOCAL_MEM_SIZE is honored.
+        return "hccl" if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() <= 0 else "zbal"
 
     @classmethod
     def seed_everything(cls, seed: int | None = None) -> None:
@@ -86,12 +90,11 @@ class NpuSRTPlatform(NpuDeviceMixin, SRTPlatform):
     """Default in-tree Ascend NPU SRT platform."""
 
     def support_cuda_graph(self) -> bool:
-        # NPU captures/replays via torch.npu.NPUGraph (NPUGraphRunner /
-        # NPUCudaGraphBackend).
+        # NPUGraphRunner / NPUCudaGraphBackend
         return True
 
     def support_piecewise_cuda_graph(self) -> bool:
-        # torch.compile piecewise capture via NPUPiecewiseBackend.
+        # NPUPiecewiseBackend.
         return True
 
     def get_default_attention_backend(self) -> str:
@@ -116,12 +119,6 @@ class NpuSRTPlatform(NpuDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "npu"
-
-    # ------------------------------------------------------------------
-    # Subsystem factory hooks — lazy imports keep this module importable on
-    # non-NPU hosts. Each returns the NPU class; callers fall back to the
-    # generic in-tree default when the active platform returns None.
-    # ------------------------------------------------------------------
 
     def get_graph_runner_cls(self) -> type:
         from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (

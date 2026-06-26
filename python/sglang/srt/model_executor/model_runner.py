@@ -2586,9 +2586,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             DecodeCudaGraphRunner,
         )
 
-        # Resolve the decode graph runner through the active platform. NPU/CPU
-        # platforms return their runner; CUDA/ROCm/unspecified return None and
-        # fall back to the default. OOT platforms supply their own.
         GraphRunnerCls = (
             current_platform.get_graph_runner_cls() or DecodeCudaGraphRunner
         )
