@@ -583,11 +583,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
-        dispatch_config = DeepEPConfig.get_instance().normal_dispatch_config
-        if dispatch_config is None:
-            # Use the default dispatch config for this group size
-            # (Buffer is the deep_ep / zbal buffer already imported)
-            dispatch_config = Buffer.get_dispatch_config(self.group.size())
 
         _deepep_precompile_tp_barrier()
         (
@@ -767,7 +762,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **self.round_scale_use_ue8m0_dict,
+                **self.fp8_configs,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
