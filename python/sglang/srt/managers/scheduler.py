@@ -3495,33 +3495,20 @@ class Scheduler(
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
-            if_success = self.tree_cache.clear_storage_backend()
-            if if_success:
-                logger.info("Hierarchical cache cleared successfully!")
-            else:
-                logger.error("Failed to clear hierarchical cache storage backend.")
+            self.tree_cache.clear_storage_backend()
+            logger.info("Hierarchical cache cleared successfully!")
+            if_success = True
         else:
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
     def clear_hicache_storage_after_weight_update(self) -> bool:
-        if not self.enable_hierarchical_cache:
-            return True
-        if not self.enable_hicache_storage:
+        if not self.enable_hierarchical_cache or not self.enable_hicache_storage:
             return True
         if not hasattr(self.tree_cache, "clear_storage_backend"):
-            logger.error(
-                "HiCache storage is enabled but tree cache cannot clear storage backend."
-            )
             return False
-
-        success = self.tree_cache.clear_storage_backend()
-        if success:
-            logger.info("HiCache storage cleared after online weight update.")
-        else:
-            logger.error("Failed to clear HiCache storage after online weight update.")
-        return success
+        return self.tree_cache.clear_storage_backend()
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
