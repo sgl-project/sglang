@@ -1323,6 +1323,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          SGLANG_AMD_MOUNT_SGL_DATA: "1"
 
       - name: Install dependencies
         run: |
@@ -1371,6 +1372,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          SGLANG_AMD_MOUNT_SGL_DATA: "1"
 
       - name: Install dependencies
         run: |
@@ -1455,6 +1457,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          SGLANG_AMD_MOUNT_SGL_DATA: "1"
 
       - name: Install dependencies
         run: |
