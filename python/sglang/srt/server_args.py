@@ -1585,6 +1585,7 @@ class ServerArgs:
     benchmark_prefill_kv_read_granularity: A[
         int,
         "Number of KV-read sample points per ISL for self-benchmark prefill sweep. The default keeps the existing miss-only sweep.",
+        NS("observability"),
     ] = 1
     benchmark_decode_length_granularity: A[
         int,
@@ -1606,11 +1607,6 @@ class ServerArgs:
         "Path to write self-benchmark results JSON.",
         NS("observability"),
     ] = "/tmp/benchmark_results.json"
-    benchmark_timeout: A[
-        int,
-        "Timeout in seconds for external callers waiting on benchmark output.",
-        NS("observability"),
-    ] = 300
     enable_trace: A[bool, "Enable opentelemetry trace", NS("observability")] = False
     trace_modules: A[
         str,
@@ -3468,6 +3464,9 @@ class ServerArgs:
                 "--default-chat-template-kwargs must decode to a JSON object"
             )
 
+        # Validate self-benchmark flags.
+        self._handle_self_benchmark_validation()
+
         # Handle deprecated arguments.
         self._handle_deprecated_args()
 
@@ -4088,11 +4087,6 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
-
-        # Self-benchmark publishes its results through the forward-pass-metrics
-        # pipeline, so benchmark mode implies the metrics are enabled.
-        if self.benchmark_mode is not None:
-            self.enable_forward_pass_metrics = True
 
         # Handle ModelScope model downloads
         if envs.SGLANG_USE_MODELSCOPE.get():
@@ -7884,6 +7878,21 @@ class ServerArgs:
                 f"--asr-max-concurrent-sessions must be positive "
                 f"(got {self.asr_max_concurrent_sessions})."
             )
+
+    def _handle_self_benchmark_validation(self):
+        """Validate startup self-benchmark flags."""
+        if self.benchmark_mode is None:
+            return
+        if not self.enable_forward_pass_metrics:
+            raise ValueError(
+                "--benchmark-mode requires --enable-forward-pass-metrics so "
+                "ForwardPassMetrics publication is enabled explicitly."
+            )
+        if self.use_ray:
+            # Ray reports scheduler readiness by calling SchedulerActor.get_info()
+            # before the scheduler event loop starts. Self-benchmarking currently
+            # runs inside that event loop, so Ray needs a separate readiness path.
+            raise ValueError("--benchmark-mode is not supported with --use-ray")
 
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.overrides import resolved_view

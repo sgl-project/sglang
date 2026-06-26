@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
+import uuid
 from array import array
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -48,7 +50,6 @@ class SelfBenchmarkConfig:
     decode_batch_size_granularity: int = 6
     warmup_iterations: int = 5
     output_path: str = "/tmp/benchmark_results.json"
-    timeout: int = 300
 
 
 @dataclass
@@ -91,7 +92,6 @@ class SelfBenchmark:
             ),
             warmup_iterations=scheduler.server_args.benchmark_warmup_iterations,
             output_path=scheduler.server_args.benchmark_output_path,
-            timeout=scheduler.server_args.benchmark_timeout,
         )
         self.phase = BenchmarkPhase.WARMUP
         self._grid: list[BenchmarkPoint] = []
@@ -102,10 +102,13 @@ class SelfBenchmark:
         self._warmup_remaining = max(0, self.config.warmup_iterations)
         self._grid_index = 0
         self._write_results = bool(getattr(scheduler, "enable_fpm", False))
+        self._run_id = self._make_run_id()
+        self._identity = self._build_output_identity()
+        self._output_path = self._rank_output_path(self.config.output_path)
+        if self._write_results:
+            self._invalidate_output()
         self._pending_seed_point: Optional[BenchmarkPoint] = None
         self._pending_seed_extra_key: Optional[str] = None
-        self._timed_out = False
-        self._deadline_monotonic = self._init_deadline_monotonic()
         self._build_grid()
         if self._warmup_remaining == 0:
             self.phase = BenchmarkPhase.SWEEP
@@ -118,9 +121,9 @@ class SelfBenchmark:
     def maybe_schedule_next(self) -> None:
         if not self.active:
             return
-        if self._has_timed_out():
-            self._finish(timed_out=True)
-            return
+
+        # Synthetic requests are owned by normal scheduler/result processing after
+        # injection, so do not advance or advertise readiness until that state drains.
         if self._current is not None or self._has_inflight_work():
             return
 
@@ -210,17 +213,6 @@ class SelfBenchmark:
         self._current = None
         self._active_reqs = []
         self._grid_index += 1
-
-    def _init_deadline_monotonic(self) -> Optional[float]:
-        if self.config.timeout <= 0:
-            return None
-        return time.monotonic() + self.config.timeout
-
-    def _has_timed_out(self) -> bool:
-        return (
-            self._deadline_monotonic is not None
-            and time.monotonic() >= self._deadline_monotonic
-        )
 
     def _build_grid(self) -> None:
         mode = self.config.mode
@@ -320,6 +312,7 @@ class SelfBenchmark:
             0,
             min(
                 self._max_valid_input_len(),
+                self._max_prefill_forward_tokens(),
                 self.scheduler.max_total_num_tokens - 2,
             ),
         )
@@ -327,6 +320,12 @@ class SelfBenchmark:
     def _max_valid_input_len(self) -> int:
         # validate_input_length rejects requests with len >= max_req_input_len.
         return max(0, self.scheduler.max_req_input_len - 1)
+
+    def _max_prefill_forward_tokens(self) -> int:
+        # max_total_num_tokens is KV capacity, not transient forward/logits
+        # headroom. Keep optional startup benchmarking within the scheduler's
+        # normal prefill-forward token budget.
+        return max(0, getattr(self.scheduler, "max_prefill_tokens", 0))
 
     def _max_decode_context_len(self) -> int:
         page_size = max(1, self.scheduler.page_size)
@@ -444,9 +443,9 @@ class SelfBenchmark:
 
         reqs = []
         for _ in range(batch_size):
-            req = self._new_synthetic_req(prompt_len=context_length, max_tokens=1)
+            req = self._new_synthetic_req(prompt_len=context_length, max_tokens=2)
             self.scheduler.init_req_max_new_tokens(req)
-            if req.sampling_params.max_new_tokens < 1:
+            if req.sampling_params.max_new_tokens < 2:
                 logger.warning(
                     "Skipping decode benchmark request after max_new_tokens clamp: "
                     "rid=%s context_length=%d max_new_tokens=%d",
@@ -464,7 +463,10 @@ class SelfBenchmark:
                 logger.warning("Skipping invalid benchmark request: %s", error_msg)
                 continue
             req.skip_radix_cache_insert = True
-            req.fill_ids = req.origin_input_ids
+            # Model the normal post-prefill boundary: prefill has produced one
+            # output token, but decode has not yet allocated KV for that token.
+            req.output_ids.append(SELF_BENCHMARK_DUMMY_TOKEN_ID)
+            req.fill_ids = req.origin_input_ids + req.output_ids
             req.kv_committed_len = context_length
             req.kv_allocated_len = context_length
             req.already_computed = context_length
@@ -627,12 +629,12 @@ class SelfBenchmark:
             batch, self.scheduler.model_config.vocab_size
         )
 
-        last_tokens = torch.tensor(
-            [req.origin_input_ids[-1] for req in reqs],
+        prefill_output_tokens = torch.tensor(
+            [req.output_ids[-1] for req in reqs],
             dtype=torch.int64,
             device=batch.device,
         )
-        self.scheduler.future_map.stash(batch.req_pool_indices, last_tokens)
+        self.scheduler.future_map.stash(batch.req_pool_indices, prefill_output_tokens)
         batch.input_ids = None
         return batch
 
@@ -737,21 +739,9 @@ class SelfBenchmark:
             return "prefill"
         return None
 
-    def _finish(self, timed_out: bool = False) -> None:
+    def _finish(self) -> None:
         if self.phase == BenchmarkPhase.DONE:
             return
-        if timed_out:
-            self._timed_out = True
-            self._current = None
-            self._active_reqs = []
-            self._pending_seed_point = None
-            self._pending_seed_extra_key = None
-            logger.warning(
-                "Self-benchmark timed out after %d seconds; writing %d completed "
-                "point(s) and continuing startup",
-                self.config.timeout,
-                len(self._results),
-            )
         if self._write_results:
             self._write_output()
         self.phase = BenchmarkPhase.DONE
@@ -761,10 +751,16 @@ class SelfBenchmark:
         logger.info("Self-benchmark completed")
 
     def _write_output(self) -> None:
-        output_path = self._rank_output_path(self.config.output_path)
         output = {
+            "schema_version": 1,
+            "scope": "local_diagnostics",
+            "status": "complete",
+            "valid": True,
+            "run_id": self._run_id,
+            "completed_at_unix": time.time(),
+            "identity": self._identity,
+            "output_path": self._output_path,
             "config": asdict(self.config),
-            "timed_out": self._timed_out,
             "limits": {
                 "max_num_scheduled_tokens": getattr(
                     self.scheduler, "max_prefill_tokens", None
@@ -781,22 +777,106 @@ class SelfBenchmark:
                 for result in self._results
             ],
         }
-        tmp = output_path + ".tmp"
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        with open(tmp, "w") as f:
-            json.dump(output, f, indent=2)
-        os.replace(tmp, output_path)
+        self._atomic_write_json(self._output_path, output)
         logger.info(
             "Self-benchmark results written to %s (%d point(s))",
-            output_path,
+            self._output_path,
             len(self._results),
         )
 
-    def _rank_output_path(self, base_path: str) -> str:
-        dp_rank = (
-            self.scheduler.ps.dp_rank if self.scheduler.ps.dp_rank is not None else 0
+    def _invalidate_output(self) -> None:
+        output_dir = os.path.dirname(self._output_path) or "."
+        os.makedirs(output_dir, exist_ok=True)
+        try:
+            os.unlink(self._output_path)
+        except FileNotFoundError:
+            pass
+        output = {
+            "schema_version": 1,
+            "scope": "local_diagnostics",
+            "status": "running",
+            "valid": False,
+            "run_id": self._run_id,
+            "started_at_unix": time.time(),
+            "identity": self._identity,
+            "output_path": self._output_path,
+            "message": "Self-benchmark is running; previous results are invalid.",
+        }
+        self._atomic_write_json(self._output_path, output)
+
+    def _atomic_write_json(self, output_path: str, output: dict) -> None:
+        output_dir = os.path.dirname(output_path) or "."
+        os.makedirs(output_dir, exist_ok=True)
+        basename = os.path.basename(output_path)
+        fd, tmp = tempfile.mkstemp(
+            prefix=f".{basename}.{os.getpid()}.",
+            suffix=".tmp",
+            dir=output_dir,
+            text=True,
         )
-        if dp_rank == 0:
-            return base_path
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(output, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, output_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _make_run_id(self) -> str:
+        return getattr(self.scheduler, "instance_id", None) or uuid.uuid4().hex[:12]
+
+    def _build_output_identity(self) -> dict:
+        server_args = self.scheduler.server_args
+        ps = self.scheduler.ps
+        return {
+            "model_path": getattr(server_args, "model_path", None),
+            "served_model_name": getattr(server_args, "served_model_name", None),
+            "benchmark_mode": self.config.mode,
+            "disaggregation_mode": self._role_name(),
+            "node_rank": getattr(server_args, "node_rank", None),
+            "nnodes": getattr(server_args, "nnodes", None),
+            "dp_rank": self._rank_value("dp_rank", default=0),
+            "dp_size": getattr(ps, "dp_size", None),
+            "tp_rank": self._rank_value("tp_rank", default=0),
+            "tp_size": getattr(ps, "tp_size", None),
+            "attn_tp_rank": self._rank_value("attn_tp_rank", default=0),
+            "attn_tp_size": getattr(ps, "attn_tp_size", None),
+            "attn_cp_rank": self._rank_value("attn_cp_rank", default=0),
+            "attn_cp_size": getattr(ps, "attn_cp_size", None),
+            "pid": os.getpid(),
+        }
+
+    def _rank_output_path(self, base_path: str) -> str:
         stem, ext = os.path.splitext(base_path)
-        return f"{stem}_dp{dp_rank}{ext}"
+        return f"{stem}_{self._output_path_suffix()}{ext}"
+
+    def _output_path_suffix(self) -> str:
+        parts = [
+            ("role", self._role_name()),
+            ("node", getattr(self.scheduler.server_args, "node_rank", 0)),
+            ("dp", self._rank_value("dp_rank", default=0)),
+            ("tp", self._rank_value("tp_rank", default=0)),
+            ("atp", self._rank_value("attn_tp_rank", default=0)),
+            ("acp", self._rank_value("attn_cp_rank", default=0)),
+        ]
+        return "_".join(
+            f"{name}-{self._sanitize_path_part(value)}" for name, value in parts
+        )
+
+    def _role_name(self) -> str:
+        role = getattr(self.scheduler, "disaggregation_mode", DisaggregationMode.NULL)
+        return str(getattr(role, "value", role))
+
+    def _rank_value(self, name: str, *, default: int) -> int:
+        value = getattr(self.scheduler.ps, name, default)
+        return default if value is None else value
+
+    @staticmethod
+    def _sanitize_path_part(value) -> str:
+        return "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value)
+        )
