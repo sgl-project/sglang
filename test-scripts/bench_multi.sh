@@ -79,7 +79,7 @@ trap cleanup EXIT INT TERM
 if [[ "$MODE" != "dense" ]]; then
   cp "${MODEL_PATH}/config.json" "${MODEL_PATH}/config.json.bak_${SERVER_TAG}"
   ENABLED=true TOPK=2048 FORCE_LEFT=64 FORCE_RIGHT=128 FREQ=4 \
-  PATTERN="FFFSSSSSSSSSSSSSSSFSSFSSSSSFSFFSSFSSSSFSSSFFSS" \
+  PATTERN="FSFSSFSFSSSFSSSSFFFSFSSSSSSFSSSSSFSSSSSSFSSSSS" \
   python3 - "$MODEL_PATH/config.json" <<'PYEOF'
 import json, os, sys
 p = sys.argv[1]

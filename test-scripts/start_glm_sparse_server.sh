@@ -2,7 +2,7 @@
 
 # 1号机 http://10.52.101.26:30000 - V5
 # 2号机 http://10.52.100.149:30000 - V3 baseline
-# 3号机 http://10.52.101.14:30000  -  dense baseline tp8
+# 3号机 http://10.52.101.14:30000  -  V5_opt
 # 4号机 http://10.52.100.141:30000 -  dense baseline
 # 5号机 http://10.52.98.151:30000 - V3 qwen tool parser tp8
 # 6号机 http://10.52.106.215:30000 - V4
@@ -11,7 +11,7 @@
 # tail -f /tmp/glm_sparse_test/server_freq4.log
 
 set -euo pipefail
-source .venv/bin/activate
+# source .venv/bin/activate
 
 SCRIPT_LOG="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_LOG="${SCRIPT_LOG%.sh}_$(date '+%Y%m%d_%H%M%S').log"
@@ -73,5 +73,5 @@ python3 -m sglang.launch_server \
     --quantization fp8 \
     --reasoning-parser glm45 \
     --tool-call-parser qwen \
-    > /tmp/glm_server_v5.log 2>&1 &
+    > /tmp/glm_server_v5_opt.log 2>&1 &
 
