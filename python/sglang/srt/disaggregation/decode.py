@@ -1798,7 +1798,9 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                batch, last_batch=self.last_batch
+            )
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()

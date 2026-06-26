@@ -108,7 +108,9 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    self.mbs[mb_id] = self.get_next_batch_to_run()
+                    self.mbs[mb_id] = self.get_next_batch_to_run(
+                        last_batch=self.last_batch
+                    )
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -248,7 +250,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk()
+                self.process_prefill_chunk(last_batch=self.last_batch)
                 batch = self.get_new_batch_prefill()
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch

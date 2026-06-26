@@ -446,7 +446,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_prefill_batch_to_run(
-        self: Scheduler,
+        self: Scheduler, last_batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
         self.process_pending_chunked_abort()
 
@@ -454,7 +454,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Otherwise, it hangs under high concurrency
         self.running_batch.batch_is_full = False
 
-        self.process_prefill_chunk()
+        self.process_prefill_chunk(last_batch=last_batch)
 
         self.resolve_waiting_queue_bootstrap()
 
@@ -480,7 +480,7 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
+            batch = self.get_next_disagg_prefill_batch_to_run(last_batch=self.last_batch)
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -514,7 +514,7 @@ class SchedulerDisaggregationPrefillMixin:
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_disagg_prefill_batch_to_run()
+            batch = self.get_next_disagg_prefill_batch_to_run(last_batch=self.last_batch)
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -920,7 +920,9 @@ class SchedulerDisaggregationPrefillMixin:
             req, polls[0], defer_release=self.enable_overlap
         )
 
-    def process_prefill_chunk(self: Scheduler) -> None:
+    def process_prefill_chunk(
+        self: Scheduler, last_batch: Optional[ScheduleBatch]
+    ) -> None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
@@ -940,17 +942,17 @@ class SchedulerDisaggregationPrefillMixin:
             if self.chunked_req is not None:
                 self.running_batch.batch_is_full = False
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req:
+        if last_batch and last_batch.forward_mode.is_extend():
+            if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+                chunked_req_to_exclude.add(last_batch.chunked_req)
 
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
+            last_bs = last_batch.batch_size()
+            last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if self.last_batch.batch_size() < last_bs:
+            if last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:

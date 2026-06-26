@@ -137,7 +137,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         # computed, so the gate must skip stash and leave prefix_indices intact.
         s, req, initial_prefix, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(s, last_batch=s.last_batch)
 
         self.assertEqual(req.prefix_indices.shape[0], self.INITIAL_PREFIX_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
@@ -147,7 +147,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         # the cached prefix, stash must run and advance prefix_indices.
         s, req, _, pool = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(s, last_batch=s.last_batch)
 
         expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
             dtype=torch.int64
@@ -162,7 +162,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         cache = _make_chunk_cache(pool)
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
 
-        Scheduler.get_next_batch_to_run(s)
+        Scheduler.get_next_batch_to_run(s, last_batch=s.last_batch)
         self.assertIsNone(s.chunked_req)
 
 
