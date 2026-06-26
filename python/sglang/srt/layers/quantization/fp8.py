@@ -623,7 +623,8 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+        backend = get_fp8_gemm_runner_backend()
+        if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
@@ -664,7 +665,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -827,9 +828,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+            backend = get_fp8_gemm_runner_backend()
+            if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
-            elif get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
             else:
                 weight_scale = layer.weight_scale_inv
