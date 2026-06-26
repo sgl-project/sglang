@@ -59,7 +59,11 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    NextBatchPlan,
+    ScheduleBatch,
+)
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1761,7 +1765,11 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
 
             # Get the next batch to run
-            batch = self.get_next_disagg_decode_batch_to_run()
+            plan = self.get_next_disagg_decode_batch_to_run(
+                running_batch=self.running_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
 
             # Launch the current batch
@@ -1795,10 +1803,16 @@ class SchedulerDisaggregationDecodeMixin:
             self._apply_war_barrier()
 
             # Get the next batch to run
-            batch = self.get_next_disagg_decode_batch_to_run()
+            plan = self.get_next_disagg_decode_batch_to_run(
+                running_batch=self.running_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                batch, last_batch=self.last_batch
+            )
 
             if disable_overlap_for_batch and self.last_batch:
                 pop_and_process()
@@ -1837,11 +1851,11 @@ class SchedulerDisaggregationDecodeMixin:
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler,
-    ) -> Optional[ScheduleBatch]:
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
@@ -1849,28 +1863,28 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = new_prebuilt_batch
+                if running_batch.is_empty():
+                    running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
-                        self.running_batch.hisparse_coordinator = (
-                            self.hisparse_coordinator
-                        )
+                        running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
-                    self.running_batch.merge_batch(new_prebuilt_batch)
+                    running_batch.merge_batch(new_prebuilt_batch)
 
         # Schedule decode batch
-        if self.running_batch.is_empty():
+        if running_batch.is_empty():
             ret = None
         else:
-            self.running_batch = self.update_running_batch(self.running_batch)
-            ret = self.running_batch if not self.running_batch.is_empty() else None
+            running_batch = self.update_running_batch(running_batch)
+            ret = running_batch if not running_batch.is_empty() else None
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:
             set_schedule_time_batch(ret)
-        return ret
+        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
+    def get_new_prebuilt_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -1881,9 +1895,9 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         if self.enable_priority_scheduling:
-            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+            self.policy.calc_priority(self.waiting_queue, running_batch)
 
-        curr_batch_size = self.running_batch.batch_size()
+        curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
