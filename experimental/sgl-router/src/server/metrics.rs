@@ -158,6 +158,11 @@ pub struct RequestLogContext {
 /// else (incl. forwarded 4xx/5xx and proxy-side 5xx) is an error. Shared by the
 /// middleware so every request — routed or rejected pre-routing — is labelled
 /// the same way.
+///
+/// The 504→`Cancelled` mapping conflates the router's own stale-request cancel
+/// with a genuine upstream 504 forwarded unchanged; the unambiguous signal for a
+/// real stale-cancel is `stale_requests_total{outcome="expired"}`, which only
+/// the janitor increments.
 pub fn outcome_from_status(status: u16) -> RequestOutcome {
     match status {
         200..=299 => RequestOutcome::Success,
@@ -423,7 +428,7 @@ impl MetricsRegistry {
     }
 
     /// Bump `sgl_router_responses_total{status_code}` for the HTTP status the
-    /// client ultimately saw. Driven by the `record_response_status` middleware,
+    /// client ultimately saw. Driven by the `access_log_and_record` middleware,
     /// so it counts EVERY response across all routes — including error
     /// short-circuits that never reach a handler's own bookkeeping (an admission
     /// 503, a body-limit 413). For streaming responses the status is the one sent

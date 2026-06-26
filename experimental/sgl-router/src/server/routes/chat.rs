@@ -109,9 +109,13 @@ pub async fn chat_completions(
 
 /// Parse model from body, select a healthy worker via the per-model policy, then
 /// proxy the request. If the request opts into streaming (`stream: true`), we
-/// pipe SSE bytes back; otherwise buffer. Early errors returned here are logged
-/// by the [`chat_completions`] wrapper; the success / post-dispatch outcomes are
-/// logged at the end of this function.
+/// pipe SSE bytes back; otherwise buffer. This function does not emit the
+/// per-request access-log line and does not count `requests_total` /
+/// `responses_total`: it attaches a [`RequestLogContext`] to routed responses and
+/// returns early errors via `?`, leaving all access logging and request/response
+/// counting to the outermost `access_log_and_record` middleware (see
+/// [`crate::server::app`]). It still records auxiliary metrics (TTFT, request
+/// duration, stale-request, ingress-tokenize errors) and emits diagnostic logs.
 async fn chat_completions_inner(
     ctx: Arc<AppContext>,
     headers: HeaderMap,

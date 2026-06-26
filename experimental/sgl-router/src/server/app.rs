@@ -56,7 +56,10 @@ fn is_infra_path(path: &str) -> bool {
 ///     `requests_total{worker_url,model_id,mode,outcome}` — reading the
 ///     per-worker labels a routed handler attached via [`RequestLogContext`], or
 ///     an empty `worker_url` when the request was rejected before routing — so
-///     the counter covers ALL ingress, not just dispatched traffic; and
+///     the counter covers ALL ingress, not just dispatched traffic. Non-chat API
+///     routes (`/v1/models`, `/v1/tokenize`, `/v1/detokenize`, `/flush_cache`)
+///     are intentionally included here (with an empty `worker_url`); only the
+///     infra paths below are excluded; and
 ///   * emits one access-log line (INFO; DEBUG for infra).
 ///
 /// Handlers therefore no longer log or count requests themselves: a single site

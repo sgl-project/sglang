@@ -593,7 +593,7 @@ async fn oversized_request_body_returns_413() {
         );
     }
     // The 413 is produced by the body-limit layer BEFORE the handler runs; the
-    // outermost `record_response_status` middleware must still count it.
+    // outermost `access_log_and_record` middleware must still count it.
     assert!(
         ctx.metrics
             .render()
@@ -1417,7 +1417,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
         policies,
         active_load,
     ));
-    let app = build_router(ctx);
+    let app = build_router(ctx.clone());
 
     let req = Request::builder()
         .method("POST")
@@ -1450,6 +1450,17 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     assert!(
         body_str.contains("\"code\":\"stale_request_expired\""),
         "504 body must encode the same code in the JSON envelope: {body_str}",
+    );
+    // The stale-cancel is a routed request (a worker was selected), so it lands
+    // in requests_total with the worker's labels and outcome="cancelled" — the
+    // 504 → Cancelled mapping in `outcome_from_status`, distinct from "error".
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(&format!(
+            r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="cancelled"}}"#,
+            worker.url
+        )),
+        "stale 504 must be counted in requests_total as outcome=cancelled: {m}",
     );
 }
 
@@ -1588,11 +1599,12 @@ async fn admission_parks_second_request_until_first_stream_frees_the_slot() {
 }
 
 /// A request shed by the admission gate (503 `service_overloaded`) must show up
-/// in BOTH the dedicated `sgl_router_backpressure_rejected_total` counter AND the
-/// general `sgl_router_responses_total{status_code="503"}` series. The latter is
-/// the point of the `record_response_status` middleware: the shed returns via `?`
-/// before the chat handler's own bookkeeping, so without the middleware it would
-/// be invisible in the response-code metric.
+/// in the dedicated `sgl_router_backpressure_rejected_total` counter, the general
+/// `sgl_router_responses_total{status_code="503"}` series, AND
+/// `sgl_router_requests_total{outcome="error"}` with an empty `worker_url`. The
+/// shed returns via `?` before reaching a worker, so only the outermost
+/// `access_log_and_record` middleware can count it — which is what makes
+/// `sum by (outcome)` include sheds instead of undercounting them.
 #[tokio::test]
 async fn admission_shed_503_is_counted_in_responses_total() {
     let chunks: Vec<&'static str> = vec![
@@ -1659,6 +1671,16 @@ async fn admission_shed_503_is_counted_in_responses_total() {
         m.contains(r#"sgl_router_responses_total{status_code="503"} 1"#),
         "shed 503 must be counted in responses_total: {m}",
     );
+    // And the by-outcome request counter: the shed returns before routing, so the
+    // middleware records it with an empty worker_url and outcome="error". This is
+    // the line that makes `sum by (outcome)` include sheds.
+    assert!(
+        m.lines()
+            .any(|l| l.starts_with("sgl_router_requests_total{")
+                && l.contains(r#"worker_url="""#)
+                && l.contains(r#"outcome="error""#)),
+        "shed must be counted in requests_total with empty worker_url + outcome=error: {m}",
+    );
 
     // Drain A to release resources cleanly.
     let _ = BodyExt::collect(res_a.into_body()).await.unwrap();
@@ -1701,6 +1723,52 @@ async fn success_200_counted_once_per_request_in_responses_total() {
             .contains(r#"sgl_router_responses_total{status_code="200"} 2"#),
         "two successes must count to exactly 2 (no double- or under-count): {}",
         ctx.metrics.render(),
+    );
+    // A routed success must carry its per-worker labels in requests_total — the
+    // handler attaches them via RequestLogContext and the middleware records
+    // them. Guards the label migration against regressing routed traffic to an
+    // empty worker_url (which would blank the per-worker convergence panels).
+    assert!(
+        ctx.metrics.render().contains(&format!(
+            r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}} 2"#,
+            worker.url
+        )),
+        "two routed successes must count to 2 with full per-worker labels: {}",
+        ctx.metrics.render(),
+    );
+}
+
+/// Infra paths (`/healthz`, `/readyz`, `/metrics`) are health/scrape probes, not
+/// API traffic: the middleware counts them in `responses_total{status_code}` (so
+/// a failing probe stays observable) but deliberately skips `requests_total` —
+/// otherwise probe successes would swamp the by-outcome view. A `/healthz` 200
+/// must therefore appear in `responses_total` yet leave `requests_total` empty.
+#[tokio::test]
+async fn infra_path_counted_in_responses_total_but_not_requests_total() {
+    let ctx = build_ctx_with_worker("http://placeholder:0");
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let res = build_router(ctx.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.into_body().collect().await.unwrap();
+
+    let m = ctx.metrics.render();
+    // Counted in responses_total — a failing probe must stay observable there.
+    assert!(
+        m.contains(r#"sgl_router_responses_total{status_code="200"} 1"#),
+        "infra 200 must be counted in responses_total: {m}",
+    );
+    // ...but NOT in requests_total: when the only traffic is an infra probe, no
+    // request series may exist (the `# TYPE` line starts with `#`, not the metric
+    // name, so it is not matched here).
+    assert!(
+        !m.lines()
+            .any(|l| l.starts_with("sgl_router_requests_total{")),
+        "infra path must NOT be counted in requests_total: {m}",
     );
 }
 
