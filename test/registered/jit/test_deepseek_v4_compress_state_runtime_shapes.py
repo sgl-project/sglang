@@ -59,7 +59,7 @@
 #
 # Workload for the service-level scenario:
 #   HF_ENDPOINT=https://hf-mirror.com \
-#   python3 -m sglang.bench_serving \
+#   python3 -m sglang.benchmark.serving \
 #     --host localhost \
 #     --port 8080 \
 #     --model /data00/models/DeepSeek-V4-Flash \
@@ -98,10 +98,11 @@ from sglang.jit_kernel.tests.deepseek_v4.common import (
     make_legacy_context,
     to_seq_extend,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.utils import is_in_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=25, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 Mode = Literal["decode", "prefill"]
 ShapeTier = Literal["ci", "smoke", "full"]
