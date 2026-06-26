@@ -1166,10 +1166,6 @@ class ServerArgs:
     benchmark_output_path: A[str, "Path to write self-benchmark results JSON."] = (
         "/tmp/benchmark_results.json"
     )
-    benchmark_timeout: A[
-        int,
-        "Timeout in seconds for external callers waiting on benchmark output.",
-    ] = 300
     enable_trace: A[bool, "Enable opentelemetry trace"] = False
     trace_modules: A[
         str,
@@ -2603,8 +2599,16 @@ class ServerArgs:
         # Validate transcription/ASR-specific server args (model-independent).
         self._handle_asr_validation()
 
-        if self.benchmark_mode is not None:
-            self.enable_forward_pass_metrics = True
+        if self.benchmark_mode is not None and not self.enable_forward_pass_metrics:
+            raise ValueError(
+                "--benchmark-mode requires --enable-forward-pass-metrics so "
+                "ForwardPassMetrics publication is enabled explicitly."
+            )
+        if self.benchmark_mode is not None and self.use_ray:
+            # Ray reports scheduler readiness by calling SchedulerActor.get_info()
+            # before the scheduler event loop starts. Self-benchmarking currently
+            # runs inside that event loop, so Ray needs a separate readiness path.
+            raise ValueError("--benchmark-mode is not supported with --use-ray")
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         from sglang.srt.arg_groups.pd_disaggregation_hook import (

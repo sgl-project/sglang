@@ -326,6 +326,7 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        self.instance_id = port_args.instance_id
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
@@ -3488,8 +3489,8 @@ class Scheduler(
         if self.enable_fpm:
             fpm = self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
-        if self.self_benchmark is not None:
-            self.self_benchmark.observe_forward_pass(batch, fpm)
+            if self.self_benchmark is not None:
+                self.self_benchmark.observe_forward_pass(batch, fpm)
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
