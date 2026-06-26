@@ -32,10 +32,10 @@ HEADERS = [
     "Decode Workers",
     "Decode GPUs",
     "Conc",
-    "Median TTFT (ms)",
-    "Median TPOT (ms)",
-    "Median Interactivity (tok/s/user)",
-    "Median E2EL (s)",
+    "TTFT (ms)",
+    "TPOT (ms)",
+    "Interactivity (tok/s/user)",
+    "E2EL (s)",
     "TPUT per GPU",
     "Output TPUT per GPU",
     "Input TPUT per GPU",
@@ -113,8 +113,13 @@ def main():
         for r in results
     ]
 
-    hw_label = "/".join(sorted({r["hw"].upper() for r in results})) or "Nightly"
-    print(f"## {hw_label} Nightly Benchmark Results\n")
+    hw_label = "/".join(sorted({r["hw"].upper() for r in results}))
+    if hw_label == "GB200":
+        # NVIDIA GB200 nightly: keep the original hardcoded title untouched.
+        print("## GB200 Nightly Benchmark Results\n")
+    else:
+        # AMD (e.g. MI355X) nightly: derive the title from the result hardware.
+        print(f"## {hw_label} Nightly Benchmark Results\n")
     print(tabulate(rows, headers=HEADERS, tablefmt="github"))
     print()
 
