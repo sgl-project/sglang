@@ -231,6 +231,12 @@ The performance test must separately benchmark:
 
 This enables calculating **speedup** = `(compute_time + comm_time) / overlap_time` and **overlap efficiency** = `max(compute_time, comm_time) / overlap_time` (how close to the ideal of fully overlapping compute and comm).
 
+**Compute kernel selection for benchmark (important):** The compute-only and non-overlap benchmarks **must prefer the user-provided compute kernel implementation** for timing, not a PyTorch reference implementation. The overlap kernel internally uses the custom compute kernel (e.g., a Triton kernel), so the non-overlap baseline must use the same compute path to ensure a fair comparison. If the benchmark measures compute-only with PyTorch ops while the overlap uses Triton, the speedup metric becomes misleading. Implementation pattern:
+
+1. If the user provides a compute kernel (path or function), import it from the overlap kernel file and use it directly in `compute_only()` and `non_overlap()`.
+2. Keep a separate PyTorch reference implementation for **correctness verification only** (comparing overlap output against ground truth).
+3. Only fall back to PyTorch ops for performance benchmarking when no user-provided compute kernel is available.
+
 Read `references/benchmark_template.md` for the complete test file structure, argument conventions, and output format.
 
 ---

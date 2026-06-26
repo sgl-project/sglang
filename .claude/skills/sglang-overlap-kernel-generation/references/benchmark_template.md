@@ -186,7 +186,45 @@ The performance test **must** include all four components separately:
 3. **Non-overlap**: run compute + comm sequentially (no overlap)
 4. **Overlap**: run the fused overlap kernel
 
-This allows calculating **speedup** = `(compute_time + comm_time) / overlap_time`.
+This allows calculating **speedup** = `(compute_time + comm_time) / overlap_time` and **overlap efficiency** = `max(compute_time, comm_time) / overlap_time`.
+
+### Compute Kernel Selection for Benchmark
+
+The **compute-only** and **non-overlap** benchmarks **must prefer the user-provided compute kernel implementation** for timing measurement, not a PyTorch reference implementation. This ensures a fair apples-to-apples comparison with the overlap kernel, which also uses the same compute kernel internally.
+
+**Priority order for compute kernel selection:**
+
+1. **User-provided compute kernel** (highest priority): If the user supplies a path to a custom compute kernel (e.g., a Triton kernel function), import and call it directly for the compute-only and non-overlap measurements. This is the same compute path that the overlap kernel uses internally, so the comparison is authoritative.
+
+2. **PyTorch reference implementation** (fallback): Only use PyTorch built-in ops (e.g., `torch.sum`, `torch.matmul`, `.mul_()`) when no user-provided compute kernel is available. The reference implementation is primarily used for **correctness verification** (comparing overlap output against ground truth), not for performance benchmarking.
+
+**Implementation pattern when user provides a compute kernel:**
+
+```python
+# Import the user-provided compute kernel from the overlap kernel file
+from <overlap_kernel_file> import (
+    <user_compute_kernel>,        # e.g., topk_sum_reduce_kernel (Triton kernel launcher)
+    <overlap_kernel_entry>,       # e.g., topk_sum_reduce_rs_overlap
+    create_<op>_overlap_context,
+)
+
+def compute_only(x, out, *args, **kwargs):
+    """Compute-only: user-provided compute kernel in isolation."""
+    <user_compute_kernel>(x, out, *args, **kwargs)
+    return out
+
+def comm_only(x, output, tp_group):
+    """Comm-only: NCCL collective in isolation."""
+    ...
+
+def non_overlap(x, out, output, *args, tp_group, **kwargs):
+    """Non-overlap: user-provided compute kernel + NCCL comm sequentially."""
+    compute_only(x, out, *args, **kwargs)
+    comm_only(out, output, tp_group)
+    return output
+```
+
+**Why this matters:** If the overlap kernel uses a Triton compute path but the benchmark measures the compute-only baseline with PyTorch ops, the speedup metric becomes misleading — PyTorch ops may be faster or slower than the custom kernel, distorting the overlap efficiency calculation. Using the same compute kernel in both overlap and non-overlap ensures the speedup metric reflects the genuine benefit of overlapping compute and communication.
 
 ## Output Table Format
 

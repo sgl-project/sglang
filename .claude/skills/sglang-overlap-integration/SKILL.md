@@ -2,19 +2,17 @@
 name: sglang-overlap-integration
 description: >
   Integrate an existing overlap kernel (compute-communication fusion) into the SGLang serving
-  framework. This skill starts from a user-provided profiling trace and overlap kernel,
-  automatically locates the corresponding operators in the trace via profiler analysis, maps
-  them to source code, validates semantic equivalence, and then performs the framework-layer
-  plumbing — kernel code placement, communicator setup, environment-variable-controlled
-  dispatch, and model code replacement. Use this skill when the user provides a profiling
-  file and wants to merge a pre-written overlap kernel into SGLang's distributed inference
-  pipeline, wants to wire up symmetric-memory-based communication for a custom kernel, or
-  needs to add an overlap kernel as a drop-in replacement for existing compute+communication
-  operators. Also trigger when the user mentions: "integrate overlap kernel into SGLang",
-  "add overlap layer to SGLang", "hook overlap kernel into model_runner",
-  "SGLang overlap kernel integration", "wire up overlap kernel with nvshmem/torch_symm_mem
-  in SGLang", or describes a step-by-step plan to add a fused compute-comm kernel to the
-  SGLang model execution flow.
+  framework. Requires a profiling trace file path and the overlap kernel source code from the
+  user — ask for them if not provided. This skill locates target operators via profiler analysis,
+  validates semantic equivalence, and performs framework-level plumbing — kernel placement,
+  communicator setup, env-var dispatch, and model code replacement. Use this skill when the
+  user wants to merge a pre-written overlap kernel into SGLang's distributed inference pipeline,
+  wire up symmetric-memory-based communication for a custom kernel, or add an overlap kernel
+  as a drop-in replacement for existing compute+communication operators. Also trigger when the
+  user mentions: "integrate overlap kernel into SGLang", "add overlap layer to SGLang",
+  "hook overlap kernel into model_runner", "SGLang overlap kernel integration",
+  "wire up overlap kernel with nvshmem/torch_symm_mem in SGLang", or describes a step-by-step
+  plan to add a fused compute-comm kernel to the SGLang model execution flow.
 ---
 
 # SGLang Overlap Kernel Integration
@@ -24,6 +22,21 @@ description: >
 This skill guides the integration of an existing overlap kernel (compute-communication fusion)
 into the SGLang LLM serving framework. It does NOT generate kernel code — it assumes the
 overlap kernel already exists and handles identification, validation, and framework-level plumbing.
+
+## Prerequisites — Required User Inputs
+
+This skill requires two mandatory inputs. **If either is missing, stop and ask the user — do not proceed with guesswork or code inspection alone.**
+
+| # | Input | Format | Used By |
+|---|-------|--------|---------|
+| 1 | **Profiling trace file path** | `.json` or `.json.gz` from `torch.profiler.profile(with_stack=True, record_shapes=True)` on a distributed run (TP≥2) | Pattern 0 — locates target compute/communication operators and maps them to source code |
+| 2 | **Overlap kernel source code** | File path or pasted code | Pattern 1 — determines compute op, communication collective, symm-mem mechanism, I/O shapes, and context state |
+
+When asking the user, request:
+1. The absolute path to the profiling trace (must include CUDA kernel events and communication collectives).
+2. The overlap kernel source — file path or pasted code.
+
+Do not skip Pattern 0, fabricate operator chains from code inspection, or begin code changes (Patterns 2–6) before both inputs are provided.
 
 ## Minimal-Invasion Principle
 
