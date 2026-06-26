@@ -115,6 +115,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DrainReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
@@ -1350,6 +1351,24 @@ async def get_weights_by_name(
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/drain", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def drain(obj: DrainReqInput, request: Request):
+    """Block until in-flight requests complete or `timeout` seconds elapse.
+
+    Returns 200 with `{"success": bool, "remaining_requests": int}`. The
+    caller is responsible for not submitting new requests during the drain
+    window; this endpoint does not block submission.
+    """
+    success, remaining = await _global_state.tokenizer_manager.drain(
+        timeout=obj.timeout
+    )
+    return ORJSONResponse(
+        {"success": success, "remaining_requests": remaining},
+        status_code=200,
+    )
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])

@@ -1200,6 +1200,23 @@ class Engine(EngineScoreMixin, EngineBase):
 
         return await self.tokenizer_manager.unload_lora_adapter(obj, None)
 
+    def drain(self, timeout: Optional[float] = None) -> Tuple[bool, int]:
+        """Block until in-flight requests complete or ``timeout`` seconds pass.
+
+        Returns ``(success, remaining_requests)``. ``success`` is True when
+        the engine reaches an idle state, False on timeout. Intended for the
+        RL inner loop where the trainer needs to confirm nothing is mid
+        decode before pushing new weights.
+
+        The caller is responsible for not submitting new requests during the
+        drain window; this method does not block submission. A pause / quiesce
+        flag is the right place to enforce that and is intentionally left to a
+        follow-up PR.
+        """
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.drain(timeout=timeout)
+        )
+
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         return self.loop.run_until_complete(

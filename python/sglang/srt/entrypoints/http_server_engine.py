@@ -134,6 +134,10 @@ class HttpServerEngineAdapter(EngineBase):
 
         return self._make_request("generate", payload)
 
+    def drain(self, timeout: Optional[float] = None) -> Tuple[bool, int]:
+        response = self._make_request("drain", {"timeout": timeout})
+        return response.get("success", False), response.get("remaining_requests", 0)
+
     def release_memory_occupation(self):
         return self._make_request("release_memory_occupation")
 
