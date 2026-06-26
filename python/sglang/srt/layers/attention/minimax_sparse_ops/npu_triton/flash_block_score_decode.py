@@ -400,7 +400,7 @@ def _decode_bnsd_score_kernel(
 
 
 # =============================================================================
-# BNSD Decode Attention Chunk Kernel
+# BNSD Decode Score Chunk Kernel (score-only, one program per block-tile)
 # =============================================================================
 
 
@@ -410,18 +410,14 @@ def _decode_bnsd_score_kernel(
             16, triton.next_power_of_2(args["gqa_group_size"])
         ),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "HAS_SINK": lambda args: args["sink_ptr"] is not None,
     }
 )
 @triton.jit
-def _decode_bnsd_attn_chunk_kernel(
+def _decode_bnsd_score_chunk_kernel(
     q_ptr,              # [B, QH, D]
-    sink_ptr,           # optional [QH, D]
     k_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
-    v_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
     block_table_ptr,    # [B, max_num_blocks]
-    o_ptr,              # [C, B, QH, D]
-    lse_ptr,            # [C, B, QH]
+    score_ptr,          # [QH, B, max_seqblock]
     seq_lens,           # [B]
     # shape
     batch_size,
@@ -430,36 +426,49 @@ def _decode_bnsd_attn_chunk_kernel(
     # block/scaling
     block_size: tl.constexpr,
     sm_scale,
+    init_blocks,
+    local_blocks,
+    num_kv_chunks,
     # strides
     stride_q_b,
     stride_q_h,
     stride_q_d,
-    stride_sink_h,
-    stride_sink_d,
     stride_k_block,
     stride_k_offset,
     stride_k_h,
     stride_k_d,
-    stride_v_block,
-    stride_v_offset,
-    stride_v_h,
-    stride_v_d,
     stride_bt_b,
     stride_bt_n,
-    stride_o_c,
-    stride_o_b,
-    stride_o_h,
-    stride_o_d,
-    stride_l_c,
-    stride_l_b,
-    stride_l_h,
+    stride_s_h,
+    stride_s_b,
+    stride_s_n,
     # meta
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    NUM_KV_CHUNKS: tl.constexpr,
-    HAS_SINK: tl.constexpr,
+    SCORE_TYPE: tl.constexpr,
+    topk: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
 ):
+    """Score-only chunked kernel.
+
+    Same per-block score math as ``_decode_bnsd_score_kernel``, but one program
+    iterates over a tile of consecutive logical blocks (its chunk), loading Q
+    once and reusing it for every block in the tile. Grid is
+    ``(batch_size * num_kv_chunks, num_kv_heads)`` -- independent of context
+    length -- so total score time no longer scales with ``max_seqblock``.
+    Output score tensor is bit-identical to the 1-block-per-program kernel.
+
+    NOTE: a multi-block K-tile (BLOCKS_PER_K_BLOCK > 1, one tl.dot over several
+    consecutive blocks) was attempted to cut dot/loop count for the full-context
+    scan, but it is NOT viable on this Ascend TBE backend: the 3D tl.reshape of
+    the dot result miscompiles (~400x slowdown at BPK=1), the lane-arithmetic
+    fallback is similarly pathological (~1500x), and BPK>1 hard-crashes the
+    compiler (BLOCK_SIZE_N=256/512 and/or the vectorized block_table gather).
+    Kept as 1-block-per-iteration. A fused/tiled version would need a non-Triton
+    (Ascend C++/TBE) kernel.
+    """
+    tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     tl.static_assert(BLOCK_SIZE_N >= block_size)
 
     pid_bc = tl.program_id(0)
@@ -472,7 +481,16 @@ def _decode_bnsd_attn_chunk_kernel(
     seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
     num_blocks = tl.cdiv(seq_len, block_size)
 
-    chunk_size_blocks = tl.maximum(1, tl.cdiv(num_blocks, NUM_KV_CHUNKS))
+    # Trivial-skip: when the sequence has <= topk blocks, every block is
+    # selected regardless of score, so the QK + scoring work is wasted. Early-
+    # return leaves score[(h,b),:] uninitialized; the streaming topk kernel
+    # short-circuits the same (num_blocks <= topk) case without reading score,
+    # so this is safe. Mirrors the GPU _decode_score_kernel trivial-skip.
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if num_blocks <= topk:
+            return
+
+    chunk_size_blocks = tl.maximum(1, tl.cdiv(num_blocks, num_kv_chunks))
     chunk_start_block = pid_c * chunk_size_blocks
     chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
 
@@ -483,7 +501,7 @@ def _decode_bnsd_attn_chunk_kernel(
     off_d = tl.arange(0, BLOCK_SIZE_D)
     off_n = tl.arange(0, BLOCK_SIZE_N)
 
-    # Q: [H, D]
+    # Q: [H, D] -- loaded once, reused across the whole chunk.
     q_offsets = (
         pid_b * stride_q_b
         + (pid_h + off_h[:, None]) * stride_q_h
@@ -496,30 +514,7 @@ def _decode_bnsd_attn_chunk_kernel(
     )
 
     sm_scale_log2e = sm_scale * 1.4426950409
-
-    if HAS_SINK:
-        if pid_c == 0:
-            sink_offsets = (
-                (pid_h + off_h[:, None]) * stride_sink_h
-                + off_d[None, :] * stride_sink_d
-            )
-            sink = tl.load(
-                sink_ptr + sink_offsets,
-                mask=(off_h[:, None] < gqa_group_size)
-                & (off_d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            qsink = tl.sum(q.to(tl.float32) * sink, axis=1) * sm_scale_log2e
-            m_i = qsink
-            l_i = tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32)
-        else:
-            m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-            l_i = tl.full((BLOCK_SIZE_H,), 0.0, dtype=tl.float32)
-    else:
-        m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
-        l_i = tl.full((BLOCK_SIZE_H,), 0.0, dtype=tl.float32)
-
-    acc_o = tl.full((BLOCK_SIZE_H, BLOCK_SIZE_D), 0.0, dtype=tl.float32)
+    local_start = tl.maximum(0, num_blocks - local_blocks)
 
     num_steps = chunk_end_block - chunk_start_block
     for step in tl.range(num_steps):
@@ -544,59 +539,33 @@ def _decode_bnsd_attn_chunk_kernel(
             other=0.0,
         )
 
-        # V: [N, D]
-        v_offsets = (
-            physical_block * stride_v_block
-            + off_n[:, None] * stride_v_offset
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d
-        )
-        v = tl.load(
-            v_cache_ptr + v_offsets,
-            mask=pos_mask[:, None] & (off_d[None, :] < head_dim),
-            other=0.0,
-        )
-
         qk = tl.dot(q, k) * sm_scale_log2e
         qk = tl.where(pos_mask[None, :], qk, float("-inf"))
 
-        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp2(qk - m_new[:, None])
-        l_new = tl.sum(p, axis=1)
+        sub_max = tl.max(qk, axis=1)
+        if SCORE_TYPE == "max":
+            score = sub_max
+        else:
+            score = sub_max + tl.log2(
+                tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1)
+            )
+            score = tl.where(score != score, float("-inf"), score)
 
-        acc_scale = tl.exp2(m_i - m_new)
-        acc_o = acc_o * acc_scale[:, None]
-        acc_o += tl.dot(p.to(v.dtype), v)
+        is_init = logical_block < init_blocks
+        is_local = (logical_block >= local_start) & (logical_block < num_blocks)
+        score = tl.where(is_init, 1e30, score)
+        score = tl.where(is_local, 1e29, score)
 
-        l_i = l_i * acc_scale + l_new
-        m_i = m_new
-
-    acc_o = acc_o / l_i[:, None]
-    lse_i = m_i + tl.log2(l_i)
-
-    o_offsets = (
-        pid_c * stride_o_c
-        + pid_b * stride_o_b
-        + (pid_h + off_h[:, None]) * stride_o_h
-        + off_d[None, :] * stride_o_d
-    )
-    tl.store(
-        o_ptr + o_offsets,
-        acc_o.to(o_ptr.dtype.element_ty),
-        mask=(off_h[:, None] < gqa_group_size) & (off_d[None, :] < head_dim),
-    )
-
-    l_offsets = (
-        pid_c * stride_l_c
-        + pid_b * stride_l_b
-        + (pid_h + off_h) * stride_l_h
-    )
-    tl.store(
-        lse_ptr + l_offsets,
-        lse_i.to(lse_ptr.dtype.element_ty),
-        mask=off_h < gqa_group_size,
-    )
-
+        s_offsets = (
+            (pid_h + off_h) * stride_s_h
+            + pid_b * stride_s_b
+            + logical_block * stride_s_n
+        )
+        tl.store(
+            score_ptr + s_offsets,
+            score.to(score_ptr.dtype.element_ty),
+            mask=off_h < gqa_group_size,
+        )
 
 
 # =============================================================================
