@@ -1187,7 +1187,10 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
-        assert seq_lens_cpu is not None
+        # NOTE: the decode / target_verify / draft_extend replay branches below
+        # derive the page-table width statically (metadata.page_table_1.shape[1])
+        # rather than from seq_lens_cpu.max(), so seq_lens_cpu may be None here
+        # once the backend opts out of the host seq-len mirror.
 
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
@@ -1206,14 +1209,17 @@ class DeepseekSparseAttnBackend(
         self.set_dsa_prefill_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            max_len = int(seq_lens_cpu.max().item())
+            # Static page-table width (= captured buffer width) instead of a
+            # seq_lens_cpu.max() host read. The kernel bounds each row's reads by
+            # the GPU cache_seqlens, so copying the full width is correct and keeps
+            # this path independent of the host seq-len mirror (no per-step D2H).
+            max_len = metadata.page_table_1.shape[1]
 
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1228,9 +1234,9 @@ class DeepseekSparseAttnBackend(
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
-            max_seqlen_k = int(
-                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-            )
+            # Static width (captured buffer already reserves +num_draft_tokens);
+            # avoids the seq_lens_cpu.max() host read. See the decode branch note.
+            max_seqlen_k = metadata.page_table_1.shape[1]
 
             cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
@@ -1260,7 +1266,10 @@ class DeepseekSparseAttnBackend(
             )
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
         elif forward_mode.is_draft_extend_v2():
-            max_seqlen_k = int(seq_lens_cpu.max().item())
+            # Static width; avoids the seq_lens_cpu.max() host read. See the decode
+            # branch note. (The spec_info.num_accept_tokens .tolist() below is a
+            # separate host dependency, tracked by the draft-extend cuda-graph work.)
+            max_seqlen_k = metadata.page_table_1.shape[1]
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
