@@ -544,6 +544,50 @@ class TestBenchmarkArgs(unittest.TestCase):
                 use_ray=True,
             )
 
+    def test_benchmark_granularity_below_one_rejected(self):
+        for arg in (
+            "benchmark_prefill_granularity",
+            "benchmark_prefill_kv_read_granularity",
+            "benchmark_decode_length_granularity",
+            "benchmark_decode_batch_granularity",
+        ):
+            for bad_value in (0, -1):
+                with self.subTest(arg=arg, value=bad_value):
+                    with self.assertRaisesRegex(ValueError, "must be >= 1"):
+                        ServerArgs(
+                            model_path="dummy",
+                            benchmark_mode="agg",
+                            enable_forward_pass_metrics=True,
+                            **{arg: bad_value},
+                        )
+
+    def test_benchmark_warmup_iterations_negative_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be >= 0"):
+            ServerArgs(
+                model_path="dummy",
+                benchmark_mode="agg",
+                enable_forward_pass_metrics=True,
+                benchmark_warmup_iterations=-1,
+            )
+
+    def test_benchmark_warmup_iterations_zero_allowed(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            benchmark_mode="agg",
+            enable_forward_pass_metrics=True,
+            benchmark_warmup_iterations=0,
+        )
+        self.assertEqual(server_args.benchmark_warmup_iterations, 0)
+
+    def test_benchmark_granularity_not_validated_without_benchmark_mode(self):
+        # Without --benchmark-mode the granularity guards must not fire.
+        server_args = ServerArgs(
+            model_path="dummy",
+            benchmark_prefill_granularity=0,
+            benchmark_warmup_iterations=-5,
+        )
+        self.assertEqual(server_args.benchmark_prefill_granularity, 0)
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

@@ -581,6 +581,32 @@ class Scheduler(
             raise ValueError("--benchmark-mode is not supported with PD multiplexing")
         if self.enable_overlap_mlx:
             raise ValueError("--benchmark-mode is not supported with MLX overlap")
+        if not self.is_generation:
+            # Non-generation (embedding/reward) models would leak synthetic
+            # prefill outputs to the tokenizer (suppress_output is only honored
+            # on the generation streaming path).
+            raise ValueError("--benchmark-mode is only supported for generative models")
+        if not self.spec_algorithm.is_none():
+            # The synthetic decode path is incompatible with speculative
+            # decoding, and the synthetic prefill path is not guarded for it.
+            raise ValueError(
+                "--benchmark-mode is not supported with speculative decoding"
+            )
+        if self.model_config.is_encoder_decoder:
+            raise ValueError(
+                "--benchmark-mode is not supported with encoder-decoder models"
+            )
+        if self.model_config.is_multimodal:
+            # Synthetic requests carry no multimodal inputs.
+            raise ValueError("--benchmark-mode is not supported with multimodal models")
+        if self.enable_lora:
+            raise ValueError("--benchmark-mode is not supported with LoRA")
+        if self.server_args.load_format == "dummy":
+            # Dummy weights produce meaningless benchmark results.
+            raise ValueError(
+                "--benchmark-mode is not supported with dummy weights "
+                "(--load-format dummy)"
+            )
 
         self.self_benchmark = SelfBenchmark(self)
 
@@ -1544,6 +1570,19 @@ class Scheduler(
     def on_self_benchmark_finished(self) -> None:
         self.send_init_info_once()
 
+    def _maybe_run_self_benchmark_step(self) -> bool:
+        """Run one self-benchmark scheduling step in place of request intake.
+
+        Returns True if the self-benchmark handled this iteration's input step
+        (so the caller should skip the normal request receive/process), False
+        otherwise. Replaces the duplicated event-loop guard across the normal
+        and disaggregated loops.
+        """
+        if self.self_benchmark is not None and self.self_benchmark.active:
+            self.self_benchmark.maybe_schedule_next()
+            return True
+        return False
+
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
@@ -1594,9 +1633,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            if self.self_benchmark is not None and self.self_benchmark.active:
-                self.self_benchmark.maybe_schedule_next()
-            else:
+            if not self._maybe_run_self_benchmark_step():
                 # Receive requests
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
@@ -1640,9 +1677,7 @@ class Scheduler(
             if self.gracefully_exit:
                 break
 
-            if self.self_benchmark is not None and self.self_benchmark.active:
-                self.self_benchmark.maybe_schedule_next()
-            else:
+            if not self._maybe_run_self_benchmark_step():
                 # Receive requests
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)

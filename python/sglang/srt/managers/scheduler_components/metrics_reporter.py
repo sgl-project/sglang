@@ -184,24 +184,34 @@ class SchedulerMetricsReporter:
     def _install_device_timer_on_runners(self):
         if self.forward_pass_device_timer is None:
             return
-        timer = self.forward_pass_device_timer
-        self.scheduler.tp_worker.model_runner.device_timer = timer
-        if self.scheduler.draft_worker is not None:
-            dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
-            if dw is not None:
-                if hasattr(dw, "draft_runner"):
-                    dw.draft_runner.device_timer = timer
-                for r in getattr(dw, "draft_runner_list", []):
-                    r.device_timer = timer
+        self._install_device_timer_on_runners_value(self.forward_pass_device_timer)
 
     def _init_fpm(self):
-        """Initialize Forward Pass Metrics (FPM) publisher if configured."""
+        """Initialize Forward Pass Metrics (FPM) publisher if configured.
+
+        Normally FPM is published only by the real FPM rank (attn_tp_rank == 0 on
+        the last pp_rank). The self-benchmark, however, drives its sweep off
+        observe_forward_pass, which only fires when enable_fpm is True. Since the
+        benchmark is built and advances on EVERY rank, we force FPM on for the
+        benchmark's duration on the ranks that would otherwise have it disabled
+        so every rank advances the sweep in lockstep and sends its deferred
+        init-info. SelfBenchmark._finish() restores the original state.
+        """
         self.scheduler.enable_fpm = False
-        if (
+        is_fpm_rank = (
             self.scheduler.server_args.enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
             and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
-        ):
+        )
+        benchmark_forces_fpm = (
+            self.scheduler.server_args.benchmark_mode is not None and not is_fpm_rank
+        )
+        # Distinguish a real FPM rank from a benchmark-forced one: only the real
+        # rank writes its JSON output and keeps publishing after the sweep.
+        self.scheduler._fpm_is_real_rank = is_fpm_rank
+        self.scheduler._fpm_benchmark_forced = benchmark_forces_fpm
+
+        if is_fpm_rank or benchmark_forces_fpm:
             from sglang.srt.observability.forward_pass_metrics import (
                 _FpmPublisherThread,
             )
@@ -214,15 +224,23 @@ class SchedulerMetricsReporter:
             self.scheduler._fpm_worker_id = (
                 self.scheduler.server_args.forward_pass_metrics_worker_id
             )
-            base_endpoint = self.scheduler.server_args.forward_pass_metrics_ipc_name
-            if base_endpoint is None:
+            if benchmark_forces_fpm:
+                # A benchmark-forced rank's published stream is never consumed.
+                # Use a process-unique endpoint: the shared
+                # {base}.{dp_rank} endpoint would collide across the multiple TP
+                # ranks that share a dp_rank, causing a ZMQ bind error.
                 ipc_path = tempfile.NamedTemporaryFile(delete=False).name
-                base_endpoint = f"ipc://{ipc_path}"
-                self.scheduler.server_args.override(
-                    "metrics_reporter.ipc_endpoint",
-                    forward_pass_metrics_ipc_name=base_endpoint,
-                )
-            endpoint = f"{base_endpoint}.{self.scheduler._fpm_dp_rank}"
+                endpoint = f"ipc://{ipc_path}"
+            else:
+                base_endpoint = self.scheduler.server_args.forward_pass_metrics_ipc_name
+                if base_endpoint is None:
+                    ipc_path = tempfile.NamedTemporaryFile(delete=False).name
+                    base_endpoint = f"ipc://{ipc_path}"
+                    self.scheduler.server_args.override(
+                        "metrics_reporter.ipc_endpoint",
+                        forward_pass_metrics_ipc_name=base_endpoint,
+                    )
+                endpoint = f"{base_endpoint}.{self.scheduler._fpm_dp_rank}"
             self.scheduler._fpm_publisher = _FpmPublisherThread(
                 endpoint,
                 worker_id=self.scheduler._fpm_worker_id,
@@ -233,19 +251,26 @@ class SchedulerMetricsReporter:
             def _fpm_device_timer_reporter(t, **_kwargs):
                 self.scheduler._fpm_gpu_time_acc += t
 
+            # Track the reporter + whether we own a freshly created timer so a
+            # benchmark-forced rank can fully tear the timer down afterwards.
+            self._fpm_device_timer_reporter = _fpm_device_timer_reporter
             if self.forward_pass_device_timer is not None:
+                self._fpm_owns_device_timer = False
                 self.forward_pass_device_timer.add_reporter(_fpm_device_timer_reporter)
             else:
+                self._fpm_owns_device_timer = True
                 self.forward_pass_device_timer = DeviceTimer(
                     reporter=_fpm_device_timer_reporter,
                 )
             self.scheduler._fpm_uses_device_timer = True
             self.scheduler.enable_fpm = True
             logger.info(
-                "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",
+                "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s, "
+                "benchmark_forced=%s)",
                 endpoint,
                 self.scheduler._fpm_dp_rank,
                 self.scheduler._fpm_uses_device_timer,
+                benchmark_forces_fpm,
             )
 
     def _build_scheduled_request_metrics(self, batch: ScheduleBatch):
@@ -985,6 +1010,43 @@ class SchedulerMetricsReporter:
         """Shut down the FPM publisher thread."""
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.shutdown()
+
+    def shutdown_benchmark_forced_fpm(self):
+        """Tear down FPM machinery that was only forced on for the self-benchmark.
+
+        Called by SelfBenchmark._finish() on ranks where FPM was benchmark-forced
+        (not a real FPM rank). Shuts down the forced publisher and stops the
+        device-timer reporter so production is unaffected. Must run BEFORE the
+        caller flips enable_fpm back to False, since the publisher only exists
+        while FPM is active on this rank.
+        """
+        if not getattr(self.scheduler, "_fpm_benchmark_forced", False):
+            return
+        self.scheduler._fpm_publisher.shutdown()
+        # Stop feeding the FPM device-timer accumulator.
+        reporter = getattr(self, "_fpm_device_timer_reporter", None)
+        if reporter is not None and self.forward_pass_device_timer is not None:
+            if getattr(self, "_fpm_owns_device_timer", False):
+                # We created this timer solely for forced FPM; drop it entirely.
+                self.forward_pass_device_timer = None
+                self._install_device_timer_on_runners_value(None)
+            else:
+                self.forward_pass_device_timer.remove_reporter(reporter)
+        self.scheduler._fpm_uses_device_timer = False
+        self._fpm_device_timer_reporter = None
+        # Forced ranks never write output and have nothing left to publish.
+        self.scheduler._fpm_benchmark_forced = False
+
+    def _install_device_timer_on_runners_value(self, timer):
+        """Set (or clear) the device timer reference on the model runners."""
+        self.scheduler.tp_worker.model_runner.device_timer = timer
+        if self.scheduler.draft_worker is not None:
+            dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
+            if dw is not None:
+                if hasattr(dw, "draft_runner"):
+                    dw.draft_runner.device_timer = timer
+                for r in getattr(dw, "draft_runner_list", []):
+                    r.device_timer = timer
 
     def _log_hicache_stats(self):
         """Populate HiCache host-tier stats on self.stats.

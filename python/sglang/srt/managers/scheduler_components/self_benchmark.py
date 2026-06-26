@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
@@ -74,7 +75,20 @@ class BenchmarkPhase(Enum):
 
 
 class SelfBenchmark:
-    """Scheduler-local self benchmark."""
+    """Scheduler-local self benchmark.
+
+    Multi-rank lockstep assumption: the benchmark is constructed and advanced on
+    every scheduler rank, and FPM is forced on for all ranks during the sweep
+    (see metrics_reporter._init_fpm) so observe_forward_pass fires everywhere and
+    every rank advances WARMUP->SWEEP->DONE together. The grid (_build_grid) and
+    synthetic allocations are deterministic functions of the server args and the
+    homogeneous per-rank limits (max_total_num_tokens, page_size, max_req_len,
+    etc.), so each iteration runs an identical synthetic batch in the same
+    collective across ranks. There is intentionally no cross-rank barrier: any
+    per-rank, data-dependent skip in maybe_schedule_next / observe_forward_pass
+    would desync the collectives, so all skip/advance decisions here must depend
+    only on homogeneous state.
+    """
 
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
@@ -101,7 +115,23 @@ class SelfBenchmark:
         self._seq = 0
         self._warmup_remaining = max(0, self.config.warmup_iterations)
         self._grid_index = 0
-        self._write_results = bool(getattr(scheduler, "enable_fpm", False))
+        # Keep output writing keyed to whether THIS rank is a real FPM rank, not
+        # to the (possibly benchmark-forced) enable_fpm flag. Otherwise every TP
+        # rank forced into FPM for the sweep would write a redundant JSON file.
+        # _fpm_is_real_rank is set in metrics_reporter._init_fpm; fall back to
+        # enable_fpm for fake schedulers in tests that don't set it.
+        self._write_results = bool(
+            getattr(
+                scheduler,
+                "_fpm_is_real_rank",
+                getattr(scheduler, "enable_fpm", False),
+            )
+        )
+        # Original per-rank enable_fpm, restored when the sweep finishes so a
+        # benchmark-forced rank stops publishing afterwards.
+        self._restore_enable_fpm = bool(getattr(scheduler, "enable_fpm", False)) and (
+            not bool(getattr(scheduler, "_fpm_benchmark_forced", False))
+        )
         self._run_id = self._make_run_id()
         self._identity = self._build_output_identity()
         self._output_path = self._rank_output_path(self.config.output_path)
@@ -477,9 +507,12 @@ class SelfBenchmark:
 
         try:
             batch = self._build_synthetic_decode_batch(reqs, context_length)
-        except RuntimeError as exc:
+        except Exception as exc:
+            # Any failure between KV/req-slot allocation and publish (KV OOM, a
+            # stash/payload error, etc.) must free the pre-allocated context KV +
+            # req slots and skip the point, never crash the scheduler.
             logger.warning(
-                "Skipping decode benchmark point due to synthetic KV allocation "
+                "Skipping decode benchmark point due to synthetic batch build "
                 "failure: %s",
                 exc,
             )
@@ -634,7 +667,12 @@ class SelfBenchmark:
             dtype=torch.int64,
             device=batch.device,
         )
-        self.scheduler.future_map.stash(batch.req_pool_indices, prefill_output_tokens)
+        # FutureMap.stash expects a RelayPayload, not a raw tensor; non-spec only
+        # fills bonus_tokens (which the synthetic decode batch reads back next iter).
+        self.scheduler.future_map.stash(
+            batch.req_pool_indices,
+            RelayPayload(bonus_tokens=prefill_output_tokens),
+        )
         batch.input_ids = None
         return batch
 
@@ -702,6 +740,12 @@ class SelfBenchmark:
             return True
         if getattr(self.scheduler, "waiting_queue", None):
             return True
+        # Requests waiting on grammar compilation are not yet in waiting_queue.
+        grammar_manager = getattr(self.scheduler, "grammar_manager", None)
+        if grammar_manager is not None and getattr(
+            grammar_manager, "grammar_queue", None
+        ):
+            return True
         for queue_name in (
             "disagg_prefill_bootstrap_queue",
             "disagg_prefill_inflight_queue",
@@ -717,6 +761,12 @@ class SelfBenchmark:
                 continue
             queue = getattr(queue_owner, "queue", None)
             if queue:
+                return True
+            # The decode prealloc queue also holds retracted and not-yet-resolved
+            # requests outside its main `queue`.
+            if getattr(queue_owner, "retracted_queue", None):
+                return True
+            if getattr(queue_owner, "pending_reqs", None):
                 return True
         running = getattr(self.scheduler, "running_batch", None)
         if running is not None and not running.is_empty():
@@ -745,10 +795,28 @@ class SelfBenchmark:
         if self._write_results:
             self._write_output()
         self.phase = BenchmarkPhase.DONE
+        self._restore_fpm_state()
         on_finish = getattr(self.scheduler, "on_self_benchmark_finished", None)
         if on_finish is not None:
             on_finish()
         logger.info("Self-benchmark completed")
+
+    def _restore_fpm_state(self) -> None:
+        """Restore FPM to its prior per-rank state after the sweep.
+
+        FPM was turned on for every rank for the sweep's duration (so each rank
+        advances WARMUP->SWEEP->DONE in lockstep). On ranks where FPM was
+        benchmark-forced, tear the forced publisher/timer down and disable FPM;
+        on the real FPM rank, leave production publishing intact.
+        """
+        reporter = getattr(self.scheduler, "metrics_reporter", None)
+        # Shut down the forced publisher BEFORE flipping enable_fpm: the forced
+        # teardown does not depend on enable_fpm, but flipping it first would
+        # leave the publisher thread running on benchmark-forced ranks.
+        if reporter is not None and hasattr(reporter, "shutdown_benchmark_forced_fpm"):
+            reporter.shutdown_benchmark_forced_fpm()
+        if hasattr(self.scheduler, "enable_fpm"):
+            self.scheduler.enable_fpm = self._restore_enable_fpm
 
     def _write_output(self) -> None:
         output = {

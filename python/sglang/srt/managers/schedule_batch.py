@@ -817,6 +817,10 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # When True, the request's outputs are not streamed to the tokenizer.
+        # Used by synthetic self-benchmark requests (see SelfBenchmark) so their
+        # dummy outputs never reach the detokenizer.
+        self.suppress_output = False
         # If we want to abort the request in the middle of the event loop,
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
