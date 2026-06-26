@@ -7,12 +7,13 @@ Use this for a single mechanical PR -- a relocation, a whole-file split, or a re
 formatter re-wraps lines, which reproduce-and-byte-diff certifies exactly.
 
 The ``Repro`` builder composes faithful relocation primitives (``move_symbol``,
-``extract_to_new_module``, ``lower_call_sites``, ``requalify_call_sites``,
-``remove_import``, ``add_import``, ``repath_import``, ``add_typechecking_import``) into a
-transform, so a move that a formatter re-wrapped can be reproduced and certified. Each primitive does only a
-relocation-faithful edit (it never changes logic), so a byte match after the formatter
-certifies the commit is exactly that relocation. The primitives are deliberately small and
-AST-driven; see how-to-guide.md.
+``extract_to_new_module``, ``extract_symbols_to_new_module``, ``lower_call_sites``,
+``requalify_call_sites``, ``remove_import``, ``remove_imported_name``, ``add_import``,
+``repath_import``, ``add_typechecking_import``) into a transform, so a move that a formatter
+re-wrapped can be reproduced and certified. Each primitive does only a relocation-faithful
+edit (it never changes logic), so a byte match after the formatter certifies the commit is
+exactly that relocation. The primitives are deliberately small and AST-driven; see
+how-to-guide.md.
 
 This module is self-contained and needs only git and the standard library.
 """
@@ -322,7 +323,8 @@ class Repro:
         a plain ``import name`` (``module=None``) -- remove the whole statement. The symbol's
         home changed, so an importer that no longer references it loses exactly that name; the
         import sorter rewrites the surviving line. An import diff is always whitelisted, so this
-        realises a lost name directly instead of relying on the formatter to prune it."""
+        realises a lost name directly instead of relying on the formatter to prune it.
+        """
 
         def alias_text(alias: ast.alias) -> str:
             return alias.name + (f" as {alias.asname}" if alias.asname else "")
@@ -601,6 +603,79 @@ class Repro:
             prefix = "from __future__ import annotations\n" if future_import else ""
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             dst_path.write_text(prefix + block)
+
+        self.ops.append(op)
+        return self
+
+    def extract_symbols_to_new_module(
+        self,
+        src: str,
+        dst: str,
+        *,
+        symbols: list[str],
+        header: str,
+        order: list[str],
+        drop_assigns: list[str] | None = None,
+    ) -> "Repro":
+        """Relocate the named top-level defs/classes from *scattered* positions in ``src`` into
+        a new module ``dst`` whose authored ``header`` (the imports, module constants, a logger,
+        a ``TYPE_CHECKING`` block -- harmless or re-derived boilerplate reproduced from the
+        target) precedes them. Unlike ``extract_to_new_module``, the symbols need not be a
+        contiguous tail: each is cut from ``src`` verbatim, so its body stays a proven
+        relocation, and the cut blocks are appended in ``order`` (their order in the target).
+        ``drop_assigns`` names module-level assignments (e.g. a ``_is_hip = is_hip()`` constant)
+        that moved into the new module's header, so they are deleted from ``src`` too -- their
+        relocated copy is reproduced in the authored ``header``. The formatter normalises the
+        spacing; the byte diff then certifies the bodies are exactly the source's, while only
+        the small header is authored."""
+
+        def op(root: Path) -> None:
+            src_path = root / src
+            dst_path = root / dst
+            src_lines = src_path.read_text().splitlines(keepends=True)
+            wanted = set(symbols)
+            dropped = set(drop_assigns or [])
+            assert set(order) == wanted, f"order {order} must permute symbols {symbols}"
+            tree = ast.parse("".join(src_lines))
+            nodes = {
+                node.name: node
+                for node in tree.body
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                )
+                and node.name in wanted
+            }
+            missing = wanted - set(nodes)
+            assert not missing, f"{missing} not top-level defs/classes in {src}"
+            spans = {name: _def_span(node) for name, node in nodes.items()}
+            blocks = {
+                name: "".join(src_lines[start - 1 : end])
+                for name, (start, end) in spans.items()
+            }
+            assign_spans: list[tuple[int, int]] = []
+            found_assigns: set[str] = set()
+            for node in tree.body:
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target] if isinstance(node, ast.AnnAssign) else []
+                )
+                names = {t.id for t in targets if isinstance(t, ast.Name)}
+                if names & dropped:
+                    assign_spans.append((node.lineno, node.end_lineno))
+                    found_assigns |= names & dropped
+            assert (
+                found_assigns == dropped
+            ), f"{dropped - found_assigns} not assigned in {src}"
+            cuts = list(spans.values()) + assign_spans
+            for start, end in sorted(cuts, reverse=True):
+                del src_lines[start - 1 : end]
+            src_path.write_text("".join(src_lines))
+
+            relocated = "\n\n\n".join(blocks[name].rstrip("\n") for name in order)
+            prefix = header.rstrip("\n") + "\n\n\n" if header.strip() else ""
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            dst_path.write_text(prefix + relocated + "\n")
 
         self.ops.append(op)
         return self

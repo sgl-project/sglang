@@ -216,6 +216,51 @@ def _removal_from_key(path: str, key) -> dict:
     return {"path": path, "module": None, "name": name, "asname": asname}
 
 
+def _module_assign_names(text: str) -> set:
+    """Names bound by module-level assignments (``logger = ...``, ``_is_hip = is_hip()``), so a
+    constant relocated into an extracted module can be told apart from one the source keeps.
+    """
+    names: set = set()
+    for node in ast.parse(text).body:
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        names |= {t.id for t in targets if isinstance(t, ast.Name)}
+    return names
+
+
+def _import_additions(
+    path: str, after: str, before_pairs: dict, after_pairs: dict
+) -> list:
+    """The module-level imports a file gained, as ``add_import`` texts. A name gained from a
+    module the file already imported is added per-name (the sorter merges it); a name from a
+    wholly new module is added as the target's *verbatim* statement, so a multi-line or
+    magic-trailing-comma wrapping the target chose is reproduced (a freshly merged single line
+    would otherwise collapse and not match)."""
+    before_modules = {key[0] for key in before_pairs if isinstance(key, tuple)}
+    additions: list = []
+    verbatim_modules: set = set()
+    for key in after_pairs:
+        if key in before_pairs:
+            continue
+        if isinstance(key, tuple) and key[0] not in before_modules:
+            verbatim_modules.add(key[0])
+        else:
+            additions.append({"path": path, "text": after_pairs[key]})
+    if verbatim_modules:
+        after_lines = after.splitlines(keepends=True)
+        for node in ast.parse(after).body:
+            if (
+                isinstance(node, ast.ImportFrom)
+                and "." * node.level + (node.module or "") in verbatim_modules
+            ):
+                text = "".join(after_lines[node.lineno - 1 : node.end_lineno])
+                additions.append({"path": path, "text": text.rstrip("\n")})
+    return additions
+
+
 @dataclass
 class Recipe:
     base: str
@@ -223,6 +268,7 @@ class Recipe:
     supported: bool = True
     moves: list = field(default_factory=list)
     extracts: list = field(default_factory=list)
+    scatter_extracts: list = field(default_factory=list)
     lowerings: list = field(default_factory=list)
     repaths: list = field(default_factory=list)
     import_removals: list = field(default_factory=list)
@@ -398,6 +444,32 @@ def _symbols_form_tail(src_text: str, symbols: list[str]) -> bool:
     return wanted <= present
 
 
+def _scatter_extract_layout(dst_after: str, symbols: list[str]) -> dict | None:
+    """For a new module whose relocated ``symbols`` form a contiguous block at the end (after
+    an authored header of imports, constants, a logger, a ``TYPE_CHECKING`` block), return the
+    ``header`` text and the ``symbols`` in target order. Returns None when a non-symbol
+    statement is interleaved among the symbols, so there is no clean header/body split.
+    """
+    lines = dst_after.splitlines(keepends=True)
+    body = ast.parse(dst_after).body
+    wanted = set(symbols)
+
+    def is_wanted(node: ast.AST) -> bool:
+        return (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name in wanted
+        )
+
+    sym_nodes = [node for node in body if is_wanted(node)]
+    if len(sym_nodes) != len(wanted):
+        return None
+    first_index = body.index(sym_nodes[0])
+    if any(not is_wanted(node) for node in body[first_index:]):
+        return None
+    header = "".join(lines[: rr._def_span(sym_nodes[0])[0] - 1])
+    return {"header": header, "order": [node.name for node in sym_nodes]}
+
+
 def infer_recipe(commit: str, root: str) -> Recipe:
     """Infer a faithful relocation recipe for a move commit from its diff + before-state.
 
@@ -449,21 +521,58 @@ def infer_recipe(commit: str, root: str) -> Recipe:
             )
             continue
         src = next(iter(srcs))
-        if not _symbols_form_tail(
-            _git_output(["show", f"{commit}^:{src}"], root), symbols
-        ):
-            recipe.supported = False
-            recipe.notes.append(
-                f"{dst}: source is not a staged trailing block "
-                "(prep should inline the module body at the source tail first)"
+        src_before = _git_output(["show", f"{commit}^:{src}"], root)
+        if _symbols_form_tail(src_before, symbols):
+            recipe.extracts.append(
+                {
+                    "src": src,
+                    "dst": dst,
+                    "symbols": symbols,
+                    "future_import": _wants_future_import(files, src, dst),
+                }
             )
             continue
-        recipe.extracts.append(
+        src_top_level = {
+            node.name
+            for node in ast.parse(src_before).body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        if not set(symbols) <= src_top_level:
+            recipe.supported = False
+            recipe.notes.append(
+                f"{dst}: relocated symbols are not all top-level in {src} "
+                "(a method still inside a class needs prep to lift it out first)"
+            )
+            continue
+        # The symbols are scattered in the source (not a staged trailing block): cut each one
+        # verbatim and assemble the new module under its authored header (imports/constants/
+        # logger/TYPE_CHECKING reproduced from the target). The defs are the proven relocation;
+        # only the small header is authored, so the prep no longer has to gather them at the
+        # source tail first.
+        layout = _scatter_extract_layout(dst_after, symbols)
+        if layout is None:
+            recipe.supported = False
+            recipe.notes.append(
+                f"{dst}: relocated symbols are not a trailing block in the new module "
+                "(a non-symbol statement is interleaved with them)"
+            )
+            continue
+        # A module-level constant the source no longer assigns but the new module does (e.g. a
+        # ``_is_hip = is_hip()`` flag) relocated into the header, so it is dropped from the
+        # source too -- its copy is reproduced in the authored header.
+        src_after = _git_output(["show", f"{commit}:{src}"], root)
+        drop_assigns = sorted(
+            (_module_assign_names(src_before) - _module_assign_names(src_after))
+            & _module_assign_names(dst_after)
+        )
+        recipe.scatter_extracts.append(
             {
                 "src": src,
                 "dst": dst,
                 "symbols": symbols,
-                "future_import": _wants_future_import(files, src, dst),
+                "header": layout["header"],
+                "order": layout["order"],
+                "drop_assigns": drop_assigns,
             }
         )
 
@@ -535,9 +644,9 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         after = _git_output(["show", f"{commit}:{path}"], root)
         before_pairs = _import_pairs(before) if before.strip() else {}
         after_pairs = _import_pairs(after) if after.strip() else {}
-        for key, stmt in after_pairs.items():
-            if key not in before_pairs:
-                recipe.import_additions.append({"path": path, "text": stmt})
+        recipe.import_additions.extend(
+            _import_additions(path, after, before_pairs, after_pairs)
+        )
         if path not in extract_srcs:
             for key in before_pairs:
                 if key not in after_pairs:
@@ -555,7 +664,7 @@ def infer_recipe(commit: str, root: str) -> Recipe:
         if f.get("deleted") and path in move_srcs:
             recipe.deletes.append(path)
 
-    if not recipe.moves and not recipe.extracts:
+    if not recipe.moves and not recipe.extracts and not recipe.scatter_extracts:
         recipe.supported = False
         if not recipe.notes:
             recipe.notes.append(
@@ -624,6 +733,19 @@ def _recipe_ops(recipe: Recipe) -> list:
                 "extract_to_new_module",
                 (ex["src"], ex["dst"]),
                 {"symbols": ex["symbols"], "future_import": ex["future_import"]},
+            )
+        )
+    for ex in recipe.scatter_extracts:
+        ops.append(
+            (
+                "extract_symbols_to_new_module",
+                (ex["src"], ex["dst"]),
+                {
+                    "symbols": ex["symbols"],
+                    "header": ex["header"],
+                    "order": ex["order"],
+                    "drop_assigns": ex["drop_assigns"],
+                },
             )
         )
     for path in recipe.deletes:
@@ -719,7 +841,7 @@ def generate_range(
         script = recipe_to_script(recipe, subject)
         (scripts_dir / f"{commit[:9]}.py").write_text(script)
         passed, residual = False, ""
-        relocates = bool(recipe.moves or recipe.extracts)
+        relocates = bool(recipe.moves or recipe.extracts or recipe.scatter_extracts)
         if recipe.supported and relocates:
             try:
                 residual = build_repro(recipe).run()
@@ -875,7 +997,9 @@ def _main(argv: list[str]) -> int:
             recipe, _git_output(["log", "-1", "--format=%s", target], root)
         )
     )
-    if recipe.supported and (recipe.moves or recipe.extracts):
+    if recipe.supported and (
+        recipe.moves or recipe.extracts or recipe.scatter_extracts
+    ):
         build_repro(recipe).run()
     return 0
 

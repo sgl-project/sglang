@@ -281,8 +281,8 @@ def test_infer_recipe_infers_added_module_imports(repo: Path) -> None:
 def test_infer_recipe_new_file_extract_from_class_method_unsupported(
     repo: Path,
 ) -> None:
-    """A method still inside the class cut straight into a new module is not a staged trailing
-    block, so the extract is reported unsupported (prep should inline it at the tail first).
+    """A method still inside the class cut straight into a new module cannot be cut as a
+    top-level symbol, so the extract is reported unsupported (prep must lift it out first).
     """
     _write(
         repo,
@@ -309,7 +309,7 @@ def test_infer_recipe_new_file_extract_from_class_method_unsupported(
     _commit(repo, "extract foo to a new module")
     recipe = infer_recipe("HEAD", str(repo))
     assert recipe.supported is False
-    assert any("staged trailing block" in note for note in recipe.notes)
+    assert any("not all top-level" in note for note in recipe.notes)
 
 
 def test_infer_recipe_new_file_extract_from_staged_tail(repo: Path) -> None:
@@ -456,7 +456,8 @@ def _free_function_move_with_module_level_caller(repo: Path) -> None:
 
 def test_infer_recipe_module_level_import_repoint_realised_by_diff(repo: Path) -> None:
     """A module-level consumer whose import is repointed old -> new yields a remove of the old
-    name and an add of the new -- not a reliance on the formatter pruning a duplicate."""
+    name and an add of the new -- not a reliance on the formatter pruning a duplicate.
+    """
     _free_function_move_with_module_level_caller(repo)
     recipe = infer_recipe("HEAD", str(repo))
     assert recipe.repaths == []
@@ -525,5 +526,167 @@ def test_infer_recipe_removes_an_import_the_source_no_longer_uses(repo: Path) ->
         "path": "model.py",
         "module": None,
         "name": "gc",
+        "asname": None,
+    } in recipe.module_import_removals
+
+
+def test_infer_recipe_scattered_new_module_extract(repo: Path) -> None:
+    """Scattered top-level defs cut into a new module (no staged trailing block) infer a scatter
+    extract with the authored header and target order, not UNSUPPORTED."""
+    _write(
+        repo,
+        **{
+            "common.py": (
+                "import os\n"
+                "\n"
+                "\n"
+                "def keep():\n"
+                "    return 0\n"
+                "\n"
+                "\n"
+                "def beta():\n"
+                "    return 2\n"
+                "\n"
+                "\n"
+                "def stay():\n"
+                "    return 9\n"
+                "\n"
+                "\n"
+                "def alpha():\n"
+                "    return 1\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "common.py": (
+                "import os\n"
+                "\n"
+                "\n"
+                "def keep():\n"
+                "    return 0\n"
+                "\n"
+                "\n"
+                "def stay():\n"
+                "    return 9\n"
+            ),
+            "alloc.py": (
+                "from __future__ import annotations\n"
+                "\n"
+                "import logging\n"
+                "\n"
+                "logger = logging.getLogger(__name__)\n"
+                "\n"
+                "\n"
+                "def alpha():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "def beta():\n"
+                "    return 2\n"
+            ),
+        },
+    )
+    _commit(repo, "extract alpha, beta to alloc.py")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert recipe.supported
+    assert recipe.extracts == []
+    assert recipe.moves == []
+    assert len(recipe.scatter_extracts) == 1
+    sx = recipe.scatter_extracts[0]
+    assert sx["src"] == "common.py" and sx["dst"] == "alloc.py"
+    assert sorted(sx["symbols"]) == ["alpha", "beta"]
+    assert sx["order"] == ["alpha", "beta"]
+    assert sx["header"].startswith("from __future__ import annotations\n")
+    assert "logger = logging.getLogger(__name__)" in sx["header"]
+    assert sx["drop_assigns"] == []
+    script = recipe_to_script(recipe, "extract alpha, beta to alloc.py")
+    assert "extract_symbols_to_new_module" in script
+
+
+def test_infer_recipe_scatter_extract_drops_relocated_constant(repo: Path) -> None:
+    """A module-level constant relocated into the new module is inferred as a drop_assign so the
+    scatter extract removes it from the source too; a constant the source keeps is not.
+    """
+    _write(
+        repo,
+        **{
+            "common.py": (
+                "from u import is_hip\n"
+                "\n"
+                "_IS_HIP = is_hip()\n"
+                "logger = 1\n"
+                "\n"
+                "\n"
+                "def moved():\n"
+                "    return _IS_HIP\n"
+                "\n"
+                "\n"
+                "def keep():\n"
+                "    return logger\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "common.py": ("logger = 1\n\n\ndef keep():\n    return logger\n"),
+            "alloc.py": (
+                "from __future__ import annotations\n"
+                "\n"
+                "from u import is_hip\n"
+                "\n"
+                "_IS_HIP = is_hip()\n"
+                "\n"
+                "\n"
+                "def moved():\n"
+                "    return _IS_HIP\n"
+            ),
+        },
+    )
+    _commit(repo, "extract moved to alloc.py")
+    recipe = infer_recipe("HEAD", str(repo))
+    assert len(recipe.scatter_extracts) == 1
+    assert recipe.scatter_extracts[0]["drop_assigns"] == ["_IS_HIP"]
+
+
+def test_infer_recipe_adds_wholly_new_module_import_verbatim(repo: Path) -> None:
+    """An import gained from a module not present in base is captured as the target's verbatim
+    statement (so an exploded/magic-comma wrapping is reproduced, not collapsed per-name).
+    """
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n\n\ndef solve(x):\n    return x\n",
+            "util.py": "import os\n",
+            "caller.py": (
+                "from model import solve\n\n\ndef run():\n    return solve(1)\n"
+            ),
+        },
+    )
+    _commit(repo, "base")
+    _write(
+        repo,
+        **{
+            "model.py": "def keep():\n    return 0\n",
+            "util.py": "import os\n\n\ndef solve(x):\n    return x\n",
+            "caller.py": (
+                "from util import (\n    solve,\n)\n\n\ndef run():\n    return solve(1)\n"
+            ),
+        },
+    )
+    _commit(repo, "move solve to util")
+    recipe = infer_recipe("HEAD", str(repo))
+    caller_adds = [
+        a["text"] for a in recipe.import_additions if a["path"] == "caller.py"
+    ]
+    assert "from util import (\n    solve,\n)" in caller_adds
+    assert {
+        "path": "caller.py",
+        "module": "model",
+        "name": "solve",
         "asname": None,
     } in recipe.module_import_removals
