@@ -39,7 +39,6 @@ from typing import (
     Union,
 )
 
-import msgspec
 import numpy as np
 import requests
 import uvicorn
@@ -174,6 +173,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -699,16 +699,18 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     # server_args.model_config is not serializable but should be excluded by asdict.
-    return {
-        **dataclasses.asdict(server_args),
-        **_global_state.scheduler_info,
-        "internal_states": internal_states,
-        "version": __version__,
-        # Structured KV-event publisher descriptor for KV-aware routers.
-        # `None` when publishing is disabled or misconfigured; see
-        # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-        "kv_events": server_args.describe_kv_events_publisher(),
-    }
+    return msgspec_to_builtins(
+        {
+            **dataclasses.asdict(server_args),
+            **_global_state.scheduler_info,
+            "internal_states": internal_states,
+            "version": __version__,
+            # Structured KV-event publisher descriptor for KV-aware routers.
+            # `None` when publishing is disabled or misconfigured; see
+            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+            "kv_events": server_args.describe_kv_events_publisher(),
+        }
+    )
 
 
 @app.get("/get_load")
@@ -1418,7 +1420,7 @@ async def load_lora_adapter(
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(msgspec.structs.asdict(result), status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
@@ -1430,7 +1432,7 @@ async def load_lora_adapter_from_tensors(
         obj, request
     )
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(msgspec.structs.asdict(result), status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/unload_lora_adapter", methods=["POST"])
@@ -1441,7 +1443,7 @@ async def unload_lora_adapter(
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-    return ORJSONResponse(msgspec.structs.asdict(result), status_code=status_code)
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])

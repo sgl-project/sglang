@@ -34,6 +34,29 @@ class Base64Bytes:
         return value
 
 
+def msgspec_to_builtins(obj: Any) -> Any:
+    """Recursively convert msgspec structs to dict/list Python builtins."""
+    if isinstance(obj, msgspec.Struct):
+        return {
+            field.name: msgspec_to_builtins(getattr(obj, field.name))
+            for field in msgspec.structs.fields(type(obj))
+        }
+
+    if isinstance(obj, dict):
+        return {key: msgspec_to_builtins(value) for key, value in obj.items()}
+
+    if isinstance(obj, list):
+        return [msgspec_to_builtins(item) for item in obj]
+
+    if isinstance(obj, tuple):
+        return tuple(msgspec_to_builtins(item) for item in obj)
+
+    if isinstance(obj, set):
+        return [msgspec_to_builtins(item) for item in obj]
+
+    return obj
+
+
 def msgspec_struct_pydantic_core_schema(cls: type[msgspec.Struct], handler):
     fields = {}
     for struct_field in msgspec.structs.fields(cls):

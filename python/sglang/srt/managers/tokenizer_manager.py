@@ -3149,7 +3149,6 @@ class SignalHandler:
 #
 
 
-
 def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
     if isinstance(obj, BaseReq):
         obj.http_worker_ipc = ipc_name

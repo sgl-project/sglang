@@ -2239,7 +2239,7 @@ def _maybe_wrap_pickle(obj: Any) -> Any:
             logger.info(f"Object of type {type(obj)} is wrapped via PickleWrapper.")
         return PickleWrapper(pickle.dumps(obj))
 
-    if isinstance(obj, msgspec.Struct) or isinstance(obj, _primitive_types):
+    if isinstance(obj, (msgspec.Struct, *_primitive_types)):
         return obj
 
     raise TypeError(
