@@ -88,6 +88,6 @@ jobs:
             -e PYTHONPATH=/root/miles:/opt/tilelang \
             -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
             python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --match-all-labels \
-            ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            ${{ (github.event_name != 'workflow_dispatch' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           cat "${GITHUB_WORKSPACE}/github_summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           exit ${TEST_EXIT_CODE}
