@@ -138,6 +138,34 @@ impl WorkerModeLabel {
     }
 }
 
+/// Routing context a handler attaches to its `Response` (via response
+/// extensions) so the outermost access-log/metrics middleware can record the
+/// per-worker labels it otherwise cannot see. Present on every routed request
+/// (the request reached a worker); absent on requests rejected before routing
+/// (a body-validation 400, an admission 503 shed, model-not-found), which the
+/// middleware records with an empty `worker_url`. Recording in one place — the
+/// middleware — is what makes `requests_total` cover EVERY request, so
+/// `sum by (outcome)` reflects all ingress, not just dispatched traffic.
+#[derive(Debug, Clone)]
+pub struct RequestLogContext {
+    pub worker_url: String,
+    pub model_id: String,
+    pub mode: WorkerModeLabel,
+}
+
+/// Derive the bounded [`RequestOutcome`] label from the client-visible HTTP
+/// status: 2xx is success, 504 is the stale-request cancellation, everything
+/// else (incl. forwarded 4xx/5xx and proxy-side 5xx) is an error. Shared by the
+/// middleware so every request — routed or rejected pre-routing — is labelled
+/// the same way.
+pub fn outcome_from_status(status: u16) -> RequestOutcome {
+    match status {
+        200..=299 => RequestOutcome::Success,
+        504 => RequestOutcome::Cancelled,
+        _ => RequestOutcome::Error,
+    }
+}
+
 /// Decode-affinity outcome — see `select_decode_with_affinity` for the
 /// three reasons the affinity may not be honored.
 #[derive(Debug, Clone, Copy)]

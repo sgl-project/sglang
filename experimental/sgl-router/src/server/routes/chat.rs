@@ -7,7 +7,7 @@ use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, RequestLogContext, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::Worker;
 use axum::body::Body;
@@ -90,39 +90,21 @@ impl Drop for RecordDurationOnDrop {
     }
 }
 
-/// POST /v1/chat/completions handler. Thin wrapper over
-/// [`chat_completions_inner`] that surfaces early-error outcomes in the access
-/// log: a body-validation 400, an admission 503, a model-not-found, etc. return
-/// via `?` before the inner handler reaches its per-request access log, so
-/// without this they would be absent from the access log (visible only in the
-/// response-code metric, and for some variants a per-variant warning). The inner
-/// handler logs the success and post-dispatch outcomes — and returns its
-/// post-dispatch errors as a response rather than `Err`, so the wrapper logs
-/// each request exactly once (only the early `?` short-circuits land here).
+/// POST /v1/chat/completions handler. Thin delegator to
+/// [`chat_completions_inner`]. Per-request logging and `requests_total` /
+/// `responses_total` counting happen once, centrally, in the outermost
+/// `access_log_and_record` middleware (see [`crate::server::app`]) — including
+/// the early `?` short-circuits this returns as `Err` (a body-validation 400,
+/// an admission 503 shed, model-not-found), which the middleware records as a
+/// pre-routing rejection. Routed requests carry a
+/// [`RequestLogContext`](crate::server::metrics::RequestLogContext) so the
+/// middleware can attach their per-worker labels.
 pub async fn chat_completions(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    let start = std::time::Instant::now();
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
-    let result = chat_completions_inner(ctx, headers, body).await;
-    if let Err(e) = &result {
-        tracing::info!(
-            request_id = %request_id,
-            method = "POST",
-            path = "/v1/chat/completions",
-            outcome = "error",
-            http_status = e.status_code().as_u16(),
-            latency_ms = start.elapsed().as_millis() as u64,
-            "chat_completions",
-        );
-    }
-    result
+    chat_completions_inner(ctx, headers, body).await
 }
 
 /// Parse model from body, select a healthy worker via the per-model policy, then
@@ -562,79 +544,34 @@ async fn chat_completions_inner(
         }
     };
 
-    // Per-request access log — always on at INFO so incoming traffic and its
-    // status are visible without DEBUG. `request_id` is the client/gateway
-    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
-    // selected. The cache-aware routing rationale is logged separately at
-    // DEBUG by the policy.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
-    let http_status = match &result {
-        Ok(resp) => resp.status().as_u16(),
-        Err(e) => e.status_code().as_u16(),
-    };
-
-    // Record the dispatch outcome AFTER we know the client-visible status.
-    // Derive `outcome` from the final HTTP status, NOT from `Result::Ok`/`Err`:
-    // a response the router FORWARDS from a worker with a 4xx/5xx status is an
-    // `Ok(Response)` here (only transport failures bubble up as `Err`), so
-    // keying off `Ok` would mislabel a forwarded engine error as a success.
-    //   * 2xx        → success
-    //   * 504        → cancelled (the stale-request branch; see below)
-    //   * everything → error (incl. forwarded 4xx/5xx and proxy-side 5xx)
-    // The metric is per-worker so convergence tests can scrape `/metrics` and
-    // assert that ≥N requests landed on a single prefill worker.
+    // The stale-request janitor fired and we observed it user-side (a 504).
+    // Record the global `expired` count; the per-request `cancelled` outcome and
+    // the access-log line are emitted centrally by the `access_log_and_record`
+    // middleware, derived from the final HTTP status.
     if matches!(&result, Err(ApiError::StaleRequestExpired { .. })) {
-        // The janitor fired the stale-cancel and we observed it user-side
-        // (surfaced as a 504). Record the global `expired` count in addition
-        // to the per-request `cancelled` outcome below. The two views are
-        // useful for different alerts: per-worker request_total{cancelled}
-        // flags a worker that's hanging, while stale_requests_total{expired}
-        // tracks the global health of the janitor.
         ctx.metrics
             .record_stale_request(StaleRequestOutcome::Expired);
     }
-    let outcome = match http_status {
-        200..=299 => RequestOutcome::Success,
-        504 => RequestOutcome::Cancelled,
-        _ => RequestOutcome::Error,
-    };
-    ctx.metrics
-        .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
-    // Record end-to-end latency now that the outcome is known. For non-streaming
-    // requests the body is already buffered here, so `start.elapsed()` is true
-    // end-to-end latency — record it directly. For streaming, the body is still
-    // pending; the `RecordDurationOnDrop` guard packed into `stream_guards`
-    // records it at stream completion instead (so we don't capture only
-    // time-to-headers). `elapsed` still feeds the access-log `latency_ms` below
-    // for both. The client-visible HTTP status is counted centrally by the
-    // `record_response_status` middleware (so error short-circuits are counted
-    // too), not here.
-    let elapsed = start.elapsed();
+    // End-to-end latency for non-streaming requests: the body is already
+    // buffered here, so `start.elapsed()` is the true total. Streaming records
+    // at stream completion via the `RecordDurationOnDrop` guard packed into
+    // `stream_guards` (so it isn't just time-to-headers).
     if !streaming {
         ctx.metrics
-            .observe_request_duration(&metrics_model, elapsed.as_secs_f64());
+            .observe_request_duration(&metrics_model, start.elapsed().as_secs_f64());
     }
-    let outcome_str = match outcome {
-        RequestOutcome::Success => "success",
-        RequestOutcome::Error => "error",
-        RequestOutcome::Cancelled => "cancelled",
+
+    // Routing context for the outermost middleware: it records
+    // `requests_total{worker_url,model_id,mode,outcome}` and the access-log line
+    // for this request. Attaching it here (rather than recording directly) keeps
+    // all request accounting at one site that also covers pre-routing
+    // rejections, so the by-outcome view reflects ALL ingress.
+    let log_ctx = RequestLogContext {
+        worker_url: metrics_worker_url,
+        model_id: metrics_model,
+        mode: metrics_mode,
     };
-    tracing::info!(
-        request_id = %request_id,
-        method = "POST",
-        path = "/v1/chat/completions",
-        model = %metrics_model,
-        worker = %metrics_worker_url,
-        outcome = outcome_str,
-        http_status,
-        stream = streaming,
-        latency_ms = elapsed.as_millis() as u64,
-        "chat_completions",
-    );
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
     // external tests / sidecars can observe PD decode affinity without
@@ -644,7 +581,7 @@ async fn chat_completions_inner(
     // resolved). A malformed URL was already rejected at the
     // request-side parse — we only reach this branch when the URL was
     // header-valid, so the second parse is safe.
-    match (result, decode_hint_url) {
+    let mut response = match (result, decode_hint_url) {
         (Ok(mut response), Some(url)) => {
             match HeaderValue::from_str(&url) {
                 Ok(v) => {
@@ -659,15 +596,19 @@ async fn chat_completions_inner(
                     );
                 }
             }
-            Ok(response)
+            response
         }
-        (Ok(response), None) => Ok(response),
-        // Post-dispatch errors were already logged with full fields by the
-        // access-log call above; return them as a response (not `Err`) so the
-        // `chat_completions` wrapper does not log them a second time. The wrapper
-        // logs only the early `?` short-circuits, which never reached that log.
-        (Err(e), _) => Ok(e.into_response()),
-    }
+        (Ok(response), None) => response,
+        // Post-dispatch error (a worker was selected). Materialize it so it can
+        // be tagged with the routing context for the middleware, instead of
+        // returning `Err` — early `?` short-circuits return `Err` and the
+        // middleware records those as pre-routing rejections (empty worker_url).
+        (Err(e), _) => e.into_response(),
+    };
+    // Tag the routed response so the middleware records its per-worker labels
+    // and logs it with the worker/model it was dispatched to.
+    response.extensions_mut().insert(log_ctx);
+    Ok(response)
 }
 
 /// Estimate prefill-token count from the raw request body for use as
@@ -1314,13 +1255,19 @@ mod tests {
         }
     }
 
-    /// Early-error short-circuits (e.g. a malformed body → 400) must still be
-    /// surfaced in the `chat_completions` access log. Before the fix they
-    /// returned via `?` ahead of the in-handler log and were invisible in the
-    /// logs (only countable via the response-code metric).
+    /// A request rejected BEFORE routing — here a body that is valid JSON but not
+    /// an object, which `parse_probe` 400s before any worker is selected — must
+    /// still be (a) logged by the outermost access-log middleware and (b) counted
+    /// in `requests_total`. Both happen in `access_log_and_record`, NOT the
+    /// handler (which returns the 400 via `?`), so this drives the request
+    /// through `build_router` to exercise that middleware. Before request
+    /// accounting moved to the middleware, pre-routing rejections were invisible
+    /// to `requests_total` (so `sum by (outcome)` undercounted) and absent from
+    /// the access log.
     #[tokio::test]
-    async fn early_error_400_is_surfaced_in_access_log() {
+    async fn pre_routing_400_is_logged_and_counted() {
         use std::sync::Mutex;
+        use tower::ServiceExt;
         use tracing_subscriber::fmt::MakeWriter;
 
         #[derive(Clone)]
@@ -1348,24 +1295,36 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        // Valid JSON but not an object → `parse_probe` rejects with 400, an early
-        // `?` return that bypasses the in-handler access log.
         let ctx = Arc::new(AppContext::stub());
-        let res = chat_completions(State(ctx), HeaderMap::new(), Bytes::from_static(b"[]")).await;
-        let status = match &res {
-            Ok(r) => r.status(),
-            Err(e) => e.status_code(),
-        };
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let app = crate::server::app::build_router(ctx.clone());
+        // Valid JSON but not an object → `parse_probe` rejects with 400 via `?`
+        // before any worker is selected.
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from("[]"))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
 
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
-            logs.contains("chat_completions"),
-            "the 400 outcome must be surfaced in the access log; captured:\n{logs}"
+            logs.contains("http_request"),
+            "every request must be logged by the middleware; captured:\n{logs}"
         );
         assert!(
-            logs.contains("http_status=400"),
-            "access log must record http_status=400; captured:\n{logs}"
+            logs.contains("path=/v1/chat/completions") && logs.contains("status=400"),
+            "access log must record the path and 400 status; captured:\n{logs}"
+        );
+
+        let metrics = ctx.metrics.render();
+        assert!(
+            metrics
+                .lines()
+                .any(|l| l.starts_with("sgl_router_requests_total")
+                    && l.contains(r#"outcome="error""#)),
+            "a pre-routing 400 must be counted in requests_total{{outcome=error}}; got:\n{metrics}"
         );
     }
 }

@@ -1971,18 +1971,18 @@ fn make_chat_req(streaming: bool, request_id: &str) -> Request<Body> {
 
 /// Count access-log lines for one specific request id. Tagging the request with
 /// a unique id and filtering on it isolates this test's log lines from any other
-/// test's `chat_completions` events that share the captured `tracing` default
+/// test's `http_request` events that share the captured `tracing` default
 /// under parallel execution.
 fn access_log_count(logs: &str, request_id: &str) -> usize {
     logs.lines()
-        .filter(|l| l.contains("chat_completions") && l.contains(request_id))
+        .filter(|l| l.contains("http_request") && l.contains(request_id))
         .count()
 }
 
 /// A post-dispatch error (unreachable upstream → 502) must be logged EXACTLY
-/// once in the access log: the inner handler logs the rich line, and the
-/// `chat_completions` wrapper must not re-log it (the wrapper logs only the
-/// early `?`-short-circuits, which never reach the inner log).
+/// once in the access log. Logging happens once, centrally, in the
+/// `access_log_and_record` middleware (the handler no longer logs), so a routed
+/// error produces a single `http_request` line — not two.
 #[tokio::test]
 async fn post_dispatch_error_logged_once_in_access_log() {
     let buf = global_log_buf();
@@ -2005,9 +2005,9 @@ async fn post_dispatch_error_logged_once_in_access_log() {
     );
 }
 
-/// A successful (200) request must be logged exactly once — by the inner
-/// handler, never additionally by the wrapper. Guards against a regression that
-/// makes the wrapper log unconditionally.
+/// A successful (200) request must be logged exactly once — by the
+/// `access_log_and_record` middleware. Guards against a regression that
+/// re-introduces handler-side logging on top of the middleware.
 #[tokio::test]
 async fn success_logged_once_in_access_log() {
     let buf = global_log_buf();
