@@ -552,7 +552,11 @@ class DeepseekV4HipRadixBackend(
             is_prefill=True,
         )
         self._attach_unified_kv_prefill_meta(
-            core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens
+            core_attn_metadata,
+            req_pool_indices,
+            seq_lens,
+            extend_seq_lens,
+            extend_seq_lens_cpu,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -589,11 +593,13 @@ class DeepseekV4HipRadixBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
         extend_seq_lens: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
+        seq_lens_cpu: Optional[List[int]] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly even when
         # SGLANG_PREP_IN_CUDA_GRAPH is enabled. The raw/lazy-upgrade route can
         # hit planner invariants during graph capture for DSV4+EAGLE.
-        seq_lens_cpu = seq_lens.tolist()
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.tolist()
         return self.init_forward_metadata_target_verify_old(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -876,6 +882,9 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
+                # CPU mirror already available here (== seq_lens, no D2H);
+                # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
+                seq_lens_cpu=seq_lens_cpu.tolist(),
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
@@ -952,6 +961,9 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
                 extend_seq_lens=forward_batch.extend_seq_lens,
+                seq_lens_cpu=(
+                    seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
+                ),
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
@@ -1083,6 +1095,7 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: Optional[List[int]] = None,
     ) -> None:
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1094,9 +1107,18 @@ class DeepseekV4HipRadixBackend(
         bs = req_pool_indices.shape[0]
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
-        # token -> req index (length L = sum(extend_seq_lens))
+        # token -> req index (length L = sum(extend_seq_lens)).
+        # Pass output_size so repeat_interleave does not read sum(extend_seq_lens)
+        # back from the GPU: the tensor-repeats form otherwise forces a D2H sync
+        # that serializes batch N execution with batch N+1 scheduling. (Matches
+        # the CUDA backend _expand_prefill_casually_vectorized.)
+        output_size = (
+            int(sum(extend_seq_lens_cpu)) if extend_seq_lens_cpu is not None else None
+        )
         bid = torch.repeat_interleave(
-            torch.arange(bs, device=device, dtype=torch.int64), extend_seq_lens
+            torch.arange(bs, device=device, dtype=torch.int64),
+            extend_seq_lens,
+            output_size=output_size,
         )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
