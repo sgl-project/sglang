@@ -2697,7 +2697,9 @@ class Scheduler(
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
-            new_batch, running_batch = self.get_new_batch_prefill(running_batch)
+            prefill_plan = self.get_new_batch_prefill(running_batch)
+            new_batch = prefill_plan.batch_to_run
+            running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -2743,9 +2745,7 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(
-        self, running_batch: ScheduleBatch
-    ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+    def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -2764,7 +2764,7 @@ class Scheduler(
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
-        return ret, running_batch
+        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def _get_new_batch_prefill_raw(
         self,

@@ -12,7 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.utils.common import Range
@@ -90,7 +90,9 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
-    s.get_new_batch_prefill = MagicMock(return_value=(None, s.running_batch))
+    s.get_new_batch_prefill = MagicMock(
+        return_value=NextBatchPlan(batch_to_run=None, running_batch=s.running_batch)
+    )
     s.dp_attn_adapter = MagicMock()
     s.dp_attn_adapter.maybe_prepare_mlp_sync_batch = MagicMock(
         side_effect=lambda batch, **_: batch

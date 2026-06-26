@@ -83,7 +83,9 @@ class SchedulerMultiplexMixin:
             return False
 
         # add new request
-        batch, self.running_batch = self.get_new_batch_prefill(self.running_batch)
+        prefill_plan = self.get_new_batch_prefill(self.running_batch)
+        batch = prefill_plan.batch_to_run
+        self.running_batch = prefill_plan.running_batch
         if batch and not batch.is_empty():
             batch.forward_mode = (
                 ForwardMode.SPLIT_PREFILL
