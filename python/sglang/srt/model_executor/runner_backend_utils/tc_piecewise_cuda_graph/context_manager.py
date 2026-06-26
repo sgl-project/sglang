@@ -21,13 +21,21 @@ This module deliberately does **not** own torch.compile-specific state
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+
+logger = logging.getLogger(__name__)
 
 _in_tc_piecewise_cuda_graph = False
 
@@ -39,13 +47,23 @@ def is_in_tc_piecewise_cuda_graph() -> bool:
 
 @contextmanager
 def enable_tc_piecewise_cuda_graph():
-    """Mark the enclosed scope as "we are inside a piecewise CUDA graph
-    capture/replay". Sets _in_tc_piecewise_cuda_graph true for the duration.
+    """Mark the enclosed scope as inside a tc_piecewise CUDA graph
+    capture/replay. Any exception raised inside is logged with the
+    PCG-specific failure hint, then re-raised for the caller to handle.
     """
     global _in_tc_piecewise_cuda_graph
     _in_tc_piecewise_cuda_graph = True
     try:
         yield
+    except Exception as exc:
+        logger.error(
+            "%s\n%s",
+            type(exc).__name__ + ": " + str(exc),
+            PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
+                backend=Backend.TC_PIECEWISE, suggestions=TCPCG_FAILURE_HINT
+            ),
+        )
+        raise
     finally:
         _in_tc_piecewise_cuda_graph = False
 

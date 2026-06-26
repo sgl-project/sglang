@@ -336,13 +336,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        try:
-            self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture prefill CUDA graph failed: {e}\n"
-                f"{prefill_failure_msg(_prefill_backend_name)}"
-            )
+        # Capture-time errors are caught + logged by the backend's enclosing
+        # context manager (enable_breakable_cuda_graph / enable_tc_piecewise_cuda_graph)
+        # so they share one wrap site with runtime replay errors.
+        self.capture()
 
         self.raw_num_tokens = 0
 

@@ -15,7 +15,15 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
+
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
+
+logger = logging.getLogger(__name__)
 
 _in_breakable_cuda_graph = False
 
@@ -26,10 +34,22 @@ def is_in_breakable_cuda_graph() -> bool:
 
 @contextmanager
 def enable_breakable_cuda_graph():
+    """Mark the enclosed scope as inside a BCG capture/replay. Any exception
+    raised inside is logged with the BCG-specific failure hint, then re-raised
+    for the caller to handle."""
     global _in_breakable_cuda_graph
     _in_breakable_cuda_graph = True
     try:
         yield
+    except Exception as exc:
+        logger.error(
+            "%s\n%s",
+            type(exc).__name__ + ": " + str(exc),
+            PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG.format(
+                backend=Backend.BREAKABLE, suggestions=BCG_FAILURE_HINT
+            ),
+        )
+        raise
     finally:
         _in_breakable_cuda_graph = False
 
