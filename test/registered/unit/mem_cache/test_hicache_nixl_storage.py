@@ -644,6 +644,51 @@ class TestNixlUnified(CustomTestCase):
         self.assertEqual(results[PoolName.MAMBA], [True])
         self.assertTrue(torch.all(pool.get_data_page(0) == 3))
 
+    def test_batch_set_get_v2_distinguishes_same_key_by_pool_name(self):
+        mamba_pool = MockHybridPool(expose_zero_copy=False)
+        swa_pool = MockHybridPool(expose_zero_copy=False)
+        self.hicache.register_mem_host_pool_v2(mamba_pool, PoolName.MAMBA)
+        self.hicache.register_mem_host_pool_v2(swa_pool, PoolName.SWA)
+
+        mamba_pool.temporal_buffer[0].fill_(11)
+        mamba_pool.conv_buffer[0][0].fill_(12)
+        swa_pool.temporal_buffer[0].fill_(21)
+        swa_pool.conv_buffer[0][0].fill_(22)
+        expected_mamba = mamba_pool.get_data_page(0).clone()
+        expected_swa = swa_pool.get_data_page(0).clone()
+
+        key = "shared_key"
+        host_indices = torch.tensor([0], dtype=torch.int64)
+        set_results = self.hicache.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA, keys=[key], host_indices=host_indices
+                ),
+                PoolTransfer(name=PoolName.SWA, keys=[key], host_indices=host_indices),
+            ]
+        )
+        self.assertEqual(set_results[PoolName.MAMBA], [True])
+        self.assertEqual(set_results[PoolName.SWA], [True])
+
+        mamba_pool.temporal_buffer.zero_()
+        mamba_pool.conv_buffer[0].zero_()
+        swa_pool.temporal_buffer.zero_()
+        swa_pool.conv_buffer[0].zero_()
+
+        get_results = self.hicache.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.MAMBA, keys=[key], host_indices=host_indices
+                ),
+                PoolTransfer(name=PoolName.SWA, keys=[key], host_indices=host_indices),
+            ]
+        )
+
+        self.assertEqual(get_results[PoolName.MAMBA], [True])
+        self.assertEqual(get_results[PoolName.SWA], [True])
+        self.assertTrue(torch.equal(mamba_pool.get_data_page(0), expected_mamba))
+        self.assertTrue(torch.equal(swa_pool.get_data_page(0), expected_swa))
+
     def _run_concurrent_stress(
         self, is_zero_copy_mode: bool, hicache: HiCacheNixl = None
     ):
