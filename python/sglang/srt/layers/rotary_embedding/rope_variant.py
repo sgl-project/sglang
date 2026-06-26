@@ -551,9 +551,9 @@ class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-        self.sync_explicit_npu_interleaved_cache()
+        self.init_npu_interleaved_cache()
 
-    def sync_explicit_npu_interleaved_cache(self):
+    def init_npu_interleaved_cache(self):
         cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
         cos_cached_total = cos.repeat(1, 2).contiguous()
         sin_cached_total = sin.repeat(1, 2).contiguous()
@@ -601,12 +601,6 @@ class LongcatExplicitInterleavedRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.is_neox_style:
-            raise RuntimeError(
-                "LongcatExplicitInterleavedRotaryEmbedding only supports "
-                "interleaved RoPE on NPU."
-            )
-        del offsets
         num_tokens, num_q_heads, _ = query.shape
         num_k_heads = key.shape[1]
 
