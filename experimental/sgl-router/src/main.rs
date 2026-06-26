@@ -156,6 +156,16 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&active_load)),
     ));
 
+    // Backstop the per-worker admission counter: reclaim any in-flight slot
+    // held past the TTL (a leaked guard whose request hung and never dropped).
+    // Complements the SSE idle timeout so the cap can never stay pinned and
+    // false-shed forever. Sweep every 60 s; a slot held > 10 min is leaked.
+    let _worker_load_janitor = sgl_router::workers::spawn_load_janitor(
+        registry.clone(),
+        std::time::Duration::from_secs(600),
+        std::time::Duration::from_secs(60),
+    );
+
     let proxy = Arc::new(
         sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
             cfg.proxy.request_timeout_secs,

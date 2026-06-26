@@ -342,6 +342,9 @@ impl AdmissionQueue {
         worker: Arc<Worker>,
         load_guard: LoadGuard,
     ) -> AdmissionGuard {
+        // Reset the slot's age: it's now held by a fresh request, so the TTL
+        // janitor must not treat a continuously handed-off slot as leaked.
+        load_guard.touch();
         AdmissionGuard::Armed(ArmedGuard {
             load_guard: Some(load_guard),
             worker,
