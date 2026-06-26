@@ -15,6 +15,7 @@ export const config = {
   quantizations: [
     { id: "fp8", label: "FP8" },
     { id: "bf16", label: "BF16" },
+    { id: "nvfp4", label: "NVFP4" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -29,6 +30,7 @@ export const config = {
   modelNames: {
     "default|fp8": "zai-org/GLM-5.2-FP8",
     "default|bf16": "zai-org/GLM-5.2",
+    "default|nvfp4": "nvidia/GLM-5.2-NVFP4",
   },
 
   placeholders: {
@@ -90,6 +92,9 @@ sgl-eval run aime25 \\
     b200:  "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
+    // NVFP4 needs the dev image with modelopt_fp4 support (per-quant override).
+    "b300|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
+    "gb300|nvfp4": "lmsysorg/sglang:dev-glm52-nvfp4",
   },
 
   github: {
@@ -624,6 +629,80 @@ sgl-eval run aime25 \\
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs 256",
         "--max-running-requests 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // NVFP4 (Blackwell Ultra) — nvidia/GLM-5.2-NVFP4 (Model Optimizer).
+    // TP4 on B300 / GB300, low-latency + balanced. GB300 mirrors the B300
+    // recipe (same TP4 / flags; the 4-GPU GB300 node fits the ~381 GB build).
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.70",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.70",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.70",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.70",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

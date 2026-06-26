@@ -19,7 +19,7 @@ io_struct.py and schedule_batch.py.
 """
 
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List
 
 import torch
 
@@ -37,7 +37,7 @@ class PositionalEmbeds:
         positions: List of positions where embeddings should be injected.
     """
 
-    embeds: Union[List[torch.Tensor], torch.Tensor]
+    embeds: torch.Tensor
     positions: List[int]
 
     def __post_init__(self):
