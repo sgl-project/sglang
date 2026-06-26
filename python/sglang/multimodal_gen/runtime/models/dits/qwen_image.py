@@ -73,6 +73,23 @@ def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
     return padded_len // sp_world_size
 
 
+def _pad_and_cat_sequence_tensors(values: List[torch.Tensor]) -> torch.Tensor:
+    max_seq_len = max(int(value.shape[1]) for value in values)
+    padded_values = []
+    for value in values:
+        seq_len = int(value.shape[1])
+        if seq_len < max_seq_len:
+            pad_shape = list(value.shape)
+            pad_shape[1] = max_seq_len - seq_len
+            pad_value = False if value.dtype == torch.bool else 0
+            value = torch.cat(
+                [value, value.new_full(pad_shape, pad_value)],
+                dim=1,
+            )
+        padded_values.append(value)
+    return torch.cat(padded_values, dim=0)
+
+
 def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
 ):
@@ -1329,9 +1346,11 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         if isinstance(encoder_hidden_states, list):
-            encoder_hidden_states = encoder_hidden_states[0]
+            encoder_hidden_states = _pad_and_cat_sequence_tensors(encoder_hidden_states)
         if isinstance(encoder_hidden_states_mask, list):
-            encoder_hidden_states_mask = encoder_hidden_states_mask[0]
+            encoder_hidden_states_mask = _pad_and_cat_sequence_tensors(
+                encoder_hidden_states_mask
+            )
 
         hidden_states, _ = self.img_in(hidden_states)
 

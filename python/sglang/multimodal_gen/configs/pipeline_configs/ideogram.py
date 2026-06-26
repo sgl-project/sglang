@@ -278,6 +278,8 @@ LATENT_SCALE = (
 
 @dataclass
 class Ideogram4PipelineConfig(ImagePipelineConfig):
+    continuous_batching_supported_tasks = (ModelTaskType.T2I,)
+
     task_type: ModelTaskType = ModelTaskType.T2I
     should_use_guidance: bool = False
     vae_precision: str = "bf16"

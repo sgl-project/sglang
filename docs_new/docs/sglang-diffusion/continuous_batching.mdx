@@ -1,0 +1,48 @@
+---
+title: "Continuous Batching"
+description: "Batch compatible active SGLang-Diffusion denoising steps during serving."
+tag: "preserve"
+mode: wide
+---
+
+Continuous batching is an opt-in SGLang-Diffusion serving mode that batches compatible denoising steps from active requests. Unlike [dynamic batching](./dynamic_batching), new requests can join while other requests are already denoising, and completed requests can leave without waiting for the original batch to finish.
+
+Use it for concurrent prompt-only image-generation traffic where requests have compatible denoising-step inputs. Keep dynamic batching or singleton serving for unsupported tasks, image-conditioned requests, or highly mixed traffic that cannot share denoising steps.
+
+## Enable
+
+```bash Command
+sglang serve \
+  --model-path Qwen/Qwen-Image-2512 \
+  --backend sglang \
+  --port 30010 \
+  --batching-mode continuous \
+  --batching-max-size 4 \
+  --batching-delay-ms 5 \
+  --enable-batching-metrics
+```
+
+For request formats, see the [OpenAI-Compatible API](./api/openai_api).
+
+## Compatibility
+
+Continuous batching currently supports native SGLang prompt-only image-generation pipelines that expose a standard denoising stage. Pipelines that route through a progressive-resolution denoising router use the full-resolution standard denoising stage for continuous batching.
+
+Current limitations:
+
+- Native SGLang backend only. Continuous batching is not supported with `--backend diffusers`.
+- Prompt-only requests only. Image-conditioned requests, edits, I2V, TI2V, and other non-text-only tasks are rejected at request admission.
+- Rollout requests, TeaCache, Cache-DiT, startup LoRA adapters, raw-frame streaming responses, disaggregated serving, DiT CPU offload, and DiT layerwise offload are not currently supported.
+- Requests are packed only when their denoising-step inputs are compatible. Requests with incompatible shapes or metadata run separately.
+
+## Metrics
+
+Use `--enable-batching-metrics` to inspect realized denoising-step batches:
+
+```text
+Continuous batching scheduler enabled (max_active=4, max_delay=5.00ms)
+Continuous denoising step batch: size=4/4
+Batch stats (last 5 dispatches): avg_size=4.00, merged_rate=100.0%, full_rate=100.0%, utilization=100.0%, top_rejects=none
+```
+
+These logs show the active step batch size, queue wait, realized utilization, and fallback/rejection reasons.

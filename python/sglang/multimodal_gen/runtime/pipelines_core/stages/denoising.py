@@ -11,7 +11,8 @@ import os
 import time
 import weakref
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from contextlib import ExitStack
+from dataclasses import dataclass, field, fields, is_dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -123,7 +124,7 @@ def _ensure_tensor_model_output(model_output):
 
 @dataclass(slots=True)
 class DenoisingContext:
-    """Loop-scoped state shared across the denoising skeleton and its hooks."""
+    """Mutable state for one request's denoising loop."""
 
     scheduler: Any
     extra_step_kwargs: dict[str, Any]
@@ -154,13 +155,12 @@ class DenoisingContext:
         return getattr(self, key, default)
 
     def to_kwargs(self) -> dict[str, Any]:
-        """Return a shallow field mapping for derived context construction."""
         return {item.name: getattr(self, item.name) for item in fields(self)}
 
 
 @dataclass(slots=True)
 class DenoisingStepState:
-    """Per-step hot-path state computed once and reused within a denoising step."""
+    """Prepared values for one request at one denoising step."""
 
     step_index: int
     t_host: torch.Tensor
@@ -169,6 +169,42 @@ class DenoisingStepState:
     current_model: Any
     current_guidance_scale: Any
     attn_metadata: Any | None
+
+
+@dataclass(slots=True)
+class DenoisingStepWorkItem:
+    req: Req
+    denoising_context: DenoisingContext
+    current_step: DenoisingStepState
+
+
+class DenoisingStepPackingError(ValueError):
+    pass
+
+
+@dataclass(slots=True)
+class PackedDenoisingStepInputs:
+    states: list[Any]
+    row_slices: tuple[slice, ...]
+    latent_model_input: torch.Tensor
+    timestep: torch.Tensor
+    guidance: torch.Tensor | None
+    branch_kwargs: tuple[dict[str, Any], ...]
+    branch_is_conditional: tuple[bool, ...]
+    current_model: Any
+    target_dtype: torch.dtype
+    autocast_enabled: bool
+    attn_metadata: Any | None
+    forward_batch: Req
+    current_timestep: int | None
+
+    def slice_prediction(
+        self, prediction: torch.Tensor | tuple[torch.Tensor, ...], index: int
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        row_slice = self.row_slices[index]
+        if isinstance(prediction, tuple):
+            return tuple(item[row_slice] for item in prediction)
+        return prediction[row_slice]
 
 
 class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
@@ -741,8 +777,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         else:
             reserved_frames_mask_sp, z_sp = (
-                reserved_frames_masks[0] if reserved_frames_masks is not None else None
-            ), z
+                (
+                    reserved_frames_masks[0]
+                    if reserved_frames_masks is not None
+                    else None
+                ),
+                z,
+            )
 
         guidance = self.get_or_build_guidance(
             # TODO: replace with raw_latent_shape?
@@ -831,7 +872,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _before_denoising_loop(
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
-        """Prepare scheduler state before entering the shared denoising loop."""
+        """Reset scheduler state for one denoising pass."""
         self._reset_scheduler_loop_state(ctx.scheduler)
         ctx.scheduler.set_begin_index(0)
         self._init_cfg_gate_state(ctx, batch, server_args)
@@ -928,7 +969,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     stack.append(wrapped)
         return None
 
-    def _prepare_step_state(
+    def _build_denoising_step_state(
         self,
         ctx: DenoisingContext,
         batch: Req,
@@ -937,7 +978,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         t_host: torch.Tensor,
         timesteps_cpu: torch.Tensor,
     ) -> DenoisingStepState:
-        """Build the per-step state shared by the loop and model-specific hooks."""
+        """Build state for one denoising step."""
         t_int = int(t_host.item())
         t_device = ctx.timesteps[step_index]
         current_model, current_guidance_scale = self._select_and_manage_model(
@@ -964,6 +1005,25 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             attn_metadata=attn_metadata,
         )
 
+    def _prepare_step_state(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+        t_host: torch.Tensor,
+        timesteps_cpu: torch.Tensor,
+    ) -> DenoisingStepState:
+        """Compatibility wrapper for model-specific denoising subclasses."""
+        return self._build_denoising_step_state(
+            ctx,
+            batch,
+            server_args,
+            step_index,
+            t_host,
+            timesteps_cpu,
+        )
+
     def _prepare_step_attn_metadata(
         self,
         ctx: DenoisingContext,
@@ -974,8 +1034,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         timesteps_cpu: torch.Tensor,
     ) -> Any | None:
         """Build attention metadata for the current denoising step."""
-        # Keep attention metadata preparation overridable so model-specific stages
-        # can preserve their original semantics without duplicating step state setup.
         return self._build_attn_metadata(
             step_index,
             batch,
@@ -1011,7 +1069,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         inner ``predict_noise`` / ``scheduler_step`` NVTX markers emitted
         below; mirror them in the override if those markers are needed.
         """
-        use_nvtx = self.current_use_nvtx
+        use_nvtx = ctx.extra.get("use_nvtx", self.current_use_nvtx)
         # 1. Prepare latent inputs in the model's compute dtype.
         latent_model_input = ctx.latents.to(ctx.target_dtype)
         if batch.image_latent is not None:
@@ -1022,7 +1080,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 [latent_model_input, batch.image_latent], dim=1
             ).to(ctx.target_dtype)
 
-        # 2. Expand the timestep to the shape expected by the current model.
         timestep = self.expand_timestep_before_forward(
             batch,
             server_args,
@@ -1032,7 +1089,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ctx.reserved_frames_mask,
         )
 
-        # 3. Apply scheduler-side input scaling before the model forward.
         latent_model_input = ctx.scheduler.scale_model_input(
             latent_model_input, step.t_device
         )
@@ -1067,7 +1123,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return_dict=False,
             )[0]
 
-        # 6. Re-apply any model-specific latent constraints after the update.
         ctx.latents = self.post_forward_for_ti2v_task(
             batch,
             server_args,
@@ -1290,6 +1345,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             current_model: the next active dit, transformer_1 or transformer_2
         """
         manager = self._component_residency_manager
+        if manager is None:
+            return
 
         component_name = manager.component_name_for_module(current_model, current_phase)
         phase = str(batch.extra.get("ltx2_phase", current_phase))
@@ -1363,14 +1420,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return latents
 
     @torch.no_grad()
-    def forward(
+    def prepare_denoising_context(
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
-        """
-        Run the denoising loop.
-        """
+        *,
+        open_progress_bar: bool = False,
+    ) -> DenoisingContext:
         ctx = self._prepare_denoising_loop(batch, server_args)
         if batch.rollout:
             self._maybe_init_denoising_env_collection(
@@ -1381,98 +1437,753 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 neg_cond_kwargs=ctx.neg_cond_kwargs,
                 guidance=ctx.guidance,
             )
-        denoising_start_time = time.time()
         self._before_denoising_loop(ctx, batch, server_args)
-        # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
-        num_timesteps = timesteps_cpu.shape[0]
-        # Re-resolve the explicit-range gate so the per-step markers
-        # below honor this request's is_warmup state. Layer hooks are
-        # registered by the residency manager at the use-site.
-        use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
-
-        with (
-            torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=ctx.target_dtype,
-                enabled=ctx.autocast_enabled,
-            ),
-            maybe_nvtx_range("denoising_loop", use_nvtx),
-        ):
-            with self.progress_bar(
+        ctx.extra["timesteps_cpu"] = timesteps_cpu
+        ctx.extra["denoising_start_time"] = time.time()
+        ctx.extra["use_nvtx"] = self._apply_nvtx_gate(ctx.is_warmup)
+        if open_progress_bar:
+            progress_manager = self.progress_bar(
                 total=ctx.num_inference_steps, batch=batch
-            ) as progress_bar:
-                for step_index, t_host in enumerate(timesteps_cpu):
-                    # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
-                    # use non-integer timesteps keep their precision in markers.
-                    step_marker = f"denoising_step_{step_index}_t{t_host.item():.4g}"
-                    with (
-                        maybe_nvtx_range(step_marker, use_nvtx),
-                        StageProfiler(
-                            f"denoising_step_{step_index}",
-                            logger=logger,
-                            metrics=batch.metrics,
-                            perf_dump_path_provided=batch.perf_dump_path is not None,
-                            record_as_step=True,
-                        ),
+            )
+            ctx.extra["progress_manager"] = progress_manager
+            ctx.extra["progress_bar"] = progress_manager.__enter__()
+        return ctx
+
+    def prepare_denoising_step_state(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        step_index: int,
+    ) -> DenoisingStepState:
+        timesteps_cpu = ctx.extra.get("timesteps_cpu")
+        if timesteps_cpu is None:
+            timesteps_cpu = ctx.timesteps.cpu()
+            ctx.extra["timesteps_cpu"] = timesteps_cpu
+        return self._build_denoising_step_state(
+            ctx,
+            batch,
+            server_args,
+            step_index,
+            timesteps_cpu[step_index],
+            timesteps_cpu,
+        )
+
+    @torch.no_grad()
+    def run_single_denoising_step(
+        self,
+        ctx: DenoisingContext,
+        step: DenoisingStepState,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=ctx.target_dtype,
+            enabled=ctx.autocast_enabled,
+        ):
+            self._run_denoising_step(ctx, step, batch, server_args)
+        self._record_trajectory(ctx, step, batch, server_args)
+
+    def _update_denoising_progress(
+        self, ctx: DenoisingContext, step_index: int
+    ) -> None:
+        progress_bar = ctx.extra.get("progress_bar")
+        if progress_bar is None:
+            return
+        timesteps_cpu = ctx.extra.get("timesteps_cpu")
+        num_timesteps = int(timesteps_cpu.shape[0]) if timesteps_cpu is not None else 0
+        if step_index == num_timesteps - 1 or (
+            (step_index + 1) > ctx.num_warmup_steps
+            and (step_index + 1) % ctx.scheduler.order == 0
+        ):
+            progress_bar.update()
+
+    def close_denoising_progress(self, ctx: DenoisingContext) -> None:
+        progress_manager = ctx.extra.pop("progress_manager", None)
+        ctx.extra.pop("progress_bar", None)
+        if progress_manager is not None:
+            progress_manager.__exit__(None, None, None)
+
+    def cleanup_denoising_context(self, ctx: DenoisingContext) -> None:
+        try:
+            self._finish_active_component_use()
+        finally:
+            self.close_denoising_progress(ctx)
+
+    @torch.no_grad()
+    def _run_unpacked_denoising_steps(
+        self,
+        states: list[Any],
+        server_args: ServerArgs,
+    ) -> None:
+        for state in states:
+            ctx = state.denoising_context
+            step = state.current_step
+            use_nvtx = ctx.extra.get("use_nvtx", self.current_use_nvtx)
+            step_marker = f"denoising_step_{step.step_index}_t{step.t_host.item():.4g}"
+            with (
+                maybe_nvtx_range(step_marker, use_nvtx),
+                StageProfiler(
+                    f"denoising_step_{step.step_index}",
+                    logger=logger,
+                    metrics=state.req.metrics,
+                    perf_dump_path_provided=state.req.perf_dump_path is not None,
+                    record_as_step=True,
+                ),
+            ):
+                self.run_single_denoising_step(
+                    ctx,
+                    step,
+                    state.req,
+                    server_args,
+                )
+                self._update_denoising_progress(
+                    ctx,
+                    step.step_index,
+                )
+                if not ctx.is_warmup:
+                    self.step_profile()
+
+    @torch.no_grad()
+    def run_denoising_steps_for_requests(
+        self,
+        states: list[Any],
+        server_args: ServerArgs,
+    ) -> None:
+        if len(states) <= 1 or not self.can_run_steps_in_one_forward_pass(
+            states, server_args
+        ):
+            self._run_unpacked_denoising_steps(states, server_args)
+            return
+
+        try:
+            batched_inputs = self._pack_denoising_step_inputs(states, server_args)
+        except DenoisingStepPackingError as exc:
+            logger.debug("Step batch packing fell back to local steps: %s", exc)
+            self._run_unpacked_denoising_steps(states, server_args)
+            return
+
+        with ExitStack() as stack:
+            for state in states:
+                step = state.current_step
+                use_nvtx = state.denoising_context.extra.get(
+                    "use_nvtx", self.current_use_nvtx
+                )
+                stack.enter_context(
+                    maybe_nvtx_range(
+                        f"denoising_step_{step.step_index}_t{step.t_host.item():.4g}",
+                        use_nvtx,
+                    )
+                )
+                stack.enter_context(
+                    StageProfiler(
+                        f"denoising_step_{step.step_index}",
+                        logger=logger,
+                        metrics=state.req.metrics,
+                        perf_dump_path_provided=state.req.perf_dump_path is not None,
+                        record_as_step=True,
+                    )
+                )
+            self._run_batched_step_forward_and_update_latents(
+                batched_inputs,
+                server_args,
+            )
+        for state in states:
+            self._update_denoising_progress(
+                state.denoising_context,
+                state.current_step.step_index,
+            )
+            if not state.denoising_context.is_warmup:
+                self.step_profile()
+
+    @torch.no_grad()
+    def finish_denoising_context(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> None:
+        timesteps_cpu = ctx.extra.get("timesteps_cpu")
+        if timesteps_cpu is None:
+            timesteps_cpu = ctx.timesteps.cpu()
+        num_timesteps = int(timesteps_cpu.shape[0])
+
+        try:
+            denoising_start_time = ctx.extra.get("denoising_start_time")
+            if (
+                denoising_start_time is not None
+                and num_timesteps > 0
+                and not ctx.is_warmup
+            ):
+                self.log_info(
+                    "average time per step: %.4f seconds",
+                    (time.time() - denoising_start_time) / num_timesteps,
+                )
+
+            self._finish_active_component_use()
+
+            if batch.rollout:
+                self._postprocess_rollout_outputs(
+                    batch=batch,
+                    latents=ctx.latents,
+                    num_inference_steps=num_timesteps,
+                    final_timestep=timesteps_cpu.new_zeros(()),
+                    server_args=server_args,
+                )
+            self._finalize_denoising_loop(ctx, batch, server_args)
+        finally:
+            self.close_denoising_progress(ctx)
+
+    def can_run_steps_in_one_forward_pass(
+        self, states: list[Any], server_args: ServerArgs
+    ) -> bool:
+        if not states:
+            return False
+        if type(self)._run_denoising_step is not DenoisingStage._run_denoising_step:
+            return False
+        if getattr(server_args, "enable_cfg_parallel", False):
+            return False
+
+        first = states[0]
+        first_step = first.current_step
+        first_ctx = first.denoising_context
+        if first_step is None:
+            return False
+        if first.req.image_latent is not None:
+            return False
+        if (first_ctx.extra.get("cfg_gate_state") or {}).get("active"):
+            return False
+        first_branches = getattr(first_ctx.cfg_policy, "branches", ())
+        if not first_branches:
+            return False
+
+        for state in states[1:]:
+            step = state.current_step
+            ctx = state.denoising_context
+            if step is None:
+                return False
+            if not self._can_share_packed_attn_metadata(
+                first_step.attn_metadata,
+                step.attn_metadata,
+            ):
+                return False
+            if step.current_model is not first_step.current_model:
+                return False
+            if state.req.image_latent is not None:
+                return False
+            if (ctx.extra.get("cfg_gate_state") or {}).get("active"):
+                return False
+            branches = getattr(ctx.cfg_policy, "branches", ())
+            if len(branches) != len(first_branches):
+                return False
+            if tuple(branch.name for branch in branches) != tuple(
+                branch.name for branch in first_branches
+            ):
+                return False
+            if tuple(branch.is_conditional for branch in branches) != tuple(
+                branch.is_conditional for branch in first_branches
+            ):
+                return False
+            if tuple(ctx.latents.shape[1:]) != tuple(first_ctx.latents.shape[1:]):
+                return False
+            if ctx.latents.dtype != first_ctx.latents.dtype:
+                return False
+            if ctx.latents.device != first_ctx.latents.device:
+                return False
+        return True
+
+    @staticmethod
+    def _can_share_packed_attn_metadata(first: Any, current: Any) -> bool:
+        if first is None or current is None:
+            return first is None and current is None
+        if type(first) is not type(current):
+            return False
+        if type(first).__name__ != "FlashAttentionMetadata":
+            return DenoisingStage._metadata_values_equal(first, current)
+        for attr in ("cu_seqlens_q", "cu_seqlens_k"):
+            if getattr(first, attr, None) is not None:
+                return False
+            if getattr(current, attr, None) is not None:
+                return False
+        for attr in ("max_seqlen_q", "max_seqlen_k"):
+            first_value = getattr(first, attr, None)
+            current_value = getattr(current, attr, None)
+            if first_value != current_value:
+                return False
+        return True
+
+    @staticmethod
+    def _metadata_values_equal(first: Any, current: Any) -> bool:
+        if first is current:
+            return True
+        if first is None or current is None:
+            return first is None and current is None
+        if isinstance(first, (str, int, float, bool)):
+            return first == current
+        if isinstance(first, torch.Tensor):
+            return (
+                isinstance(current, torch.Tensor)
+                and tuple(first.shape) == tuple(current.shape)
+                and first.dtype == current.dtype
+                and first.device == current.device
+                and torch.equal(first, current)
+            )
+        if isinstance(first, (list, tuple)):
+            return (
+                isinstance(current, type(first))
+                and len(first) == len(current)
+                and all(
+                    DenoisingStage._metadata_values_equal(left, right)
+                    for left, right in zip(first, current, strict=True)
+                )
+            )
+        if isinstance(first, dict):
+            return (
+                isinstance(current, dict)
+                and set(first) == set(current)
+                and all(
+                    DenoisingStage._metadata_values_equal(first[key], current[key])
+                    for key in first
+                )
+            )
+        if is_dataclass(first):
+            if "cache" in type(first).__name__.lower():
+                return False
+            return all(
+                field_info.name != "cache"
+                and DenoisingStage._metadata_values_equal(
+                    getattr(first, field_info.name),
+                    getattr(current, field_info.name),
+                )
+                for field_info in fields(first)
+            )
+        return False
+
+    @staticmethod
+    def _merge_step_input_value(
+        values: list[Any], *, allow_shared: bool = False, key: str | None = None
+    ) -> Any:
+        """Merge one branch kwarg across requests for packed execution."""
+        first = values[0]
+        if first is None:
+            if any(value is not None for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch kwargs mix None and non-None values"
+                )
+            return None
+
+        if key == "freqs_cis":
+            return DenoisingStage._merge_rope_cache(values)
+
+        if isinstance(first, torch.Tensor):
+            if any(not isinstance(value, torch.Tensor) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch kwargs mix tensor and non-tensor values"
+                )
+            if allow_shared and all(
+                tuple(value.shape) == tuple(first.shape)
+                and value.dtype == first.dtype
+                and value.device == first.device
+                and torch.equal(value, first)
+                for value in values
+            ):
+                return first
+            if allow_shared:
+                raise DenoisingStepPackingError(
+                    "step batch shared tensor kwarg values differ"
+                )
+            if key in {
+                "encoder_hidden_states",
+                "encoder_hidden_states_mask",
+                "encoder_attention_mask",
+            } and all(
+                value.ndim >= 2
+                and first.ndim >= 2
+                and tuple(value.shape[2:]) == tuple(first.shape[2:])
+                and value.dtype == first.dtype
+                and value.device == first.device
+                for value in values
+            ):
+                return DenoisingStage._pad_and_cat_text_tensors(values)
+            if all(
+                value.ndim > 0
+                and first.ndim > 0
+                and tuple(value.shape[1:]) == tuple(first.shape[1:])
+                and value.dtype == first.dtype
+                and value.device == first.device
+                for value in values
+            ):
+                return torch.cat(values, dim=0)
+            raise DenoisingStepPackingError(
+                "step batch tensor kwarg is neither batch-concatable nor shared"
+            )
+
+        if isinstance(first, tuple):
+            if any(not isinstance(value, tuple) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch kwargs mix tuple and non-tuple values"
+                )
+            if any(len(value) != len(first) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch tuple kwargs have different lengths"
+                )
+            return tuple(
+                DenoisingStage._merge_step_input_value(
+                    [value[index] for value in values],
+                    allow_shared=allow_shared,
+                    key=key,
+                )
+                for index in range(len(first))
+            )
+
+        if isinstance(first, list):
+            if any(not isinstance(value, list) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch kwargs mix list and non-list values"
+                )
+            if key == "encoder_hidden_states" and all(
+                all(torch.is_tensor(item) for item in value) for value in values
+            ):
+                merged = []
+                for value in values:
+                    merged.extend(value)
+                return merged
+            if key in {"img_shapes", "txt_seq_lens"}:
+                merged = []
+                for value in values:
+                    merged.extend(value)
+                return merged
+            if any(len(value) != len(first) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch list kwargs have different lengths"
+                )
+            return [
+                DenoisingStage._merge_step_input_value(
+                    [value[index] for value in values],
+                    allow_shared=allow_shared,
+                    key=key,
+                )
+                for index in range(len(first))
+            ]
+
+        if isinstance(first, dict):
+            keys = set(first)
+            if any(
+                not isinstance(value, dict) or set(value) != keys for value in values
+            ):
+                raise DenoisingStepPackingError(
+                    "step batch dict kwargs have different keys"
+                )
+            return {
+                key: DenoisingStage._merge_step_input_value(
+                    [value[key] for value in values],
+                    allow_shared=allow_shared,
+                    key=str(key),
+                )
+                for key in first
+            }
+
+        try:
+            if all(value == first for value in values):
+                return first
+        except Exception:
+            if all(value is first for value in values):
+                return first
+        raise DenoisingStepPackingError(
+            f"step batch scalar kwarg values differ for {type(first).__name__}"
+        )
+
+    @staticmethod
+    def _pad_and_cat_text_tensors(values: list[torch.Tensor]) -> torch.Tensor:
+        max_seq_len = max(int(value.shape[1]) for value in values)
+        padded_values = []
+        for value in values:
+            seq_len = int(value.shape[1])
+            if seq_len < max_seq_len:
+                pad_shape = list(value.shape)
+                pad_shape[1] = max_seq_len - seq_len
+                pad_value = False if value.dtype == torch.bool else 0
+                value = torch.cat(
+                    [value, value.new_full(pad_shape, pad_value)],
+                    dim=1,
+                )
+            padded_values.append(value)
+        return torch.cat(padded_values, dim=0)
+
+    @staticmethod
+    def _merge_rope_cache(values: list[Any]) -> Any:
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            if any(not isinstance(value, torch.Tensor) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache mixes tensor and non-tensor values"
+                )
+            if not all(
+                value.ndim == first.ndim
+                and tuple(value.shape[1:]) == tuple(first.shape[1:])
+                and value.dtype == first.dtype
+                and value.device == first.device
+                for value in values
+            ):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache tensors are incompatible"
+                )
+            longest = max(values, key=lambda value: int(value.shape[0]))
+            for value in values:
+                if not torch.equal(longest[: value.shape[0]], value):
+                    raise DenoisingStepPackingError(
+                        "step batch RoPE cache tensors differ"
+                    )
+            return longest
+
+        if isinstance(first, tuple):
+            if any(not isinstance(value, tuple) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache mixes tuple and non-tuple values"
+                )
+            if any(len(value) != len(first) for value in values):
+                raise DenoisingStepPackingError(
+                    "step batch RoPE cache tuples have different lengths"
+                )
+            return tuple(
+                DenoisingStage._merge_rope_cache([value[index] for value in values])
+                for index in range(len(first))
+            )
+
+        if all(value == first for value in values):
+            return first
+        raise DenoisingStepPackingError("step batch RoPE cache values differ")
+
+    @staticmethod
+    def _step_input_can_be_shared(key: str) -> bool:
+        return key in {"freqs_cis", "joint_attention_kwargs"}
+
+    def _merge_step_input_kwargs(self, branch_kwargs: list[dict[str, Any]]) -> dict:
+        keys = tuple(branch_kwargs[0])
+        key_set = set(keys)
+        for kwargs in branch_kwargs[1:]:
+            if set(kwargs) != key_set:
+                raise DenoisingStepPackingError(
+                    "step batch branch kwargs have mismatched keys"
+                )
+        return {
+            key: self._merge_step_input_value(
+                [kwargs[key] for kwargs in branch_kwargs],
+                allow_shared=self._step_input_can_be_shared(key),
+                key=key,
+            )
+            for key in keys
+        }
+
+    def _pack_denoising_step_inputs(
+        self, states: list[Any], server_args: ServerArgs
+    ) -> PackedDenoisingStepInputs:
+        """Build packed model inputs for selected compatible request steps."""
+        first = states[0]
+        first_ctx = first.denoising_context
+        first_step = first.current_step
+
+        latent_inputs = []
+        timesteps = []
+        guidance_values = []
+        branch_kwargs_by_index: list[list[dict[str, Any]]] = []
+        branch_is_conditional = []
+        row_slices = []
+        row_offset = 0
+        for state in states:
+            ctx = state.denoising_context
+            step = state.current_step
+            req = state.req
+            latent_model_input = ctx.latents.to(ctx.target_dtype)
+            latent_model_input = ctx.scheduler.scale_model_input(
+                latent_model_input, step.t_device
+            )
+            timestep = self.expand_timestep_before_forward(
+                req,
+                server_args,
+                step.t_device,
+                ctx.target_dtype,
+                ctx.seq_len,
+                ctx.reserved_frames_mask,
+            )
+            latent_inputs.append(latent_model_input)
+            timesteps.append(timestep)
+            guidance_values.append(ctx.guidance)
+            for branch_index, branch in enumerate(ctx.cfg_policy.branches):
+                if len(branch_kwargs_by_index) <= branch_index:
+                    branch_kwargs_by_index.append([])
+                    branch_is_conditional.append(branch.is_conditional)
+                branch.configure_batch(req)
+                branch_kwargs_by_index[branch_index].append(branch.kwargs)
+
+            rows = int(ctx.latents.shape[0])
+            row_slices.append(slice(row_offset, row_offset + rows))
+            row_offset += rows
+
+        try:
+            latent_model_input = torch.cat(latent_inputs, dim=0)
+            timestep = torch.cat(timesteps, dim=0)
+            if any(guidance_value is None for guidance_value in guidance_values):
+                if not all(
+                    guidance_value is None for guidance_value in guidance_values
+                ):
+                    raise DenoisingStepPackingError(
+                        "step batch mixes guidance tensor presence"
+                    )
+                guidance = None
+            else:
+                guidance = torch.cat(guidance_values, dim=0)
+        except RuntimeError as exc:
+            raise DenoisingStepPackingError(
+                f"step batch tensor packing failed: {exc}"
+            ) from exc
+        merged_branch_kwargs = tuple(
+            self._merge_step_input_kwargs(branch_kwargs)
+            for branch_kwargs in branch_kwargs_by_index
+        )
+        step_indices = {state.current_step.step_index for state in states}
+        return PackedDenoisingStepInputs(
+            states=states,
+            row_slices=tuple(row_slices),
+            latent_model_input=latent_model_input,
+            timestep=timestep,
+            guidance=guidance,
+            branch_kwargs=merged_branch_kwargs,
+            branch_is_conditional=tuple(branch_is_conditional),
+            current_model=first_step.current_model,
+            target_dtype=first_ctx.target_dtype,
+            autocast_enabled=first_ctx.autocast_enabled,
+            attn_metadata=first_step.attn_metadata,
+            forward_batch=first.req,
+            current_timestep=first_step.step_index if len(step_indices) == 1 else None,
+        )
+
+    def _run_batched_step_forward_and_update_latents(
+        self, packed_inputs: PackedDenoisingStepInputs, server_args: ServerArgs
+    ) -> None:
+        """Run one packed forward pass and update each request's scheduler state."""
+        use_nvtx = any(
+            state.denoising_context.extra.get("use_nvtx", self.current_use_nvtx)
+            for state in packed_inputs.states
+        )
+        with maybe_nvtx_range("predict_noise", use_nvtx):
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=packed_inputs.target_dtype,
+                enabled=packed_inputs.autocast_enabled,
+            ):
+                with set_forward_context(
+                    current_timestep=packed_inputs.current_timestep,
+                    attn_metadata=packed_inputs.attn_metadata,
+                    forward_batch=packed_inputs.forward_batch,
+                ):
+                    branch_predictions = []
+                    for branch_kwargs, is_conditional in zip(
+                        packed_inputs.branch_kwargs,
+                        packed_inputs.branch_is_conditional,
+                        strict=True,
                     ):
-                        step = self._prepare_step_state(
-                            ctx,
-                            batch,
-                            server_args,
-                            step_index,
-                            t_host,
-                            timesteps_cpu,
-                        )
-                        # Capture the raw (pre-scale, pre-I2V-concat) noisy latent
-                        # x_{t_i} for rollout trajectory collection. Must run
-                        # BEFORE _run_denoising_step so ctx.latents is still the
-                        # pre-step value. Gated on batch.rollout to keep the
-                        # non-rollout path strictly untouched.
-                        if batch.rollout:
-                            batch._rollout_loop_step_index = step_index
-                            self._maybe_append_dit_trajectory_step(
-                                batch=batch,
-                                latents=ctx.latents,
-                                timestep_value=step.t_host,
-                                step_index=step_index,
+                        packed_inputs.forward_batch.is_cfg_negative = not is_conditional
+                        branch_predictions.append(
+                            self._predict_noise(
+                                current_model=packed_inputs.current_model,
+                                latent_model_input=packed_inputs.latent_model_input,
+                                timestep=packed_inputs.timestep,
+                                target_dtype=packed_inputs.target_dtype,
+                                guidance=packed_inputs.guidance,
+                                **branch_kwargs,
                             )
-                        self._run_denoising_step(ctx, step, batch, server_args)
-                        self._record_trajectory(ctx, step, batch, server_args)
+                        )
 
-                        if step_index == num_timesteps - 1 or (
-                            (step_index + 1) > ctx.num_warmup_steps
-                            and (step_index + 1) % ctx.scheduler.order == 0
-                            and progress_bar is not None
-                        ):
-                            progress_bar.update()
+        with maybe_nvtx_range("scheduler_step", use_nvtx):
+            for index, state in enumerate(packed_inputs.states):
+                ctx = state.denoising_context
+                step = state.current_step
+                req = state.req
+                predictions = []
+                for branch_prediction in branch_predictions:
+                    sliced_prediction = packed_inputs.slice_prediction(
+                        branch_prediction, index
+                    )
+                    pred_t = _wrap(sliced_prediction)
+                    if len(pred_t) == 1:
+                        pred_t = (
+                            server_args.pipeline_config.slice_noise_pred(
+                                pred_t[0], ctx.latents
+                            ),
+                        )
+                    predictions.append(_unwrap(pred_t))
+                cfg_scale = (
+                    server_args.pipeline_config.get_classifier_free_guidance_scale(
+                        req,
+                        step.current_guidance_scale,
+                    )
+                )
+                noise_pred = ctx.cfg_policy.combine(
+                    predictions,
+                    req,
+                    cfg_scale,
+                    server_args.pipeline_config,
+                    cfg_parallel=False,
+                )
+                if server_args.comfyui_mode:
+                    req.noise_pred = noise_pred
+                ctx.latents = ctx.scheduler.step(
+                    model_output=noise_pred,
+                    timestep=step.t_device,
+                    sample=ctx.latents,
+                    **ctx.extra_step_kwargs,
+                    return_dict=False,
+                )[0]
+                ctx.latents = self.post_forward_for_ti2v_task(
+                    req,
+                    server_args,
+                    ctx.reserved_frames_mask,
+                    ctx.latents,
+                    ctx.z,
+                )
+                self._record_trajectory(ctx, step, req, server_args)
 
-                        if not ctx.is_warmup:
-                            self.step_profile()
-
-        denoising_end_time = time.time()
-
-        if num_timesteps > 0 and not ctx.is_warmup:
-            self.log_info(
-                "average time per step: %.4f seconds",
-                (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
-            )
-
-        self._finish_active_component_use()
-
-        # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
-        # the final scheduler.step output (ctx.latents) is still SP-sharded and
-        # can be gathered uniformly alongside the per-step dit_trajectory via
-        # gather_stacked_latents_for_sp.
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=ctx.latents,
-                num_inference_steps=num_timesteps,
-                final_timestep=timesteps_cpu.new_zeros(()),
-                server_args=server_args,
-            )
-        self._finalize_denoising_loop(ctx, batch, server_args)
+    @torch.no_grad()
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Run the denoising loop.
+        """
+        ctx = self.prepare_denoising_context(batch, server_args, open_progress_bar=True)
+        timesteps_cpu = ctx.extra["timesteps_cpu"]
+        try:
+            with maybe_nvtx_range(
+                "denoising_loop", ctx.extra.get("use_nvtx", self.current_use_nvtx)
+            ):
+                for step_index, _t_host in enumerate(timesteps_cpu):
+                    step = self.prepare_denoising_step_state(
+                        ctx,
+                        batch,
+                        server_args,
+                        step_index,
+                    )
+                    if batch.rollout:
+                        batch._rollout_loop_step_index = step_index
+                        self._maybe_append_dit_trajectory_step(
+                            batch=batch,
+                            latents=ctx.latents,
+                            timestep_value=step.t_host,
+                            step_index=step_index,
+                        )
+                    self.run_denoising_steps_for_requests(
+                        [DenoisingStepWorkItem(batch, ctx, step)],
+                        server_args,
+                    )
+        except Exception:
+            self.cleanup_denoising_context(ctx)
+            raise
+        self.finish_denoising_context(ctx, batch, server_args)
         return batch
 
     def _get_extra_func_kwarg_names(self, func) -> tuple[bool, frozenset[str]]:

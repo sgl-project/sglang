@@ -23,10 +23,10 @@ def get_or_create_request_scheduler(
     and avoids unnecessary deepcopy overhead. Set ``isolate=True`` only when a
     request can run concurrently or outlive the stage-local scheduler state.
     """
+    if isolate:
+        batch.scheduler = clone_scheduler_runtime(batch.scheduler or scheduler_template)
+        return batch.scheduler
+
     if batch.scheduler is None:
-        batch.scheduler = (
-            clone_scheduler_runtime(scheduler_template)
-            if isolate
-            else scheduler_template
-        )
+        batch.scheduler = scheduler_template
     return batch.scheduler
