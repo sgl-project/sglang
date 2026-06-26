@@ -405,43 +405,60 @@ class _DeepEPDispatcherImplBase:
         # 2. Validate and adjust dtype according to hardware capabilities
         self._validate_and_adjust_dtype()
     
-        # 3. Apply quantisation flags for low_latency_dispacth based on the final dtype
-        self._apply_quantisation_flags()
-
+        # 3. Apply quantization flags for low_latency_dispatch based on the final dtype
+        self._apply_low_latency_quantization_flags()
+    
         # 4. Prepare NPU-specific quantisation tensor for normal dispatch if on Ascend hardware
         if _is_npu:
-            self.npu_quant_tensor = self._get_npu_quant_tensor()
+            self.npu_quant_tensor = self._get_npu_normal_quant_tensor()
         else:
             self.npu_quant_tensor = None  # Not used on GPU
     
-    def _apply_quantisation_flags(self) -> None:
+    def _apply_low_latency_quantization_flags(self) -> None:
         """Set use_fp8 and use_nvfp4 flags from the resolved output dtype."""
         dtype = self.deepep_output_dtype
-    
+        self.fp8_configs = dict()
+
         if dtype == DeepEPOutputDtype.BF16:
             self.use_fp8 = False
             self.use_nvfp4 = False
         elif dtype == DeepEPOutputDtype.FP8:
             self.use_fp8 = True
             self.use_nvfp4 = False
+            # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
+            # to return int32-packed UE8M0 scales that don't feed the flashinfer
+            # cutedsl kernel.
+            self.fp8_configs = (
+                dict(
+                    round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                    and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                    use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                    and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                )
+                if self.use_fp8
+                else dict()
+            )
         elif dtype == DeepEPOutputDtype.INT8:
             # Ascend A2/A3 uses int8 quantisation under the 'use_fp8' flag
             self.use_fp8 = True
             self.use_nvfp4 = False
+            self.fp8_configs = [(False, False)]
         elif dtype == DeepEPOutputDtype.NVFP4:
             self.use_fp8 = False
             self.use_nvfp4 = True
-
-            if quant_type == "mxfp8":
-                fp8_configs = [(True, True)]
-            elif quant_type == "fp8":
-                fp8_configs = [(True, False)]
-            else:
-                fp8_configs = [(False, False)]
+        elif dtype in (
+            DeepEPOutputDtype.MXFP8_e4m3fn,
+            DeepEPOutputDtype.MXFP8_e5m2,
+        ):
+            self.use_fp8 = True
+            self.use_nvfp4 = False
+            self.fp8_configs = [(True, True)]
+        elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
+            raise ValueError(f"Ascend does not support {dtype} quantization in low_latency mode now")
         else:
             raise ValueError(f"Unsupported DeepEP output dtype: {dtype}")
 
-    def _get_npu_quant_tensor(self):
+    def _get_npu_normal_quant_tensor(self):
         """
         Build a reference tensor of the quantisation data type used on NPU.
         Returns None if no quantisation is required (e.g., bf16).
@@ -451,11 +468,11 @@ class _DeepEPDispatcherImplBase:
             return None
         elif dtype == DeepEPOutputDtype.INT8:
             return torch.tensor([], dtype=torch.int8, device="npu")
-        elif dtype == DeepEPOutputDtype.FP8_e4m3fn:
+        elif dtype == DeepEPOutputDtype.MXFP8_e4m3fn:
             return torch.tensor([], dtype=torch.float8_e4m3fn, device="npu")
-        elif dtype == DeepEPOutputDtype.FP8_e5m2:
+        elif dtype == DeepEPOutputDtype.MXFP8_e5m2:
              return torch.tensor([], dtype=torch.float8_e5m2, device="npu")
-        elif dtype == DeepEPOutputDtype.FP4_e2m1fn_x2:
+        elif dtype == DeepEPOutputDtype.MXFP4_e2m1fn_x2:
             return torch.tensor([], dtype=torch.float4_e2m1fn_x2, device="npu")
         else:
             raise RuntimeError(f"Unexpected output dtype for NPU quant tensor: {dtype}")
@@ -740,20 +757,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
-        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
-        # to return int32-packed UE8M0 scales that don't feed the flashinfer
-        # cutedsl kernel.
-        fp8_deepgemm_scale_opts = (
-            dict(
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-            )
-            if self.use_fp8
-            else dict()
-        )
-
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
@@ -771,7 +774,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
+                **self.round_scale_use_ue8m0_dict,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
