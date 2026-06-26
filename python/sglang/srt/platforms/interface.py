@@ -56,25 +56,30 @@ class SRTPlatform(DeviceMixin):
         """Return the default attention backend name for this platform."""
         raise NotImplementedError
 
-    def get_graph_runner_cls(self) -> type:
-        """Return the graph runner class for this platform."""
-        raise NotImplementedError
+    def get_graph_runner_cls(self) -> Optional[type]:
+        """Return the graph runner class for this platform.
 
-    def get_mha_kv_pool_cls(self) -> type:
-        """Return the MHA KV pool class for this platform."""
-        raise NotImplementedError
+        Return None to let the caller use the generic in-tree default
+        (DecodeCudaGraphRunner). In-tree platforms that need a different
+        runner (CPU, NPU) override this; OOT platforms must provide one.
+        """
+        return None
 
-    def get_mla_kv_pool_cls(self) -> type:
-        """Return the MLA KV pool class for this platform."""
-        raise NotImplementedError
+    def get_mha_kv_pool_cls(self) -> Optional[type]:
+        """Return the MHA KV pool class, or None for the in-tree default."""
+        return None
 
-    def get_dsa_kv_pool_cls(self) -> type:
-        """Return the DSA KV pool class for this platform (DeepSeek V3.2)."""
-        raise NotImplementedError
+    def get_mla_kv_pool_cls(self) -> Optional[type]:
+        """Return the MLA KV pool class, or None for the in-tree default."""
+        return None
 
-    def get_paged_allocator_cls(self) -> type:
-        """Return the paged allocator class for this platform."""
-        raise NotImplementedError
+    def get_dsa_kv_pool_cls(self) -> Optional[type]:
+        """Return the DSA KV pool class (DeepSeek V3.2), or None for the default."""
+        return None
+
+    def get_paged_allocator_cls(self) -> Optional[type]:
+        """Return the paged allocator class, or None for the in-tree default."""
+        return None
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
@@ -83,9 +88,9 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
-    def get_piecewise_backend_cls(self) -> type:
-        """Return the piecewise compilation backend class for this platform."""
-        raise NotImplementedError
+    def get_piecewise_backend_cls(self) -> Optional[type]:
+        """Return the piecewise backend class, or None for the in-tree default."""
+        return None
 
     def get_quantization_config(
         self, quantization: str

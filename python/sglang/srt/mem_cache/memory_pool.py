@@ -1935,16 +1935,9 @@ class HybridLinearKVPool(KVCache):
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-            TokenToKVPoolClass = MHATokenToKVPool
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
-            elif _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMHATokenToKVPool
+            TokenToKVPoolClass = (
+                current_platform.get_mha_kv_pool_cls() or MHATokenToKVPool
+            )
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -1958,16 +1951,9 @@ class HybridLinearKVPool(KVCache):
                 enable_kv_cache_copy=enable_kv_cache_copy,
             )
         else:
-            TokenToKVPoolClass = MLATokenToKVPool
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
-            elif _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMLATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMLATokenToKVPool
+            TokenToKVPoolClass = (
+                current_platform.get_mla_kv_pool_cls() or MLATokenToKVPool
+            )
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
