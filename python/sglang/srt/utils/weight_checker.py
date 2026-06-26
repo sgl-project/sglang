@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.utils.weight_checker_comparator import (
-    _CHUNK_NUMEL,
     ComparableWeight,
     RawComparable,
     _compare_weights,
@@ -52,23 +51,40 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
     return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
 
 
+def _is_skip_weight_check(name, param, skip_tensor_list=None) -> bool:
+    # Excluded from the equality check: tensors the owning layer flagged
+    # _skip_weight_check (kv-cache k_scale/v_scale, placeholders rewritten by
+    # process_weights_after_loading), plus names matching skip_tensor_list.
+    return getattr(param, "_skip_weight_check", False) or any(
+        pat in name for pat in (skip_tensor_list or ())
+    )
+
+
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
         self._snapshot_tensors = None
 
-    def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
+    def handle(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ) -> Optional[Dict]:
         logger.info(
-            f"[WeightChecker] handle action={action} allow_quant_error={allow_quant_error}"
+            f"[WeightChecker] handle action={action} "
+            f"allow_quant_error={allow_quant_error} skip_tensor_list={skip_tensor_list}"
         )
         if action == "snapshot":
             return self._snapshot()
         elif action == "reset_tensors":
-            return self._reset_tensors()
+            return self._reset_tensors(skip_tensor_list)
         elif action == "compare":
-            return self._compare(allow_quant_error=allow_quant_error)
+            return self._compare(
+                allow_quant_error=allow_quant_error, skip_tensor_list=skip_tensor_list
+            )
         elif action == "checksum":
-            return self._compute_checksum()
+            return self._compute_checksum(skip_tensor_list)
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -81,21 +97,34 @@ class WeightChecker:
             named_tensors
         ), f"should not have duplicated tensor name"
 
-    def _reset_tensors(self):
-        for name, param in self._model_state():
-            if _is_non_persistent_buffer_name(name):
-                continue
-            param.copy_(_random_like(param))
+    def _skip_compare_names(
+        self, skip_tensor_list: Optional[List[str]] = None
+    ) -> Set[str]:
+        return {
+            name
+            for name, param in self._model_state()
+            if _is_skip_weight_check(name, param, skip_tensor_list)
+        }
 
-    def _compare(self, allow_quant_error: bool = False):
+    def _reset_tensors(self, skip_tensor_list: Optional[List[str]] = None):
+        for name, param in self._model_state():
+            # Skip exactly what compare/checksum skip, so reset only poisons
+            # tensors compare will verify.
+            if _is_non_persistent_buffer_name(name) or _is_skip_weight_check(
+                name, param, skip_tensor_list
+            ):
+                continue
+            param.copy_(_sentinel_like(param))
+
+    def _compare(
+        self,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
         assert self._snapshot_tensors is not None
 
         quantized_set = _build_quantized_set(self._model_runner.model)
-        skip_compare_names = {
-            name
-            for name, param in self._model_state()
-            if getattr(param, "_skip_weight_check", False)
-        }
+        skip_compare_names = self._skip_compare_names(skip_tensor_list)
         _check_tensors(
             expect_tensors=_build_entries(
                 self._snapshot_tensors, skip_compare_names, quantized_set
@@ -106,16 +135,12 @@ class WeightChecker:
             allow_quant_error=allow_quant_error,
         )
 
-    def _compute_checksum(self) -> Dict:
+    def _compute_checksum(self, skip_tensor_list: Optional[List[str]] = None) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
         quantized_set = _build_quantized_set(self._model_runner.model)
-        skip_compare_names = {
-            name
-            for name, param in self._model_state()
-            if getattr(param, "_skip_weight_check", False)
-        }
+        skip_compare_names = self._skip_compare_names(skip_tensor_list)
 
         # Hash the dequantized weight so two (qweight, scale) pairs with the same
         # bf16 hash equal.
@@ -220,26 +245,21 @@ def _check_tensors(
         raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
 
 
-def _random_like(t: torch.Tensor):
-    device = t.device
-    shape = t.shape
-    dtype = t.dtype
+# Deterministic non-zero poison: must differ from every real weight so a missed
+# sync is caught by compare. Avoid 0 (zero-init params) and 1.0 (norm weights),
+# which alias stale weights and hide the miss.
+_RESET_SENTINEL = (
+    88.0  # fits fp8 e4m3 (max 448), unlike real weight magnitudes
+)
 
-    if dtype.is_floating_point:
-        out = torch.empty(shape, device=device, dtype=dtype)
-        for chunk in out.view(-1).split(_CHUNK_NUMEL):
-            chunk.copy_(
-                torch.rand(chunk.shape, device=device, dtype=torch.float32).to(dtype)
-            )
-        return out
 
-    if dtype == torch.bool:
-        return torch.rand(shape, device=device) > 0.5
-
-    info = torch.iinfo(dtype)
-    return torch.randint(
-        low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
-    )
+def _sentinel_like(t: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.bool:
+        return torch.ones_like(t)
+    if t.dtype.is_floating_point:
+        return torch.full_like(t, _RESET_SENTINEL)
+    info = torch.iinfo(t.dtype)
+    return torch.full_like(t, min(int(_RESET_SENTINEL), info.max))
 
 
 def _build_quantized_set(model) -> Dict[str, Tuple[type, str]]:

@@ -3816,9 +3816,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weights(self, action: str, allow_quant_error: bool = False):
+    def check_weights(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
         return self._weight_checker.handle(
-            action=action, allow_quant_error=allow_quant_error
+            action=action,
+            allow_quant_error=allow_quant_error,
+            skip_tensor_list=skip_tensor_list,
         )
 
     def update_weights_from_ipc(self, recv_req):
