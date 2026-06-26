@@ -809,7 +809,8 @@
                 "group": "Development",
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
-                  "docs/developer_guide/development_jit_kernel_guide"
+                  "docs/developer_guide/development_jit_kernel_guide",
+                  "docs/developer_guide/quantization_contribution_guide"
                 ]
               },
               {
@@ -1179,6 +1180,13 @@
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
+                    ]
+                  },
+                  {
+                    "group": "JoyEcho",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
                   },
                   {
