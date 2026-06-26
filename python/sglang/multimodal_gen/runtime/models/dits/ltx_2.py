@@ -58,8 +58,8 @@ _LTX2_TE_NVFP4_RUNTIME_DISABLED = False
 _LTX2_TE_NVFP4_WARNING_EMITTED = False
 
 
-def _ltx2_env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+def _ltx2_env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
 
 
 def _ltx2_te_nvfp4_video_ffn_enabled() -> bool:
@@ -99,13 +99,9 @@ def _ltx2_get_te_nvfp4_context():
             _LTX2_TE_NVFP4_LINEAR_CLS = te.Linear
             _LTX2_TE_NVFP4_FP8_AUTOCAST = fp8_autocast
             _LTX2_TE_NVFP4_RECIPE = NVFP4BlockScaling(
-                disable_rht=_ltx2_env_flag("SGLANG_LTX2_TE_NVFP4_DISABLE_RHT", "1"),
-                disable_stochastic_rounding=_ltx2_env_flag(
-                    "SGLANG_LTX2_TE_NVFP4_DISABLE_STOCHASTIC_ROUNDING", "1"
-                ),
-                disable_2d_quantization=_ltx2_env_flag(
-                    "SGLANG_LTX2_TE_NVFP4_DISABLE_2D_QUANTIZATION", "1"
-                ),
+                disable_rht=True,
+                disable_stochastic_rounding=True,
+                disable_2d_quantization=True,
             )
     except Exception as exc:
         _LTX2_TE_NVFP4_IMPORT_FAILED = True
@@ -973,7 +969,7 @@ class LTX2FeedForward(nn.Module):
             return None
         x_2d = x.reshape(-1, input_shape[-1])
         original_m = int(x_2d.shape[0])
-        pad_m_to = int(os.environ.get("SGLANG_LTX2_TE_NVFP4_PAD_M_TO", "16"))
+        pad_m_to = 16
         if pad_m_to > 1:
             pad_rows = (-original_m) % pad_m_to
             if pad_rows:
