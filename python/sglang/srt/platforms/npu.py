@@ -49,6 +49,14 @@ class NpuDeviceMixin(DeviceMixin):
     def get_device_name(self, device_id: int = 0) -> str:
         return str(torch.npu.get_device_name(device_id))
 
+    def get_device_uuid(self, device_id: int = 0) -> str:
+        # Ascend NPUs expose no NVML/CUDA-style device UUID (NPUDeviceProperties
+        # has no `uuid` field), and no in-tree path consumes one — the CUDA-IPC
+        # uuid path in utils.patch_torch is CUDA-only. Return the device name as
+        # a stable identifier, mirroring CpuDeviceMixin's use of a host-level id
+        # in place of a real UUID.
+        return str(torch.npu.get_device_name(device_id))
+
     def get_device_capability(self, device_id: int = 0) -> Optional[DeviceCapability]:
         # NPU has no CUDA-style (major, minor) compute capability; in-tree code
         # paths skip the capability query on NPU (e.g. model_loader.loader).
