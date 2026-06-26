@@ -1310,6 +1310,17 @@ def _mask_topk_ids_padded_region(
 ) -> None:
     if num_token_non_padded is None:
         return
+    if _is_npu:
+        # Ascend MoeDistributeDispatchV2 indexes experts by topk_ids and
+        # cannot tolerate a -1 (padded) id -> OOB ('MTE/CCU address invalid')
+        # on the MTP verify path, where DP ranks pad to equal token counts and
+        # the short ranks get padded rows. Those rows (>= num_token_non_padded)
+        # are discarded downstream, so leave their already-valid ids untouched
+        # instead of masking to -1. Restores the effective pre-merge behavior
+        # (the old _is_npu torch.where branch was a silent no-op due to local
+        # reassignment; the merge's _fill_padded_rows branch now precedes it
+        # and actually writes -1, which crashes the NPU dispatch).
+        return
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
         mask_topk_ids(topk_ids, num_token_non_padded)
