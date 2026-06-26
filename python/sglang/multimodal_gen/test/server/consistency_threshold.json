@@ -25,6 +25,12 @@
             "psnr_threshold": 18.0,
             "mean_abs_diff_threshold": 18.0
         },
+        "qwen_image_2512_modelopt_nvfp4_t2i": {
+            "clip_threshold": 0.95,
+            "ssim_threshold": 0.88,
+            "psnr_threshold": 23.0,
+            "mean_abs_diff_threshold": 9.0
+        },
         "flux_2_klein_image_t2i": {
             "clip_threshold": 0.94,
             "ssim_threshold": 0.78,

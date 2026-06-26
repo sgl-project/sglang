@@ -863,7 +863,7 @@ def _register_configs():
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image"],
+        hf_model_paths=["Qwen/Qwen-Image", "nvidia/Qwen-Image-NVFP4"],
         model_detectors=[
             lambda hf_id: (
                 "qwen-image" in hf_id.lower()

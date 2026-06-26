@@ -120,7 +120,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -844,8 +843,6 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        # The relative logprob_start_len in an extend batch
-        self.extend_logprob_start_len = 0
         # TODO(ispobock): rename to last_device_node
         self.last_node: Any = None
         self.last_host_node: Any = None
@@ -1098,7 +1095,6 @@ class Req(ReqDllmMixin):
 
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
-        self._recompute_extend_logprob_start_len()
 
     def get_fill_ids(self) -> array:
         return self.full_untruncated_fill_ids[: self.extend_range.end]
@@ -1458,7 +1454,6 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
-        self.extend_logprob_start_len = 0
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
@@ -1523,23 +1518,6 @@ class Req(ReqDllmMixin):
         )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
-
-    def _recompute_extend_logprob_start_len(self):
-        # Setting extend_input_len and computing the relative logprob_start_len in an extend batch
-        #
-        # Key variables:
-        # - logprob_start_len: Absolute position in full sequence where logprob computation begins
-        # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
-        # - extend_input_len: Number of tokens that need to be processed in this extend batch
-        if self.logprob_start_len == -1:
-            logprob_start_len = len(self.full_untruncated_fill_ids)
-        else:
-            # logprob_start_len should be at least the length of the prefix indices
-            logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
-        self.extend_logprob_start_len = min(
-            logprob_start_len - len(self.prefix_indices),
-            self.extend_range.length,
-        )
 
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
@@ -1649,6 +1627,25 @@ def retract_all(
             hisparse_coordinator=hisparse_coordinator,
         )
     return retracted_reqs
+
+
+def compute_extend_logprob_start_len(
+    *,
+    logprob_start_len: int,
+    prefix_len: int,
+    extend_len: int,
+    full_untruncated_fill_len: int,
+) -> int:
+    # Key variables:
+    # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+    # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+    # - extend_input_len: Number of tokens that need to be processed in this extend batch
+    if logprob_start_len == -1:
+        resolved_start = full_untruncated_fill_len
+    else:
+        # logprob_start_len should be at least the length of the prefix indices
+        resolved_start = max(logprob_start_len, prefix_len)
+    return min(resolved_start - prefix_len, extend_len)
 
 
 def _compute_chunked_req_next_prompt_token(
@@ -2004,9 +2001,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.extend_range = req.extend_range._replace(
                     start=req.extend_range.start + encoder_len
                 )
-                req.extend_logprob_start_len = max(
-                    0, req.extend_logprob_start_len - encoder_len
-                )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
@@ -2024,6 +2018,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_range.length for r in reqs]
+        extend_logprob_start_lens = [
+            compute_extend_logprob_start_len(
+                logprob_start_len=r.logprob_start_len,
+                prefix_len=prefix_lens[i],
+                extend_len=extend_lens[i],
+                full_untruncated_fill_len=len(r.full_untruncated_fill_ids),
+            )
+            for i, r in enumerate(reqs)
+        ]
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -2172,13 +2175,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                # We will need req.extend_range.length - req.extend_logprob_start_len number of
+                # We will need req.extend_range.length - extend_logprob_start_lens[i] number of
                 # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
                         req.extend_range.length
-                        - req.extend_logprob_start_len
+                        - extend_logprob_start_lens[i]
                         - len(logprob_token_ids)
                     )
                 )
@@ -2237,7 +2240,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_logprob_start_lens = extend_logprob_start_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
@@ -2432,7 +2435,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
-        """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
+        """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
@@ -2609,7 +2612,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
-        bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -2619,10 +2621,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.attn_cp_metadata = None
 
         if not self.spec_algorithm.is_none():
-            # Spec decoding: the draft input owns decode preparation
-            # (allocation, pre-claim, seq-lens bookkeeping).
-            draft_input: EagleDraftInput = self.spec_info
-            draft_input.prepare_for_decode(self)
+            # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
+            from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+
+            spec_prepare_for_decode(self)
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
