@@ -305,6 +305,8 @@ class SchedulerInvariantChecker:
         batch = self.get_last_batch()
         if batch is not None:
             for req in batch.reqs:
+                if req.kv is None:
+                    continue
                 _add_owner(
                     req,
                     f"req {req.rid}",
