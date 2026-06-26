@@ -11,6 +11,19 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Max time the pump waits to hand a chunk to the client before giving up.
+///
+/// A client that reads the response headers, stops reading the body, but never
+/// closes the connection fills the bounded channel and parks the pump on
+/// `tx.send()`. The upstream idle timeout cannot rescue this: it is only armed
+/// while the pump polls `s.next()`, not while it blocks on `tx.send()`. Without
+/// this bound the pump parks forever, its `stream_guards` (the per-worker
+/// admission slot + active-load entry) never drop, and the in-flight counter
+/// leaks until every worker is pinned at its cap and all traffic is shed while
+/// the engines sit idle. 120 s mirrors the upstream idle timeout: a client that
+/// accepts no bytes for that long is treated as gone.
+const STREAM_SEND_STALL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Bridge a byte stream into an axum Body that streams chunks unchanged.
 ///
 /// Spawns one tokio task per stream so the handler can return immediately.
@@ -107,15 +120,36 @@ where
                 if is_err_chunk {
                     *outcome_setter.lock() = false;
                 }
-                if tx.send(item).await.is_err() {
-                    // Receiver dropped. If we were about to ship an upstream
-                    // error there's nothing left to report; otherwise this is
-                    // a clean client-side disconnect — log at debug since it's
-                    // not a router-side fault.
-                    if !is_err_chunk {
-                        tracing::debug!("SSE client disconnected mid-stream");
+                // Bound the downstream send. A client that read headers, stopped
+                // reading, and never closed the connection leaves the receiver
+                // open but undrained; the bounded channel fills and this send
+                // parks. The upstream idle timeout cannot fire here (it is only
+                // armed while polling `s.next()`), so without this bound the pump
+                // parks forever and `_hold` (the admission slot + active-load
+                // entry) leaks — pinning the worker at its cap.
+                match tokio::time::timeout(STREAM_SEND_STALL, tx.send(item)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        // Receiver dropped. If we were about to ship an upstream
+                        // error there's nothing left to report; otherwise this is
+                        // a clean client-side disconnect — log at debug since it's
+                        // not a router-side fault.
+                        if !is_err_chunk {
+                            tracing::debug!("SSE client disconnected mid-stream");
+                        }
+                        break;
                     }
-                    break;
+                    Err(_elapsed) => {
+                        // Client accepted no bytes for STREAM_SEND_STALL while the
+                        // connection stayed open. Treat it like a disconnect: stop
+                        // pumping so `_hold` drops and the slot is released. The
+                        // worker delivered fine, so this is not a breaker failure.
+                        tracing::warn!(
+                            stall = ?STREAM_SEND_STALL,
+                            "SSE downstream not draining; aborting to release in-flight slot"
+                        );
+                        break;
+                    }
                 }
                 if is_err_chunk {
                     // Surfaced upstream error to client; stop reading.
@@ -483,6 +517,49 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "stalled upstream must release stream_guards via the idle timeout",
+        );
+    }
+
+    /// A stalled *downstream* — the client reads response headers, then stops
+    /// reading the body but never closes the connection — must not pin the SSE
+    /// pump forever. The bounded channel fills, the pump parks on `tx.send()`,
+    /// and the upstream idle timeout CANNOT fire there (it is only armed while we
+    /// poll `s.next()`). Without a send-stall timeout the pump blocks on the send
+    /// indefinitely and `stream_guards` (the per-worker admission slot +
+    /// active-load entry) leak — pinning every worker at its cap and shedding all
+    /// traffic while the engines sit idle (the exact production failure observed:
+    /// engine `num_running_reqs=0` while the router holds `inflight=cap`).
+    #[tokio::test(start_paused = true)]
+    async fn stalled_downstream_releases_stream_guards() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard: Box<dyn Send + 'static> = Box::new(DropFlag(Arc::clone(&dropped)));
+
+        // Upstream readily yields far more chunks than the 64-slot channel holds.
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            (0..256).map(|_| Ok(Bytes::from_static(b"x"))).collect();
+        let s = stream::iter(chunks);
+
+        // Hold the Body WITHOUT reading it: the receiver stays open (no clean
+        // disconnect) but undrained, so the pump parks on `tx.send()`.
+        let _body = bytes_stream_to_body(s, Some(guard), None, None);
+
+        // Advance past the send-stall timeout. The pump must give up on the
+        // non-draining client and drop its guards.
+        tokio::time::sleep(STREAM_SEND_STALL + std::time::Duration::from_secs(1)).await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "a client that stops reading (without disconnecting) must not pin \
+             stream_guards — the pump must time out the blocked send and release \
+             the admission slot",
         );
     }
 }
