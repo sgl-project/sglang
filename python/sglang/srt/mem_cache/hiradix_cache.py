@@ -480,10 +480,30 @@ class HiRadixCache(RadixCache):
         # After controller threads are fully stopped, it's safe to force-release any
         # leftover pending ops (e.g., async prefetch/backup that didn't get a revoke/ack).
         self._force_release_pending_storage_ops()
+        # The storage backend is gone, so no node's pages can be recovered from
+        # it anymore. Clear storage_backed so internal host nodes are no longer
+        # treated as host-evictable (which would orphan their subtrees).
+        self._invalidate_storage_backing()
 
         self.enable_storage = False
         self.enable_storage_metrics = False
         return True, "Detached HiCache storage backend successfully."
+
+    def _invalidate_storage_backing(self):
+        """Clear storage_backed across the tree and refresh host-leaf status.
+
+        Used when the storage backend is detached or cleared: pages that were
+        previously confirmed in storage are no longer recoverable, so internal
+        nodes must not be host-evicted (only true leaves may be).
+        """
+        stack = [self.root_node]
+        self.evictable_host_leaves.clear()
+        while stack:
+            node = stack.pop()
+            node.storage_backed = False
+            stack.extend(node.children.values())
+            if node != self.root_node:
+                self._update_host_leaf_status(node)
 
     def _force_release_pending_storage_ops(self):
         """Force release any leftover pending prefetch/backup bookkeeping.
@@ -591,7 +611,13 @@ class HiRadixCache(RadixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
+                    # A fully-completed backup confirms the node's pages are now
+                    # recoverable from storage, so the internal node may later
+                    # shed its host pages without orphaning its subtree.
+                    if operation.completed_tokens >= len(entry.key):
+                        entry.storage_backed = True
                     entry.release_host()
+                    self._update_host_leaf_status(entry)
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -742,6 +768,7 @@ class HiRadixCache(RadixCache):
                 # Check if the storage backend has a clear method (for nixl backends)
                 if hasattr(self.cache_controller.storage_backend, "clear"):
                     self.cache_controller.storage_backend.clear()
+                    self._invalidate_storage_backing()
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )
@@ -860,6 +887,7 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        self._update_host_leaf_status(node)
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""
@@ -1017,17 +1045,27 @@ class HiRadixCache(RadixCache):
             node = node.parent
         return DecLockRefResult(delta=delta)
 
+    def _is_host_evictable(self, node: TreeNode):
+        if (
+            node == self.root_node
+            or not node.evicted
+            or not node.backuped
+            or node.lock_ref > 0
+            or node.host_ref_counter > 0
+        ):
+            return False
+        # Leaves are removed from the tree entirely. Internal nodes must keep
+        # their radix subtree reachable, so they may only shed their host pages
+        # when the pages are confirmed recoverable from the storage backend.
+        return len(node.children) == 0 or (
+            getattr(self, "enable_storage", False) and node.storage_backed
+        )
+
     def _update_host_leaf_status(self, node: TreeNode):
-        if not node.evicted or node.lock_ref > 0:
+        if not self._is_host_evictable(node):
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
             return
-
-        for child in node.children.values():
-            if child.backuped:
-                if node in self.evictable_host_leaves:
-                    self.evictable_host_leaves.remove(node)
-                return
 
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
@@ -1117,6 +1155,8 @@ class HiRadixCache(RadixCache):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
+            if x not in self.evictable_host_leaves:
+                continue
             # only evict the host value of evicted nodes
             if not x.evicted:
                 continue
@@ -1124,21 +1164,36 @@ class HiRadixCache(RadixCache):
             if x.host_ref_counter > 0:
                 continue
 
-            # Block deleted entirely (GPU already evicted, now CPU freed) --
-            # emit remove(CPU) so the router drops the host-tier entry.
-            self._record_remove_event(x, medium=StorageMedium.CPU)
+            # Re-check eviction eligibility: heap entries can go stale as the
+            # tree mutates between heapify and pop (e.g. an internal node gained
+            # a non-evictable child, or its storage backing was invalidated).
+            if not self._is_host_evictable(x):
+                self.evictable_host_leaves.discard(x)
+                continue
+
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            x.host_value = None
+            self.evictable_host_leaves.discard(x)
 
-            key = x.key.child_key(self.page_size)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
-            if x in self.evictable_host_leaves:
-                self.evictable_host_leaves.remove(x)
-            self._update_host_leaf_status(x.parent)
+            if len(x.children) == 0:
+                # Leaf: GPU already evicted, host now freed -> the block is gone.
+                # Emit remove(CPU) so the router drops the host-tier entry and
+                # detach the node from the tree.
+                self._record_remove_event(x, medium=StorageMedium.CPU)
+                key = x.key.child_key(self.page_size)
+                v = x.parent.children.pop(key, None)
+                assert v == x, f"parent does not have child key, {key}"
+                self._update_host_leaf_status(x.parent)
 
-            if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                if len(x.parent.children) == 0 and x.parent.evicted:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
+            else:
+                # Internal node: only shed the host pages, keep the radix
+                # subtree reachable so it can be restored from storage later.
+                # The host pages were confirmed storage-backed by
+                # _is_host_evictable, so no BlockRemoved is emitted.
+                self._update_host_leaf_status(x)
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1147,70 +1202,109 @@ class HiRadixCache(RadixCache):
         start_time = time.perf_counter()
         last_hit_node = node
         nodes_to_load = []
-        while node.evicted:
-            assert (
-                node.backuped
-            ), "No backup available on evicted nodes, should not happen"
-            nodes_to_load.insert(0, node)
-            node = node.parent
-        else:
-            ancester_node = node
+        protected_host_nodes = []
+        ancester_node = None
+        ancestor_locked = False
 
-        # protect the ancestor nodes from eviction
-        result = self.inc_lock_ref(ancester_node)
-        delta = result.delta
+        try:
+            # Protect each evicted node's host pages for the duration of the
+            # load. inc_lock_ref only guards device eviction; host eviction is
+            # gated on host_ref_counter, so without protect_host() a concurrent
+            # evict_host() can free host_value mid-load and the subsequent
+            # len()/cat() crashes the scheduler.
+            while node.evicted:
+                node.protect_host()
+                protected_host_nodes.append(node)
+                self.evictable_host_leaves.discard(node)
+                if not node.backuped:
+                    logger.warning(
+                        "load_back: skip evicted node %d without host backup "
+                        "(last_hit_node=%d)",
+                        node.id,
+                        last_hit_node.id,
+                    )
+                    return None
+                nodes_to_load.insert(0, node)
+                node = node.parent
+            else:
+                ancester_node = node
 
-        # load it all or not at all
-        host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
-            len(host_indices) > mem_quota + delta if mem_quota is not None else False
-        ):
-            # skip loading back if the total size is too small or exceeding the memory quota
-            self.dec_lock_ref(ancester_node)
-            return None
+            # protect the ancestor nodes from device eviction
+            result = self.inc_lock_ref(ancester_node)
+            ancestor_locked = True
+            delta = result.delta
 
-        device_indices = self.cache_controller.load(
-            host_indices=host_indices,
-            node_id=last_hit_node.id,
-            **self._get_extra_pools(),
-        )
-        if device_indices is None:
-            self.evict(EvictParams(num_tokens=len(host_indices)))
+            # Snapshot host segment lengths now while protect_host() guarantees
+            # the host pages are still present; later code must not re-read
+            # node.host_value lengths (they may be freed once unprotected).
+            host_values = [n.host_value for n in nodes_to_load]
+            if any(v is None for v in host_values):
+                logger.warning(
+                    "load_back: host backup disappeared while protecting node %d",
+                    last_hit_node.id,
+                )
+                return None
+            host_lengths = [len(v) for v in host_values]
+
+            # load it all or not at all
+            host_indices = torch.cat(host_values)
+            if len(host_indices) < self.load_back_threshold or (
+                len(host_indices) > mem_quota + delta
+                if mem_quota is not None
+                else False
+            ):
+                # skip loading back if the total size is too small or exceeding the memory quota
+                return None
+
             device_indices = self.cache_controller.load(
                 host_indices=host_indices,
                 node_id=last_hit_node.id,
                 **self._get_extra_pools(),
             )
-        self.dec_lock_ref(ancester_node)
-        if device_indices is None:
-            # no sufficient GPU memory to load back KV caches
-            logger.warning(
-                "load_back: FAILED to load %d tokens for node %d "
-                "even after eviction (evictable_size=%d)",
-                len(host_indices),
-                last_hit_node.id,
-                self.evictable_size_,
-            )
-            return None
+            if device_indices is None:
+                self.evict(EvictParams(num_tokens=len(host_indices)))
+                device_indices = self.cache_controller.load(
+                    host_indices=host_indices,
+                    node_id=last_hit_node.id,
+                    **self._get_extra_pools(),
+                )
+            if device_indices is None:
+                # no sufficient GPU memory to load back KV caches
+                logger.warning(
+                    "load_back: FAILED to load %d tokens for node %d "
+                    "even after eviction (evictable_size=%d)",
+                    len(host_indices),
+                    last_hit_node.id,
+                    self.evictable_size_,
+                )
+                return None
 
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
-        offset = 0
-        for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)].clone()
-            offset += len(node.host_value)
-            # Block promoted from host to GPU -- emit store(GPU) so downstream
-            # indexers see it as device-local again.
-            self._record_store_event(node, medium=StorageMedium.GPU)
-        self.evictable_size_ += len(device_indices)
-        self.inc_lock_ref(last_hit_node)
+            self.ongoing_load_back[last_hit_node.id] = last_hit_node
+            offset = 0
+            for node, node_len in zip(nodes_to_load, host_lengths):
+                node.value = device_indices[offset : offset + node_len].clone()
+                offset += node_len
+                # Block promoted from host to GPU -- emit store(GPU) so downstream
+                # indexers see it as device-local again.
+                self._record_store_event(node, medium=StorageMedium.GPU)
+            self.evictable_size_ += len(device_indices)
+            self.inc_lock_ref(last_hit_node)
 
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+            if self.metrics_collector is not None:
+                self.metrics_collector.observe_load_back_duration(
+                    time.perf_counter() - start_time
+                )
+                self.metrics_collector.increment_load_back_num_tokens(
+                    len(device_indices)
+                )
 
-        return device_indices
+            return device_indices
+        finally:
+            if ancestor_locked:
+                self.dec_lock_ref(ancester_node)
+            for protected_node in protected_host_nodes:
+                protected_node.release_host()
+                self._update_host_leaf_status(protected_node)
 
     def init_load_back(
         self,
@@ -1406,14 +1500,22 @@ class HiRadixCache(RadixCache):
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            fetched_key,
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
+        matched_prefix_length, matched_length, extra_matched_host_values = (
+            self._insert_helper_host(
+                last_host_node,
+                fetched_key,
+                written_indices,
+                hash_value[: min_completed_tokens // self.page_size],
+            )
         )
 
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.mem_pool_host.free(
+            host_indices[:matched_prefix_length]
+        )
+        if extra_matched_host_values:
+            self.cache_controller.mem_pool_host.free(
+                torch.cat(extra_matched_host_values)
+            )
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
@@ -1463,13 +1565,28 @@ class HiRadixCache(RadixCache):
         else:
             value = self._empty_match_result.device_indices
 
+        # Collect the evicted suffix (deepest -> shallowest).
+        host_path = []
+        while last_node.evicted:
+            host_path.append(last_node)
+            last_node = last_node.parent
+
+        # Walk from the shallowest evicted node downward and stop at the first
+        # host gap. Internal host eviction can leave a parent with host_value=None
+        # while a deeper child still has host pages; those deeper pages are not a
+        # contiguous, loadable prefix, so they must not be counted as host hits.
         host_hit_length = 0
         last_host_node = last_node
-        while last_node.evicted:
-            host_hit_length += len(last_node.host_value)
-            last_node = last_node.parent
-        while not last_host_node.backuped:
-            last_host_node = last_host_node.parent
+        for node in reversed(host_path):
+            if not node.backuped:
+                self.evictable_host_leaves.discard(node)
+                break
+            host_hit_length += len(node.host_value)
+            last_host_node = node
+
+        if host_hit_length == 0:
+            while last_host_node != self.root_node and not last_host_node.backuped:
+                last_host_node = last_host_node.parent
 
         return MatchResult(
             device_indices=value,
@@ -1544,23 +1661,48 @@ class HiRadixCache(RadixCache):
     ):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, 0, []
 
         child_key = key.child_key(self.page_size)
 
+        # matched_prefix_length: leading host pages that already exist on
+        #   contiguous backed nodes -> the freshly written copy can be freed.
+        # matched_length: total tokens already host-resident (used for metrics).
+        # extra_matched_host_values: host pages that duplicate already-backed
+        #   nodes *after* a gap, so they aren't a simple leading prefix and must
+        #   be freed separately to avoid leaking host memory.
+        matched_prefix_length = 0
         matched_length = 0
+        consumed_length = 0
+        extra_matched_host_values = []
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = node.key.match(key, page_size=self.page_size)
-            key = key[prefix_len:]
-            host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len // self.page_size :]
-            matched_length += prefix_len
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
+
+            if node.backuped:
+                matched_length += prefix_len
+                if consumed_length == matched_prefix_length:
+                    matched_prefix_length += prefix_len
+                else:
+                    extra_matched_host_values.append(host_value[:prefix_len])
+            else:
+                # Internal node previously shed its host pages; restore them
+                # from this freshly prefetched copy and re-mark it storage-backed.
+                node.host_value = host_value[:prefix_len].clone()
+                if node.hash_value is None:
+                    node.hash_value = hash_value[: prefix_len // self.page_size]
+                node.storage_backed = True
+                self._update_host_leaf_status(node)
+
+            consumed_length += prefix_len
+            key = key[prefix_len:]
+            host_value = host_value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
 
             if len(key):
                 child_key = key.child_key(self.page_size)
@@ -1572,6 +1714,7 @@ class HiRadixCache(RadixCache):
             new_node.value = None
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
+            new_node.storage_backed = True
             node.children[child_key] = new_node
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
@@ -1580,7 +1723,7 @@ class HiRadixCache(RadixCache):
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
 
-        return matched_length
+        return matched_prefix_length, matched_length, extra_matched_host_values
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
@@ -1626,6 +1769,9 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
+        # The prefix half inherits the child's storage backing: if the child's
+        # pages were confirmed in storage, the split prefix is too.
+        new_node.storage_backed = child.storage_backed
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size

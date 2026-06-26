@@ -242,6 +242,8 @@ class TreeNode:
         self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # Whether this node's pages are confirmed present in the storage backend.
+        self.storage_backed = False
         # priority for priority-aware eviction
         self.priority = priority
 
