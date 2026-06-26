@@ -58,7 +58,6 @@ if is_npu:
 
 logger = logging.getLogger(__name__)
 
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -83,8 +82,6 @@ def patch_model_npu(
         )
     else:
         yield model.forward
-
-
 
 
 class NPUGraphRunner(DecodeCudaGraphRunner):

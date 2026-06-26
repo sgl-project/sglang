@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4St
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+
 def get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -592,17 +593,11 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             ``req_to_token_c{4,128}[_state]`` and returns them to the c-pools
             (the paged allocator dedupes by page).
 
-        KV pools free ``[0, kv_allocated_len // ratio)``. State pools are
-        1-per-raw-token and free only the tail
-        ``[c{N}_state_alloc_offset, kv_allocated_len)`` — the prefix was already
-        returned by ScheduleBatch._evict_swa (state rides SWA eviction);
-        freeing it again would double-free (caught by the paged allocator's
-        debug_mode assert, corrupts the free list otherwise).
-
-        Spec-v2 deliberately keeps a reserve beyond ``kv_committed_len``. The
-        DSV4 c/state allocators mirror that reserve, so request teardown must
-        release through ``kv_allocated_len`` or every completed request leaks
-        its speculative tail.
+        KV pools free ``[0, kv_len // ratio)``. State pools are 1-per-raw-token
+        and free only the tail ``[c{N}_state_alloc_offset, kv_len)`` — the prefix
+        was already returned by ScheduleBatch._evict_swa (state rides SWA
+        eviction); freeing it again would double-free (caught by the paged
+        allocator's debug_mode assert, corrupts the free list otherwise).
         """
         if free_index is not None:
             super().free(free_index)

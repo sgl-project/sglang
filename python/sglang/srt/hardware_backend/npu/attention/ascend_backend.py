@@ -675,7 +675,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables_swa[bs:, :].fill_(0)
 
-            # Update SWA mask: True = masked out, False = attend.
+            # Update SWA mask: True = masked out (don't attend), False = attend
             seq_lens_int = seq_lens_cpu[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
             indices = self.graph_metadata["swa_indices"]
@@ -2469,8 +2469,8 @@ class AscendAttnBackend(AttentionBackend):
                     else None
                 )
                 self.token_to_kv_pool.set_kv_buffer(
-                        layer, KVWriteLoc(cache_loc, swa_loc), k, v
-                    )
+                    layer, KVWriteLoc(cache_loc, swa_loc), k, v
+                )
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)

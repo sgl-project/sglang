@@ -660,14 +660,16 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         )
         if batch.out_cache_loc_dsv4 is not None:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                maybe_write_dsv4_reserve,
+                maybe_write_dsv4_extend,
             )
 
-            maybe_write_dsv4_reserve(
+            maybe_write_dsv4_extend(
                 batch,
                 batch.req_pool_indices_cpu,
                 cur_kv_lens_cpu,
                 nxt_kv_lens_cpu,
+                c4_state_alloc_offsets=cur_kv_lens_cpu,
+                c128_state_alloc_offsets=cur_kv_lens_cpu,
             )
 
     assign_req_to_token_pool_func(

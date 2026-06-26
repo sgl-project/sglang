@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
     cache = _walsh_hadamard_matrix._cache
@@ -968,8 +969,6 @@ class DeepseekV4AscendAttnBackend(
         speculative_step_id: int = 0,
     ):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
-        # DSV4 custom sparse attention uses page tables plus ori_mask_mode and
-        # never consumes ForwardMetadata.swa_mask.
         self.use_graph_swa_mask = False
         cfg = model_runner.model_config
         self._dsv4_config = cfg
@@ -1542,8 +1541,6 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: ForwardBatch,
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """ratio=0 dense layers — sliding-window attention via
-        npu_sparse_attn_sharedkv with has_cmp_kv=False."""
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)

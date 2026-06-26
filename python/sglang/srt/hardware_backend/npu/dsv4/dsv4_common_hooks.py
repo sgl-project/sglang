@@ -123,28 +123,6 @@ def maybe_write_dsv4_extend(
         )
 
 
-def maybe_write_dsv4_reserve(
-    batch: ScheduleBatch,
-    req_pool_indices_cpu: torch.Tensor,
-    cur_kv_lens_cpu: torch.Tensor,
-    nxt_kv_lens_cpu: torch.Tensor,
-) -> None:
-    """Post speculative-reserve hook for DSV4.
-
-    Spec-v2 reserves the raw interval ``[cur_kv_lens, nxt_kv_lens)`` before
-    draft/verify. The compressed KV tables use the same interval as extend,
-    while state tables must be written at raw positions starting from
-    ``cur_kv_lens`` instead of the Req eviction low-water mark.
-    """
-    maybe_write_dsv4_extend(
-        batch,
-        req_pool_indices_cpu,
-        cur_kv_lens_cpu,
-        nxt_kv_lens_cpu,
-        c4_state_alloc_offsets=cur_kv_lens_cpu,
-        c128_state_alloc_offsets=cur_kv_lens_cpu,
-    )
-
 
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,

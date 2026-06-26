@@ -327,8 +327,6 @@ class MQALayer(nn.Module):
             else config.compress_ratios[layer_id]
         )
 
-        # V4-Flash modelslim uses ratio=0 for dense edge layers. These layers
-        # do not create Compressor/C4Indexer state.
         assert compress_ratio in (
             0,
             4,
