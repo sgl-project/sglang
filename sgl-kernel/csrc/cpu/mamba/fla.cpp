@@ -864,6 +864,7 @@ template <typename scalar_t, int D, int CHUNK_SIZE>
 void chunk_gated_delta_rule_fwd_inter_kernel_impl(
     scalar_t* __restrict__ out,
     float* __restrict__ state,
+    const int32_t* __restrict__ indices,
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
     const scalar_t* __restrict__ w,
@@ -956,7 +957,7 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
         apply_mask_kernel<scalar_t, CHUNK_SIZE, false>::apply(attn2, attn, nullptr, d_ptr, mb_size);
 
         // step 2.a: v' = w @ state (fuse state *= exp(g_last) with packing)
-        float* __restrict__ s_ptr = state + bs * (Hv * D * D) + hv * (D * D);
+        float* __restrict__ s_ptr = state + indices[bs] * (Hv * D * D) + hv * (D * D);
         const float* __restrict__ g_ptr = g + nt * (Hv * CHUNK_SIZE) + hv * (CHUNK_SIZE);
         float g_last = g_ptr[mb_size - 1];
         pack_vnni2<scalar_t, D, D>(
@@ -1475,6 +1476,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
   chunk_gated_delta_rule_fwd_inter_kernel_impl<scalar_t, HD, CHUNK_SIZE>( \
       o.data_ptr<scalar_t>(),                                             \
       initial_state.data_ptr<float>(),                                    \
+      initial_state_indices.data_ptr<int32_t>(),                          \
       q.data_ptr<scalar_t>(),                                             \
       k.data_ptr<scalar_t>(),                                             \
       w.data_ptr<scalar_t>(),                                             \
@@ -1502,14 +1504,15 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_inter(
     const at::Tensor& initial_state,
     bool output_final_state,
     const at::Tensor& cu_seqlens,
-    const at::Tensor& chunk_offsets) {
+    const at::Tensor& chunk_offsets,
+    const at::Tensor& initial_state_indices) {
   const int64_t B = q.size(0);
   const int64_t T = q.size(1);
   const int64_t H = q.size(2);
   const int64_t D = q.size(3);
   const int64_t Hv = w.size(2);
   const int64_t Dv = u.size(3);
-  const int64_t num_seqs = initial_state.size(0);
+  const int64_t num_seqs = initial_state_indices.size(0);
 
   at::Tensor o = at::empty({B, T, Hv, Dv}, q.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "chunk_gated_delta_rule_fwd_inter", [&] {
@@ -1542,6 +1545,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& cu_seqlens,
     bool head_first,
     bool use_qk_l2norm_in_kernel,
+    const at::Tensor& initial_state_indices,
     double eps = 1e-6) {
   TORCH_CHECK(!head_first, "chunk_gated_delta_rule_cpu: does not support head first");
 
@@ -1551,7 +1555,7 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   int64_t D = query.size(3);
   int64_t Hv = value.size(2);
   int64_t Dv = value.size(3);
-  int64_t num_seqs = initial_state.size(0);
+  int64_t num_seqs = initial_state_indices.size(0);
 
   TORCH_CHECK(B == 1, __func__, ": expect batch size to be 1");
   TORCH_CHECK(Hv % H == 0, __func__, ": expect num_heads_kv multiple of num_heads.");
@@ -1564,7 +1568,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   CHECK_INPUT_SHAPE_DTYPE<false>(g, {B, T, Hv}, at::kFloat);
   CHECK_INPUT_SHAPE_DTYPE<false>(beta, {B, T, Hv}, at::kBFloat16);
   CHECK_INPUT_SHAPE_DTYPE<false>(cu_seqlens, {num_seqs + 1}, at::kInt);
-  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {num_seqs, Hv, Dv, D}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state, {initial_state.size(0), Hv, Dv, D}, at::kFloat);
+  CHECK_INPUT_SHAPE_DTYPE<false>(initial_state_indices, {num_seqs}, at::kInt);
 
   constexpr int CHUNK_SIZE = 64;
 
@@ -1582,7 +1587,17 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 
   // fused `chunk_gated_delta_rule_fwd_h` + `chunk_fwd_o`
   auto [output, final_state] = chunk_gated_delta_rule_fwd_inter<CHUNK_SIZE>(
-      query_, key_, w, u, g_, decay_mask, initial_state, output_final_state, cu_seqlens, chunk_offsets);
+      query_,
+      key_,
+      w,
+      u,
+      g_,
+      decay_mask,
+      initial_state,
+      output_final_state,
+      cu_seqlens,
+      chunk_offsets,
+      initial_state_indices);
 
   return std::make_tuple(output, final_state);
 }
