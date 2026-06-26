@@ -236,8 +236,7 @@ class SchedulerInvariantChecker:
         swa_uncached = 0
         for batch in batches:
             for req in batch.reqs:
-                assert req.kv_committed_freed == req.kv_overallocated_freed
-                if req.kv_committed_freed or req.req_pool_idx is None:
+                if req.req_pool_idx is None:
                     continue
 
                 allocated_len = req.kv.kv_allocated_len

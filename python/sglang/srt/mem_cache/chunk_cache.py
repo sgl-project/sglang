@@ -76,11 +76,12 @@ class ChunkCache(BasePrefixCache):
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        kv_committed_len = req.pop_committed_kv_cache()
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, :kv_len_to_handle
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
