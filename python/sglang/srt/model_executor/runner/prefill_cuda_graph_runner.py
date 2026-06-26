@@ -894,9 +894,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if ie is None and len(args) > 3:
                             ie = args[3]
                         if ie is not None:
-                            self.buffer_registry.get_slot(
-                                "input_embeds"
-                            ).slice_for(1, static_n).copy_(ie[:static_n])
+                            self.buffer_registry.get_slot("input_embeds").slice_for(
+                                1, static_n
+                            ).copy_(ie[:static_n])
                     return self.backend.replay(
                         shape_key, static_forward_batch, **kwargs
                     )
