@@ -938,11 +938,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _maybe_auto_tune_deepep_num_max_dispatch_tokens(self):
         """Size the DeepEP low_latency dispatch cap to the scheduler's decode concurrency.
 
-        num_max must cover the largest per-rank decode batch the scheduler can run
-        (req_to_token_pool.size): nothing clamps the runtime decode batch to num_max,
-        so a smaller value lets an eager decode batch dispatch more tokens than the
-        buffer holds and trip a DeepEP assert. Capped at DeepEP's FINISHED_SUM_TAG
-        ceiling (1024). User env wins; only ever raised above the default.
+        num_max must cover the largest per-rank decode dispatch the scheduler can
+        run (req_to_token_pool.size * num_tokens_per_bs): nothing clamps the runtime
+        decode batch to num_max, so a smaller value lets an eager decode batch
+        dispatch more tokens than the buffer holds and trip a DeepEP assert. Capped
+        at DeepEP's FINISHED_SUM_TAG ceiling (1024). User env wins; only ever raised
+        above the default.
         """
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
@@ -954,8 +955,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self._is_deepep_low_latency():
             return
 
+        # num_max is a per-rank token cap, not a request count: spec/MTP verify
+        # dispatches num_tokens_per_bs tokens per request, so size it to
+        # concurrency * num_tokens_per_bs. The concurrency cap divided by the same
+        # multiplier, so this stays within FINISHED_SUM_TAG.
+        tokens_per_req = self.server_args.speculative_num_draft_tokens or 1
         num_max = min(
-            self.req_to_token_pool.size, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+            self.req_to_token_pool.size * tokens_per_req,
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
         )
         if num_max > env.get():
             env.set(num_max)

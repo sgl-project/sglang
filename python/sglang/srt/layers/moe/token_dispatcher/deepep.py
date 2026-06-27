@@ -67,10 +67,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
-# DeepEP internode low_latency dispatch packs each rank's token count against a
-# 1024 "finished" sentinel (FINISHED_SUM_TAG); a per-rank dispatch above it
-# collides with the sentinel and asserts. Bounds num_max and the decode
-# concurrency that feeds it.
+# DeepEP low_latency dispatch asserts once a rank's token count reaches the
+# FINISHED_SUM_TAG sentinel; bounds num_max and the decode concurrency feeding it.
 DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS = 1024
 
 

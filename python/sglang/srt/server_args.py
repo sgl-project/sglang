@@ -3266,23 +3266,9 @@ class ServerArgs:
         if self.mem_fraction_static is None:
             # Constant meta data (e.g., from attention backend)
             reserved_mem = 512
-            # Mirror the per-rank chunked-prefill split that _handle_data_parallelism
-            # applies later. Skip for DeepEP-dispatch backends: there the un-divided
-            # headroom is load-bearing (holds the all-to-all buffer), and dividing
-            # lifts mem_fraction_static enough to OOM (#28991).
-            from sglang.srt.layers.moe.utils import is_deepep_dispatch_backend
-
-            divide_for_dp = (
-                self.enable_dp_attention
-                and self.dp_size > 1
-                and not is_deepep_dispatch_backend(self.moe_a2a_backend)
-            )
-            effective_chunked_prefill_size = self.chunked_prefill_size // (
-                self.dp_size if divide_for_dp else 1
-            )
             # For activation during large prefill
             if self.chunked_prefill_size > 0:
-                reserved_mem += max(effective_chunked_prefill_size, 2048) * 1.5
+                reserved_mem += max(self.chunked_prefill_size, 2048) * 1.5
             else:
                 reserved_mem += max(self.max_prefill_tokens, 2048) * 1.5
             # For cuda graphs

@@ -1046,7 +1046,13 @@ class ModelRunnerKVCacheMixin:
         if not self._is_deepep_low_latency():
             return max_num_reqs
 
-        capped = min(max_num_reqs, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS)
+        # The per-rank dispatch is concurrency * num_tokens_per_bs (spec/MTP verify
+        # packs num_tokens_per_bs tokens per request); bound that product by
+        # FINISHED_SUM_TAG, so the concurrency ceiling shrinks by the spec multiplier.
+        tokens_per_req = self.server_args.speculative_num_draft_tokens or 1
+        capped = min(
+            max_num_reqs, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req
+        )
         ep_group = get_moe_ep_group()
         if ep_group.world_size > 1:
             tensor = torch.tensor(capped, dtype=torch.int64)

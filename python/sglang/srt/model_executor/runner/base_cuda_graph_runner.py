@@ -102,8 +102,12 @@ def get_batch_sizes_to_capture(
         and server_args.deepep_mode != "normal"
     ):
         deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        if max(capture_bs) > deepep_cap:
-            capture_bs = [bs for bs in capture_bs if bs <= deepep_cap]
+        # A captured decode step dispatches bs * num_tokens_per_bs tokens (spec/MTP
+        # verify packs num_tokens_per_bs per sequence), so clamp on that product.
+        if max(capture_bs) * num_tokens_per_bs > deepep_cap:
+            capture_bs = [
+                bs for bs in capture_bs if bs * num_tokens_per_bs <= deepep_cap
+            ]
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (

@@ -61,9 +61,13 @@ def _env_unset():
             _ENV.clear()
 
 
-def _deepep_runner(backend="deepep", mode="auto", **extra):
+def _deepep_runner(backend="deepep", mode="auto", num_draft_tokens=None, **extra):
     runner = SimpleNamespace(
-        server_args=SimpleNamespace(moe_a2a_backend=backend, deepep_mode=mode),
+        server_args=SimpleNamespace(
+            moe_a2a_backend=backend,
+            deepep_mode=mode,
+            speculative_num_draft_tokens=num_draft_tokens,
+        ),
         device="cuda",
         gpu_id=0,
         **extra,
@@ -113,10 +117,13 @@ class TestDeepEPNumMaxDispatchTokensProperty(unittest.TestCase):
 class TestDeepEPAutoTune(unittest.TestCase):
     """ModelRunner._maybe_auto_tune_deepep_num_max_dispatch_tokens behavior."""
 
-    def _runner(self, backend="deepep", mode="auto", pool_size=4096):
+    def _runner(
+        self, backend="deepep", mode="auto", pool_size=4096, num_draft_tokens=None
+    ):
         return _deepep_runner(
             backend=backend,
             mode=mode,
+            num_draft_tokens=num_draft_tokens,
             req_to_token_pool=SimpleNamespace(size=pool_size),
         )
 
@@ -162,6 +169,16 @@ class TestDeepEPAutoTune(unittest.TestCase):
             self.assertFalse(_ENV.is_set())
             self.assertEqual(_ENV.get(), 128)
 
+    def test_spec_scales_num_max_by_draft_tokens(self):
+        # Spec verify dispatches num_draft_tokens per request, so num_max tracks
+        # concurrency * num_draft_tokens, still clamped to the 1024 ceiling.
+        with _env_unset():
+            self._run(self._runner(pool_size=100, num_draft_tokens=4))
+            self.assertEqual(_ENV.get(), 400)
+        with _env_unset():
+            self._run(self._runner(pool_size=512, num_draft_tokens=4))
+            self.assertEqual(_ENV.get(), 1024)
+
 
 @unittest.skipUnless(_HAS_MODEL_RUNNER, "model_runner not importable")
 class TestDeepEPConcurrencyClamp(unittest.TestCase):
@@ -201,6 +218,15 @@ class TestDeepEPConcurrencyClamp(unittest.TestCase):
             self.assertEqual(
                 self._clamp(_deepep_runner(backend="mooncake"), 2048), 1024
             )
+
+    def test_spec_divides_cap_by_draft_tokens(self):
+        # num_draft_tokens=4 means batch * 4 tokens dispatched, so the concurrency
+        # ceiling is FINISHED_SUM_TAG // 4 = 256.
+        with patch(
+            f"{_MIXIN_MODULE}.get_moe_ep_group",
+            return_value=SimpleNamespace(world_size=1, cpu_group=None),
+        ):
+            self.assertEqual(self._clamp(_deepep_runner(num_draft_tokens=4), 2048), 256)
 
     def test_takes_ep_group_minimum(self):
         # Simulate a peer rank contributing a smaller concurrency: cap is 800,
