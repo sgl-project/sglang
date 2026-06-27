@@ -835,8 +835,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w13_weight
             del layer.w2_weight
         elif _is_cpu and _is_cpu_amx_available:
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             if use_intel_amx_backend(layer):
-                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
                 packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
                     layer.w13_weight_scale
                 )
@@ -877,8 +877,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight
             del layer.w13_weight_scale
             del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
 
             return
         else:
@@ -903,7 +903,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
-
 
     def _process_weights_for_sm90_cutlass(self, layer):
         """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
