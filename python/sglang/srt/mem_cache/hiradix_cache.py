@@ -963,18 +963,30 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete."""
+        """Return True after the local load-back event is complete.
+
+        This is a pure per-rank GPU-event poll and must NOT issue any TP
+        collective. It is called per-request from the decode load-back path,
+        and both the number of calls and the result of the local
+        ``finish_event.query()`` differ across TP ranks. Previously this
+        conditionally called ``loading_check()`` (which runs an ``all_reduce``)
+        only on the subset of ranks whose local event had already fired, so the
+        TP collective sequence diverged and the ``all_reduce`` could deadlock
+        under TP > 1.
+
+        The ack-reaping collective is already issued exactly once per scheduler
+        iteration at a rank-invariant point (``check_hicache_events`` ->
+        ``loading_check``), so dropping it here is safe: load-back acks are still
+        reaped in lockstep, and this function only reports local readiness for
+        per-request scheduling.
+        """
         if consumer_index < 0:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
-
-        self.loading_check()
-        return True
+        return finish_event.query()
 
     def evictable_size(self):
         return self.evictable_size_
