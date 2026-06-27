@@ -875,6 +875,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # runs with aux hidden state capture enabled.
         self.init_aux_hidden_state_capture()
 
+        # Apple Silicon MLX backend routes forward through MlxModelRunner and
+        # never touches the CUDA-side attention backends. Skip their init so
+        # the GDNAttnBackend / FlashInfer constructors don't try to dereference
+        # MLX-owned pools that are intentionally left as ``None``.
+        if self.device == "mps":
+            return
+
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()

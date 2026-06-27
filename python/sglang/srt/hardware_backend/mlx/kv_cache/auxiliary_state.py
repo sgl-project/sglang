@@ -108,6 +108,24 @@ class MlxAuxiliaryStatePool:
     def available_size(self) -> int:
         return int(self.free_slots.numel())
 
+    def alloc_group_begin(self, num_reqs: int):
+        """Mirror CUDA MambaSlotAllocator group pre-allocation. MLX doesn't
+        amortize match-prefix slot lookup, so just allocate a contiguous
+        block and remember it for alloc_group_end rollback."""
+        self._alloc_iter = None
+        if num_reqs > 0:
+            result = self.alloc(num_reqs)
+            if result is not None:
+                self._alloc_iter = iter(result.split(1))
+
+    def alloc_group_end(self):
+        """Release any unused pre-allocated group slots."""
+        if getattr(self, "_alloc_iter", None) is not None:
+            remaining = list(self._alloc_iter)
+            if remaining:
+                self.free(torch.cat(remaining))
+        self._alloc_iter = None
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > self.available_size():
             return None
@@ -215,6 +233,10 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
+        # Some sglang consumers (e.g. pool_stats_observer) reach for
+        # ``req_to_token_pool.mamba_allocator`` directly. Alias to the
+        # MLX pool so both names work.
+        self.mamba_allocator = self.mamba_pool
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(
             self._alloc_size, dtype=torch.int32, device=device
