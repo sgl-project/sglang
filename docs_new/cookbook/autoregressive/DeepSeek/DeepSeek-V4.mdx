@@ -49,13 +49,14 @@ docker run --gpus all \
 
 **AMD GPUs (ROCm)**
 
-AMD uses the daily-updated `lmsysorg/sglang-rocm` images:
+AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260615`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260615`
+For example:
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260615
+docker pull lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -65,7 +66,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260615 \
+    lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623 \
     sglang serve <use args below>
 ```
 
@@ -86,6 +87,10 @@ import { config }     from "/src/snippets/configs/deepseek-ai/deepseek-v4.jsx";
 import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} />
+
+<Note>
+  For a runnable end-to-end example, see the [DeepSeek-V4-Flash demo notebook](https://github.com/sgl-project/sglang/blob/main/docs_new/demo/deepseek_v4_flash.ipynb).
+</Note>
 
 <div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
   <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
@@ -246,6 +251,31 @@ sglang serve \
   --moe-runner-backend flashinfer_mxfp4 \
   --enable-deepseek-v4-fp4-indexer
 ```
+
+**NVFP4 Hybrid Checkpoints**
+
+The [`nvidia/DeepSeek-V4-Pro-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Pro-NVFP4) and
+[`nvidia/DeepSeek-V4-Flash-NVFP4`](https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4) checkpoints
+quantize MoE experts to **NVFP4** while keeping attention and dense layers in
+**FP8**. It requires `--moe-runner-backend flashinfer_trtllm_routed` which will be automatically selected if not provided.
+
+```bash Command
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Pro-NVFP4 \
+  --tp 8
+```
+
+or
+
+```bash Command
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Flash-NVFP4 \
+  --tp 8
+```
+
+Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
+MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
+automatically.
 
 <a id="hopper-note" />
 

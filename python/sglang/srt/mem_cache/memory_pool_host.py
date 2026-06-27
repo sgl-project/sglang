@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    sync_fixed_hicache_size,
     synchronized,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -1405,11 +1406,15 @@ class MambaPoolHost(HostKVCache):
     ):
         self.device_pool = device_pool
         self.page_size = 1
-        assert layout in [
-            "page_first",
-            "page_first_direct",
-            "layer_first",
-        ], f"Unsupported layout: {layout}"
+
+        # TODO: Mamba pool is currently incompatible with write-back staging
+        # kernel; only allow 'page_first_direct' + 'direct' for now.
+        # Relax this restriction once the staging bug is fixed.
+        if layout != "page_first_direct":
+            raise ValueError(
+                f"MambaPoolHost only supports layout='page_first_direct', "
+                f"got '{layout}'."
+            )
 
         self.layout = layout
         self.pin_memory = pin_memory
@@ -1431,16 +1436,23 @@ class MambaPoolHost(HostKVCache):
         self.size_per_token = self.get_size_per_token()
 
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "L2 cache effectiveness is reduced."
+                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                self.size,
+                device_pool.size,
+            )
 
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
@@ -1767,6 +1779,11 @@ class MambaPoolHost(HostKVCache):
         layer_id,
         io_backend="kernel",
     ):
+        if io_backend != "direct":
+            raise ValueError(
+                f"MambaPoolHost only supports io_backend='direct', "
+                f"got '{io_backend}'."
+            )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_pf_lf(
                 src=self.temporal_buffer,
@@ -1807,6 +1824,11 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
+        if io_backend != "direct":
+            raise ValueError(
+                f"MambaPoolHost only supports io_backend='direct', "
+                f"got '{io_backend}'."
+            )
         if self.layout in ["page_first", "page_first_direct"]:
             self._copy_tensor_all_layers_lf_pf(
                 src_layers=device_pool.mamba_cache.temporal,
