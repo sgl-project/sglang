@@ -3522,31 +3522,6 @@ class ServerArgs:
             estimate_low_latency_rdma_size_bytes,
         )
 
-        # num_max is auto-tuned post-KV toward this ceiling; the concurrency and
-        # capture clamps keep runtime dispatch <= num_max, so reserving at the
-        # ceiling is a safe over-bound that the runtime only ever shrinks under.
-        spec_mult = (
-            self.max_speculative_num_draft_tokens
-            or self.speculative_num_draft_tokens
-            or 1
-        )
-        if self.max_running_requests is not None:
-            per_rank = max(1, self.max_running_requests // max(1, self.dp_size))
-            num_max_upper = min(
-                per_rank * spec_mult, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
-            )
-        else:
-            num_max_upper = DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
-        # Publish the num_max we reserved the buffer for as a hard ceiling the
-        # post-KV num_max auto-tune (model_runner) and the decode-concurrency clamp
-        # must honor. Otherwise a short-context / high-concurrency config can
-        # auto-tune num_max above what this buffer reservation covers and OOM at
-        # capture (the reservation is sized for THIS num_max, not the runtime one).
-        self._deepep_reserved_num_max = num_max_upper
-        deepep_mib = estimate_low_latency_rdma_size_bytes(
-            num_max_upper, hidden, num_experts
-        ) / (1024**2)
-
         # Decode capture + deep_gemm grouped-GEMM warmup footprint. This is driven
         # by the grouped-GEMM size (num_experts * moe_intermediate * hidden), NOT
         # num_layers * hidden: a deep small-MoE model (GLM-5.2: 78 layers, 256x2048)
@@ -3570,11 +3545,54 @@ class ServerArgs:
         # net adjustment a *reduction* of mem_fraction (never above the un-divided
         # baseline that main ships), so we cannot OOM a config that main passed,
         # while still topping up where buffer + capture exceed that slack.
-        # Capped so a large estimate can't squeeze out the model weights (the
-        # post-capture check in model_runner ERRORs if headroom ends up short).
         slack_mib = getattr(self, "_auto_mem_chunked_slack_mib", 0.0)
-        delta_mib = max(0.0, capture_mib + deepep_mib - slack_mib)
         max_reserve_mib = envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * gpu_mem
+        # deep_gemm runs a transient grouped-GEMM warmup right after capture; keep a
+        # little headroom beyond buffer+capture so it can't tip capture into OOM.
+        safety_mib = 2 * 1024
+
+        spec_mult = (
+            self.max_speculative_num_draft_tokens
+            or self.speculative_num_draft_tokens
+            or 1
+        )
+        if self.max_running_requests is not None:
+            user_cap = max(
+                1, (self.max_running_requests // max(1, self.dp_size)) * spec_mult
+            )
+        else:
+            user_cap = DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+
+        # Pick the largest num_max whose buffer + capture reservation still fits under
+        # the cap. A short-context / high-concurrency config (e.g. V3.2 TBO) would
+        # otherwise size num_max at the 1024 ceiling, whose ~14 GiB nvshmem buffer is
+        # clamped by the cap and starves capture; tiering down keeps the reservation
+        # un-clamped so the full buffer+capture headroom is honored. The post-KV
+        # auto-tune and concurrency clamp shrink runtime dispatch to this ceiling, so a
+        # smaller num_max only trims decode batch (never correctness), and on
+        # wide-memory cards the loop selects the 1024 ceiling unchanged.
+        num_max_upper = min(user_cap, 128)
+        for candidate in (1024, 512, 256, 128):
+            if candidate > user_cap:
+                continue
+            rdma_mib = estimate_low_latency_rdma_size_bytes(
+                candidate, hidden, num_experts
+            ) / (1024**2)
+            required = max(0.0, rdma_mib + capture_mib + safety_mib - slack_mib)
+            if required <= max_reserve_mib:
+                num_max_upper = candidate
+                break
+
+        # Publish the num_max we reserved the buffer for as a hard ceiling the
+        # post-KV num_max auto-tune (model_runner) and the decode-concurrency clamp
+        # must honor. Otherwise a short-context / high-concurrency config can
+        # auto-tune num_max above what this buffer reservation covers and OOM at
+        # capture (the reservation is sized for THIS num_max, not the runtime one).
+        self._deepep_reserved_num_max = num_max_upper
+        deepep_mib = estimate_low_latency_rdma_size_bytes(
+            num_max_upper, hidden, num_experts
+        ) / (1024**2)
+        delta_mib = max(0.0, capture_mib + deepep_mib + safety_mib - slack_mib)
         if delta_mib > max_reserve_mib:
             logger.warning(
                 "DeepEP auto mem reserve %.1f GiB exceeds the %.0f%% cap (%.1f GiB); "
@@ -3587,8 +3605,9 @@ class ServerArgs:
             delta_mib = max_reserve_mib
         new_mem_fraction = round(self.mem_fraction_static - delta_mib / gpu_mem, 3)
         logger.info(
-            "DeepEP auto mem reserve: buffer=%.2f GiB capture=%.2f GiB slack=%.2f GiB; "
-            "mem_fraction_static %.3f -> %.3f",
+            "DeepEP auto mem reserve: num_max=%d buffer=%.2f GiB capture=%.2f GiB "
+            "slack=%.2f GiB; mem_fraction_static %.3f -> %.3f",
+            num_max_upper,
             deepep_mib / 1024,
             capture_mib / 1024,
             slack_mib / 1024,
