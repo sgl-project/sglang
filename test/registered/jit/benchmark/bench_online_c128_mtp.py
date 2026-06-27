@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 
 import torch
-import triton
-import triton.testing
 
-from sglang.jit_kernel.benchmark.utils import (
-    DEFAULT_DEVICE,
-    get_benchmark_range,
-    run_benchmark,
-    run_benchmark_no_cudagraph,
-)
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.dsv4.online_c128_mtp import _jit_online_c128_mtp_module
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -24,15 +17,10 @@ HEAD_DIM = 512
 STATE_DIM = HEAD_DIM * 3
 SWA_PAGE_SIZE = 128
 
-BATCH_SIZE_RANGE = get_benchmark_range(
-    full_range=[1, 2, 4, 8, 16, 32, 64, 128, 256],
-    ci_range=[8, 64],
-)
-NUM_VERIFY_TOKENS_RANGE = get_benchmark_range(
-    full_range=[1, 4, 8],
-    ci_range=[8],
-)
-BENCHMARK_CONFIGS = list(itertools.product(BATCH_SIZE_RANGE, NUM_VERIFY_TOKENS_RANGE))
+BATCH_SIZE_RANGE = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+BATCH_SIZE_CI_RANGE = [8, 64]
+NUM_VERIFY_TOKENS_RANGE = [1, 4, 8]
+NUM_VERIFY_TOKENS_CI_RANGE = [8]
 
 
 @dataclass
@@ -135,32 +123,26 @@ def call_write_prefix(module, case: BenchmarkCase) -> None:
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "num_verify_tokens"],
-        x_vals=BENCHMARK_CONFIGS,
-        line_arg="launch_mode",
-        line_vals=["cuda_graph", "eager"],
-        line_names=["CUDA graph", "Eager launch"],
-        styles=[("blue", "-"), ("orange", "--")],
-        ylabel="us",
-        plot_name="online-c128-mtp-write-prefix-performance",
-        args={},
-    )
+@marker.parametrize(
+    "num_verify_tokens", NUM_VERIFY_TOKENS_RANGE, NUM_VERIFY_TOKENS_CI_RANGE
 )
+@marker.parametrize("batch_size", BATCH_SIZE_RANGE, BATCH_SIZE_CI_RANGE)
+@marker.benchmark("launch_mode", ["cuda_graph", "eager"])
 def benchmark(
     batch_size: int, num_verify_tokens: int, launch_mode: str
-) -> tuple[float, float, float]:
+) -> marker.BenchResult:
     module = _jit_online_c128_mtp_module(HEAD_DIM)
     case = make_case(batch_size, num_verify_tokens)
-    fn = lambda: call_write_prefix(module, case)
 
-    if launch_mode == "cuda_graph":
-        return run_benchmark(fn)
-    if launch_mode == "eager":
-        return run_benchmark_no_cudagraph(fn)
-    raise ValueError(f"Unknown launch_mode: {launch_mode}")
+    def fn():
+        call_write_prefix(module, case)
+
+    return marker.do_bench(
+        fn,
+        use_cuda_graph=launch_mode == "cuda_graph",
+        disable_log_bandwidth=True,
+    )
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    benchmark.run()
