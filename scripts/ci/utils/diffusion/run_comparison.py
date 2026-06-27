@@ -796,9 +796,17 @@ def run_single(
         # torch.compile compilation; these external warmups just stabilize triton
         # kernel specializations across requests.
         WARMUP_STEPS = 3
-        warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
+        if case.get("preset_locked_steps"):
+            # Some models (e.g. Ideogram-4 preset V4_DEFAULT_20) derive
+            # num_inference_steps from a preset and reject any override; warm up
+            # with the model's own preset step count instead of WARMUP_STEPS.
+            warmup_case = {k: v for k, v in case.items() if k != "num_inference_steps"}
+            warmup_label = "preset steps"
+        else:
+            warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
+            warmup_label = f"{WARMUP_STEPS} steps"
         for wi in range(1, 3):
-            print(f"  Sending warmup request ({wi}/2, {WARMUP_STEPS} steps)...")
+            print(f"  Sending warmup request ({wi}/2, {warmup_label})...")
             try:
                 send_request(base_url, warmup_case, framework, config)
             except Exception as e:
