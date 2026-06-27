@@ -11,22 +11,32 @@ Verifies the documented contract:
     SDPA, which produces deterministic attention output at those rows).
 """
 
+import unittest
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
-    fused_pack_qkv,
-    fused_scatter_to_padded,
-)
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
-from sglang.jit_kernel.utils import get_ci_test_range
-from sglang.multimodal_gen.runtime.layers.attention.backends import (
-    flash_attn as _fa_backend,
-)
-from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    build_varlen_mask_meta,
-)
+if torch.cuda.is_available():
+    from sglang.jit_kernel.diffusion.triton.varlen_pack_pad import (
+        fused_pack_qkv,
+        fused_scatter_to_padded,
+    )
+    from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+    from sglang.jit_kernel.utils import get_ci_test_range
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        flash_attn as _fa_backend,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.layer import (
+        build_varlen_mask_meta,
+    )
+else:
+    fused_pack_qkv = None
+    fused_scatter_to_padded = None
+    flash_attn_varlen_func = None
+    get_ci_test_range = lambda x, y=None: x
+    _fa_backend = None
+    build_varlen_mask_meta = None
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, suite="base-b-kernel-unit-1-gpu-large")
@@ -99,6 +109,7 @@ def _varlen_path(q, k, v, key_mask, softmax_scale):
     return fused_scatter_to_padded(out_unpad, meta["inv_indices"], bs, seq)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize(
     "shape", SHAPES, ids=lambda s: s[0] if isinstance(s, tuple) else str(s)
@@ -128,6 +139,7 @@ def test_varlen_path_matches_sdpa_on_valid_rows(dtype, shape):
     )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize(
     "shape", SHAPES, ids=lambda s: s[0] if isinstance(s, tuple) else str(s)

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -294,6 +295,7 @@ def _parse_comparator_stats(stdout: str) -> dict[str, Any]:
     return out
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyPrecisionRegression(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

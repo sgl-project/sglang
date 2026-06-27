@@ -23,6 +23,9 @@ import torch.distributed as dist
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, suite="sgl-kernel-unit-test-2-gpu-amd")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 def get_open_port():

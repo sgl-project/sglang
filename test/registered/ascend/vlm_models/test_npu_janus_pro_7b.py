@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ascend.test_ascend_utils import JANUS_PRO_7B_WEIGHTS_PATH
 from sglang.test.ascend.vlm_utils import TestVLMModels
 from sglang.test.ci.ci_register import register_npu_ci
@@ -7,6 +9,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestJanusPro7B(TestVLMModels):
     """Testcase: Verify that the inference accuracy of the deepseek-ai/Janus-Pro-7B model on the MMMU dataset is no less than 0.2.
 

@@ -27,8 +27,10 @@ def calc_diff(x, y):
 
 
 def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
+    return (
+        torch.cuda.is_available()
+        and (torch.cuda.get_device_capability(device)[0] == 10)
+        and (torch.version.cuda >= "12.8")
     )
 
 

@@ -31,6 +31,9 @@ except ImportError:
 
 register_cuda_ci(est_time=5, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 def run_triton_kernel(A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale):

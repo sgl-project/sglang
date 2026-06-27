@@ -18,6 +18,10 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=10, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=60, suite="nightly-kernel-1-gpu", nightly=True)
 register_amd_ci(est_time=15, suite="nightly-amd-kernel-1-gpu", nightly=True)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 DEVICE = "cuda"
 DTYPES = get_ci_test_range([torch.bfloat16, torch.float16], [torch.bfloat16])

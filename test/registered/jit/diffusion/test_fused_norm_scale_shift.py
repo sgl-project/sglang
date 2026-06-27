@@ -6,11 +6,12 @@ import torch
 from einops import rearrange
 from torch import Tensor
 
-from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-    fused_norm_scale_shift,
-    fused_scale_residual_norm_scale_shift,
-    validate_scale_shift,
-)
+if torch.cuda.is_available():
+    from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+        fused_norm_scale_shift,
+        fused_scale_residual_norm_scale_shift,
+        validate_scale_shift,
+    )
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=28, suite="base-b-kernel-unit-1-gpu-large")

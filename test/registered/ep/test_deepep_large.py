@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -20,6 +21,7 @@ register_cuda_ci(est_time=528, stage="extra-b", runner_config="deepep-8-gpu-h200
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skip("Skip for saving ci time")
 class TestDeepseek(CustomTestCase):
     @classmethod
@@ -81,6 +83,7 @@ class TestDeepseek(CustomTestCase):
         self.assertGreater(metrics["score"], 0.92)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -161,6 +164,7 @@ class TestDeepseekMTP(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 1.85)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV32TBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):

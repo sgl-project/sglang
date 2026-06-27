@@ -10,6 +10,7 @@ Registry: nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 suite
 import ast
 import os
 import re
+import torch
 import time
 import unittest
 from typing import Tuple
@@ -109,6 +110,7 @@ def run_gsm8k_benchmark(
     return float(acc), float(invalid), float(latency)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepSeekR1MXFP4TP2MI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

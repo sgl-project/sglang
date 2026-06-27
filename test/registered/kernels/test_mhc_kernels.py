@@ -7,6 +7,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("num_tokens", [0, 1, 8, 17, 32, 64])
@@ -14,9 +18,6 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 def test_mhc_fused_post_pre_matches_unfused(
     monkeypatch, hidden_size, num_tokens, use_norm
 ):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for TileLang mHC kernels")
-
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
     monkeypatch.setattr(mhc, "_mhc_pre_warmed", True)
     torch.manual_seed(0)

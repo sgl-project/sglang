@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.send_one import BenchArgs, send_one_prompt
@@ -11,6 +13,7 @@ register_cuda_ci(est_time=400, stage="base-c", runner_config="4-gpu-b200")
 DSV32_FP4_MODEL = "nvidia/DeepSeek-V3.2-NVFP4"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV32FP4DPSpec(GSM8KMixin, DefaultServerBase):
     model = DSV32_FP4_MODEL
     timeout = 1200

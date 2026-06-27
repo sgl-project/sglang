@@ -8,6 +8,9 @@ from sglang.srt.models.utils import fused_qk_gemma_rmsnorm_with_gate
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=20, suite="jit-kernel-unit-test-amd")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 def reference_qk_gemma_rmsnorm_with_gate(

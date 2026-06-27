@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import unittest
 
+import torch
 from test_unified_radix_cache_kl_nightly import AccuracyTwoPassMixin
 
 from sglang.srt.utils import kill_process_tree
@@ -28,6 +29,7 @@ MAMBA_TRACK_INTERVAL = 128
 MAMBA_CHUNKED_PREFILL_SIZE = 2048
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + UnifiedRadixCache."""
 
@@ -72,6 +74,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 # ─── Mamba + HiCache L2 ──────────────────────────────────────────────────────
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + HiCache L2 + UnifiedRadixCache."""
 
@@ -131,6 +134,7 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 # ─── Mamba + HiCache L3 (file backend) ───────────────────────────────────────
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """Mamba hybrid + HiCache L3 (file backend) + UnifiedRadixCache."""
 

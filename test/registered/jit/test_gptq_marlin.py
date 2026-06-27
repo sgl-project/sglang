@@ -25,6 +25,10 @@ from sglang.test.test_marlin_utils import (
 
 register_cuda_ci(est_time=13, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
+
 
 MNK_FACTORS = [
     (1, 1, 1),

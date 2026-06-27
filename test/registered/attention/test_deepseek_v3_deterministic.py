@@ -6,6 +6,8 @@ python3 -m unittest test_deepseek_v3_deterministic.TestFa3Deterministic
 
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
@@ -17,6 +19,7 @@ register_cuda_ci(est_time=240, suite="nightly-1-gpu", nightly=True)
 DEEPSEEK_MODEL = "lmsys/sglang-ci-dsv3-test"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFa3Deterministic(TestDeterministicBase):
     @classmethod
     def get_model(cls):
@@ -35,6 +38,7 @@ class TestFa3Deterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTritonDeterministic(TestDeterministicBase):
     @classmethod
     def get_model(cls):

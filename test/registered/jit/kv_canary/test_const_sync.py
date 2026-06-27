@@ -3,12 +3,18 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+import torch
+
 import sglang.jit_kernel
 from sglang.jit_kernel.kv_canary import consts
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="base-b-kernel-unit-1-gpu-large")
 register_amd_ci(est_time=5, suite="jit-kernel-unit-test-amd")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 # Resolve the kernel source against the installed jit_kernel package rather

@@ -53,6 +53,9 @@ register_cuda_ci(
     suite="nightly-kernel-8-gpu-h200",
     nightly=True,
 )
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 # ---------------------------------------------------------------------------
 # Test parameters

@@ -4,11 +4,16 @@ import pytest
 import torch
 import triton
 
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer
-from sglang.jit_kernel.diffusion.triton.scale_shift import (
-    fuse_layernorm_scale_shift_gate_select01_kernel,
-    fuse_residual_layernorm_scale_shift_gate_select01_kernel,
-)
+if torch.cuda.is_available():
+    from sglang.jit_kernel.diffusion.triton.norm import norm_infer
+    from sglang.jit_kernel.diffusion.triton.scale_shift import (
+        fuse_layernorm_scale_shift_gate_select01_kernel,
+        fuse_residual_layernorm_scale_shift_gate_select01_kernel,
+    )
+else:
+    norm_infer = None
+    fuse_layernorm_scale_shift_gate_select01_kernel = None
+    fuse_residual_layernorm_scale_shift_gate_select01_kernel = None
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 

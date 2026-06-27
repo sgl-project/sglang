@@ -12,6 +12,9 @@ from sglang.jit_kernel.ngram_embedding import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
+)
 
 
 def _make_ngram_params(ne_n: int, ne_k: int, vocab_size: int):

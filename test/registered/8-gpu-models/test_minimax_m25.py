@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -12,6 +14,7 @@ register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMiniMaxM25(unittest.TestCase):
     """Unified test class for MiniMax-M2.5 performance and accuracy.
 

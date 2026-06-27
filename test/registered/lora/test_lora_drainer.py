@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
+import torch
+
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.managers.schedule_batch import Req
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -31,6 +33,7 @@ def make_req(lora_id, wait_queue_entry_time, max_new_tokens, output_len=0):
     return cast(Req, req_ns)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRADrainer(unittest.TestCase):
     def test_update_draining_marks_adapter(self):
         if is_in_ci():

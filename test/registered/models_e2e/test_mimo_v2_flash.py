@@ -1,4 +1,5 @@
 import unittest
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -9,6 +10,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 register_cuda_ci(est_time=350, stage="base-c", runner_config="8-gpu-h200")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.75
     gsm8k_num_questions = 1319

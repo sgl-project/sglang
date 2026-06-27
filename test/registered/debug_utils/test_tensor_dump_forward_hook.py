@@ -1,5 +1,6 @@
 import unittest
 
+import pytest
 import torch
 from torch import nn
 
@@ -27,6 +28,10 @@ register_amd_ci(
     est_time=15,
     suite="stage-b-test-1-gpu-small-amd",
     disabled="Test uses pytest-style function without TestCase class - see #17145",
+)
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Test requires CUDA"
 )
 
 TEST_HIDDEN_SIZE = 32
