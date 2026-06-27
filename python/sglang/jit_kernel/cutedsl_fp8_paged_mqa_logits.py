@@ -738,7 +738,7 @@ class FP8MQALogitsKernel:
             barrier_id=1, num_threads=tmem_alloc_num_threads
         )
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=0,  # math warp 0 does alloc+free (last TMEM consumer)
             is_two_cta=False,

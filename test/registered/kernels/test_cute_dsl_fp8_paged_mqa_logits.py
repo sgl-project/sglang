@@ -11,21 +11,15 @@ to SGLang.
 import pytest
 import torch
 
+from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-
-def _device_cap_major():
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_capability()[0]
-
-
 skip_not_sm100 = pytest.mark.skipif(
-    _device_cap_major() != 10,
+    not is_sm100_supported(),
     reason="CuTe DSL FP8 Paged MQA Logits only supports SM 100 family.",
 )
 
-register_cuda_ci(est_time=15, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=15, suite="nightly-4-gpu-b200", nightly=True)
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -203,7 +197,7 @@ def _generate_test_data(
 
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("next_n", [1, 2, 3, 4, 5, 6])
 @pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096])
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16])

@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """CuTe DSL FP8 Paged MQA Logits runner and custom op.
 
-Ported from TensorRT-LLM PR #13219
-(``tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py``).
-
+Ported from TensorRT-LLM https://github.com/NVIDIA/TensorRT-LLM/pull/13219
 Provides ``torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits`` as an alternative
-to ``deep_gemm.fp8_paged_mqa_logits`` on Blackwell SM100.
+to ``deep_gemm.fp8_paged_mqa_logits`` on Blackwell SM100. It performs well, when the bs is low,
+and the context is long.
 """
 
 from __future__ import annotations
@@ -81,43 +80,6 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
-
-
-def _check_fp8_paged_mqa_logits_dtypes(
-    q,
-    kv_fused,
-    weights,
-    context_lens,
-    block_table,
-    schedule_meta,
-    epi_dtype,
-    acc_dtype,
-    output_dtype,
-):
-    errs = []
-    if q.dtype != torch.float8_e4m3fn:
-        errs.append(f"q must be float8_e4m3fn, got {q.dtype}")
-    if kv_fused.dtype != torch.uint8:
-        errs.append(f"kv_fused must be uint8, got {kv_fused.dtype}")
-    # TODO: update to (torch.float32, torch.float16) once fp16 weights
-    # are validated end-to-end and the in-kernel .half() conversion is removed.
-    if weights.dtype != torch.float32:
-        errs.append(f"weights must be float32, got {weights.dtype}")
-    if context_lens.dtype != torch.int32:
-        errs.append(f"context_lens must be int32, got {context_lens.dtype}")
-    if block_table.dtype != torch.int32:
-        errs.append(f"block_table must be int32, got {block_table.dtype}")
-    if schedule_meta.dtype != torch.int32:
-        errs.append(f"schedule_meta must be int32, got {schedule_meta.dtype}")
-    for name, dt in [
-        ("epi_dtype", epi_dtype),
-        ("acc_dtype", acc_dtype),
-        ("output_dtype", output_dtype),
-    ]:
-        if dt not in (torch.float16, torch.float32):
-            errs.append(f"{name} must be float16 or float32, got {dt}")
-    if errs:
-        raise ValueError("FP8 Paged MQA Logits dtype errors:\n  " + "\n  ".join(errs))
 
 
 class CuteDSLPagedMQALogitsRunner:
@@ -370,17 +332,6 @@ def cute_dsl_fp8_paged_mqa_logits(
 ) -> torch.Tensor:
     if not is_sm100_supported():
         raise ValueError("CuteDSL FP8 Paged MQA Logits only supports SM 100 family.")
-    _check_fp8_paged_mqa_logits_dtypes(
-        q,
-        kv_fused,
-        weights,
-        context_lens,
-        block_table,
-        schedule_meta,
-        epi_dtype,
-        acc_dtype,
-        output_dtype,
-    )
     return CuteDSLPagedMQALogitsRunner.forward(
         q,
         kv_fused,

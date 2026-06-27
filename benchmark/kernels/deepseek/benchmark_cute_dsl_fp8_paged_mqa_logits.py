@@ -1,32 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""
-Standalone benchmark for the CuTe DSL FP8 Paged MQA Logits kernel
-(``torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits``) versus DeepGEMM's
-``fp8_paged_mqa_logits`` on Blackwell SM100.
-
-Timing backend: FlashInfer ``bench_gpu_time`` with CUPTI activity tracing
-(``enable_cupti=True``) and CUDA-graph capture (``use_cuda_graph=True``) — same
-configuration SGLang uses at runtime, so the numbers reflect the in-server
-hot-path (launch overhead amortized via the captured graph, kernel time
-measured directly via CUPTI).
-
-Workload generation mirrors the TensorRT-LLM benchmark from
-``tests/unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py``
-(``benchmark_fp8_paged_mqa_logits``), with input/output shapes matched to
-SGLang's NSA decode indexer (DSV3.2-style, indexer ``n_heads=64``,
-``head_dim=128``, page size 64).
-
-Usage:
-    python benchmark/kernels/deepseek/benchmark_cute_dsl_fp8_paged_mqa_logits.py
-    python benchmark/kernels/deepseek/benchmark_cute_dsl_fp8_paged_mqa_logits.py \\
-        --batch_size 1 8 32 64 128 \\
-        --next_n 1 2 4 \\
-        --context_len 4096 32768 131072
-
-Requires: cupti-python>=13 (``pip install -U cupti-python``).
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -35,7 +8,6 @@ import sys
 import numpy as np
 import torch
 
-# Force registration of torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits.
 import sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits  # noqa: F401
 from sglang.srt.utils import is_sm100_supported
 
@@ -203,7 +175,7 @@ def benchmark(
     )
     hdr = (
         f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} {'ntask':>6s} | "
-        f"{'maxAtom':>7s} {'DSL(us)':>9s} | "
+        f"{'maxAtom':>7s} {'DSL(us)':>9s} {'DSLf16(us)':>10s} {'f16/f32':>8s} | "
         f"{'maxNa':>5s} {'DSL(us)':>9s} {'max_atom/max_na':>15s} | "
         f"{'DG-nat(us)':>11s} {'nat/DSL_maxA':>13s}"
     )
@@ -212,6 +184,9 @@ def benchmark(
         "  nat = DG-native   (q=[B,next_n,H,D])   — TRT-LLM's path; now also SGLang's"
     )
     print("  maxAtom = baseline picker (min waves, tie-break largest atom = least HBM)")
+    print(
+        "  DSLf16  = maxAtom DSL with fp16 epilogue (epi_dtype=float16; acc/out unchanged)"
+    )
     print(
         "  maxNa   = experimental picker (min waves, tie-break largest num_atoms = more SMs busy)"
     )
@@ -305,8 +280,13 @@ def benchmark(
                     else dsl_schedule_meta_base
                 )
 
-                def _make_dsl(t, schedule_meta, data=data):
-                    def _dsl(t=t, schedule_meta=schedule_meta, data=data):
+                def _make_dsl(t, schedule_meta, data=data, epi_dtype=output_dtype):
+                    def _dsl(
+                        t=t,
+                        schedule_meta=schedule_meta,
+                        data=data,
+                        epi_dtype=epi_dtype,
+                    ):
                         torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits(
                             t["q"],
                             data["kv_fused"],
@@ -315,7 +295,7 @@ def benchmark(
                             t["block_table"],
                             schedule_meta,
                             data["max_model_len"],
-                            epi_dtype=output_dtype,
+                            epi_dtype=epi_dtype,
                             acc_dtype=output_dtype,
                             output_dtype=output_dtype,
                         )
@@ -324,6 +304,10 @@ def benchmark(
 
                 _dsl_base = _make_dsl(base_t, dsl_schedule_meta_base)
                 _dsl_exp = _make_dsl(exp_t, dsl_schedule_meta_exp)
+                # fp16-epilogue variant of the maxAtom baseline (epi_dtype only).
+                _dsl_base_f16 = _make_dsl(
+                    base_t, dsl_schedule_meta_base, epi_dtype=torch.float16
+                )
 
                 # DG-native: schedule input shape (B, next_n) — wrapper
                 # derives num_next_n_atoms = next_n. q stays [B, next_n, H, D].
@@ -358,11 +342,13 @@ def benchmark(
 
                 # First DSL call(s) trigger JIT compile; do them outside timing.
                 _dsl_base()
+                _dsl_base_f16()
                 if strats_diverge:
                     _dsl_exp()
                 torch.cuda.synchronize()
 
                 base_ms = np.median(bench_gpu_time(_dsl_base, **bench_kwargs))
+                base_f16_ms = np.median(bench_gpu_time(_dsl_base_f16, **bench_kwargs))
                 exp_ms = (
                     np.median(bench_gpu_time(_dsl_exp, **bench_kwargs))
                     if strats_diverge
@@ -372,11 +358,13 @@ def benchmark(
 
                 strat_speedup = base_ms / exp_ms if exp_ms > 0 else float("nan")
                 nat_ratio = dg_nat_ms / base_ms if base_ms > 0 else float("nan")
+                f16_ratio = base_f16_ms / base_ms if base_ms > 0 else float("nan")
                 base_lab = f"{na_base}/{atom_base}"
                 exp_lab = f"{na_exp}/{atom_exp}"
                 print(
                     f"{batch_size:5d} {context_len:7d} {next_n:6d} {nblk:7d} {ntask:6d} | "
-                    f"{base_lab:>7s} {base_ms * 1e3:9.2f} | "
+                    f"{base_lab:>7s} {base_ms * 1e3:9.2f} {base_f16_ms * 1e3:10.2f} "
+                    f"{f16_ratio:7.3f}x | "
                     f"{exp_lab:>5s} {exp_ms * 1e3:9.2f} {strat_speedup:14.3f}x | "
                     f"{dg_nat_ms * 1e3:11.2f} {nat_ratio:12.3f}x"
                 )
@@ -394,8 +382,8 @@ def main():
         "--batch_size",
         type=int,
         nargs="+",
-        default=[1, 8, 32, 64, 128],
-        help="Batch sizes to sweep (default: 1 8 32 64 128).",
+        default=[1, 2, 4, 6, 8, 10, 12, 14, 16],
+        help="Batch sizes to sweep (default: 1 2 4 6 8 10 12 14 16).",
     )
     parser.add_argument(
         "--next_n",
@@ -409,8 +397,8 @@ def main():
         "--context_len",
         type=int,
         nargs="+",
-        default=[4096, 32768, 131072],
-        help="Context lengths to sweep (default: 4096 32768 131072).",
+        default=[4096, 10240, 32768, 81920, 131072],
+        help="Context lengths to sweep (default: 4096 10240 32768 81920 131072).",
     )
     parser.add_argument(
         "--output_dtype",

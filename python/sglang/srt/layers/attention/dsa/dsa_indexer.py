@@ -643,7 +643,6 @@ class Indexer(MultiPlatformOp):
         next_n = q_offset // B if B > 0 else 0
         use_cute_dsl = (
             self.use_cute_dsl_paged_mqa_logits
-            and _is_cuda
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
@@ -708,15 +707,6 @@ class Indexer(MultiPlatformOp):
             # (or [B, 1, H, D] for decode), per-batch block_tables [B, max_blks].
             ctx_lens_1d = metadata.get_seqlens_int32()
             schedule_metadata_dsl = schedule_metadata
-            # Wave-aware atom-split decision is computed once per forward batch
-            # in `dsa_backend.init_forward_metadata*` (CPU-side, cuda-graph
-            # safe), with invariant `factor * atom == speculative_num_draft_tokens`
-            # (the target_verify-time next_n). The reshape
-            # `(B, next_n, ...) -> (B*factor, atom, ...)` is only valid when the
-            # caller actually supplies next_n == factor * atom tokens, so gate on
-            # that equality: a multi-step draft loop can reuse the same metadata
-            # with next_n mutated to 1, which must fall back to the kernel-native
-            # next_n path instead of splitting.
             factor = getattr(metadata, "dsl_expand_factor", 1)
             atom = getattr(metadata, "dsl_atom", 1)
             dsl_atom_split = factor > 1 and next_n == factor * atom
