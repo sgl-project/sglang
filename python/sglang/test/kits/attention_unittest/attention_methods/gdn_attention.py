@@ -183,7 +183,9 @@ class TinyGDNModelConfig:
         self.attention_chunk_size = None
         self.sliding_window_size = None
         self.hf_config = SimpleNamespace(architectures=["TinyGDNForCausalLM"])
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_kv_heads(self, tp_size: int) -> int:
         assert self.num_key_value_heads % tp_size == 0
@@ -211,6 +213,26 @@ class MockGDNModelRunner(ModelRunner):
         self.dtype = dtype
         self.kv_cache_dtype = dtype
         self.gpu_id = 0
+        self.ps = SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=0,
+            dp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            attn_dp_rank=0,
+            attn_dp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            moe_dp_rank=0,
+            moe_dp_size=1,
+            dcp_size=1,
+            gpu_id=0,
+        )
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config

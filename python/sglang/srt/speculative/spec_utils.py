@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     patch_tensor_parallel_group,
@@ -593,7 +594,7 @@ def commit_mamba_states_after_verify(
     commit hook.
     """
     model_runner = target_worker.model_runner
-    if model_runner.mambaish_config is None:
+    if mambaish_config(model_runner.model_config) is None:
         return
     attn_backend = model_runner.attn_backend
     if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):

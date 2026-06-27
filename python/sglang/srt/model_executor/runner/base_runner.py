@@ -223,7 +223,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.pp_size > 1
+            and mr.ps.pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -385,10 +385,10 @@ class BaseRunner(ABC):
                 str(mr.dtype),
                 str(server_args.quantization),
                 str(server_args.moe_runner_backend),
-                str(mr.tp_size),
-                str(mr.pp_size),
-                str(mr.dp_size),
-                str(mr.moe_ep_size),
+                str(mr.ps.tp_size),
+                str(mr.ps.pp_size),
+                str(mr.ps.attn_dp_size),
+                str(mr.ps.moe_ep_size),
                 str(mr.model_config.hf_config.__class__.__name__),
             ]
         )
@@ -403,7 +403,8 @@ class BaseRunner(ABC):
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
         return (
-            cache_dir / f"rank_tp{mr.tp_rank}_pp{mr.pp_rank}_dp{mr.dp_rank or 0}.json"
+            cache_dir
+            / f"rank_tp{mr.ps.tp_rank}_pp{mr.ps.pp_rank}_dp{mr.ps.dp_rank or 0}.json"
         )
 
     def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
@@ -580,10 +581,10 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.pp_rank != 0
-                and mr.attn_cp_size > 1
+                and mr.ps.pp_rank != 0
+                and mr.ps.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )

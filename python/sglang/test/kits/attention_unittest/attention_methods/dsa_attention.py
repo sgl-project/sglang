@@ -259,7 +259,9 @@ class TinyDSAModelConfig:
             index_topk=index_topk,
             num_hidden_layers=1,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
 
 class DSAMockModelRunner(ModelRunner):
@@ -309,6 +311,26 @@ class DSAMockModelRunner(ModelRunner):
         self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=0,
+            dp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            attn_dp_rank=0,
+            attn_dp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            moe_dp_rank=0,
+            moe_dp_size=1,
+            dcp_size=1,
+            gpu_id=0,
+        )
         self.server_args = make_mock_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,

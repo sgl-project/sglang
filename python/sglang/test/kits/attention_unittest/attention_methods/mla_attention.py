@@ -192,7 +192,9 @@ class TinyMLAModelConfig:
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=kv_lora_rank,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0
@@ -234,6 +236,26 @@ class MockMLAModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=0,
+            dp_size=1,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            attn_dp_rank=0,
+            attn_dp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            moe_dp_rank=0,
+            moe_dp_size=1,
+            dcp_size=1,
+            gpu_id=0,
+        )
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()

@@ -504,7 +504,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=get_attention_tp_size(),
-            attn_cp_size=model_runner.attn_cp_size,
+            attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,

@@ -11,7 +11,7 @@ import torch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
@@ -412,3 +412,13 @@ class _ProfilerRPD(_ProfilerConcreteBase):
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
+
+
+def build_step_span_name(forward_batch: ForwardBatch) -> str:
+    """Build a profile-trace span name for one forward step."""
+    mode = forward_batch.forward_mode
+    bs = forward_batch.batch_size
+    if mode == ForwardMode.EXTEND:
+        ext_toks = forward_batch.extend_num_tokens or 0
+        return f"step[EXTEND bs={bs} toks={ext_toks}]"
+    return f"step[{mode.name} bs={bs}]"

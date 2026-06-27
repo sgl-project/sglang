@@ -1,11 +1,13 @@
 import logging
 import math
 from copy import deepcopy
+from dataclasses import replace
 from typing import List, Optional
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -70,21 +72,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.tp_rank = tp_rank
-        self.dp_rank = dp_rank
-        self.moe_ep_rank = moe_ep_rank
-        self.attn_cp_rank = attn_cp_rank
-        self.moe_dp_rank = moe_dp_rank
+        self.ps = ps
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
@@ -147,12 +141,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
+            ps=replace(ps, pp_rank=0),
             nccl_port=nccl_port,
             is_draft_worker=True,
         )
@@ -188,7 +177,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
                 getattr(draft_server_args, "attention_backend", None),
@@ -352,7 +341,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     break
 
             if fused_disable_reason is not None:
-                if self.tp_rank == 0:
+                if self.ps.tp_rank == 0:
                     logger.info(
                         "DFLASH fused KV materialization disabled: %s",
                         fused_disable_reason,
@@ -374,7 +363,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
                 + int(self.block_size),
             )
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 logger.info(
                     "DFLASH fused KV materialization enabled. "
                     "n_layers=%d, num_kv_heads=%d, head_dim=%d",
@@ -581,7 +570,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if resolved_id is None:
                 resolved_id = tokenizer.convert_tokens_to_ids(mask_token)
 
-            if added and self.tp_rank == 0:
+            if added and self.ps.tp_rank == 0:
                 logger.info(
                     "Added DFLASH mask token to tokenizer. token=%s, mask_token_id=%s, tokenizer_len=%s, model_vocab_size=%s",
                     mask_token,
@@ -1147,7 +1136,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if (
             not is_dflash_sampling_verify_available()
             and not self._warned_sampling_fallback
-            and self.tp_rank == 0
+            and self.ps.tp_rank == 0
         ):
             logger.warning(
                 "DFLASH non-greedy verification is unavailable on this build/device; "

@@ -22,10 +22,12 @@ start of the next draft.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -39,7 +41,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.model_runner_components.pool_configurator import (
+    MemoryPoolConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
@@ -89,11 +93,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -101,6 +101,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.ps = ps
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
@@ -136,12 +137,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 self,
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
+                # spec workers don't support pipeline parallelism
+                ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -652,11 +649,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -667,7 +660,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.tp_rank = tp_rank
+        self.ps = ps
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -685,11 +678,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,
             gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
+            ps,
             nccl_port,
             target_worker,
         )

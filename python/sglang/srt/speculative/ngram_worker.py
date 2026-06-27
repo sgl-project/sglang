@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -47,11 +48,7 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -59,7 +56,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.enable_overlap = not server_args.disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
+        self.tp_rank = ps.tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth

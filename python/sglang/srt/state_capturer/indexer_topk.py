@@ -5,6 +5,7 @@ import numpy as np
 import pybase64
 import torch
 
+from sglang.srt.configs.model_config import ModelConfig, get_num_indexer_layers
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -82,6 +83,39 @@ def extract_indexer_topk_from_meta_info(data):
 
 
 def create_indexer_capturer(
+    *,
+    model_config: ModelConfig,
+    num_tokens: int,
+    max_running_requests: int,
+    device: str,
+) -> Optional[IndexerTopkCapturer]:
+    from sglang.srt.server_args import get_global_server_args
+
+    enable = get_global_server_args().enable_return_indexer_topk
+    # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
+    # path); other backends would create a capturer but never feed it.
+    if enable and device != "cuda":
+        logger.warning(
+            "indexer-topk capture is CUDA-only; %s backend not yet wired. "
+            "Disabling capturer.",
+            device,
+        )
+        return None
+
+    hf_text_config = model_config.hf_text_config
+    num_indexer_layers = get_num_indexer_layers(hf_text_config)
+    index_topk = getattr(hf_text_config, "index_topk", 0)
+    return _create_indexer_capturer_raw(
+        enable=enable,
+        num_indexer_layers=num_indexer_layers,
+        index_topk=index_topk,
+        num_tokens=num_tokens,
+        max_running_requests=max_running_requests,
+        device=device,
+    )
+
+
+def _create_indexer_capturer_raw(
     enable: bool,
     num_indexer_layers: int,
     index_topk: int,

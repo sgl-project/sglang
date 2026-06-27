@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    kimi_linear_config,
+    linear_attn_model_spec,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -185,9 +190,9 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = full_v_head_dim
             self.swa_v_head_dim = swa_v_head_dim
         elif (
-            model_runner.hybrid_gdn_config is not None
-            or model_runner.kimi_linear_config is not None
-            or model_runner.linear_attn_model_spec is not None
+            hybrid_gdn_config(model_runner.model_config) is not None
+            or kimi_linear_config(model_runner.model_config) is not None
+            or linear_attn_model_spec(model_runner.model_config) is not None
         ):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()

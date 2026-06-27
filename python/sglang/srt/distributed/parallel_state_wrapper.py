@@ -20,4 +20,5 @@ class ParallelState:
     moe_ep_size: int
     moe_dp_rank: Optional[int]
     moe_dp_size: int
+    dcp_size: int
     gpu_id: int
