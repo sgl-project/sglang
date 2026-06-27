@@ -216,10 +216,12 @@ class Qwen2MoeMLP(nn.Module):
             # Gate on use_aiter_fp8_per_token (set in __init__): it implies the
             # bpreshuffle per-token path the tuple needs; use_per_token_if_dynamic is
             # only set later in process_weights_after_loading.
-            self._fp8_silu_fuse = type(
-                quant_method
-            ).__name__ == "Fp8LinearMethod" and getattr(
-                quant_method, "use_aiter_fp8_per_token", False
+            qm = getattr(self.down_proj, "quant_method", None)
+            qcfg = getattr(qm, "quant_config", None)
+            self._fp8_silu_fuse = (
+                type(qm).__name__ == "Fp8LinearMethod"
+                and getattr(qm, "use_aiter_fp8_per_token", False)
+                and getattr(qcfg, "activation_scheme", None) == "dynamic"
             )
 
     def forward(
