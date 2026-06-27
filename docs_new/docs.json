@@ -435,11 +435,11 @@
     },
     {
       "source": "/platforms/ascend/ascend_npu_best_practice.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice"
+      "destination": "/docs/hardware-platforms/ascend-npus/best_practice"
     },
     {
       "source": "/platforms/ascend/ascend_npu_deepseek_example.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/deepseek_v3_2"
     },
     {
       "source": "/platforms/ascend/ascend_npu_environment_variables.html",
@@ -447,7 +447,7 @@
     },
     {
       "source": "/platforms/ascend/ascend_npu_glm5_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/glm_5_1"
     },
     {
       "source": "/platforms/ascend/ascend_npu_quantization.html",
@@ -459,11 +459,11 @@
     },
     {
       "source": "/platforms/ascend/ascend_npu_qwen3_5_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_5_397b"
     },
     {
       "source": "/platforms/ascend/ascend_npu_qwen3_examples.html",
-      "destination": "/docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples"
+      "destination": "/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_235b_a22b"
     },
     {
       "source": "/platforms/ascend/ascend_npu_support.html",
@@ -809,7 +809,8 @@
                 "group": "Development",
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
-                  "docs/developer_guide/development_jit_kernel_guide"
+                  "docs/developer_guide/development_jit_kernel_guide",
+                  "docs/developer_guide/quantization_contribution_guide"
                 ]
               },
               {
@@ -878,6 +879,14 @@
               {
                 "group": "Ascend NPUs",
                 "pages": [
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_models",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
+                  "docs/hardware-platforms/ascend-npus/mindspore_backend",
+                  "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   {
                     "group": "Model Tutorials",
                     "pages": [
@@ -896,17 +905,6 @@
                       "docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_next_80b_a3b_instruct"
                     ]
                   },
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_quick_start",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_features",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_models",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_quantization",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_deepseek_example",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
-                  "docs/hardware-platforms/ascend-npus/mindspore_backend",
-                  "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
                   {
                     "group": "Best Practice",
                     "pages": [
@@ -929,8 +927,6 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_accuracy_evaluation",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
-                  "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_faq",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_operator_performance_optimizing",
@@ -1187,6 +1183,13 @@
                     ]
                   },
                   {
+                    "group": "JoyEcho",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/JoyEcho/JoyEcho"
+                    ]
+                  },
+                  {
                     "group": "Qwen-Image",
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
@@ -1197,6 +1200,13 @@
                     "group": "Z-Image",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"
+                    ]
+                  },
+                  {
+                    "group": "Krea",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/Krea/Krea-2"
                     ]
                   },
                   {

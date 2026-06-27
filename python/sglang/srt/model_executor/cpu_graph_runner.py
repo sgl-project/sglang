@@ -534,7 +534,8 @@ def register_fake_ops(tp_size: int):
         cu_seqlens,
         head_first,
         use_qk_l2norm_in_kernel,
-        eps,
+        initial_state_indices,
+        eps=1e-6,
     ):
         output = torch.empty_like(value)
         assert initial_state is not None

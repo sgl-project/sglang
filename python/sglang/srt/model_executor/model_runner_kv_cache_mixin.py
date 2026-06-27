@@ -402,6 +402,8 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    enable_linear_replayssm=self.server_args.enable_linear_replayssm,
+                    linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
@@ -885,7 +887,7 @@ class ModelRunnerKVCacheMixin:
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                             )
                         )
-                    elif self.page_size == 1:
+                    elif self.page_size == 1 and self.dcp_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -895,8 +897,8 @@ class ModelRunnerKVCacheMixin:
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
+                            self.max_total_num_tokens * self.dcp_size,
+                            page_size=self.page_size * self.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
