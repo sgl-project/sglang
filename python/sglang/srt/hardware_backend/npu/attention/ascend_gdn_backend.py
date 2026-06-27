@@ -335,21 +335,37 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            extend_ssm_states = ssm_states
+            extend_cache_indices = cache_indices
+            if not forward_batch.spec_algorithm.is_none() and any(
+                forward_batch.extend_prefix_lens_cpu
+            ):
+                prefix_batch_indices = has_initial_states.nonzero(as_tuple=True)[0]
+                if prefix_batch_indices.numel() > 0:
+                    extend_ssm_states = ssm_states[cache_indices].clone()
+                    extend_ssm_states[prefix_batch_indices] = extend_ssm_states[
+                        prefix_batch_indices
+                    ].transpose(-1, -2)
+                    extend_cache_indices = torch.arange(
+                        cache_indices.shape[0],
+                        dtype=cache_indices.dtype,
+                        device=cache_indices.device,
+                    )
+
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
+                ssm_states=extend_ssm_states,
+                cache_indices=extend_cache_indices,
                 query_start_loc=query_start_loc,
             )
             if last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )
-                ssm_states[cache_indices] = last_recurrent_state
             if not forward_batch.spec_algorithm.is_none():
                 last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
                     ssm_states.dtype, copy=False
@@ -363,6 +379,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )
+                if (
+                    not forward_batch.spec_algorithm.is_none()
+                    and forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_dst.numel() > 0
+                ):
+                    h_track_indices = forward_metadata.track_ssm_h_dst
+                    ssm_states[h_track_indices] = ssm_states[h_track_indices].transpose(
+                        -1, -2
+                    )
 
         return core_attn_out
 
@@ -387,7 +412,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         if intermediate_state is not None:
             intermediate_state = intermediate_state.view(
-                -1, num_value_heads, head_k_dim, head_v_dim
+                -1, num_value_heads, head_v_dim, head_k_dim
             )
 
         if self.graph_mode:
@@ -420,6 +445,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
 
         if intermediate_state is not None:
             intermediate_state = intermediate_state.view(
-                -1, seq_len, num_value_heads, head_k_dim, head_v_dim
+                -1, seq_len, num_value_heads, head_v_dim, head_k_dim
             )
         return attn_core_out
