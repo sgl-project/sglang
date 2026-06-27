@@ -4,7 +4,9 @@ metatags:
   description: "Best Practice for Kimi-K2.6 on Ascend NPU"
 ---
 
-This guide describes the best practice data for Kimi-K2.6 on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Kimi-K2.6 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Kimi-K2.6 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/kimi_k2_6).
+</Note>
 
 ### Low Latency
 
@@ -1006,7 +1008,7 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --trust-remote-code \
     --device npu \
     --attention-backend ascend \
@@ -1116,7 +1118,7 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 --port 6688 \
     --quantization modelslim \
     --dtype bfloat16 \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --trust-remote-code \
     --device npu \
     --attention-backend ascend \
@@ -1249,7 +1251,7 @@ python3 -m sglang.launch_server \
     --deepep-mode auto \
     --cuda-graph-bs 1 2 3 4 5 \
     --disable-radix-cache \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 4 \
@@ -1358,7 +1360,7 @@ python3 -m sglang.launch_server \
     --deepep-mode auto \
     --cuda-graph-bs 1 2 4 8 12 13 \
     --disable-radix-cache \
-    --model-loader-extra-config {"enable_multithread_load": true} \
+    --model-loader-extra-config '{"enable_multithread_load": true}' \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
     --speculative-num-steps 4 \

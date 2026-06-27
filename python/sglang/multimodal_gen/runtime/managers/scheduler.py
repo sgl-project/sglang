@@ -18,6 +18,8 @@ from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromTensorCheckerReqInput,
     UpdateWeightFromTensorReqInput,
@@ -138,6 +140,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self._handle_update_weights_from_tensor_checker
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
+            ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
@@ -214,6 +218,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         req = reqs[0]
         return self.worker.release_realtime_session(req.session_id)
 
+    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_disk request for RL workflows."""
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Cannot update weights while the server is sleeping. "
+                "Call resume_memory_occupation first."
+            )
+        return super()._handle_update_weights_from_disk(reqs)
+
     @staticmethod
     def _normalize_generation_reqs(reqs: list[Any]) -> list[Req]:
         if len(reqs) == 1 and isinstance(reqs[0], list):
@@ -249,6 +262,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ):
         """Dispatch generation requests, merging compatible requests when allowed."""
         reqs = self._normalize_generation_reqs(reqs)
+        if self.worker.is_sleeping():
+            raise RuntimeError(
+                "Server is sleeping. Call resume_memory_occupation first."
+            )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
@@ -1067,3 +1084,11 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         for pipe in self.result_pipes_from_slaves:
             results.append(pipe.recv())
         return results
+
+    def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.release_memory_occupation())
+
+    def _handle_resume_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[WAKE] handle_resume_memory_occupation on rank={self.gpu_id}")
+        return OutputBatch(output=self.worker.resume_memory_occupation())
