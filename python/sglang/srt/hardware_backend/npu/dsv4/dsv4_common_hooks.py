@@ -123,22 +123,6 @@ def maybe_write_dsv4_extend(
         )
 
 
-def maybe_write_dsv4_reserve_extend(
-    batch: ScheduleBatch,
-    cur_kv_lens_cpu: torch.Tensor,
-    nxt_kv_lens_cpu: torch.Tensor,
-) -> None:
-    """Post-reserve hook for speculative DSV4-NPU extend allocation."""
-    maybe_write_dsv4_extend(
-        batch,
-        batch.req_pool_indices_cpu,
-        cur_kv_lens_cpu,
-        nxt_kv_lens_cpu,
-        c4_state_alloc_offsets=cur_kv_lens_cpu,
-        c128_state_alloc_offsets=cur_kv_lens_cpu,
-    )
-
-
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,
     seq_lens_cpu: torch.Tensor,
