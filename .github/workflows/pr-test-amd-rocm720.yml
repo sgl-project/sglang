@@ -248,7 +248,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-sglang-mi300-1gpu.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -294,7 +294,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-sglang-mi300-2gpu.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -335,7 +335,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-sglang-mi300-1gpu.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -373,7 +373,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-sglang-mi300-1gpu.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -412,7 +412,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-sglang-mi300-1gpu.test]
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     runs-on: ${{matrix.runner}}
     steps:
@@ -451,7 +451,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-sglang-mi300-1gpu.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -527,7 +527,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-sglang-mi300-1gpu.test]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -566,7 +566,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-sglang-mi300-2gpu.test]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
@@ -605,7 +605,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-1gpu-sglang]
+        runner: [linux-sglang-mi300-1gpu.test]
         part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
@@ -745,7 +745,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-2gpu-sglang]
+        runner: [linux-sglang-mi300-2gpu.test]
         part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
@@ -884,7 +884,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-4gpu-sglang]
+        runner: [linux-sglang-mi300-8gpu.test]
         part: [0]
     runs-on: ${{matrix.runner}}
     steps:
@@ -938,11 +938,11 @@ jobs:
         )
       )
     env:
-      RUNNER_LABELS: linux-mi325-8gpu-sglang
+      RUNNER_LABELS: linux-sglang-mi300-8gpu.test
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-8gpu-sglang]
+        runner: [linux-sglang-mi300-8gpu.test]
         part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
