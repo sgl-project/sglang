@@ -42,15 +42,8 @@ class FastDiffuser(DllmAlgorithm):
         self.threshold: Optional[float] = cfg.get("threshold", None)
         self.max_steps: int = config.max_steps
         self.causal_context: bool = config.causal_context
-        self.tokens_per_step: Optional[int] = cfg.get("tokens_per_step", None)
 
         self._eos_token_id: Optional[int] = None
-
-        self._stats_forward_passes: int = 0
-        self._stats_tokens_generated: int = 0
-        self._stats_cuda_graph: int = 0
-        self._stats_eager: int = 0
-        self._stats_file: Optional[str] = cfg.get("stats_file", None)
 
         logger.info(
             "FastDiffuser: block_size=%d  max_steps=%d  temperature=%s  "
@@ -60,21 +53,6 @@ class FastDiffuser(DllmAlgorithm):
             self.temperature,
             self.threshold,
         )
-
-    def _flush_stats(self) -> None:
-        if not self._stats_file:
-            return
-        import json
-        import os
-
-        data = {
-            "forward_passes": self._stats_forward_passes,
-            "tokens_generated": self._stats_tokens_generated,
-        }
-        tmp = self._stats_file + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, self._stats_file)
 
     def _get_eos_id(self, model_runner: ModelRunner) -> Optional[int]:
         if self._eos_token_id is None:
@@ -87,6 +65,19 @@ class FastDiffuser(DllmAlgorithm):
             except (AttributeError, TypeError, ValueError, IndexError):
                 self._eos_token_id = None
         return self._eos_token_id
+
+    def _forward_for_kv_update(
+        self, model_runner: ModelRunner, forward_batch: ForwardBatch
+    ):
+        if not self.causal_context:
+            return model_runner.forward(forward_batch, pp_proxy_tensors=None)
+
+        previous = forward_batch.dllm_causal_kv_update
+        forward_batch.dllm_causal_kv_update = True
+        try:
+            return model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        finally:
+            forward_batch.dllm_causal_kv_update = previous
 
     def _compute_confidence(
         self,
@@ -199,27 +190,19 @@ class FastDiffuser(DllmAlgorithm):
             start_list.append(self.block_size - n_masks)
 
         finished = [False] * batch_size
-        req_steps_active = [0] * batch_size
 
         for step in range(self.max_steps):
             active_indices = [b for b in range(batch_size) if not finished[b]]
             if not active_indices:
                 break
-            for b in active_indices:
-                req_steps_active[b] += 1
 
-            self._stats_forward_passes += 1
             if len(active_indices) == batch_size:
                 out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             else:
                 compact_fb = self._compact_forward_batch(forward_batch, active_indices)
                 out = model_runner.forward(compact_fb, pp_proxy_tensors=None)
 
-            logits_output, can_run_graph = out.logits_output, out.can_run_graph
-            if can_run_graph:
-                self._stats_cuda_graph += 1
-            else:
-                self._stats_eager += 1
+            logits_output = out.logits_output
 
             for compact_i, orig_b in enumerate(active_indices):
                 lbs = compact_i * self.block_size
@@ -277,17 +260,12 @@ class FastDiffuser(DllmAlgorithm):
                     finished[orig_b] = True
 
         # Refresh KV/logits for the accepted block.
-        self._stats_forward_passes += 1
         if self.causal_context:
             forward_batch.dllm_causal_kv_update = True
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         if self.causal_context:
             forward_batch.dllm_causal_kv_update = False
         logits_output, can_run_graph = out.logits_output, out.can_run_graph
-        if can_run_graph:
-            self._stats_cuda_graph += 1
-        else:
-            self._stats_eager += 1
 
         # Threshold mode may leave masks; commit them before the next block.
         forced_any = False
@@ -314,49 +292,18 @@ class FastDiffuser(DllmAlgorithm):
                 forced_any = True
 
         if forced_any:
-            self._stats_forward_passes += 1
             if self.causal_context:
                 forward_batch.dllm_causal_kv_update = True
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             if self.causal_context:
                 forward_batch.dllm_causal_kv_update = False
             logits_output, can_run_graph = out.logits_output, out.can_run_graph
-            if can_run_graph:
-                self._stats_cuda_graph += 1
-            else:
-                self._stats_eager += 1
 
         token_grid = forward_batch.input_ids.reshape(batch_size, self.block_size)
         next_token_ids_list = [
             token_grid[b, start_list[b] :] for b in range(batch_size)
         ]
 
-        if self._stats_file:
-            import json as _json
-
-            with open(self._stats_file, "a") as _sf:
-                for b in range(batch_size):
-                    fp = req_steps_active[b]
-                    tokens = int(next_token_ids_list[b].shape[0])
-                    self._stats_tokens_generated += tokens
-                    tpfp = tokens / fp if fp > 0 else 0.0
-                    _sf.write(
-                        _json.dumps(
-                            {
-                                "forward_passes": fp,
-                                "tokens": tokens,
-                                "tokens_per_fp": round(tpfp, 4),
-                            }
-                        )
-                        + "\n"
-                    )
-
-        logger.debug(
-            "FastDiffuser block done: CG=%d  eager=%d  total_fp=%d",
-            self._stats_cuda_graph,
-            self._stats_eager,
-            self._stats_forward_passes,
-        )
         return logits_output, next_token_ids_list, can_run_graph
 
 

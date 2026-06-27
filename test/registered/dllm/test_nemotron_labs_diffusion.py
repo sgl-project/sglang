@@ -29,7 +29,7 @@ _COMMON_SERVER_ARGS = [
     "4",
     "--attention-backend",
     "flashinfer",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     "1",
     "2",
     "3",

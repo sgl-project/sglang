@@ -639,9 +639,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if skip_attn_backend_init:
             self.mark_forward_metadata_ready()
 
-    # For DLLM: when True the final KV-update pass inside FastDiffuser should use
-    # causal attention (matching HF's causal_context=True KV-update pass).
-    # Set by FastDiffuser.run() before the final forward, cleared afterwards.
+    # Select causal attention for FastDiffuser final KV updates.
     dllm_causal_kv_update: bool = False
 
     @classmethod

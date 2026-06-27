@@ -140,7 +140,7 @@ class ReqDllmMixin:
 
     def _update_block_offset_for_dllm(self):
         prefix_len = len(self.prefix_indices)
-        # LinearSpec can later accept partial blocks, so only the prompt is aligned.
+        # Generated blocks may be partially accepted; only the prompt must be aligned.
         if not self.output_ids and prefix_len % self.dllm_config.block_size != 0:
             raise ValueError(
                 f"DLLM prefix len {prefix_len} is not aligned to "

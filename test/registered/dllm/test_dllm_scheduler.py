@@ -2,11 +2,36 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from sglang.srt.dllm.algorithm.fastdiffuser import FastDiffuser
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+
+
+class TestFastDiffuserState(unittest.TestCase):
+    def test_causal_kv_flag_is_restored_after_forward_failure(self):
+        config = DllmConfig(
+            algorithm="FastDiffuser",
+            algorithm_config={},
+            block_size=32,
+            mask_id=100,
+            max_running_requests=1,
+            max_steps=32,
+            causal_context=True,
+        )
+        algorithm = FastDiffuser(config)
+        forward_batch = SimpleNamespace(dllm_causal_kv_update=False)
+        model_runner = SimpleNamespace(
+            forward=Mock(side_effect=RuntimeError("forward failed"))
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "forward failed"):
+            algorithm._forward_for_kv_update(model_runner, forward_batch)
+
+        self.assertFalse(forward_batch.dllm_causal_kv_update)
 
 
 class TestDllmPromptAdmission(unittest.TestCase):

@@ -861,9 +861,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
                     if self.is_dllm and self.dllm_config.causal_context:
-                        pre_verify = getattr(self, "_dllm_pre_verify_hook", None)
-                        if pre_verify is not None:
-                            pre_verify()
                         causal_variant = self._compose_variant_label(
                             variant_label, True
                         )
@@ -874,9 +871,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             causal_variant,
                             dllm_causal=True,
                         )
-                        post_verify = getattr(self, "_dllm_post_verify_hook", None)
-                        if post_verify is not None:
-                            post_verify()
 
     def capture_one_shape(
         self,

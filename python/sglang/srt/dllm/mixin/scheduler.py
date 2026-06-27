@@ -56,30 +56,36 @@ class SchedulerDllmMixin:
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
-        """Build the next DLLM batch."""
+        """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
         if self.enable_priority_preemption:
             running_batch.batch_is_full = False
 
+        # Early exit if batch is full or no requests available
         if self._should_skip_prefill():
             return None
 
         running_bs = len(running_batch.reqs)
         self.policy.calc_priority(self.waiting_queue)
 
+        # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs)
 
+        # Initialize DLLM manager and transfer requests
         self._prepare_staging_reqs()
         self._fetch_waiting_reqs()
 
+        # Process batches
         forward_mode = self._process_dllm_batches(adder)
 
         can_run_list = adder.can_run_list
         if not can_run_list:
             return None
 
+        # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
         self._update_state_for_batch(can_run_list, adder)
 
+        # Create and prepare batch
         batch = self._create_dllm_batch(can_run_list, forward_mode)
 
         return batch
@@ -219,20 +225,24 @@ class SchedulerDllmMixin:
         self.dllm_manager.staging_queue = []
 
     def _fetch_waiting_reqs(self: Scheduler):
+        # Calculate how many requests can be added to DLLM manager
         max_dllm_capacity = self.dllm_config.max_running_requests - len(
             self.dllm_manager.waiting_queue
         )
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
+
         if num_requests_to_add > 0:
             requests_to_add = self.waiting_queue[:num_requests_to_add]
             self.dllm_manager.add_waiting_reqs(requests_to_add)
             self.waiting_queue = self.waiting_queue[num_requests_to_add:]
 
     def _should_skip_prefill(self: Scheduler) -> bool:
+        """Check if DLLM prefill should be skipped."""
         if (
             running_batch.batch_is_full or not self.waiting_queue
         ) and self.dllm_manager.is_empty():
             return True
+
         running_bs = len(self.running_batch.reqs)
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
@@ -241,9 +251,11 @@ class SchedulerDllmMixin:
         ):
             running_batch.batch_is_full = True
             return True
+
         return False
 
     def _create_dllm_prefill_adder(self: Scheduler, running_bs: int) -> PrefillAdder:
+        """Create a prefill adder configured for DLLM scheduling."""
         return PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -269,6 +281,7 @@ class SchedulerDllmMixin:
             self._process_incoming_prefill_reqs(adder, incoming_prefill)
             return ForwardMode.EXTEND
 
+        # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
             self._process_batch_by_phase(
@@ -279,6 +292,7 @@ class SchedulerDllmMixin:
                 running_batch=running_batch,
             )
         else:
+            # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
             self._process_batch_by_phase(
                 adder,
@@ -324,6 +338,7 @@ class SchedulerDllmMixin:
         incoming_phase: DllmReqPhase,
         running_batch: ScheduleBatch,
     ) -> None:
+        """Process a batch, separating staging and incoming requests."""
         staging_reqs = [req for req in batch if req.dllm_phase == staging_phase]
         if staging_reqs:
             result = self.process_dllm_staging_reqs(adder, staging_reqs)
@@ -339,6 +354,8 @@ class SchedulerDllmMixin:
     def _update_state_for_batch(
         self: Scheduler, can_run_list: List[Req], adder: PrefillAdder
     ) -> None:
+        """Update state for the batch."""
+
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -354,6 +371,7 @@ class SchedulerDllmMixin:
         adder: PrefillAdder,
         running_batch: ScheduleBatch,
     ) -> ScheduleBatch:
+        """Create and prepare a new DLLM batch."""
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -368,6 +386,7 @@ class SchedulerDllmMixin:
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
+        # Record prefill stats for logging after forward
         from sglang.srt.managers.scheduler_components.metrics_reporter import (
             PrefillStats,
         )
@@ -386,12 +405,15 @@ class SchedulerDllmMixin:
         reqs: List[Req],
         running_batch: ScheduleBatch,
     ) -> AddReqResult:
+        """Process incoming DLLM requests with resource allocation and preemption."""
         res = AddReqResult.CONTINUE
         for req in reqs:
+            # Check if batch is full
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 running_batch.batch_is_full = True
 
+            # Try preemption if batch is full
             if self.running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
@@ -399,6 +421,7 @@ class SchedulerDllmMixin:
                 ):
                     break
 
+            # Prepare and add request
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -416,15 +439,23 @@ class SchedulerDllmMixin:
     def process_dllm_staging_reqs(
         self: Scheduler, adder: PrefillAdder, reqs: List[Req]
     ) -> AddReqResult:
+        """Process staging DLLM requests with resource allocation."""
         for req in reqs:
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
                 return res
+
         return AddReqResult.CONTINUE
 
 
 class DllmManager:
-    """Tracks active DLLM requests between scheduler rounds."""
+    """
+    Manager for Diffusion LLM request scheduling.
+
+    Maintains two queues:
+    - waiting_queue: The requests waiting to be scheduled with max running requests limit
+    - staging_queue: Requests allocated resources by PrefillAdder
+    """
 
     def __init__(self, dllm_config: Optional[DllmConfig] = None):
         self.dllm_config = dllm_config
@@ -435,38 +466,51 @@ class DllmManager:
         self.staging_queue: List[Req] = []
 
     def get_prefill_requests(self) -> List[Req]:
+        """Get all prefill requests from waiting queue."""
         return [req for req in self.waiting_queue if req.is_dllm_prefill()]
 
     def get_decode_requests(self) -> List[Req]:
+        """Get all decode requests from waiting queue."""
         return [req for req in self.waiting_queue if not req.is_dllm_prefill()]
 
     def add_waiting_reqs(self, reqs: Union[Req, List[Req]]) -> None:
-        assert self.dllm_config is not None
+        """Add requests to waiting queue with redundancy check."""
+        assert self.dllm_config is not None, "Diffusion LLM config is not set."
+
         reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
+
+        # Check for duplicate request IDs
         if self._has_duplicate_reqs(reqs_to_add):
             raise RuntimeError("Redundant requests detected in dLLM requests.")
+
         self.waiting_queue.extend(reqs_to_add)
 
     def add_staging_reqs(self, reqs: Union[Req, List[Req]]) -> None:
+        """Add requests to staging queue (allocated by PrefillAdder)."""
         reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
         self.staging_queue.extend(reqs_to_add)
 
     def _has_duplicate_reqs(self, reqs: List[Req]) -> bool:
+        """Check if any request ID already exists in waiting queue."""
         existing_rids: Set[str] = {r.rid for r in self.waiting_queue}
         return any(req.rid in existing_rids for req in reqs)
 
     def any_staging_reqs(self) -> bool:
+        """Check if there are requests in staging queue."""
         return self.dllm_config is not None and len(self.staging_queue) > 0
 
     def is_empty(self) -> bool:
+        """Check if both queues are empty or DLLM is not configured."""
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
 
     def increment_inflight_middle_chunks(self) -> None:
+        """Increment chunked count for all staging requests."""
         for req in self.staging_queue:
             req.inflight_middle_chunks += 1
 
     def filter_finished_reqs(self) -> None:
+        """Remove finished requests from both queues."""
         self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]

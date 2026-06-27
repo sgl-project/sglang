@@ -739,8 +739,7 @@ class PrefillAdder:
         return _rem_tokens
 
     def _add_dllm_req(self, req: Req, prefix_len: int):
-        # DLLM block_size (e.g. 32) is smaller than page_size (e.g. 64),
-        # so do NOT floor-divide by page_size or trunc_len becomes 0.
+        # A DLLM block can be smaller than one KV page.
         trunc_len = min(self.rem_dllm_tokens, self.dllm_block_size)
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
@@ -756,11 +755,7 @@ class PrefillAdder:
         )
 
     def add_dllm_prompt_cache_req(self, req: Req) -> AddReqResult:
-        """Add an INCOMING_PREFILL request using standard prefill budget.
-
-        Schedules the full prompt as a regular EXTEND pass (no mask tokens, no
-        DLLM block budget).  Used to cache prompt KV before denoising begins.
-        """
+        """Schedule prompt KV caching as a regular extend pass."""
         total_tokens = req.extend_range.length + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,

@@ -1997,7 +1997,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     dllm_algorithm: A[
         Optional[str],
-        "The diffusion LLM algorithm, such as LinearSpec or FastDiffuser.",
+        "The diffusion LLM algorithm, such as LowConfidence or FastDiffuser.",
     ] = None
     dllm_algorithm_config: A[
         Optional[str],

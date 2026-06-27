@@ -1522,7 +1522,6 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -2684,10 +2683,8 @@ class Scheduler(
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
-            # DLLM reqs manage KV explicitly (via req_to_token_pool).  Skip
-            # stash_chunked_request to avoid inserting mask-token keys into the
-            # radix tree and the double-free that would follow from tree eviction
-            # freeing pages that were also freed by the stale-KV cleanup step.
+            # Stashing DLLM mask-token KV in the radix tree would create
+            # duplicate ownership and a later double-free.
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge

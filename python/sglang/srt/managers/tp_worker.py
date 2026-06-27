@@ -430,10 +430,6 @@ class TpModelWorker(BaseTpWorker):
 
         if self.server_args.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
-            # Let the algorithm load auxiliary weights and set CUDA graph
-            # capture hooks before graphs are captured.
-            if hasattr(self.dllm_algorithm, "setup"):
-                self.dllm_algorithm.setup(self._model_runner)
         else:
             self.dllm_algorithm = None
 
