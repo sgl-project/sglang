@@ -105,6 +105,11 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS = (
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4ForCausalLMNextN",
+)
+CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS = ("file", "mooncake")
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
@@ -934,6 +939,10 @@ class ServerArgs:
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     prefill_cp_mode: A[str, Arg(no_cli=True)] = "in-seq-split"
+    enable_cp_kv_layer_split: A[
+        bool,
+        "Prefill CP KV layer split: shard KV cache by transformer layer across attention-CP ranks on prefill-only servers (experimental).",
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,
@@ -2622,6 +2631,12 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+
+        # Re-apply after model-specific defaults resolve attention_backend so
+        # canonical CP mirrors to the right legacy runtime aliases before
+        # LayerSplit adjusts CUDA graph settings.
+        self._handle_legacy_cp_arguments()
+        self._handle_cp_kv_layer_split()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -5225,6 +5240,112 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _handle_cp_kv_layer_split(self):
+        if not self.enable_cp_kv_layer_split:
+            return
+
+        if (
+            self.model_path.lower() not in ("none", "dummy")
+            and parse_connector_type(self.model_path) != ConnectorType.INSTANCE
+        ):
+            model_arch = self.get_model_config().hf_config.architectures[0]
+            if model_arch not in CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS:
+                supported = ", ".join(CP_KV_LAYER_SPLIT_SUPPORTED_MODEL_ARCHS)
+                raise ValueError(
+                    "--enable-cp-kv-layer-split is not supported for model arch "
+                    f"{model_arch!r}. Supported architectures: {supported}."
+                )
+
+        backend = self.hicache_storage_backend
+        if (
+            backend is not None
+            and backend not in CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS
+        ):
+            supported = ", ".join(CP_KV_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS)
+            raise ValueError(
+                f"--enable-cp-kv-layer-split + --hicache-storage-backend={backend!r} "
+                f"is not yet supported. Supported backends under CP KV LayerSplit: {supported}."
+            )
+
+        if not self.enable_dsa_prefill_context_parallel:
+            raise ValueError(
+                "--enable-cp-kv-layer-split requires "
+                "--enable-prefill-cp --cp-strategy interleave "
+                "(or the deprecated --enable-dsa-prefill-context-parallel / "
+                "--enable-nsa-prefill-context-parallel aliases)"
+            )
+        if self.attn_cp_size <= 1:
+            raise ValueError("--enable-cp-kv-layer-split requires --attn-cp-size > 1")
+        if self.dsa_prefill_cp_mode != "round-robin-split":
+            raise ValueError(
+                "--enable-cp-kv-layer-split requires "
+                "--cp-strategy interleave "
+                "(deprecated mode name: round-robin-split)"
+            )
+        if self.disaggregation_mode != "prefill":
+            raise ValueError(
+                "--enable-cp-kv-layer-split is currently supported only on "
+                "prefill-only servers. Set --disaggregation-mode prefill."
+            )
+        if self.enable_hisparse:
+            raise ValueError(
+                "--enable-cp-kv-layer-split is incompatible with --enable-hisparse"
+            )
+        if self.prefill_only_disable_kv_cache:
+            raise ValueError(
+                "--enable-cp-kv-layer-split is incompatible with "
+                "--prefill-only-disable-kv-cache"
+            )
+        if self.enable_prefill_context_parallel:
+            raise ValueError(
+                "--enable-cp-kv-layer-split is only supported with "
+                "--enable-dsa-prefill-context-parallel, not "
+                "--enable-prefill-context-parallel"
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--enable-cp-kv-layer-split is not validated with speculative "
+                "decoding yet"
+            )
+        if is_hip():
+            raise ValueError(
+                "--enable-cp-kv-layer-split is currently supported only on CUDA"
+            )
+        if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+            raise ValueError(
+                "--enable-cp-kv-layer-split requires the Compressor V2 path"
+            )
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if is_unified_kv_triton():
+            raise ValueError(
+                "--enable-cp-kv-layer-split is incompatible with "
+                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton"
+            )
+        if self.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+            raise ValueError(
+                "--enable-cp-kv-layer-split currently supports PD transfer only "
+                "with --disaggregation-transfer-backend mooncake or nixl"
+            )
+
+        cuda_graph_config = getattr(self, "cuda_graph_config", None)
+        if cuda_graph_config is not None:
+            if cuda_graph_config.decode.backend != Backend.DISABLED:
+                logger.warning(
+                    "Disabling decode CUDA graph because --enable-cp-kv-layer-split "
+                    "is currently prefill-only."
+                )
+                cuda_graph_config.decode.backend = Backend.DISABLED
+            if cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "Disabling prefill CUDA graph because --enable-cp-kv-layer-split "
+                    "is currently prefill-only."
+                )
+                cuda_graph_config.prefill.backend = Backend.DISABLED
+        self.disable_cuda_graph = True
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

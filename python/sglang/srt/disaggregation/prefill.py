@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.cp_kv_layer_split import is_cp_kv_layer_split_pool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -158,6 +159,11 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_data_layout = (
+            self.token_to_kv_pool.get_kv_transfer_layout()
+            if hasattr(self.token_to_kv_pool, "get_kv_transfer_layout")
+            else []
+        )
 
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
@@ -168,10 +174,17 @@ class PrefillBootstrapQueue:
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            kv_data_layout = []
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_data_layout = kv_data_layout
+
+        kv_args.cp_kv_layer_split = (
+            is_cp_kv_layer_split_pool(self.token_to_kv_pool)
+            and self.token_to_kv_pool.is_any_family_sharded()
+        )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
+    CP_KV_LAYER_SPLIT_STORAGE_SUFFIX,
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -29,6 +30,23 @@ DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 
 logger = logging.getLogger(__name__)
+
+
+def _with_cp_kv_layer_split_suffixes(
+    mha_suffix, mla_suffix, attn_cp_rank: int, attn_cp_size: int
+):
+    def _append_token(suffix, token: str):
+        if isinstance(suffix, list):
+            return [f"{s}_{token}" if s else token for s in suffix]
+        return f"{suffix}_{token}" if suffix else token
+
+    mha_suffix = _append_token(mha_suffix, CP_KV_LAYER_SPLIT_STORAGE_SUFFIX)
+    mla_suffix = _append_token(mla_suffix, CP_KV_LAYER_SPLIT_STORAGE_SUFFIX)
+    if attn_cp_size > 1:
+        cp_token = f"cp{attn_cp_rank}_{attn_cp_size}"
+        mha_suffix = _append_token(mha_suffix, cp_token)
+        mla_suffix = _append_token(mla_suffix, cp_token)
+    return mha_suffix, mla_suffix
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -555,6 +573,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
+
+            cp_kv_layer_split = bool(
+                getattr(self.storage_config, "cp_kv_layer_split", False)
+            )
+            if cp_kv_layer_split:
+                self.mha_suffix, self.mla_suffix = _with_cp_kv_layer_split_suffixes(
+                    self.mha_suffix,
+                    self.mla_suffix,
+                    self.attn_cp_rank,
+                    self.attn_cp_size,
+                )
 
             self.registered_pools = {}
 

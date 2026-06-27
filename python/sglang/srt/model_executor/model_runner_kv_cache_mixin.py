@@ -15,7 +15,12 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
+    get_attention_cp_rank,
+    get_attention_cp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -26,6 +31,10 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.cp_kv_layer_split import should_use_cp_kv_layer_split_pool
+from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_pool import (
+    CpKvLayerSplitDeepSeekV4TokenToKVPool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -485,7 +494,7 @@ class ModelRunnerKVCacheMixin:
                 c4_state_pool_size = self.c4_state_pool_size
                 c128_state_pool_size = self.c128_state_pool_size
 
-            self.token_to_kv_pool = pool_cls(
+            pool_kwargs = dict(
                 max_num_reqs=self.max_running_requests,
                 # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
                 # past max_running_requests (pre-alloc), so size to the real capacity.
@@ -515,6 +524,24 @@ class ModelRunnerKVCacheMixin:
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
             )
+            if should_use_cp_kv_layer_split_pool(self.server_args):
+                self.token_to_kv_pool = CpKvLayerSplitDeepSeekV4TokenToKVPool(
+                    cp_rank=get_attention_cp_rank(),
+                    cp_size=get_attention_cp_size(),
+                    model_num_hidden_layers=len(self.model_config.compress_ratios),
+                    cp_kv_layer_split_staging_context_len=(
+                        self.model_config.context_len
+                    ),
+                    cp_kv_layer_split_staging_chunked_prefill_size=(
+                        self.server_args.chunked_prefill_size
+                    ),
+                    cp_kv_layer_split_staging_max_prefill_tokens=(
+                        self.server_args.max_prefill_tokens
+                    ),
+                    **pool_kwargs,
+                )
+            else:
+                self.token_to_kv_pool = pool_cls(**pool_kwargs)
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()
@@ -977,6 +1004,18 @@ class ModelRunnerKVCacheMixin:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        # CP KV layer split broadcasts full per-layer page buffers between
+        # attention-CP ranks. Capacity must therefore be identical within the CP
+        # group so every rank allocates the same page-buffer shape.
+        if should_use_cp_kv_layer_split_pool(self.server_args):
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_attention_cp_group().cpu_group,
             )
             token_capacity = tensor.item()
 

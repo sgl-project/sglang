@@ -29,8 +29,14 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     group_concurrent_contiguous,
+    pack_int_list,
     pack_int_lists,
+    pack_nested_transfer_layout,
+    pack_transfer_layout,
+    unpack_int_list,
     unpack_int_lists,
+    unpack_nested_transfer_layout,
+    unpack_transfer_layout,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -122,9 +128,11 @@ class KVArgsRegisterInfo:
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
-    # Keep last: optional, parsed from a variable-length tail of the ZMQ
-    # frame in from_zmq() below, so positional construction stays stable.
+    # Keep optional fields after the stable registration prefix.
     staging: Optional[StagingRegisterInfo] = None
+    dst_kv_data_layout: Optional[list] = None
+    dst_state_data_layouts: Optional[List[list]] = None
+    dst_kv_item_lens: Optional[List[int]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -158,6 +166,13 @@ class KVArgsRegisterInfo:
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            dst_kv_data_layout=(
+                unpack_transfer_layout(msg[17]) if len(msg) > 17 else []
+            ),
+            dst_state_data_layouts=(
+                unpack_nested_transfer_layout(msg[18]) if len(msg) > 18 else []
+            ),
+            dst_kv_item_lens=unpack_int_list(msg[19], "I") if len(msg) > 19 else [],
         )
 
 
@@ -678,6 +693,14 @@ class NixlKVManager(CommonKVManager):
 
     def _prepare_payload_xfer(self, peer_info: KVArgsRegisterInfo):
         if self.is_mla_backend or peer_info.decode_tp_size == self.attn_tp_size:
+            if self._layouts_require_descriptor_matching(
+                getattr(self.kv_args, "kv_data_layout", []) or [],
+                peer_info.dst_kv_data_layout or [],
+                self.kv_args.kv_item_lens,
+                peer_info.dst_kv_item_lens or [],
+            ):
+                return
+
             # Safe to use prefill's kv_item_lens for the dst dlist stride:
             # equal_tp guarantees identical heads-per-rank (same item_len);
             # MLA latent shape is TP-invariant.
@@ -808,6 +831,8 @@ class NixlKVManager(CommonKVManager):
                                     chunked_dst_kv_indice,
                                     dst_info.gpu_id,
                                     notif,
+                                    dst_info.dst_kv_data_layout,
+                                    dst_info.dst_kv_item_lens,
                                 )
                             else:
                                 kv_xfer_handle = self.send_kvcache_slice(
@@ -833,6 +858,7 @@ class NixlKVManager(CommonKVManager):
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
                                 dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                                dst_state_data_layouts=dst_info.dst_state_data_layouts,
                             )
                             handles.extend(
                                 h for h in state_xfer_handles if h is not None
@@ -947,6 +973,31 @@ class NixlKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prepare_payload_xfer(decode_kv_args)
 
+    @staticmethod
+    def _layouts_require_descriptor_matching(
+        src_data_layout, dst_data_layout, src_item_lens=None, dst_item_lens=None
+    ) -> bool:
+        if not src_data_layout and not dst_data_layout:
+            return False
+        if not src_data_layout or not dst_data_layout:
+            return True
+        if len(src_data_layout) != len(dst_data_layout):
+            return True
+        if src_item_lens and dst_item_lens:
+            if len(src_item_lens) != len(dst_item_lens):
+                return True
+            if any(
+                int(src) != int(dst) for src, dst in zip(src_item_lens, dst_item_lens)
+            ):
+                return True
+
+        for src_key, dst_key in zip(src_data_layout, dst_data_layout):
+            if src_key is None or dst_key is None:
+                return True
+            if tuple(src_key) != tuple(dst_key):
+                return True
+        return False
+
     def _send_kvcache_generic(
         self,
         peer_name: str,
@@ -957,6 +1008,9 @@ class NixlKVManager(CommonKVManager):
         dst_data_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        src_data_layout=None,
+        dst_data_layout=None,
+        dst_item_lens=None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra."""
@@ -965,6 +1019,9 @@ class NixlKVManager(CommonKVManager):
             src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
+            and not self._layouts_require_descriptor_matching(
+                src_data_layout, dst_data_layout, item_lens, dst_item_lens or []
+            )
         ):
             src_prep = self.prep_handles[""]
             dst_prep = self.prep_handles[peer_name]
@@ -1013,17 +1070,26 @@ class NixlKVManager(CommonKVManager):
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         if self.is_mla_backend:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+            layers_params = self.build_descriptor_matched_transfer_params(
+                src_data_ptrs,
+                dst_data_ptrs,
+                item_lens,
+                src_data_layout,
+                dst_data_layout,
+                dst_item_lens,
             )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+            if layers_params is None:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
                 )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -1110,6 +1176,8 @@ class NixlKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        dst_kv_data_layout=None,
+        dst_kv_item_lens=None,
     ):
         return self._send_kvcache_generic(
             peer_name=peer_name,
@@ -1120,6 +1188,9 @@ class NixlKVManager(CommonKVManager):
             dst_data_indices=dst_kv_indices,
             dst_gpu_id=dst_gpu_id,
             notif=notif,
+            src_data_layout=getattr(self.kv_args, "kv_data_layout", []) or [],
+            dst_data_layout=dst_kv_data_layout or [],
+            dst_item_lens=dst_kv_item_lens or [],
         )
 
     def send_kvcache_slice(
@@ -1559,6 +1630,7 @@ class NixlKVManager(CommonKVManager):
         decode_tp_rank: int = 0,
         dst_state_item_lens: List[List[int]] | None = None,
         dst_state_dim_per_tensor: List[List[int]] | None = None,
+        dst_state_data_layouts: List[list] | None = None,
     ):
         """Send state per hybrid component, dispatching by state_type[i]."""
         state_types = getattr(self.kv_args, "state_types", []) or []
@@ -1569,6 +1641,7 @@ class NixlKVManager(CommonKVManager):
         )
         dst_state_item_lens = dst_state_item_lens or []
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
+        dst_state_data_layouts = dst_state_data_layouts or []
 
         handles = []
         for i, st in enumerate(state_types):
@@ -1582,11 +1655,19 @@ class NixlKVManager(CommonKVManager):
             src_dims = (
                 src_state_dim_per_tensor[i] if i < len(src_state_dim_per_tensor) else []
             )
+            src_layout = (
+                self.kv_args.state_data_layouts[i]
+                if i < len(getattr(self.kv_args, "state_data_layouts", []))
+                else []
+            )
             dst_ptrs = dst_state_data_ptrs[i] if i < len(dst_state_data_ptrs) else []
             dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else []
             dst_lens = dst_state_item_lens[i] if i < len(dst_state_item_lens) else []
             dst_dims = (
                 dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else []
+            )
+            dst_layout = (
+                dst_state_data_layouts[i] if i < len(dst_state_data_layouts) else []
             )
             comp_notif = f"{notif}_{i}"
 
@@ -1637,6 +1718,9 @@ class NixlKVManager(CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
+                    src_data_layout=src_layout,
+                    dst_data_layout=dst_layout,
+                    dst_item_lens=dst_lens,
                 )
             else:
                 raise RuntimeError(
@@ -2107,6 +2191,15 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_kv_item_lens = pack_int_list(
+                self.kv_mgr.kv_args.kv_item_lens or [], "I"
+            )
+            packed_kv_data_layout = pack_transfer_layout(
+                getattr(self.kv_mgr.kv_args, "kv_data_layout", []) or []
+            )
+            packed_state_data_layouts = pack_nested_transfer_layout(
+                getattr(self.kv_mgr.kv_args, "state_data_layouts", []) or []
+            )
 
             # Include staging allocator metadata if available
             if (
@@ -2145,6 +2238,9 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_staging_base_ptr,
                         staging_total_size_str,
                         str(dst_num_slots).encode("ascii"),
+                        packed_kv_data_layout,
+                        packed_state_data_layouts,
+                        packed_kv_item_lens,
                     ]
                 )
 
