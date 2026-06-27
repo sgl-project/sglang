@@ -539,7 +539,20 @@ jobs:
   # GB300 (Grace-Blackwell NVL4) performance tests - 4 GPU (ARM64)
   nightly-test-perf-4-gpu-gb300:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-4-gpu-gb300')
-    runs-on: 4-gpu-gb300
+    name: nightly-test-perf-4-gpu-gb300 (${{ matrix.model }})
+    runs-on: 4-gpu-gb300-nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: glm5-nvfp4
+            suite: nightly-4-gpu-gb300-glm5-nvfp4
+          - model: qwen35-fp8
+            suite: nightly-4-gpu-gb300-qwen35-fp8
+          - model: deepseek-v4-pro-fp4
+            suite: nightly-4-gpu-gb300-deepseek-v4-pro-fp4
+          - model: kimi-k25-nvfp4
+            suite: nightly-4-gpu-gb300-kimi-k25-nvfp4
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -549,8 +562,10 @@ jobs:
       - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
+        env:
+          GRACE_BLACKWELL: "1"
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_deepep.sh
 
       - name: Run test
         timeout-minutes: 600
@@ -560,7 +575,7 @@ jobs:
           GPU_CONFIG: "4-gpu-gb300"
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite nightly-4-gpu-gb300 --nightly --continue-on-error --timeout-per-file 7200
+          python3 run_suite.py --hw cuda --suite ${{ matrix.suite }} --nightly --continue-on-error --timeout-per-file 7200
 
       - name: Publish traces to storage repo
         if: always()
