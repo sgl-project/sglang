@@ -69,7 +69,7 @@ HIGH_THROUGHPUT_ARGS = [
     "--moe-a2a-backend",
     "megamoe",
     "--mem-fraction-static",
-    "0.85",
+    "0.9",
     "--cuda-graph-max-bs",
     "128",
     "--max-running-requests",
