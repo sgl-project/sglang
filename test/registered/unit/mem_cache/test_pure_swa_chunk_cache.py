@@ -1,14 +1,13 @@
 """Unit tests for all-SWA ChunkCache release semantics."""
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
