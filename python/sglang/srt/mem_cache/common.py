@@ -81,7 +81,10 @@ def free_swa_out_of_window_slots(
     assert (
         req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
-    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
+    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
+    if page_size > 1 and evict_floor > req.cache_protected_len:
+        evict_floor = -(-evict_floor // page_size) * page_size
+    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
 
     # Subtract an extra page_size so the eviction frontier never reaches the
     # radix tree insert boundary (page_floor(seq_len)). This keeps at least one

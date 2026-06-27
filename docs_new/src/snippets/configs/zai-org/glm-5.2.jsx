@@ -635,16 +635,16 @@ sgl-eval run aime25 \\
     },
 
     // ====================================================================
-    // NVFP4 (Blackwell Ultra) — nvidia/GLM-5.2-NVFP4 (Model Optimizer).
-    // TP4 on B300 / GB300, low-latency + balanced. GB300 mirrors the B300
-    // recipe (same TP4 / flags; the 4-GPU GB300 node fits the ~381 GB build).
+    // NVFP4 (Blackwell Ultra) — nvidia/GLM-5.2-NVFP4 (Model Optimizer). TP4.
+    // B300: low-latency + balanced (the 4-GPU GB300 node fits the ~381 GB build).
+    // GB300: low-latency / balanced / high-throughput measured on a single 4xGB300
+    // node — balanced & high-throughput add DP-Attention (dp4); low-latency uses MTP 5-1-6.
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
@@ -663,7 +663,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
@@ -678,7 +677,6 @@ sgl-eval run aime25 \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
@@ -687,7 +685,7 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.8",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -697,12 +695,37 @@ sgl-eval run aime25 \\
       verified: true,
       env: [],
       flags: [
-        "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--quantization modelopt_fp4",
+        "--dp 4",
+        "--enable-dp-attention",
+        // Shorter draft (MTP 2-1-3) than low-latency's 5-1-6: at this concurrency the
+        // verify overhead of a long draft outweighs the accept-length gain.
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 2",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 3",
         "--chunked-prefill-size 8192",
-        "--mem-fraction-static 0.8",
+        "--mem-fraction-static 0.92",
+        "--max-running-requests 256",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--chunked-prefill-size 8192",
+        "--mem-fraction-static 0.92",
+        "--max-running-requests 512",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
