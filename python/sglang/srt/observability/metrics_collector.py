@@ -2046,10 +2046,10 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
             buckets=[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24, 32, 64],
         )
 
-        # Encoder batch E2E latency histogram (in seconds)
-        self.encoder_e2e_latency_seconds = Histogram(
-            name="sglang:encoder_batch_e2e_latency_seconds",
-            documentation="Histogram of encoder batch end-to-end latency in seconds.",
+        # Per-request E2E encoder latency
+        self.encoder_request_e2e_latency_seconds = Histogram(
+            name="sglang:encoder_request_e2e_latency_seconds",
+            documentation="Histogram of per-request end-to-end encoder latency in seconds (queue wait + encode).",
             labelnames=list(labels.keys()) + ["modality"],
             buckets=[0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60],
         )
@@ -2165,11 +2165,11 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
         """
         self.requests_received_total.labels(**self.labels, modality=modality).inc()
 
-    def observe_e2e_latency(
+    def observe_request_e2e_latency(
         self, latency_seconds: float, modality: str = "image"
     ) -> None:
-        """Record encoder batch end-to-end latency in seconds."""
-        self.encoder_e2e_latency_seconds.labels(
+        """Record per-request end-to-end encoder latency in seconds."""
+        self.encoder_request_e2e_latency_seconds.labels(
             **self.labels, modality=modality
         ).observe(latency_seconds)
 

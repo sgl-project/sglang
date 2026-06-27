@@ -2502,10 +2502,6 @@ class EncoderScheduler:
 
         try:
             results = await self.encoder.batch_encode(requests, modality)
-            if encoder_metrics_collector is not None:
-                encoder_metrics_collector.observe_e2e_latency(
-                    time.time() - start, modality=modality_str
-                )
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
@@ -2563,10 +2559,6 @@ class EncoderScheduler:
                 for sock in self.send_sockets:
                     sock_send(sock, wrap_as_pickle(req))
                 result = await self.encoder.encode_request(req, modality)
-                if encoder_metrics_collector is not None:
-                    encoder_metrics_collector.observe_e2e_latency(
-                        time.time() - start, modality=modality_str
-                    )
                 if not p.future.done():
                     p.future.set_result(result)
             except Exception as e:
@@ -2636,6 +2628,8 @@ async def _dp_worker_encode_and_send(
         time_stats.decode_json(time_stats_json)
     request["enter_time"] = time.time()
     modality = Modality.from_str(request["modality"])
+    time_stats.modality = modality.name.lower()
+    time_stats.set_metrics_collector(encoder_metrics_collector)
     backend = enc.server_args.encoder_transfer_backend
 
     # URL state lives in main process module globals; workers don't see it.
@@ -3781,8 +3775,10 @@ async def handle_encode_request(request: dict):
             if time_stats_json:
                 time_stats.decode_json(time_stats_json)
 
-            time_stats.set_mm_encode_start_time()
             modality_str = modality.name.lower()
+            time_stats.modality = modality_str
+            time_stats.set_metrics_collector(encoder_metrics_collector)
+            time_stats.set_mm_encode_start_time()
             if encoder_metrics_collector is not None:
                 encoder_metrics_collector.inc_requests_received(modality=modality_str)
             if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
