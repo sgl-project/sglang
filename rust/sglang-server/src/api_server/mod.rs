@@ -6,8 +6,13 @@
 //! ingress pipeline, and then either awaits a single `Done` (unary) or relays
 //! frames as Server-Sent Events (streaming), byte-compatible with the Python
 //! `http_server.generate_request` (`data: {json}\n\n` … `data: [DONE]\n\n`).
+//!
+//! The OpenAI-compatible endpoints (`/v1/*`) live in the [`openai`] submodule;
+//! they share this module's [`AppState`] and submit machinery. Future protocols
+//! (e.g. Anthropic) get their own sibling submodule the same way.
 
-use std::convert::Infallible;
+mod openai;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -21,15 +26,25 @@ use axum::{
     },
     routing::{get, post},
 };
+use std::convert::Infallible;
 use tokio::sync::mpsc;
 
 use crate::fsm::RequestState;
 use crate::ids::RequestIdGen;
+use dynamo_renderer::PromptFormatter;
+
 use crate::message::{
-    ControlRequest, EgressItem, GeneratePayload, GenerateRequest, Request, RequestKind,
+    ControlRequest, EgressItem, GeneratePayload, GenerateRequest, GenerationOutput, Request,
+    RequestKind,
 };
 use crate::runtime::ServerArgs;
 use crate::runtime::channels::{Senders, TmEvent};
+
+/// Built once at startup from the model's `tokenizer_config.json` (`None` when
+/// the model has no chat template, or under `skip_tokenizer_init`). `Clone` is a
+/// refcount bump (the formatter is `Arc`-backed), so it rides on `AppState`.
+#[derive(Clone)]
+struct ChatFormatter(PromptFormatter);
 
 /// Shared state for every handler. Holds the submit machinery (`senders`,
 /// `id_gen`, `egress_buf`) plus the static `ServerArgs` read by `/v1/models`.
@@ -41,6 +56,8 @@ struct AppState {
     id_gen: Arc<RequestIdGen>,
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
+    /// `None` when the model has no chat template → `/v1/chat/completions` 400s.
+    chat: Option<ChatFormatter>,
 }
 
 pub async fn serve(
@@ -50,20 +67,28 @@ pub async fn serve(
     egress_buf: usize,
     server_args: Arc<ServerArgs>,
 ) {
+    let chat = openai::load_chat_formatter(&server_args).map(ChatFormatter);
     let state = AppState {
         senders,
         id_gen,
         egress_buf,
         server_args,
+        chat,
     };
     let app = Router::new()
         .route("/generate", post(generate))
+        // OpenAI-compatible: same tokenize→generate→detok pipeline, OpenAI shape.
+        .route("/v1/completions", post(openai::openai_completions))
+        .route(
+            "/v1/chat/completions",
+            post(openai::openai_chat_completions),
+        )
         // Control-plane endpoints: each reuses the ingress FSM (no tokenization)
         // and returns a single, non-streamed JSON result from the scheduler.
         // Adding one = a route line passing its scheduler request-struct tag.
         .route("/server_info", get(server_info))
         // Static config endpoint (OpenAI-compatible): no scheduler round-trip.
-        .route("/v1/models", get(available_models))
+        .route("/v1/models", get(openai::available_models))
         .with_state(state);
 
     match tokio::net::TcpListener::bind(bind).await {
@@ -75,37 +100,6 @@ pub async fn serve(
         }
         Err(e) => tracing::error!(error = %e, %bind, "failed to bind api server"),
     }
-}
-
-/// `GET /v1/models` — OpenAI-compatible model list. Served from `server_args`;
-/// no scheduler round-trip. Mirrors `http_server.available_models`.
-///
-/// TODO(v1/models): when `--enable-lora`, append a `ModelCard` per loaded LoRA
-/// adapter (`id=lora_name, root=lora_path, parent=served_model_name,
-/// max_model_len=None`). Adapters load/unload at runtime, so that part needs a
-/// control-request query to the scheduler's LoRA registry.
-async fn available_models(State(state): State<AppState>) -> Response {
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let name = state.server_args.served_model_name();
-    let base = serde_json::json!({
-        "id": name,
-        "object": "model",
-        "created": created,
-        "owned_by": "sglang",
-        "root": name,
-        "parent": serde_json::Value::Null,
-        "max_model_len": state.server_args.context_len(),
-    });
-    let list = serde_json::json!({ "object": "list", "data": [base] });
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        serde_json::to_vec(&list).unwrap_or_default(),
-    )
-        .into_response()
 }
 
 /// Submit a request into the ingress pipeline. Returns the per-request egress
@@ -144,14 +138,39 @@ async fn await_control_result(
         .await
         .map_err(|()| (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())?;
     match rx.recv().await {
-        Some(EgressItem::Done(bytes)) | Some(EgressItem::Frame(bytes)) => Ok(bytes),
+        Some(EgressItem::Control(bytes)) => Ok(bytes),
         Some(EgressItem::Error(e)) => {
             let code =
                 StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Err((code, e.to_string()).into_response())
         }
+        // A control request never receives generation frames.
+        Some(EgressItem::Frame(_)) | Some(EgressItem::Done(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected generation output for control request",
+        )
+            .into_response()),
         None => Err((StatusCode::from_u16(499).unwrap(), "request aborted").into_response()),
     }
+}
+
+/// Format a neutral [`GenerationOutput`] as one SGLang `/generate` frame. Lives
+/// in the handler now that the detok shard is protocol-neutral. `output_ids` is
+/// surfaced only in `skip_tokenizer_init` mode (cumulative, non-empty there).
+fn sglang_frame(out: &GenerationOutput) -> Vec<u8> {
+    let mut v = serde_json::json!({
+        "text": out.text,
+        "meta_info": {
+            "id": out.rid,
+            "prompt_tokens": out.prompt_tokens,
+            "completion_tokens": out.completion_tokens,
+            "finish_reason": out.finish_reason.as_deref().map(|r| serde_json::json!({ "type": r })),
+        },
+    });
+    if !out.output_ids.is_empty() {
+        v["output_ids"] = serde_json::json!(out.output_ids);
+    }
+    serde_json::to_vec(&v).unwrap_or_default()
 }
 
 /// Generic control endpoint: returns the scheduler's response rendered straight
@@ -247,11 +266,13 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         let s = async_stream::stream! {
             while let Some(item) = rx.recv().await {
                 match item {
-                    EgressItem::Frame(bytes) => {
-                        yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&bytes)));
+                    EgressItem::Frame(out) => {
+                        let f = sglang_frame(&out);
+                        yield Ok::<_, Infallible>(Event::default().data(String::from_utf8_lossy(&f)));
                     }
-                    EgressItem::Done(bytes) => {
-                        yield Ok(Event::default().data(String::from_utf8_lossy(&bytes)));
+                    EgressItem::Done(out) => {
+                        let f = sglang_frame(&out);
+                        yield Ok(Event::default().data(String::from_utf8_lossy(&f)));
                         break;
                     }
                     EgressItem::Error(e) => {
@@ -261,6 +282,8 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                         yield Ok(Event::default().data(body.to_string()));
                         break;
                     }
+                    // Control results never arrive on a `/generate` request.
+                    EgressItem::Control(_) => break,
                 }
             }
             yield Ok(Event::default().data("[DONE]"));
@@ -271,11 +294,11 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         while let Some(item) = rx.recv().await {
             match item {
                 EgressItem::Frame(_) => continue, // ignore intermediate for unary
-                EgressItem::Done(bytes) => {
+                EgressItem::Done(out) => {
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
-                        bytes,
+                        sglang_frame(&out),
                     )
                         .into_response();
                 }
@@ -287,6 +310,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                     });
                     return (code, Json(body)).into_response();
                 }
+                EgressItem::Control(_) => continue, // never on `/generate`
             }
         }
         // Sender dropped without a terminal item → treated as aborted.

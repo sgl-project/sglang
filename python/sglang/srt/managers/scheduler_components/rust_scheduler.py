@@ -161,21 +161,24 @@ class RustServer:
 
         Fan the batch out into per-request ChunkEvents and push them into the
         Rust egress ring (-> detokenizer shard -> client stream). ChunkEvent is a
-        positional msgpack array ``[rid, seq, token_ids, finish_reason]`` (which
-        rmp-serde decodes from an array). ``output_ids[i]`` is the incremental
-        new output tokens for this step; ``finished_reasons[i]``'s ``type``
-        becomes the chunk's finish reason.
+        positional msgpack array ``[rid, seq, token_ids, finish_reason,
+        prompt_tokens]`` (which rmp-serde decodes from an array).
+        ``output_ids[i]`` is the incremental new output tokens for this step;
+        ``finished_reasons[i]``'s ``type`` becomes the chunk's finish reason;
+        ``prompt_tokens[i]`` rides along so the egress can report usage.
         """
         output_ids = payload.output_ids or []
+        prompt_tokens = payload.prompt_tokens or []
         for i, rid in enumerate(payload.rids):
             ids = output_ids[i] if i < len(output_ids) else None
             token_ids = list(ids) if ids is not None else []
             fr = payload.finished_reasons[i]
             finish = fr.get("type") if isinstance(fr, dict) else None
+            n_prompt = prompt_tokens[i] if i < len(prompt_tokens) else 0
 
             seq = self._seq_id.get(rid, 0)
             self._seq_id[rid] = seq + 1
-            chunk = msgspec.msgpack.encode([rid, seq, token_ids, finish])
+            chunk = msgspec.msgpack.encode([rid, seq, token_ids, finish, n_prompt])
             if not self.server.push_chunk(chunk):
                 logger.warning("Rust egress ring full; dropped chunk for %s", rid)
             if finish is not None:

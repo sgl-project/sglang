@@ -18,14 +18,36 @@ pub type EgressSink = mpsc::Sender<EgressItem>;
 #[allow(dead_code)] // the receiver half is created inline in api_server::submit.
 pub type EgressSource = mpsc::Receiver<EgressItem>;
 
-/// What the connection handler receives on the egress stream.
+/// Protocol-neutral output for one generation step (cumulative values). The
+/// detok shard produces these; each API handler formats them into its own wire
+/// shape — SGLang `/generate`, OpenAI `/v1/completions`, `/v1/chat/completions`.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationOutput {
+    pub rid: String,
+    /// Cumulative decoded text (empty in `skip_tokenizer_init` mode).
+    pub text: String,
+    /// Cumulative output token ids (`skip_tokenizer_init` mode; empty otherwise).
+    pub output_ids: Vec<i32>,
+    /// Prompt token count (from the scheduler; constant across the request).
+    pub prompt_tokens: u32,
+    /// Cumulative output token count.
+    pub completion_tokens: u64,
+    /// `Some(reason)` on the final step, `None` while streaming.
+    pub finish_reason: Option<String>,
+}
+
+/// What the connection handler receives on the egress stream. Generation output
+/// is protocol-neutral (the handler formats it); control results are a single
+/// verbatim payload.
 #[derive(Debug)]
 pub enum EgressItem {
-    /// A streamed delta, already serialized to the JSON bytes the client expects
-    /// (built by the detok shard / TM egress so the handler stays trivial).
-    Frame(Bytes),
-    /// Terminal success: handler emits the final frame then `data: [DONE]`.
-    Done(Bytes),
+    /// An intermediate streamed generation step (only sent for streaming reqs).
+    Frame(GenerationOutput),
+    /// The final generation step.
+    Done(GenerationOutput),
+    /// A control-request result: one verbatim payload (e.g. `/server_info`),
+    /// delivered as-is with no per-protocol formatting.
+    Control(Bytes),
     /// Terminal failure: handler emits an error frame (stream) or status (unary).
     Error(Error),
 }
@@ -274,4 +296,8 @@ pub struct ChunkEvent {
     pub token_ids: Vec<i32>,
     /// `None` while streaming, `Some(reason)` on the final chunk.
     pub finish_reason: Option<String>,
+    /// Prompt token count for this request (constant across its chunks).
+    /// `#[serde(default)]` keeps the wire backward-compatible with 4-field frames.
+    #[serde(default)]
+    pub prompt_tokens: u32,
 }

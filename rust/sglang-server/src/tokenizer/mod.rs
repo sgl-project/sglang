@@ -50,26 +50,38 @@ pub fn load_tokenizer(
         "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
     })?;
 
-    let p = Path::new(path);
-    let file = if p.is_dir() {
-        p.join("tokenizer.json").to_string_lossy().into_owned()
-    } else if p.is_file() {
-        path.to_string()
-    } else {
-        // Not a local path → treat as an HF Hub repo id.
-        resolve_from_hub_cache(path, revision).map_err(|e| e.to_string())?
-    };
+    let file = resolve_model_file(path, revision, "tokenizer.json")
+        .ok_or_else(|| format!("tokenizer.json not found for '{path}'"))?;
     let tokenizer = dynamo_tokenizers::Tokenizer::from_file(&file)
         .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
     tracing::info!(%path, "loaded tokenizer");
     Ok(Some(tokenizer))
 }
 
-/// Locate `tokenizer.json` for an HF Hub repo id in the local cache (shared with
+/// Resolve a model file (`tokenizer.json`, `tokenizer_config.json`, …) given the
+/// configured tokenizer source: a directory → `dir/<file>`; a tokenizer file →
+/// its parent dir; otherwise an HF Hub repo id → the local HF cache. `None` when
+/// the file can't be located.
+pub fn resolve_model_file(path: &str, revision: Option<&str>, filename: &str) -> Option<String> {
+    let p = Path::new(path);
+    if p.is_dir() {
+        let f = p.join(filename);
+        return f.is_file().then(|| f.to_string_lossy().into_owned());
+    }
+    if p.is_file() {
+        // `path` is e.g. a `tokenizer.json`; look for the sibling next to it.
+        let f = p.parent()?.join(filename);
+        return f.is_file().then(|| f.to_string_lossy().into_owned());
+    }
+    // Not a local path → treat as an HF Hub repo id (offline cache lookup).
+    resolve_from_hub_cache(path, revision, filename)
+}
+
+/// Locate a file for an HF Hub repo id in the local cache (shared with
 /// `huggingface_hub` via `HF_HOME`). The scheduler downloads the model before
 /// the server starts, so the file is already present — this does no network I/O
-/// and pulls no TLS/openssl deps.
-fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>) -> Result<String, Error> {
+/// and pulls no TLS/openssl deps. `None` if the file isn't cached.
+fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>, filename: &str) -> Option<String> {
     use hf_hub::{Cache, Repo, RepoType};
 
     let rev = revision.unwrap_or("main");
@@ -79,14 +91,8 @@ fn resolve_from_hub_cache(repo_id: &str, revision: Option<&str>) -> Result<Strin
             RepoType::Model,
             rev.to_string(),
         ))
-        .get("tokenizer.json")
+        .get(filename)
         .map(|p| p.to_string_lossy().into_owned())
-        .ok_or_else(|| {
-            Error::Tokenize(format!(
-                "tokenizer.json not in HF cache for repo '{repo_id}' (rev {rev}); \
-                 pass a local path or pre-download the tokenizer"
-            ))
-        })
 }
 
 /// Real tokenizer backed by dynamo-tokenizers, wrapping an already-loaded

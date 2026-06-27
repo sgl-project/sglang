@@ -17,12 +17,10 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
-
 use crate::error::Error;
 use crate::fsm::{Event, RequestState};
 use crate::ids::RequestId;
-use crate::message::{ChunkEvent, EgressItem, EgressSink};
+use crate::message::{ChunkEvent, EgressItem, EgressSink, GenerationOutput};
 use crate::runtime::Runnable;
 use crate::runtime::channels::DetokMsg;
 
@@ -154,7 +152,7 @@ impl Runnable for DetokenizerWorker {
 /// single `Done` frame — no detokenization, no streaming.
 fn handle_result(table: &mut HashMap<RequestId, DetokState>, id: RequestId, payload: bytes::Bytes) {
     if let Some(mut st) = table.remove(&id) {
-        let _ = st.sink.try_send(EgressItem::Done(payload));
+        let _ = st.sink.try_send(EgressItem::Control(payload));
         // Egress FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
         st.fsm = RequestState::Completed;
@@ -199,17 +197,22 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
     let finished = ev.finish_reason.is_some();
     // Streaming → Streaming (finish:false) or Streaming → Finalizing (finish:true).
     let _ = st.fsm.apply(Event::Chunk { finish: finished });
-    let frame = build_frame(
-        &ev.rid,
-        &st.text,
-        &st.output_ids,
-        st.completion_tokens,
-        ev.finish_reason.as_deref(),
-    );
+
+    // Protocol-neutral cumulative snapshot; the API handler formats it. `text`
+    // and `output_ids` are cumulative so we clone (the entry persists across
+    // streamed frames); `rid`/`finish_reason` are moved (this `ev` is done).
+    let output = GenerationOutput {
+        rid: ev.rid,
+        text: st.text.clone(),
+        output_ids: st.output_ids.clone(),
+        prompt_tokens: ev.prompt_tokens,
+        completion_tokens: st.completion_tokens,
+        finish_reason: ev.finish_reason,
+    };
 
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
-        let sent = st.sink.try_send(EgressItem::Done(frame)).is_ok();
+        let sent = st.sink.try_send(EgressItem::Done(output)).is_ok();
         let _ = st.fsm.apply(if sent {
             Event::FinalFrameSent
         } else {
@@ -219,37 +222,10 @@ fn handle_chunk(table: &mut HashMap<RequestId, DetokState>, ev: ChunkEvent) {
     } else if st.stream {
         // Only emit intermediate frames for streaming requests; unary requests
         // just accumulate until the final Done. A failed send == client gone.
-        if st.sink.try_send(EgressItem::Frame(frame)).is_err() {
+        if st.sink.try_send(EgressItem::Frame(output)).is_err() {
             let _ = st.fsm.apply(Event::Disconnect);
             table.remove(&id);
             // TODO(abort): signal the scheduler to abort this rid.
         }
     }
-}
-
-/// Serialize one SGLang-style `/generate` output frame. `output_ids` is the
-/// cumulative token-id list emitted in `skip_tokenizer_init` mode (empty
-/// otherwise, in which case the field is omitted and only `text` is sent).
-fn build_frame(
-    rid: &str,
-    text: &str,
-    output_ids: &[i32],
-    completion_tokens: u64,
-    finish_reason: Option<&str>,
-) -> Bytes {
-    let mut v = serde_json::json!({
-        "text": text,
-        "meta_info": {
-            "id": rid,
-            "completion_tokens": completion_tokens,
-            "finish_reason": finish_reason.map(|r| serde_json::json!({ "type": r })),
-        },
-    });
-    // skip_tokenizer_init: surface raw token ids alongside the (empty) text,
-    // mirroring SGLang's `/generate` output shape.
-    if !output_ids.is_empty() {
-        v["output_ids"] = serde_json::json!(output_ids);
-    }
-    // to_vec never fails for this shape.
-    Bytes::from(serde_json::to_vec(&v).unwrap_or_default())
 }

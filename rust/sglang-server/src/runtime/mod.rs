@@ -175,6 +175,25 @@ impl ServerArgs {
             .unwrap_or(false)
     }
 
+    /// `reasoning_parser` family name (e.g. `deepseek-r1`, `qwen3`, `gpt-oss`).
+    /// `None` → `/v1/chat/completions` returns content without splitting out a
+    /// `reasoning_content`. `dynamo-parsers` normalizes the name and falls back
+    /// to a basic `<think>…</think>` parser for unknown families.
+    pub fn reasoning_parser(&self) -> Option<String> {
+        self.str_field("reasoning_parser")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// `tool_call_parser` family name (e.g. `qwen`, `pythonic`, `llama3`). `None`
+    /// → no tool-call extraction; chat output stays plain content. Only consulted
+    /// when the request actually carries `tools`.
+    pub fn tool_call_parser(&self) -> Option<String> {
+        self.str_field("tool_call_parser")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
     fn str_field(&self, key: &str) -> Option<&str> {
         self.data.get(key).and_then(|v| v.as_str())
     }
