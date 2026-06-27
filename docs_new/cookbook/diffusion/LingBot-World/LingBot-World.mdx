@@ -11,15 +11,12 @@ tag: REALTIME
 
 <div style={{border: "1px solid #dbe3ef", borderRadius: "10px", overflow: "hidden", background: "linear-gradient(135deg, #ffffff 0%, #f8fafc 52%, #ecfeff 100%)", boxShadow: "0 10px 30px rgba(15, 23, 42, 0.08)", margin: "22px 0 28px 0", padding: "18px 22px"}}>
   <div style={{fontSize: "20px", fontWeight: 750, color: "#0f172a", lineHeight: 1.2}}>LingBot World</div>
-  <div style={{fontSize: "13px", color: "#64748b", marginTop: "5px"}}>Realtime camera-controlled world model in SGLang-diffusion</div>
-  <div style={{display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "12px"}}>
+  <div style={{display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "10px"}}>
     <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>realtime</span>
     <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>world model</span>
     <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>causal DiT</span>
   </div>
-  <div style={{fontSize: "14px", color: "#334155", marginTop: "14px", lineHeight: 1.55}}>
-    Prompt, first frame, and camera control events are streamed through <code>/v1/realtime_video/generate</code> to produce video chunks from one live session.
-  </div>
+  <div style={{fontSize: "13px", color: "#64748b", marginTop: "12px"}}>Realtime camera-controlled world model in SGLang-diffusion</div>
 </div>
 
 This is different from offline diffusion video models such as Wan or LTX. Offline models denoise a bounded latent sequence for one request. Realtime world models generate a continuing stream, so the runtime must manage session state, control events, causal attention cache, and VAE decode cache.
