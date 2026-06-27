@@ -631,7 +631,7 @@ pub async fn chat_completions(
 /// to thread the tokenizer's actual token count through (the
 /// cache-aware-zmq policy already tokenizes the prompt for tree
 /// matching — that count could be reused here).
-fn estimate_prefill_tokens(body: &Bytes) -> usize {
+pub(crate) fn estimate_prefill_tokens(body: &Bytes) -> usize {
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
 

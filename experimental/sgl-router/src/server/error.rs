@@ -151,6 +151,61 @@ impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         self.status_and_code().0
     }
+
+    /// The client-facing message, sanitized exactly as `IntoResponse` renders
+    /// it — never leaks worker URLs or raw anyhow source chains. Exposed so
+    /// alternative error envelopes (e.g. the Anthropic Messages shape on the
+    /// `/v1/messages` route) reuse the same single sanitized message source
+    /// instead of `format!("{self}")`, which would leak internals.
+    pub fn client_message(&self) -> String {
+        match self {
+            ApiError::Internal(e) => {
+                tracing::error!("internal error serving request: {e:#}");
+                "internal error".to_string()
+            }
+            ApiError::UpstreamUnreachable { worker, source } => {
+                tracing::warn!(upstream = %worker, error = %format_args!("{source:#}"), "upstream worker unreachable");
+                "upstream unavailable".to_string()
+            }
+            ApiError::UpstreamStatus { status } => {
+                tracing::warn!(upstream_status = %status, "upstream returned an error status");
+                "upstream returned an error status".to_string()
+            }
+            ApiError::UpstreamTimeout { worker } => {
+                tracing::warn!(upstream = %worker, "upstream request timed out");
+                "upstream request timed out".to_string()
+            }
+            ApiError::NoHealthyWorkers { model } => {
+                tracing::warn!(model = %model, reason = "no_healthy_workers", "service unavailable");
+                "no healthy workers for the requested model".to_string()
+            }
+            ApiError::NoPrefillWorkersAvailable { model } => {
+                tracing::warn!(model = %model, reason = "no_prefill_workers_available", "service unavailable");
+                "no prefill workers available for the requested model".to_string()
+            }
+            ApiError::NoDecodeWorkersAvailable { model } => {
+                tracing::warn!(model = %model, reason = "no_decode_workers_available", "service unavailable");
+                "no decode workers available for the requested model".to_string()
+            }
+            ApiError::StaleRequestExpired { model } => {
+                tracing::warn!(model = %model, reason = "stale_request_expired", "stale-request janitor expired in-flight request");
+                "request expired before completion".to_string()
+            }
+            ApiError::PolicySelectionFailed { model } => {
+                tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");
+                "service unavailable".to_string()
+            }
+            ApiError::BreakerOpen { worker } => {
+                tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
+                "service unavailable".to_string()
+            }
+            ApiError::WorkerMisconfigured { worker, source } => {
+                tracing::error!(upstream = %worker, error = %format_args!("{source:#}"), "worker URL emitted by discovery is malformed");
+                "service unavailable".to_string()
+            }
+            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -173,80 +228,7 @@ impl IntoResponse for ApiError {
             400..=499 => "invalid_request_error",
             _ => "server_error",
         };
-        // Pick a client-facing message that NEVER leaks worker URLs or raw
-        // source chains; full structured details are logged server-side.
-        let message = match &self {
-            ApiError::Internal(e) => {
-                // `{:#}` prints the anyhow chain (top error + sources) — `?e`
-                // would only show the outermost message.
-                tracing::error!("internal error serving request: {e:#}");
-                "internal error".to_string()
-            }
-            ApiError::UpstreamUnreachable { worker, source } => {
-                tracing::warn!(
-                    upstream = %worker,
-                    error = %format_args!("{source:#}"),
-                    "upstream worker unreachable",
-                );
-                "upstream unavailable".to_string()
-            }
-            ApiError::UpstreamStatus { status } => {
-                tracing::warn!(
-                    upstream_status = %status,
-                    "upstream returned an error status",
-                );
-                "upstream returned an error status".to_string()
-            }
-            ApiError::UpstreamTimeout { worker } => {
-                tracing::warn!(upstream = %worker, "upstream request timed out");
-                "upstream request timed out".to_string()
-            }
-            ApiError::NoHealthyWorkers { model } => {
-                tracing::warn!(model = %model, reason = "no_healthy_workers", "service unavailable");
-                "no healthy workers for the requested model".to_string()
-            }
-            ApiError::NoPrefillWorkersAvailable { model } => {
-                tracing::warn!(
-                    model = %model,
-                    reason = "no_prefill_workers_available",
-                    "service unavailable",
-                );
-                "no prefill workers available for the requested model".to_string()
-            }
-            ApiError::NoDecodeWorkersAvailable { model } => {
-                tracing::warn!(
-                    model = %model,
-                    reason = "no_decode_workers_available",
-                    "service unavailable",
-                );
-                "no decode workers available for the requested model".to_string()
-            }
-            ApiError::StaleRequestExpired { model } => {
-                tracing::warn!(
-                    model = %model,
-                    reason = "stale_request_expired",
-                    "stale-request janitor expired in-flight request",
-                );
-                "request expired before completion".to_string()
-            }
-            ApiError::PolicySelectionFailed { model } => {
-                tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");
-                "service unavailable".to_string()
-            }
-            ApiError::BreakerOpen { worker } => {
-                tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
-                "service unavailable".to_string()
-            }
-            ApiError::WorkerMisconfigured { worker, source } => {
-                tracing::error!(
-                    upstream = %worker,
-                    error = %format_args!("{source:#}"),
-                    "worker URL emitted by discovery is malformed",
-                );
-                "service unavailable".to_string()
-            }
-            ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
-        };
+        let message = self.client_message();
         let mut resp = (
             status,
             Json(ErrorEnvelope {

@@ -15,6 +15,7 @@ mod chat_routing;
 mod failover;
 mod graceful_shutdown;
 mod header_forwarding;
+mod messages_routing;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod roundrobin_input_ids;
