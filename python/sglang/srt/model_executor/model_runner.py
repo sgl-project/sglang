@@ -2038,8 +2038,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 weights.append((name, weight))
             for handle in handles:
                 handle.wait()
-
-            self.model.load_weights(weights)
+            if not _is_npu:
+                self.model.load_weights(weights)
+            else:
+                target_device = torch.device(self.device)
+                DefaultModelLoader.load_weights_and_postprocess(
+                    self.model, reconstructed_tensors, target_device
+                )
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -2071,7 +2076,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 group=self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
-            self.model.load_weights(reconstructed_tensors)
+            if not _is_npu:
+                self.model.load_weights(reconstructed_tensors)
+            else:
+                target_device = torch.device(self.device)
+                DefaultModelLoader.load_weights_and_postprocess(
+                    self.model, reconstructed_tensors, target_device
+                )
             return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
@@ -2109,13 +2120,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             custom_loader(self.model, named_tensors)
         elif load_format is None:
             try:
-                if _is_npu:
+                if not _is_npu:
+                    self.model.load_weights(named_tensors)
+                else:
                     target_device = torch.device(self.device)
                     DefaultModelLoader.load_weights_and_postprocess(
                         self.model, named_tensors, target_device
                     )
-                else:
-                    self.model.load_weights(named_tensors)
                 return True, "Success"
             except Exception as e:
                 error_msg = (
@@ -2157,13 +2168,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         try:
-            if _is_npu:
+            if not _is_npu:
+                self.model.load_weights(reconstructed_tensors)
+            else:
                 target_device = torch.device(self.device)
                 DefaultModelLoader.load_weights_and_postprocess(
                     self.model, reconstructed_tensors, target_device
                 )
-            else:
-                self.model.load_weights(reconstructed_tensors)
             return True, "Success"
         except Exception as e:
             error_msg = (
