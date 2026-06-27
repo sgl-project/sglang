@@ -289,7 +289,9 @@ async fn streaming_5xx_request_records_duration_and_status_but_not_ttft() {
         "TTFT must NOT be recorded for a non-2xx streaming response; got:\n{m}",
     );
     assert!(
-        m.contains(r#"sgl_router_responses_total{status_code="500"} 1"#),
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="500"} 1"#
+        ),
         "the 500 status must be counted; got:\n{m}",
     );
     assert!(
@@ -597,7 +599,7 @@ async fn oversized_request_body_returns_413() {
     assert!(
         ctx.metrics
             .render()
-            .contains(r#"sgl_router_responses_total{status_code="413"} 1"#),
+            .contains(r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="413"} 1"#),
         "body-limit 413 must be counted in responses_total: {}",
         ctx.metrics.render(),
     );
@@ -1674,7 +1676,9 @@ async fn admission_shed_503_is_counted_in_responses_total() {
     );
     // The general response-code series now sees the shed too (the fix).
     assert!(
-        m.contains(r#"sgl_router_responses_total{status_code="503"} 1"#),
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="503"} 1"#
+        ),
         "shed 503 must be counted in responses_total: {m}",
     );
     // And the by-outcome request counter: the shed returns before routing, so the
@@ -1723,12 +1727,17 @@ async fn success_200_counted_once_per_request_in_responses_total() {
         let _ = res.into_body().collect().await.unwrap();
     }
 
+    let m = ctx.metrics.render();
     assert!(
-        ctx.metrics
-            .render()
-            .contains(r#"sgl_router_responses_total{status_code="200"} 2"#),
-        "two successes must count to exactly 2 (no double- or under-count): {}",
-        ctx.metrics.render(),
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 2"#
+        ),
+        "two successes must count to exactly 2 (no double- or under-count): {m}",
+    );
+    // Both successes are also true intake (counted at entry, through build_router).
+    assert!(
+        m.contains(r#"sgl_router_intake_total{route="/v1/chat/completions",method="POST"} 2"#),
+        "two successes must each be counted as intake: {m}",
     );
     // A routed success must carry its per-worker labels in requests_total — the
     // handler attaches them via RequestLogContext and the middleware records
@@ -1765,7 +1774,9 @@ async fn infra_path_counted_in_responses_total_but_not_requests_total() {
     let m = ctx.metrics.render();
     // Counted in responses_total — a failing probe must stay observable there.
     assert!(
-        m.contains(r#"sgl_router_responses_total{status_code="200"} 1"#),
+        m.contains(
+            r#"sgl_router_responses_total{route="/healthz",method="GET",status_code="200"} 1"#
+        ),
         "infra 200 must be counted in responses_total: {m}",
     );
     // ...but NOT in requests_total: when the only traffic is an infra probe, no

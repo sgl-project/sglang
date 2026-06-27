@@ -6,7 +6,7 @@ use crate::server::metrics::{
     outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome, WorkerModeLabel,
 };
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
@@ -44,22 +44,25 @@ fn is_infra_path(path: &str) -> bool {
     matches!(path, "/healthz" | "/readyz" | "/metrics")
 }
 
-/// Outermost middleware: the single access-log and request/response metric site.
+/// Outermost middleware: the single edge-counting + access-log site.
 ///
 /// Runs for EVERY request — all routes, plus responses produced before any
 /// handler runs (a 413 from the body-limit layer; a 400 from the body extractor
 /// when a client drops the connection mid-upload; a `CatchPanicLayer` 500) and
 /// handler short-circuits that return via `?` (a 503 admission shed, a 400
-/// body-validation, a 404 model-not-found). For each request it:
-///   * counts `responses_total{status_code}` (every response, incl. infra);
+/// body-validation, a 404 model-not-found).
+///
+/// At ENTRY (before the handler runs) it counts `intake_total{route,method}` —
+/// true intake, so a request parked/shed/cancelled/dropped before producing a
+/// response is still counted. `route` is the matched [`MatchedPath`] template
+/// (bounded cardinality), `unmatched` for a 404. At EXIT it:
+///   * counts `responses_total{route,method,status_code}` (every response, incl.
+///     infra); `intake_total - responses_total` is the received-but-not-answered
+///     gap;
 ///   * for non-infra paths, counts
 ///     `requests_total{worker_url,model_id,mode,outcome}` — reading the
 ///     per-worker labels a routed handler attached via [`RequestLogContext`], or
-///     an empty `worker_url` when the request was rejected before routing — so
-///     the counter covers ALL ingress, not just dispatched traffic. Non-chat API
-///     routes (`/v1/models`, `/v1/tokenize`, `/v1/detokenize`, `/flush_cache`)
-///     are intentionally included here (with an empty `worker_url`); only the
-///     infra paths below are excluded; and
+///     an empty `worker_url` when the request was rejected before routing; and
 ///   * emits one access-log line (INFO; DEBUG for infra).
 ///
 /// Handlers therefore no longer log or count requests themselves: a single site
@@ -71,6 +74,13 @@ async fn access_log_and_record(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // Matched route template (e.g. `/v1/chat/completions`), not the raw URI, so
+    // `intake_total` / `responses_total` stay low-cardinality; `unmatched` for a 404.
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
     let request_id = req
         .headers()
         .get("x-request-id")
@@ -79,11 +89,17 @@ async fn access_log_and_record(
         .to_string();
     let start = std::time::Instant::now();
 
+    // ENTRY: true intake — counted before the handler can park/shed/drop it, so
+    // a never-answered request still shows up (intake - responses = the gap).
+    metrics.record_intake(&route, method.as_str());
+
     let resp = next.run(req).await;
 
     let status = resp.status();
     let latency_ms = start.elapsed().as_millis() as u64;
-    metrics.record_response(status.as_u16());
+    // Edge responses count ALL routes (incl. infra) so the intake/response
+    // population matches; filter infra by `route` in PromQL.
+    metrics.record_response(&route, method.as_str(), status.as_u16());
 
     if is_infra_path(&path) {
         tracing::debug!(
@@ -114,6 +130,7 @@ async fn access_log_and_record(
         request_id = %request_id,
         method = %method,
         path = %path,
+        route = %route,
         status = status.as_u16(),
         outcome = outcome_str,
         worker = %worker,
@@ -220,11 +237,55 @@ mod tests {
             "a handler panic must surface as 500, not a dropped connection",
         );
         assert!(
-            metrics
-                .render()
-                .contains(r#"sgl_router_responses_total{status_code="500"} 1"#),
+            metrics.render().contains(
+                r#"sgl_router_responses_total{route="/boom",method="GET",status_code="500"} 1"#
+            ),
             "the metrics middleware must observe and count the panic-500; got:\n{}",
             metrics.render(),
+        );
+    }
+
+    /// The point of counting intake at ENTRY: a request that never produces a
+    /// response — client disconnect / cancellation drops the in-flight handler
+    /// future at its `.await` — is still counted in `intake_total`, while
+    /// `responses_total` stays empty. `intake_total - responses_total` is the
+    /// received-but-not-answered gap that exit-only counting can never show. A
+    /// handler that sleeps far past our abandon timeout models the dropped future.
+    #[tokio::test]
+    async fn intake_counted_at_entry_even_when_request_never_completes() {
+        let metrics = MetricsRegistry::new();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&metrics),
+                access_log_and_record,
+            ));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::empty())
+            .unwrap();
+        // Abandon before the handler completes — drops the middleware future at
+        // its `.await`, exactly like a client disconnect mid-request.
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.oneshot(req)).await;
+        assert!(abandoned.is_err(), "request must not complete within 50ms");
+
+        let m = metrics.render();
+        assert!(
+            m.contains(r#"sgl_router_intake_total{route="/v1/chat/completions",method="POST"} 1"#),
+            "intake must be counted at entry even when the request never completes; got:\n{m}",
+        );
+        assert!(
+            !m.contains(r#"sgl_router_responses_total{route="/v1/chat/completions""#),
+            "a never-answered request must NOT appear in responses_total; got:\n{m}",
         );
     }
 }

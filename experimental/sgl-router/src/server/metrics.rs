@@ -18,10 +18,11 @@
 //!
 //! | Metric | Type | Labels |
 //! |---|---|---|
+//! | `sgl_router_intake_total` | Counter | `route`, `method` |
 //! | `sgl_router_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
-//! | `sgl_router_responses_total` | Counter | `status_code` |
+//! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
@@ -249,6 +250,14 @@ impl ActiveLoadKind {
 /// internal state is `Arc`/`Atomic`/`Mutex`-protected.
 #[derive(Debug, Default)]
 pub struct MetricsRegistry {
+    // Edge intake, counted at the `access_log_and_record` middleware BEFORE the
+    // handler runs, so it includes requests parked/shed/cancelled/dropped before
+    // a response is produced. `intake_total - responses_total` (per route,method)
+    // = received but never answered, which the post-dispatch `requests_total`
+    // cannot see.
+    intake_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
+    // Per-worker dispatch outcomes. Recorded after a worker is picked, so blind
+    // to pre-dispatch drops (see `intake_total`).
     requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
@@ -256,7 +265,9 @@ pub struct MetricsRegistry {
     // on `requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
-    responses_total: Mutex<HashMap<u16, Arc<AtomicU64>>>,
+    // Edge responses by route/method/status (incl. early-exit 400/413/503 and the
+    // CatchPanicLayer-synthesized 500).
+    responses_total: Mutex<HashMap<EdgeResponseKey, Arc<AtomicU64>>>,
     overlap_blocks: Mutex<HashMap<String, Histogram>>,
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -279,6 +290,23 @@ struct RequestKey {
     model_id: String,
     mode: &'static str,
     outcome: &'static str,
+}
+
+/// Labels for the edge `intake_total` counter. `route` is the matched route
+/// template (a small fixed set), not the raw URI, so cardinality stays bounded.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct EdgeKey {
+    route: String,
+    method: String,
+}
+
+/// Labels for the edge `responses_total` counter: an [`EdgeKey`] plus the final
+/// client-visible HTTP status.
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct EdgeResponseKey {
+    route: String,
+    method: String,
+    status_code: u16,
 }
 
 /// Per-worker state sampled from the [`crate::workers::WorkerRegistry`] at
@@ -427,20 +455,43 @@ impl MetricsRegistry {
         hist.observe(seconds);
     }
 
-    /// Bump `sgl_router_responses_total{status_code}` for the HTTP status the
-    /// client ultimately saw. Driven by the `access_log_and_record` middleware,
-    /// so it counts EVERY response across all routes — including error
-    /// short-circuits that never reach a handler's own bookkeeping (an admission
-    /// 503, a body-limit 413). For streaming responses the status is the one sent
-    /// with the headers, so a stream that fails mid-body after a 200 header is
-    /// counted as 200 (the breaker / duration metrics capture mid-stream
-    /// failures). Cardinality is bounded by the small set of status codes the
-    /// router returns (2xx success, 4xx client, 5xx upstream/proxy, 504
-    /// stale-cancel).
-    pub fn record_response(&self, status_code: u16) {
+    /// Bump `sgl_router_intake_total{route,method}` — true edge intake, counted
+    /// by the `access_log_and_record` middleware BEFORE the handler runs, so a
+    /// request that is parked/shed/cancelled/dropped before producing a response
+    /// is still counted. `intake_total - responses_total` is the
+    /// received-but-not-answered gap.
+    pub fn record_intake(&self, route: &str, method: &str) {
+        let key = EdgeKey {
+            route: route.to_owned(),
+            method: method.to_owned(),
+        };
+        let mut guard = self.intake_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_responses_total{route,method,status_code}` for the HTTP
+    /// status the client ultimately saw. Driven by the `access_log_and_record`
+    /// middleware, so it counts EVERY response across all routes — including
+    /// error short-circuits that never reach a handler's own bookkeeping (an
+    /// admission 503, a body-limit 413). For streaming responses the status is
+    /// the one sent with the headers, so a stream that fails mid-body after a
+    /// 200 header is counted as 200 (the breaker / duration metrics capture
+    /// mid-stream failures). `route` is the matched template, so cardinality
+    /// stays bounded.
+    pub fn record_response(&self, route: &str, method: &str, status_code: u16) {
+        let key = EdgeResponseKey {
+            route: route.to_owned(),
+            method: method.to_owned(),
+            status_code,
+        };
         let mut guard = self.responses_total.lock();
         let counter = guard
-            .entry(status_code)
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -569,6 +620,27 @@ impl MetricsRegistry {
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
 
+        // intake_total — true edge intake (every request, counted before the handler)
+        out.push_str(
+            "# HELP sgl_router_intake_total Requests received at the router HTTP edge, counted before the handler runs (true intake; includes requests dropped/shed/cancelled before a response).\n",
+        );
+        out.push_str("# TYPE sgl_router_intake_total counter\n");
+        let guard = self.intake_total.lock();
+        let mut entries: Vec<(&EdgeKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.route, &a.0.method).cmp(&(&b.0.route, &b.0.method)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_intake_total{{route=\"{}\",method=\"{}\"}} {}\n",
+                escape_label(&key.route),
+                escape_label(&key.method),
+                value,
+            ));
+        }
+        drop(guard);
+
         // requests_total
         out.push_str(
             "# HELP sgl_router_requests_total Total chat-completions requests dispatched to a worker.\n",
@@ -635,21 +707,30 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // responses_total
+        // responses_total — edge, by route/method/status (incl. early-exit 400/413/503)
         out.push_str(
-            "# HELP sgl_router_responses_total HTTP responses returned to clients across all routes, by status code (recorded at response-headers time, so a mid-stream failure after a 200 header counts as 200).\n",
+            "# HELP sgl_router_responses_total HTTP responses returned at the router edge, by route, method and status code (recorded at response-headers time, so a mid-stream failure after a 200 header counts as 200).\n",
         );
         out.push_str("# TYPE sgl_router_responses_total counter\n");
         let guard = self.responses_total.lock();
-        let mut entries: Vec<(u16, u64)> = guard
+        let mut entries: Vec<(&EdgeResponseKey, u64)> = guard
             .iter()
-            .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
-        entries.sort_by_key(|e| e.0);
-        for (status_code, value) in entries {
+        entries.sort_by(|a, b| {
+            (&a.0.route, &a.0.method, a.0.status_code).cmp(&(
+                &b.0.route,
+                &b.0.method,
+                b.0.status_code,
+            ))
+        });
+        for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_responses_total{{status_code=\"{}\"}} {}\n",
-                status_code, value,
+                "sgl_router_responses_total{{route=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
+                escape_label(&key.route),
+                escape_label(&key.method),
+                key.status_code,
+                value,
             ));
         }
         drop(guard);
@@ -1065,16 +1146,34 @@ mod tests {
     }
 
     #[test]
-    fn record_response_counts_by_status_code() {
+    fn record_response_counts_by_route_method_status_code() {
         let reg = MetricsRegistry::new();
-        reg.record_response(200);
-        reg.record_response(200);
-        reg.record_response(502);
-        reg.record_response(504);
+        reg.record_response("/v1/chat/completions", "POST", 200);
+        reg.record_response("/v1/chat/completions", "POST", 200);
+        reg.record_response("/v1/chat/completions", "POST", 502);
+        reg.record_response("/v1/models", "GET", 200);
         let out = reg.render();
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="200"} 2"#));
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="502"} 1"#));
-        assert!(out.contains(r#"sgl_router_responses_total{status_code="504"} 1"#));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 2"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="502"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_responses_total{route="/v1/models",method="GET",status_code="200"} 1"#
+        ));
+    }
+
+    #[test]
+    fn record_intake_counts_by_route_method() {
+        let reg = MetricsRegistry::new();
+        reg.record_intake("/v1/chat/completions", "POST");
+        reg.record_intake("/v1/chat/completions", "POST");
+        reg.record_intake("/v1/models", "GET");
+        let out = reg.render();
+        assert!(out
+            .contains(r#"sgl_router_intake_total{route="/v1/chat/completions",method="POST"} 2"#));
+        assert!(out.contains(r#"sgl_router_intake_total{route="/v1/models",method="GET"} 1"#));
     }
 
     #[test]
