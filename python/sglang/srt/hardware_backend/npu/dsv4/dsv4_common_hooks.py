@@ -95,11 +95,15 @@ def maybe_write_dsv4_extend(
     # offsets for the pre-reserved interval.
     if c4_state_alloc_offsets is None:
         c4_state_alloc_offsets = [
-            getattr(r, "c4_state_alloc_offset", 0) for r in batch.reqs
+            getattr(r, "c4_state_write_offset", getattr(r, "c4_state_alloc_offset", 0))
+            for r in batch.reqs
         ]
     if c128_state_alloc_offsets is None:
         c128_state_alloc_offsets = [
-            getattr(r, "c128_state_alloc_offset", 0) for r in batch.reqs
+            getattr(
+                r, "c128_state_write_offset", getattr(r, "c128_state_alloc_offset", 0)
+            )
+            for r in batch.reqs
         ]
     if bundle.out_c4_state_loc is not None and hasattr(
         req_to_token_pool, "write_c4_state"

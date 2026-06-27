@@ -108,6 +108,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
+        prefix_cpu = forward_batch.extend_prefix_lens_cpu
         ratio_lists: dict = {
             r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)
         }
@@ -116,12 +117,16 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             end = int(cu_cpu[idx + 1])
             if end == start:
                 continue
-            seq = end - start
-            req_positions = positions[start:end]
+            prefix = int(prefix_cpu[idx]) if prefix_cpu is not None else 0
+            total = prefix + (end - start)
             for ratio in ratio_lists:
-                cutoff = seq - (seq % ratio)
-                if cutoff > 0:
-                    ratio_lists[ratio].append(req_positions[:cutoff:ratio])
+                first_k = prefix // ratio
+                last_k = total // ratio
+                if last_k > first_k:
+                    ratio_lists[ratio].append(
+                        torch.arange(first_k, last_k, device=device, dtype=torch.int64)
+                        * ratio
+                    )
 
         for ratio in (4, 128):
             if ratio not in ratio_lists:
@@ -138,7 +143,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
 
         # start_pos=0: chunked prefill unsupported; seqused=None -> op derives lens from cu_seqlens
-        fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
+        if forward_batch.extend_prefix_lens is not None:
+            fm.start_pos = forward_batch.extend_prefix_lens.to(
+                device=device, dtype=torch.int32
+            )
+        else:
+            fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         fm.seqused = None
 
         # bundle out_c*_loc is densely packed in batch order (matches cmp_kv); invalid under chunked prefill
@@ -162,9 +172,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             if spt is None:
                 continue
             for idx in range(bs):
-                seqlen = int(cu_cpu[idx + 1] - cu_cpu[idx])
-                if seqlen == 0:
+                chunk_len = int(cu_cpu[idx + 1] - cu_cpu[idx])
+                if chunk_len == 0:
                     continue
+                seqlen = (
+                    int(prefix_cpu[idx]) if prefix_cpu is not None else 0
+                ) + chunk_len
                 tail = seqlen % 128
                 if ratio == 4:
                     c_alloc_len = tail + 128 if (tail <= 3 and seqlen >= 128) else tail
@@ -387,6 +400,90 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
             self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
 
+    def _native_chunked_followup(
+        self,
+        compressor,
+        idx: int,
+        prefix_len: int,
+        chunk_len: int,
+        seqlen_offset: int,
+        kv_full: torch.Tensor,
+        score_full: torch.Tensor,
+        positions: torch.Tensor,
+        page_table: torch.Tensor,
+        forward_batch: ForwardBatch,
+        kv_out_list: list,
+        kv_out_positions: list,
+        kv_state_to_be_cached: list,
+        score_state_to_be_cached: list,
+        state_loc_list: list,
+        write_req_indices: list,
+        write_pos_in_req: list,
+        device: torch.device,
+    ) -> None:
+        ratio, overlap, d = compressor.ratio, compressor.overlap, compressor.head_dim
+        token_to_kv_pool = self.token_to_kv_pool
+        req_to_token_pool = self.req_to_token_pool
+        req_pool_idx = int(forward_batch.req_pool_indices[idx])
+        state_row = (
+            req_to_token_pool.req_to_token_c4_state
+            if ratio == 4
+            else req_to_token_pool.req_to_token_c128_state
+        )[req_pool_idx]
+
+        kv = kv_full[seqlen_offset : seqlen_offset + chunk_len]
+        score = score_full[seqlen_offset : seqlen_offset + chunk_len]
+        pos_req = positions[seqlen_offset : seqlen_offset + chunk_len]
+
+        total = prefix_len + chunk_len
+        first_k = prefix_len // ratio
+        last_k = total // ratio
+        cutoff = (last_k - first_k) * ratio
+        remainder = chunk_len - cutoff
+        should_compress = last_k > first_k
+
+        if remainder > 0:
+            gpos = torch.arange(cutoff, chunk_len, device=device) + prefix_len
+            kv_state_to_be_cached.append(kv[cutoff:chunk_len])
+            score_state_to_be_cached.append(
+                score[cutoff:chunk_len] + compressor.ape[gpos % ratio]
+            )
+            state_loc_list.append(state_row[gpos].to(torch.int64))
+        if overlap and should_compress:
+            gpos = torch.arange(cutoff - ratio, cutoff, device=device) + prefix_len
+            kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
+            score_state_to_be_cached.append(
+                score[cutoff - ratio : cutoff] + compressor.ape
+            )
+            state_loc_list.append(state_row[gpos].to(torch.int64))
+
+        if not should_compress:
+            return
+
+        kvc = kv[:cutoff].unflatten(0, (-1, ratio))
+        scorec = score[:cutoff].unflatten(0, (-1, ratio)) + compressor.ape
+        if overlap:
+            kvc = _overlap_transform(kvc, value=0.0, head_dim=d)
+            scorec = _overlap_transform(scorec, value=float("-inf"), head_dim=d)
+            kv_idx = _get_kv_indices(forward_batch, ratio, page_table, idx, prefix_len)
+            prior_kv, prior_score = token_to_kv_pool.get_state_buffer(
+                compressor.layer_id, compressor.is_in_indexer, kv_idx
+            )
+            prior_kv = prior_kv.squeeze(1)
+            prior_score = prior_score.squeeze(1)
+            kvc[0, :ratio] = prior_kv[:, :d]
+            scorec[0, :ratio] = prior_score[:, :d]
+        kv_compressed = (kvc * scorec.softmax(dim=1)).sum(dim=1)
+        n_out = kv_compressed.shape[0]
+        kv_out_list.append(kv_compressed)
+        kv_out_positions.append(pos_req[:cutoff:ratio])
+        write_req_indices.append(
+            torch.full((n_out,), idx, dtype=torch.int64, device=device)
+        )
+        write_pos_in_req.append(
+            torch.arange(first_k, last_k, dtype=torch.int64, device=device)
+        )
+
     def _forward_compress_native(
         self,
         compressor,
@@ -419,6 +516,8 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
         is_prefill = forward_batch.forward_mode.is_prefill()
         token_to_kv_pool = self.token_to_kv_pool
         backend_fm = self.forward_metadata
@@ -449,6 +548,39 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             if seqlen == 0:
                 continue
             if is_prefill:
+                chunk_len = (
+                    int(extend_seq_lens_cpu[idx])
+                    if extend_seq_lens_cpu is not None
+                    else seqlen
+                )
+                prefix_len = (
+                    int(extend_prefix_lens_cpu[idx])
+                    if extend_prefix_lens_cpu is not None
+                    else 0
+                )
+                if prefix_len > 0:
+                    self._native_chunked_followup(
+                        compressor,
+                        idx,
+                        prefix_len,
+                        chunk_len,
+                        seqlen_offset,
+                        kv_full,
+                        score_full,
+                        positions,
+                        page_table,
+                        forward_batch,
+                        kv_out_list,
+                        kv_out_positions,
+                        kv_state_to_be_cached,
+                        score_state_to_be_cached,
+                        state_loc_list,
+                        write_req_indices,
+                        write_pos_in_req,
+                        device,
+                    )
+                    seqlen_offset += chunk_len
+                    continue
                 pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
 
                 # Per-req tail-only state alloc range; same formula as
