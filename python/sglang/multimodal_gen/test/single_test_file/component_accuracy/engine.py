@@ -48,14 +48,15 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.accuracy_config import (
+from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.config import (
     DEFAULT_TIMESTEP,
     ComponentType,
 )
-from sglang.multimodal_gen.test.server.accuracy_hooks import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.hooks import (
     resolve_component_native_profile,
 )
-from sglang.multimodal_gen.test.server.accuracy_utils import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     build_accuracy_server_args,
     build_parameter_shard_contexts,
     build_state_lookup,
@@ -70,7 +71,6 @@ from sglang.multimodal_gen.test.server.accuracy_utils import (
     resolve_text_encoder_forward_module,
     select_component_source,
 )
-from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
 

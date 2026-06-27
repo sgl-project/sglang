@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from sglang.multimodal_gen.test.server.accuracy_config import (
-    ComponentType,
-    should_skip_component,
-)
-from sglang.multimodal_gen.test.server.accuracy_utils import (
-    extract_component_path_overrides,
-)
-from sglang.multimodal_gen.test.server.component_accuracy import COMPONENT_SPECS
 from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.config import (
+    ComponentType,
+    should_skip_component,
+)
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.engine import (
+    COMPONENT_SPECS,
+)
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
+    extract_component_path_overrides,
+)
 
 
 def _component_accuracy_key(case: DiffusionTestCase, component: ComponentType) -> tuple:

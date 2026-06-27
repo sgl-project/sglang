@@ -4,62 +4,68 @@
 Common generate cli test, one test for image and video each
 """
 
-import dataclasses
 import os
 import shlex
+import tempfile
 import unittest
+from typing import Any
 
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.test_utils import check_image_size, run_command
 
-logger = init_logger(__name__)
+def run_command(command: list[str]) -> bool:
+    from sglang.multimodal_gen.test.test_utils import run_command as _run_command
+
+    return _run_command(command)
 
 
-@dataclasses.dataclass
-class TestResult:
-    name: str
-    key: str
-    succeed: bool
+def check_image_size(ut, image, width, height):
+    ut.assertEqual(image.size, (width, height))
 
 
 class CLIBase(unittest.TestCase):
     model_path: str = None
-    extra_args = []
-    data_type: DataType = None
-    log_level: str = "info"
-    # tested on h100
+    extra_args: tuple[str, ...] = ()
+    data_type: Any = None
 
+    log_level: str = "info"
     width: int = 720
     height: int = 720
-    output_path: str = "test_outputs"
+    output_path: str | None = None
 
     def setUp(self):
         super().setUp()
-        if not os.path.exists(self.output_path):
+        self._temp_output_dir = None
+        if self.output_path is None:
+            self._temp_output_dir = tempfile.TemporaryDirectory(
+                prefix="sglang_cli_test_"
+            )
+            self.output_path = self._temp_output_dir.name
+        else:
             os.makedirs(self.output_path, exist_ok=True)
-        if os.path.exists(self.output_path):
-            for f in os.listdir(self.output_path):
-                path = os.path.join(self.output_path, f)
-                if os.path.isfile(path):
-                    os.remove(path)
+            self._clear_output_files()
 
     def tearDown(self):
-        super().tearDown()
-        if os.path.exists(self.output_path):
-            for f in os.listdir(self.output_path):
-                path = os.path.join(self.output_path, f)
-                if os.path.isfile(path):
-                    os.remove(path)
+        try:
+            if self._temp_output_dir is not None:
+                self._temp_output_dir.cleanup()
+            elif self.output_path and os.path.exists(self.output_path):
+                self._clear_output_files()
+        finally:
+            super().tearDown()
+
+    def _clear_output_files(self):
+        for filename in os.listdir(self.output_path):
+            path = os.path.join(self.output_path, filename)
+            if os.path.isfile(path):
+                os.remove(path)
 
     def get_base_command(self):
         return [
             "sglang",
             "generate",
             "--prompt",
-            "A curious raccoon",
+            "A red cube on a white table",
             "--save-output",
             f"--log-level={self.log_level}",
             f"--width={self.width}",
@@ -67,13 +73,13 @@ class CLIBase(unittest.TestCase):
             f"--output-path={self.output_path}",
         ]
 
-    def _run_command(self, name: str, model_path: str, args=[]):
+    def _run_command(self, name: str, model_path: str, args: str | None = None):
         command = (
             self.get_base_command()
             + [f"--model-path={model_path}"]
             + shlex.split(args or "")
             + ["--output-file-name", f"{name}"]
-            + self.extra_args
+            + list(self.extra_args)
         )
         succeed = run_command(command)
         status = "Success" if succeed else "Failed"
@@ -96,7 +102,7 @@ class CLIBase(unittest.TestCase):
             self.output_path, f"{name}.{self.data_type.get_default_extension()}"
         )
         self.assertTrue(os.path.exists(path), f"Output file not exist for {path}")
-        if self.data_type == DataType.IMAGE:
+        if self.data_type.get_default_extension() in ("png", "jpg", "jpeg", "webp"):
             with Image.open(path) as image:
                 check_image_size(self, image, self.width, self.height)
 

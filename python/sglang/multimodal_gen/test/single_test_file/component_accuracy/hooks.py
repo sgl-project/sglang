@@ -7,13 +7,13 @@ from typing import Any, Callable, Dict, Optional
 import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.test.server.accuracy_config import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.config import (
     DEFAULT_TIMESTEP,
     I2V_IMAGE_DIM,
     TIMESTEP_NORMALIZATION_FACTOR,
     ComponentType,
 )
-from sglang.multimodal_gen.test.server.accuracy_utils import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     extract_output_tensor,
     seed_and_broadcast,
 )

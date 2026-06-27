@@ -28,7 +28,7 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
     load_overlay_manifest_if_present,
     resolve_model_overlay_target,
 )
-from sglang.multimodal_gen.test.server.accuracy_config import (
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.config import (
     DEFAULT_TEXT_ENCODER_VOCAB_SIZE,
     I2V_TEXT_ENCODER_DIM,
     TEXT_ENCODER_INPUT_SEED,
@@ -709,7 +709,7 @@ def _run_staged_native_component_accuracy_case(
     library: str,
     num_gpus: int,
 ) -> None:
-    from sglang.multimodal_gen.test.server.accuracy_hooks import (
+    from sglang.multimodal_gen.test.single_test_file.component_accuracy.hooks import (
         resolve_component_native_profile,
     )
 

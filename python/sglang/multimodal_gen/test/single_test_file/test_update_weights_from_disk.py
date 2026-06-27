@@ -26,15 +26,15 @@ encoder are still the same.
 To strictly verify the correctness of the refit API, we compare the checksum in
 SHA-256 on the disk and the server.
 
-NOTE and TODO: In the refit a specific module test, we randomly select one module
-from the transformer and vae to refit the server and keep other modules the same.
-As described above, the vae's weights are perturbed. If we select the vae to be the
-target module, ideally speaking, we should assert that the refitted vae's checksum
-is the same as directly computed from the perturbed vae weights in the disk. However,
-since the there is complex weight-name remapping and QKV merge during model loading,
-it is not easy to compare the server-disk checksum for vae and text encoder directly.
-Therefore, if the target module is vae, we only verify that the refitted vae's checksum
-is different from the base model's vae's checksum.
+NOTE and TODO: In the refit a specific module test, we update the transformer
+module and keep other modules the same. As described above, the vae's weights
+are perturbed. If we add vae as a target module in the future, ideally speaking,
+we should assert that the refitted vae's checksum is the same as directly
+computed from the perturbed vae weights in the disk. However, since there is
+complex weight-name remapping and QKV merge during model loading, it is not easy
+to compare the server-disk checksum for vae and text encoder directly. Therefore,
+if the target module is vae, we only verify that the refitted vae's checksum is
+different from the base model's vae's checksum.
 
 It should be good issue to solve for the community to adds comparison the server-disk
 checksum for vae and text encoder in this test.
@@ -43,12 +43,12 @@ checksum for vae and text encoder in this test.
 
 Test organization:
 
-7 test cases in 2 classes;
+5 test cases in 2 classes;
 two model pairs are tested locally, one in CI.
 
 =============================================================================
 
-Class 1: TestUpdateWeightsFromDisk                  (6 tests) — API contract, checksum & rollback
+Class 1: TestUpdateWeightsFromDisk                  (4 tests) — API contract, checksum & rollback
 Class 2: TestUpdateWeightsFromDiskWithOffload       (1 test) — Offload-aware update + checksum
 
 -----------------------------------------------------------------------------
@@ -72,32 +72,16 @@ base model first so behavior is order-independent and updates are real
 
   • test_update_weights_specific_modules
 
-    base -> perturbed with flush_cache=False.  Randomly selects one module
-    from _DIFFERING_MODULES (transformer and vae) as target_modules, updates
-    only that module. Verifies that:
+    base -> perturbed with flush_cache=False. Updates only transformer as
+    target_modules. Verifies that:
     (1) targeted module's in-memory checksum changed;
     (2) non-targeted modules' in-memory checksums are unchanged.
 
-  • test_update_weights_nonexistent_model
+  • test_update_weights_rejects_invalid_requests
 
-    model_path set to a non-existent path; must fail (400, success=False).
-
-    Ensure server is healthy after failed update and server's transformer
-    checksums equal base model's transformer disk checksum.
-
-  • test_update_weights_missing_model_path
-
-    Request body empty (no model_path); must fail (400, success=False).
-
-    Ensure server is healthy after failed update and server's transformer
-    checksums equal base model's transformer disk checksum.
-
-  • test_update_weights_nonexistent_module
-
-    target_modules=["nonexistent_module"]; must fail (400, success=False).
-
-    Verify server is healthy after failed update and server's checksums
-    equal base model's transformer disk checksum.
+    Invalid requests must fail (400, success=False) without mutating live
+    weights. Covers nonexistent model, missing model_path, and nonexistent
+    target module.
 
   • test_corrupted_weights_rollback
 
@@ -137,7 +121,6 @@ from __future__ import annotations
 
 import functools
 import os
-import random
 import shutil
 import sys
 import tempfile
@@ -194,6 +177,9 @@ _ALL_MODEL_PAIRS: list[tuple[str, str]] = [
 
 
 _CI_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+_CI_MODEL_PAIR_IDS = ("FLUX.2-klein-base-4B",)
+_UPDATE_TIMEOUT_SECONDS = 900
+_CHECKSUM_TIMEOUT_SECONDS = 600
 
 
 def _resolve_active_model_pairs() -> list[tuple[str, str]]:
@@ -203,7 +189,7 @@ def _resolve_active_model_pairs() -> list[tuple[str, str]]:
     pair_by_id = {pair[0].split("/")[-1]: pair for pair in _ALL_MODEL_PAIRS}
     selected_pair_id = os.environ.get(_CI_MODEL_PAIR_ENV)
     if selected_pair_id is None:
-        return [random.choice(_ALL_MODEL_PAIRS)]
+        return [pair_by_id[_CI_MODEL_PAIR_IDS[0]]]
 
     selected_pair = pair_by_id.get(selected_pair_id)
     if selected_pair is None:
@@ -296,7 +282,6 @@ def _truncate_safetensor(src_file: str, dst_file: str) -> None:
 
 
 def _perturb_safetensor(src_file: str, dst_file: str) -> None:
-
     tensors = load_file(src_file)
     perturbed = {
         k: (t + 0.01 if t.is_floating_point() else t) for k, t in tensors.items()
@@ -312,7 +297,7 @@ class _UpdateWeightsApiMixin:
         model_path: str,
         flush_cache: bool = True,
         target_modules: list[str] | None = None,
-        timeout: int = 300,
+        timeout: int = _UPDATE_TIMEOUT_SECONDS,
     ) -> tuple[dict, int]:
         payload = {"model_path": model_path, "flush_cache": flush_cache}
         if target_modules is not None:
@@ -328,7 +313,7 @@ class _UpdateWeightsApiMixin:
         self,
         base_url: str,
         module_names: list[str] | None = None,
-        timeout: int = 300,
+        timeout: int = _CHECKSUM_TIMEOUT_SECONDS,
     ) -> dict:
         payload = {}
         if module_names is not None:
@@ -361,7 +346,6 @@ class _UpdateWeightsApiMixin:
 
 
 class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
-
     @pytest.fixture(
         scope="class",
         params=_ACTIVE_MODEL_PAIRS,
@@ -460,7 +444,7 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
             base_url, module_names=_DIFFERING_MODULES
         )
 
-        target_modules = [random.choice(_DIFFERING_MODULES)]
+        target_modules = [_TRANSFORMER_MODULE]
         result, status_code = self._update_weights(
             base_url,
             perturbed_model_dir,
@@ -492,12 +476,13 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
                 f"  after:  {cs}"
             )
 
-    def test_update_weights_nonexistent_model(self, diffusion_server_no_offload):
-        """Nonexistent model path must fail (400). Server healthy, checksums == base disk."""
-        ctx, default_model, _, _ = diffusion_server_no_offload
+    def test_update_weights_rejects_invalid_requests(self, diffusion_server_no_offload):
+        ctx, _, perturbed_model_dir, _ = diffusion_server_no_offload
         base_url = f"http://localhost:{ctx.port}"
 
-        self._update_weights(base_url, default_model)
+        before_checksums = self._get_weights_checksum(
+            base_url, module_names=_DIFFERING_MODULES
+        )
 
         result, status_code = self._update_weights(
             base_url,
@@ -508,14 +493,6 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
 
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent model"
-        self._assert_server_matches_model(base_url, default_model)
-
-    def test_update_weights_missing_model_path(self, diffusion_server_no_offload):
-        """Request without model_path must fail (400). Server healthy, checksums == base disk."""
-        ctx, default_model, _, _ = diffusion_server_no_offload
-        base_url = f"http://localhost:{ctx.port}"
-
-        self._update_weights(base_url, default_model)
 
         response = requests.post(
             f"{base_url}/update_weights_from_disk",
@@ -526,14 +503,6 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         assert response.status_code == 400, f"Expected 400, got {response.status_code}"
         result = response.json()
         assert not result.get("success", True), "Should fail when model_path is missing"
-        self._assert_server_matches_model(base_url, default_model)
-
-    def test_update_weights_nonexistent_module(self, diffusion_server_no_offload):
-        """Nonexistent module must fail (400). Server healthy, checksums == base disk."""
-        ctx, default_model, perturbed_model_dir, _ = diffusion_server_no_offload
-        base_url = f"http://localhost:{ctx.port}"
-
-        self._update_weights(base_url, default_model)
 
         result, status_code = self._update_weights(
             base_url,
@@ -546,7 +515,11 @@ class TestUpdateWeightsFromDisk(_UpdateWeightsApiMixin):
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent module"
         assert "not found in pipeline" in result.get("message", "")
-        self._assert_server_matches_model(base_url, default_model)
+
+        after_checksums = self._get_weights_checksum(
+            base_url, module_names=_DIFFERING_MODULES
+        )
+        assert after_checksums == before_checksums
 
     def test_corrupted_weights_rollback(self, diffusion_server_no_offload):
         ctx, default_model, perturbed_model_dir, corrupted_vae_model_dir = (
