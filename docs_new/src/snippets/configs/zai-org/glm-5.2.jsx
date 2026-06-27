@@ -91,7 +91,7 @@ sgl-eval run aime25 \\
     b200:  "lmsysorg/sglang:latest",
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260616",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
@@ -656,7 +656,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
