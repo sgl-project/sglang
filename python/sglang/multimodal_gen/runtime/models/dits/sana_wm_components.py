@@ -20,8 +20,11 @@ logger = init_logger(__name__)
 
 _SANA_WM_TRITON_GDN_DISABLED_REASON: Optional[str] = None
 _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = False
-_SANA_WM_TRITON_CAM_GDN_DISABLED_REASON: Optional[str] = None
-_SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = False
+_SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON: Optional[str] = None
+_SANA_WM_TRITON_CAM_PREPROCESS_DISABLED_REASON: Optional[str] = None
+_SANA_WM_TRITON_CAM_SOFTMAX_PREPROCESS_DISABLED_REASON: Optional[str] = None
+_SANA_WM_TRITON_CAM_OUTPUT_DISABLED_REASON: Optional[str] = None
+_SANA_WM_TRITON_CAM_FALLBACK_LOGGED: set[str] = set()
 
 # Streaming per-block cache: a 10-slot list per block (mirrors the reference
 # SANA-WM forward_long). GDN blocks store recurrent state (0/1 main, 2 cam),
@@ -68,15 +71,17 @@ def _log_sana_wm_triton_gdn_fallback(reason: str) -> None:
         _SANA_WM_TRITON_GDN_FALLBACK_LOGGED = True
 
 
-def _log_sana_wm_triton_cam_gdn_fallback(reason: str) -> None:
-    global _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED
-    if not _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED:
+def _log_sana_wm_triton_cam_gdn_fallback(
+    reason: str, subpath: str = "scan"
+) -> None:
+    if subpath not in _SANA_WM_TRITON_CAM_FALLBACK_LOGGED:
         logger.warning(
-            "SANA-WM Triton camera GDN fast path is unavailable; falling back "
-            "to torch camera scan. reason=%s",
+            "SANA-WM Triton camera %s fast path is unavailable; falling back "
+            "to torch camera path. reason=%s",
+            subpath,
             reason,
         )
-        _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = True
+        _SANA_WM_TRITON_CAM_FALLBACK_LOGGED.add(subpath)
 
 
 class _UCPEApplyFns:
@@ -2175,6 +2180,32 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self._triton_rope_tables_cache = (key, tables)
         return tables
 
+    def _get_triton_qk_inv_rms(
+        self,
+        qkv: torch.Tensor,
+        *,
+        norm_eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import fused_qk_inv_rms
+
+        # TP-ready boundary: future TP can all-reduce Q/K squared sums here and
+        # keep the downstream Triton API unchanged.
+        return fused_qk_inv_rms(qkv, eps=norm_eps)
+
+    def _get_triton_cam_qk_inv_rms(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        norm_eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+            sana_wm_cam_qk_inv_rms,
+        )
+
+        # Same TP-ready boundary as the main branch, but for camera Q/K rows.
+        return sana_wm_cam_qk_inv_rms(q, k, eps=norm_eps)
+
     def _maybe_main_branch_triton_gdn(
         self,
         qkv: torch.Tensor,
@@ -2193,9 +2224,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         try:
             from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
-                fused_bigdn_func,
-                fused_qk_inv_rms,
                 prepare_rope_tables,
+                sana_wm_fused_bigdn_bidi_with_inv_rms,
             )
 
             B, N, _, heads, head_dim = qkv.shape
@@ -2203,7 +2233,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             S = H_sp * W_sp
             q_norm_weight, k_norm_weight = self._get_triton_norm_weights()
             norm_eps = float(getattr(self.q_norm, "eps", 1e-5))
-            q_inv_rms, k_inv_rms = fused_qk_inv_rms(qkv, eps=norm_eps)
+            q_inv_rms, k_inv_rms = self._get_triton_qk_inv_rms(
+                qkv, norm_eps=norm_eps
+            )
             rope_cos, rope_sin = self._get_triton_rope_tables(
                 prepare_rope_tables,
                 rotary_emb,
@@ -2211,22 +2243,97 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                 head_dim=head_dim,
                 device=qkv.device,
             )
-            out = fused_bigdn_func(
+            out = sana_wm_fused_bigdn_bidi_with_inv_rms(
                 qkv,
                 q_inv_rms,
                 k_inv_rms,
-                q_norm_weight=q_norm_weight,
-                k_norm_weight=k_norm_weight,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                beta=beta.contiguous(),
-                decay=decay.contiguous(),
+                q_norm_weight,
+                k_norm_weight,
+                rotary_emb,
+                beta.contiguous(),
+                decay.contiguous(),
                 F=T,
                 S=S,
                 k_scale=(head_dim**-0.5) * (S**-0.5),
                 eps=self.eps,
+                norm_eps=norm_eps,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
             )
             return out.reshape(B, N, heads * head_dim)
+        except Exception as exc:
+            if self.gdn_backend == "triton":
+                raise
+            _SANA_WM_TRITON_GDN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_gdn_fallback(str(exc))
+            return None
+
+    def _maybe_main_branch_triton_gdn_stateful(
+        self,
+        qkv: torch.Tensor,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        HW: Tuple[int, int, int],
+        rotary_emb: Optional[torch.Tensor],
+        *,
+        init_state_kv: Optional[torch.Tensor],
+        init_state_z: Optional[torch.Tensor],
+        return_final_state: bool,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
+        global _SANA_WM_TRITON_GDN_DISABLED_REASON
+
+        reason = self._triton_gdn_unavailable_reason(qkv, beta, decay, HW)
+        if reason is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(f"SANA-WM Triton GDN backend unavailable: {reason}")
+            return None
+
+        try:
+            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+                prepare_rope_tables,
+                sana_wm_fused_bigdn_bidi_with_inv_rms,
+            )
+
+            B, N, _, heads, head_dim = qkv.shape
+            T, H_sp, W_sp = HW
+            S = H_sp * W_sp
+            q_norm_weight, k_norm_weight = self._get_triton_norm_weights()
+            norm_eps = float(getattr(self.q_norm, "eps", 1e-5))
+            q_inv_rms, k_inv_rms = self._get_triton_qk_inv_rms(
+                qkv, norm_eps=norm_eps
+            )
+            rope_cos, rope_sin = self._get_triton_rope_tables(
+                prepare_rope_tables,
+                rotary_emb,
+                N=N,
+                head_dim=head_dim,
+                device=qkv.device,
+            )
+            result = sana_wm_fused_bigdn_bidi_with_inv_rms(
+                qkv,
+                q_inv_rms,
+                k_inv_rms,
+                q_norm_weight,
+                k_norm_weight,
+                rotary_emb,
+                beta.contiguous(),
+                decay.contiguous(),
+                F=T,
+                S=S,
+                k_scale=(head_dim**-0.5) * (S**-0.5),
+                eps=self.eps,
+                norm_eps=norm_eps,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                init_state_kv=init_state_kv,
+                init_state_z=init_state_z,
+                return_final_state=return_final_state,
+            )
+            if return_final_state:
+                out, state_kv, state_z = result
+            else:
+                out, state_kv, state_z = result, None, None
+            return out.reshape(B, N, heads * head_dim), state_kv, state_z
         except Exception as exc:
             if self.gdn_backend == "triton":
                 raise
@@ -2247,8 +2354,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
     ) -> Optional[str]:
         if self.gdn_backend == "torch":
             return "gdn_backend=torch"
-        if _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
-            return _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        if _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON is not None:
+            return _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON
         if self.training or torch.is_grad_enabled():
             return "requires eval/inference mode"
         if not q.is_cuda:
@@ -2292,13 +2399,13 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         decay: torch.Tensor,
         HW: Tuple[int, int, int],
     ) -> Optional[torch.Tensor]:
-        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        global _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON
 
         precheck_reason = None
         if self.gdn_backend == "torch":
             precheck_reason = "gdn_backend=torch"
-        elif _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
-            precheck_reason = _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        elif _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON is not None:
+            precheck_reason = _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON
         elif self.training or torch.is_grad_enabled():
             precheck_reason = "requires eval/inference mode"
         elif not q.is_cuda:
@@ -2346,8 +2453,83 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         except Exception as exc:
             if self.gdn_backend == "triton":
                 raise
-            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
-            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
+            _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc), subpath="scan")
+            return None
+
+    def _maybe_cam_branch_triton_scan_stateful(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        beta: torch.Tensor,
+        decay: torch.Tensor,
+        HW: Tuple[int, int, int],
+        *,
+        init_state_kv: Optional[torch.Tensor],
+        return_final_state: bool,
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        global _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON
+
+        q = q.float().contiguous()
+        k = k.float().contiguous()
+        v = v.float().contiguous()
+        reason = self._triton_cam_gdn_unavailable_reason(q, k, v, beta, decay, HW)
+        if reason is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    f"SANA-WM Triton camera GDN backend unavailable: {reason}"
+                )
+            return None
+
+        try:
+            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn_chunkwise import (
+                cam_scan_bidi_chunkwise,
+            )
+
+            B, heads, head_dim, _ = q.shape
+            T, H_sp, W_sp = HW
+            S = H_sp * W_sp
+            if beta.ndim == 3:
+                beta_in = beta.unsqueeze(-1).expand(B, heads, T, S).contiguous()
+            else:
+                beta_in = beta.contiguous()
+
+            block_d = 1 << (head_dim - 1).bit_length()
+            init_state_padded = None
+            if init_state_kv is not None:
+                state = init_state_kv.to(device=q.device, dtype=torch.float32)
+                init_state_padded = F.pad(
+                    state.transpose(-1, -2).reshape(B * heads, head_dim, head_dim),
+                    (0, block_d - head_dim, 0, block_d - head_dim),
+                ).contiguous()
+
+            result = cam_scan_bidi_chunkwise(
+                q,
+                k,
+                v,
+                beta_in.float(),
+                decay.float().contiguous(),
+                init_state=init_state_padded,
+                save_final_state=return_final_state,
+            )
+            if return_final_state:
+                out, final_state = result
+                state_kv = (
+                    final_state.view(B, heads, block_d, block_d)[
+                        :, :, :head_dim, :head_dim
+                    ]
+                    .transpose(-1, -2)
+                    .contiguous()
+                )
+            else:
+                out, state_kv = result, None
+            return out, state_kv
+        except Exception as exc:
+            if self.gdn_backend == "triton":
+                raise
+            _SANA_WM_TRITON_CAM_SCAN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc), subpath="scan")
             return None
 
     def _get_triton_cam_norm_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2400,11 +2582,18 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         v: torch.Tensor,
         HW: Tuple[int, int, int],
         prope_fns: object,
+        *,
+        softmax: bool = False,
     ) -> Optional[str]:
         if self.gdn_backend == "torch":
             return "gdn_backend=torch"
-        if _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
-            return _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        disabled_reason = (
+            _SANA_WM_TRITON_CAM_SOFTMAX_PREPROCESS_DISABLED_REASON
+            if softmax
+            else _SANA_WM_TRITON_CAM_PREPROCESS_DISABLED_REASON
+        )
+        if disabled_reason is not None:
+            return disabled_reason
         if self.training or torch.is_grad_enabled():
             return "requires eval/inference mode"
         if not q.is_cuda:
@@ -2442,7 +2631,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         HW: Tuple[int, int, int],
         prope_fns: object,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        global _SANA_WM_TRITON_CAM_PREPROCESS_DISABLED_REASON
 
         reason = self._triton_cam_preprocess_unavailable_reason(
             q,
@@ -2461,18 +2650,24 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         try:
             from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
-                can_use_sana_wm_cam_gdn_preprocess,
-                sana_wm_cam_gdn_preprocess,
+                can_use_sana_wm_cam_gdn_preprocess_with_inv_rms,
+                sana_wm_cam_gdn_preprocess_with_inv_rms,
             )
 
             q_weight, k_weight = self._get_triton_cam_norm_weights()
             raymats_t = getattr(prope_fns, "raymats_t")
             raymats_inv = getattr(prope_fns, "raymats_inv")
             rotary_emb_cam = getattr(prope_fns, "rotary_emb_cam", None)
-            if not can_use_sana_wm_cam_gdn_preprocess(
+            norm_eps = float(getattr(self.q_norm_cam, "eps", 1e-5))
+            q_inv_rms, k_inv_rms = self._get_triton_cam_qk_inv_rms(
+                q, k, norm_eps=norm_eps
+            )
+            if not can_use_sana_wm_cam_gdn_preprocess_with_inv_rms(
                 q,
                 k,
                 v,
+                q_inv_rms,
+                k_inv_rms,
                 q_weight,
                 k_weight,
                 raymats_t,
@@ -2488,23 +2683,25 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
             _, H_sp, W_sp = HW
             S = H_sp * W_sp
-            return sana_wm_cam_gdn_preprocess(
+            return sana_wm_cam_gdn_preprocess_with_inv_rms(
                 q.contiguous(),
                 k.contiguous(),
                 v.contiguous(),
+                q_inv_rms,
+                k_inv_rms,
                 q_weight,
                 k_weight,
                 raymats_t,
                 raymats_inv,
                 rotary_emb_cam,
                 k_scale=(self.dim**-0.5) * (S**-0.5),
-                eps=float(getattr(self.q_norm_cam, "eps", 1e-5)),
+                eps=norm_eps,
             )
         except Exception as exc:
             if self.gdn_backend == "triton":
                 raise
-            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
-            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
+            _SANA_WM_TRITON_CAM_PREPROCESS_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc), subpath="preprocess")
             return None
 
     def _maybe_cam_softmax_triton_preprocess(
@@ -2515,7 +2712,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         HW: Tuple[int, int, int],
         prope_fns: object,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        global _SANA_WM_TRITON_CAM_SOFTMAX_PREPROCESS_DISABLED_REASON
 
         reason = self._triton_cam_preprocess_unavailable_reason(
             q,
@@ -2523,6 +2720,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             v,
             HW,
             prope_fns,
+            softmax=True,
         )
         if reason is not None:
             if self.gdn_backend == "triton":
@@ -2534,18 +2732,24 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
 
         try:
             from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
-                can_use_sana_wm_cam_softmax_preprocess,
-                sana_wm_cam_softmax_preprocess,
+                can_use_sana_wm_cam_softmax_preprocess_with_inv_rms,
+                sana_wm_cam_softmax_preprocess_with_inv_rms,
             )
 
             q_weight, k_weight = self._get_triton_cam_norm_weights()
             raymats_t = getattr(prope_fns, "raymats_t")
             raymats_inv = getattr(prope_fns, "raymats_inv")
             rotary_emb_cam = getattr(prope_fns, "rotary_emb_cam", None)
-            if not can_use_sana_wm_cam_softmax_preprocess(
+            norm_eps = float(getattr(self.q_norm_cam, "eps", 1e-5))
+            q_inv_rms, k_inv_rms = self._get_triton_cam_qk_inv_rms(
+                q, k, norm_eps=norm_eps
+            )
+            if not can_use_sana_wm_cam_softmax_preprocess_with_inv_rms(
                 q,
                 k,
                 v,
+                q_inv_rms,
+                k_inv_rms,
                 q_weight,
                 k_weight,
                 raymats_t,
@@ -2559,23 +2763,26 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     )
                 return None
 
-            return sana_wm_cam_softmax_preprocess(
+            return sana_wm_cam_softmax_preprocess_with_inv_rms(
                 q.contiguous(),
                 k.contiguous(),
                 v.contiguous(),
+                q_inv_rms,
+                k_inv_rms,
                 q_weight,
                 k_weight,
                 raymats_t,
                 raymats_inv,
                 rotary_emb_cam,
-                norm_eps=float(getattr(self.q_norm_cam, "eps", 1e-5)),
                 downscale_eps=1e-6,
             )
         except Exception as exc:
             if self.gdn_backend == "triton":
                 raise
-            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
-            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
+            _SANA_WM_TRITON_CAM_SOFTMAX_PREPROCESS_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(
+                str(exc), subpath="softmax_preprocess"
+            )
             return None
 
     def _maybe_cam_output_triton_apply_o(
@@ -2583,15 +2790,15 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         x: torch.Tensor,
         prope_fns: object,
     ) -> Optional[torch.Tensor]:
-        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        global _SANA_WM_TRITON_CAM_OUTPUT_DISABLED_REASON
 
         if self.gdn_backend == "torch":
             return None
-        if _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
+        if _SANA_WM_TRITON_CAM_OUTPUT_DISABLED_REASON is not None:
             if self.gdn_backend == "triton":
                 raise RuntimeError(
                     "SANA-WM Triton camera output backend unavailable: "
-                    f"{_SANA_WM_TRITON_CAM_GDN_DISABLED_REASON}"
+                    f"{_SANA_WM_TRITON_CAM_OUTPUT_DISABLED_REASON}"
                 )
             return None
         if self.training or torch.is_grad_enabled():
@@ -2632,8 +2839,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         except Exception as exc:
             if self.gdn_backend == "triton":
                 raise
-            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
-            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
+            _SANA_WM_TRITON_CAM_OUTPUT_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc), subpath="output")
             return None
 
     # ------------------------------------------------------------------ #
@@ -3078,12 +3285,33 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             k = k.reshape(B, N, self.heads, self.dim)
             if save_kv_cache:
                 kv_cache[_SLOT_SHORTCONV] = new_prefix
+            qkv = torch.stack((q, k, v), dim=2).contiguous()
 
         beta, decay = _compute_frame_gates(
             x, HW, self.heads, self.beta_proj, self.gate_proj, self.dt_bias, self.A_log
         )
 
-        # Bypass the Triton fast path: it carries no state.
+        rotary_emb_chunk = _slice_rope_to_current_chunk(rotary_emb, N)
+        triton_out = self._maybe_main_branch_triton_gdn_stateful(
+            qkv,
+            beta,
+            decay,
+            HW,
+            rotary_emb_chunk,
+            init_state_kv=kv_cache[_SLOT_K],
+            init_state_z=kv_cache[_SLOT_V],
+            return_final_state=save_kv_cache,
+        )
+        if triton_out is not None:
+            out, state_kv, state_z = triton_out
+            if save_kv_cache:
+                kv_cache[_SLOT_K] = state_kv.detach().clone()
+                kv_cache[_SLOT_V] = state_z.detach().clone()
+                kv_cache[_SLOT_TYPE_FLAG] = torch.tensor(
+                    [_CACHE_TYPE_STATE], device=x.device
+                )
+            return out, beta, decay
+
         q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
         k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
         q = F.relu(q)
@@ -3094,10 +3322,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         k = k.permute(0, 2, 3, 1)
         v = v.permute(0, 2, 3, 1)
 
-        rotary_emb = _slice_rope_to_current_chunk(rotary_emb, N)
-        if rotary_emb is not None:
-            q_rot = _apply_rotary_emb_dn(q, rotary_emb)
-            k_rot = _apply_rotary_emb_dn(k, rotary_emb)
+        if rotary_emb_chunk is not None:
+            q_rot = _apply_rotary_emb_dn(q, rotary_emb_chunk)
+            k_rot = _apply_rotary_emb_dn(k, rotary_emb_chunk)
         else:
             q_rot = q
             k_rot = k
@@ -3252,18 +3479,33 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             beta = beta / frame_inflation_sq.unsqueeze(-1).clamp_min(1.0)
 
         dtype = q_dn.dtype
-        # Bypass the Triton cam scan: it carries no state.
-        out, cam_state = _single_path_delta_scan_cached(
-            q_dn.float(),
-            k_dn.float(),
-            v_dn.float(),
-            beta.float(),
-            decay.float(),
+        triton_scan = self._maybe_cam_branch_triton_scan_stateful(
+            q_dn,
+            k_dn,
+            v_dn,
+            beta,
+            decay,
+            HW,
             init_state_kv=kv_cache[_SLOT_CAM_K],
+            return_final_state=save_kv_cache,
         )
-        out = out.to(dtype)
-        if save_kv_cache:
-            kv_cache[_SLOT_CAM_K] = cam_state.detach().clone()
+        if triton_scan is None:
+            out, cam_state = _single_path_delta_scan_cached(
+                q_dn.float(),
+                k_dn.float(),
+                v_dn.float(),
+                beta.float(),
+                decay.float(),
+                init_state_kv=kv_cache[_SLOT_CAM_K],
+            )
+            out = out.to(dtype)
+            if save_kv_cache:
+                kv_cache[_SLOT_CAM_K] = cam_state.detach().clone()
+        else:
+            out, cam_state = triton_scan
+            out = out.to(dtype)
+            if save_kv_cache:
+                kv_cache[_SLOT_CAM_K] = cam_state.detach().clone()
 
         out_bhnd = out.permute(0, 1, 3, 2)
         out_bhnd = apply_o(out_bhnd)

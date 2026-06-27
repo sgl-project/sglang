@@ -38,8 +38,6 @@ import torch
 import triton
 import triton.language as tl
 
-_CAM_IDENTITY_CACHE: dict = {}
-
 # Per-architecture launch config (auto-selected via compute capability).
 # Empirically tuned at production config (B=1..8, T=11, S=920, H=20, D=112).
 # Two effects drive BLOCK_S:
@@ -624,6 +622,258 @@ def phase_a(
         num_stages=num_stages,
     )
     return I_P_kv, A, I_P_z, B_z
+
+
+@triton.jit
+def _cam_phase_a_kv_direct_kernel(
+    k_ptr,
+    v_ptr,
+    beta_ptr,
+    I_minus_P_kv_ptr,
+    A_ptr,
+    H: tl.constexpr,
+    F: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    if DOT_PRECISION >= 1:
+        dot_dtype = tl.float32
+    else:
+        dot_dtype = tl.bfloat16
+    dot_ip: tl.constexpr = "ieee" if DOT_PRECISION == 2 else "tf32"
+
+    pid = tl.program_id(0)
+    pid_b = pid // (H * F)
+    pid_hf = pid % (H * F)
+    pid_h = pid_hf // F
+    pid_f = pid_hf % F
+    bh = pid_b * H + pid_h
+    N: tl.constexpr = F * S
+
+    kv_base = (pid_b * H + pid_h) * D * N
+    beta_bhf = beta_ptr + bh * (F * S) + pid_f * S
+    I_P_kv_bhf = (
+        I_minus_P_kv_ptr + bh * F * BLOCK_D * BLOCK_D + pid_f * BLOCK_D * BLOCK_D
+    )
+    A_bhf = A_ptr + bh * F * BLOCK_D * BLOCK_D + pid_f * BLOCK_D * BLOCK_D
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    P_kv_acc = tl.zeros([BLOCK_D, BLOCK_D], dtype=tl.float32)
+    A_acc = tl.zeros([BLOCK_D, BLOCK_D], dtype=tl.float32)
+    n_base = pid_f * S
+
+    for s0 in range(0, S, BLOCK_S):
+        offs_s = s0 + tl.arange(0, BLOCK_S)
+        mask_s = offs_s < S
+        mask_sd = mask_s[:, None] & mask_d[None, :]
+        n_idx = n_base + offs_s
+        kv_ptrs = kv_base + offs_d[None, :] * N + n_idx[:, None]
+
+        K = tl.load(k_ptr + kv_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
+        V = tl.load(v_ptr + kv_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
+        beta_t = tl.load(beta_bhf + offs_s, mask=mask_s, other=0.0).to(tl.float32)
+
+        beta_K = beta_t[:, None] * K
+        beta_V = beta_t[:, None] * V
+        K_T = tl.trans(K)
+        P_kv_acc += tl.dot(
+            K_T.to(dot_dtype),
+            beta_K.to(dot_dtype),
+            out_dtype=tl.float32,
+            input_precision=dot_ip,
+        )
+        A_acc += tl.dot(
+            K_T.to(dot_dtype),
+            beta_V.to(dot_dtype),
+            out_dtype=tl.float32,
+            input_precision=dot_ip,
+        )
+
+    offs_dd = offs_d[:, None] * BLOCK_D + offs_d[None, :]
+    diag_in_range = (
+        (offs_d[:, None] == offs_d[None, :]) & mask_d[:, None] & mask_d[None, :]
+    )
+    I_minus_P_kv = tl.where(diag_in_range, 1.0 - P_kv_acc, -P_kv_acc)
+    if DOT_PRECISION >= 1:
+        tl.store(I_P_kv_bhf + offs_dd, I_minus_P_kv)
+        tl.store(A_bhf + offs_dd, A_acc)
+    else:
+        tl.store(I_P_kv_bhf + offs_dd, I_minus_P_kv.to(tl.bfloat16))
+        tl.store(A_bhf + offs_dd, A_acc.to(tl.bfloat16))
+
+
+def cam_phase_a_direct(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    F: int,
+    S: int,
+    *,
+    dot_precision: int = 0,
+    num_warps: int | None = None,
+    num_stages: int = 1,
+    BLOCK_S: int | None = None,
+):
+    """Camera Phase A over preprocessed ``(B, H, D, N)`` K/V.
+
+    Camera Q/K/V are already RMSNorm/ReLU/UCPE/RoPE prepared, so this direct
+    path avoids materializing the generic ``(B, N, 3, H, D)`` qkv layout.
+    """
+    if num_warps is None or BLOCK_S is None:
+        a_w, a_bs, *_ = _get_arch_config(dot_precision, device=k.device)
+        if num_warps is None:
+            num_warps = a_w
+        if BLOCK_S is None:
+            BLOCK_S = a_bs
+    B, H, D, N = k.shape
+    assert v.shape == k.shape and N == F * S
+    BLOCK_D = triton.next_power_of_2(D)
+    BH = B * H
+    bridge_dtype = torch.float32 if dot_precision >= 1 else torch.bfloat16
+    I_P_kv = torch.empty(BH, F, BLOCK_D, BLOCK_D, device=k.device, dtype=bridge_dtype)
+    A = torch.empty(BH, F, BLOCK_D, BLOCK_D, device=k.device, dtype=bridge_dtype)
+    I_P_z = torch.empty(1, device=k.device, dtype=bridge_dtype)
+    B_z = torch.empty(1, device=k.device, dtype=torch.float32)
+
+    _cam_phase_a_kv_direct_kernel[(BH * F,)](
+        k,
+        v,
+        beta.contiguous(),
+        I_P_kv,
+        A,
+        H=H,
+        F=F,
+        S=S,
+        D=D,
+        DOT_PRECISION=dot_precision,
+        BLOCK_D=BLOCK_D,
+        BLOCK_S=BLOCK_S,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return I_P_kv, A, I_P_z, B_z
+
+
+@triton.jit
+def _cam_phase_c_direct_kernel(
+    q_ptr,
+    M_ptr,
+    out_ptr,
+    H: tl.constexpr,
+    F: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    ACCUMULATE: tl.constexpr = False,
+):
+    if DOT_PRECISION >= 1:
+        dot_dtype = tl.float32
+    else:
+        dot_dtype = tl.bfloat16
+    dot_ip: tl.constexpr = "ieee" if DOT_PRECISION == 2 else "tf32"
+
+    pid = tl.program_id(0)
+    pid_b = pid // (H * F)
+    pid_hf = pid % (H * F)
+    pid_h = pid_hf // F
+    pid_f = pid_hf % F
+    bh = pid_b * H + pid_h
+    N: tl.constexpr = F * S
+
+    q_base = (pid_b * H + pid_h) * D * N
+    out_base = q_base
+    M_bhf = M_ptr + bh * F * BLOCK_D * BLOCK_D + pid_f * BLOCK_D * BLOCK_D
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+    offs_dd = offs_d[:, None] * BLOCK_D + offs_d[None, :]
+    mask_dd = mask_d[:, None] & mask_d[None, :]
+    M_f = tl.load(M_bhf + offs_dd, mask=mask_dd, other=0.0)
+
+    n_base = pid_f * S
+    for s0 in range(0, S, BLOCK_S):
+        offs_s = s0 + tl.arange(0, BLOCK_S)
+        mask_s = offs_s < S
+        mask_sd = mask_s[:, None] & mask_d[None, :]
+        n_idx = n_base + offs_s
+        q_ptrs = q_base + offs_d[None, :] * N + n_idx[:, None]
+        Q = tl.load(q_ptr + q_ptrs, mask=mask_sd, other=0.0).to(tl.float32)
+
+        num = tl.dot(
+            Q.to(dot_dtype),
+            M_f.to(dot_dtype),
+            out_dtype=tl.float32,
+            input_precision=dot_ip,
+        )
+        out_ptrs = out_base + offs_d[None, :] * N + n_idx[:, None]
+        if ACCUMULATE:
+            prev = tl.load(out_ptr + out_ptrs, mask=mask_sd, other=0.0).to(
+                tl.float32
+            )
+            num = num + prev
+        if DOT_PRECISION >= 1:
+            tl.store(out_ptr + out_ptrs, num, mask=mask_sd)
+        else:
+            tl.store(out_ptr + out_ptrs, num.to(tl.bfloat16), mask=mask_sd)
+
+
+def cam_phase_c_direct(
+    q: torch.Tensor,
+    M: torch.Tensor,
+    F: int,
+    S: int,
+    *,
+    dot_precision: int = 0,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
+    BLOCK_S: int | None = None,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+):
+    """Camera Phase C over preprocessed ``(B, H, D, N)`` Q."""
+    if num_warps is None or num_stages is None or BLOCK_S is None:
+        *_, c_w, c_bs, c_s = _get_arch_config(dot_precision, device=q.device)
+        if num_warps is None:
+            num_warps = c_w
+        if num_stages is None:
+            num_stages = c_s
+        if BLOCK_S is None:
+            BLOCK_S = c_bs
+    B, H, D, N = q.shape
+    assert N == F * S
+    BLOCK_D = triton.next_power_of_2(D)
+    if out is None:
+        out = torch.empty(
+            B,
+            H,
+            D,
+            N,
+            device=q.device,
+            dtype=(torch.float32 if dot_precision >= 1 else torch.bfloat16),
+        )
+    _cam_phase_c_direct_kernel[(B * H * F,)](
+        q,
+        M,
+        out,
+        H=H,
+        F=F,
+        S=S,
+        D=D,
+        DOT_PRECISION=dot_precision,
+        BLOCK_D=BLOCK_D,
+        BLOCK_S=BLOCK_S,
+        ACCUMULATE=1 if accumulate else 0,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1550,6 +1800,32 @@ def fused_bigdn_bidi_chunkwise(
         dot_precision=dot_precision,
     )
 
+    init_kv_padded, init_z_padded = init_state_kv, init_state_z
+    if init_state_kv is not None:
+        B_, H_, D_in, D_out = init_state_kv.shape
+        BLOCK_D_ = I_P_kv.shape[-1]
+        if D_in != BLOCK_D_ or D_out != BLOCK_D_:
+            pad_in = BLOCK_D_ - D_in
+            pad_out = BLOCK_D_ - D_out
+            init_kv_padded = torch.nn.functional.pad(
+                init_state_kv.transpose(-1, -2).reshape(B_ * H_, D_out, D_in),
+                (0, pad_in, 0, pad_out),
+            ).contiguous()
+        else:
+            init_kv_padded = (
+                init_state_kv.transpose(-1, -2)
+                .reshape(B_ * H_, BLOCK_D_, BLOCK_D_)
+                .contiguous()
+            )
+        z_ = init_state_z.squeeze(-1) if init_state_z.dim() == 4 else init_state_z
+        Bz_, Hz_, Dz_ = z_.shape
+        if Dz_ != BLOCK_D_:
+            init_z_padded = torch.nn.functional.pad(
+                z_.reshape(Bz_ * Hz_, Dz_), (0, BLOCK_D_ - Dz_)
+            ).contiguous()
+        else:
+            init_z_padded = z_.reshape(Bz_ * Hz_, Dz_).contiguous()
+
     if return_final_state:
         M_hist, z_hist, _, _, final_kv, final_z = phase_b_triton(
             I_P_kv,
@@ -1560,8 +1836,8 @@ def fused_bigdn_bidi_chunkwise(
             F=F,
             dot_precision=dot_precision,
             direction=0,
-            init_state_kv=init_state_kv,
-            init_state_z=init_state_z,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
             return_final_state=True,
             combined_history=True,
         )
@@ -1575,8 +1851,8 @@ def fused_bigdn_bidi_chunkwise(
             F=F,
             dot_precision=dot_precision,
             direction=0,
-            init_state_kv=init_state_kv,
-            init_state_z=init_state_z,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
             combined_history=True,
         )
     num_out, den_out = phase_c(
@@ -1624,29 +1900,6 @@ def _default_dot_prec() -> int:
         return 0
 
 
-def _cam_identity_tables(
-    *,
-    B: int,
-    N: int,
-    H: int,
-    D: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    device_index = device.index if device.type == "cuda" else None
-    key = (device.type, device_index, B, N, H * D, D)
-    cached = _CAM_IDENTITY_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    ones_inv_rms = torch.ones(B, N, device=device, dtype=torch.float32)
-    ones_nw = torch.ones(H * D, device=device, dtype=torch.float32)
-    ones_cos = torch.ones(N, D, device=device, dtype=torch.float32)
-    zeros_sin = torch.zeros(N, D, device=device, dtype=torch.float32)
-    cached = (ones_inv_rms, ones_nw, ones_cos, zeros_sin)
-    _CAM_IDENTITY_CACHE[key] = cached
-    return cached
-
-
 def cam_scan_bidi_chunkwise(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1654,6 +1907,8 @@ def cam_scan_bidi_chunkwise(
     beta: torch.Tensor,
     decay: torch.Tensor,
     *,
+    init_state: torch.Tensor | None = None,
+    save_final_state: bool = False,
     dot_precision: int | None = None,
 ) -> torch.Tensor:
     """Bidirectional camera scan for SANA-WM's numerator-only branch.
@@ -1680,58 +1935,72 @@ def cam_scan_bidi_chunkwise(
     if dot_precision is None:
         dot_precision = _default_dot_prec()
 
-    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
-    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
-    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
-    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
+    BLOCK_D = triton.next_power_of_2(D)
+    init_kv_padded = None
+    init_z_padded = None
+    if init_state is not None:
+        if init_state.shape != (B * H, BLOCK_D, BLOCK_D):
+            raise ValueError(
+                f"cam_scan_bidi_chunkwise: init_state shape {tuple(init_state.shape)} "
+                f"!= expected {(B * H, BLOCK_D, BLOCK_D)}."
+            )
+        init_kv_padded = init_state.to(torch.float32).contiguous()
+        init_z_padded = torch.zeros(
+            B * H, BLOCK_D, device=q.device, dtype=torch.float32
+        )
 
-    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(
-        B=B, N=N, H=H, D=D, device=q.device
-    )
-    I_P_kv, A, I_P_z, B_z = phase_a(
-        qkv,
+    I_P_kv, A, I_P_z, B_z = cam_phase_a_direct(
+        k,
+        v,
         beta,
-        ones_inv_rms,
-        ones_inv_rms,
-        ones_nw,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
         F=F,
         S=S,
-        k_scale=1.0,
-        norm_eps=1e-5,
         dot_precision=dot_precision,
-        skip_relu=True,
-        skip_z=True,
     )
-    M_hist, z_hist, _, _ = phase_b_triton(
-        I_P_kv,
-        A,
-        I_P_z,
-        B_z,
-        decay,
-        F=F,
-        dot_precision=dot_precision,
-        direction=0,
-        combined_history=True,
-        skip_z=True,
-    )
-    num_out, _ = phase_c(
-        qkv,
-        ones_inv_rms,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
+    if save_final_state:
+        M_hist, z_hist, _, _, final_kv, _final_z = phase_b_triton(
+            I_P_kv,
+            A,
+            I_P_z,
+            B_z,
+            decay,
+            F=F,
+            dot_precision=dot_precision,
+            direction=0,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
+            return_final_state=True,
+            combined_history=True,
+            skip_z=True,
+        )
+    else:
+        M_hist, z_hist, _, _ = phase_b_triton(
+            I_P_kv,
+            A,
+            I_P_z,
+            B_z,
+            decay,
+            F=F,
+            dot_precision=dot_precision,
+            direction=0,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
+            combined_history=True,
+            skip_z=True,
+        )
+    num_out = cam_phase_c_direct(
+        q,
         M_hist,
-        z_hist,
         F=F,
         S=S,
         dot_precision=dot_precision,
-        skip_relu=True,
-        num_only=True,
     )
-    return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
+    out = num_out.contiguous().to(torch.float32)
+    if save_final_state:
+        return out, final_kv
+    return out
+
+
 def fused_gdn_func_chunkwise(
     qkv,
     q_inv_rms,
@@ -2067,35 +2336,13 @@ def cam_scan_chunkwise(
     if dot_precision is None:
         dot_precision = _default_dot_prec()
 
-    # Repack (B, H, D, N) → (B, N, 3, H, D) for chunkwise's qkv layout.
-    # Avoid ``stack(...).permute(...).contiguous()`` because that materializes
-    # two large tensors. Direct packing allocates the destination once.
-    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
-    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
-    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
-    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
-
-    # Identity prep tables — make chunkwise's RMSNorm + RoPE no-ops.
-    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(B=B, N=N, H=H, D=D, device=q.device)
-
-    # Phase A (skip_relu=True for cam-prep'd K; skip_z=True since cam has no Z scan).
-    # k_scale=1.0 because cam_prep already applied K-scale.
-    I_P_kv, A_, I_P_z, B_z = phase_a(
-        qkv,
+    I_P_kv, A_, I_P_z, B_z = cam_phase_a_direct(
+        k,
+        v,
         beta,
-        ones_inv_rms,
-        ones_inv_rms,
-        ones_nw,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
         F=F,
         S=S,
-        k_scale=1.0,
-        norm_eps=1e-5,
         dot_precision=dot_precision,
-        skip_relu=True,
-        skip_z=True,
     )
 
     # Phase B (forward direction only; cam supports init_state on fwd, save_final
@@ -2155,27 +2402,14 @@ def cam_scan_chunkwise(
     # such that M_rev[F-1] = 0 and M_rev[t] = state computed from K/V at frames
     # {F-1, F-2, ..., t+1} — exactly cam's REVERSE=1 semantics.
     M_use = M_rev if reverse else M_fwd
-    z_use = z_rev_out if reverse else z_fwd_out
-
-    # Phase C — num-only (NUM_ONLY=True skips den compute + store).
-    # z is unused with NUM_ONLY but still required by the kernel signature.
-    num_out, _ = phase_c(
-        qkv,
-        ones_inv_rms,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
+    num_out = cam_phase_c_direct(
+        q,
         M_use,
-        z_use,
         F=F,
         S=S,
         dot_precision=dot_precision,
-        skip_relu=True,
-        num_only=True,
     )
-
-    # Convert chunkwise output (B, N, H, D) → cam's (B, H, D, N) layout, fp32.
-    out = num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
+    out = num_out.contiguous().to(torch.float32)
 
     if save_final_state:
         return out, final_kv  # final_kv already (B*H, BLOCK_D, BLOCK_D) fp32
@@ -2197,8 +2431,7 @@ def cam_scan_pair_chunkwise(
 
     Chunk-causal camera attention needs the reverse branch to use boundary-masked
     gates while the forward branch uses the original gates. This wrapper keeps
-    that exact behavior but shares QKV packing, identity tables, and the final
-    output layout conversion across the two scans.
+    that exact behavior while avoiding the generic packed-QKV camera layout.
     """
     assert q.shape == k.shape == v.shape, f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
@@ -2216,29 +2449,13 @@ def cam_scan_pair_chunkwise(
     if dot_precision is None:
         dot_precision = _default_dot_prec()
 
-    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
-    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
-    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
-    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
-
-    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(B=B, N=N, H=H, D=D, device=q.device)
-
-    I_P_kv, A_, I_P_z, B_z = phase_a(
-        qkv,
+    I_P_kv, A_, I_P_z, B_z = cam_phase_a_direct(
+        k,
+        v,
         beta_fwd,
-        ones_inv_rms,
-        ones_inv_rms,
-        ones_nw,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
         F=F,
         S=S,
-        k_scale=1.0,
-        norm_eps=1e-5,
         dot_precision=dot_precision,
-        skip_relu=True,
-        skip_z=True,
     )
     M_fwd, z_fwd, _, _ = phase_b_triton(
         I_P_kv,
@@ -2251,38 +2468,22 @@ def cam_scan_pair_chunkwise(
         direction=1,
         skip_z=True,
     )
-    num_out, _ = phase_c(
-        qkv,
-        ones_inv_rms,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
+    num_out = cam_phase_c_direct(
+        q,
         M_fwd,
-        z_fwd,
         F=F,
         S=S,
         dot_precision=dot_precision,
-        skip_relu=True,
-        num_only=True,
     )
     del I_P_kv, A_, I_P_z, B_z, M_fwd, z_fwd
 
-    I_P_kv, A_, I_P_z, B_z = phase_a(
-        qkv,
+    I_P_kv, A_, I_P_z, B_z = cam_phase_a_direct(
+        k,
+        v,
         beta_rev,
-        ones_inv_rms,
-        ones_inv_rms,
-        ones_nw,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
         F=F,
         S=S,
-        k_scale=1.0,
-        norm_eps=1e-5,
         dot_precision=dot_precision,
-        skip_relu=True,
-        skip_z=True,
     )
     _, _, M_rev, z_rev = phase_b_triton(
         I_P_kv,
@@ -2295,20 +2496,13 @@ def cam_scan_pair_chunkwise(
         direction=2,
         skip_z=True,
     )
-    phase_c(
-        qkv,
-        ones_inv_rms,
-        ones_nw,
-        ones_cos,
-        zeros_sin,
+    cam_phase_c_direct(
+        q,
         M_rev,
-        z_rev,
         F=F,
         S=S,
         dot_precision=dot_precision,
-        num_out=num_out,
+        out=num_out,
         accumulate=True,
-        skip_relu=True,
-        num_only=True,
     )
-    return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
+    return num_out.contiguous().to(torch.float32)

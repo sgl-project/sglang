@@ -597,6 +597,11 @@ def sana_wm_fused_bigdn_bidi_with_inv_rms(
     eps: float,
     norm_eps: float,
     dot_precision: int = 0,
+    rope_cos: Optional[torch.Tensor] = None,
+    rope_sin: Optional[torch.Tensor] = None,
+    init_state_kv: Optional[torch.Tensor] = None,
+    init_state_z: Optional[torch.Tensor] = None,
+    return_final_state: bool = False,
 ) -> torch.Tensor:
     """Run fused bidirectional GDN with caller-provided Q/K inv-RMS.
 
@@ -612,15 +617,20 @@ def sana_wm_fused_bigdn_bidi_with_inv_rms(
         qkv = qkv.contiguous()
 
     _, N, _, _, D = qkv.shape
-    rope_cos, rope_sin = prepare_sana_wm_rope_tables(rotary_emb, N, D, qkv.device)
+    if rope_cos is None or rope_sin is None:
+        if rope_cos is not None or rope_sin is not None:
+            raise ValueError("rope_cos and rope_sin must be provided together.")
+        rope_cos, rope_sin = prepare_sana_wm_rope_tables(
+            rotary_emb, N, D, qkv.device
+        )
     return fused_bigdn_bidi_chunkwise(
         qkv,
         q_inv_rms.contiguous(),
         k_inv_rms.contiguous(),
         q_weight.float().contiguous(),
         k_weight.float().contiguous(),
-        rope_cos,
-        rope_sin,
+        rope_cos.contiguous(),
+        rope_sin.contiguous(),
         beta.contiguous(),
         decay.contiguous(),
         F=F,
@@ -629,6 +639,9 @@ def sana_wm_fused_bigdn_bidi_with_inv_rms(
         eps=eps,
         norm_eps=norm_eps,
         dot_precision=dot_precision,
+        init_state_kv=init_state_kv,
+        init_state_z=init_state_z,
+        return_final_state=return_final_state,
     )
 
 
@@ -646,6 +659,9 @@ def sana_wm_fused_bigdn_bidi(
     eps: float,
     norm_eps: float,
     dot_precision: int = 0,
+    init_state_kv: Optional[torch.Tensor] = None,
+    init_state_z: Optional[torch.Tensor] = None,
+    return_final_state: bool = False,
 ) -> torch.Tensor:
     """Run the upstream Sana-WM fused bidirectional GDN pipeline.
 
@@ -671,6 +687,9 @@ def sana_wm_fused_bigdn_bidi(
         eps=eps,
         norm_eps=norm_eps,
         dot_precision=dot_precision,
+        init_state_kv=init_state_kv,
+        init_state_z=init_state_z,
+        return_final_state=return_final_state,
     )
 
 
