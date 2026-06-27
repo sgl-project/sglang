@@ -79,6 +79,50 @@ def _log_sana_wm_triton_cam_gdn_fallback(reason: str) -> None:
         _SANA_WM_TRITON_CAM_GDN_FALLBACK_LOGGED = True
 
 
+class _UCPEApplyFns:
+    """Tuple-like UCPE callables plus tensors needed by Triton camera kernels."""
+
+    __slots__ = (
+        "apply_q",
+        "apply_kv",
+        "apply_o",
+        "raymats",
+        "raymats_t",
+        "raymats_inv",
+        "rotary_emb_cam",
+    )
+
+    def __init__(
+        self,
+        apply_q: Callable,
+        apply_kv: Callable,
+        apply_o: Callable,
+        *,
+        raymats: torch.Tensor,
+        raymats_t: torch.Tensor,
+        raymats_inv: torch.Tensor,
+        rotary_emb_cam: Optional[torch.Tensor],
+    ) -> None:
+        self.apply_q = apply_q
+        self.apply_kv = apply_kv
+        self.apply_o = apply_o
+        self.raymats = raymats
+        self.raymats_t = raymats_t
+        self.raymats_inv = raymats_inv
+        self.rotary_emb_cam = rotary_emb_cam
+
+    def __iter__(self):
+        yield self.apply_q
+        yield self.apply_kv
+        yield self.apply_o
+
+    def __len__(self) -> int:
+        return 3
+
+    def __getitem__(self, idx):
+        return (self.apply_q, self.apply_kv, self.apply_o)[idx]
+
+
 # ---------------------------------------------------------------------------
 # Small primitives (RMSNorm, ShortConvolution). Parameter names/shapes match
 # the released checkpoint so it loads cleanly.
@@ -563,7 +607,7 @@ def _build_ucpe_apply_fns(
     head_dim: int,
     raymats: torch.Tensor,  # (B, N, 4, 4) -- ray<-world
     rotary_emb: Optional[torch.Tensor],
-) -> Tuple[Callable, Callable, Callable]:
+) -> _UCPEApplyFns:
     """Build the (apply_q, apply_kv, apply_o) callables used in the camera
     branch.  Splits the head_dim in two: half for 4x4 projmat tiling, half
     for complex-RoPE rotation.
@@ -609,7 +653,15 @@ def _build_ucpe_apply_fns(
     def apply_o(x: torch.Tensor) -> torch.Tensor:
         return _apply_block_diagonal(x, [(ray_proj, half), (rope_fn_inv, half)])
 
-    return apply_q, apply_kv, apply_o
+    return _UCPEApplyFns(
+        apply_q,
+        apply_kv,
+        apply_o,
+        raymats=P,
+        raymats_t=P_T,
+        raymats_inv=P_inv,
+        rotary_emb_cam=rotary_emb_cam,
+    )
 
 
 def _compute_fov_from_focal(focal: torch.Tensor, image_size: int) -> torch.Tensor:
@@ -1973,6 +2025,9 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self._triton_norm_weights_cache: Optional[
             Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
         ] = None
+        self._triton_cam_norm_weights_cache: Optional[
+            Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None
         self._cam_qkv_params_cache: Optional[
             Tuple[Tuple, Tuple[torch.Tensor, torch.Tensor]]
         ] = None
@@ -2295,6 +2350,292 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             _log_sana_wm_triton_cam_gdn_fallback(str(exc))
             return None
 
+    def _get_triton_cam_norm_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_weight = self.q_norm_cam.weight
+        k_weight = self.k_norm_cam.weight
+        key = (
+            "triton_cam_norm_weights",
+            _tensor_cache_key(q_weight),
+            _tensor_cache_key(k_weight),
+        )
+        cached = self._triton_cam_norm_weights_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        weights = (
+            q_weight.float().contiguous(),
+            k_weight.float().contiguous(),
+        )
+        self._triton_cam_norm_weights_cache = (key, weights)
+        return weights
+
+    def _ucpe_triton_metadata_unavailable_reason(
+        self,
+        prope_fns: object,
+        *,
+        B: int,
+        N: int,
+    ) -> Optional[str]:
+        raymats = getattr(prope_fns, "raymats", None)
+        raymats_t = getattr(prope_fns, "raymats_t", None)
+        raymats_inv = getattr(prope_fns, "raymats_inv", None)
+        if raymats is None or raymats_t is None or raymats_inv is None:
+            return "requires UCPE kernel metadata"
+        expected = (B, N, 4, 4)
+        if tuple(raymats.shape) != expected:
+            return f"requires raymats shape {expected}, got {tuple(raymats.shape)}"
+        if tuple(raymats_t.shape) != expected:
+            return f"requires raymats_t shape {expected}, got {tuple(raymats_t.shape)}"
+        if tuple(raymats_inv.shape) != expected:
+            return (
+                f"requires raymats_inv shape {expected}, "
+                f"got {tuple(raymats_inv.shape)}"
+            )
+        return None
+
+    def _triton_cam_preprocess_unavailable_reason(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        HW: Tuple[int, int, int],
+        prope_fns: object,
+    ) -> Optional[str]:
+        if self.gdn_backend == "torch":
+            return "gdn_backend=torch"
+        if _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
+            return _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+        if self.training or torch.is_grad_enabled():
+            return "requires eval/inference mode"
+        if not q.is_cuda:
+            return "requires CUDA tensor"
+        if q.shape != k.shape or q.shape != v.shape:
+            return f"q/k/v shape mismatch: {q.shape}/{k.shape}/{v.shape}"
+        if q.dim() != 4:
+            return f"requires q/k/v shape (B, N, H, D), got {tuple(q.shape)}"
+        if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return f"requires fp16/bf16/fp32 q, got {q.dtype}"
+        B, N, heads, head_dim = q.shape
+        T, H_sp, W_sp = HW
+        if heads != self.heads or head_dim != self.dim:
+            return (
+                f"requires local heads/dim {(self.heads, self.dim)}, "
+                f"got {(heads, head_dim)}"
+            )
+        if N != T * H_sp * W_sp:
+            return f"requires N=T*S, got N={N}, T*S={T * H_sp * W_sp}"
+        if not hasattr(self.q_norm_cam, "weight") or not hasattr(
+            self.k_norm_cam, "weight"
+        ):
+            return "requires learned camera q/k RMSNorm weights"
+        return self._ucpe_triton_metadata_unavailable_reason(
+            prope_fns,
+            B=B,
+            N=N,
+        )
+
+    def _maybe_cam_gdn_triton_preprocess(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        HW: Tuple[int, int, int],
+        prope_fns: object,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+
+        reason = self._triton_cam_preprocess_unavailable_reason(
+            q,
+            k,
+            v,
+            HW,
+            prope_fns,
+        )
+        if reason is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    "SANA-WM Triton camera preprocess backend unavailable: "
+                    f"{reason}"
+                )
+            return None
+
+        try:
+            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+                can_use_sana_wm_cam_gdn_preprocess,
+                sana_wm_cam_gdn_preprocess,
+            )
+
+            q_weight, k_weight = self._get_triton_cam_norm_weights()
+            raymats_t = getattr(prope_fns, "raymats_t")
+            raymats_inv = getattr(prope_fns, "raymats_inv")
+            rotary_emb_cam = getattr(prope_fns, "rotary_emb_cam", None)
+            if not can_use_sana_wm_cam_gdn_preprocess(
+                q,
+                k,
+                v,
+                q_weight,
+                k_weight,
+                raymats_t,
+                raymats_inv,
+                rotary_emb_cam,
+            ):
+                if self.gdn_backend == "triton":
+                    raise RuntimeError(
+                        "SANA-WM Triton camera preprocess backend unavailable: "
+                        "kernel guard rejected inputs"
+                    )
+                return None
+
+            _, H_sp, W_sp = HW
+            S = H_sp * W_sp
+            return sana_wm_cam_gdn_preprocess(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                q_weight,
+                k_weight,
+                raymats_t,
+                raymats_inv,
+                rotary_emb_cam,
+                k_scale=(self.dim**-0.5) * (S**-0.5),
+                eps=float(getattr(self.q_norm_cam, "eps", 1e-5)),
+            )
+        except Exception as exc:
+            if self.gdn_backend == "triton":
+                raise
+            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
+            return None
+
+    def _maybe_cam_softmax_triton_preprocess(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        HW: Tuple[int, int, int],
+        prope_fns: object,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+
+        reason = self._triton_cam_preprocess_unavailable_reason(
+            q,
+            k,
+            v,
+            HW,
+            prope_fns,
+        )
+        if reason is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    "SANA-WM Triton camera softmax preprocess backend "
+                    f"unavailable: {reason}"
+                )
+            return None
+
+        try:
+            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+                can_use_sana_wm_cam_softmax_preprocess,
+                sana_wm_cam_softmax_preprocess,
+            )
+
+            q_weight, k_weight = self._get_triton_cam_norm_weights()
+            raymats_t = getattr(prope_fns, "raymats_t")
+            raymats_inv = getattr(prope_fns, "raymats_inv")
+            rotary_emb_cam = getattr(prope_fns, "rotary_emb_cam", None)
+            if not can_use_sana_wm_cam_softmax_preprocess(
+                q,
+                k,
+                v,
+                q_weight,
+                k_weight,
+                raymats_t,
+                raymats_inv,
+                rotary_emb_cam,
+            ):
+                if self.gdn_backend == "triton":
+                    raise RuntimeError(
+                        "SANA-WM Triton camera softmax preprocess backend "
+                        "unavailable: kernel guard rejected inputs"
+                    )
+                return None
+
+            return sana_wm_cam_softmax_preprocess(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                q_weight,
+                k_weight,
+                raymats_t,
+                raymats_inv,
+                rotary_emb_cam,
+                norm_eps=float(getattr(self.q_norm_cam, "eps", 1e-5)),
+                downscale_eps=1e-6,
+            )
+        except Exception as exc:
+            if self.gdn_backend == "triton":
+                raise
+            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
+            return None
+
+    def _maybe_cam_output_triton_apply_o(
+        self,
+        x: torch.Tensor,
+        prope_fns: object,
+    ) -> Optional[torch.Tensor]:
+        global _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON
+
+        if self.gdn_backend == "torch":
+            return None
+        if _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON is not None:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    "SANA-WM Triton camera output backend unavailable: "
+                    f"{_SANA_WM_TRITON_CAM_GDN_DISABLED_REASON}"
+                )
+            return None
+        if self.training or torch.is_grad_enabled():
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    "SANA-WM Triton camera output backend unavailable: "
+                    "requires eval/inference mode"
+                )
+            return None
+        if not x.is_cuda:
+            if self.gdn_backend == "triton":
+                raise RuntimeError(
+                    "SANA-WM Triton camera output backend unavailable: "
+                    "requires CUDA tensor"
+                )
+            return None
+
+        try:
+            from sglang.jit_kernel.diffusion.triton.sana_wm_gdn import (
+                can_use_sana_wm_cam_output_apply_o,
+                sana_wm_cam_output_apply_o,
+            )
+
+            raymats = getattr(prope_fns, "raymats", None)
+            rotary_emb_cam = getattr(prope_fns, "rotary_emb_cam", None)
+            if not can_use_sana_wm_cam_output_apply_o(
+                x,
+                raymats,
+                rotary_emb_cam,
+            ):
+                if self.gdn_backend == "triton":
+                    raise RuntimeError(
+                        "SANA-WM Triton camera output backend unavailable: "
+                        "kernel guard rejected inputs"
+                    )
+                return None
+            return sana_wm_cam_output_apply_o(x, raymats, rotary_emb_cam)
+        except Exception as exc:
+            if self.gdn_backend == "triton":
+                raise
+            _SANA_WM_TRITON_CAM_GDN_DISABLED_REASON = str(exc)
+            _log_sana_wm_triton_cam_gdn_fallback(str(exc))
+            return None
+
     # ------------------------------------------------------------------ #
 
     def _main_branch_gdn(
@@ -2458,6 +2799,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         apply_o: Callable,
         beta: torch.Tensor,
         decay: torch.Tensor,
+        prope_fns: object,
     ) -> torch.Tensor:
         B, N, C = x.shape
         T, H_sp, W_sp = HW
@@ -2474,41 +2816,55 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
             k = k.reshape(B, N, self.heads, self.dim)
 
-        q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
-        k = self.k_norm_cam(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        cam_preprocessed = self._maybe_cam_gdn_triton_preprocess(
+            q,
+            k,
+            v,
+            HW,
+            prope_fns,
+        )
+        if cam_preprocessed is None:
+            q = self.q_norm_cam(q.reshape(B, N, C)).reshape(
+                B, N, self.heads, self.dim
+            )
+            k = self.k_norm_cam(k.reshape(B, N, C)).reshape(
+                B, N, self.heads, self.dim
+            )
 
-        q = F.relu(q)
-        k = F.relu(k)
-        k_scale = (self.dim**-0.5) * (S**-0.5)
-        k = k * k_scale
+            q = F.relu(q)
+            k = F.relu(k)
+            k_scale = (self.dim**-0.5) * (S**-0.5)
+            k = k * k_scale
 
-        # (B, H, N, D) for UCPE apply, then back to (B, H, D, N) for the scan.
-        q_bhnd = q.permute(0, 2, 1, 3)
-        k_bhnd = k.permute(0, 2, 1, 3)
-        v_bhnd = v.permute(0, 2, 1, 3)
+            # (B, H, N, D) for UCPE apply, then back to (B, H, D, N) for the scan.
+            q_bhnd = q.permute(0, 2, 1, 3)
+            k_bhnd = k.permute(0, 2, 1, 3)
+            v_bhnd = v.permute(0, 2, 1, 3)
 
-        q_proj = apply_q(q_bhnd)
-        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
-        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
+            q_proj = apply_q(q_bhnd)
+            kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+            k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
-        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
-        q_dn = q_proj.permute(0, 1, 3, 2)
-        k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
-        k_dn = k_proj.permute(0, 1, 3, 2)
-        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
-        v_dn = v_proj.permute(0, 1, 3, 2)
+            q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
+            q_dn = q_proj.permute(0, 1, 3, 2)
+            k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
+            k_dn = k_proj.permute(0, 1, 3, 2)
+            v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
+            v_dn = v_proj.permute(0, 1, 3, 2)
 
-        q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
-        k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
-        v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
+            q_dn = _downscale_to_reference_rms(q_pre_dn, q_dn)
+            k_dn = _downscale_to_reference_rms(k_pre_dn, k_dn)
+            v_dn = _downscale_to_reference_rms(v_pre_dn, v_dn)
 
-        pre_ucpe_k_norm = torch.linalg.vector_norm(
-            k_pre_dn.float(), dim=2, keepdim=True
-        ).clamp_min(1e-6)
-        post_ucpe_k_norm = torch.linalg.vector_norm(
-            k_dn.float(), dim=2, keepdim=True
-        ).clamp_min(1e-6)
-        inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2
+            pre_ucpe_k_norm = torch.linalg.vector_norm(
+                k_pre_dn.float(), dim=2, keepdim=True
+            ).clamp_min(1e-6)
+            post_ucpe_k_norm = torch.linalg.vector_norm(
+                k_dn.float(), dim=2, keepdim=True
+            ).clamp_min(1e-6)
+            inflation_sq = (post_ucpe_k_norm / pre_ucpe_k_norm) ** 2
+        else:
+            q_dn, k_dn, v_dn, inflation_sq = cam_preprocessed
         frame_inflation_sq = inflation_sq.view(B, self.heads, T, S).mean(dim=-1)
         if beta.ndim == 3:
             beta = beta / frame_inflation_sq.clamp_min(1.0)
@@ -2534,7 +2890,11 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
         out = out.to(dtype)
         out_bhnd = out.permute(0, 1, 3, 2)
-        out_bhnd = apply_o(out_bhnd)
+        triton_out_bhnd = self._maybe_cam_output_triton_apply_o(out_bhnd, prope_fns)
+        if triton_out_bhnd is None:
+            out_bhnd = apply_o(out_bhnd)
+        else:
+            out_bhnd = triton_out_bhnd
         return out_bhnd.permute(0, 2, 1, 3).reshape(B, N, C)
 
     def _cam_branch_softmax(
@@ -2544,6 +2904,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         apply_q: Callable,
         apply_kv: Callable,
         apply_o: Callable,
+        prope_fns: object,
         chunk_size: Optional[int] = None,
         chunk_split_strategy: str = "uniform",
         chunk_index: Optional[List[int]] = None,
@@ -2561,23 +2922,46 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             )
             k = k.reshape(B, N, self.heads, self.dim)
 
-        q = self.q_norm_cam(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
-        k = self.k_norm_cam(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        cam_preprocessed = self._maybe_cam_softmax_triton_preprocess(
+            q,
+            k,
+            v,
+            HW,
+            prope_fns,
+        )
+        if cam_preprocessed is None:
+            q = self.q_norm_cam(q.reshape(B, N, C)).reshape(
+                B, N, self.heads, self.dim
+            )
+            k = self.k_norm_cam(k.reshape(B, N, C)).reshape(
+                B, N, self.heads, self.dim
+            )
 
-        q_bhnd = q.permute(0, 2, 1, 3)
-        k_bhnd = k.permute(0, 2, 1, 3)
-        v_bhnd = v.permute(0, 2, 1, 3)
+            q_bhnd = q.permute(0, 2, 1, 3)
+            k_bhnd = k.permute(0, 2, 1, 3)
+            v_bhnd = v.permute(0, 2, 1, 3)
 
-        q_proj = apply_q(q_bhnd)
-        kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
-        k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
+            q_proj = apply_q(q_bhnd)
+            kv_proj = apply_kv(torch.cat([k_bhnd, v_bhnd], dim=1))
+            k_proj, v_proj = torch.chunk(kv_proj, chunks=2, dim=1)
 
-        q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
-        k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
-        v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
-        q_dn = _downscale_to_reference_rms(q_pre_dn, q_proj.permute(0, 1, 3, 2))
-        k_dn = _downscale_to_reference_rms(k_pre_dn, k_proj.permute(0, 1, 3, 2))
-        v_dn = _downscale_to_reference_rms(v_pre_dn, v_proj.permute(0, 1, 3, 2))
+            q_pre_dn = q_bhnd.permute(0, 1, 3, 2)
+            k_pre_dn = k_bhnd.permute(0, 1, 3, 2)
+            v_pre_dn = v_bhnd.permute(0, 1, 3, 2)
+            q_dn = _downscale_to_reference_rms(
+                q_pre_dn,
+                q_proj.permute(0, 1, 3, 2),
+            )
+            k_dn = _downscale_to_reference_rms(
+                k_pre_dn,
+                k_proj.permute(0, 1, 3, 2),
+            )
+            v_dn = _downscale_to_reference_rms(
+                v_pre_dn,
+                v_proj.permute(0, 1, 3, 2),
+            )
+        else:
+            q_dn, k_dn, v_dn = cam_preprocessed
 
         q_in = q_dn.permute(0, 3, 1, 2).contiguous()
         k_in = k_dn.permute(0, 3, 1, 2).contiguous()
@@ -2598,7 +2982,11 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             out = self.softmax_attn(q_in, k_in, v_in)  # (B, N, H, D)
 
         out_bhnd = out.transpose(1, 2).contiguous()
-        out_bhnd = apply_o(out_bhnd)
+        triton_out_bhnd = self._maybe_cam_output_triton_apply_o(out_bhnd, prope_fns)
+        if triton_out_bhnd is None:
+            out_bhnd = apply_o(out_bhnd)
+        else:
+            out_bhnd = triton_out_bhnd
         return out_bhnd.transpose(1, 2).reshape(B, N, C)
 
     # ------------------------------------------------------------------ #
@@ -2634,13 +3022,14 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
                     apply_q,
                     apply_kv,
                     apply_o,
+                    prope_fns,
                     chunk_size=chunk_size,
                     chunk_split_strategy=chunk_split_strategy,
                     chunk_index=chunk_index,
                 )
             else:
                 cam_raw = self._cam_branch(
-                    x, HW, apply_q, apply_kv, apply_o, beta, decay
+                    x, HW, apply_q, apply_kv, apply_o, beta, decay, prope_fns
                 )
             combined = main_raw + self.out_proj_cam(cam_raw)
         else:

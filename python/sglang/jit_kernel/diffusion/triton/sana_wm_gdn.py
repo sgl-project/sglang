@@ -823,6 +823,7 @@ def _sana_wm_cam_prep_kernel(
     D_HALF: tl.constexpr,
     N_GROUPS: tl.constexpr,
     K_SCALE: tl.constexpr,
+    DOWNSCALE_EPS: tl.constexpr,
     BLOCK_D_ROPE: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
 ):
@@ -872,13 +873,17 @@ def _sana_wm_cam_prep_kernel(
 
     q_half = tl.maximum(q_half * q_inv_rms * q_w_half, 0.0)
     k_half = tl.maximum(k_half * k_inv_rms * k_w_half, 0.0) * K_SCALE
+    q_pre_half_sq = tl.sum(tl.where(mask_gj, q_half * q_half, 0.0))
     k_pre_half_sq = tl.sum(tl.where(mask_gj, k_half * k_half, 0.0))
+    v_pre_half_sq = tl.sum(tl.where(mask_gj, v_half * v_half, 0.0))
 
     # out[g, i] = sum_j P[i, j] * in[g, j]
     q_half_out = tl.sum(q_half[:, None, :] * proj_q[None, :, :], axis=-1)
     k_half_out = tl.sum(k_half[:, None, :] * proj_kv[None, :, :], axis=-1)
     v_half_out = tl.sum(v_half[:, None, :] * proj_kv[None, :, :], axis=-1)
+    q_post_half_sq = tl.sum(tl.where(mask_gj, q_half_out * q_half_out, 0.0))
     k_post_half_sq = tl.sum(tl.where(mask_gj, k_half_out * k_half_out, 0.0))
+    v_post_half_sq = tl.sum(tl.where(mask_gj, v_half_out * v_half_out, 0.0))
 
     # Second half: interleaved-pair RoPE.
     offs_r = tl.arange(0, BLOCK_D_ROPE)
@@ -935,27 +940,64 @@ def _sana_wm_cam_prep_kernel(
     k_r = tl.maximum(k_r * k_inv_rms * k_w, 0.0) * K_SCALE
     q_pair = tl.maximum(q_pair * q_inv_rms * q_pair_w, 0.0)
     k_pair = tl.maximum(k_pair * k_inv_rms * k_pair_w, 0.0) * K_SCALE
+    q_pre_rope_sq = tl.sum(tl.where(mask_r, q_r * q_r, 0.0))
     k_pre_rope_sq = tl.sum(tl.where(mask_r, k_r * k_r, 0.0))
+    v_pre_rope_sq = tl.sum(tl.where(mask_r, v_r * v_r, 0.0))
 
     q_rope_out = q_r * cos_v + q_pair * sin_v
     k_rope_out = k_r * cos_v + k_pair * sin_v
     v_rope_out = v_r * cos_v + v_pair * sin_v
+    q_post_rope_sq = tl.sum(tl.where(mask_r, q_rope_out * q_rope_out, 0.0))
     k_post_rope_sq = tl.sum(tl.where(mask_r, k_rope_out * k_rope_out, 0.0))
+    v_post_rope_sq = tl.sum(tl.where(mask_r, v_rope_out * v_rope_out, 0.0))
 
-    pre_sq = k_pre_half_sq + k_pre_rope_sq
-    post_sq = k_post_half_sq + k_post_rope_sq
-    inflation = tl.maximum(post_sq, 1.0e-12) / tl.maximum(pre_sq, 1.0e-12)
+    inv_d = 1.0 / D
+    q_pre_sq = q_pre_half_sq + q_pre_rope_sq
+    k_pre_sq = k_pre_half_sq + k_pre_rope_sq
+    v_pre_sq = v_pre_half_sq + v_pre_rope_sq
+    q_post_sq = q_post_half_sq + q_post_rope_sq
+    k_post_sq = k_post_half_sq + k_post_rope_sq
+    v_post_sq = v_post_half_sq + v_post_rope_sq
+    q_scale = tl.sqrt(q_pre_sq * inv_d + DOWNSCALE_EPS) / tl.sqrt(
+        q_post_sq * inv_d + DOWNSCALE_EPS
+    )
+    k_scale = tl.sqrt(k_pre_sq * inv_d + DOWNSCALE_EPS) / tl.sqrt(
+        k_post_sq * inv_d + DOWNSCALE_EPS
+    )
+    v_scale = tl.sqrt(v_pre_sq * inv_d + DOWNSCALE_EPS) / tl.sqrt(
+        v_post_sq * inv_d + DOWNSCALE_EPS
+    )
+    q_scale = tl.minimum(q_scale, 1.0)
+    k_scale = tl.minimum(k_scale, 1.0)
+    v_scale = tl.minimum(v_scale, 1.0)
+    k_post_scaled_sq = k_post_sq * k_scale * k_scale
+    inflation = tl.maximum(k_post_scaled_sq, 1.0e-12) / tl.maximum(
+        k_pre_sq,
+        1.0e-12,
+    )
 
     out_base = b_idx * (H * D * N) + h_idx * (D * N) + n_idx
     offs_d_half = offs_g[:, None] * 4 + offs_i[None, :]
-    tl.store(q_out_ptr + out_base + offs_d_half * N, q_half_out, mask=mask_gj)
-    tl.store(k_out_ptr + out_base + offs_d_half * N, k_half_out, mask=mask_gj)
-    tl.store(v_out_ptr + out_base + offs_d_half * N, v_half_out, mask=mask_gj)
+    tl.store(
+        q_out_ptr + out_base + offs_d_half * N,
+        q_half_out * q_scale,
+        mask=mask_gj,
+    )
+    tl.store(
+        k_out_ptr + out_base + offs_d_half * N,
+        k_half_out * k_scale,
+        mask=mask_gj,
+    )
+    tl.store(
+        v_out_ptr + out_base + offs_d_half * N,
+        v_half_out * v_scale,
+        mask=mask_gj,
+    )
 
     offs_d_rope = D_HALF + offs_r
-    tl.store(q_out_ptr + out_base + offs_d_rope * N, q_rope_out, mask=mask_r)
-    tl.store(k_out_ptr + out_base + offs_d_rope * N, k_rope_out, mask=mask_r)
-    tl.store(v_out_ptr + out_base + offs_d_rope * N, v_rope_out, mask=mask_r)
+    tl.store(q_out_ptr + out_base + offs_d_rope * N, q_rope_out * q_scale, mask=mask_r)
+    tl.store(k_out_ptr + out_base + offs_d_rope * N, k_rope_out * k_scale, mask=mask_r)
+    tl.store(v_out_ptr + out_base + offs_d_rope * N, v_rope_out * v_scale, mask=mask_r)
     tl.store(inflation_sq_ptr + (b_idx * H + h_idx) * N + n_idx, inflation)
 
 
@@ -1373,6 +1415,7 @@ def sana_wm_cam_gdn_preprocess(
     *,
     k_scale: float,
     eps: float,
+    downscale_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse SANA-WM camera-branch RMSNorm, UCPE, RoPE, and layout conversion.
 
@@ -1402,6 +1445,7 @@ def sana_wm_cam_gdn_preprocess(
         rotary_emb_cam,
         k_scale=k_scale,
         eps=eps,
+        downscale_eps=downscale_eps,
     )
 
 
@@ -1419,6 +1463,7 @@ def sana_wm_cam_gdn_preprocess_with_inv_rms(
     *,
     k_scale: float,
     eps: float,
+    downscale_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Camera preprocess with caller-provided Q/K inverse RMS.
 
@@ -1498,6 +1543,7 @@ def sana_wm_cam_gdn_preprocess_with_inv_rms(
             D_HALF=D_HALF,
             N_GROUPS=D_HALF // 4,
             K_SCALE=k_scale,
+            DOWNSCALE_EPS=downscale_eps,
             BLOCK_D_ROPE=block_d_rope,
             BLOCK_GROUPS=block_groups,
             num_warps=1,
