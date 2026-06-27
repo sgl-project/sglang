@@ -542,7 +542,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node)
+        # `req.last_node` is None when the request was retracted: reset_for_retract()
+        # clears it, and the decode prebuilt path resumes via cache_unfinished_req
+        # without re-matching the tree, so there is no previous node to release here.
+        # cache_finished_req already guards this; mirror it to avoid dereferencing None.
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later

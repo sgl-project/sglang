@@ -295,6 +295,39 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(cache.protected_size(), 0)
         self.assertEqual(cache.evictable_size(), 0)
 
+    def test_retracted_request_unfinished_none_last_node(self):
+        """Scenario 5: a retracted request resumes with last_node=None.
+
+        reset_for_retract() sets req.last_node=None. On resume, the decode
+        prebuilt path calls cache_unfinished_req without re-matching the tree,
+        so dec_lock_ref(req.last_node) receives None. It must be a no-op (no
+        previous node to release), not raise
+        AttributeError: 'NoneType' object has no attribute 'lock_ref'.
+        Lock refs must stay balanced afterwards.
+        """
+        cache, req_to_token = _make_cache_with_pools()
+
+        full_ids = [10, 20, 30]
+        full_vals = [100, 200, 300]
+        req_to_token[0, : len(full_vals)] = torch.tensor(full_vals, dtype=torch.int64)
+
+        # last_node=None mimics a retracted request resuming in the prebuilt path
+        req = _make_req(
+            fill_ids=full_ids,
+            req_pool_idx=0,
+            cache_protected_len=0,
+            last_node=None,
+        )
+
+        # Must not raise; with no previous node, dec_lock_ref is skipped and the
+        # newly matched node is still locked / released normally.
+        cache.cache_unfinished_req(req)
+        cache.cache_finished_req(req)
+
+        self.assertEqual(cache.root_node.lock_ref, 1)
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(cache.evictable_size(), len(full_ids))
+
     def test_pop_preallocated_rechecks_budget_after_lock(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
 
