@@ -44,7 +44,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware to generate the launch command. The recipe uses FlashAttention-3 with `--page-size 1`, which is required by the current prefill-aware sliding-window attention path.
+Pick your hardware to generate the launch command. The recipe uses FlashAttention-3 with `--page-size 1`, which is required by the current prefill-aware sliding-window attention path. It also disables radix cache by default, which is the better fit for batch OCR workloads where each request usually contains a different image.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/baidu/unlimited-ocr.jsx";
@@ -70,6 +70,7 @@ The SGLang integration loads the standalone Unlimited-OCR architecture with SAM 
 ## 2. Configuration Tips
 
 - **Attention backend**: use `--attention-backend fa3 --page-size 1`. The prefill-aware SWA page table is built with token-level locations, so page size 1 is required.
+- **Radix cache**: keep `--disable-radix-cache` for batch OCR over different documents. If your workload repeatedly asks about the same image and prompt, remove this flag to allow prefix reuse through `PureSWARadixCache`.
 - **Long OCR generations**: keep the default prefill-aware SWA path enabled. It retains prompt and image KV while still applying a sliding window to generated text.
 - **Custom logit processor**: keep `--enable-custom-logit-processor` in the launch command.
 - **Image modes**: pass `images_config.image_mode` per request. Supported modes are `tiny`, `small`, `base`, `large`, and `gundam`. Multiple images are supported only for `tiny`, `small`, and `base`.
