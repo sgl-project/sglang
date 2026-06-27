@@ -385,6 +385,7 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
     int32_t bonus_token;
     std::vector<int32_t> tokens;
     size_t total_len;
+    MatchState state;
   };
   std::vector<Phase2Entry> phase2_entries;
   PrecomputeDraftsStats stats;
@@ -425,13 +426,18 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
 
       auto check_tokens = appendAndTrim(base_tokens[req_idx], path_draft_tokens, max_trie_depth);
       const auto check_total_len = base_total_lens[req_idx] + path_draft_tokens.size();
-      MatchState temp_state;
+      MatchState path_state;
       auto bonus_candidates =
-          buildRootCandidatesUnlocked(check_tokens, check_total_len, temp_state, max_bonus_candidates);
+          buildRootCandidatesUnlocked(check_tokens, check_total_len, path_state, max_bonus_candidates);
 
       auto current_child_tokens = directChildTokens(req_draft_tokens, tree_mask, row_mask_offset, d, node);
       std::unordered_set<int32_t> seen_bonus;
       std::vector<int32_t> path_bonus_candidates;
+      // Keep root wide for bonus-token accuracy; keep non-root narrow to avoid path * bonus combinatorial blow-up.
+      const size_t path_bonus_topk = path_cols.size() == 1 ? bonus_topk : std::min<size_t>(bonus_topk, 1);
+      if (path_bonus_topk == 0) {
+        continue;
+      }
       for (const auto bonus_token : bonus_candidates) {
         if (containsToken(current_child_tokens, bonus_token)) {
           continue;
@@ -442,8 +448,9 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
         path_bonus_candidates.emplace_back(bonus_token);
         auto draft_check_tokens = appendAndTrim(check_tokens, std::vector<int32_t>{bonus_token}, max_trie_depth);
         phase2_entries.emplace_back(
-            Phase2Entry{state_id, path_cols, bonus_token, std::move(draft_check_tokens), check_total_len + 1});
-        if (path_bonus_candidates.size() >= bonus_topk) {
+            Phase2Entry{
+                state_id, path_cols, bonus_token, std::move(draft_check_tokens), check_total_len + 1, path_state});
+        if (path_bonus_candidates.size() >= path_bonus_topk) {
           break;
         }
       }
@@ -456,9 +463,8 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
 
   stats.num_phase2_contexts = static_cast<int64_t>(phase2_entries.size());
   const auto phase2_batch_size = std::max<size_t>(phase2_entries.size(), 1);
-  for (const auto& entry : phase2_entries) {
-    MatchState temp_state;
-    auto res = buildMatchUnlocked(entry.tokens, entry.total_len, temp_state, phase2_batch_size);
+  for (auto& entry : phase2_entries) {
+    auto res = buildMatchUnlocked(entry.tokens, entry.total_len, entry.state, phase2_batch_size);
     PathBonusKey key{entry.state_id, entry.path_cols, entry.bonus_token};
     if (precomputed_cache_.find(key) == precomputed_cache_.end()) {
       precomputed_cache_.emplace(std::move(key), std::move(res));
