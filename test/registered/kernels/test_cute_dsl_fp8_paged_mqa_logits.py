@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.cute_dsl_mqa_logits_utils import ceil_to_ue8m0, make_fused_kv
 
 skip_not_sm100 = pytest.mark.skipif(
     not is_sm100_supported(),
@@ -20,10 +21,6 @@ skip_not_sm100 = pytest.mark.skipif(
 )
 
 register_cuda_ci(est_time=15, suite="nightly-4-gpu-b200", nightly=True)
-
-
-def _ceil_to_ue8m0(x: torch.Tensor):
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
 def _ref_fp8_paged_mqa_logits(
@@ -79,23 +76,6 @@ def _ref_fp8_paged_mqa_logits(
             )
 
     return logits
-
-
-def _make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim):
-    num_phys_blocks = kv_fp8.shape[0]
-    per_token_size = head_dim + 4
-    block_bytes = block_kv * per_token_size
-    scale_offset = block_kv * head_dim
-
-    fused = torch.zeros(
-        num_phys_blocks, block_bytes, dtype=torch.uint8, device=kv_fp8.device
-    )
-    for blk in range(num_phys_blocks):
-        fused[blk, :scale_offset] = kv_fp8[blk].view(torch.uint8).reshape(-1)
-        fused[blk, scale_offset:] = (
-            kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
-        )
-    return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
 
 
 def _generate_test_data(
@@ -172,14 +152,14 @@ def _generate_test_data(
 
         kv_bf16 = torch.randn(num_phys_blocks, block_kv, head_dim, device=device)
         kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
-        kv_scale = _ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
+        kv_scale = ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
         kv_fp8 = (kv_bf16 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
         weights = torch.randn(
             batch_size * next_n, num_heads, device=device, dtype=torch.float32
         )
 
-    kv_fused = _make_fused_kv(kv_fp8, kv_scale, block_kv, head_dim)
+    kv_fused = make_fused_kv(kv_fp8, kv_scale, block_kv, head_dim)
 
     return {
         "q_fp8": q_fp8,
