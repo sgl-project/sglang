@@ -54,6 +54,8 @@ class AnthropicUsage(BaseModel):
 class TextBlock(BaseModel):
     type: Literal["text"] = "text"
     text: str
+    cache_control: Optional[dict[str, Any]] = None
+    citations: Optional[list[dict[str, Any]]] = None
 
 
 class ImageBlock(BaseModel):
