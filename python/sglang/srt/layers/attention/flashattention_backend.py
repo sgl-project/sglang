@@ -77,7 +77,7 @@ def _build_pa_page_table_kernel(
     src_base = req_idx * req_to_token_stride
     dst_base = bid * dst_stride
 
-    for start in range(0, kv_len, BLOCK_SIZE):
+    for start in tl.range(0, kv_len, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
         mask = offs < kv_len
         pos = tl.where(offs < pf, offs, offs + gap)
@@ -2137,6 +2137,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                if self.is_prefill_aware_swa:
+                    metadata.pa_swa_page_table = metadata.page_table
+                    metadata.pa_swa_cache_seqlens = metadata.cache_seqlens_int32
                 if self.use_sliding_window_kv_pool:
                     metadata.swa_page_table = self.decode_cuda_graph_metadata[
                         "swa_page_table"

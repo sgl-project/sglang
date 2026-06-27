@@ -143,8 +143,11 @@ class PureSWAChunkCache(SWAChunkCache):
     For hybrid models, full_to_swa_index_mapping prevents SWA double-free.
     All-SWA models lack this mapping, so on request completion we must
     explicitly skip the range already freed by ``free_swa_out_of_window_slots``
-    (a.k.a. _evict_swa) during decode, and never free below
-    ``req.swa_evict_floor``.
+    (a.k.a. _evict_swa) during decode.
+
+    ``req.swa_evict_floor`` only protects the prompt/image KV while the request
+    is active. ChunkCache does not retain finished prefixes, so the protected
+    prefix is released here when the request finishes.
     """
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
