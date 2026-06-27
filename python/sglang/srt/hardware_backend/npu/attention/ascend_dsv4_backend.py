@@ -1009,7 +1009,6 @@ class DeepseekV4AscendAttnBackend(
         self.graph_metadata["c128_page_table"] = torch.full(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
-        # state_block_table uses 0 as the skip sentinel; real pages start at 1.
         self.graph_metadata["c4_state_page_table"] = torch.zeros(
             (max_bs, max_pages), dtype=torch.int32, device=device
         )
