@@ -27,8 +27,8 @@ try:
 except ImportError:
     _HAS_GRANIAN = False
 
-register_cuda_ci(est_time=52, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=52, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=150, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=150, suite="stage-b-test-1-gpu-small-amd")
 
 
 @unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
@@ -106,6 +106,27 @@ class TestHTTP2Server(CustomTestCase):
         )
         self.assertEqual(
             result.stdout.strip(), "2", "Server should respond with HTTP/2"
+        )
+
+
+@unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
+class TestHTTP2ServerMultiTokenizer(TestHTTP2Server):
+    """Same checks as TestHTTP2Server but with multiple tokenizer workers.
+
+    With --tokenizer-worker-num > 1 the HTTP/2 server is served by Granian's
+    multi-process server (instead of the single-process embedded server), so
+    this exercises the multi-worker code path.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=["--enable-http2", "--tokenizer-worker-num", "2"],
         )
 
 

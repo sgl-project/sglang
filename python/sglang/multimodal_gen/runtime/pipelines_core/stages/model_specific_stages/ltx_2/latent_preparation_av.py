@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     is_ltx2_two_stage_pipeline_name,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -66,11 +67,22 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
     ):
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
             if is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
-                return server_args.pipeline_config.get_latent_dtype(
+                prompt_dtype = (
                     batch.prompt_embeds[0].dtype
+                    if isinstance(batch.prompt_embeds, list)
+                    else batch.prompt_embeds.dtype
                 )
+                return server_args.pipeline_config.get_latent_dtype(prompt_dtype)
+            if isinstance(batch.prompt_embeds, list) and batch.prompt_embeds:
+                return batch.prompt_embeds[0].dtype
+            if isinstance(batch.prompt_embeds, torch.Tensor):
+                return batch.prompt_embeds.dtype
             return torch.float32
-        return torch.float32
+        if isinstance(batch.prompt_embeds, list) and batch.prompt_embeds:
+            return batch.prompt_embeds[0].dtype
+        if isinstance(batch.prompt_embeds, torch.Tensor):
+            return batch.prompt_embeds.dtype
+        return resolve_precision(server_args, "dit", precision_attr="dit_precision")
 
     @staticmethod
     def _packed_video_latent_shape(
