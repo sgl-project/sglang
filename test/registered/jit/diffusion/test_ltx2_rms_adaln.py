@@ -14,8 +14,6 @@ def cuda_setup():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.cuda.manual_seed(0)
-    ltx2._LTX2_FUSED_RMS_ADALN = None
-    ltx2._LTX2_FUSED_RMS_ADALN_UNAVAILABLE = False
     ltx2._LTX2_FUSED_RMS_ADALN_RUNTIME_DISABLED = False
 
 
@@ -26,23 +24,30 @@ def _reference(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: f
 
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("batch", "seq_len", "hidden_size"),
+    ("batch", "seq_len", "hidden_size", "param_seq"),
     [
-        (1, 17, 4096),
-        (2, 5, 2048),
+        (1, 529, 4096, 529),
+        (1, 161, 4096, 1),
+        (2, 5, 2048, 1),
     ],
 )
-def test_ltx2_try_fused_rms_adaln_broadcast_scale(batch, seq_len, hidden_size):
+def test_ltx2_try_fused_rms_adaln_broadcast_scale(
+    batch, seq_len, hidden_size, param_seq
+):
     eps = 1e-6
     x = torch.randn(batch, seq_len, hidden_size, device="cuda", dtype=torch.bfloat16)
-    scale = torch.randn(batch, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
-    shift = torch.randn(batch, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(
+        batch, param_seq, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    shift = torch.randn(
+        batch, param_seq, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
 
     actual = ltx2._ltx2_try_fused_rms_adaln(x, scale, shift, eps)
     assert actual is not None
 
     expected = _reference(x, scale, shift, eps)
-    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @torch.no_grad()
