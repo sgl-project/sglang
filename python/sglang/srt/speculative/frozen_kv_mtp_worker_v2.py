@@ -241,28 +241,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
     def _init_draft_attn_backend(self):
         if self.topk == 1:
-            backend = self.draft_model_runner.attn_backend
-
-            from sglang.srt.utils import is_npu
-
-            if is_npu():
-                from sglang.srt.configs.model_config import is_deepseek_v4
-                from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-                    DeepseekV4AscendAttnBackend,
-                )
-
-                if is_deepseek_v4(
-                    self.draft_model_runner.model_config.hf_config
-                ) and not isinstance(backend, DeepseekV4AscendAttnBackend):
-                    logger.warning(
-                        "Draft model backend is %s, replacing it with "
-                        "DeepseekV4AscendAttnBackend for DeepSeek V4.",
-                        type(backend).__name__,
-                    )
-                    backend = DeepseekV4AscendAttnBackend(self.draft_model_runner)
-                    self.draft_model_runner.attn_backend = backend
-                    self.draft_model_runner.decode_attn_backend = backend
-            return backend
+            return self.draft_model_runner.attn_backend
 
         backend_type = self._resolve_draft_backend_type()
         if backend_type != "triton":

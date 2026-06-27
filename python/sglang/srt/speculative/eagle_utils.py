@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_build_dsv4_verify_bundle,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    alloc_paged_token_slots_extend_npu,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -32,6 +39,14 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {
+        "npu": alloc_paged_token_slots_extend_npu,
+    },
+)
 
 
 def per_step_draft_out_cache_loc(
@@ -321,14 +336,9 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
-        if hasattr(req_to_token_pool, "req_to_token_c4"):
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                build_dsv4_verify_bundle,
-            )
-
-            batch.out_cache_loc_dsv4 = build_dsv4_verify_bundle(
-                batch, verify_input.draft_token_num
-            )
+        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+            batch, verify_input.draft_token_num
+        )
 
         prepare_mamba_track_for_verify(batch)
 
@@ -638,15 +648,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             batch.req_pool_indices,
             cur_kv_lens_device,
         )
-        allocator = batch.token_to_kv_pool_allocator
-        dsv4_state_lens = (
-            allocator.compute_dsv4_state_lens_reserve(
-                batch.reqs, cur_kv_lens, nxt_kv_lens
-            )
-            if hasattr(allocator, "compute_dsv4_state_lens_reserve")
-            else None
-        )
-        out_cache_loc = alloc_paged_token_slots_extend(
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
             batch.tree_cache,
             cur_kv_lens_device,
             cur_kv_lens_cpu,
@@ -655,23 +658,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             last_loc,
             num_needed_tokens,
             req_pool_indices=batch.req_pool_indices,
-            dsv4_state_lens=dsv4_state_lens,
             batch=batch,
         )
-        if batch.out_cache_loc_dsv4 is not None:
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                maybe_write_dsv4_extend,
-            )
-
-            maybe_write_dsv4_extend(
-                batch,
-                batch.req_pool_indices_cpu,
-                cur_kv_lens_cpu,
-                nxt_kv_lens_cpu,
-                c4_state_alloc_offsets=cur_kv_lens_cpu,
-                c128_state_alloc_offsets=cur_kv_lens_cpu,
-            )
-
     assign_req_to_token_pool_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
