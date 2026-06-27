@@ -791,26 +791,17 @@ def run_single(
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
 
-        # Warmup requests (not measured, no perf dump)
-        # Use few steps to be fast — server's own warmup (warmup_steps=3) handles
-        # torch.compile compilation; these external warmups just stabilize triton
-        # kernel specializations across requests.
-        WARMUP_STEPS = 3
-        if case.get("preset_locked_steps"):
-            # Some models (e.g. Ideogram-4 preset V4_DEFAULT_20) derive
-            # num_inference_steps from a preset and reject any override; warm up
-            # with the model's own preset step count instead of WARMUP_STEPS.
-            warmup_case = {k: v for k, v in case.items() if k != "num_inference_steps"}
-            warmup_label = "preset steps"
-        else:
-            warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
-            warmup_label = f"{WARMUP_STEPS} steps"
-        for wi in range(1, 3):
-            print(f"  Sending warmup request ({wi}/2, {warmup_label})...")
-            try:
-                send_request(base_url, warmup_case, framework, config)
-            except Exception as e:
-                raise RuntimeError(f"Warmup request {wi} failed: {e}") from e
+        # No client-side warmup: each framework relies on its own server-side
+        # warmup before traffic. sglang's serve_args pass --warmup, which `serve`
+        # resolves to server-based (synthetic) warmup that primes kernels at
+        # startup, before the health check passes. This goes through the internal
+        # warmup path that bypasses sampling-param preset validation (e.g.
+        # Ideogram-4's preset-locked num_inference_steps), so no per-case warmup
+        # special-casing is needed here.
+        # NOTE: vllm-omni / lightx2v configure no server-side warmup; if
+        # cross-framework comparison is restored, they must add their own warmup
+        # to stay on equal footing — otherwise their measured request pays the
+        # full cold-start.
 
         # Measured request — pass perf_dump_path for SGLang server-side timing
         if perf_dump_path and os.path.exists(perf_dump_path):
