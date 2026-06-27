@@ -631,16 +631,18 @@ def _merged_experts_fused_moe_lora_add_impl(
             block_size=block_size,
             num_experts=virtual_num_experts,
         )
-        # _align_block_size uses a worst-case padded allocation. Trim the routing buffers
-        # to a tighter upper bound so we keep the real routed work but drop unused padding
-        num_tokens = topk_ids.numel()
-        max_nonempty = min(num_tokens, virtual_num_experts)
-        tight_padded = (
-            triton.cdiv(num_tokens + max_nonempty * (block_size - 1), block_size)
-            * block_size
-        )
-        sorted_token_ids = sorted_token_ids[:tight_padded]
-        expert_ids = expert_ids[: tight_padded // block_size]
+        # NOTE: do NOT trim sorted_token_ids / expert_ids to a tighter upper bound here.
+        # The downstream kernels (_moe_lora_shrink_splitk_kernel, fused_moe_kernel) read
+        # sorted_token_ids[pid_m*BLOCK : +BLOCK] and expert_ids[pid_m] WITHOUT a bounds mask
+        # for every block up to num_tokens_post_padded (a GPU-side count loaded at run time).
+        # num_tokens_post_padded comes from _align_block_size with `virtual_num_experts` buckets
+        # and can exceed a tighter `numel + min(numel,virtual_num_experts)*(block-1)` bound
+        # (most so for shared-outer, where virtual_num_experts = max_loras is small), so trimming
+        # made those unmasked reads land PAST the view. In eager mode the slack still lives inside
+        # the same _align_block_size allocation (garbage, masked out downstream) so it worked; under
+        # CUDA-graph capture/replay the graph mempool packs tensors tightly and that slack may belong
+        # to another pooled tensor / lie past a page -> cudaErrorIllegalInstruction during capture.
+        # Keep the full worst-case-allocated buffers so every unmasked read stays in-allocation.
         expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
         result = (
             sorted_token_ids,
