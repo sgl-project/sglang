@@ -89,6 +89,9 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 
+        if self.ps.pp_rank == 0:
+            self.unwrap_pickle_wrapper(recv_reqs)
+
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
         self._finalize_shm_features(recv_reqs)
@@ -194,6 +197,19 @@ class SchedulerRequestReceiver:
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
+
+    def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
+        if not recv_reqs:
+            return
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                req.unwrap_pickle_fields()
+            elif isinstance(
+                req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+            ):
+                for sub_req in req:
+                    sub_req.unwrap_pickle_fields()
 
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode

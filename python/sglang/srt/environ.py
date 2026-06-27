@@ -241,6 +241,10 @@ class Envs:
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
 
+    # IPC
+    SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
+
     # SGLang CI
     SGLANG_IS_IN_CI = EnvBool(False)
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
@@ -390,8 +394,22 @@ class Envs:
     SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE = EnvStr(None)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
 
+    # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
+    # When set, get_open_port() and shm_broadcast search upwards from this
+    # value instead of asking the OS for a random port.  Useful to keep all
+    # SGLang ports in a predictable range behind a firewall.
+    SGLANG_PORT = EnvInt(None)
+
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+
+    # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
+    # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
+    # request defaults for the built-in GPT-OSS web_search tool.
+    EXA_API_KEY = EnvStr(None)
+    SGLANG_EXA_NUM_RESULTS = EnvInt(10)
+    SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
+    SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
