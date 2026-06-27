@@ -308,7 +308,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
         """
-        if self.server_args.enable_breakable_cuda_graph:
+        if getattr(self.server_args, "enable_breakable_cuda_graph", False):
             # BCG captures the eager kernel stream itself; compiling first
             # would capture inductor's own cudagraph trees / guards.
             return
@@ -387,7 +387,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         transformers with (potentially) different configurations.
 
         """
-        if self.server_args.enable_breakable_cuda_graph:
+        if getattr(self.server_args, "enable_breakable_cuda_graph", False):
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
             return
@@ -1929,7 +1929,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Return (lazily creating) the breakable CUDA graph runner for
         ``current_model``, or ``None`` if BCG is disabled / inapplicable.
         """
-        if not self.server_args.enable_breakable_cuda_graph:
+        if not getattr(self.server_args, "enable_breakable_cuda_graph", False):
             return None
         if not isinstance(current_model, nn.Module):
             return None
