@@ -976,16 +976,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.server_args.speculative_num_draft_tokens
             or 1
         )
+        # Cap at the num_max the auto mem_fraction actually reserved the buffer for
+        # (ServerArgs._adjust_mem_fraction_for_deepep_capture). Going above it would
+        # allocate a larger low_latency buffer than was reserved and OOM at capture.
+        hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
         num_max = min(
             self.req_to_token_pool.size * tokens_per_req,
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+            hard if hard is not None else DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
         )
-        if num_max > env.get():
+        # With a reserved ceiling (hard), the buffer was sized for exactly that
+        # num_max, so the runtime must honor it even when it drops below the env
+        # default. Without one, keep the original "only raise above the default"
+        # behavior -- a larger default buffer is harmless when nothing reserved it.
+        should_write = num_max > env.get() or (
+            hard is not None and num_max != env.get()
+        )
+        if should_write:
             env.set(num_max)
             log_info_on_rank0(
                 logger,
                 f"Auto-tuned SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={num_max} "
-                f"(decode concurrency={self.req_to_token_pool.size}).",
+                f"(decode concurrency={self.req_to_token_pool.size}, "
+                f"reserved ceiling={hard}).",
             )
         self._warn_on_deepep_buffer_size_drift(env.get())
 

@@ -3537,6 +3537,12 @@ class ServerArgs:
             )
         else:
             num_max_upper = DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+        # Publish the num_max we reserved the buffer for as a hard ceiling the
+        # post-KV num_max auto-tune (model_runner) and the decode-concurrency clamp
+        # must honor. Otherwise a short-context / high-concurrency config can
+        # auto-tune num_max above what this buffer reservation covers and OOM at
+        # capture (the reservation is sized for THIS num_max, not the runtime one).
+        self._deepep_reserved_num_max = num_max_upper
         deepep_mib = estimate_low_latency_rdma_size_bytes(
             num_max_upper, hidden, num_experts
         ) / (1024**2)

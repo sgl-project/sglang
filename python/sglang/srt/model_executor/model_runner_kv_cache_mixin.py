@@ -1059,6 +1059,13 @@ class ModelRunnerKVCacheMixin:
         capped = min(
             max_num_reqs, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req
         )
+        # Also cap to the num_max the auto mem_fraction reserved the buffer for, so
+        # the runtime decode batch can never dispatch more tokens than that buffer
+        # holds (which would OOM at capture / overrun the buffer). num_max is a
+        # per-rank token cap; divide by tokens_per_req to get a request count.
+        hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
+        if hard is not None:
+            capped = min(capped, max(1, hard // tokens_per_req))
         ep_group = get_moe_ep_group()
         if ep_group.world_size > 1:
             tensor = torch.tensor(capped, dtype=torch.int64)

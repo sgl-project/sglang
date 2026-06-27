@@ -68,12 +68,14 @@ def _deepep_runner(
     mode="auto",
     num_draft_tokens=None,
     max_draft_tokens=None,
+    reserved_num_max=None,
     **extra,
 ):
     # max_speculative_num_draft_tokens is a cached_property on the real ServerArgs:
     # it returns the startup value for non-adaptive spec and a larger ceiling for
     # adaptive spec. Default the mock to the startup value; max_draft_tokens models
-    # the adaptive case.
+    # the adaptive case. reserved_num_max models the auto mem_fraction reservation
+    # ceiling published by ServerArgs._adjust_mem_fraction_for_deepep_capture.
     runner = SimpleNamespace(
         server_args=SimpleNamespace(
             moe_a2a_backend=backend,
@@ -82,6 +84,7 @@ def _deepep_runner(
             max_speculative_num_draft_tokens=(
                 max_draft_tokens if max_draft_tokens is not None else num_draft_tokens
             ),
+            _deepep_reserved_num_max=reserved_num_max,
         ),
         device="cuda",
         gpu_id=0,
@@ -142,12 +145,14 @@ class TestDeepEPAutoTune(unittest.TestCase):
         pool_size=4096,
         num_draft_tokens=None,
         max_draft_tokens=None,
+        reserved_num_max=None,
     ):
         return _deepep_runner(
             backend=backend,
             mode=mode,
             num_draft_tokens=num_draft_tokens,
             max_draft_tokens=max_draft_tokens,
+            reserved_num_max=reserved_num_max,
             req_to_token_pool=SimpleNamespace(size=pool_size),
         )
 
@@ -194,6 +199,23 @@ class TestDeepEPAutoTune(unittest.TestCase):
             self._run(self._runner(pool_size=64))
             self.assertFalse(_ENV.is_set())
             self.assertEqual(_ENV.get(), 128)
+
+    def test_reserved_ceiling_caps_num_max(self):
+        # The auto mem_fraction sized the buffer for reserved_num_max; the runtime
+        # must not auto-tune above it even when decode concurrency is far higher,
+        # or the larger buffer would OOM at capture.
+        with _env_unset():
+            self._run(self._runner(pool_size=4096, reserved_num_max=128))
+            self.assertEqual(_ENV.get(), 128)
+
+    def test_reserved_ceiling_below_default_is_written(self):
+        # A reserved ceiling below the env default must still be written verbatim
+        # (the buffer was reserved for exactly that num_max), unlike the no-
+        # reservation low-concurrency case which keeps the default.
+        with _env_unset():
+            self._run(self._runner(pool_size=4096, reserved_num_max=64))
+            self.assertTrue(_ENV.is_set())
+            self.assertEqual(_ENV.get(), 64)
 
     def test_spec_scales_num_max_by_draft_tokens(self):
         # Spec verify dispatches num_draft_tokens per request, so num_max tracks
