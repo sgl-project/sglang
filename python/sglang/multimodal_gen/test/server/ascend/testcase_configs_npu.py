@@ -2,6 +2,7 @@ import os
 
 from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_PROMPT,
+    COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
@@ -47,21 +48,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             modality="image",
             extras=EXTRAS_DISABLE_WARMUP,
         ),
-        DiffusionSamplingParams(
-            prompt="A red cube on a white table, product photo.",
-            output_size="832x480",
-            output_format="png",
-            extras={
-                "num_inference_steps": 35,
-                "seed": 0,
-                "max_sequence_length": 128,
-                "flow_shift": 10.0,
-                "extra_args": {
-                    "guardrails": False,
-                    "use_resolution_template": False,
-                },
-            },
-        ),
+        COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
         run_consistency_check=True,
         run_component_accuracy_check=False,
