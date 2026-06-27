@@ -25,14 +25,48 @@ pip install uv
 uv pip install sglang
 ```
 
-The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
+The default pip/uv dependency set targets CUDA 13. In a CUDA 12 environment,
+use uv's exclude file support before installing SGLang, so the first resolver
+pass does not pull CUDA 13 packages:
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
-uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
+
+cat > excludes-cu13.txt <<'EOF'
+flash-attn-4
+tilelang
+quack-kernels
+nvidia-cutlass-dsl
+nvidia-cutlass-dsl-libs-base
+nvidia-cutlass-dsl-libs-cu13
+cuda-toolkit
+cuda-tile
+nvidia-cublas
+nvidia-cuda-crt
+nvidia-cuda-cupti
+nvidia-cuda-nvcc
+nvidia-cuda-nvrtc
+nvidia-cuda-runtime
+nvidia-cuda-tileiras
+nvidia-cudnn-cu13
+nvidia-cufft
+nvidia-cufile
+nvidia-curand
+nvidia-cusolver
+nvidia-cusparse
+nvidia-cusparselt-cu13
+nvidia-nccl-cu13
+nvidia-nvjitlink
+nvidia-nvshmem-cu13
+nvidia-nvtx
+nvidia-nvvm
+EOF
+
+uv pip install --prerelease=allow --excludes excludes-cu13.txt sglang
+uv pip install --force-reinstall torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
 uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
 uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+uv pip install --force-reinstall cuda-python==12.9.0 cuda-bindings==12.9.4
 ```
 
 ### Quick fixes to common problems
