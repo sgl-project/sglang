@@ -28,6 +28,7 @@ export const Gemma4Deployment = () => {
         return [
           { id: 'h200', label: 'H200', default: true },
           { id: 'b200', label: 'B200', default: false },
+          { id: 'b300', label: 'B300', default: false },
           { id: 'mi300x', label: 'MI300X', default: false, disabled: !showMI300X },
         ];
       }
@@ -70,6 +71,13 @@ export const Gemma4Deployment = () => {
       '26b-a4b': { tp: 1, mem: 0.85 },
     },
     b200: {
+      e2b: { tp: 1, mem: 0.9 },
+      e4b: { tp: 1, mem: 0.9 },
+      '12b': { tp: 1, mem: 0.9 },
+      '31b': { tp: 1, mem: 0.9 },
+      '26b-a4b': { tp: 1, mem: 0.75 },
+    },
+    b300: {
       e2b: { tp: 1, mem: 0.9 },
       e4b: { tp: 1, mem: 0.9 },
       '12b': { tp: 1, mem: 0.9 },
@@ -127,6 +135,10 @@ export const Gemma4Deployment = () => {
       cmd += ` \\\n  --speculative-num-steps 5`;
       cmd += ` \\\n  --speculative-num-draft-tokens 6`;
       cmd += ` \\\n  --speculative-eagle-topk 1`;
+    }
+
+    if (hardware === 'b300') {
+      cmd += ` \\\n  --attention-backend triton`;
     }
 
     cmd += ` \\\n  --mem-fraction-static ${mem}`;

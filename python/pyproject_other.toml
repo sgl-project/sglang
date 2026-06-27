@@ -13,16 +13,16 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: Apache Software License",
 ]
-dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
+# Please keep dependency lists in this file sorted alphabetically by package name.
+dependencies = ["aiohttp", "IPython", "numpy", "requests", "setproctitle", "tqdm"]
 
 [project.optional-dependencies]
 runtime_common = [
-  "IPython",
   "aiohttp",
-  "apache-tvm-ffi",
   "anthropic>=0.20.0",
-  "blobfile==3.0.0",
+  "apache-tvm-ffi",
   "av",
+  "blobfile==3.0.0",
   "build",
   "compressed-tensors",
   "datasets",
@@ -31,13 +31,15 @@ runtime_common = [
   "fastapi",
   "gguf",
   "interegular",
+  "IPython",
   "llguidance>=0.7.11,<0.8.0",
+  "mistral_common>=1.11.0",
   "modelscope",
   "msgspec",
   "ninja",
   "numpy",
-  "openai-harmony==0.0.4",
   "openai==2.6.1",
+  "openai-harmony==0.0.4",
   "orjson",
   "outlines==0.1.11",
   "packaging",
@@ -54,61 +56,60 @@ runtime_common = [
   "scipy",
   "sentencepiece",
   "setproctitle",
+  "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "mistral_common>=1.11.0",
   "transformers==5.8.1",
   "uvicorn",
   "uvloop",
   "xgrammar==0.2.1",
-  "smg-grpc-servicer>=0.5.0",
 ]
 
 diffusion_common = [
-  "PyYAML==6.0.1",
+  "addict",
   "cloudpickle",
   "diffusers==0.37.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
   "opencv-python-headless==4.10.0.84",
+  "PyYAML==6.0.1",
   "remote-pdb",
-  "addict",
   "scikit-image==0.25.2",
   "trimesh>=4.0.0",
   "xatlas",
 ]
 
 tracing = [
-  "opentelemetry-sdk",
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
-  "sglang[runtime_common]",
-  "torch",
-  "petit_kernel==0.0.2",
-  "wave-lang==3.8.2",
   # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
   # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable
   # ancient setuptools sdist; an exact pin keeps the resolver converging.
   "compressed-tensors==0.15.0",
+  "petit_kernel==0.0.2",
+  "sglang[runtime_common]",
+  "torch",
+  "wave-lang==3.8.2",
 ]
 
 diffusion_hip = [
-  "sglang[diffusion_common]",
+  "cache-dit==1.3.0",
   "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
+  "runai_model_streamer>=0.15.5",
+  "sglang[diffusion_common]",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer>=0.15.5",
-  "cache-dit==1.3.0",
 ]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
@@ -117,44 +118,44 @@ srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
+  "deep-gemm>=0.1.3",
+  "flash_attn_3>=0.1.4",
+  "mate>=0.2.0",
+  "mthreads-ml-py",
+  "numpy<2.0",
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.59",
-  "mthreads-ml-py",
-  "mate>=0.2.0",
-  "deep-gemm>=0.1.3",
-  "flash_attn_3>=0.1.4",
-  "numpy<2.0",
+  "torchada>=0.1.68",
 ]
 
 diffusion_musa = [
+  "cache-dit==1.1.8",
+  "runai_model_streamer>=0.15.5",
   "sglang[diffusion_common]",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer>=0.15.5",
-  "cache-dit==1.1.8",
 ]
 
 # https://docs.sglang.io/platforms/mps.md
 srt_mps = [
+    "mlx",
+    "mlx-lm",
     "sglang[runtime_common]",
     "torch==2.11.0",
     "torchao==0.9.0",
     "torchaudio==2.11.0",
     "torchvision",
-    "mlx",
-    "mlx-lm",
 ]
 
 diffusion_mps = [
-  "sglang[diffusion_common]",
-  "cloudpickle==3.1.2",
-  "remote-pdb==2.1.0",
-  "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
+  "cache-dit==1.2.3",
+  "cloudpickle==3.1.2",
+  "remote-pdb==2.1.0",
   "scikit-image==0.25.2",
+  "sglang[diffusion_common]",
   "trimesh>=4.0.0",
   "xatlas",
 ]
@@ -172,10 +173,10 @@ test = [
   "tabulate",
 ]
 
-all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]", "sglang[tracing]"]
+all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
-all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
-all_mps = ["sglang[srt_mps]", "sglang[diffusion_mps]"]
+all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
+all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]

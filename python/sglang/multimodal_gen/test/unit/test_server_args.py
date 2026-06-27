@@ -833,6 +833,32 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
+    def test_cache_dit_rejects_explicit_fsdp(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            with self.assertRaisesRegex(ValueError, "FSDP inference"):
+                self._from_dict_with_pipeline_config(
+                    SanaWMPipelineConfig(),
+                    kwargs={
+                        "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                        "num_gpus": 2,
+                        "use_fsdp_inference": True,
+                    },
+                )
+
+    def test_cache_dit_auto_disables_implicit_fsdp(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            args = self._from_dict_with_pipeline_config(
+                SanaWMPipelineConfig(),
+                kwargs={
+                    "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
     def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
             SanaWMRealtimeConfig(),
