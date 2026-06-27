@@ -432,6 +432,54 @@ class TestSWA(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
+    def test_swa_prefix_truncation_metric_records_dropped_tokens(self):
+        # A prefix that still matches logically but has lost its sliding window to
+        # SWA eviction (tombstoning) must report the dropped tokens through the SWA
+        # prefix-truncation metric. This mirrors the truncated match in
+        # test_swa_radix_cache_1 (req5 -> 0-length hit).
+        class _SpyCollector:
+            def __init__(self):
+                self.truncated_tokens = 0
+
+            def increment_swa_prefix_truncated_num_tokens(self, num_tokens):
+                self.truncated_tokens += num_tokens
+
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            req_size=10,
+            max_context_len=128,
+            kv_size=128,
+            kv_size_swa=64,
+            sliding_window_size=4,
+        )
+        spy = _SpyCollector()
+        tree.metrics_collector = spy
+
+        for token_ids in (
+            [1, 2, 3],
+            [1, 2, 3, 4, 5, 6, 7],
+            [10, 11, 12],
+            [1, 2, 3, 4, 5, 60, 70],
+        ):
+            kv_indices = allocator.alloc(len(token_ids))
+            key = RadixKey(array("q", token_ids))
+            tree.insert(InsertParams(key=key, value=kv_indices[: len(key)]))
+
+        # Evict SWA capacity (tombstoning the shared [1..5] prefix) while keeping
+        # the full-attention KV alive.
+        tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        tree.evict(EvictParams(num_tokens=1, swa_num_tokens=2))
+
+        # [1, 2, 3, 4, 5] still matches in the tree, but the sliding window is no
+        # longer covered by live SWA KV, so the usable hit is truncated to zero.
+        result = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 5])))
+        )
+        self.assertEqual(len(result.device_indices), 0)
+        self.assertGreater(spy.truncated_tokens, 0)
+        tree.sanity_check()
+
     def test_swa_radix_cache_eagle(self):
         # args
         req_size = 10
