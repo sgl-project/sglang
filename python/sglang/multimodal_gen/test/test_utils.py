@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "3c6e06ae99001d93f7901bc9b7fdf19ec6c2ce4e"
+SGL_TEST_FILES_CI_DATA_REVISION = "4a271ef34602043f19d253f0d30a5f653fe11325"
 
 if current_platform.is_npu():
     SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"
@@ -999,7 +999,7 @@ def _is_ascend_consistency_case(case_id: str) -> bool:
     return "npu" in case_id
 
 
-def _remote_file_exists(url: str) -> bool:
+def _remote_file_exists(url: str) -> bool | None:
     for _ in range(3):
         for method in ("head", "get"):
             try:
@@ -1016,6 +1016,8 @@ def _remote_file_exists(url: str) -> bool:
                 try:
                     if resp.status_code in (200, 206):
                         return True
+                    if resp.status_code == 404:
+                        return False
                     if (
                         resp.status_code not in (403, 405, 429)
                         and resp.status_code < 500
@@ -1025,7 +1027,7 @@ def _remote_file_exists(url: str) -> bool:
                     resp.close()
             except requests.RequestException:
                 pass
-    return False
+    return None
 
 
 def _load_remote_gt_image(url: str) -> np.ndarray:
@@ -1068,12 +1070,19 @@ def _find_remote_consistency_gt_files(
             base_url, case_id, num_gpus, is_video, output_format
         )
         if is_video:
-            if all(_remote_file_exists(url) for _, url in candidates):
+            exists = [_remote_file_exists(url) for _, url in candidates]
+            if all(status is not False for status in exists):
                 return candidates
         else:
+            uncertain_candidate = None
             for filename, url in candidates:
-                if _remote_file_exists(url):
+                exists = _remote_file_exists(url)
+                if exists is True:
                     return [(filename, url)]
+                if exists is None and uncertain_candidate is None:
+                    uncertain_candidate = (filename, url)
+            if uncertain_candidate is not None:
+                return [uncertain_candidate]
     return []
 
 
