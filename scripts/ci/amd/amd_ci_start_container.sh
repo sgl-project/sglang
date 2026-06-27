@@ -154,15 +154,65 @@ find_latest_image() {
     fi
   done
 
-  # If not found locally, fall back to pulling from public registry.
-  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
-  # `docker manifest inspect --insecure` because that command runs in the
-  # runner pod's network namespace, which on every observed AMD scale set
-  # cannot reach 10.245.143.50:5000 (every probe either fast-fails with TLS
-  # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
-  # The actual local-registry pull still happens in the call site below via
-  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
-  # docker daemon on the host and inherits its insecure-registries config.
+  # Prefer the freshest tag that is BOTH on Docker Hub AND mirrored to the
+  # LAN registry. This closes the daily ~30-60 min "tag-flip" window in
+  # release-docker-amd-nightly.yml where the `publish` job pushes the new
+  # date-stamped tag to Docker Hub BEFORE its `push_local_registry` job
+  # finishes mirroring to ${LOCAL_DOCKER_REGISTRY}. Without this guard the
+  # next loop happily selects a tag whose only available copy is on Docker
+  # Hub, and every concurrent MI300 job falls into the slow Docker-Hub-pull
+  # path at the same time, blowing the runner pool queue (this is the
+  # 2026-05-25 cliff root-caused in sgl-project/sglang#26434).
+  #
+  # `docker manifest inspect --insecure` does NOT work from the runner
+  # pod's network namespace on AMD scale sets (see comment further down),
+  # but plain HTTP `curl` against the v2 manifests endpoint does (the
+  # registry is unauthenticated and the diag script in #26434 shows MI300
+  # gets TTFB ~2 ms to /v2/). On MI325 / mi35x pools where the LAN
+  # registry is unreachable, the one-shot ${LOCAL_DOCKER_REGISTRY}/v2/
+  # probe below fails in <2 s and we skip this whole block, so this
+  # change is a no-op for pools that already always go to Docker Hub.
+  lan_has_tag() {
+    local tag=$1
+    # Registry-v2 protocol: HEAD /v2/<name>/manifests/<reference> with the
+    # right Accept headers so the registry doesn't return 404 just because
+    # we didn't ask for a manifest type it serves. --max-time 3 keeps the
+    # 7-day loop bounded even if a single tag's manifest is slow to read.
+    curl --connect-timeout 2 --max-time 3 -sfI \
+      -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+      -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+      -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+      -H 'Accept: application/vnd.oci.image.index.v1+json' \
+      "http://${LOCAL_DOCKER_REGISTRY}/v2/rocm/sgl-dev/manifests/${tag}" \
+      >/dev/null 2>&1
+  }
+  if curl --connect-timeout 2 --max-time 3 -sf -o /dev/null \
+       "http://${LOCAL_DOCKER_REGISTRY}/v2/" 2>/dev/null; then
+    echo "LAN registry ${LOCAL_DOCKER_REGISTRY} reachable; preferring LAN-mirrored tags." >&2
+    for days_back in {0..6}; do
+      image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+      if lan_has_tag "${image_tag}"; then
+        echo "Found LAN-mirrored image: rocm/sgl-dev:${image_tag}" >&2
+        echo "rocm/sgl-dev:${image_tag}"
+        return 0
+      fi
+    done
+    echo "LAN registry has no rocm/sgl-dev:${base_tag}-<date> in last 7 days; falling through to Docker Hub." >&2
+  else
+    echo "LAN registry ${LOCAL_DOCKER_REGISTRY} unreachable from this runner; skipping LAN preference." >&2
+  fi
+
+  # Fall back to a Docker Hub manifest probe.
+  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} via `docker
+  # manifest inspect --insecure` because that command runs in the runner
+  # pod's network namespace, which on every observed AMD scale set cannot
+  # reach 10.245.143.50:5000 (every probe either fast-fails with TLS reject
+  # or hits a 30s TCP timeout, multiplied across 7 daily candidates). The
+  # actual local-registry pull still happens in the call site below via
+  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through
+  # the docker daemon on the host and inherits its insecure-registries
+  # config. The LAN-preference block above uses plain `curl` to dodge the
+  # pod-network-namespace issue.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -283,8 +333,11 @@ else
   fi
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
+# Cirrascale Austin MI300 .test runners mount a 5Ti shared cache volume at
+# /home/runner/sglang-data (HF_HOME -> /home/runner/sglang-data/hf-cache).
+# Bind that into the container as /sgl-data so HF/pip/MIOPEN caches persist
+# across jobs instead of re-downloading into the container layer.
+CACHE_HOST=/home/runner/sglang-data
 if [[ -d "$CACHE_HOST" ]]; then
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
 else
@@ -315,3 +368,14 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
 docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+
+# In-container runner-perf snapshot. Mirrors the host-side snapshot already
+# emitted by ensure_vram_clear.sh, but tagged `[runner-perf-diag:container]`
+# so the two vantage points can be diffed in the same job log. Catches
+# (1) the Docker bridge-network amplification of the host TCP-tuning gap,
+# (2) whether the /sgl-data bind-mount actually made it inside the
+#     container (PR #26260 found it MISSING on at least one host).
+# Best-effort; never fatal.
+docker exec -e CONTEXT=container ci_sglang \
+    bash /sglang-checkout/scripts/ci/amd/diagnose_runner_perf.sh \
+    || true
