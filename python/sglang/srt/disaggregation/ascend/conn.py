@@ -7,6 +7,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
@@ -35,6 +36,12 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def _requires_exact_state_index_match(self, st: StateType) -> bool:
+        return (
+            super()._requires_exact_state_index_match(st)
+            or st in _DSV4_KVCACHE_STATE_TYPES
+        )
+
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()

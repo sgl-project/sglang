@@ -957,7 +957,7 @@ class MooncakeKVManager(CommonKVManager):
 
         return skip_kv, skip_state
 
-    def _is_generic_kvcache_state_type(self, st: "StateType") -> bool:
+    def _is_generic_kvcache_state_type(self, st: StateType) -> bool:
         """State types sent via the page-indexed ``_send_kvcache_generic`` path
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
@@ -966,6 +966,10 @@ class MooncakeKVManager(CommonKVManager):
             StateType.SWA_RING,
             StateType.C128_STATE,
         )
+
+    def _requires_exact_state_index_match(self, st: StateType) -> bool:
+        """State types whose page lists are positional and must not be truncated."""
+        return st in (StateType.SWA_RING, StateType.C128_STATE)
 
     def maybe_send_extra(
         self,
@@ -1073,7 +1077,7 @@ class MooncakeKVManager(CommonKVManager):
                     # truncating silently misaligns rows and corrupts KV.
                     # Paged SWA/DSA tolerate a 1-page drift -> keep the
                     # lenient truncation below.
-                    if st in (StateType.SWA_RING, StateType.C128_STATE):
+                    if self._requires_exact_state_index_match(st):
                         raise RuntimeError(
                             f"{st.upper()} state index length mismatch: "
                             f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"

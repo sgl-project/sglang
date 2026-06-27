@@ -1043,6 +1043,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            if total_prefix_len != 0 and hasattr(
+                self.token_to_kv_pool_allocator, "c4_attn_allocator"
+            ):
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                raise RuntimeError(
+                    "DSV4 NPU PD disaggregation does not support decode-side "
+                    "prefix cache yet; disable disaggregation decode radix/HiCache "
+                    "for PD + chunked prefill."
+                )
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1157,9 +1168,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
             }
-            if _is_npu and isinstance(
-                self.token_to_kv_pool, DeepSeekV4TokenToKVPool
-            ):
+            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+                # DSV4 on NPU: per-pool dst page indices, produced by the same
+                # shared builder prefill uses so src/dst line up positionally.
+                if total_prefix_len != 0:
+                    raise RuntimeError(
+                        "DSV4 NPU PD disaggregation does not support decode-side "
+                        "prefix cache yet; disable disaggregation decode radix/HiCache "
+                        "for PD + chunked prefill."
+                    )
+            if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,
                 )
@@ -1171,6 +1189,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
                         self.scheduler.sliding_window_size,
+                        prefix_len=total_prefix_len,
                     )
                 )
             state_indices: Optional[List] = [
