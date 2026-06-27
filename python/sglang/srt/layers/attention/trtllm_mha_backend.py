@@ -972,7 +972,11 @@ class TRTLLMHAAttnMultiStepDraftBackend:
                 )
             )
 
-        self.max_context_len = self.attn_backends[0].max_context_len
+        self.max_context_len = (
+            self.attn_backends[0].max_context_len
+            if self.attn_backends
+            else model_runner.model_config.context_len
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
