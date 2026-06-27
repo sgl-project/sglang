@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -92,6 +93,9 @@ class HiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
+        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
+            # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
+            self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -102,7 +106,9 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
+            raise ValueError(
+                "HiRadixCache only supports MHA, MLA, DSA, and MiniMax M3 sparse models"
+            )
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -130,6 +136,22 @@ class HiRadixCache(RadixCache):
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, DSATokenToKVPool):
             attach_hybrid_dsa_pool_to_hiradix_cache(
+                self,
+                params,
+                server_args,
+                extra_config=extra_config,
+                prefetch_threshold=prefetch_threshold,
+                enable_storage_metrics=self.enable_storage_metrics,
+                load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
+            )
+        elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                attach_hybrid_minimax_sparse_pool_to_hiradix_cache,
+            )
+
+            attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -720,7 +742,10 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, DSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool) or (
+            isinstance(self.kv_cache, MiniMaxSparseKVPool)
+            and self.kv_cache.index_k_pool is not None
+        ):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,

@@ -297,6 +297,14 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
+    # KV cache
+    # Store the MHA (dense) KV cache in HND layout [num_pages, num_kv_heads,
+    # page_size, head_dim] instead of the default NHD [num_pages, page_size,
+    # num_kv_heads, head_dim]. HND lets a (page, head) pair be folded into a single
+    # paged index (free reshape), which paged backends like trtllm_mha consume
+    # directly and which is required for per-kv-head sparse page tables (DP attn).
+    SGLANG_USE_HND_KVCACHE = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
@@ -872,10 +880,52 @@ class Envs:
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
 
-    # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
+    # deep_gemm MoE combine: use the 2-D-grid, fp32-accumulation post_reorder
+    # kernel with routed_scaling_factor fused into the store (post_reorder_deepgemm),
+    # instead of the 1-program-per-token post_reorder_triton_kernel followed by a
+    # separate full-tensor `output *= routed_scaling_factor` pass.
+    SGLANG_OPT_USE_FUSED_DEEPGEMM_POST_REORDER = EnvBool(True)
+    # Replace the sort-based dispatch-index chain (torch.sort + compute_seg_indptr
+    # + compute_masked_m + deepgemm_compute_src2dst) in moe_ep_deepgemm_preprocess
+    # with a single atomic-cursor kernel (fused_moe_dispatch_index).
+    SGLANG_OPT_USE_FUSED_MOE_DISPATCH_INDEX = EnvBool(True)
+    # Route the plain (no silu-fuse, no masked-layout) per-token-group fp8/UE8M0
+    # activation quant through the optimized JIT kernel instead of the AOT v2
+    # kernel. Byte-identical output; ~1.3-3.9x faster (the [8192,6144] group=32
+    # prefill quant drops ~103us -> ~26us). Falls back to AOT for silu/masked.
+    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(True)
+    # MiniMax-M3 router: store the gate weight as bf16 and run the router as a
+    # bf16-in / fp32-out GEMM, instead of upcasting hidden_states to fp32 for a
+    # fp32 gate GEMM. Set False to keep the exact fp32 router.
+    SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    # MiniMax-M3 sparse decode (TP>=4, num_kv_heads==1): replace the custom
+    # _gqa_share_sparse_decode kernel with the dense paged-attention backend
+    # (trtllm_mha on Blackwell, fa3 on Hopper) over a per-query page table gathered
+    # from the top-k block selection. Requires a paged KV cache (page_size>1), i.e.
+    # the trtllm_mha / fa3 backends; no-op (custom kernel) otherwise.
+    SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
+    # MiniMax-M3 sparse decode indexer: replace the 2-stage split-K Triton block
+    # topk (_topk_index_partial_kernel + _topk_index_merge_kernel) with a single
+    # JIT CUDA radix-select kernel (minimax_decode_topk).
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
 
-    # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
+    # MiniMax-M3 attention: fuse per-head GemmaRMSNorm(q,k) + partial NeoX RoPE
+    # into one in-place JIT kernel (minimax_qknorm_rope) instead of separate
+    # norm + rope launches. Only activates for the verified config (per_head
+    # gemma norm, head_dim=128, rotary_dim=64, neox, no output gate, fp32 cache).
+    SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE = EnvBool(True)
+
+    # MiniMax-M3 sparse attention: store the main K/V plus the index K (and
+    # optional index V) into their KV pools in a single fused JIT launch
+    # (minimax_store_kv_index) instead of 2-3 separate set_*_buffer copies.
+    # Falls back to the separate stores when the main and index caches do not
+    # share a store dtype (e.g. fp8 KV cache) or on non-CUDA devices.
+    SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
+    # MiniMax-M3 main sparse attention: force the Triton path even when MiniMax's
+    # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
+    # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.
+    SGLANG_DISABLE_MSA = EnvBool(False)
+    # MiniMax-M3 MXFP8 MoE: experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
