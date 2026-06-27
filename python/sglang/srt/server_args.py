@@ -2665,6 +2665,9 @@ class ServerArgs:
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
+        # After the deepep auto-flip is final, reserve its buffer + capture in the
+        # auto mem_fraction so deepep+DP serves without hand-set memory flags.
+        self._adjust_mem_fraction_for_deepep_capture()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
@@ -3435,6 +3438,31 @@ class ServerArgs:
                 if gpu_mem is not None
                 else 0.88
             )
+            # Remember the auto inputs so _adjust_mem_fraction_for_deepep_capture
+            # (run after the deepep auto-flip is known) can reserve the deepep
+            # buffer + capture footprint this crude reserved_mem under-counts.
+            # Left unset on the user-set / unknown-capacity path, which no-ops it.
+            if gpu_mem is not None:
+                self._auto_mem_fraction_gpu_mib = gpu_mem
+                self._auto_mem_fraction_reserved_mib = reserved_mem
+                # reserved_mem above counts the un-divided chunked_prefill_size, but
+                # under DP attention _handle_data_parallelism divides it by dp_size,
+                # so each rank only uses a per-rank slice. The over-reserved slack is
+                # headroom the deepep buffer/capture reservation can draw from instead
+                # of double-counting (which would push mem_fraction below the weights
+                # for large chunked sizes). Only EP MoE (deepep) actually shrinks the
+                # per-rank batch; TP MoE all-gathers the global batch so keeps no slack.
+                self._auto_mem_chunked_slack_mib = 0.0
+                if (
+                    self.chunked_prefill_size > 0
+                    and self.enable_dp_attention
+                    and self.dp_size > 1
+                    and self.moe_a2a_backend == "deepep"
+                ):
+                    per_rank = self.chunked_prefill_size // self.dp_size
+                    self._auto_mem_chunked_slack_mib = (
+                        max(0, self.chunked_prefill_size - per_rank) * 1.5
+                    )
 
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
@@ -3449,6 +3477,119 @@ class ServerArgs:
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
                 "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
             )
+
+    def _adjust_mem_fraction_for_deepep_capture(self):
+        """Reserve the DeepEP low_latency RDMA buffer + decode cuda-graph capture
+        footprint in the auto mem_fraction.
+
+        The low_latency buffer (nvshmem::alloc, outside the torch allocator, sized
+        by num_max) and the decode capture are allocated after the KV pool, so the
+        crude reserved_mem heuristic under-counts them and deepep+DP serving OOMs
+        at capture unless --mem-fraction-static / --cuda-graph-max-bs are hand-set.
+        Runs after _handle_a2a_moe so the deepep auto-flip is final; only shrinks
+        the auto value and no-ops for a user-set mem_fraction.
+        """
+        if not envs.SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE.get():
+            return
+        gpu_mem = getattr(self, "_auto_mem_fraction_gpu_mib", None)
+        if gpu_mem is None:
+            return
+        if self.moe_a2a_backend != "deepep" or self.deepep_mode == "normal":
+            return
+
+        try:
+            model_config = self.get_model_config()
+            hidden = model_config.hidden_size
+            hf_config = model_config.hf_config
+            num_experts = None
+            for attr in (
+                "n_routed_experts",
+                "num_experts",
+                "num_local_experts",
+                "moe_num_experts",
+            ):
+                value = getattr(hf_config, attr, None)
+                if value:
+                    num_experts = int(value)
+                    break
+        except Exception:
+            return
+        if not hidden or not num_experts:
+            return
+
+        from sglang.srt.layers.moe.token_dispatcher.deepep import (
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
+            estimate_low_latency_rdma_size_bytes,
+        )
+
+        # num_max is auto-tuned post-KV toward this ceiling; the concurrency and
+        # capture clamps keep runtime dispatch <= num_max, so reserving at the
+        # ceiling is a safe over-bound that the runtime only ever shrinks under.
+        spec_mult = (
+            self.max_speculative_num_draft_tokens
+            or self.speculative_num_draft_tokens
+            or 1
+        )
+        if self.max_running_requests is not None:
+            per_rank = max(1, self.max_running_requests // max(1, self.dp_size))
+            num_max_upper = min(
+                per_rank * spec_mult, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+            )
+        else:
+            num_max_upper = DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
+        deepep_mib = estimate_low_latency_rdma_size_bytes(
+            num_max_upper, hidden, num_experts
+        ) / (1024**2)
+
+        # Decode capture + deep_gemm grouped-GEMM warmup footprint. This is driven
+        # by the grouped-GEMM size (num_experts * moe_intermediate * hidden), NOT
+        # num_layers * hidden: a deep small-MoE model (GLM-5.2: 78 layers, 256x2048)
+        # needs far less capture headroom than a shallow large-MoE one (DeepSeek-V4:
+        # 61 layers, 384x3072), and a layer-based estimate inverts that ordering.
+        # The coefficient folds in fp8 A/B staging + bf16 output across the warmup
+        # kernels (compile_utils.get_memory_requirement); the warmup peak is
+        # ~max_bs-independent because expert-weight staging dominates.
+        moe_intermediate = (
+            getattr(hf_config, "moe_intermediate_size", None)
+            or getattr(hf_config, "intermediate_size", None)
+            or hidden
+        )
+        coef = envs.SGLANG_DEEPEP_CAPTURE_COEF.get()
+        capture_mib = coef * num_experts * moe_intermediate * hidden / (1024**2)
+
+        # Credit the chunked over-reservation already baked into the auto
+        # mem_fraction (see _auto_mem_chunked_slack_mib): the un-divided
+        # chunked_prefill_size reserved upstream is slack the runtime never uses
+        # under deepep+DP, so only reserve the shortfall beyond it. This keeps the
+        # net adjustment a *reduction* of mem_fraction (never above the un-divided
+        # baseline that main ships), so we cannot OOM a config that main passed,
+        # while still topping up where buffer + capture exceed that slack.
+        # Capped so a large estimate can't squeeze out the model weights (the
+        # post-capture check in model_runner ERRORs if headroom ends up short).
+        slack_mib = getattr(self, "_auto_mem_chunked_slack_mib", 0.0)
+        delta_mib = max(0.0, capture_mib + deepep_mib - slack_mib)
+        max_reserve_mib = envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * gpu_mem
+        if delta_mib > max_reserve_mib:
+            logger.warning(
+                "DeepEP auto mem reserve %.1f GiB exceeds the %.0f%% cap (%.1f GiB); "
+                "clamping. Raise SGLANG_DEEPEP_MAX_RESERVE_FRACTION or set "
+                "--mem-fraction-static if capture OOMs.",
+                delta_mib / 1024,
+                envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * 100,
+                max_reserve_mib / 1024,
+            )
+            delta_mib = max_reserve_mib
+        new_mem_fraction = round(self.mem_fraction_static - delta_mib / gpu_mem, 3)
+        logger.info(
+            "DeepEP auto mem reserve: buffer=%.2f GiB capture=%.2f GiB slack=%.2f GiB; "
+            "mem_fraction_static %.3f -> %.3f",
+            deepep_mib / 1024,
+            capture_mib / 1024,
+            slack_mib / 1024,
+            self.mem_fraction_static,
+            new_mem_fraction,
+        )
+        self.mem_fraction_static = new_mem_fraction
 
     def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
         """

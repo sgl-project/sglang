@@ -1307,7 +1307,9 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
     assertion during graph capture.
     """
 
-    def _make_runner(self, moe_a2a_backend="deepep", deepep_mode="auto"):
+    def _make_runner(
+        self, moe_a2a_backend="deepep", deepep_mode="auto", max_draft_tokens=None
+    ):
         # The non-spec decode capture list for max_bs=512 (see
         # _generate_decode_cuda_graph_batch_sizes): includes 256 and 512.
         decode_bs = (
@@ -1319,6 +1321,7 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
         server_args = SimpleNamespace(
             moe_a2a_backend=moe_a2a_backend,
             deepep_mode=deepep_mode,
+            max_speculative_num_draft_tokens=max_draft_tokens,
             enable_two_batch_overlap=False,
             enable_torch_compile=False,
             torch_compile_max_bs=32,
@@ -1364,6 +1367,24 @@ class TestDeepEPCaptureBsClamp(unittest.TestCase):
         runner = self._make_runner("deepep", "low_latency")
         capture_bs, _ = get_batch_sizes_to_capture(runner)
         self.assertLessEqual(max(capture_bs), 128)
+
+    @patch(
+        "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",
+        return_value=False,
+    )
+    @patch("sglang.srt.model_executor.runner.base_cuda_graph_runner.get_parallel")
+    def test_clamps_by_adaptive_max_draft_tokens(self, mock_get_parallel, _):
+        # Adaptive spec: startup num_tokens_per_bs=2 but draft tokens can grow to
+        # 8 at runtime; the clamp must use the max (8), so bs*8 <= 128 -> bs <= 16.
+        from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+            get_batch_sizes_to_capture,
+        )
+
+        mock_get_parallel.return_value = SimpleNamespace(attn_tp_size=1, attn_cp_size=1)
+        runner = self._make_runner("deepep", "auto", max_draft_tokens=8)
+        capture_bs, _ = get_batch_sizes_to_capture(runner, num_tokens_per_bs=2)
+        self.assertLessEqual(max(capture_bs) * 8, 128)
+        self.assertLessEqual(max(capture_bs), 16)
 
     @patch(
         "sglang.srt.model_executor.runner.base_cuda_graph_runner.require_gathered_buffer",

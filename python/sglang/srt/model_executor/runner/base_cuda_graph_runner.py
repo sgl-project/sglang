@@ -94,20 +94,22 @@ def get_batch_sizes_to_capture(
 
     # DeepEP low_latency caps per-rank dispatch tokens; a decode capture bs above
     # that cap trips the deep_ep dispatch assertion, so clamp the list to it.
-    # Covers every a2a backend that routes through the DeepEP dispatcher.
-    from sglang.srt.layers.moe.utils import is_deepep_dispatch_backend
+    from sglang.srt.layers.moe.utils import MoeA2ABackend
 
     if (
-        is_deepep_dispatch_backend(server_args.moe_a2a_backend)
+        MoeA2ABackend(server_args.moe_a2a_backend).is_deepep()
         and server_args.deepep_mode != "normal"
     ):
         deepep_cap = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         # A captured decode step dispatches bs * num_tokens_per_bs tokens (spec/MTP
-        # verify packs num_tokens_per_bs per sequence), so clamp on that product.
-        if max(capture_bs) * num_tokens_per_bs > deepep_cap:
-            capture_bs = [
-                bs for bs in capture_bs if bs * num_tokens_per_bs <= deepep_cap
-            ]
+        # verify packs num_tokens_per_bs per sequence). Adaptive spec can grow draft
+        # tokens to max_speculative_num_draft_tokens at runtime, so clamp on that
+        # upper bound to keep eager-fallback batches within num_max too.
+        spec_mult = max(
+            num_tokens_per_bs, server_args.max_speculative_num_draft_tokens or 0
+        )
+        if max(capture_bs) * spec_mult > deepep_cap:
+            capture_bs = [bs for bs in capture_bs if bs * spec_mult <= deepep_cap]
 
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (

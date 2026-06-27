@@ -1021,10 +1021,10 @@ class ModelRunnerKVCacheMixin:
         return self._clamp_deepep_low_latency_concurrency(max_num_reqs)
 
     def _is_deepep_low_latency(self: ModelRunner) -> bool:
-        from sglang.srt.layers.moe.utils import is_deepep_dispatch_backend
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
 
         return (
-            is_deepep_dispatch_backend(self.server_args.moe_a2a_backend)
+            MoeA2ABackend(self.server_args.moe_a2a_backend).is_deepep()
             and self.server_args.deepep_mode != "normal"
         )
 
@@ -1051,7 +1051,11 @@ class ModelRunnerKVCacheMixin:
         # The per-rank dispatch is concurrency * num_tokens_per_bs (spec/MTP verify
         # packs num_tokens_per_bs tokens per request); bound that product by
         # FINISHED_SUM_TAG, so the concurrency ceiling shrinks by the spec multiplier.
-        tokens_per_req = self.server_args.speculative_num_draft_tokens or 1
+        tokens_per_req = (
+            self.server_args.max_speculative_num_draft_tokens
+            or self.server_args.speculative_num_draft_tokens
+            or 1
+        )
         capped = min(
             max_num_reqs, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req
         )

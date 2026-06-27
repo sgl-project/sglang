@@ -971,7 +971,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # dispatches num_tokens_per_bs tokens per request, so size it to
         # concurrency * num_tokens_per_bs. The concurrency cap divided by the same
         # multiplier, so this stays within FINISHED_SUM_TAG.
-        tokens_per_req = self.server_args.speculative_num_draft_tokens or 1
+        tokens_per_req = (
+            self.server_args.max_speculative_num_draft_tokens
+            or self.server_args.speculative_num_draft_tokens
+            or 1
+        )
         num_max = min(
             self.req_to_token_pool.size * tokens_per_req,
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
@@ -983,6 +987,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Auto-tuned SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK={num_max} "
                 f"(decode concurrency={self.req_to_token_pool.size}).",
             )
+        self._warn_on_deepep_buffer_size_drift(env.get())
+
+    def _warn_on_deepep_buffer_size_drift(self, num_max: int):
+        """Cross-check the pure-Python low_latency buffer-size replica (used by the
+        auto mem_fraction reservation in ServerArgs) against DeepEP's native hint.
+        Loud warn on drift so an upstream config.hpp change is caught instead of
+        silently mis-reserving the buffer.
+        """
+        try:
+            from deep_ep import Buffer
+
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                estimate_low_latency_rdma_size_bytes,
+            )
+
+            hidden = self.model_config.hidden_size
+            num_experts = None
+            for attr in (
+                "n_routed_experts",
+                "num_experts",
+                "num_local_experts",
+                "moe_num_experts",
+            ):
+                value = getattr(self.model_config.hf_config, attr, None)
+                if value:
+                    num_experts = int(value)
+                    break
+            if not hidden or not num_experts:
+                return
+            native = Buffer.get_low_latency_rdma_size_hint(
+                num_max, hidden, max(self.moe_ep_size, 1), num_experts
+            )
+            replica = estimate_low_latency_rdma_size_bytes(num_max, hidden, num_experts)
+            if native and abs(native - replica) / native > 0.001:
+                logger.warning(
+                    "DeepEP low_latency buffer-size replica drifted from the native "
+                    "hint (replica=%d, native=%d, num_max=%d); the auto mem_fraction "
+                    "reservation may be off — update estimate_low_latency_rdma_size_bytes.",
+                    replica,
+                    native,
+                    num_max,
+                )
+        except Exception:
+            return
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -2649,6 +2697,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"elapsed={time.perf_counter() - tic:.2f} s, "
             f"mem usage={self.graph_mem_usage:.2f} GB, avail mem={after_mem:.2f} GB."
         )
+        self._validate_deepep_capture_reservation(after_mem)
+
+    def _validate_deepep_capture_reservation(self, after_mem_gb: float):
+        """Post-capture check that the auto mem_fraction left enough headroom for
+        the DeepEP low_latency path. ERROR (not raise) so the diagnostic surfaces
+        without killing a serve that may still run.
+        """
+        if not self._is_deepep_low_latency():
+            return
+        safety_floor_gib = 2.0
+        if after_mem_gb < safety_floor_gib:
+            logger.error(
+                "DeepEP capture left only %.2f GiB free (< %.1f GiB safety floor); "
+                "the auto mem_fraction reservation is too small for this config — "
+                "set --mem-fraction-static lower or raise SGLANG_DEEPEP_CAPTURE_COEF.",
+                after_mem_gb,
+                safety_floor_gib,
+            )
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
         """Initialize prefill CUDA graph runner."""

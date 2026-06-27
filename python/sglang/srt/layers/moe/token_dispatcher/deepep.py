@@ -72,6 +72,31 @@ logger = logging.getLogger(__name__)
 DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS = 1024
 
 
+def estimate_low_latency_rdma_size_bytes(
+    num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
+) -> int:
+    """Pure-Python replica of DeepEP's C++ LowLatencyLayout.total_bytes.
+
+    Lets the auto mem_fraction heuristic size the low_latency RDMA buffer before
+    deep_ep is importable (ServerArgs runs pre-load). num_ranks is passed to the
+    C++ ctor but never referenced in total_bytes, so it is omitted here. Validated
+    against the native Buffer.get_low_latency_rdma_size_hint at runtime.
+    """
+    num_scales = hidden // 128
+    bytes_per_dispatch = 16 + max(hidden * 2, hidden + num_scales * 4)
+    bytes_per_combine = num_scales * 4 + hidden * 2
+    num_msg = num_experts * num_max_dispatch_tokens_per_rank
+    send = max(
+        num_max_dispatch_tokens_per_rank * bytes_per_dispatch,
+        num_msg * bytes_per_combine,
+    )
+    recv = max(num_msg * bytes_per_dispatch, num_msg * bytes_per_combine)
+    signaling = ((num_experts * 4 + 127) // 128) * 128
+    total = (send + recv + signaling) * 2
+    # DeepEP appends one extra 128-byte alignment unit past the aligned total.
+    return ((total + 127) // 128) * 128 + 128
+
+
 def _is_mnnvl_fabric_supported() -> bool:
     if not is_flashinfer_available():
         return False
