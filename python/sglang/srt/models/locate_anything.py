@@ -288,9 +288,7 @@ class LocateAnythingBoxGrammarLogitProcessor(CustomLogitProcessor):
     """
 
     @classmethod
-    def build_sampling_params(
-        cls, config: "LocateAnythingConfig"
-    ) -> Dict[str, Any]:
+    def build_sampling_params(cls, config: "LocateAnythingConfig") -> Dict[str, Any]:
         """Build the sampling-param fields needed to enable constrained decoding.
 
         Returns a dict with ``custom_logit_processor`` (the serialized
