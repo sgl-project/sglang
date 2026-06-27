@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -647,7 +648,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             else None
         )
         alloc_extend_fn = alloc_paged_token_slots_extend
-        if dsv4_state_lens is not None:
+        if _is_npu and is_deepseek_v4(batch.model_config.hf_config):
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                 alloc_paged_token_slots_reserve_extend,
             )
