@@ -1,32 +1,32 @@
 ---
-title: "mimo_v2_flash"
+title: "MiMo-V2-Flash"
 metatags:
-  description: "Best Practice for mimo_v2_flash on Ascend NPU"
+  description: "Best Practice for MiMo-V2-Flash on Ascend NPU"
 ---
 
-This guide describes the best practice data for mimo_v2_flash on the Ascend NPU.
+This guide describes the best practice data for MiMo-V2-Flash on the Ascend NPU.
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| mimo_v2_flash | Atlas 800I A3 | 12 | PD Disaggregation | 16K+1K | 20ms | - | BF16 | [Optimal Configuration](#mimo_v2_flash-1p1d-12p-in16k-out1k-tpot-20ms) |
-| mimo_v2_flash | Atlas 800I A3 | 12 | PD Disaggregation | 32K+1K | 20ms | - | BF16 | [Optimal Configuration](#mimo_v2_flash-1p1d-12p-in32k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16K+1K | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1k-tpot-20ms) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32K+1K | 20ms | - | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1k-tpot-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| mimo_v2_flash | Atlas 800I A3 | 12 | PD Disaggregation | 16K+1 | - | 5s | BF16 | [Optimal Configuration](#mimo_v2_flash-1p1d-12p-in16k-out1-ttft-5s) |
-| mimo_v2_flash | Atlas 800I A3 | 12 | PD Disaggregation | 32K+1 | - | 5s | BF16 | [Optimal Configuration](#mimo_v2_flash-1p1d-12p-in32k-out1-ttft-5s) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 16K+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in16k-out1-ttft-5s) |
+| MiMo-V2-Flash | Atlas 800I A3 | 12 | PD Disaggregation | 32K+1 | - | 5s | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-1p1d-12p-in32k-out1-ttft-5s) |
 
 ## Optimal Configuration
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### mimo_v2_flash 1P1D 12P IN16K OUT1 TTFT 5s
+### MiMo-V2-Flash 1P1D 12P IN16K OUT1 TTFT 5s
 
-**Model**: mimo_v2_flash
+**Model**: MiMo-V2-Flash
 
 **Hardware**: Atlas 800I A3
 
@@ -34,7 +34,7 @@ This guide describes the best practice data for mimo_v2_flash on the Ascend NPU.
 
 **Deploy Mode**: PD Disaggregation
 
-**Quantization**: BF16
+**Quantization**: W8A8 INT8
 
 **Dataset**: 16K+1
 
@@ -142,7 +142,6 @@ do
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
-        export SGLANG_PROFILE_WITH_STACK=True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -211,9 +210,9 @@ python -m sglang.bench_serving \
     --request-rate 0.4
 ```
 
-### mimo_v2_flash 1P1D 12P IN16K OUT1K TPOT 20ms
+### MiMo-V2-Flash 1P1D 12P IN16K OUT1K TPOT 20ms
 
-**Model**: mimo_v2_flash
+**Model**: MiMo-V2-Flash
 
 **Hardware**: Atlas 800I A3
 
@@ -221,7 +220,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Disaggregation
 
-**Quantization**: BF16
+**Quantization**: W8A8 INT8
 
 **Dataset**: 16K+1K
 
@@ -329,7 +328,6 @@ do
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
-        export SGLANG_PROFILE_WITH_STACK=True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -398,9 +396,9 @@ python -m sglang.bench_serving \
     --request-rate inf
 ```
 
-### mimo_v2_flash 1P1D 12P IN32K OUT1 TTFT 5s
+### MiMo-V2-Flash 1P1D 12P IN32K OUT1 TTFT 5s
 
-**Model**: mimo_v2_flash
+**Model**: MiMo-V2-Flash
 
 **Hardware**: Atlas 800I A3
 
@@ -408,7 +406,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Disaggregation
 
-**Quantization**: BF16
+**Quantization**: W8A8 INT8
 
 **Dataset**: 32K+1
 
@@ -516,7 +514,6 @@ do
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
-        export SGLANG_PROFILE_WITH_STACK=True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -585,9 +582,9 @@ python -m sglang.bench_serving \
     --request-rate 0.4
 ```
 
-### mimo_v2_flash 1P1D 12P IN32K OUT1K TPOT 20ms
+### MiMo-V2-Flash 1P1D 12P IN32K OUT1K TPOT 20ms
 
-**Model**: mimo_v2_flash
+**Model**: MiMo-V2-Flash
 
 **Hardware**: Atlas 800I A3
 
@@ -595,7 +592,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Disaggregation
 
-**Quantization**: BF16
+**Quantization**: W8A8 INT8
 
 **Dataset**: 32K+1K
 
@@ -703,7 +700,6 @@ do
         export HCCL_BUFFSIZE=800
         export HCCL_SOCKET_IFNAME=<network-interface>
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
-        export SGLANG_PROFILE_WITH_STACK=True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
