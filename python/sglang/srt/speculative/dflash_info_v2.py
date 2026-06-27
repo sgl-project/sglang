@@ -181,7 +181,7 @@ class DFlashDraftInputV2(SpecInput):
             ):
                 cur_alloc_len = int(cur_allocated_seq_lens_cpu[i])
             else:
-                cur_alloc_len = int(req.kv_allocated_len)
+                cur_alloc_len = int(req.kv.kv_allocated_len)
             planning_len = committed_len + block_size
             reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
             top_k = int(req.sampling_params.top_k)
@@ -266,7 +266,9 @@ class DFlashDraftInputV2(SpecInput):
         # This request-side high-water mark is what release_kv_cache() uses to
         # reclaim any DFLASH over-allocation if the request finishes later.
         for i, req in enumerate(batch.reqs):
-            req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
+            req.kv.kv_allocated_len = max(
+                req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
+            )
 
         # Preserve the lagging committed CPU view on the batch and carry the
         # tighter host-side planning bound separately from the full reserved

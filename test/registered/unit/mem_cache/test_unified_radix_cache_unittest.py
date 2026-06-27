@@ -935,7 +935,7 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.kv_allocated_len = kv_len
+        req.kv.kv_allocated_len = kv_len
         req.last_node = tree.root_node
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
@@ -1827,7 +1827,7 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.swa_evicted_seqlen = 0
+        req.kv.swa_evicted_seqlen = 0
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
@@ -1837,10 +1837,10 @@ class UnifiedRadixCacheSuite:
         cushion = self.cfg.sliding_window_size + self.cfg.page_size
         expected_evicted = (pre_len - 1) - cushion
         self.assertEqual(
-            req.swa_evicted_seqlen,
+            req.kv.swa_evicted_seqlen,
             expected_evicted,
             f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
-            f"{expected_evicted}, got {req.swa_evicted_seqlen}",
+            f"{expected_evicted}, got {req.kv.swa_evicted_seqlen}",
         )
 
         swa_avail_after = allocator.swa_attn_allocator.available_size()
@@ -1879,13 +1879,13 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.swa_evicted_seqlen = 0
+        req.kv.swa_evicted_seqlen = 0
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             tree.cache_unfinished_req(req)
 
         self.assertEqual(
-            req.swa_evicted_seqlen,
+            req.kv.swa_evicted_seqlen,
             0,
             "Nothing should be evicted when prefill fits inside the cushion",
         )

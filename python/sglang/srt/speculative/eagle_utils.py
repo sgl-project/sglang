@@ -588,7 +588,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     nxt_kv_lens = [0] * bs
     num_needed_tokens = 0
     for i, r in enumerate(batch.reqs):
-        cur = r.kv_allocated_len
+        cur = r.kv.kv_allocated_len
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
@@ -596,7 +596,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
-        r.kv_allocated_len = nxt
+        r.kv.kv_allocated_len = nxt
         r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
