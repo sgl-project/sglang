@@ -20,7 +20,7 @@ def _generate_bench_data(
     batch_size: int,
     context_len: int,
     next_n: int,
-    num_heads: int = 64,
+    num_heads: int = 32,
     head_dim: int = 128,
     block_kv: int = 64,
     varlen: bool = False,
@@ -139,7 +139,7 @@ def benchmark(
     import deep_gemm
     from flashinfer.testing.utils import bench_gpu_time
 
-    num_heads = 64
+    num_heads = 32
     head_dim = 128
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
