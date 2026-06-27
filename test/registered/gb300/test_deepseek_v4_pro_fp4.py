@@ -96,21 +96,21 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
 
     def test_deepseek_v4_pro_fp4(self):
         variants = [
-            # ModelLaunchSettings(
-            #     MODEL_PATH,
-            #     tp_size=4,
-            #     extra_args=LOW_LATENCY_ARGS,
-            #     variant="low-latency",
-            #     launch_timeout=SERVER_LAUNCH_TIMEOUT,
-            # ),
-            # ModelLaunchSettings(
-            #     MODEL_PATH,
-            #     tp_size=4,
-            #     extra_args=BALANCED_ARGS,
-            #     env=BALANCED_ENV,
-            #     variant="balanced",
-            #     launch_timeout=SERVER_LAUNCH_TIMEOUT,
-            # ),
+            ModelLaunchSettings(
+                MODEL_PATH,
+                tp_size=4,
+                extra_args=LOW_LATENCY_ARGS,
+                variant="low-latency",
+                launch_timeout=SERVER_LAUNCH_TIMEOUT,
+            ),
+            ModelLaunchSettings(
+                MODEL_PATH,
+                tp_size=4,
+                extra_args=BALANCED_ARGS,
+                env=BALANCED_ENV,
+                variant="balanced",
+                launch_timeout=SERVER_LAUNCH_TIMEOUT,
+            ),
             ModelLaunchSettings(
                 MODEL_PATH,
                 tp_size=4,
