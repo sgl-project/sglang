@@ -648,7 +648,9 @@ class DeepseekSparseAttnBackend(
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         if forward_batch.seq_lens_cpu is not None:
-            max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+            max_seqlen_k = int(
+                forward_batch.seq_lens_cpu.max().item() + draft_token_num
+            )
         else:
             # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
             # batches; graph replay uses the static page-table width, so only this
