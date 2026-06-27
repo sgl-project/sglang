@@ -1074,7 +1074,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
