@@ -50,7 +50,20 @@ from sglang.srt.layers.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_sm100_supported,
+)
+
+# Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
+# per-query flash kernel instead of TileLang. Validated on gfx950 (GLM-5.1 @
+# TP4: 16 heads, d_v=512, tail=64). Reads q_nope/q_rope directly (skips the
+# concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
+_DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
+_IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
     import deep_gemm
@@ -990,11 +1003,11 @@ class DeepseekSparseAttnBackend(
                 max_bs + 1, dtype=torch.int32, device=self.device
             ),
             # fake page_table for sparse_prefill
-            # Add extra columns for speculative draft tokens to avoid
-            # overflow during target_verify when max_seqlen_k = seq_len + num_draft_tokens
+            # Match req_to_token's width exactly. It is over-allocated beyond
+            # context_len because spec decoding lets seq_len transiently overshoot.
             "page_table": torch.zeros(
                 max_num_tokens,
-                self.max_context_len + (self.speculative_num_draft_tokens or 0),
+                self.req_to_token.shape[1],
                 dtype=torch.int32,
                 device=self.device,
             ),
@@ -1648,6 +1661,32 @@ class DeepseekSparseAttnBackend(
 
         if dsa_impl == "tilelang":
             if q_rope is not None:
+                # Triton prefill kernel reads q_nope/q_rope directly, skipping
+                # the concat (it splits q into main/tail internally anyway).
+                # Gated to gfx950 + the validated shape (16 heads, d_v=512,
+                # tail=64, topk=2048); everything else uses TileLang.
+                if (
+                    _DSA_TRITON_PREFILL
+                    and _IS_GFX95
+                    and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+                    and layer.tp_q_head_num == 16
+                    and layer.v_head_dim == 512
+                    and (layer.head_dim - layer.v_head_dim) == 64
+                    and page_table_1.shape[-1] == 2048
+                    and q_nope.shape[0] >= 512
+                ):
+                    from sglang.srt.layers.attention.dsa.triton_sparse_mla import (
+                        triton_sparse_mla_fwd,
+                    )
+
+                    return triton_sparse_mla_fwd(
+                        q_nope=q_nope,
+                        q_rope=q_rope,
+                        kv=kv_cache,
+                        indices=page_table_1.unsqueeze(1),
+                        sm_scale=layer.scaling,
+                        d_v=layer.v_head_dim,
+                    )
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
@@ -2432,14 +2471,18 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+            is_in_breakable_cuda_graph,
+        )
         from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
             is_in_tc_piecewise_cuda_graph,
         )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if is_in_tc_piecewise_cuda_graph():
-            # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
+        if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+            # Can't branch on seq_lens_cpu in graph replay, force MHA off to
+            # guarantee correctness.
             self.use_mha = False
         elif (
             forward_batch and forward_batch.forward_mode.is_extend_without_speculative()

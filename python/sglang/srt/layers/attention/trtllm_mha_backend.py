@@ -248,6 +248,45 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return swa_pt
         return self.forward_metadata.page_table
 
+    @staticmethod
+    def _get_scalar_scale(
+        layer: RadixAttention,
+        float_attr: str,
+        scale_attr: str,
+    ) -> float:
+        scale = getattr(layer, float_attr, None)
+        if scale is None:
+            scale = getattr(layer, scale_attr, None)
+        if scale is None:
+            return 1.0
+        if isinstance(scale, torch.Tensor):
+            logger.warning_once(
+                "Ignoring tensor %s for TRT-LLM MHA FP8 KV cache scale. "
+                "Expected %s to be populated with a Python scalar.",
+                scale_attr,
+                float_attr,
+            )
+            return 1.0
+        scale = float(scale)
+        return scale if scale > 0.0 else 1.0
+
+    def _get_bmm_scales(
+        self, layer: RadixAttention, q_scale: float | torch.Tensor = 1.0
+    ) -> tuple[float | torch.Tensor, float]:
+        """Return FlashInfer TRT-LLM MHA BMM scales.
+
+        The FP8 paths store Q/K/V as values divided by their per-tensor scales.
+        FlashInfer applies bmm1_scale to QK and bmm2_scale to PV, so FP8 reads
+        need Q and K descales in BMM1 and V descale in BMM2. Non-FP8 KV cache
+        entries are already in model dtype.
+        """
+        if self.data_type != torch.float8_e4m3fn:
+            return layer.scaling, 1.0
+
+        k_scale = self._get_scalar_scale(layer, "k_scale_float", "k_scale")
+        v_scale = self._get_scalar_scale(layer, "v_scale_float", "v_scale")
+        return q_scale * k_scale * layer.scaling, v_scale
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -736,8 +775,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        # For XQA, q_dtype should be bf16
-        if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
+        # For XQA, q_dtype should be bf16. For trtllm-gen,
+        # q_dtype should be FP8 when KV is in FP8.
+        q_scale = 1.0
+        if self.data_type == torch.float8_e4m3fn and not self.is_xqa_impl:
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -757,15 +798,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -827,7 +860,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     layer.v_scale,
                 )
 
-        if self.data_type == torch.float8_e4m3fn:
+        q_scale = 1.0
+        if self.data_type == torch.float8_e4m3fn and (
+            not self.is_xqa_impl or not forward_batch.forward_mode.is_target_verify()
+        ):
             q = q.to(torch.float8_e4m3fn)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
@@ -848,15 +884,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(layer, q_scale)
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
