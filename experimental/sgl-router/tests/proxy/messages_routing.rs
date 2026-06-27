@@ -58,6 +58,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -95,6 +96,7 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
         mode: WorkerMode::Prefill,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -242,6 +244,72 @@ async fn messages_rejects_pd_disaggregated_mode() {
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn messages_pd_rejection_wins_over_priority_filter() {
+    // Ordering regression (codex super-review round 5): when a PD-mode model's
+    // only prefill candidate is priority-gated AND the request is below the
+    // threshold, the permanent "PD not supported on this route" 400 must win
+    // over the eligibility filter's transient empty-set 503. PD-unsupported is
+    // a route/client error; reporting it as no-healthy-workers would mislead
+    // Anthropic clients and operators.
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = Config {
+        server: ServerConfig {
+            host: "0".into(),
+            port: 0,
+        },
+        observability: ObservabilityConfig::default(),
+        model: ModelConfig {
+            id: "tiny".into(),
+            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            policy: PolicyKind::RoundRobin,
+            circuit_breaker: None,
+            cache_aware: None,
+            sticky: None,
+        },
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            urls: vec!["http://placeholder:0".into()],
+        }),
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
+    };
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Prefill,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+        min_priority: Some(100),
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let app = build_router(ctx);
+
+    // priority 0 (absent) is below the gate — without correct ordering the
+    // filter would empty the set and 503 before the PD check runs.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "tiny",
+        "stream": false,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "PD-unsupported (400) must win over the priority filter's empty-set 503",
+    );
 }
 
 #[tokio::test]

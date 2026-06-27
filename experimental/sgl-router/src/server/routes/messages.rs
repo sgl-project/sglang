@@ -15,11 +15,11 @@
 //! counts — without this the LB scheme would route on stale load.
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::metrics::{RequestOutcome, WorkerModeLabel};
+use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLabel};
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
@@ -40,6 +40,11 @@ struct MessagesProbe {
     #[serde(default)]
     stream: Option<bool>,
     model: Option<String>,
+    /// Request priority, captured as a raw JSON value so a malformed value
+    /// is tolerated (treated as `0`) rather than rejected. Gates
+    /// capacity-restricted workers (see [`filter_eligible`]).
+    #[serde(default)]
+    priority: Option<serde_json::Value>,
 }
 
 fn parse_probe(body: &Bytes) -> Result<MessagesProbe, ApiError> {
@@ -136,10 +141,57 @@ async fn messages_inner(
             },
         })?;
 
+    // Resolve the model's policy BEFORE priority filtering — see the
+    // `/v1/chat/completions` path: an unknown model must 404 `ModelNotFound`
+    // rather than be masked by a 503 from the eligibility filter emptying a
+    // gated-but-policyless model's candidate set.
     let policy = ctx
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
+
+    // PD-disaggregated mode is unsupported on this route, and that is a
+    // permanent property of the model/route — NOT a transient capacity
+    // condition. Reject it (400) BEFORE priority filtering so a PD model
+    // whose only prefill candidate is priority-gated surfaces the honest
+    // "PD not supported" error rather than a misleading 503 from the filter
+    // emptying the candidate set. A model's workers are homogeneous in mode
+    // (`prefill_candidates` yields prefill/non-Plain workers only for PD
+    // deployments), so any non-Plain candidate marks a PD topology. This
+    // passthrough forwards to a single worker and does NOT replicate
+    // chat.rs's decode-peer resolution + bootstrap body injection (see
+    // design.md); in PD mode the final response comes from the decode side,
+    // so silently forwarding to a prefill worker would hang.
+    if workers.iter().any(|w| w.mode() != WorkerMode::Plain) {
+        return Err(ApiError::BadRequest(
+            "/v1/messages passthrough does not support PD-disaggregated mode yet; use /v1/chat/completions".into(),
+        ));
+    }
+
+    // Priority-eligibility filtering — identical semantics to the
+    // `/v1/chat/completions` path: capacity-restricted workers are removed
+    // for sub-threshold requests before policy selection. Hard isolation:
+    // if filtering empties the candidate set, reject with 503 rather than
+    // spill the request onto a gated worker.
+    let request_priority = crate::policies::priority_from_value(probe.priority.as_ref());
+    let eligible = filter_eligible(&workers, request_priority);
+    if eligible.excluded_all {
+        tracing::warn!(
+            model = %model_str,
+            request_priority,
+            healthy_workers = workers.len(),
+            "priority filter removed all candidates; rejecting request (no eligible-capacity worker healthy for this priority)",
+        );
+        ctx.metrics
+            .record_priority_filtered(PriorityFilterOutcome::EmptySetRejected);
+        return Err(ApiError::NoHealthyWorkers {
+            model: model_str.clone(),
+        });
+    } else if eligible.excluded_any {
+        ctx.metrics
+            .record_priority_filtered(PriorityFilterOutcome::WorkerExcluded);
+    }
+    let workers = eligible.workers;
 
     // Deliberately do NOT produce routing tokens for /v1/messages.
     //
@@ -182,17 +234,6 @@ async fn messages_inner(
             .ok_or_else(|| ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
             })?;
-
-    // PD-disaggregated mode: this passthrough only forwards to a single worker
-    // and does NOT replicate chat.rs's decode-peer resolution + bootstrap body
-    // injection (see design.md). In PD mode the final response comes from the
-    // decode side, so silently forwarding to a prefill worker would hang. Fail
-    // explicitly instead of degrading silently. Plain mode is unaffected.
-    if worker.mode() != WorkerMode::Plain {
-        return Err(ApiError::BadRequest(
-            "/v1/messages passthrough does not support PD-disaggregated mode yet; use /v1/chat/completions".into(),
-        ));
-    }
 
     // Hold the per-worker in-flight guard + register active load so load-aware
     // policies see this request. prefill_load uses the real token count when we

@@ -42,6 +42,7 @@ fn build_worker(url: &str, model: &str) -> Arc<Worker> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(model.into())],
         bootstrap_port: None,
+        min_priority: None,
     }))
 }
 

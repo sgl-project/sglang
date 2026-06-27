@@ -18,6 +18,7 @@ mod header_forwarding;
 mod messages_routing;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
+mod priority_routing;
 mod roundrobin_input_ids;
 mod sticky_input_ids;
 mod sticky_routing;

@@ -77,6 +77,7 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
                     mode: WorkerMode::Plain,
                     model_ids: vec![model.clone()],
                     bootstrap_port: None,
+                    min_priority: None,
                 });
                 let snapshot = r.workers_for(&model);
                 for w in &snapshot {
@@ -130,6 +131,7 @@ fn load_guard_decrements_on_panic_unwind() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("m".into())],
         bootstrap_port: None,
+        min_priority: None,
     }));
     assert_eq!(w.active_load(), 0);
 

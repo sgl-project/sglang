@@ -99,6 +99,11 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// Minimum request priority this worker accepts (`None` = any). A
+    /// request with effective priority below this value is filtered out
+    /// of the candidate set before policy selection. Carried from
+    /// `WorkerSpec`; see [`crate::discovery::WorkerSpec::min_priority`].
+    min_priority: Option<i64>,
 }
 
 impl Worker {
@@ -126,6 +131,7 @@ impl Worker {
             active_requests: Arc::new(AtomicUsize::new(0)),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            min_priority: spec.min_priority,
         }
     }
 
@@ -137,6 +143,15 @@ impl Worker {
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
+    }
+
+    /// Minimum request priority this worker accepts. `None` means the
+    /// worker accepts any request; `Some(N)` means it is eligible only for
+    /// requests whose effective priority is `>= N`. Consumed by the
+    /// pre-selection eligibility filter (see
+    /// [`crate::policies::registry::filter_eligible`]).
+    pub fn min_priority(&self) -> Option<i64> {
+        self.min_priority
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -190,6 +205,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            min_priority: None,
         });
         assert_eq!(w.active_load(), 0);
         let g = w.load_guard();
@@ -211,6 +227,7 @@ mod tests {
                 mode: m,
                 model_ids: vec![],
                 bootstrap_port: None,
+                min_priority: None,
             });
             assert_eq!(w.mode(), m);
         }
@@ -224,6 +241,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: None,
+            min_priority: None,
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
@@ -240,6 +258,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: Some(8997),
+            min_priority: None,
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -252,6 +271,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![],
             bootstrap_port: None,
+            min_priority: None,
         });
         assert_eq!(w.bootstrap_port(), None);
     }
@@ -264,6 +284,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            min_priority: None,
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -276,6 +297,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            min_priority: None,
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -292,6 +314,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            min_priority: None,
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }

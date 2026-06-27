@@ -166,6 +166,68 @@ pub(crate) fn extract_prompt_text_from_value(v: &serde_json::Value) -> Option<St
     None
 }
 
+/// Effective integer priority for a request, read from the body `priority`
+/// field. Missing, null, or non-integer values yield `0` — the lowest
+/// priority — so an unrecognized or absent signal is treated as
+/// internal/low-priority traffic and never gains access to priority-gated
+/// workers (see [`crate::policies::registry::filter_eligible`]).
+///
+/// Convenience wrapper for callers holding a whole request body. The ingress
+/// hot path (chat/messages) instead extracts `priority` via a lightweight
+/// probe and calls [`priority_from_value`] directly, to avoid re-walking the
+/// full body. This wrapper keeps a body-oriented entry point for any caller
+/// that already has the deserialized `Value`.
+///
+/// This mirrors the `priority` field the SGLang scheduler reads for
+/// preemption: the same value drives both engine-side scheduling and
+/// router-side worker eligibility, so the two never disagree on what
+/// "high priority" means. Production traffic carries `priority=100`
+/// (injected by the API gateway per key class); internal/self-use traffic
+/// carries `0` or omits the field.
+///
+/// Accepts integer and integer-valued float JSON (`100` and `100.0`) since
+/// gateways and SDKs serialize whole numbers inconsistently. A FRACTIONAL
+/// value (`100.5`), a non-finite float (NaN/inf), or a non-numeric value
+/// (string, object, bool) is treated as `0` — a malformed signal must never
+/// satisfy a gate by truncation.
+pub fn effective_priority(body: &serde_json::Value) -> i64 {
+    priority_from_value(body.get("priority"))
+}
+
+/// Core of [`effective_priority`], operating on the `priority` field value
+/// directly (or its absence). Lets callers that already extracted the
+/// field — e.g. via a lightweight request probe — avoid re-walking the
+/// whole body. `None` (absent), null, and any non-numeric value yield `0`.
+pub fn priority_from_value(priority: Option<&serde_json::Value>) -> i64 {
+    match priority {
+        Some(p) => {
+            if let Some(i) = p.as_i64() {
+                i
+            } else if let Some(f) = p.as_f64() {
+                // Accept ONLY integer-valued, finite, in-range floats (e.g.
+                // 100.0) — gateways/SDKs sometimes serialize whole numbers as
+                // floats. A FRACTIONAL value (100.5), a non-finite value
+                // (NaN/inf), or one outside i64 range (1e100, > i64::MAX) is a
+                // malformed priority signal and must degrade to 0 (lowest) —
+                // never satisfy a gate. Without the range check `f as i64`
+                // saturates to i64::MAX, which would pass EVERY `min_priority`
+                // gate. Upper bound is strict `<` because `i64::MAX as f64`
+                // rounds up to 2^63 (one past i64::MAX), so `==` to it would
+                // itself saturate.
+                if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64
+                {
+                    f as i64
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
+}
+
 /// Selection input — carries the request body and the routing tokens
 /// (computed once at ingress) so cache-aware policies can hash prefix
 /// tokens without reshaping the [`Policy`] trait or re-tokenizing.  Today's
@@ -278,5 +340,77 @@ impl PolicyRegistry {
         for entry in self.by_model.iter() {
             entry.value().attach_metrics(Arc::clone(&metrics));
         }
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::effective_priority;
+    use serde_json::json;
+
+    #[test]
+    fn missing_priority_is_zero() {
+        assert_eq!(effective_priority(&json!({"model": "m"})), 0);
+    }
+
+    #[test]
+    fn explicit_integer_priority() {
+        assert_eq!(effective_priority(&json!({"priority": 100})), 100);
+        assert_eq!(effective_priority(&json!({"priority": 0})), 0);
+        assert_eq!(effective_priority(&json!({"priority": -5})), -5);
+    }
+
+    #[test]
+    fn integer_valued_float_priority() {
+        assert_eq!(effective_priority(&json!({"priority": 100.0})), 100);
+    }
+
+    #[test]
+    fn fractional_float_priority_is_zero() {
+        // A fractional priority is a malformed signal: it must NOT truncate
+        // to 100 and satisfy a `min_priority=100` gate. Degrade to 0 (lowest)
+        // exactly like a string/object — otherwise `100.5` would bypass
+        // isolation. Just-below and just-above-integer both degrade.
+        assert_eq!(effective_priority(&json!({"priority": 100.5})), 0);
+        assert_eq!(effective_priority(&json!({"priority": 99.9})), 0);
+        assert_eq!(effective_priority(&json!({"priority": 0.5})), 0);
+    }
+
+    #[test]
+    fn non_finite_float_priority_is_zero() {
+        // serde_json can't represent NaN/inf in standard JSON, but guard the
+        // f64 path anyway: a non-finite value must degrade to 0, not panic
+        // or saturate the cast.
+        let nan = serde_json::Value::from(f64::NAN);
+        assert_eq!(super::priority_from_value(Some(&nan)), 0);
+    }
+
+    #[test]
+    fn out_of_range_numeric_priority_is_zero() {
+        // A finite but out-of-i64-range number must degrade to 0, NOT
+        // saturate to i64::MAX (which would pass every `min_priority` gate).
+        // Covers a huge float and an unsigned integer past i64::MAX (which
+        // `as_i64()` rejects, falling through to the f64 path).
+        assert_eq!(effective_priority(&json!({"priority": 1e100})), 0);
+        assert_eq!(effective_priority(&json!({"priority": -1e100})), 0);
+        let big_u64 = serde_json::json!({ "priority": (i64::MAX as u64) + 1 });
+        assert_eq!(effective_priority(&big_u64), 0);
+    }
+
+    #[test]
+    fn null_priority_is_zero() {
+        assert_eq!(effective_priority(&json!({"priority": null})), 0);
+    }
+
+    #[test]
+    fn string_priority_is_zero() {
+        // A non-numeric priority must not crash or be coerced; treat as 0
+        // (lowest) so a malformed signal never unlocks a gated worker.
+        assert_eq!(effective_priority(&json!({"priority": "100"})), 0);
+    }
+
+    #[test]
+    fn object_priority_is_zero() {
+        assert_eq!(effective_priority(&json!({"priority": {"x": 1}})), 0);
     }
 }
