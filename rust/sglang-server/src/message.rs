@@ -213,11 +213,15 @@ impl TokenizedReqPayload {
         };
 
         // `sampling_params: SamplingParams` is required (not Optional) and
-        // map-encoded; default to an empty map (all-defaults) when absent, and
-        // make sure `stop` / `stop_regex` are present so the scheduler doesn't
-        // panic on the `None` they'd otherwise carry into `stop_strs` /
-        // `stop_regex_strs` (see SamplingParams.__post_init__).
-        let sampling_params_val = with_stop_defaults(self.sampling_params.clone());
+        // map-encoded; default to an empty map (all-defaults) when absent. Send
+        // only what the client set: the scheduler normalizes these and turns an
+        // absent `stop` / `stop_regex` into an empty list. Injecting `""` here
+        // instead would make `normalize` expand it to `[""]`, which matches at
+        // every position and ends generation on the first token.
+        let sampling_params_val = match self.sampling_params.clone() {
+            Some(v @ Value::Map(_)) => v,
+            _ => Value::Map(Vec::new()),
+        };
 
         // Tagged array in TokenizedGenerateReqInput declaration order (BaseReq
         // fields first), truncated at `stream`.
@@ -240,25 +244,6 @@ impl TokenizedReqPayload {
         rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;
         Ok(Bytes::from(buf))
     }
-}
-
-/// Return the sampling-params map with `stop` and `stop_regex` guaranteed
-/// present (defaulting to `""`). `SamplingParams.__post_init__` assigns
-/// `stop_strs = stop` / `stop_regex_strs = stop_regex`; a `None` there can panic
-/// downstream Python, and `""` is falsy so it behaves as "no stop". A
-/// client-provided value for either key is left untouched.
-fn with_stop_defaults(sp: Option<rmpv::Value>) -> rmpv::Value {
-    use rmpv::Value;
-    let mut map = match sp {
-        Some(Value::Map(m)) => m,
-        _ => Vec::new(),
-    };
-    for key in ["stop", "stop_regex"] {
-        if !map.iter().any(|(k, _)| k.as_str() == Some(key)) {
-            map.push((Value::from(key), Value::from("")));
-        }
-    }
-    Value::Map(map)
 }
 
 /// Egress-ring frame discriminator (first byte). Internal to the Rust egress

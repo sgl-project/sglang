@@ -7,7 +7,9 @@
 //!
 //! Edges driven here (from the design table):
 //!   Received      → Validating
-//!   Validating    → {Encoding | Tokenizing | Queued}   (by ValidationOutcome)
+//!   Validating    → Normalizing   (generate: sampling-param normalize/verify)
+//!   Validating    → Queued        (control: no tokenize, no sampling params)
+//!   Normalizing   → {Encoding | Tokenizing | Queued}   (by ValidationOutcome)
 //!   Tokenizing    → Queued        (on TokenizeDone, when the request returns)
 //!   Queued        → ring          (handed to the scheduler)
 //!
@@ -25,6 +27,7 @@ use crate::message::{
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
 use crate::runtime::ring::IngressProducer;
+use crate::tokenizer_manager::sampling::normalize_sampling_params;
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -101,6 +104,18 @@ impl Ingress {
                 .state
                 .apply(Event::Validated(ValidationOutcome::AlreadyTokenized)); // → Queued
             self.push_control_to_ring(req, tag);
+            return;
+        }
+
+        // Validating → Normalizing: normalize + verify the sampling params here
+        // (the Rust server replaces the Python TokenizerManager, where this runs)
+        // so the work stays off the scheduler's latency-critical loop. Sets
+        // `is_normalized=true` on the wire; the scheduler then skips its pass.
+        let _ = req.state.apply(Event::Normalized);
+        if let RequestKind::Generate(g) = &mut req.kind
+            && let Err(e) = normalize_sampling_params(&mut g.payload.sampling_params)
+        {
+            fail(&mut req, e);
             return;
         }
 

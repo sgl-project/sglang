@@ -7,7 +7,7 @@
 //!
 //! Port of the design enum:
 //! ```text
-//! Received, Validating, Encoding, Tokenizing, Queued,
+//! Received, Validating, Normalizing, Encoding, Tokenizing, Queued,
 //! Streaming { chunks_sent }, Finalizing, Completed, Failed(Error), Aborted
 //! ```
 
@@ -20,10 +20,14 @@ use crate::error::Error;
 pub enum RequestState {
     Received,
     Validating,
+    /// Generate-only: sampling params normalized + verified before routing.
+    Normalizing,
     Encoding,
     Tokenizing,
     Queued,
-    Streaming { chunks_sent: u64 },
+    Streaming {
+        chunks_sent: u64,
+    },
     Finalizing,
     Completed,
     Failed(Error),
@@ -48,11 +52,15 @@ pub enum ValidationOutcome {
 pub enum Event {
     // --- ingress ---
     Validated(ValidationOutcome),
+    /// Generate request's sampling params normalized: Validating → Normalizing.
+    Normalized,
     EncodeDone,
     TokenizeDone,
     SchedulerPicked,
     // --- egress ---
-    Chunk { finish: bool },
+    Chunk {
+        finish: bool,
+    },
     FinalFrameSent,
     // --- terminal (valid from any state) ---
     Error(Error),
@@ -104,9 +112,13 @@ impl RequestState {
         let next = match (&*self, &event) {
             // ingress
             (Received, Validated(_)) => Validating,
-            (Validating, Validated(HasMultimodal)) => Encoding,
-            (Validating, Validated(NeedsTokenize)) => Tokenizing,
+            // Generate requests pass through Normalizing (sampling-param
+            // normalize/verify); control requests skip straight to Queued.
+            (Validating, Normalized) => Normalizing,
             (Validating, Validated(AlreadyTokenized)) => Queued,
+            (Normalizing, Validated(HasMultimodal)) => Encoding,
+            (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
+            (Normalizing, Validated(AlreadyTokenized)) => Queued,
             (Encoding, EncodeDone) => Tokenizing,
             (Tokenizing, TokenizeDone) => Queued,
             (Queued, SchedulerPicked) => Streaming { chunks_sent: 0 },
