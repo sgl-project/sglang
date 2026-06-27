@@ -280,6 +280,11 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
+        if write_policy == "write_back":
+            logger.warning(
+                "write_back policy will be deprecated in future releases; please migrate to write_through_selective with appropriate configuration for better performance and reliability."
+            )
+
         # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
@@ -498,9 +503,8 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
-            )
+            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
