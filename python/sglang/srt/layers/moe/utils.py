@@ -164,8 +164,10 @@ class EpV2RunnerCapability(NamedTuple):
     """
     Describes the EPv2 dispatcher contract required by the active MoE runner.
 
-    The dispatcher should depend on this explicit contract instead of peeking at
-    runner implementation details such as DeepGEMM JIT flags.
+    This capability is resolved once (in get_epv2_runner_capability, which reads
+    runner-side flags such as DeepGEMM JIT TMA/UE8M0 settings) and then consumed
+    by the dispatcher. The dispatcher depends only on this resolved contract and
+    does not peek at runner implementation details itself.
     """
 
     output_dtype: EpV2OutputDtype
@@ -466,48 +468,6 @@ def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
-
-
-def uses_a2a_moe_forward() -> bool:
-    """Return whether the active backend uses the A2A MoE forward path."""
-    b = get_moe_a2a_backend()
-    return (
-        b.is_deepep()
-        or b.is_mooncake()
-        or b.is_nixl()
-        or b.is_mori()
-        or b.is_ascend_fuseep()
-        or b.is_flashinfer()
-        or b.is_epv2()
-    )
-
-
-def uses_a2a_expert_parallel_metadata() -> bool:
-    """Return whether the backend needs EP metadata on DeepSeek MoE layers."""
-    b = get_moe_a2a_backend()
-    return (
-        b.is_deepep()
-        or b.is_mooncake()
-        or b.is_nixl()
-        or b.is_mori()
-        or b.is_ascend_fuseep()
-        or b.is_epv2()
-    )
-
-
-def requires_shared_expert_tp1() -> bool:
-    """Return whether shared experts should be materialized with TP=1."""
-    b = get_moe_a2a_backend()
-    return (
-        b.is_deepep()
-        or b.is_mooncake()
-        or b.is_nixl()
-        or b.is_mori()
-        or b.is_ascend_fuseep()
-        or b.is_flashinfer()
-        or b.is_megamoe()
-        or b.is_epv2()
-    )
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:

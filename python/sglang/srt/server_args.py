@@ -5547,6 +5547,13 @@ class ServerArgs:
             if not epv2_graph_ok:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            else:
+                # Only the direct-mode decode masked-GEMM path is capture-safe
+                # (static shapes, no host readback). The direct-mode prefill
+                # (extend) path goes through the non-masked contiguous layout with
+                # a host readback and is not capture-validated, so keep the decode
+                # graph but always disable the prefill graph under EPv2.
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )

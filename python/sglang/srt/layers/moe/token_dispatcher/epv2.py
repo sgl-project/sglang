@@ -527,6 +527,10 @@ class EpV2Dispatcher(BaseDispatcher):
         self._dispatch_state = self._impl.dispatch_a(hidden_states, topk_output)
 
     def dispatch_b(self) -> DispatchOutput:
+        if self._dispatch_state is None:
+            raise RuntimeError(
+                "DeepEP v2 dispatch_b() called without a preceding dispatch_a()"
+            )
         out = self._impl.dispatch_b(*self._dispatch_state)
         self._dispatch_state = None
         self._stage = _Stage.AFTER_DISPATCH
@@ -553,6 +557,10 @@ class EpV2Dispatcher(BaseDispatcher):
         self._combine_state = self._impl.combine_a(combine_input)
 
     def combine_b(self) -> torch.Tensor:
+        if self._combine_state is None:
+            raise RuntimeError(
+                "DeepEP v2 combine_b() called without a preceding combine_a()"
+            )
         try:
             return self._impl.combine_b(*self._combine_state)
         finally:

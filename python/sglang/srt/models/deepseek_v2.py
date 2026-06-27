@@ -101,9 +101,6 @@ from sglang.srt.layers.moe.utils import (
     is_deepep_class_backend,
     is_sbo_enabled,
     is_tbo_enabled,
-    requires_shared_expert_tp1,
-    uses_a2a_expert_parallel_metadata,
-    uses_a2a_moe_forward,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -702,7 +699,14 @@ class DeepseekV2MoE(nn.Module):
             # explicitly requested for DSV4 checkpoints whose shared scales are
             # not divisible by the global TP size.
             _shared_expert_use_tp1 = (
-                requires_shared_expert_tp1()
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or get_moe_a2a_backend().is_nixl()
+                or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+                or get_moe_a2a_backend().is_flashinfer()
+                or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_epv2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -777,7 +781,14 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if uses_a2a_expert_parallel_metadata():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
+            or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_epv2()
+        ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -793,7 +804,15 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-        self._enable_a2a_moe = uses_a2a_moe_forward()
+        self._enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
+            or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_epv2()
+        )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
@@ -2415,9 +2434,12 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
-                    # requires_shared_expert_tp1() is epv2-aware (is_deepep_class_backend
-                    # is not); keep it so EPv2 also materializes shared experts at TP=1.
-                    is_a2a_moe = requires_shared_expert_tp1()
+                    # Keep the original deepep-class scope here and only add EPv2,
+                    # so unrelated backends' allocator sizing is unchanged.
+                    is_a2a_moe = (
+                        is_deepep_class_backend()
+                        or get_moe_a2a_backend().is_epv2()
+                    )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
@@ -2437,7 +2459,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        self.enable_a2a_moe = uses_a2a_moe_forward()
+        self.enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_epv2()
+        )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
