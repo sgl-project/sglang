@@ -38,9 +38,7 @@ class LRUSessionEvictionPolicy(SessionEvictionPolicy):
     def score(self, session_id: str, metadata: SessionMetadata) -> float:
         return metadata.last_active_time
 
-
-class PriorityLRUSessionEvictionPolicy(SessionEvictionPolicy):
-    """Evict lower-priority sessions first; LRU as tiebreaker within same priority."""
-
-    def score(self, session_id: str, metadata: SessionMetadata) -> tuple:
-        return (metadata.priority, metadata.last_active_time)
+# TODO(Zhangmj0621): Eviction based on priority.
+# Pass priority into the session metadata and update it on each request.
+class PriorityEvictionPolicy(SessionEvictionPolicy):
+    pass
