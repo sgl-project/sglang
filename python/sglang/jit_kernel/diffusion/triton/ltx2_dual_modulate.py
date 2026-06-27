@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -78,8 +79,12 @@ def _ltx2_rmsnorm_dual_modulate_kernel(
         other=0.0,
     )
 
-    tl.store(y0_ptr + row * hidden + cols, normed * (1.0 + scale0) + shift0, mask=mask)
-    tl.store(y1_ptr + row * hidden + cols, normed * (1.0 + scale1) + shift1, mask=mask)
+    one_plus_scale0 = (1.0 + scale0).to(tl.bfloat16)
+    one_plus_scale1 = (1.0 + scale1).to(tl.bfloat16)
+    y0 = ((normed * one_plus_scale0).to(tl.bfloat16) + shift0).to(tl.bfloat16)
+    y1 = ((normed * one_plus_scale1).to(tl.bfloat16) + shift1).to(tl.bfloat16)
+    tl.store(y0_ptr + row * hidden + cols, y0, mask=mask)
+    tl.store(y1_ptr + row * hidden + cols, y1, mask=mask)
 
 
 def _expand_param(
@@ -126,37 +131,11 @@ def ltx2_rmsnorm_dual_modulate(
                 "scale/shift tensors must be CUDA, same dtype, last-dim contiguous"
             )
 
-    y0 = torch.empty_like(x)
-    y1 = torch.empty_like(x)
-    rows = int(batch * seq)
-    _ltx2_rmsnorm_dual_modulate_kernel[(rows,)](
-        x,
-        y0,
-        y1,
-        params[0],
-        params[1],
-        params[2],
-        params[3],
-        rows,
-        seq,
-        hidden,
-        params[0].stride(0),
-        params[0].stride(1),
-        params[0].stride(2),
-        params[1].stride(0),
-        params[1].stride(1),
-        params[1].stride(2),
-        params[2].stride(0),
-        params[2].stride(1),
-        params[2].stride(2),
-        params[3].stride(0),
-        params[3].stride(1),
-        params[3].stride(2),
-        eps,
-        BLOCK_N=triton.next_power_of_2(hidden),
-        num_warps=4 if hidden >= 4096 else 8,
+    normed = F.rms_norm(x, normalized_shape=(hidden,), eps=eps)
+    return (
+        normed * (1 + params[0]) + params[1],
+        normed * (1 + params[2]) + params[3],
     )
-    return y0, y1
 
 
 @triton.jit
@@ -243,8 +222,12 @@ def _ltx2_rmsnorm_ca_dual_modulate_from_temb_kernel(
         ).to(tl.bfloat16)
     ).to(tl.bfloat16)
 
-    tl.store(y0_ptr + row * hidden + cols, normed * (1.0 + scale0) + shift0, mask=mask)
-    tl.store(y1_ptr + row * hidden + cols, normed * (1.0 + scale1) + shift1, mask=mask)
+    one_plus_scale0 = (1.0 + scale0).to(tl.bfloat16)
+    one_plus_scale1 = (1.0 + scale1).to(tl.bfloat16)
+    y0 = ((normed * one_plus_scale0).to(tl.bfloat16) + shift0).to(tl.bfloat16)
+    y1 = ((normed * one_plus_scale1).to(tl.bfloat16) + shift1).to(tl.bfloat16)
+    tl.store(y0_ptr + row * hidden + cols, y0, mask=mask)
+    tl.store(y1_ptr + row * hidden + cols, y1, mask=mask)
 
 
 def ltx2_rmsnorm_ca_dual_modulate_from_temb(
@@ -286,25 +269,12 @@ def ltx2_rmsnorm_ca_dual_modulate_from_temb(
             "scale_shift_table must be CUDA, bf16/fp32, last-dim contiguous"
         )
 
-    y0 = torch.empty_like(x)
-    y1 = torch.empty_like(x)
-    rows = int(batch * seq)
-    _ltx2_rmsnorm_ca_dual_modulate_from_temb_kernel[(rows,)](
-        x,
-        y0,
-        y1,
-        temb_scale_shift,
-        scale_shift_table,
-        rows,
-        seq,
-        hidden,
-        temb_scale_shift.stride(0),
-        temb_scale_shift.stride(1),
-        temb_scale_shift.stride(2),
-        scale_shift_table.stride(0),
-        scale_shift_table.stride(1),
-        eps,
-        BLOCK_N=triton.next_power_of_2(hidden),
-        num_warps=4 if hidden >= 4096 else 8,
+    scale0, shift0, scale1, shift1 = (
+        scale_shift_table.to(dtype=x.dtype).view(1, 1, 4, hidden)
+        + temb_scale_shift.reshape(batch, seq, 4, hidden)
+    ).unbind(dim=2)
+    normed = F.rms_norm(x, normalized_shape=(hidden,), eps=eps)
+    return (
+        normed * (1 + scale0) + shift0,
+        normed * (1 + scale1) + shift1,
     )
-    return y0, y1

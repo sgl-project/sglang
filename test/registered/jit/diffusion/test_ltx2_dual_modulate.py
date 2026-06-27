@@ -28,7 +28,7 @@ def _rms_norm_ref(x: torch.Tensor) -> torch.Tensor:
 
 
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @torch.no_grad()
