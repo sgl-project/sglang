@@ -86,6 +86,14 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
         cmd += ["--num-gpus", str(case["num_gpus"])]
     if fw_cfg.get("serve_args", "").strip():
         cmd += fw_cfg["serve_args"].strip().split()
+    # Warm up at the exact measured resolution so server-based warmup primes
+    # kernels for the real request shape — eliminates a ~0.1s residual observed
+    # when synthetic warmup falls back to a default resolution. Relies on the
+    # --warmup dead-zone fix (server_args._adjust_warmup): `--warmup
+    # --warmup-resolutions WxH` now correctly runs server-based synthetic warmup
+    # at this resolution instead of running no warmup at all.
+    if case.get("width") and case.get("height"):
+        cmd += ["--warmup-resolutions", f"{case['width']}x{case['height']}"]
     return cmd
 
 
@@ -401,14 +409,16 @@ def send_image_request_sglang(
     if "data" not in data or len(data["data"]) == 0:
         raise RuntimeError(f"Image request returned no data: {data}")
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Image generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Image generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Image generated in {client_latency:.2f}s")
     return client_latency
 
@@ -452,14 +462,16 @@ def send_video_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Video generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Video generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Video generated in {client_latency:.2f}s")
     return client_latency
 
@@ -538,14 +550,16 @@ def send_image_conditioned_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
     return client_latency
 
