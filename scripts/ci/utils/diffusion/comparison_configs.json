@@ -144,7 +144,6 @@
             "width": 1024,
             "height": 1024,
             "seed": 42,
-            "preset_locked_steps": true,
             "num_gpus": 2,
             "frameworks": {
                 "sglang": {
