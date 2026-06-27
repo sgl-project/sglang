@@ -9,6 +9,55 @@ use thiserror::Error;
 
 pub const X_ROUTER_ERROR_CODE: HeaderName = HeaderName::from_static("x-router-error-code");
 
+/// Carries the worker's *own* HTTP status when the router had to synthesize a
+/// status of its own over a worker that did respond (today: a mid-body drop,
+/// where headers arrived but the body did not). Lets a gateway / operator
+/// recover what the engine actually said instead of seeing only the router's
+/// synthesized 502. Absent on every other response: a forwarded worker response
+/// already carries the worker's status in the status line, and a router-only
+/// condition (admission shed, no workers, …) has no upstream status to report.
+pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
+    HeaderName::from_static("x-router-upstream-status");
+
+/// Coarse failure class for a router-originated error. The router's HTTP status
+/// is a pure function of the class, so two conditions that mean the same thing
+/// — e.g. a per-request timeout and a stale-deadline cancel — can never drift to
+/// different status codes. The *precise* condition travels in
+/// `x-router-error-code` (see [`ApiError::error_code`]); since the router is
+/// always behind a gateway, that header is the authoritative signal the gateway
+/// converts on, and the status is only a self-sufficient HTTP-honest default for
+/// a direct caller. The class never contradicts the precise code — it only
+/// generalizes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorClass {
+    /// 400 — request rejected at ingress as malformed / invalid.
+    BadRequest,
+    /// 404 — requested model / resource not found.
+    NotFound,
+    /// 502 — a selected worker failed to return a usable response (unreachable,
+    /// or started a response then dropped the body).
+    Upstream,
+    /// 503 — the router had no worker to dispatch to, or declined to.
+    NoTarget,
+    /// 504 — the router gave up waiting (any timeout / deadline).
+    Timeout,
+    /// 500 — internal router fault.
+    Internal,
+}
+
+impl ErrorClass {
+    fn status(self) -> StatusCode {
+        match self {
+            ErrorClass::BadRequest => StatusCode::BAD_REQUEST,
+            ErrorClass::NotFound => StatusCode::NOT_FOUND,
+            ErrorClass::Upstream => StatusCode::BAD_GATEWAY,
+            ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            ErrorClass::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("bad request: {0}")]
@@ -74,10 +123,12 @@ pub enum ApiError {
     /// token wins, the handler returns this variant → HTTP 504 →
     /// client sees `stale_request_expired`.
     ///
-    /// Mapped to 504 (not 503) because the failure is a router-side
-    /// gateway timeout from the client's perspective: the upstream
-    /// worker is still potentially fine, the router gave up because
-    /// the per-request budget elapsed.
+    /// Classed as [`ErrorClass::Timeout`] (→ 504), the same class as
+    /// `UpstreamTimeout`: from the client's perspective both are a router-side
+    /// gateway timeout. Here the upstream worker is still potentially fine — the
+    /// router gave up because the per-request budget elapsed. The shared class
+    /// is what keeps the two timeouts on the same status; they stay tellable
+    /// apart only by `x-router-error-code`.
     #[error("stale request expired for model {model}")]
     StaleRequestExpired { model: String },
 
@@ -118,40 +169,53 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    fn status_and_code(&self) -> (StatusCode, &'static str) {
+    /// The failure class — the sole determinant of the HTTP status. Grouping by
+    /// class is what makes the status non-divergent: every timeout is
+    /// [`ErrorClass::Timeout`], so a per-request timeout and a stale-deadline
+    /// cancel are guaranteed the same status, and no future variant can quietly
+    /// pick a different one.
+    fn class(&self) -> ErrorClass {
         match self {
-            ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
-            ApiError::ModelNotFound(_) => (StatusCode::NOT_FOUND, "model_not_found"),
-            ApiError::UpstreamUnreachable { .. } => {
-                (StatusCode::BAD_GATEWAY, "upstream_unreachable")
-            }
-            ApiError::UpstreamStatus { .. } => (StatusCode::BAD_GATEWAY, "upstream_status"),
-            ApiError::UpstreamTimeout { .. } => (StatusCode::BAD_GATEWAY, "upstream_timeout"),
-            ApiError::NoHealthyWorkers { .. } => {
-                (StatusCode::SERVICE_UNAVAILABLE, "no_healthy_workers")
-            }
-            ApiError::NoPrefillWorkersAvailable { .. } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_prefill_workers_available",
-            ),
-            ApiError::NoDecodeWorkersAvailable { .. } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_decode_workers_available",
-            ),
-            ApiError::StaleRequestExpired { .. } => {
-                (StatusCode::GATEWAY_TIMEOUT, "stale_request_expired")
-            }
-            ApiError::PolicySelectionFailed { .. } => {
-                (StatusCode::SERVICE_UNAVAILABLE, "policy_selection_failed")
-            }
-            ApiError::BreakerOpen { .. } => (StatusCode::SERVICE_UNAVAILABLE, "breaker_open"),
-            ApiError::WorkerMisconfigured { .. } => {
-                (StatusCode::SERVICE_UNAVAILABLE, "worker_misconfigured")
-            }
-            ApiError::ServiceOverloaded { .. } => {
-                (StatusCode::SERVICE_UNAVAILABLE, "service_overloaded")
-            }
-            ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            ApiError::BadRequest(_) => ErrorClass::BadRequest,
+            ApiError::ModelNotFound(_) => ErrorClass::NotFound,
+            ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
+            ApiError::UpstreamStatus { .. } => ErrorClass::Upstream,
+            ApiError::UpstreamTimeout { .. } => ErrorClass::Timeout,
+            ApiError::NoHealthyWorkers { .. } => ErrorClass::NoTarget,
+            ApiError::NoPrefillWorkersAvailable { .. } => ErrorClass::NoTarget,
+            ApiError::NoDecodeWorkersAvailable { .. } => ErrorClass::NoTarget,
+            ApiError::StaleRequestExpired { .. } => ErrorClass::Timeout,
+            ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
+            ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
+            ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
+            ApiError::ServiceOverloaded { .. } => ErrorClass::NoTarget,
+            ApiError::Internal(_) => ErrorClass::Internal,
+        }
+    }
+
+    /// Stable, machine-readable `x-router-error-code` — the authoritative signal
+    /// a gateway converts on. Distinct per condition even when two conditions
+    /// share a class (and thus a status): `upstream_timeout` and
+    /// `stale_request_expired` both map to 504 but stay tellable apart here.
+    fn error_code(&self) -> &'static str {
+        match self {
+            ApiError::BadRequest(_) => "bad_request",
+            ApiError::ModelNotFound(_) => "model_not_found",
+            ApiError::UpstreamUnreachable { .. } => "upstream_unreachable",
+            // Mid-body drop: headers (incl. a status) arrived, then the body
+            // didn't. We surface a 502 but echo the worker's status in
+            // `x-router-upstream-status` (see `into_response`).
+            ApiError::UpstreamStatus { .. } => "upstream_body_incomplete",
+            ApiError::UpstreamTimeout { .. } => "upstream_timeout",
+            ApiError::NoHealthyWorkers { .. } => "no_healthy_workers",
+            ApiError::NoPrefillWorkersAvailable { .. } => "no_prefill_workers_available",
+            ApiError::NoDecodeWorkersAvailable { .. } => "no_decode_workers_available",
+            ApiError::StaleRequestExpired { .. } => "stale_request_expired",
+            ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
+            ApiError::BreakerOpen { .. } => "breaker_open",
+            ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
+            ApiError::ServiceOverloaded { .. } => "service_overloaded",
+            ApiError::Internal(_) => "internal_error",
         }
     }
 
@@ -159,7 +223,7 @@ impl ApiError {
     /// `into_response`. Exposed so the access log records the real status
     /// (e.g. 502/503/504) instead of a sentinel.
     pub fn status_code(&self) -> StatusCode {
-        self.status_and_code().0
+        self.class().status()
     }
 }
 
@@ -178,7 +242,8 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, code) = self.status_and_code();
+        let status = self.class().status();
+        let code = self.error_code();
         let typ = match status.as_u16() {
             400..=499 => "invalid_request_error",
             _ => "server_error",
@@ -270,6 +335,15 @@ impl IntoResponse for ApiError {
             .into_response();
         resp.headers_mut()
             .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+        // Preserve the worker's real status when we synthesized our own. Only
+        // the mid-body-drop case has one: the worker sent a status, then dropped
+        // the body, so we report a 502 but don't throw away what it said.
+        if let ApiError::UpstreamStatus { status: upstream } = &self {
+            resp.headers_mut().insert(
+                X_ROUTER_UPSTREAM_STATUS,
+                HeaderValue::from(upstream.as_u16()),
+            );
+        }
         resp
     }
 }
@@ -345,7 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn upstream_status_envelope_has_code() {
+    fn upstream_body_incomplete_preserves_worker_status_in_header() {
+        // Mid-body drop: the worker sent a status (here 500) then dropped the
+        // body. The router synthesizes its own 502, but the worker's real status
+        // is preserved in `x-router-upstream-status` rather than silently lost.
         let err = ApiError::UpstreamStatus {
             status: StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -355,10 +432,20 @@ mod tests {
             resp.headers()
                 .get("x-router-error-code")
                 .and_then(|v| v.to_str().ok()),
-            Some("upstream_status"),
+            Some("upstream_body_incomplete"),
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-router-upstream-status")
+                .and_then(|v| v.to_str().ok()),
+            Some("500"),
+            "the worker's real status must be preserved, not discarded",
         );
         let body = collect_body(resp);
-        assert!(body.contains("\"code\":\"upstream_status\""), "{body}");
+        assert!(
+            body.contains("\"code\":\"upstream_body_incomplete\""),
+            "{body}"
+        );
     }
 
     #[test]
@@ -369,7 +456,10 @@ mod tests {
             worker: worker.clone(),
         };
         let resp = err.into_response();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // A timeout is a gateway timeout (504), not a bad gateway (502): same
+        // class — and same status — as the stale-deadline cancel, so the two
+        // can't drift apart.
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
             resp.headers()
                 .get("x-router-error-code")
@@ -455,5 +545,164 @@ mod tests {
             !body_str.contains(secret_msg),
             "ApiError::Internal must not leak anyhow chain to client; got: {body_str}"
         );
+    }
+
+    /// The three client-facing signals of the router status-code contract:
+    /// the HTTP status, `x-router-error-code`, and `x-router-upstream-status`.
+    fn signals(err: ApiError) -> (StatusCode, Option<String>, Option<String>) {
+        let resp = err.into_response();
+        let status = resp.status();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        (
+            status,
+            header("x-router-error-code"),
+            header("x-router-upstream-status"),
+        )
+    }
+
+    /// Every router-*originated* condition maps to a fixed (status, error-code)
+    /// pair, and ONLY the mid-body-drop case echoes the worker's real status in
+    /// `x-router-upstream-status`. This pins the router half of the status-code
+    /// contract:
+    ///   * same condition class → same status — both timeouts are 504, so the
+    ///     per-request timeout and the stale-deadline cancel can never diverge
+    ///     to 502-vs-504 the way they used to;
+    ///   * a worker's real status is preserved, never silently rewritten.
+    #[test]
+    fn router_originated_scenarios_match_status_and_headers() {
+        let worker = reqwest::Url::parse("http://host:1/").unwrap();
+        // (label, error, expected status, expected x-router-error-code,
+        //  expected x-router-upstream-status)
+        let cases: Vec<(&str, ApiError, StatusCode, &str, Option<&str>)> = vec![
+            (
+                "mid-body drop preserves worker status",
+                ApiError::UpstreamStatus {
+                    status: StatusCode::OK,
+                },
+                StatusCode::BAD_GATEWAY,
+                "upstream_body_incomplete",
+                Some("200"),
+            ),
+            (
+                "unreachable",
+                ApiError::UpstreamUnreachable {
+                    worker: worker.clone(),
+                    source: anyhow::anyhow!("connect refused"),
+                },
+                StatusCode::BAD_GATEWAY,
+                "upstream_unreachable",
+                None,
+            ),
+            (
+                "request timeout",
+                ApiError::UpstreamTimeout {
+                    worker: worker.clone(),
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                None,
+            ),
+            (
+                "stale-deadline cancel",
+                ApiError::StaleRequestExpired { model: "m".into() },
+                StatusCode::GATEWAY_TIMEOUT,
+                "stale_request_expired",
+                None,
+            ),
+            (
+                "admission shed",
+                ApiError::ServiceOverloaded { model: "m".into() },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_overloaded",
+                None,
+            ),
+            (
+                "no healthy workers",
+                ApiError::NoHealthyWorkers { model: "m".into() },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_healthy_workers",
+                None,
+            ),
+            (
+                "bad request",
+                ApiError::BadRequest("bad".into()),
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                None,
+            ),
+            (
+                "model not found",
+                ApiError::ModelNotFound("ghost".into()),
+                StatusCode::NOT_FOUND,
+                "model_not_found",
+                None,
+            ),
+            (
+                "no prefill workers",
+                ApiError::NoPrefillWorkersAvailable { model: "m".into() },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_prefill_workers_available",
+                None,
+            ),
+            (
+                "no decode workers",
+                ApiError::NoDecodeWorkersAvailable { model: "m".into() },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_decode_workers_available",
+                None,
+            ),
+            (
+                "policy selection failed",
+                ApiError::PolicySelectionFailed { model: "m".into() },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "policy_selection_failed",
+                None,
+            ),
+            (
+                "breaker open",
+                ApiError::BreakerOpen {
+                    worker: "http://w:1".into(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "breaker_open",
+                None,
+            ),
+            (
+                "worker misconfigured",
+                ApiError::WorkerMisconfigured {
+                    worker: "http://w:1".into(),
+                    source: anyhow::anyhow!("unparsable url"),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "worker_misconfigured",
+                None,
+            ),
+            (
+                "internal",
+                ApiError::Internal(anyhow::anyhow!("boom")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                None,
+            ),
+        ];
+        for (label, err, want_status, want_code, want_upstream) in cases {
+            let (status, code, upstream) = signals(err);
+            assert_eq!(status, want_status, "status mismatch for `{label}`");
+            assert_eq!(
+                code.as_deref(),
+                Some(want_code),
+                "x-router-error-code mismatch for `{label}`",
+            );
+            assert_eq!(
+                upstream.as_deref(),
+                want_upstream,
+                "x-router-upstream-status mismatch for `{label}`",
+            );
+        }
     }
 }

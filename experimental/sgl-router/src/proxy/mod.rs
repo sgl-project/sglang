@@ -182,10 +182,15 @@ impl Proxy {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
+                // Walk the full source chain (`{:#}`) like the connect-error
+                // handler in `classify_reqwest_error_for` — a mid-body drop's
+                // real cause (incomplete message, connection reset) lives in the
+                // wrapped source, not the outer reqwest error.
+                let cause = anyhow::Error::new(e);
                 tracing::warn!(
                     upstream = %url,
                     status = %status,
-                    error = ?e,
+                    error = %format_args!("{cause:#}"),
                     "upstream dropped connection mid-body",
                 );
                 breaker.record_failure();
@@ -501,6 +506,43 @@ mod tests {
             breaker.would_allow(),
             "worker must admit traffic again after recovering from the probe",
         );
+    }
+
+    /// A worker's own response is forwarded with its status VERBATIM and carries
+    /// NO `x-router-error-code` header. The absence of that header is exactly how
+    /// a gateway tells "the engine said this" from "the router said this" — a
+    /// worker 2xx, 4xx, and 5xx (incl. a complete 500, distinct from a synthesized
+    /// 502 mid-body drop) all pass straight through, unannotated.
+    #[tokio::test]
+    async fn forwarded_worker_response_is_verbatim_with_no_router_error_code() {
+        for status in [200u16, 400, 500, 503] {
+            let (url, _shutdown) = spawn_status_worker(status).await;
+            let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+            let breaker = CircuitBreaker::new();
+            let resp = proxy
+                .forward_json_to(
+                    &url,
+                    &breaker,
+                    "/v1/chat/completions",
+                    &HeaderMap::new(),
+                    Bytes::from_static(b"{}"),
+                )
+                .await
+                .expect("dispatch should reach the worker");
+            assert_eq!(
+                resp.status().as_u16(),
+                status,
+                "worker status {status} must be forwarded verbatim",
+            );
+            assert!(
+                resp.headers().get("x-router-error-code").is_none(),
+                "a forwarded worker response must NOT carry x-router-error-code (status {status})",
+            );
+            assert!(
+                resp.headers().get("x-router-upstream-status").is_none(),
+                "a forwarded worker response must NOT carry x-router-upstream-status (status {status})",
+            );
+        }
     }
 
     /// Streaming path parity: the engine's 503 on the streaming arm must also

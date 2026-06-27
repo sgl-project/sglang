@@ -7,7 +7,8 @@
 //! Without a configured `.timeout(...)` on the reqwest client, a stalled
 //! backend hangs the axum handler future forever and the test harness
 //! would just timeout. We assert here that the router returns a fast,
-//! clean 502 (`upstream_timeout`) instead.
+//! clean 504 (`upstream_timeout`) instead — a timeout is a gateway timeout,
+//! the same status class as the stale-deadline cancel.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -96,7 +97,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         elapsed < Duration::from_secs(1),
         "router must short-circuit on upstream timeout; elapsed {elapsed:?}"
     );
-    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(res.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
         "upstream_timeout"

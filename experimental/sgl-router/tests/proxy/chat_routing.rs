@@ -681,12 +681,13 @@ async fn chat_rejects_string_body_400() {
 }
 
 #[tokio::test]
-async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
+async fn non_streaming_mid_body_drop_classified_as_upstream_body_incomplete() {
     // Regression: when the upstream replies with a status line and headers
     // but drops the connection mid-body, the failure is NOT
-    // "upstream_unreachable" (the upstream demonstrably DID reply). It must
-    // be classified as `upstream_status` so the operator-visible envelope
-    // reflects that the worker partially served the request.
+    // "upstream_unreachable" (the upstream demonstrably DID reply). It is
+    // classified as `upstream_body_incomplete`, and the worker's real status
+    // (200 here) is preserved in `x-router-upstream-status` rather than lost
+    // behind the synthesized 502.
     let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
         StatusCode::OK,
         b"{\"partial\": ",
@@ -716,8 +717,13 @@ async fn non_streaming_mid_body_drop_classified_as_upstream_status() {
     );
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
-        "upstream_status",
-        "mid-body drop must be upstream_status (worker DID reply), not upstream_unreachable",
+        "upstream_body_incomplete",
+        "mid-body drop must be upstream_body_incomplete (worker DID reply), not upstream_unreachable",
+    );
+    assert_eq!(
+        res.headers().get("x-router-upstream-status").unwrap(),
+        "200",
+        "the worker's real status must be preserved end-to-end, not discarded",
     );
 }
 
