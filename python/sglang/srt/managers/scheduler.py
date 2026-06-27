@@ -2626,8 +2626,9 @@ class Scheduler(
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
-            # so there is nothing new to cache and stashing would be a no-op.
+            # hybrid-SWA early-return) leaves extend_range.end ==
+            # len(prefix_indices), so there is nothing new to cache and
+            # stashing would be a no-op.
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
@@ -2974,7 +2975,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.swa_evict_floor = req.fill_len
+                req.swa_evict_floor = req.extend_range.end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
