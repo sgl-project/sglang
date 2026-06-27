@@ -50,7 +50,10 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_position,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -83,12 +86,14 @@ def _all_gather_dsa_trtllm_fp8_kv(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     kv_lora_rank = k.shape[-1]
     qk_rope_head_dim = k_rope.shape[-1]
+    kv_dtype = k.dtype
+    kv = torch.cat((k, k_rope), dim=-1).view(torch.uint8)
     kv = cp_all_gather_rerange_output(
-        torch.cat((k, k_rope), dim=-1),
+        kv,
         get_parallel().attn_cp_size,
         forward_batch,
         torch.cuda.current_stream(),
-    )
+    ).view(kv_dtype)
     return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
 
 
@@ -2369,12 +2374,18 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
 
+            rope_positions = forward_batch.positions
+            if dsa_use_prefill_cp(forward_batch):
+                rope_positions = cp_split_and_rebuild_position(
+                    forward_batch, rope_positions
+                )
+
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
                 k.squeeze(1),
                 k_rope.squeeze(1),
-                forward_batch.positions,
+                rope_positions,
                 cos_sin_cache,
                 is_neox,
                 self.kv_lora_rank,
