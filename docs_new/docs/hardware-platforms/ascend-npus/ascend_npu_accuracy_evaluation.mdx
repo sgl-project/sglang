@@ -257,6 +257,10 @@ The error is caused by a corporate TLS proxy injecting a self-signed certificate
 export REQUESTS_CA_BUNDLE=/path/to/your-proxy-ca-bundle.crt
 ```
 
+<Note>
+This is a common workaround for corporate proxy environments. If it does not resolve your issue, consult your IT department — proxy configurations vary across organizations.
+</Note>
+
 If you cannot obtain the CA certificate, download datasets manually as shown in [Download Dataset Error](#download-dataset-error) below.
 
 ### EvalScope Request Retry Timeout
