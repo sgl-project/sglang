@@ -2546,10 +2546,11 @@ class EncoderScheduler:
                     encoder_metrics_collector.observe_queue_wait(
                         max(0.0, start - p.submit_time), modality=modality_str
                     )
-                    mm_items = req.get("mm_items", [])
-                    mm_count = (
-                        len(mm_items) if isinstance(mm_items, (list, tuple)) else 1
-                    )
+                    # Count like batch_encode: flatten nested items and expand
+                    # per-leaf grids so {"type": "image", "image": [p1, p2, ...]}
+                    # counts as N, not 1.
+                    leaves = MMEncoder._flatten_nested_items(req.get("mm_items", []))
+                    mm_count = sum(self.encoder._grid_count_per_leaf(leaves, modality))
                     encoder_metrics_collector.observe_mm_items_per_request(
                         mm_count, modality=modality_str
                     )
