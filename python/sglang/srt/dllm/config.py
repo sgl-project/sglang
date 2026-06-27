@@ -41,7 +41,6 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
-            "DiffEncoderModel": {"block_size": 32, "mask_id": 151662},
             "NemotronLabsDiffusionModel": {"block_size": 32, "mask_id": 100},
         }
 
@@ -64,6 +63,7 @@ class DllmConfig:
                 )
             with open(server_args.dllm_algorithm_config, "r") as f:
                 algorithm_config = yaml.safe_load(f) or {}
+            # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
         max_steps = algorithm_config.get("max_steps", block_size)

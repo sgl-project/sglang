@@ -92,11 +92,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
         self.truncate = truncate
-        # Get n-d magnitude scaling corrected for interpolation.
-        # When mscale and mscale_all_dim are provided (HF convention),
-        # compute attention_factor as the ratio used by HF's
-        # _compute_yarn_parameters which uses get_mscale(factor, mscale)
-        # / get_mscale(factor, mscale_all_dim).
+        # Match Hugging Face YaRN scaling when both mscale values are present.
         if mscale is not None and mscale_all_dim is not None:
             self.mscale = float(
                 yarn_get_mscale(self.scaling_factor, mscale)
