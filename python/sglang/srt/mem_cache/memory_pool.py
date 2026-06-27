@@ -25,6 +25,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -1884,6 +1885,8 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
+    SF_VEC_SIZE = 16
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1896,8 +1899,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 m = self.size + self.page_size
                 n = self.head_num
                 k = self.head_dim
+                v = self.v_head_dim
 
-                scale_block_size = 16
                 self.store_dtype = torch.uint8
                 self.k_buffer = [
                     torch.zeros(
@@ -1909,7 +1912,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 ]
                 self.v_buffer = [
                     torch.zeros(
-                        (m, n, k // 2),
+                        (m, n, v // 2),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -1918,7 +1921,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
                 self.k_scale_buffer = [
                     torch.zeros(
-                        (m, (n * k) // scale_block_size),
+                        (m, n, k // self.SF_VEC_SIZE),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -1926,54 +1929,240 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
                 ]
                 self.v_scale_buffer = [
                     torch.zeros(
-                        (m, (n * k) // scale_block_size),
+                        (m, n, v // self.SF_VEC_SIZE),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
                     for _ in range(self.layer_num)
                 ]
 
+                self.k_global = torch.ones(
+                    (self.layer_num, 1), dtype=torch.float32, device=self.device
+                )
+                self.v_global = torch.ones(
+                    (self.layer_num, 1), dtype=torch.float32, device=self.device
+                )
+                self.k_global_float = [1.0 for _ in range(self.layer_num)]
+                self.v_global_float = [1.0 for _ in range(self.layer_num)]
+                self._gs_calibrated = [False for _ in range(self.layer_num)]
+                self._autocalib_warned = False
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.k_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_scale_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat(
+            [
+                self.k_data_ptrs,
+                self.v_data_ptrs,
+                self.k_scale_data_ptrs,
+                self.v_scale_data_ptrs,
+            ],
+            dim=0,
+        )
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in (
+                    self.k_buffer
+                    + self.v_buffer
+                    + self.k_scale_buffer
+                    + self.v_scale_buffer
+                )
+            ],
+            device=self.device,
+        )
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
         del self.k_scale_buffer
         del self.v_scale_buffer
+        del self.k_global
+        del self.v_global
+        del self.k_global_float
+        del self.v_global_float
+        del self._gs_calibrated
 
     def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            cache_k_nope_fp4 = self.k_buffer[layer_id - self.start_layer].view(
-                torch.uint8
-            )
-            cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
-
-            from sglang.srt.layers.quantization.kvfp4_tensor import (
-                BlockFP4KVQuantizeUtil,
-            )
-
-            cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
-                cache_k_nope_fp4, cache_k_nope_fp4_sf
-            )
-            return cache_k_nope_fp4_dequant
         return self.k_buffer[layer_id - self.start_layer]
 
     def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
-            cache_v_nope_fp4 = self.v_buffer[layer_id - self.start_layer].view(
-                torch.uint8
-            )
-            cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
-
-            from sglang.srt.layers.quantization.kvfp4_tensor import (
-                BlockFP4KVQuantizeUtil,
-            )
-
-            cache_v_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
-                cache_v_nope_fp4, cache_v_nope_fp4_sf
-            )
-            return cache_v_nope_fp4_dequant
         return self.v_buffer[layer_id - self.start_layer]
+
+    def get_kv_scale_buffer(self, layer_id: int):
+        local_layer_id = layer_id - self.start_layer
+        return (
+            self.k_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
+            self.v_scale_buffer[local_layer_id].view(torch.float8_e4m3fn),
+        )
+
+    def get_kv_global_scale(self, layer_id: int):
+        local_layer_id = layer_id - self.start_layer
+        return self.k_global_float[local_layer_id], self.v_global_float[local_layer_id]
+
+    def _get_kv_global_scale_tensor(self, layer_id: int):
+        local_layer_id = layer_id - self.start_layer
+        return (
+            self.k_global[local_layer_id : local_layer_id + 1],
+            self.v_global[local_layer_id : local_layer_id + 1],
+        )
+
+    @staticmethod
+    def _scale_to_positive_float(scale) -> Optional[float]:
+        if scale is None:
+            return None
+        try:
+            value = float(scale.detach().to("cpu").item())
+        except AttributeError:
+            value = float(scale)
+        return value if value > 0.0 else None
+
+    def _maybe_load_layer_global_scales(self, layer: RadixAttention, layer_id: int):
+        local_layer_id = layer_id - self.start_layer
+        k_scale = self._scale_to_positive_float(
+            getattr(layer, "k_scale_float", None)
+        ) or self._scale_to_positive_float(getattr(layer, "k_scale", None))
+        v_scale = self._scale_to_positive_float(
+            getattr(layer, "v_scale_float", None)
+        ) or self._scale_to_positive_float(getattr(layer, "v_scale", None))
+
+        if k_scale is not None:
+            self.k_global[local_layer_id].fill_(k_scale)
+            self.k_global_float[local_layer_id] = k_scale
+        if v_scale is not None:
+            self.v_global[local_layer_id].fill_(v_scale)
+            self.v_global_float[local_layer_id] = v_scale
+
+    def _maybe_calibrate_global_scales(
+        self,
+        layer: RadixAttention,
+        layer_id: int,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        local_layer_id = layer_id - self.start_layer
+        if self._gs_calibrated[local_layer_id]:
+            return
+        if os.environ.get("SGLANG_FP4_KV_AUTOCALIB", "1") == "0":
+            self._gs_calibrated[local_layer_id] = True
+            return
+        has_calibrated_scale = (
+            self._scale_to_positive_float(getattr(layer, "k_scale_float", None))
+            is not None
+            or self._scale_to_positive_float(getattr(layer, "v_scale_float", None))
+            is not None
+            or self._scale_to_positive_float(getattr(layer, "k_scale", None))
+            is not None
+            or self._scale_to_positive_float(getattr(layer, "v_scale", None))
+            is not None
+        )
+        if has_calibrated_scale:
+            self._gs_calibrated[local_layer_id] = True
+            return
+        explicit_autocalib = getattr(self, "_explicit_autocalib_in_progress", False)
+        if not self._autocalib_warned and not explicit_autocalib:
+            self._autocalib_warned = True
+            logger.warning(
+                "NVFP4 KV cache: this model ships no calibrated KV scales; "
+                "auto-calibrating per-layer global scales from the first eager prefill. "
+                "Disable with SGLANG_FP4_KV_AUTOCALIB=0."
+            )
+        if get_is_capture_mode():
+            raise RuntimeError(
+                "NVFP4 KV cache global scales must be calibrated before CUDA "
+                "graph capture. Run an eager prefill first or provide checkpoint "
+                "k_scale/v_scale values."
+            )
+        try:
+            from sglang.srt.compilation.piecewise_context_manager import (
+                get_pcg_capture_stream,
+                is_in_piecewise_cuda_graph,
+            )
+        except Exception:
+            pass
+        else:
+            if is_in_piecewise_cuda_graph() or get_pcg_capture_stream() is not None:
+                raise RuntimeError(
+                    "NVFP4 KV cache global scales must be calibrated before "
+                    "piecewise CUDA graph capture. Run an eager prefill first or "
+                    "provide checkpoint k_scale/v_scale values."
+                )
+
+        from sglang.srt.layers.quantization.kvfp4_tensor import (
+            E2M1_MAX,
+            MAX_BLOCK_SCALE_FP8,
+        )
+
+        denom = E2M1_MAX * MAX_BLOCK_SCALE_FP8
+        # Calibration headroom. A global scale of amax/denom maps this warmup's amax
+        # to the very TOP of the NVFP4 representable range, i.e. ZERO headroom: any
+        # serving-time |k|/|v| larger than the single eager warmup prefill's amax
+        # saturates the fp4 + fp8-block range and is clipped. The warmup is short and
+        # not guaranteed representative of real traffic, so a tight (headroom=1) fit
+        # clips the heavier tails of real data, and the clipped KV reads compound into
+        # runaway repetition the deeper a sequence is decoded. Quantization-calibration
+        # practice is to leave headroom above the observed max; here the risk is
+        # strongly asymmetric (under-scaling -> catastrophic degeneration, over-scaling
+        # -> only minor precision loss), so we map amax into a FRACTION of the range.
+        # Default 2.0 = amax sits at half the representable range. Measured on
+        # Gemma-4-12B (GB10 / GSM8K 5-shot): headroom 1.0 -> 6-10% garbled, acc 0.33;
+        # 2.0 -> ~2% garbled, acc matches the bf16-KV baseline; >=4.0 starts to lose
+        # precision again. A checkpoint that ships k_scale/v_scale overrides this path.
+        headroom = float(os.environ.get("SGLANG_FP4_KV_AUTOCALIB_HEADROOM", "2.0"))
+        if headroom <= 0:
+            headroom = 1.0
+        k_amax = cache_k.detach().abs().amax().float()
+        v_amax = cache_v.detach().abs().amax().float()
+        k_gs = (k_amax * headroom / denom).clamp_(min=1e-8)
+        v_gs = (v_amax * headroom / denom).clamp_(min=1e-8)
+        self.k_global[local_layer_id].copy_(k_gs)
+        self.v_global[local_layer_id].copy_(v_gs)
+        self.k_global_float[local_layer_id] = float(k_gs)
+        self.v_global_float[local_layer_id] = float(v_gs)
+        self._gs_calibrated[local_layer_id] = True
+        if not explicit_autocalib:
+            logger.info(
+                "NVFP4 KV auto-calibrated layer %d: k_amax=%.4g v_amax=%.4g "
+                "k_gs=%.4g v_gs=%.4g headroom=%.3g (n_tokens=%d)",
+                layer_id,
+                float(k_amax),
+                float(v_amax),
+                self.k_global_float[local_layer_id],
+                self.v_global_float[local_layer_id],
+                headroom,
+                cache_k.shape[0],
+            )
+
+    def get_kv_size_bytes(self):
+        k_size_bytes, v_size_bytes = super().get_kv_size_bytes()
+        for k_scale_cache in self.k_scale_buffer:
+            k_size_bytes += get_tensor_size_bytes(k_scale_cache)
+        for v_scale_cache in self.v_scale_buffer:
+            v_size_bytes += get_tensor_size_bytes(v_scale_cache)
+        k_size_bytes += get_tensor_size_bytes(self.k_global)
+        v_size_bytes += get_tensor_size_bytes(self.v_global)
+        return k_size_bytes, v_size_bytes
 
     def set_kv_buffer(
         self,
@@ -1993,25 +2182,23 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
+        self._maybe_load_layer_global_scales(layer, layer_id)
+        self._maybe_calibrate_global_scales(layer, layer_id, cache_k, cache_v)
+        k_global, v_global = self._get_kv_global_scale_tensor(layer_id)
 
-            from sglang.srt.layers.quantization.kvfp4_tensor import (
-                BlockFP4KVQuantizeUtil,
-            )
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
-            cache_k, cache_k_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_v)
+        cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
+            cache_k.contiguous(), k_global
+        )
+        cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
+            cache_v.contiguous(), v_global
+        )
 
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
-
-            cache_k_fp4_sf = cache_k_fp4_sf.view(self.store_dtype)
-            cache_v_fp4_sf = cache_v_fp4_sf.view(self.store_dtype)
+        cache_k = cache_k.view(self.store_dtype)
+        cache_v = cache_v.view(self.store_dtype)
+        cache_k_fp4_sf = cache_k_fp4_sf.view(self.store_dtype)
+        cache_v_fp4_sf = cache_v_fp4_sf.view(self.store_dtype)
 
         if get_is_capture_mode() and self.alt_stream is not None:
             # Overlap the copy of K and V cache for small batch size
@@ -2031,6 +2218,49 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
             self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if self.layer_num == 0:
+            return
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
+        N = tgt_loc.numel()
+        if N == 0:
+            return
+
+        if self._kv_copy_config is None:
+            for buffers in (
+                self.k_buffer,
+                self.v_buffer,
+                self.k_scale_buffer,
+                self.v_scale_buffer,
+            ):
+                for buffer in buffers:
+                    buffer[tgt_loc] = buffer[src_loc]
+            return
+
+        cfg = self._kv_copy_config
+        cap = int(cfg.get("num_locs_upper", 256))
+        grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
+
+        for start in range(0, N, cap):
+            end = min(start + cap, N)
+            chunk_len = end - start
+            upper = next_power_of_2(chunk_len)
+            copy_all_layer_kv_cache_tiled[grid](
+                self.data_ptrs,
+                self.data_strides,
+                tgt_loc[start:end],
+                src_loc[start:end],
+                chunk_len,
+                upper,
+                BYTES_PER_TILE=cfg["bytes_per_tile"],
+                num_warps=cfg["num_warps"],
+                num_stages=2,
+            )
 
 
 class HybridLinearKVPool(KVCache):

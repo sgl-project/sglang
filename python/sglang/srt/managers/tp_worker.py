@@ -449,13 +449,17 @@ class TpModelWorker(BaseTpWorker):
             self.model_config.context_len - 1,
             self.model_runner.max_token_pool_size - 1,
         )
+        max_req_input_len = max_req_len - 5
+        if self.dllm_algorithm is not None:
+            # The canvas extends past the prompt within the same row.
+            max_req_input_len -= self.dllm_algorithm.block_size
         return (
             self.model_runner.max_total_num_tokens,
             self.server_args.max_prefill_tokens,
             self.model_runner.max_running_requests,
             self.server_args.max_queued_requests,
             max_req_len,
-            max_req_len - 5,
+            max_req_input_len,
             self.random_seed,
             self.device,
             self.model_runner.forward_stream,

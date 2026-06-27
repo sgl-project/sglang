@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -82,6 +83,31 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
         "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
         f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
+
+
+def _fp4_kv_mixed_kv_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_MIXED_KV") == "1"
+
+
+def _mixed_fp8_k_nvfp4_v_cell_size(
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+    num_layers: int,
+    kv_size: int,
+) -> int:
+    """Per-token bytes for the experimental FP8-K + NVFP4-V cache.
+
+    MHATokenToKVPoolFP4 stores K densely as FP8 e4m3 and V as packed NVFP4
+    plus one FP8 scale per 16 V elements. This must be larger than the
+    full-FP4 logical dtype estimate, otherwise mem_fraction_static can
+    understate the realized physical K/V allocation.
+    """
+    scale_block_size = 16
+    k_data_size = head_num * head_dim * num_layers * kv_size
+    v_data_size = head_num * (v_head_dim // 2) * num_layers * kv_size
+    v_scale_size = head_num * (v_head_dim // scale_block_size) * num_layers * kv_size
+    return k_data_size + v_data_size + v_scale_size
 
 
 class MemoryPoolConfigurator:
@@ -213,9 +239,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_block_size = 16
                 n = model_config.get_num_kv_heads(tp_size)
                 k = model_config.head_dim
-                cell_size = (cell_size // 2) + (
-                    (n * k * num_layers * 2 * kv_size) // scale_block_size
-                )
+                if _fp4_kv_mixed_kv_enabled():
+                    cell_size = _mixed_fp8_k_nvfp4_v_cell_size(
+                        n,
+                        k,
+                        model_config.v_head_dim,
+                        num_layers,
+                        kv_size,
+                    )
+                else:
+                    cell_size = (cell_size // 2) + (
+                        (n * k * num_layers * 2 * kv_size) // scale_block_size
+                    )
 
         return cell_size
 
@@ -255,18 +290,36 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
         # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
-        )
+        if is_float4_e2m1fn_x2(kv_cache_dtype) and _fp4_kv_mixed_kv_enabled():
+            self._full_per_token = _mixed_fp8_k_nvfp4_v_cell_size(
+                model_config.get_num_kv_heads(tp_size),
+                model_config.head_dim,
+                model_config.v_head_dim,
+                1,
+                kv_size,
+            )
+        else:
+            self._full_per_token = (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * kv_size
+            )
 
         # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
-        )
+        if is_float4_e2m1fn_x2(kv_cache_dtype) and _fp4_kv_mixed_kv_enabled():
+            self._swa_per_token = _mixed_fp8_k_nvfp4_v_cell_size(
+                model_config.get_swa_num_kv_heads(tp_size),
+                model_config.swa_head_dim,
+                model_config.swa_v_head_dim,
+                1,
+                kv_size,
+            )
+        else:
+            self._swa_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         # Bytes per token of max_total_num_tokens.
         #
@@ -285,6 +338,19 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
+            )
+        if os.environ.get("SGLANG_GEMMA_KV_GEOMETRY") == "1":
+            logger.info(
+                "SGLANG_GEMMA_KV_POOL_CONFIG full_layers=%s swa_layers=%s "
+                "full_per_token_bytes=%s swa_per_token_bytes=%s "
+                "swa_full_tokens_ratio=%s cell_size_bytes=%s mixed_kv=%s",
+                self._full_layers_num,
+                self._swa_layers_num,
+                self._full_per_token,
+                self._swa_per_token,
+                self._swa_full_tokens_ratio,
+                self._cell_size,
+                _fp4_kv_mixed_kv_enabled(),
             )
 
     def _solve_pool_sizes(

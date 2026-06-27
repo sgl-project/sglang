@@ -912,6 +912,65 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertIsNone(args.decode_attention_backend)
 
 
+class TestKV4Compatibility(unittest.TestCase):
+    def _make_args(
+        self,
+        *,
+        attention_backend: str,
+        prefill_attention_backend: str,
+        decode_attention_backend: str,
+    ) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        args.kv_cache_dtype = "fp4_e2m1"
+        args.attention_backend = attention_backend
+        args.prefill_attention_backend_str = prefill_attention_backend
+        args.decode_attention_backend_str = decode_attention_backend
+        return args
+
+    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm120_supported", return_value=True)
+    def test_sm120_allows_flashinfer_mha_kv4(
+        self, _mock_sm120, _mock_cuda, _mock_use_mla_backend
+    ):
+        args = self._make_args(
+            attention_backend="flashinfer",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="flashinfer",
+        )
+
+        args._handle_kv4_compatibility()
+
+    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm120_supported", return_value=False)
+    def test_non_sm120_rejects_flashinfer_mha_kv4(
+        self, _mock_sm120, _mock_cuda, _mock_use_mla_backend
+    ):
+        args = self._make_args(
+            attention_backend="flashinfer",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="flashinfer",
+        )
+
+        with self.assertRaisesRegex(AssertionError, "KV4 MHA expects"):
+            args._handle_kv4_compatibility()
+
+    @patch.object(ServerArgs, "use_mla_backend", return_value=False)
+    @patch("sglang.srt.server_args.is_cuda", return_value=True)
+    @patch("sglang.srt.server_args.is_sm120_supported", return_value=True)
+    def test_sm120_allows_flashinfer_mha_kv4_with_fa4_prefill(
+        self, _mock_sm120, _mock_cuda, _mock_use_mla_backend
+    ):
+        args = self._make_args(
+            attention_backend="fa4",
+            prefill_attention_backend="fa4",
+            decode_attention_backend="flashinfer",
+        )
+
+        args._handle_kv4_compatibility()
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def test_prepare_server_args_parses_external_sam_args(self):
         server_args = prepare_server_args(

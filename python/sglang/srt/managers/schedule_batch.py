@@ -38,7 +38,9 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import hashlib
 import logging
+import os
 import re
 from array import array
 from concurrent.futures import Future
@@ -129,6 +131,38 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+def _fp4_kv_radix_trace_enabled(rid: Optional[str] = None) -> bool:
+    if os.environ.get("SGLANG_FP4_KV_TRACE_RADIX") != "1":
+        return False
+    rid_filter = os.environ.get("SGLANG_FP4_KV_TRACE_RID")
+    return rid_filter in (None, "", str(rid))
+
+
+def _trace_len(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def _trace_sequence_summary(value, *, limit: int = 8):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        data = value.detach().to("cpu").flatten().tolist()
+    else:
+        data = list(value)
+    encoded = ",".join(str(x) for x in data).encode("utf-8")
+    return {
+        "len": len(data),
+        "head": data[:limit],
+        "tail": data[-limit:] if len(data) > limit else data,
+        "hash": hashlib.blake2b(encoded, digest_size=8).hexdigest(),
+    }
 
 
 @lru_cache(maxsize=1)
@@ -728,6 +762,9 @@ class Req(ReqDllmMixin):
         self.full_untruncated_fill_ids = array("q")
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
+        # Uniform-diffusion (DiffusionGemma #28054) fill length; the canvas scheduler
+        # mutates this. Main tracks masked dLLM via dllm_initialized; uniform needs this.
+        self.fill_len: int = 0
 
         self.session = session
         self.input_embeds = input_embeds
@@ -1200,6 +1237,48 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            if _fp4_kv_radix_trace_enabled(self.rid):
+                logger.warning(
+                    "FP4 KV radix trace rid=%s input_len=%s match_tokens=%s "
+                    "origin=%s fill=%s match=%s extra_key=%s "
+                    "prefix_indices_len=%s prefix_indices=%s "
+                    "host_hit_length=%s swa_host_hit_length=%s "
+                    "mamba_host_hit_length=%s cache_protected_len=%s "
+                    "tree_page_size=%s tree_disable=%s last_node=%s "
+                    "last_host_node=%s best_match_node=%s force_miss=%s",
+                    self.rid,
+                    input_len,
+                    len(token_ids_to_match),
+                    _trace_sequence_summary(self.origin_input_ids),
+                    _trace_sequence_summary(self.fill_ids),
+                    _trace_sequence_summary(token_ids_to_match),
+                    self.extra_key,
+                    _trace_len(self.prefix_indices),
+                    _trace_sequence_summary(self.prefix_indices),
+                    self.host_hit_length,
+                    self.swa_host_hit_length,
+                    self.mamba_host_hit_length,
+                    self.cache_protected_len,
+                    getattr(tree_cache, "page_size", None),
+                    getattr(tree_cache, "disable", None),
+                    (
+                        type(self.last_node).__name__
+                        if self.last_node is not None
+                        else None
+                    ),
+                    (
+                        type(self.last_host_node).__name__
+                        if self.last_host_node is not None
+                        else None
+                    ),
+                    (
+                        type(self.best_match_node).__name__
+                        if self.best_match_node is not None
+                        else None
+                    ),
+                    envs.SGLANG_RADIX_FORCE_MISS.get(),
+                )
+
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
@@ -1449,6 +1528,7 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released = False
         self.extend_range = None
         self.dllm_initialized = False
+        self.fill_len = 0
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None

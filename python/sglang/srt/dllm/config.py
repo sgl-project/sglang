@@ -12,12 +12,16 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
+        is_uniform: bool,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        # Uniform-state (renoising) diffusion (DiffusionGemma) vs masked diffusion
+        # (LLaDA2 / SDAR). Selects the per-round scheduling in ReqDllmMixin.
+        self.is_uniform = is_uniform
 
     @staticmethod
     def from_server_args(
@@ -35,6 +39,11 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "DiffusionGemmaForBlockDiffusion": {
+                "block_size": None,
+                "mask_id": -1,
+                "is_uniform": True,
+            },
         }
 
         arch = model_config.hf_config.architectures[0]
@@ -42,6 +51,11 @@ class DllmConfig:
             params = DLLM_PARAMS[arch]
             block_size = params["block_size"]
             mask_id = params["mask_id"]
+            is_uniform = params.get("is_uniform", False)
+            if is_uniform:
+                # canvas_length lives only on the Gemma4 config, so read it here, not
+                # in the eager dict above (built for every dLLM, masked ones lack it).
+                block_size = model_config.hf_config.canvas_length
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
@@ -72,4 +86,5 @@ class DllmConfig:
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
+            is_uniform=is_uniform,
         )

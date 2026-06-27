@@ -28,6 +28,8 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -73,6 +75,33 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
+
+
+def _fp4_kv_radix_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_FP4_KV_TRACE_RADIX") == "1"
+
+
+def _trace_sequence_summary(value, *, limit: int = 8):
+    if value is None:
+        return None
+    dtype = None
+    shape = None
+    if isinstance(value, torch.Tensor):
+        dtype = str(value.dtype)
+        shape = list(value.shape)
+        data = value.detach().to("cpu").flatten().tolist()
+    else:
+        data = list(value)
+    encoded = ",".join(str(x) for x in data).encode("utf-8")
+    return {
+        "len": len(data),
+        "dtype": dtype,
+        "shape": shape,
+        "head": data[:limit],
+        "tail": data[-limit:] if len(data) > limit else data,
+        "hash": hashlib.blake2b(encoded, digest_size=8).hexdigest(),
+    }
 
 
 class ForwardMode(IntEnum):
@@ -516,6 +545,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
+    forward_pass_id: Optional[int] = None
 
     # kv-canary token-id validator snapshot
     req_all_ids_flat: Optional[torch.Tensor] = None
@@ -543,6 +573,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # wrapper plans and view-context plans must keep this False — a
     # forward-path re-plan would clobber their metadata.
     forward_metadata_replan_equivalent: bool = False
+
+    # DiffusionGemma (uniform-state block diffusion) extras.
+    # None (not dLLM) keeps the field invisible to TBO's field filter.
+    dllm_is_encoder: Optional[bool] = None
+    dllm_self_conditioning_logits: Optional[torch.Tensor] = None
 
     def mark_forward_metadata_ready(self, replan_equivalent: bool = False):
         """Record that attention metadata was pre-planned for this batch.
@@ -787,17 +822,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Override the positions with diffusion LLM or spec_info
         if batch.dllm_config is not None:
-            block_size = batch.dllm_config.block_size
-            # Use int64 for AMD rotary embedding kernel compatibility
-            positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            ret._init_dllm_positions(batch, device)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
@@ -835,6 +860,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+
+            if _fp4_kv_radix_trace_enabled():
+                logger.warning(
+                    "FP4 KV ForwardBatch trace rids=%s mode=%s "
+                    "seq_lens_cpu=%s extend_prefix_lens_cpu=%s "
+                    "extend_seq_lens_cpu=%s input_ids=%s positions=%s "
+                    "out_cache_loc=%s req_pool_indices=%s",
+                    [str(rid) for rid in ret.rids],
+                    ret.forward_mode,
+                    _trace_sequence_summary(ret.seq_lens_cpu),
+                    _trace_sequence_summary(ret.extend_prefix_lens_cpu),
+                    _trace_sequence_summary(ret.extend_seq_lens_cpu),
+                    _trace_sequence_summary(ret.input_ids),
+                    _trace_sequence_summary(ret.positions),
+                    _trace_sequence_summary(ret.out_cache_loc),
+                    _trace_sequence_summary(ret.req_pool_indices),
+                )
 
         if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, device)
@@ -988,6 +1030,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.contains_video_inputs()
             or self.contains_image_inputs()
         )
+
+    def _init_dllm_positions(self, batch: ScheduleBatch, device: torch.device):
+        if batch.dllm_config.is_uniform:
+            self.dllm_is_encoder = all(req.is_dllm_prefill() for req in batch.reqs)
+        # Masked always uses fixed block-offset positions. Uniform uses them only
+        # for the canvas decode, since its encode is a variable-length prompt.
+        if not (batch.dllm_config.is_uniform and self.dllm_is_encoder):
+            block_size = batch.dllm_config.block_size
+            # Use int64 for AMD rotary embedding kernel compatibility
+            positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
+            self.positions = torch.tensor(
+                [
+                    i
+                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
+                    for i in range(block_offset, block_offset + block_size)
+                ],
+                dtype=positions_dtype,
+            ).to(device, non_blocking=True)
 
     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():
