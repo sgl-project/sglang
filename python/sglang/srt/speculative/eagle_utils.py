@@ -646,7 +646,14 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             if hasattr(allocator, "compute_dsv4_state_lens_reserve")
             else None
         )
-        out_cache_loc = alloc_paged_token_slots_extend(
+        alloc_extend_fn = alloc_paged_token_slots_extend
+        if dsv4_state_lens is not None:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+                alloc_paged_token_slots_reserve_extend,
+            )
+
+            alloc_extend_fn = alloc_paged_token_slots_reserve_extend
+        out_cache_loc = alloc_extend_fn(
             batch.tree_cache,
             cur_kv_lens_device,
             cur_kv_lens_cpu,
@@ -658,20 +665,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             dsv4_state_lens=dsv4_state_lens,
             batch=batch,
         )
-        if batch.out_cache_loc_dsv4 is not None:
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                maybe_write_dsv4_extend,
-            )
-
-            maybe_write_dsv4_extend(
-                batch,
-                batch.req_pool_indices_cpu,
-                cur_kv_lens_cpu,
-                nxt_kv_lens_cpu,
-                c4_state_alloc_offsets=cur_kv_lens_cpu,
-                c128_state_alloc_offsets=cur_kv_lens_cpu,
-            )
-
     assign_req_to_token_pool_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,

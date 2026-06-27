@@ -29,6 +29,10 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.hardware_backend.npu.allocator_npu import NPUPagedTokenToKVPoolAllocator
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_write_dsv4_reserve_extend,
+)
+from sglang.srt.mem_cache.common import alloc_paged_token_slots_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, DSV4StateLens
 
@@ -58,6 +62,37 @@ def get_last_loc(
         looked_up,
         torch.full_like(prefix_lens, -1),
     )
+
+
+def alloc_paged_token_slots_reserve_extend(
+    tree_cache,
+    prefix_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    extend_num_tokens: int,
+    *,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    dsv4_state_lens: Optional[DSV4StateLens] = None,
+    batch=None,
+):
+    """Allocate reserved draft slots and update DSV4 per-request tables."""
+    out_cache_loc = alloc_paged_token_slots_extend(
+        tree_cache,
+        prefix_lens,
+        prefix_lens_cpu,
+        seq_lens,
+        seq_lens_cpu,
+        last_loc,
+        extend_num_tokens,
+        req_pool_indices=req_pool_indices,
+        dsv4_state_lens=dsv4_state_lens,
+        batch=batch,
+    )
+    if batch is not None:
+        maybe_write_dsv4_reserve_extend(batch, prefix_lens_cpu, seq_lens_cpu)
+    return out_cache_loc
 
 
 class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):

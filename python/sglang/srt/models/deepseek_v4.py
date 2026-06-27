@@ -2121,10 +2121,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         num_hidden_layers: Optional[int] = None,
         scale_suffix: str = "weight_scale_inv",
     ) -> str:
-        # ModelSlim checkpoints use ".scale"; the in-model parameter name
-        # differs between FP8 ("weight_scale_inv") and int8/W8A8 compressed
-        # tensors ("weight_scale"). The caller selects the suffix from
-        # params_dict before loading.
         if name == "embed.weight":
             return "model.embed_tokens.weight"
         if name == "head.weight":
@@ -2148,6 +2144,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     "head",
                     "hc_head",
                 ]
+                scale_target = "." + scale_suffix
                 is_nextn_spec = any(rest.startswith(p) for p in nextn_spec_prefixes)
                 if is_nextn_spec:
                     if rest.startswith("emb.tok_emb"):
@@ -2157,9 +2154,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     elif rest.startswith("head."):
                         rest = "shared_head.head.weight"
                     elif rest == "e_proj.scale":
-                        rest = "e_proj." + scale_suffix
+                        rest = "e_proj" + scale_target
                     elif rest == "h_proj.scale":
-                        rest = "h_proj." + scale_suffix
+                        rest = "h_proj" + scale_target
                 name = f"model.layers.{num_hidden_layers}." + rest
 
         if name.startswith("layers."):
@@ -2188,12 +2185,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
 
         scale_suffix = "weight_scale_inv"
-        for param_name in params_dict:
-            if param_name.endswith(".weight_scale"):
-                scale_suffix = "weight_scale"
-                break
-            if param_name.endswith(".weight_scale_inv"):
-                break
+        if _is_npu:
+            scale_suffix = "weight_scale"
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):

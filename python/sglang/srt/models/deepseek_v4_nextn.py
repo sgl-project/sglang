@@ -23,6 +23,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_round_robin_input_ids,
@@ -99,7 +100,7 @@ class DeepseekV4ModelNextN(nn.Module):
             is_nextn=True,
             # NPU (DSV4-Flash modelslim ckpt) registers the NEXTN decoder under
             # "mtp.0"; keep the original "decoder" prefix on other devices.
-            prefix="mtp.0" if is_npu() else add_prefix("decoder", prefix),
+            prefix="mtp.0" if isinstance(quant_config, ModelSlimConfig) else add_prefix("decoder", prefix),
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )
