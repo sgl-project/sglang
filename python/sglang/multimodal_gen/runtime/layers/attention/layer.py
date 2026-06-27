@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import os
 from contextlib import nullcontext
 from typing import Type
@@ -51,6 +52,11 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    get_current_replay_token,
+    is_in_breakable_cuda_graph,
+)
 
 _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.CUDNN_ATTENTION,
@@ -90,6 +96,38 @@ def build_varlen_mask_meta(
         "inv_indices": inv_indices,
         "max_seqlen": seq,  # upper bound; FA varlen uses cu_seqlens for actual ranges
     }
+
+
+class DynamicVarlenMaskMeta:
+    """Replay-local builder for varlen attention metadata.
+
+    BCG attention break points capture Python kwargs once. Passing a plain
+    ``attn_mask_meta`` dict would replay stale cu_seqlens/indices when the same
+    graph bucket is reused for a different prompt length. This helper keeps only
+    replay-local metadata and rebuilds it from the current ``attn_mask`` tensor
+    on the first attention block of each graph replay.
+    """
+
+    def __init__(self) -> None:
+        self._cache_key = None
+        self._meta = None
+
+    def resolve(self, attn_mask: torch.Tensor | None) -> dict | None:
+        if attn_mask is None:
+            self._cache_key = None
+            self._meta = None
+            return None
+
+        replay_token = get_current_replay_token()
+        if replay_token is None:
+            cache_key = ("capture", id(attn_mask), tuple(attn_mask.shape))
+        else:
+            cache_key = ("replay", replay_token, tuple(attn_mask.shape))
+
+        if cache_key != self._cache_key:
+            self._meta = build_varlen_mask_meta(attn_mask)
+            self._cache_key = cache_key
+        return self._meta
 
 
 class UlyssesAttention(nn.Module):
@@ -532,6 +570,8 @@ class USPAttention(nn.Module):
             self.skip_sequence_parallel or skip_sequence_parallel_override
         )
         if attn_mask is not None:
+            if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
+                attn_mask_meta = attn_mask_meta.resolve(attn_mask)
 
             def _prepare_sdpa_mask(
                 mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
@@ -988,3 +1028,38 @@ class USPAttention(nn.Module):
         )
         out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
         return torch.cat([out_shard, out_rep], dim=1)
+
+
+def _make_breakable_attention_forward(forward_method):
+    """Wrap a DiT attention module's ``forward`` so it becomes a breakable
+    CUDA graph (BCG) break point.
+
+    During BCG capture the whole attention forward runs eagerly between
+    captured graph segments -- the sequence-parallel all-to-all collectives,
+    varlen packing, and dynamic/sparse attention kernels that live here
+    cannot (or should not) be captured into a static CUDA graph. When BCG is
+    disabled this is a transparent pass-through to the original method.
+    """
+    bcg_forward = eager_on_graph(True)(forward_method)
+
+    @functools.wraps(forward_method)
+    def forward(self, *args, **kwargs):
+        if is_in_breakable_cuda_graph():
+            return bcg_forward(self, *args, **kwargs)
+        return forward_method(self, *args, **kwargs)
+
+    return forward
+
+
+# Install the break points on every DiT attention entry point. All diffusion
+# models route attention through one of these modules (e.g. FLUX -> USPAttention),
+# so wrapping here gives universal, model-agnostic BCG break points without
+# touching individual model files.
+for _attn_cls in (
+    UlyssesAttention,
+    UlyssesAttention_VSA,
+    LocalAttention,
+    USPAttention,
+):
+    _attn_cls.forward = _make_breakable_attention_forward(_attn_cls.forward)
+del _attn_cls

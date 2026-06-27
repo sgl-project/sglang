@@ -22,6 +22,7 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import itertools
 import logging
 import threading
 from contextvars import ContextVar
@@ -46,6 +47,7 @@ __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
+    "get_current_replay_token",
 ]
 
 
@@ -66,9 +68,13 @@ _current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVa
 _current_stream_var: ContextVar[torch.cuda.Stream | None] = ContextVar(
     "current_stream", default=None
 )
+_current_replay_token_var: ContextVar[int | None] = ContextVar(
+    "current_replay_token", default=None
+)
 _forked_streams_var: ContextVar[set[torch.cuda.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )
+_replay_token_counter = itertools.count(1)
 
 
 def get_current_stream(device: torch.device | None = None) -> torch.cuda.Stream:
@@ -76,6 +82,17 @@ def get_current_stream(device: torch.device | None = None) -> torch.cuda.Stream:
     if stream is None:
         return torch.cuda.current_stream(device)
     return stream
+
+
+def get_current_replay_token() -> int | None:
+    """Return a unique token for the current BCG replay, or ``None``.
+
+    Eager break-point code can use this to cache metadata within a single replay
+    while still rebuilding it for the next replay when static buffers change.
+    This was added for diffusion model adaptation, where Qwen Image rebuilds
+    replay-local varlen attention metadata from the current prompt mask.
+    """
+    return _current_replay_token_var.get()
 
 
 def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
@@ -166,6 +183,10 @@ def _weak_ref_if_tensor(x):
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
         return weak_ref_tensors(x)
+    if isinstance(x, tuple):
+        return tuple(_weak_ref_if_tensor(e) for e in x)
+    if isinstance(x, list):
+        return [_weak_ref_if_tensor(e) for e in x]
     return x
 
 
@@ -179,6 +200,14 @@ def _copy_output(dst: Any, src: Any) -> Any:
     if torch.is_tensor(dst) and torch.is_tensor(src):
         dst.copy_(src)
         return dst
+
+    if (
+        isinstance(dst, (tuple, list))
+        and isinstance(src, (tuple, list))
+        and len(dst) == len(src)
+    ):
+        copied = [_copy_output(d, s) for d, s in zip(dst, src)]
+        return tuple(copied) if isinstance(dst, tuple) else copied
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
@@ -220,13 +249,14 @@ def eager_on_graph(enable: bool):
             # writes real data into them.
             output = inner(*args, **kwargs)
 
-            # Weak-ref the closure state. Storage lives with the segment
-            # CUDAGraphs' mempool pin; Python refs don't need to prevent
-            # pool reuse across layers.
+            # Weak-ref captured inputs so segment-allocated intermediates can
+            # be reclaimed by the graph pool. Keep the eager break output as a
+            # strong reference: replay copies the newly-computed eager output
+            # into this bridge buffer before later captured segments consume it.
             captured_inner = inner
             captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
             captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            captured_output = _weak_ref_if_tensor(output)
+            captured_output = output
 
             def replay_fn():
                 new_out = captured_inner(*captured_args, **captured_kwargs)
@@ -253,14 +283,16 @@ class BreakableCUDAGraph:
 
     def replay(self) -> None:
         stream = torch.cuda.current_stream()
-        token = _current_stream_var.set(stream)
+        stream_token = _current_stream_var.set(stream)
+        replay_token = _current_replay_token_var.set(next(_replay_token_counter))
         try:
             for i, seg in enumerate(self._segments):
                 seg.replay()
                 if i < len(self._break_fns):
                     self._break_fns[i]()
         finally:
-            _current_stream_var.reset(token)
+            _current_replay_token_var.reset(replay_token)
+            _current_stream_var.reset(stream_token)
 
 
 class BreakableCUDAGraphCapture:
