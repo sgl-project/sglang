@@ -138,6 +138,37 @@ try:
 except ImportError:
     pass
 
+
+# Newer transformers versions (>5.9.0) will expose MellumConfig directly,
+# but fallback to Qwen3MoeConfig for older versions.
+try:
+    import transformers as _hf_transformers
+
+    _HFMellumConfig = getattr(_hf_transformers, "MellumConfig", None)
+
+    if _HFMellumConfig is not None:
+        _CONFIG_REGISTRY["mellum"] = _HFMellumConfig
+    else:
+        from transformers import Qwen3MoeConfig as _HFQwen3MoeConfig
+
+        class _MellumConfigAlias(_HFQwen3MoeConfig):
+            model_type = "mellum"
+
+            def __post_init__(self, **kwargs):
+                # Qwen3MoeConfig.__post_init__ wipes sliding_window unless
+                # use_sliding_window=True. Mellum gates sliding attention
+                # per-layer via layer_types, so preserve sliding_window
+                # regardless of the legacy use_sliding_window flag.
+                sliding_window = getattr(self, "sliding_window", None)
+                super().__post_init__(**kwargs)
+                self.sliding_window = sliding_window
+
+        _CONFIG_REGISTRY["mellum"] = _MellumConfigAlias
+
+except ImportError:
+    pass
+
+
 for name, cls in _CONFIG_REGISTRY.items():
     try:
         AutoConfig.register(name, cls)
