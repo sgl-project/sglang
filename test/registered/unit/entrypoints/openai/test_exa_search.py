@@ -180,9 +180,7 @@ class NativeWebSearchIntegrationTestCase(unittest.TestCase):
                 return None
 
             def post(self, url, json, headers):
-                captured_calls.append(
-                    {"url": url, "json": json, "headers": headers}
-                )
+                captured_calls.append({"url": url, "json": json, "headers": headers})
                 return FakeResponse(url, json)
 
         async def run_tool_flow():

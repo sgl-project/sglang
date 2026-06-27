@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 import logging
-import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +9,7 @@ from sglang.srt.entrypoints.search.exa_client import (
     ExaClient,
     ExaSearchConfig,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import print_info_once, print_warning_once
 
 if TYPE_CHECKING:
@@ -35,7 +35,7 @@ class HarmonyBrowserTool(Tool):
             print_info_once("Browser tool initialized")
             return
 
-        api_key = os.getenv("EXA_API_KEY")
+        api_key = envs.EXA_API_KEY.get()
         if not api_key:
             self.enabled = False
             print_warning_once("EXA_API_KEY is not set, browsing is disabled")
@@ -62,10 +62,6 @@ class HarmonyBrowserTool(Tool):
         content = TextContent(text=result_text)
         author = Author(role=Role.TOOL, name=recipient)
         return [Message(author=author, content=[content], recipient=Role.ASSISTANT)]
-
-    @property
-    def tool_config(self) -> Any:
-        return None
 
     async def _dispatch_browser_call(
         self, context: "ConversationContext", recipient: str, args: dict[str, Any]
@@ -177,7 +173,12 @@ class HarmonyBrowserTool(Tool):
             if not results:
                 return f"No page contents returned for {url}."
             page = results[0]
-            text = page.get("text") or self._best_snippet(page) or page.get("summary") or ""
+            text = (
+                page.get("text")
+                or self._best_snippet(page)
+                or page.get("summary")
+                or ""
+            )
             return self._format_matches(pattern, text)
 
         searchable_text = "\n\n".join(
@@ -207,6 +208,7 @@ class HarmonyBrowserTool(Tool):
         if cursor is None:
             return None
         cursor_str = str(cursor)
+        # GPT-OSS emits 0 as a 1-based cursor; map it to the first result.
         if cursor_str == "0":
             return "1"
         return cursor_str

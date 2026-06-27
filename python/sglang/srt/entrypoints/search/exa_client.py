@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
-from dataclasses import dataclass
+import asyncio
 from typing import Any, Optional
 
 import aiohttp
+import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import print_warning_once
 
 EXA_API_BASE_URL = "https://api.exa.ai"
@@ -21,75 +22,37 @@ class ExaClientError(RuntimeError):
     """Raised when an Exa API request fails."""
 
 
-@dataclass(frozen=True)
-class ExaSearchConfig:
+class ExaSearchConfig(msgspec.Struct, frozen=True, kw_only=True):
     num_results: int = EXA_DEFAULT_NUM_RESULTS
     search_type: str = EXA_DEFAULT_SEARCH_TYPE
     include_highlights: bool = EXA_DEFAULT_HIGHLIGHTS
 
     @classmethod
     def from_env(cls) -> "ExaSearchConfig":
+        # EnvField handles type parsing (int/bool) and falls back to its own
+        # default on a parse error; here we only enforce the semantic bounds
+        # that the generic descriptors cannot express.
+        num_results = envs.SGLANG_EXA_NUM_RESULTS.get()
+        if not 1 <= num_results <= 100:
+            print_warning_once(
+                f"Ignoring invalid SGLANG_EXA_NUM_RESULTS={num_results!r}; "
+                f"expected a value from 1 to 100."
+            )
+            num_results = EXA_DEFAULT_NUM_RESULTS
+
+        search_type = envs.SGLANG_EXA_SEARCH_TYPE.get()
+        if search_type not in _SEARCH_TYPES:
+            print_warning_once(
+                f"Ignoring invalid SGLANG_EXA_SEARCH_TYPE={search_type!r}; "
+                f"expected one of {', '.join(sorted(_SEARCH_TYPES))}."
+            )
+            search_type = EXA_DEFAULT_SEARCH_TYPE
+
         return cls(
-            num_results=_get_int_env("SGLANG_EXA_NUM_RESULTS", EXA_DEFAULT_NUM_RESULTS),
-            search_type=_get_search_type_env(
-                "SGLANG_EXA_SEARCH_TYPE", EXA_DEFAULT_SEARCH_TYPE
-            ),
-            include_highlights=_get_bool_env(
-                "SGLANG_EXA_INCLUDE_HIGHLIGHTS", EXA_DEFAULT_HIGHLIGHTS
-            ),
+            num_results=num_results,
+            search_type=search_type,
+            include_highlights=envs.SGLANG_EXA_INCLUDE_HIGHLIGHTS.get(),
         )
-
-
-def _get_bool_env(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-
-    normalized = value.strip().lower()
-    if normalized in ("1", "true", "yes", "y", "on"):
-        return True
-    if normalized in ("0", "false", "no", "n", "off"):
-        return False
-
-    print_warning_once(
-        f"Ignoring invalid {name}={value!r}; expected a boolean value."
-    )
-    return default
-
-
-def _get_int_env(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-
-    try:
-        parsed = int(value)
-    except ValueError:
-        print_warning_once(f"Ignoring invalid {name}={value!r}; expected an integer.")
-        return default
-
-    if not 1 <= parsed <= 100:
-        print_warning_once(
-            f"Ignoring invalid {name}={value!r}; expected a value from 1 to 100."
-        )
-        return default
-    return parsed
-
-
-def _get_search_type_env(name: str, default: str) -> str:
-    value = os.getenv(name)
-    if value is None:
-        return default
-
-    normalized = value.strip()
-    if normalized in _SEARCH_TYPES:
-        return normalized
-
-    print_warning_once(
-        f"Ignoring invalid {name}={value!r}; expected one of "
-        f"{', '.join(sorted(_SEARCH_TYPES))}."
-    )
-    return default
 
 
 class ExaClient:
@@ -105,6 +68,8 @@ class ExaClient:
         self.config = config or ExaSearchConfig()
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -135,25 +100,39 @@ class ExaClient:
     async def contents(self, urls: list[str]) -> dict[str, Any]:
         return await self._post("/contents", self._contents_payload(urls))
 
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        url = f"{self.base_url}{path}"
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                url,
-                json=payload,
-                headers=self._headers(),
-            ) as response:
-                response_text = await response.text()
-                if response.status >= 400:
-                    raise ExaClientError(
-                        f"Exa API request failed with status {response.status}: "
-                        f"{response_text}"
+    async def _get_session(self) -> aiohttp.ClientSession:
+        # Reuse a single session across requests so the connection pool and
+        # DNS cache survive; aiohttp.ClientSession is intended to be long-lived.
+        if self._session is None:
+            async with self._session_lock:
+                if self._session is None:
+                    self._session = aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=self.timeout)
                     )
-                try:
-                    return await response.json()
-                except Exception as exc:
-                    raise ExaClientError(
-                        f"Failed to decode Exa API response: {response_text}"
-                    ) from exc
+        return self._session
 
+    async def close(self):
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        session = await self._get_session()
+        url = f"{self.base_url}{path}"
+        async with session.post(
+            url,
+            json=payload,
+            headers=self._headers(),
+        ) as response:
+            response_text = await response.text()
+            if response.status >= 400:
+                raise ExaClientError(
+                    f"Exa API request failed with status {response.status}: "
+                    f"{response_text}"
+                )
+            try:
+                return await response.json()
+            except Exception as exc:
+                raise ExaClientError(
+                    f"Failed to decode Exa API response: {response_text}"
+                ) from exc

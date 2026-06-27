@@ -334,7 +334,7 @@ async def lifespan(fast_api_app: FastAPI):
 
         tool_server = MCPToolServer()
         await tool_server.add_tool_server(server_args.tool_server)
-    elif os.getenv("EXA_API_KEY"):
+    elif envs.EXA_API_KEY.get():
         from sglang.srt.entrypoints.openai.tool_server import NativeToolServer
 
         tool_server = NativeToolServer()
@@ -382,6 +382,8 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
+        if tool_server is not None and hasattr(tool_server, "aclose"):
+            await tool_server.aclose()
         warmup_thread.join()
 
 

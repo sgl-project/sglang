@@ -144,7 +144,7 @@ class MCPToolServer(ToolServer):
 
 class DemoToolServer(ToolServer):
 
-    def __init__(self):
+    def __init__(self, *, enable_python: bool = True):
         from sglang.srt.entrypoints.tool import (
             HarmonyBrowserTool,
             HarmonyPythonTool,
@@ -155,9 +155,10 @@ class DemoToolServer(ToolServer):
         browser_tool = HarmonyBrowserTool()
         if browser_tool.enabled:
             self.tools["browser"] = browser_tool
-        python_tool = HarmonyPythonTool()
-        if python_tool.enabled:
-            self.tools["python"] = python_tool
+        if enable_python:
+            python_tool = HarmonyPythonTool()
+            if python_tool.enabled:
+                self.tools["python"] = python_tool
 
     def has_tool(self, tool_name: str):
         return tool_name in self.tools
@@ -176,29 +177,15 @@ class DemoToolServer(ToolServer):
     async def get_tool_session(self, tool_name: str):
         yield self.tools[tool_name]
 
+    async def aclose(self):
+        browser = self.tools.get("browser")
+        exa_client = getattr(browser, "exa_client", None) if browser else None
+        if exa_client is not None:
+            await exa_client.close()
 
-class NativeToolServer(ToolServer):
+
+class NativeToolServer(DemoToolServer):
     """Built-in SGLang hosted tools that do not require an external MCP server."""
 
     def __init__(self):
-        from sglang.srt.entrypoints.tool import HarmonyBrowserTool, Tool
-
-        self.tools: dict[str, Tool] = {}
-        browser_tool = HarmonyBrowserTool()
-        if browser_tool.enabled:
-            self.tools["browser"] = browser_tool
-
-    def has_tool(self, tool_name: str):
-        return tool_name in self.tools
-
-    def get_tool_description(self, tool_name: str):
-        if tool_name not in self.tools:
-            return None
-        if tool_name == "browser":
-            return ToolNamespaceConfig.browser()
-        else:
-            raise ValueError(f"Unknown tool {tool_name}")
-
-    @asynccontextmanager
-    async def get_tool_session(self, tool_name: str):
-        yield self.tools[tool_name]
+        super().__init__(enable_python=False)
