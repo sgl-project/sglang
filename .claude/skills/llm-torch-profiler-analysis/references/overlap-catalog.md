@@ -26,11 +26,11 @@ necessarily present in the checked-out `sglang` tree, but they should still be
 treated as upstream or analogous kernel-overlap families before labeling an
 overlap opportunity as novel.
 
-Refresh note `2026-06-26`: rechecked official main heads for SGLang
-`8524678889485801e7a4a12d62015be0c68f7a90`, vLLM
-`abc71548ef029132c3316b902207f254a246d593`, TensorRT-LLM
-`0722c5f47d2cae69ac1a237da51e550dd214532c`, and TokenSpeed
-`5aedf69d6b476baa65571011de6ea60fd5a238a8`, then added the first
+Refresh note `2026-06-27`: rechecked official main heads for SGLang
+`e0c0c0a45cb1bda90392bfa2bba4184f5b0638a0`, vLLM
+`091d13976c1c246714bb2112dd2e208561dda6a3`, TensorRT-LLM
+`aaffa2f9fef3025e0f698d978385a73460344e0b`, and TokenSpeed
+`d0a7faddb5ec0d4c6d037c4c3e6a781d2c5164a8`. The previous refresh added the first
 TokenSpeed-origin communication-fusion row. Closed-unmerged SGLang
 [#22410](https://github.com/sgl-project/sglang/pull/22410) and FlashInfer
 [#2840](https://github.com/flashinfer-ai/flashinfer/pull/2840) were removed

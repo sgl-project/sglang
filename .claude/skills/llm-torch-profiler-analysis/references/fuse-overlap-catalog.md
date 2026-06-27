@@ -28,17 +28,18 @@ overlap opportunity as novel.
 
 The catalog is grouped by reusable optimization family, not by one specific model.
 
-Refresh note `2026-06-26`: rechecked official main heads for SGLang
-`8524678889485801e7a4a12d62015be0c68f7a90`, vLLM
-`abc71548ef029132c3316b902207f254a246d593`, TensorRT-LLM
-`0722c5f47d2cae69ac1a237da51e550dd214532c`, and TokenSpeed
-`5aedf69d6b476baa65571011de6ea60fd5a238a8`. The vLLM torch.compile pass
+Refresh note `2026-06-27`: rechecked official main heads for SGLang
+`e0c0c0a45cb1bda90392bfa2bba4184f5b0638a0`, vLLM
+`091d13976c1c246714bb2112dd2e208561dda6a3`, TensorRT-LLM
+`aaffa2f9fef3025e0f698d978385a73460344e0b`, and TokenSpeed
+`d0a7faddb5ec0d4c6d037c4c3e6a781d2c5164a8`. The vLLM torch.compile pass
 inventory is split out in
 [`vllm-torch-compile-fusions.md`](vllm-torch-compile-fusions.md). Stable
-current-code families remain folded into the mainline rows below. This refresh
-adds first-class TokenSpeed-origin rows for CuTe DSL MLA, MLA KV pack+FP8
+current-code families remain folded into the mainline rows below. The prior refresh
+added first-class TokenSpeed-origin rows for CuTe DSL MLA, MLA KV pack+FP8
 quantize, sampling, lm_head GEMM, and NVFP4 GEMM+SwiGLU+quant, plus the latest
-SGLang LTX2 Ada-value diffusion fusion. Recheck PR state before treating an
+SGLang LTX2 Ada-value diffusion fusion; the SGLang `#29486` GLM-5.2 cookbook
+refresh does not add a new profiler-visible fusion family. Recheck PR state before treating an
 in-flight row as shipped.
 
 ## 1. LLM / SRT fused-kernel families

@@ -72,6 +72,26 @@ own native `profile_by_stage` field for manual capture, but the unified helper
 uses workload-separated `prefill/` and `decode/` directories by default so the
 tables stay comparable across frameworks.
 
+## Real B200 Validation
+
+The current B200 smoke run was captured on `2026-06-27` on `GPUC5A6`
+(`cirrascale-gpuc5a6`) in container `sglang_bbuf` under:
+
+- `/data/bbuf/ai_infra_skills_pr72_20260627/profiler/qwen25_0_5b_live`
+
+Validated live profile:
+
+| Model | GPU | Workloads | Result |
+| --- | --- | --- | --- |
+| `Qwen/Qwen2.5-0.5B-Instruct` | 1x B200 | prefill `128->1`, decode `32->8` | generated separate `prefill/*.trace.json.gz` and `decode/*.trace.json.gz`; kernel, overlap, and fuse tables rendered with separate `extend/prefill` and `decode` sections |
+
+The same run verified Nsight Compute availability with a tiny CUDA matmul:
+
+- `/data/bbuf/ai_infra_skills_pr72_20260627/profiler/ncu_smoke_qwen_matmul.ncu-rep`
+- `/data/bbuf/ai_infra_skills_pr72_20260627/profiler/ncu_smoke.log`
+
+After server and ncu cleanup, all eight B200 GPUs reported `0 MiB` used.
+
 ## Real H100 Validation
 
 The current reference run is the `4x H100` matrix captured on `2026-04-23` on
@@ -157,7 +177,7 @@ H100 notes:
 - SGLang kernel-site reconstruction keeps sampling disabled in the mapping path so the optimized parser does not perturb SGLang table output; equality rechecks matched for `Mixtral-8x7B-Instruct-v0.1`, `Qwen3-32B`, and `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8`
 - vLLM live capture requires `--output-dir` to match the server `torch_profiler_dir`; the validated H100 flow uses `--profiler-config {"profiler":"torch","torch_profiler_dir":"..."}` and then drives `/start_profile` and `/stop_profile`
 - TensorRT-LLM validation stays on `--backend pytorch`; the H100 flow writes the trace with `TLLM_TORCH_PROFILE_TRACE` and then analyzes the saved trace
-- TensorRT-LLM current mainline was rechecked at `0722c5f47d2cae69ac1a237da51e550dd214532c` on 2026-06-26; the latest delta affects KV eviction / block-offset staging rather than profiler trace controls, so the `b9e1945` profiler evidence still applies: PyTorch profiling uses `record_shapes=True` and `with_modules=True`, but not `with_stack=True`; keep the override path for table-quality Python locations unless the target image proves otherwise
+- TensorRT-LLM current mainline was rechecked at `aaffa2f9fef3025e0f698d978385a73460344e0b` on 2026-06-27; the latest delta still affects runtime/model serving surfaces rather than the profiler trace controls, so the `b9e1945` profiler evidence still applies: PyTorch profiling uses `record_shapes=True` and `with_modules=True`, but not `with_stack=True`; keep the override path for table-quality Python locations unless the target image proves otherwise
 - TokenSpeed trace analysis has first-class registry rows for native TokenSpeed CuTe DSL MLA, MLA KV pack + FP8 quantize, fused top-k/top-p sampling, persistent lm_head GEMM, and NVFP4 GEMM + SwiGLU + quant; live capture still requires an existing torch-profiler trace until the target TokenSpeed image exposes a supported profiler API
 - on this host, keep all trace roots under `/data/...`, not `/home/...`
 

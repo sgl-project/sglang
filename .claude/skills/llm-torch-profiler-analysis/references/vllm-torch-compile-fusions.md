@@ -1,12 +1,13 @@
 # vLLM Torch Compile Fusion Patterns
 
-Refresh: `2026-06-26`.
+Refresh: `2026-06-27`.
 Source tree: vLLM `origin/main` at
-`abc71548ef029132c3316b902207f254a246d593`; no new LLM compile-fusion pass was
+`091d13976c1c246714bb2112dd2e208561dda6a3`; no new LLM compile-fusion pass was
 added after `2317682f9` in this refresh. The mainline `#40392` MLA RoPE +
 KV-cache cat fusion is already included below. Recent post-`#46735` vLLM
-changes include runtime / frontend work such as `#44800` and `#46799`, but they
-do not add a new LLM compile-fusion pass to this inventory.
+changes include runtime / model-runner work such as `#44800`, `#46762`, `#46862`,
+and `#45924`, but they do not add a new torch.compile pass registration to this
+inventory.
 
 Use this file when the fuse-pattern table reports split kernels in a trace and
 you need to decide whether the shape is already covered by vLLM's
