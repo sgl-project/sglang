@@ -310,8 +310,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             extend_ssm_states = ssm_states
             extend_cache_indices = cache_indices
-            if not forward_batch.spec_algorithm.is_none() and any(
-                forward_batch.extend_prefix_lens_cpu
+            if (
+                not forward_batch.spec_algorithm.is_none()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
             ):
                 prefix_batch_indices = has_initial_states.nonzero(as_tuple=True)[0]
                 if prefix_batch_indices.numel() > 0:
