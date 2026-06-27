@@ -84,13 +84,7 @@ def fused_topk_npu(
             group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
             # 1 for sigmoid, 0 for softmax.
-            # correction_bias implies sigmoid (noaux_tc). For bias-less routing,
-            # fall back to scoring_func so sigmoid-without-bias isn't misclassified.
-            norm_type=(
-                0
-                if (correction_bias is None and topk_config.scoring_func == "softmax")
-                else 1
-            ),
+            norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
             routed_scaling_factor=(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
