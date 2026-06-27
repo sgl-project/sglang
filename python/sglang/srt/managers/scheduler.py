@@ -266,6 +266,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
@@ -454,6 +455,7 @@ class Scheduler(
             enable_metrics=self.server_args.enable_metrics,
             enable_kv_cache_events=bool(
                 self.server_args.kv_events_config
+                and self.ps.pp_rank == 0
                 and self.ps.attn_tp_rank == 0
                 and self.ps.attn_cp_rank == 0
             ),
@@ -1212,6 +1214,8 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
         # Init mm receiver for EPD disaggregation mode
         if (
             self.server_args.language_only
@@ -1763,7 +1767,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2968,6 +2972,10 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        if self.tp_worker.model_runner.prefill_aware_swa:
+            for req in can_run_list:
+                req.swa_evict_floor = req.fill_len
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
@@ -3203,6 +3211,11 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in batch.reqs:
+                self.maybe_send_cached_prefix_chunk(req)
 
         # Run forward
         if self.is_generation:
@@ -3744,7 +3757,7 @@ class Scheduler(
         # This field is not serializable.
         ret.pop("model_config", None)
 
-        return GetInternalStateReqOutput(internal_state=ret)
+        return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -3793,7 +3806,7 @@ class Scheduler(
         server_args.pop("model_config", None)
         return SetInternalStateReqOutput(
             updated=if_success,
-            server_args=server_args,
+            server_args=msgspec_to_builtins(server_args),
         )
 
     def save_remote_model(self, **kwargs):

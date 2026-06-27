@@ -122,6 +122,11 @@ from sglang.srt.layers.utils.cp_utils import (
     mla_use_prefill_cp,
     prepare_context_parallel_metadata,
 )
+from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
+    get_attention_dcp_world_size,
+    prepare_decode_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -196,8 +201,11 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
+
+    from sglang.jit_kernel.dsv3_router_gemm import (
+        dsv3_router_gemm as _jit_dsv3_router_gemm,
+    )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -208,7 +216,7 @@ elif _is_npu:
         forward_mla_prepare_npu,
     )
 elif _is_musa:
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
 else:
     pass
 
@@ -489,28 +497,16 @@ class MoEGate(nn.Module):
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE: For some unknown reason, router_gemm seems degrade accept length.
             if (
                 _is_cuda
                 and hidden_states.shape[0] <= 16
-                and hidden_states.shape[1] == 7168
+                and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-                if _device_sm in [100, 103] and self.weight.shape[0] == 256:
-                    # TODO: will check the dtype to be bf16
-                    # router gemm output float32
-                    logits = torch.empty(
-                        hidden_states.shape[0],
-                        self.weight.shape[0],
-                        device=hidden_states.device,
-                        dtype=torch.float32,
-                    )
-                    flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
-                else:
-                    logits = dsv3_router_gemm(
-                        hidden_states, self.weight, out_dtype=torch.float32
-                    )
+                logits = _jit_dsv3_router_gemm(
+                    hidden_states, self.weight, out_dtype=torch.float32
+                )
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -1723,6 +1719,18 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
+        if dcp_enabled():
+            self.attn_mqa_for_dcp_decode = RadixAttention(
+                self.num_local_heads * get_attention_dcp_world_size(),
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
@@ -2890,6 +2898,34 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        return prepare_decode_context_parallel_metadata(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+        )
+
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
@@ -2897,24 +2933,6 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
-
-
-@register_custom_op(
-    op_name="flashinfer_dsv3_router_gemm",
-    mutates_args=[],
-    fake_impl=lambda logits, hidden_states, weight: None,
-)
-def flashinfer_dsv3_router_gemm(
-    logits: torch.Tensor,
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> None:
-    _raw_dsv3_router_gemm(
-        hidden_states,
-        weight.t(),
-        logits,
-        launch_with_pdl=True,
-    )
 
 
 @register_custom_op(out_shape="hidden_states")

@@ -30,6 +30,28 @@ Qwen-Image is a text-to-image model. The recommended launch configurations vary 
 
 <QwenImageDeployment />
 
+For the validated ModelOpt NVFP4 checkpoint on Blackwell, load the published
+Qwen-Image-2512 NVFP4 repo directly:
+
+```bash Command
+sglang serve \
+  --model-path lmsys/qwen-image-2512-modelopt-nvfp4-sglang \
+  --ulysses-degree=1 \
+  --ring-degree=1
+```
+
+For high-resolution B200 generations, the FlashInfer CUTLASS FP4 GEMM backend
+can be faster than the default TensorRT-LLM FP4 GEMM backend:
+
+```bash Command
+SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cutlass \
+sglang generate \
+  --model-path lmsys/qwen-image-2512-modelopt-nvfp4-sglang \
+  --width 2048 --height 2048 \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
+  --save-output
+```
+
 ### 3.2 Configuration Tips
 
 Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
