@@ -720,12 +720,12 @@ sgl-eval run aime25 \\
     //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
     //   high-throughput  — bs256, max-running 256.
     // ACCURACY: the earlier gfx950 block-FP8 bpreshuffle miscompile (GSM8K ~0) is
-    // fixed as of the pinned mi355x image (...-20260618); MI355X FP8 low-latency is
-    // re-validated (GSM8K ~0.96, NIAH 15/15 to ~118K) and marked verified:true. The
-    // balanced/high-throughput, all BF16, and all gfx942 (MI325X/MI300X) cells are
-    // verified:false (not yet benchmarked, but correct). BF16 (~1.51 TB) only fits
-    // single-node on MI325X (2 TB) / MI355X (2.3 TB); MI300X (1.5 TB) needs
-    // multi-node, so its BF16 cells are omitted.
+    // fixed as of the pinned mi355x image (...-20260618); MI355X FP8 was re-validated
+    // (GSM8K ~0.96, NIAH 15/15 to ~118K) and all three FP8 strategies are benchmarked
+    // + marked verified:true (see glm-5.2-benchmarks.jsx). All BF16 and all gfx942
+    // (MI325X/MI300X) cells stay verified:false (not yet benchmarked, but correct).
+    // BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X (2.3 TB);
+    // MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
@@ -745,7 +745,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -763,7 +763,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
