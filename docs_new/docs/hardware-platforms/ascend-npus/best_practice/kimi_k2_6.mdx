@@ -10,22 +10,22 @@ This page focuses on optimal configuration and benchmark results for Kimi-K2.6 o
 
 ### Low Latency
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 20ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 20ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-20ms) |
 
 ### High Throughput
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Mixed | 64K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K (90% prefix cache hit rate) | 100ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1080p_30+256 | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
-| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Mixed | 64K+1K | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-16p-in64k-out1k-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 100ms | 5s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in128k-out1k-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K | 100ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 16 | PD Disaggregation | 64K+1.5K (90% prefix cache hit rate) | 100ms | 3s | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-prefix90-100ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1024x1024 (30)+1024 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1024x1024-30-out1024-50ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 1080p_30+256 | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in1080p-30-out256-50ms) |
+| Kimi-K2.6 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#kimi-k2-6-w4a8-8p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
@@ -111,7 +111,7 @@ do
         --quantization modelslim \
         --dtype bfloat16 \
         --tp-size 32 \
-        --mem-fraction-static 0.55 \
+        --mem-fraction-static 0.662 \
         --max-running-requests 32 \
         --chunked-prefill-size 262144 \
         --context-length 75000 \
@@ -129,7 +129,9 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         break
     fi
 done
@@ -248,14 +250,13 @@ do
         --device npu \
         --tp-size 16 \
         --disable-radix-cache \
-        --disable-cuda-graph \
         --mem-fraction-static 0.78 \
-        --max-running-requests 1 \
+        --max-running-requests 2 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --chunked-prefill-size 16384 \
-        --prefill-max-requests 1 \
-        --max-prefill-tokens 131072 \
+        --prefill-max-requests 2 \
+        --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --sampling-backend ascend
@@ -292,8 +293,8 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 16 \
-        --mem-fraction-static 0.73 \
-        --max-running-requests 1 \
+        --mem-fraction-static 0.82 \
+        --max-running-requests 2 \
         --enable-dp-attention \
         --dp-size 1 \
         --enable-dp-lm-head \
@@ -309,7 +310,9 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -365,6 +368,7 @@ python -m sglang.bench_serving \
 **Dataset**: 128K+1K (90% prefix cache hit rate)
 
 **TPOT**: 100ms
+**TTFT**: 5s
 
 #### Model Deployment
 
@@ -452,7 +456,9 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -486,7 +492,7 @@ do
         --attention-backend ascend \
         --device npu \
         --tp-size 16 \
-        --mem-fraction-static 0.73 \
+        --mem-fraction-static 0.82 \
         --max-running-requests 2 \
         --enable-dp-attention \
         --dp-size 1 \
@@ -503,7 +509,9 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
-        --speculative-draft-model-quantization unquant
+        --speculative-draft-model-quantization unquant \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -619,13 +627,8 @@ do
     then
         echo "${P_IP[$i]}"
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=8
+        export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=<network-interface>
-        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-        export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24699
-        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
-        export ZBAL_ENABLE_GRAPH=1
-        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -653,7 +656,9 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -688,7 +693,7 @@ do
         --device npu \
         --tp-size 16 \
         --mem-fraction-static 0.82 \
-        --max-running-requests 1 \
+        --max-running-requests 16 \
         --enable-dp-attention \
         --dp-size 1 \
         --enable-dp-lm-head \
@@ -699,6 +704,8 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs 16 \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2 \
         --speculative-algorithm EAGLE3 \
         --speculative-draft-model-path $DRAFT_MODEL_PATH \
         --speculative-num-steps 4 \
@@ -760,6 +767,7 @@ python -m sglang.bench_serving \
 **Dataset**: 64K+1.5K (90% prefix cache hit rate)
 
 **TPOT**: 100ms
+**TTFT**: 3s
 
 #### Model Deployment
 
@@ -815,13 +823,8 @@ do
     then
         echo "${P_IP[$i]}"
         export GLOO_SOCKET_IFNAME=<network-interface>
-        export HCCL_BUFFSIZE=8
+        export HCCL_BUFFSIZE=1800
         export HCCL_SOCKET_IFNAME=<network-interface>
-        export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-        export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24699
-        export SGLANG_ZBAL_LOCAL_MEM_SIZE=61184
-        export ZBAL_ENABLE_GRAPH=1
-        export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
         python3 -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
@@ -847,7 +850,9 @@ do
         --max-prefill-tokens 65536 \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
-        --sampling-backend ascend
+        --sampling-backend ascend \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2
         NODE_RANK=$i
         break
     fi
@@ -893,6 +898,8 @@ do
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --cuda-graph-bs 1 2 4 6 8 \
+        --reasoning-parser kimi_k2 \
+        --tool-call-parser kimi_k2 \
         --speculative-algorithm EAGLE3 \
         --speculative-draft-model-path $DRAFT_MODEL_PATH \
         --speculative-num-steps 4 \
@@ -1013,7 +1020,7 @@ python3 -m sglang.launch_server \
     --device npu \
     --attention-backend ascend \
     --tp-size 16 \
-    --mem-fraction-static 0.76 \
+    --mem-fraction-static 0.872 \
     --max-running-requests 176 \
     --chunked-prefill-size 32768 \
     --context-length 8192 \
@@ -1025,7 +1032,7 @@ python3 -m sglang.launch_server \
     --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --cuda-graph-bs 1 2 4 8 9 10 11 \
+    --cuda-graph-bs-decode 1 2 4 8 9 10 11 \
     --disable-radix-cache \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path $DRAFT_MODEL_PATH \
@@ -1034,7 +1041,9 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 3 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
@@ -1124,7 +1133,7 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --tp-size 16 \
     --base-gpu-id 0 \
-    --mem-fraction-static 0.74 \
+    --mem-fraction-static 0.852 \
     --max-running-requests 64 \
     --chunked-prefill-size 16384 \
     --context-length 8192 \
@@ -1145,7 +1154,9 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 3 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
@@ -1237,7 +1248,7 @@ python3 -m sglang.launch_server \
     --quantization modelslim \
     --dtype bfloat16 \
     --tp-size 16 \
-    --mem-fraction-static 0.753 \
+    --mem-fraction-static 0.865 \
     --max-running-requests 80 \
     --chunked-prefill-size 32768 \
     --context-length 6144 \
@@ -1249,7 +1260,7 @@ python3 -m sglang.launch_server \
     --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --cuda-graph-bs 1 2 3 4 5 \
+    --cuda-graph-bs-decode 1 2 3 4 5 \
     --disable-radix-cache \
     --model-loader-extra-config '{"enable_multithread_load": true}' \
     --speculative-algorithm EAGLE3 \
@@ -1259,7 +1270,9 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 5 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
@@ -1346,7 +1359,7 @@ python3 -m sglang.launch_server \
     --quantization modelslim \
     --dtype bfloat16 \
     --tp-size 16 \
-    --mem-fraction-static 0.783 \
+    --mem-fraction-static 0.895 \
     --max-running-requests 208 \
     --chunked-prefill-size 32768 \
     --context-length 6144 \
@@ -1358,7 +1371,7 @@ python3 -m sglang.launch_server \
     --dp-size 16 \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --cuda-graph-bs 1 2 4 8 12 13 \
+    --cuda-graph-bs-decode 1 2 4 8 12 13 \
     --disable-radix-cache \
     --model-loader-extra-config '{"enable_multithread_load": true}' \
     --speculative-algorithm EAGLE3 \
@@ -1368,7 +1381,9 @@ python3 -m sglang.launch_server \
     --speculative-num-draft-tokens 5 \
     --speculative-draft-model-quantization unquant \
     --prefill-delayer-max-delay-passes 200 \
-    --enable-prefill-delayer
+    --enable-prefill-delayer \
+    --reasoning-parser kimi_k2 \
+    --tool-call-parser kimi_k2
 ```
 
 #### Benchmark
