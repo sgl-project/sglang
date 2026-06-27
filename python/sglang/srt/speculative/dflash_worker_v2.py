@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -43,6 +44,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_parallel,
     get_schedule,
     get_spec,
@@ -88,7 +90,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import empty_context
 
 _is_npu = is_npu()
 
@@ -386,24 +387,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_probs_buf = None
         self._logged_first_verify = False
         self._full_embed_gpu: Optional[torch.Tensor] = None
-        # Under dp attention, peer DP ranks run different (idle) paths, so
-        # spec broadcasts must stay within the attn-TP group.
-        self._tp_sync = SpecTpSync(
-            get_parallel().attn_tp_group
-            if get_parallel().enable_dp_attention
-            else get_tp_group()
+        self.enable_dp_attention = get_parallel().enable_dp_attention
+        # Draft collectives must not wait for idle peer DP ranks.
+        self._draft_tp_group = (
+            get_parallel().attn_tp_group if self.enable_dp_attention else get_tp_group()
         )
-
-        # Under dp attention, the draft worker runs on the per-DP attn-TP
-        # group, independent of idle peer DP ranks.
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
-        if get_parallel().enable_dp_attention:
-            draft_init_ctx = draft_tp_context(get_parallel().attn_tp_group)
-        else:
-            draft_init_ctx = empty_context()
-        with draft_init_ctx:
+        self._tp_sync = SpecTpSync(self._draft_tp_group)
+        with self._draft_context(initializing=True):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -563,6 +553,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
+    @contextmanager
+    def _draft_context(self, *, initializing: bool = False):
+        """Run the dense draft locally inside this rank's attention-TP group."""
+        with ExitStack() as stack:
+            if self.enable_dp_attention:
+                group = (
+                    self._draft_tp_group
+                    if initializing
+                    else self.draft_model_runner.tp_group
+                )
+                stack.enter_context(draft_tp_context(group))
+                # Keep one KV row per local token; restore target DP flags on exit.
+                stack.enter_context(get_flags().dp.override(enabled=False))
+            yield
+
     @property
     def draft_worker(self):
         # DFLASH drives the draft model through a plain TpModelWorker: the
@@ -599,7 +604,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
+        with self._draft_context():
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -609,7 +614,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(self.draft_model_runner.tp_group):
+        with self._draft_context():
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             )
@@ -1800,7 +1805,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with (
             torch.inference_mode(),
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self._draft_context(),
         ):
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
@@ -2208,13 +2213,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            # An idle DP rank runs the empty target prefill above to stay in
-            # the DP collective, but must skip the draft KV materialization,
-            # which needs per-request extend info.
-            if batch.forward_mode.is_idle():
-                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
-                    device=self.device
-                )
+            # The global extend flag can also bring local IDLE/DECODE ranks
+            # here. They participate in the target forward, but have no prompt
+            # tokens to materialize into the draft KV cache.
+            if not batch.forward_mode.is_extend():
+                logits_output.hidden_states = None
+                if batch.forward_mode.is_idle():
+                    batch_output.next_draft_input = (
+                        DFlashDraftInputV2.create_idle_input(device=self.device)
+                    )
+                else:
+                    batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                        bonus_tokens=next_token_ids,
+                        seq_lens=new_seq_lens,
+                    )
                 return batch_output
 
             if logits_output.hidden_states is None:
@@ -2495,66 +2507,69 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with (
             torch.inference_mode(),
-            self.draft_tp_context(self.draft_model_runner.tp_group),
+            self._draft_context(),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
-        draft_logits_output = draft_out.logits_output
+            draft_logits_output = draft_out.logits_output
 
-        if (
-            self._is_domino
-            and self._draft_sampler is not None
-            and draft_out.can_run_graph
-        ):
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
-        elif self._is_domino:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            prefix_gru = self.draft_model.prefix_gru
-            embed_proj = self.draft_model.embed_proj
-            if prefix_gru is None or embed_proj is None:
-                raise RuntimeError("DFLASH Domino projector modules are unavailable.")
-            tp_group = get_tp_group()
-            shard = getattr(lm_head, "shard_indices", None)
-            draft_next = domino_greedy_rollout(
-                draft_hidden=draft_hidden,
-                bonus_tokens=block_ids[:, 0],
-                target_embedding=embed_module,
-                lm_head_weight=lm_head.weight,
-                prefix_gru=prefix_gru,
-                embed_proj=embed_proj,
-                vocab_size=int(self.model_runner.model_config.vocab_size),
-                shift_label=bool(self.draft_model.shift_label),
-                candidate_pool_size=self.domino_candidate_pool_size,
-                tp_group=tp_group,
-                lm_head_org_vocab_start=(
-                    int(shard.org_vocab_start_index) if shard is not None else 0
-                ),
-                lm_head_num_org=(
-                    int(shard.num_org_elements) if shard is not None else None
-                ),
-                lm_head_num_org_padded=(
-                    int(shard.num_org_elements_padded) if shard is not None else None
-                ),
-            )
-        elif self._draft_sampler is not None and draft_out.can_run_graph:
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
             if (
-                self.selector is not None
-                and not _is_all_greedy(batch.sampling_info)
-                and self._selector_sampling_enabled
+                self._is_domino
+                and self._draft_sampler is not None
+                and draft_out.can_run_graph
             ):
-                self._selector_sample = (
-                    self._draft_sampler.candidate_out[:bs],
-                    self._draft_sampler.q_out[:bs],
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
+            elif self._is_domino:
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+                prefix_gru = self.draft_model.prefix_gru
+                embed_proj = self.draft_model.embed_proj
+                if prefix_gru is None or embed_proj is None:
+                    raise RuntimeError(
+                        "DFLASH Domino projector modules are unavailable."
+                    )
+                tp_group = get_tp_group()
+                shard = getattr(lm_head, "shard_indices", None)
+                draft_next = domino_greedy_rollout(
+                    draft_hidden=draft_hidden,
+                    bonus_tokens=block_ids[:, 0],
+                    target_embedding=embed_module,
+                    lm_head_weight=lm_head.weight,
+                    prefix_gru=prefix_gru,
+                    embed_proj=embed_proj,
+                    vocab_size=int(self.model_runner.model_config.vocab_size),
+                    shift_label=bool(self.draft_model.shift_label),
+                    candidate_pool_size=self.domino_candidate_pool_size,
+                    tp_group=tp_group,
+                    lm_head_org_vocab_start=(
+                        int(shard.org_vocab_start_index) if shard is not None else 0
+                    ),
+                    lm_head_num_org=(
+                        int(shard.num_org_elements) if shard is not None else None
+                    ),
+                    lm_head_num_org_padded=(
+                        int(shard.num_org_elements_padded)
+                        if shard is not None
+                        else None
+                    ),
                 )
-        elif self.selector is not None:
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
+            elif self._draft_sampler is not None and draft_out.can_run_graph:
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
+                if (
+                    self.selector is not None
+                    and not _is_all_greedy(batch.sampling_info)
+                    and self._selector_sampling_enabled
+                ):
+                    self._selector_sample = (
+                        self._draft_sampler.candidate_out[:bs],
+                        self._draft_sampler.q_out[:bs],
+                    )
+            elif self.selector is not None:
                 draft_next = self._propose_selector_block(
                     draft_logits_output=draft_logits_output,
                     bs=bs,
@@ -2562,12 +2577,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     anchor_token_ids=block_ids[:, 0],
                     sampling_info=batch.sampling_info,
                 )
-        else:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
+            else:
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]
