@@ -1002,15 +1002,15 @@ class HiCacheController:
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        ok = True
+        all_success = True
         completed_tokens = 0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
-            if ok and operation.is_terminated():
-                ok = False
-            if ok:
+            if all_success and operation.is_terminated():
+                all_success = False
+            if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[
                     i * self.page_size : (i + len(batch_hashes)) * self.page_size
@@ -1028,7 +1028,7 @@ class HiCacheController:
                     operation, batch_hashes, batch_host_indices, extra_info
                 )
                 if n != len(batch_hashes):
-                    ok = False
+                    all_success = False
                 completed_tokens += n * self.page_size
                 if prefix_keys and len(prefix_keys) > 0:
                     prefix_keys += batch_hashes
@@ -1038,7 +1038,7 @@ class HiCacheController:
                 operation=operation,
             )
             self.prefetch_sync_queue.put(ack)
-        return ok
+        return all_success
 
     def prefetch_io_aux_func(self):
         """
