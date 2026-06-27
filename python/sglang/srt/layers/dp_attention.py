@@ -533,12 +533,20 @@ _USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
 
 def is_dp_gatherv_active() -> bool:
     """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
-    enabled and the current parallel layout (attn_tp_size==1, tp_size==dp_size)
-    is supported. Env-gated by SGLANG_DP_USE_GATHERV; default off."""
+    enabled and applicable to the CURRENT forward. Requires:
+      - env SGLANG_DP_USE_GATHERV (default off),
+      - supported layout (attn_tp_size==1, tp_size==dp_size),
+      - SUM_LEN padding mode. The gatherv pair (all_gatherv + reduce_scatterv) is
+        only valid under SUM_LEN; under MAX_LEN the buffer is equal-padded and the
+        gather/combine use all_gather / (aiter) reduce_scatter instead. Reading the
+        per-forward padding via _DpGatheredBufferWrapper.is_dp_max_padding() (set by
+        set_dp_buffer_len) keeps callers that lack a ForwardBatch (e.g.
+        dp_reduce_scatter_tensor) consistent."""
     return (
         _USE_DP_GATHERV
         and get_attention_tp_size() == 1
         and get_tensor_model_parallel_world_size() == get_attention_dp_size()
+        and not _DpGatheredBufferWrapper.is_dp_max_padding()
     )
 
 
