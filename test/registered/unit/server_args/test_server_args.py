@@ -1300,5 +1300,19 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         self.assertEqual(parsed.sampling_backend, "token_oracle")
 
 
+class TestGrpcPortDerivation(CustomTestCase):
+    def test_high_port_does_not_overflow(self):
+        # port + 10000 would exceed 65535; this used to raise. grpc_port must
+        # stay in range and differ from --port.
+        sa = ServerArgs(model_path="dummy", device="cuda", port=65438)
+        self.assertTrue(1 <= sa.grpc_port <= 65535)
+        self.assertNotEqual(sa.grpc_port, sa.port)
+        self.assertEqual(sa.grpc_port, sa.port - 10000)
+
+    def test_normal_port_uses_plus_10000(self):
+        sa = ServerArgs(model_path="dummy", device="cuda", port=30000)
+        self.assertEqual(sa.grpc_port, sa.port + 10000)
+
+
 if __name__ == "__main__":
     unittest.main()

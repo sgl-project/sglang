@@ -2881,9 +2881,16 @@ class ServerArgs:
         self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
-        self.grpc_port = (
-            grpc_port_env if grpc_port_env is not None else self.port + 10000
-        )
+        if grpc_port_env is not None:
+            self.grpc_port = grpc_port_env
+        else:
+            # Derive from --port. Use +10000, but fall back to -10000 when that
+            # would exceed 65535 (e.g. a high --port), so a valid --port never
+            # crashes here. port + 10000 > 65535 implies port > 55535, so
+            # port - 10000 > 45535 stays in range and differs from --port.
+            self.grpc_port = (
+                self.port + 10000 if self.port + 10000 <= 65535 else self.port - 10000
+            )
 
         if not (1 <= self.grpc_port <= 65535):
             raise ValueError(
