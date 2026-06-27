@@ -218,9 +218,7 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
-# Shared freqs_cis tensors keyed by the RoPE parameters. V4-Flash otherwise
-# builds one large complex tensor per layer, which is avoidable on NPU because
-# layers with the same base can share the same immutable buffer.
+# Shared freqs_cis tensors keyed by the RoPE parameters.
 _PRECOMPUTED_FREQS_CIS: dict[tuple, torch.Tensor] = {}
 
 
@@ -2118,7 +2116,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
-        scale_suffix: str = "weight_scale_inv",
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -2129,6 +2126,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         if name.startswith("hc_head_"):
             return "model." + name
 
+        scale_suffix = "weight_scale_inv"
+        if _is_npu:
+            scale_suffix = "weight_scale_inv"
         scale_target = "." + scale_suffix
         if is_nextn and name.startswith("mtp."):
             parts = name.split(".", 2)
@@ -2181,14 +2181,6 @@ class DeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-
-        scale_suffix = "weight_scale_inv"
-        for param_name in params_dict:
-            if param_name.endswith(".weight_scale"):
-                scale_suffix = "weight_scale"
-                break
-            if param_name.endswith(".weight_scale_inv"):
-                break
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -2267,7 +2259,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
-                        scale_suffix=scale_suffix,
                     )
 
                     layer_id = get_layer_id(name)
