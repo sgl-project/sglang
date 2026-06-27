@@ -28,15 +28,24 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
     int rank,
     uint8_t** dbuffer_list,
     uint32_t data_offset,
-    uint32_t flag_color,
+    uint32_t* d_flag_counters,
     int64_t data_size_per_phase) {
   int block = blockIdx.x;
   int grid = gridDim.x;
+
+  // Read this block's counter from device memory and bump it here in the
+  // kernel. Keeping the value in device memory (instead of a host scalar
+  // baked into the launch) lets every CUDA-graph replay see a fresh color.
+  uint32_t flag_color = d_flag_counters[blockIdx.x];
 
   while (block < num_blocks) {
     AllReduceKernel::run(A, B, N, block, rank, dbuffer_list, data_offset, flag_color, data_size_per_phase);
     block += grid;
     flag_color++;
+  }
+  // The whole block ends up with the same value, so a single writer suffices.
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    d_flag_counters[blockIdx.x] = flag_color;
   }
 }
 
@@ -57,7 +66,7 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        flag_color,                                                       \
+        d_flag_counters,                                                  \
         this->kMaxProblemSize);                                           \
   } else if (world_size == 4) {                                           \
     using LineCodec = __codec<T, 4>;                                      \
@@ -75,7 +84,7 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        flag_color,                                                       \
+        d_flag_counters,                                                  \
         this->kMaxProblemSize);                                           \
   } else if (world_size == 8) {                                           \
     using LineCodec = __codec<T, 8>;                                      \
@@ -93,7 +102,7 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        flag_color,                                                       \
+        d_flag_counters,                                                  \
         this->kMaxProblemSize);                                           \
   }
 
@@ -112,7 +121,7 @@ struct DeviceComms {
   static int constexpr kMaxWorldSize = 8;
 
   bool initialized = false;
-  uint32_t flag_color = 1;
+  uint32_t* d_flag_counters = nullptr;
   int world_size;
   int rank;
 
@@ -145,6 +154,15 @@ struct DeviceComms {
     // Clear the flags buffer.
     HIP_CHECK(hipMemset(dbuffer, 0, flags_buffer_size));
 
+    // A per-block color counter that the kernel advances itself. Seed it with
+    // 1 rather than 0 so it never matches the freshly zeroed flags buffer.
+    HIP_CHECK(hipMalloc(&d_flag_counters, kMaxNumBlocks * sizeof(uint32_t)));
+    {
+      std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
+      HIP_CHECK(hipMemcpy(
+          d_flag_counters, init_color.data(), kMaxNumBlocks * sizeof(uint32_t), hipMemcpyHostToDevice));
+    }
+
     // Device-side list of IPC buffers.
     buffer_list.resize(world_size);
     HIP_CHECK(hipMalloc(&dbuffer_list, world_size * sizeof(uint8_t*)));
@@ -169,6 +187,12 @@ struct DeviceComms {
   }
 
   void destroy() {
+    // This buffer is created before `initialized` becomes true, so release it
+    // on its own check to keep a half-finished init from leaking it.
+    if (d_flag_counters) {
+      HIP_CHECK(hipFree(d_flag_counters));
+      d_flag_counters = nullptr;
+    }
     if (initialized) {
       for (int i = 0; i < world_size; i++) {
         if (i != rank) {
@@ -229,8 +253,7 @@ struct DeviceComms {
         break;
     }
     HIP_CHECK(cudaGetLastError());
-    // Rotate the flag color.
-    flag_color += divceil(N, grid);
+    // The color now advances on-device inside the kernel; no host-side bump.
   }
 };
 
