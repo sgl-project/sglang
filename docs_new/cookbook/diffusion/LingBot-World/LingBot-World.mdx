@@ -5,19 +5,15 @@ metatags:
 tag: REALTIME
 ---
 
+<div className="not-prose" style={{display: "flex", flexWrap: "wrap", gap: "6px", margin: "8px 0 30px"}}>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>realtime</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>world model</span>
+  <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>causal DiT</span>
+</div>
+
 ## 1. Model Introduction
 
 [LingBot World](https://huggingface.co/robbyant/lingbot-world-fast-diffusers) is a realtime camera-controlled video world model. In SGLang-diffusion, it belongs to the realtime causal path: the server keeps a live session, samples control signals per chunk, reuses causal DiT state, and decodes video frames incrementally.
-
-<div style={{border: "1px solid #dbe3ef", borderRadius: "10px", overflow: "hidden", background: "linear-gradient(135deg, #ffffff 0%, #f8fafc 52%, #ecfeff 100%)", boxShadow: "0 10px 30px rgba(15, 23, 42, 0.08)", margin: "22px 0 28px 0", padding: "18px 22px"}}>
-  <div style={{fontSize: "20px", fontWeight: 750, color: "#0f172a", lineHeight: 1.2}}>LingBot World</div>
-  <div style={{display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "10px"}}>
-    <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>realtime</span>
-    <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>world model</span>
-    <span style={{display: "inline-block", padding: "4px 9px", borderRadius: "999px", background: "#ecfeff", color: "#155e75", fontSize: "12px", fontWeight: 750}}>causal DiT</span>
-  </div>
-  <div style={{fontSize: "13px", color: "#64748b", marginTop: "12px"}}>Realtime camera-controlled world model in SGLang-diffusion</div>
-</div>
 
 This is different from offline diffusion video models such as Wan or LTX. Offline models denoise a bounded latent sequence for one request. Realtime world models generate a continuing stream, so the runtime must manage session state, control events, causal attention cache, and VAE decode cache.
 
