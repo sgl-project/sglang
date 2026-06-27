@@ -356,13 +356,17 @@ def _compute_moe_lora_info_kernel(
     offs = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     valid = offs < seg_len
     lora_id = tl.load(weight_indices_ptr + pid_seg)
-    lora_rank = tl.load(lora_ranks_ptr + lora_id)
+    valid_lora = lora_id >= 0
+    safe_lora_id = tl.maximum(lora_id, 0)
+    lora_rank = tl.load(lora_ranks_ptr + safe_lora_id, mask=valid_lora, other=0)
+    active_lora = valid_lora & (lora_rank > 0)
     tl.store(
-        adapter_enabled_ptr + lora_id,
-        (lora_rank > 0).to(tl.int32),
-        mask=pid_m == 0,
+        adapter_enabled_ptr + safe_lora_id,
+        active_lora.to(tl.int32),
+        mask=(pid_m == 0) & valid_lora,
     )
-    tl.store(token_lora_mapping_ptr + seg_start + offs, lora_id, mask=valid)
+    token_lora_id = tl.where(active_lora, lora_id, -1)
+    tl.store(token_lora_mapping_ptr + seg_start + offs, token_lora_id, mask=valid)
 
 
 def _compute_moe_lora_info(
@@ -378,6 +382,11 @@ def _compute_moe_lora_info(
         assert (
             num_tokens <= token_lora_mapping.shape[0]
         ), "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        # CUDA graph captures kernels against the full preallocated mapping
+        # buffer.  Runtime batches may be padded to a larger graph bucket than
+        # their real token count, so reset the whole buffer and only rewrite the
+        # active prefix below.
+        token_lora_mapping.fill_(-1)
         token_lora_mapping = token_lora_mapping[:num_tokens]
     else:
         token_lora_mapping = torch.empty(
@@ -420,10 +429,20 @@ def _compute_moe_lora_info(
         return adapter_enabled, token_lora_mapping
 
     if has_segments:
-        active_ranks = lora_ranks[weight_indices.long()]
-        adapter_enabled.scatter_(
-            0, weight_indices.long(), (active_ranks > 0).to(torch.int32)
+        valid_weight_indices = weight_indices >= 0
+        safe_weight_indices = torch.where(valid_weight_indices, weight_indices, 0)
+        active_ranks = torch.where(
+            valid_weight_indices,
+            lora_ranks[safe_weight_indices.long()],
+            0,
         )
+        valid_indices = weight_indices[valid_weight_indices]
+        if valid_indices.numel() != 0:
+            adapter_enabled.scatter_(
+                0,
+                valid_indices.long(),
+                (active_ranks[valid_weight_indices] > 0).to(torch.int32),
+            )
     if num_tokens == 0:
         return adapter_enabled, token_lora_mapping
     if not has_segments:
@@ -440,8 +459,13 @@ def _compute_moe_lora_info(
         torch.searchsorted(seg_indptr.to(torch.int32), token_positions, right=True) - 1
     )
 
+    active_weight_indices = torch.where(
+        valid_weight_indices & (active_ranks > 0),
+        weight_indices.to(torch.int32),
+        -1,
+    )
     token_lora_mapping = torch.index_select(
-        weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping
+        active_weight_indices, 0, req_indices, out=token_lora_mapping
     )
 
     return adapter_enabled, token_lora_mapping
