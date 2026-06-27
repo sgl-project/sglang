@@ -43,18 +43,19 @@ QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS = [
     "npu",
     "--chunked-prefill-size",
     -1,
+    "--max-total-tokens",
+    470784,
     "--max-prefill-tokens",
     65536,
     "--trust-remote-code",
-    "--enable-prefill-delayer",
     "--mamba-scheduler-strategy",
     "extra_buffer",
     "--max-running-requests",
-    42,
+    40,
     "--max-mamba-cache-size",
-    210,
+    200,
     "--mem-fraction-static",
-    0.71,
+    0.9,
     "--cuda-graph-bs",
     2,
     8,
@@ -63,7 +64,6 @@ QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS = [
     32,
     36,
     40,
-    42,
     "--enable-multimodal",
     "--mm-attention-backend",
     "ascend_attn",
@@ -79,6 +79,10 @@ QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen3_coder",
 ]
 
 
@@ -118,8 +122,8 @@ class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
     other_args = QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS
     envs = QWEN3_6_35B_A3B_64K_PREFIX_ENVS
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 42
-    num_prompts = 42
+    max_concurrency = 40
+    num_prompts = 40
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1
@@ -127,6 +131,7 @@ class TestNPUQwen3_6_35BA3B_1P_In64k_Out1k_Prefix90_50ms(
     tpot = 50
     request_rate = float("inf")
     output_token_throughput = 660
+    pop_sglang_is_in_ci_for_gsp = True
 
     @classmethod
     def setUpClass(cls):

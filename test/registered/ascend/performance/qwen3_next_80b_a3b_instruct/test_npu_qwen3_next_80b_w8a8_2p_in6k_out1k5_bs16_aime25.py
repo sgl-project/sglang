@@ -91,6 +91,10 @@ QWEN3_NEXT_80B_A3B_OTHER_ARGS = [
     "bfloat16",
     "--speculative-draft-model-path",
     QWEN3_NEXT_80B_A3B_MODEL_PATH,
+    "--reasoning-parser",
+    "qwen3",
+    "--tool-call-parser",
+    "qwen",
 ]
 
 
@@ -128,7 +132,7 @@ class TestQwen3Next80BA3B_aime25(TestNpuAccuracyTestCaseBase):
     max_concurrency = 16
 
     def test_aime25(self):
-        self.run_accuracy()
+        self.run_accuracy_multiple(n_runs=3)
 
 
 if __name__ == "__main__":

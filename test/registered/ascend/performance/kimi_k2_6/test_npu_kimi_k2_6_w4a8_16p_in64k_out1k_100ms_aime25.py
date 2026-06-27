@@ -48,7 +48,7 @@ OTHER_ARGS = [
     "--nnodes",
     2,
     "--mem-fraction-static",
-    0.55,
+    0.662,
     "--max-running-requests",
     32,
     "--chunked-prefill-size",
@@ -82,6 +82,10 @@ OTHER_ARGS = [
     4,
     "--speculative-draft-model-quantization",
     "unquant",
+    "--reasoning-parser",
+    "kimi_k2",
+    "--tool-call-parser",
+    "kimi_k2",
 ]
 
 MODEL_CONFIG = {
@@ -104,7 +108,9 @@ class TestNPUKimiK2_6_W4A8_16P_AIME2025(TestNpuAccuracyMultiNodePdMixTestCaseBas
         self.run_accuracy()
 
 
-class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(TestNpuPerfMultiNodePdMixTestCaseBase):
+class TestNPUKimiK2_6_W4A8_16P_In64k_Out1k_100ms(
+    TestNpuPerfMultiNodePdMixTestCaseBase
+):
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model_config = MODEL_CONFIG
