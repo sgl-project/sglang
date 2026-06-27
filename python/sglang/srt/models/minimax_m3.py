@@ -263,7 +263,7 @@ class MiniMaxM3MLP(nn.Module):
         x: torch.Tensor, alpha: float, limit: float
     ) -> torch.Tensor:
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
-        from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
+        from sglang.srt.layers.triton_ops.npu_swiglu_oai_quant import swiglu_oai_quant
 
         out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
         return out
