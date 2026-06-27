@@ -67,6 +67,7 @@ export const config = {
         strategy: "balanced",
         nodes: "single",
       },
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
