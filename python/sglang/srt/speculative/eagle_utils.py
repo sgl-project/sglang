@@ -6,12 +6,8 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_token_slots,
-    get_alloc_reserve_per_decode,
-    get_last_loc,
-)
+from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
@@ -572,8 +568,6 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-
     bs = batch.batch_size()
 
     # Accumulate penalty
@@ -588,7 +582,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     nxt_kv_lens = [0] * bs
     num_needed_tokens = 0
     for i, r in enumerate(batch.reqs):
-        cur = r.kv_allocated_len
+        cur = r.kv.kv_allocated_len
         # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
         # kv_committed_len is honest (bonus committed in resolve, not here),
         # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
@@ -596,7 +590,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens[i] = cur
         nxt_kv_lens[i] = nxt
         num_needed_tokens += nxt - cur
-        r.kv_allocated_len = nxt
         r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
@@ -621,29 +614,14 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     # barrier has chained to the prev forward -> host stalls a full forward.
     cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
     nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    if page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-    else:
-        last_loc = get_last_loc(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            cur_kv_lens_device,
-        )
-        out_cache_loc = alloc_paged_token_slots_extend(
-            batch.tree_cache,
-            cur_kv_lens_device,
-            cur_kv_lens_cpu,
-            nxt_kv_lens_device,
-            nxt_kv_lens_cpu,
-            last_loc,
-            num_needed_tokens,
-        )
-
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        cur_kv_lens_device,
-        nxt_kv_lens_device,
-        out_cache_loc,
-        bs,
+    alloc_for_spec_decode(
+        batch.tree_cache,
+        batch.req_to_token_pool,
+        reqs=batch.reqs,
+        req_pool_indices=batch.req_pool_indices,
+        cur_kv_lens=cur_kv_lens_device,
+        cur_kv_lens_cpu=cur_kv_lens_cpu,
+        nxt_kv_lens=nxt_kv_lens_device,
+        nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+        num_needed_tokens=num_needed_tokens,
     )

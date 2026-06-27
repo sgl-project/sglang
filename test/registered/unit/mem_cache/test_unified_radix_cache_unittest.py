@@ -20,7 +20,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -647,6 +647,7 @@ class UnifiedRadixCacheSuite:
         )
         self._rid += 1
         req_to_token_pool.alloc([req])
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
     def _apply_match_to_req(self, req, match):
@@ -908,7 +909,9 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 
-        tree.cache_finished_req(req, is_insert=True)
+        tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -935,7 +938,7 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.kv_allocated_len = kv_len
+        req.kv = ReqKvInfo(kv_allocated_len=kv_len, swa_evicted_seqlen=0)
         req.last_node = tree.root_node
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
@@ -947,8 +950,10 @@ class UnifiedRadixCacheSuite:
         get_global_server_args().strip_thinking_cache = True
         try:
             avail_before = allocator.available_size()
-            tree.cache_finished_req(req, is_insert=True)
-            start_p, end_p = req.pop_overallocated_kv_cache()
+            tree.cache_finished_req(
+                req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+            )
+            start_p, end_p = req.effective_kv_committed_len(), req.kv.kv_allocated_len
         finally:
             get_global_server_args().strip_thinking_cache = False
         if ps > 1:
@@ -990,7 +995,9 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        tree.cache_finished_req(req, is_insert=False)
+        tree.cache_finished_req(
+            req, is_insert=False, kv_len_to_handle=req.effective_kv_committed_len()
+        )
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -1149,7 +1156,9 @@ class UnifiedRadixCacheSuite:
             req.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        tree.cache_finished_req(req, is_insert=True)
+        tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req.effective_kv_committed_len()
+        )
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -1827,7 +1836,7 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.swa_evicted_seqlen = 0
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
@@ -1837,10 +1846,10 @@ class UnifiedRadixCacheSuite:
         cushion = self.cfg.sliding_window_size + self.cfg.page_size
         expected_evicted = (pre_len - 1) - cushion
         self.assertEqual(
-            req.swa_evicted_seqlen,
+            req.kv.swa_evicted_seqlen,
             expected_evicted,
             f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
-            f"{expected_evicted}, got {req.swa_evicted_seqlen}",
+            f"{expected_evicted}, got {req.kv.swa_evicted_seqlen}",
         )
 
         swa_avail_after = allocator.swa_attn_allocator.available_size()
@@ -1879,13 +1888,13 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.swa_evicted_seqlen = 0
+        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             tree.cache_unfinished_req(req)
 
         self.assertEqual(
-            req.swa_evicted_seqlen,
+            req.kv.swa_evicted_seqlen,
             0,
             "Nothing should be evicted when prefill fits inside the cushion",
         )
