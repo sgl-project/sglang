@@ -342,10 +342,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
                 if weight_name == "w13_weight":
-                    in_memory_n = layer.hidden_size
+                    already_transposed = (
+                        weight.data.shape[1]
+                        == layer.hidden_size
+                    )
                 else:
-                    in_memory_n = layer.intermediate_size_per_partition
-                if weight.data.shape[1] == in_memory_n:
+                    already_transposed = (
+                        weight.data.shape[2] == layer.hidden_size
+                    )
+                if already_transposed:
                     continue
                 origin_weight = weight.data.transpose(1, 2)
                 new_weight = origin_weight.contiguous()
