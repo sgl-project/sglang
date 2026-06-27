@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation as HybridPrefetchOperation,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _indexer_topk_sidecar_enabled,
     attach_hybrid_dsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -721,12 +722,24 @@ class HiRadixCache(RadixCache):
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
         if isinstance(self.kv_cache, DSATokenToKVPool):
-            pool = PoolTransfer(
-                name=PoolName.INDEXER,
-                hit_policy=PoolHitPolicy.ALL_PAGES,
-                indices_from_pool=PoolName.KV,
-            )
-            return {"extra_pools": [pool]}
+            from sglang.srt.server_args import get_global_server_args
+
+            pools = [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                    indices_from_pool=PoolName.KV,
+                )
+            ]
+            if _indexer_topk_sidecar_enabled(get_global_server_args()):
+                pools.append(
+                    PoolTransfer(
+                        name=PoolName.INDEXER_TOPK,
+                        hit_policy=PoolHitPolicy.ALL_PAGES,
+                        indices_from_pool=PoolName.KV,
+                    )
+                )
+            return {"extra_pools": pools}
         else:
             return {}
 

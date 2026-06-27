@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
     DSAIndexerPoolHost,
+    DSAIndexerTopkPoolHost,
     HostPoolGroup,
     LogicalHostPool,
     MambaPoolHost,
@@ -35,6 +36,17 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _indexer_topk_sidecar_enabled(server_args: "ServerArgs") -> bool:
+    """Gate sidecar on the capturer existing, not just the flag: it only has
+    data to migrate when the capturer was actually built (DSA+CUDA)."""
+    from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+
+    return (
+        server_args.enable_return_indexer_topk
+        and get_global_indexer_capturer() is not None
+    )
 
 
 def _make_layer_mapper(
@@ -581,6 +593,7 @@ def build_anchor_sidecar_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    extra_sidecar_pools: Optional[list[tuple[PoolName, Callable[[Any], Any]]]] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
@@ -608,6 +621,17 @@ def build_anchor_sidecar_stack(
             transfer_layer_num=transfer_layer_num,
         ),
     ]
+    if extra_sidecar_pools:
+        for pool_name, host_pool_factory in extra_sidecar_pools:
+            entries.append(
+                build_pool_entry(
+                    name=pool_name,
+                    host_pool=host_pool_factory(kv_host_pool),
+                    device_pool=kv_pool,
+                    layer_mapping=full_layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                )
+            )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -920,6 +944,7 @@ class _DsaStrategy(StackStrategy):
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
         full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
+        enable_indexer_topk_sidecar = _indexer_topk_sidecar_enabled(server_args)
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
@@ -944,6 +969,37 @@ class _DsaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            extra_sidecar_pools=(
+                [
+                    (
+                        PoolName.INDEXER_TOPK,
+                        lambda kv_host_pool: DSAIndexerTopkPoolHost(
+                            full_kv_pool,
+                            kv_host_pool,
+                            server_args.hicache_mem_layout,
+                            allocator_type=server_args.hicache_storage_backend,
+                        ),
+                    ),
+                ]
+                if enable_indexer_topk_sidecar
+                else None
+            ),
+        )
+        sidecars = [
+            SidecarPoolSpec(
+                pool_name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+            ),
+        ]
+        if enable_indexer_topk_sidecar:
+            sidecars.append(
+                SidecarPoolSpec(
+                    pool_name=PoolName.INDEXER_TOPK,
+                    indices_from_pool=PoolName.KV,
+                )
+            )
+        pools_desc = "KV + INDEXER" + (
+            " + INDEXER_TOPK" if enable_indexer_topk_sidecar else ""
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -951,14 +1007,9 @@ class _DsaStrategy(StackStrategy):
             component_host_pools={
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
             },
-            sidecars=[
-                SidecarPoolSpec(
-                    pool_name=PoolName.INDEXER,
-                    indices_from_pool=PoolName.KV,
-                ),
-            ],
+            sidecars=sidecars,
             transfer_layer_num=len(full_layer_mapping),
-            pools_desc="KV + INDEXER",
+            pools_desc=pools_desc,
         )
 
 
@@ -1142,6 +1193,7 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     try:
         kv = radix_cache.kv_cache
         layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+        enable_indexer_topk_sidecar = _indexer_topk_sidecar_enabled(server_args)
         host_pool_group, cache_controller = build_anchor_sidecar_stack(
             params=params,
             server_args=server_args,
@@ -1167,13 +1219,29 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
             model_name=server_args.served_model_name,
             storage_backend_extra_config=extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            extra_sidecar_pools=(
+                [
+                    (
+                        PoolName.INDEXER_TOPK,
+                        lambda kv_host_pool: DSAIndexerTopkPoolHost(
+                            kv,
+                            kv_host_pool,
+                            server_args.hicache_mem_layout,
+                            allocator_type=server_args.hicache_storage_backend,
+                        ),
+                    ),
+                ]
+                if enable_indexer_topk_sidecar
+                else None
+            ),
         )
         radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
         logger.info(
-            "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
+            "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER%s, "
             "transfer_layer_num=%s",
+            " + INDEXER_TOPK" if enable_indexer_topk_sidecar else "",
             len(layer_mapping),
         )
     except Exception:

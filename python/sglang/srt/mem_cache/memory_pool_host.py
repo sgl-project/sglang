@@ -3278,3 +3278,145 @@ class DSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
+
+class DSAIndexerTopkPoolHost(HostKVCache):
+    """Host sidecar for the DSA indexer-topk capture buffer; slot layout matches
+    the anchor MLA host pool.
+
+    Travels with KV (``indices_from_pool=KV``) so a HiCache load_back migrates the
+    capturer's topk rows to the new device slots too. All copies are CPU<->CPU
+    (the capturer buffer is already pinned), so ``device_pool`` and ``io_backend``
+    are ignored.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        anchor_host,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        from sglang.srt.state_capturer.indexer_topk import (
+            get_global_indexer_capturer,
+        )
+
+        self.device_pool = device_pool
+        self.page_size = anchor_host.page_size
+        self.layout = layout  # stored for parity; CPU<->CPU transfer ignores it
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
+        self.size = anchor_host.size
+        self.page_num = anchor_host.page_num
+
+        cap = get_global_indexer_capturer()
+        if cap is None:
+            raise ValueError(
+                "INDEXER_TOPK host pool requires the indexer capturer to be "
+                "initialized (enable-return-indexer-topk)."
+            )
+        self._capturer = cap
+        self._cap_buffer = cap.host_cache.buffer
+        self.num_layers = cap.num_layers
+        self.topk_size = cap.topk_size
+
+        requested_bytes = self.size * self.num_layers * self.topk_size * 4
+        host_mem = psutil.virtual_memory()
+        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for the indexer-topk hierarchical cache "
+                f"sidecar. Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the size of "
+                f"the hierarchical cache or max-total-tokens."
+            )
+        logger.info(
+            "Allocating %.2f GB host memory for indexer-topk sidecar "
+            "(size=%d, num_layers=%d, topk_size=%d).",
+            requested_bytes / 1e9,
+            self.size,
+            self.num_layers,
+            self.topk_size,
+        )
+
+        self.init_kv_buffer()
+        self.lock = threading.RLock()
+        self.clear()
+
+    def get_size_per_token(self):
+        return self.num_layers * self.topk_size * 4
+
+    def get_ksize_per_token(self):
+        # Storage backends call this during host-pool registration (not on base).
+        return self.get_size_per_token()
+
+    def init_kv_buffer(self):
+        self.buffer = torch.zeros(
+            (self.size, self.num_layers, self.topk_size),
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def get_hybrid_pool_buffer(self):
+        return [self.buffer]
+
+    def _capturer_buffer(self) -> torch.Tensor:
+        return self._cap_buffer
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ) -> None:
+        # device_indices index the capturer (KV slots); host_indices index this pool.
+        if host_indices.numel() == 0:
+            return
+        self.buffer[host_indices] = self._capturer_buffer()[device_indices]
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ) -> None:
+        # Inverse of backup, one layer at a time (per-layer load contract).
+        if host_indices.numel() == 0:
+            return
+        self._capturer_buffer()[device_indices, layer_id, :] = self.buffer[
+            host_indices, layer_id, :
+        ]
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        page_idx = int(index) // self.page_size
+        start = page_idx * self.page_size
+        data_page = self.buffer[start : start + self.page_size]
+        if flat:
+            data_page = data_page.flatten()
+        return data_page
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            (self.page_size, self.num_layers, self.topk_size),
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        page_idx = int(index) // self.page_size
+        start = page_idx * self.page_size
+        self.buffer[start : start + self.page_size] = data_page.reshape(
+            self.page_size, self.num_layers, self.topk_size
+        )
+
+    def get_page_buffer_meta(self, indices):
+        """Meta data for zero-copy storage I/O. Buffer is page-contiguous:
+        a page occupies ``page_size`` rows of ``(num_layers, topk_size)`` int32."""
+        assert len(indices) % self.page_size == 0
+        ptr_list = []
+        indices = indices.tolist()
+        page_stride_bytes = self.page_size * self.num_layers * self.topk_size * 4
+        base_ptr = self.buffer.data_ptr()
+        for i in range(0, len(indices), self.page_size):
+            page_index = int(indices[i]) // self.page_size
+            ptr_list.append(base_ptr + page_index * page_stride_bytes)
+        return ptr_list, [page_stride_bytes] * len(ptr_list)
