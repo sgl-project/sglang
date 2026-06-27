@@ -179,6 +179,46 @@ class NgramCorpus:
             if state_ids:
                 self._obj.erase_states(state_ids)
 
+    def precompute_drafts(
+        self,
+        req_ids: List[str],
+        base_tokens: List[List[int]],
+        total_lens: List[int],
+        draft_tokens,
+        tree_mask,
+        bonus_topk: int,
+        max_trie_depth: int,
+    ) -> Tuple[int, int, int]:
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.precompute_drafts_stateful_wrapper(
+            state_ids,
+            base_tokens,
+            total_lens,
+            draft_tokens,
+            tree_mask,
+            bonus_topk,
+            max_trie_depth,
+        )
+
+    def select_precomputed_drafts(
+        self,
+        req_ids: List[str],
+        accept_tokens,
+        accept_lens,
+        accept_index,
+        fallback_tokens: List[List[int]],
+        fallback_total_lens: List[int],
+    ):
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.select_precomputed_drafts_stateful_wrapper(
+            state_ids,
+            accept_tokens,
+            accept_lens,
+            accept_index,
+            fallback_tokens,
+            fallback_total_lens,
+        )
+
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
         for rid in req_ids:

@@ -136,6 +136,86 @@ def get_ngram_corpus_cls():
                 for i in range(batch_size)
             ]
 
+        def precompute_drafts_stateful_wrapper(
+            self,
+            state_ids: List[int],
+            base_tokens: List[List[int]],
+            total_lens: List[int],
+            draft_tokens,
+            tree_mask,
+            bonus_topk: int,
+            max_trie_depth: int,
+        ) -> Tuple[int, int, int]:
+            tokens_flat, offsets = _to_csr(base_tokens)
+            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+            total_lens_t = torch.tensor(total_lens, dtype=torch.int64)
+            draft_tokens_t = torch.as_tensor(draft_tokens, dtype=torch.int32).flatten()
+            tree_mask_t = torch.as_tensor(tree_mask, dtype=torch.uint8).flatten()
+            out_stats = torch.zeros(3, dtype=torch.int64)
+
+            self.precompute_drafts_stateful(  # type: ignore
+                state_ids_t,
+                tokens_flat,
+                offsets,
+                total_lens_t,
+                draft_tokens_t,
+                tree_mask_t,
+                bonus_topk,
+                max_trie_depth,
+                out_stats,
+            )
+            stats = out_stats.numpy().astype(np.int64).tolist()
+            return int(stats[0]), int(stats[1]), int(stats[2])
+
+        def select_precomputed_drafts_stateful_wrapper(
+            self,
+            state_ids: List[int],
+            accept_tokens,
+            accept_lens,
+            accept_index,
+            fallback_tokens: List[List[int]],
+            fallback_total_lens: List[int],
+        ):
+            fallback_tokens_flat, fallback_offsets = _to_csr(fallback_tokens)
+            batch_size = len(fallback_tokens)
+            d = self._draft_token_num
+
+            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+            accept_tokens_t = torch.as_tensor(
+                accept_tokens, dtype=torch.int32
+            ).flatten()
+            accept_lens_t = torch.as_tensor(accept_lens, dtype=torch.int64).flatten()
+            accept_index_t = torch.as_tensor(accept_index, dtype=torch.int64).flatten()
+            fallback_total_lens_t = torch.tensor(fallback_total_lens, dtype=torch.int64)
+            out_tokens = torch.zeros(batch_size * d, dtype=torch.int32)
+            out_mask = torch.zeros(batch_size * d * d, dtype=torch.uint8)
+            out_bonus_hit = torch.zeros(batch_size, dtype=torch.uint8)
+            out_cache_hit = torch.zeros(batch_size, dtype=torch.uint8)
+            out_stats = torch.zeros(4, dtype=torch.int64)
+
+            self.select_precomputed_drafts_stateful(  # type: ignore
+                state_ids_t,
+                accept_tokens_t,
+                accept_lens_t,
+                accept_index_t,
+                fallback_tokens_flat,
+                fallback_offsets,
+                fallback_total_lens_t,
+                out_tokens,
+                out_mask,
+                out_bonus_hit,
+                out_cache_hit,
+                out_stats,
+            )
+
+            return (
+                out_tokens.numpy().astype(np.int64),
+                out_mask.numpy().astype(np.int64),
+                out_bonus_hit.numpy().astype(np.int64).tolist(),
+                out_cache_hit.numpy().astype(np.int64).tolist(),
+                tuple(int(x) for x in out_stats.numpy().astype(np.int64).tolist()),
+            )
+
         def erase_states(self, state_ids: List[int]) -> None:
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
             self.erase_match_state(state_ids_t)  # type: ignore

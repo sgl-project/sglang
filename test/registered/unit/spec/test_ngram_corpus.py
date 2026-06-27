@@ -979,6 +979,219 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
         )
 
 
+@unittest.skipUnless(
+    os.getenv("RUN_NGRAM_PRECOMPUTE_PERF_TEST") == "1",
+    "Set RUN_NGRAM_PRECOMPUTE_PERF_TEST=1 to run the manual ngram precompute perf test.",
+)
+class TestNgramCorpusPrecomputePerf(CustomTestCase):
+    """Manual timing for batch_get vs C++ precomputed draft selection."""
+
+    @staticmethod
+    def _parse_int_list_env(name: str, default: list[int]) -> list[int]:
+        raw = os.getenv(name)
+        if not raw:
+            return default
+        return [int(piece.strip()) for piece in raw.split(",") if piece.strip()]
+
+    @staticmethod
+    def _avg_ms(fn, repeats: int):
+        import time
+
+        last = None
+        start = time.perf_counter()
+        for _ in range(repeats):
+            last = fn()
+        return (time.perf_counter() - start) * 1000.0 / repeats, last
+
+    @staticmethod
+    def _make_perf_corpus(draft_token_num: int, max_trie_depth: int):
+        corpus = _make_corpus(
+            "BFS",
+            max_trie_depth=max_trie_depth,
+            draft_token_num=draft_token_num,
+            min_bfs_breadth=1,
+            max_bfs_breadth=draft_token_num,
+            capacity=2000000,
+        )
+        prefix = [101, 102, 103]
+        rows = []
+        for round_idx in range(32):
+            for child in range(2000, 2080):
+                rows.append(
+                    prefix
+                    + [
+                        child,
+                        child + 100000,
+                        child + 200000,
+                        round_idx,
+                    ]
+                )
+        corpus.batch_put(rows)
+        corpus.synchronize()
+        return corpus
+
+    def _root_residual_bonus_tokens(
+        self,
+        corpus: NgramCorpus,
+        base_tokens: list[list[int]],
+        total_lens: list[int],
+        draft_tokens: np.ndarray,
+        tree_mask: np.ndarray,
+        draft_token_num: int,
+    ) -> list[int]:
+        candidates_per_req = corpus.batch_get_root_candidates_temporary(
+            base_tokens,
+            total_lens,
+            draft_token_num * 2,
+        )
+        drafts_2d = draft_tokens.reshape(len(base_tokens), draft_token_num)
+        masks_3d = tree_mask.reshape(len(base_tokens), draft_token_num, draft_token_num)
+        bonus_tokens = []
+        for i, candidates in enumerate(candidates_per_req):
+            direct_children = set(
+                corpus.direct_child_tokens(drafts_2d[i], masks_3d[i], parent=0)
+            )
+            residual = next(
+                (token for token in candidates if token not in direct_children),
+                None,
+            )
+            self.assertIsNotNone(
+                residual,
+                "Perf corpus should expose residual root candidates for cache hits",
+            )
+            bonus_tokens.append(int(residual))
+        return bonus_tokens
+
+    @staticmethod
+    def _build_select_payload(
+        base_tokens: list[list[int]],
+        total_lens: list[int],
+        root_bonus_tokens: list[int],
+        hit_count: int,
+        draft_token_num: int,
+        max_trie_depth: int,
+    ):
+        bs = len(base_tokens)
+        accept_tokens = np.zeros((bs, draft_token_num), dtype=np.int32)
+        accept_lens = np.ones(bs, dtype=np.int64)
+        accept_index = np.full((bs, draft_token_num), -1, dtype=np.int64)
+        fallback_tokens = []
+        fallback_total_lens = []
+        for i in range(bs):
+            if i < hit_count:
+                bonus_token = root_bonus_tokens[i]
+            else:
+                bonus_token = 900000000 + i
+            accept_tokens[i, 0] = bonus_token
+            accept_index[i, 0] = i * draft_token_num
+            fallback_tokens.append((base_tokens[i] + [bonus_token])[-max_trie_depth:])
+            fallback_total_lens.append(total_lens[i] + 1)
+
+        return (
+            accept_tokens.reshape(-1),
+            accept_lens,
+            accept_index.reshape(-1),
+            fallback_tokens,
+            fallback_total_lens,
+        )
+
+    def test_batch_get_vs_precomputed_select_perf(self):
+        draft_token_num = int(os.getenv("NGRAM_PRECOMPUTE_PERF_DRAFT_NUM", "12"))
+        max_trie_depth = int(os.getenv("NGRAM_PRECOMPUTE_PERF_MAX_DEPTH", "18"))
+        repeats = int(os.getenv("NGRAM_PRECOMPUTE_PERF_REPEATS", "20"))
+        precompute_repeats = int(os.getenv("NGRAM_PRECOMPUTE_PERF_PRE_REPEATS", "5"))
+        batch_sizes = self._parse_int_list_env(
+            "NGRAM_PRECOMPUTE_PERF_BATCH_SIZES",
+            [1, 8, 32, 128],
+        )
+
+        corpus = self._make_perf_corpus(draft_token_num, max_trie_depth)
+        prefix = [101, 102, 103]
+
+        print(
+            "\nNgram precompute perf "
+            f"(draft={draft_token_num}, max_depth={max_trie_depth}, "
+            f"select_repeats={repeats}, precompute_repeats={precompute_repeats})"
+        )
+        for bs in batch_sizes:
+            req_ids = [f"precompute-perf-bs{bs}-{i}" for i in range(bs)]
+            base_tokens = [prefix[:] for _ in range(bs)]
+            total_lens = [len(prefix)] * bs
+
+            batch_get_ms, batch_result = self._avg_ms(
+                lambda: corpus.batch_get(req_ids, base_tokens, total_lens),
+                repeats,
+            )
+            draft_tokens, tree_mask = batch_result
+            root_bonus_tokens = self._root_residual_bonus_tokens(
+                corpus,
+                base_tokens,
+                total_lens,
+                draft_tokens,
+                tree_mask,
+                draft_token_num,
+            )
+
+            precompute_ms, precompute_stats = self._avg_ms(
+                lambda: corpus.precompute_drafts(
+                    req_ids,
+                    base_tokens,
+                    total_lens,
+                    draft_tokens,
+                    tree_mask,
+                    draft_token_num,
+                    max_trie_depth,
+                ),
+                precompute_repeats,
+            )
+
+            hit_counts = sorted({0, bs // 2, bs})
+            select_parts = []
+            for hit_count in hit_counts:
+                (
+                    accept_tokens,
+                    accept_lens,
+                    accept_index,
+                    fallback_tokens,
+                    fallback_total_lens,
+                ) = self._build_select_payload(
+                    base_tokens,
+                    total_lens,
+                    root_bonus_tokens,
+                    hit_count,
+                    draft_token_num,
+                    max_trie_depth,
+                )
+                select_ms, select_result = self._avg_ms(
+                    lambda: corpus.select_precomputed_drafts(
+                        req_ids,
+                        accept_tokens,
+                        accept_lens,
+                        accept_index,
+                        fallback_tokens,
+                        fallback_total_lens,
+                    ),
+                    repeats,
+                )
+                out_tokens, out_mask, _, _, stats = select_result
+                self.assertEqual(out_tokens.shape[0], bs * draft_token_num)
+                self.assertEqual(
+                    out_mask.shape[0], bs * draft_token_num * draft_token_num
+                )
+                self.assertEqual(stats[2], hit_count)
+                select_parts.append(
+                    f"hit={hit_count}/{bs}: {select_ms:.3f} ms "
+                    f"(bonus={stats[0]}/{stats[1]}, cache={stats[2]}/{stats[3]})"
+                )
+
+            print(
+                f"  bs={bs:4d} batch_get={batch_get_ms:.3f} ms "
+                f"precompute={precompute_ms:.3f} ms "
+                f"(paths={precompute_stats[0]}, phase2={precompute_stats[1]}, "
+                f"cache={precompute_stats[2]}) | " + " | ".join(select_parts)
+            )
+
+
 class TestNgramCorpusMultiSam(CustomTestCase):
     """Verify multi-SAM add/remove/list and budget splitting."""
 

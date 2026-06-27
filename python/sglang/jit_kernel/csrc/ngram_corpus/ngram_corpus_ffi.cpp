@@ -106,6 +106,102 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     write_root_candidates_(result, static_cast<size_t>(max_candidates), out_tokens, out_counts);
   }
 
+  void precompute_drafts_stateful(
+      const tvm::ffi::TensorView state_ids_tv,
+      const tvm::ffi::TensorView tokens_flat,
+      const tvm::ffi::TensorView offsets,
+      const tvm::ffi::TensorView total_lens_tv,
+      const tvm::ffi::TensorView draft_tokens_tv,
+      const tvm::ffi::TensorView tree_mask_tv,
+      int64_t bonus_topk,
+      int64_t max_trie_depth,
+      const tvm::ffi::TensorView out_stats) {
+    if (bonus_topk < 0 || max_trie_depth <= 0) {
+      throw std::runtime_error("precompute_drafts_stateful received invalid bonus_topk or max_trie_depth");
+    }
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
+    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
+    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
+    auto* tlens = static_cast<const int64_t*>(total_lens_tv.data_ptr());
+    auto* draft_data = static_cast<const int32_t*>(draft_tokens_tv.data_ptr());
+    auto* mask_data = static_cast<const uint8_t*>(tree_mask_tv.data_ptr());
+    auto* stats_out = static_cast<int64_t*>(out_stats.data_ptr());
+    int64_t batch_size = offsets.size(0) - 1;
+
+    std::vector<int64_t> state_ids(sid, sid + batch_size);
+    std::vector<std::vector<int32_t>> tokens(batch_size);
+    std::vector<size_t> total_lens(batch_size);
+    for (int64_t i = 0; i < batch_size; ++i) {
+      tokens[i].assign(data + offs[i], data + offs[i + 1]);
+      total_lens[i] = static_cast<size_t>(tlens[i]);
+    }
+
+    std::vector<int32_t> draft_tokens(draft_data, draft_data + draft_tokens_tv.size(0));
+    std::vector<uint8_t> tree_mask(mask_data, mask_data + tree_mask_tv.size(0));
+    auto stats = ngram_->precomputeDrafts(
+        state_ids,
+        tokens,
+        total_lens,
+        draft_tokens,
+        tree_mask,
+        static_cast<size_t>(bonus_topk),
+        static_cast<size_t>(max_trie_depth));
+    if (out_stats.size(0) < 3) {
+      throw std::runtime_error("out_stats buffer too small for precompute_drafts_stateful");
+    }
+    stats_out[0] = stats.num_paths;
+    stats_out[1] = stats.num_phase2_contexts;
+    stats_out[2] = stats.num_cache_entries;
+  }
+
+  void select_precomputed_drafts_stateful(
+      const tvm::ffi::TensorView state_ids_tv,
+      const tvm::ffi::TensorView accept_tokens_tv,
+      const tvm::ffi::TensorView accept_lens_tv,
+      const tvm::ffi::TensorView accept_index_tv,
+      const tvm::ffi::TensorView fallback_tokens_flat,
+      const tvm::ffi::TensorView fallback_offsets,
+      const tvm::ffi::TensorView fallback_total_lens_tv,
+      const tvm::ffi::TensorView out_tokens,
+      const tvm::ffi::TensorView out_mask,
+      const tvm::ffi::TensorView out_bonus_hit,
+      const tvm::ffi::TensorView out_cache_hit,
+      const tvm::ffi::TensorView out_stats) {
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
+    auto* accept_tokens_data = static_cast<const int32_t*>(accept_tokens_tv.data_ptr());
+    auto* accept_lens_data = static_cast<const int64_t*>(accept_lens_tv.data_ptr());
+    auto* accept_index_data = static_cast<const int64_t*>(accept_index_tv.data_ptr());
+    auto* fallback_data = static_cast<const int32_t*>(fallback_tokens_flat.data_ptr());
+    auto* fallback_offs = static_cast<const int64_t*>(fallback_offsets.data_ptr());
+    auto* fallback_tlens = static_cast<const int64_t*>(fallback_total_lens_tv.data_ptr());
+    auto* stats_out = static_cast<int64_t*>(out_stats.data_ptr());
+    int64_t batch_size = state_ids_tv.size(0);
+
+    std::vector<int64_t> state_ids(sid, sid + batch_size);
+    std::vector<int32_t> accept_tokens(accept_tokens_data, accept_tokens_data + accept_tokens_tv.size(0));
+    std::vector<int64_t> accept_lens(accept_lens_data, accept_lens_data + accept_lens_tv.size(0));
+    std::vector<int64_t> accept_index(accept_index_data, accept_index_data + accept_index_tv.size(0));
+    std::vector<std::vector<int32_t>> fallback_tokens(batch_size);
+    std::vector<size_t> fallback_total_lens(batch_size);
+    for (int64_t i = 0; i < batch_size; ++i) {
+      fallback_tokens[i].assign(fallback_data + fallback_offs[i], fallback_data + fallback_offs[i + 1]);
+      fallback_total_lens[i] = static_cast<size_t>(fallback_tlens[i]);
+    }
+
+    auto result = ngram_->selectPrecomputedDrafts(
+        state_ids, accept_tokens, accept_lens, accept_index, fallback_tokens, fallback_total_lens);
+    write_result_(result.result, out_tokens, out_mask);
+    write_flags_(result.bonus_prediction_hit, out_bonus_hit);
+    write_flags_(result.precomputed_cache_hit, out_cache_hit);
+    if (out_stats.size(0) < 4) {
+      throw std::runtime_error("out_stats buffer too small for select_precomputed_drafts_stateful");
+    }
+    stats_out[0] = result.bonus_prediction_hit_ct;
+    stats_out[1] = result.bonus_prediction_total_ct;
+    stats_out[2] = result.precomputed_cache_hit_ct;
+    stats_out[3] = result.precomputed_cache_total_ct;
+  }
+
   void erase_match_state(const tvm::ffi::TensorView state_ids_tv) {
     auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
     int64_t n = state_ids_tv.size(0);
@@ -201,6 +297,16 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     }
   }
 
+  void write_flags_(const std::vector<uint8_t>& result, const tvm::ffi::TensorView& out_flags) {
+    auto* out = static_cast<uint8_t*>(out_flags.data_ptr());
+    if (out_flags.size(0) < static_cast<int64_t>(result.size())) {
+      throw std::runtime_error("out_flags buffer too small");
+    }
+    if (!result.empty()) {
+      std::memcpy(out, result.data(), result.size() * sizeof(uint8_t));
+    }
+  }
+
   std::unique_ptr<ngram::Ngram> ngram_;
 };
 
@@ -211,6 +317,8 @@ void register_ngram_corpus() {
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("batch_root_candidates_stateful", &NgramCorpusObj::batch_root_candidates_stateful)
+      .def("precompute_drafts_stateful", &NgramCorpusObj::precompute_drafts_stateful)
+      .def("select_precomputed_drafts_stateful", &NgramCorpusObj::select_precomputed_drafts_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
