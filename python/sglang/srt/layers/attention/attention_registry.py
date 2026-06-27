@@ -101,15 +101,6 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
-    from sglang.srt.configs.model_config import is_deepseek_v4
-
-    if is_deepseek_v4(runner.model_config.hf_config):
-        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-            DeepseekV4AscendAttnBackend,
-        )
-
-        return DeepseekV4AscendAttnBackend(runner)
-
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )
