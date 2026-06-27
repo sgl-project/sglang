@@ -1379,7 +1379,7 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
@@ -1422,6 +1422,26 @@ class ResponsesRequest(BaseModel):
     def normalize_responses_input(cls, values):
         if not isinstance(values, dict):
             return values
+
+        # The OpenAI Responses API accepts ``tool_choice`` in the *flat*
+        # object form {"type": "function", "name": "<fn>"}, whereas the
+        # sibling Chat Completions API (and SGLang's ``ToolChoice`` model)
+        # use the nested form {"type": "function", "function": {"name": ...}}.
+        # Normalize the flat form to the nested form once, so the downstream
+        # ChatCompletionRequest / tool_call_constraint path reuses the exact
+        # enforcement logic already proven on /v1/chat/completions.
+        tc = values.get("tool_choice")
+        if (
+            isinstance(tc, dict)
+            and tc.get("type") == "function"
+            and "name" in tc
+            and not isinstance(tc.get("function"), dict)
+        ):
+            values = values.copy()
+            values["tool_choice"] = {
+                "type": "function",
+                "function": {"name": tc["name"]},
+            }
 
         input_value = values.get("input")
         if not isinstance(input_value, list):
@@ -1560,7 +1580,7 @@ class ResponsesResponse(BaseModel):
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Union[str, ToolChoice] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
@@ -1644,7 +1664,15 @@ class ResponsesResponse(BaseModel):
                 if request.parallel_tool_calls is not None
                 else True
             ),
-            tool_choice=request.tool_choice,
+            # Echo tool_choice as a string. The object form
+            # (forced function) is semantically "required"; echoing the
+            # raw ToolChoice object breaks the OpenAI SDK's response event
+            # types, whose tool_choice union differs from the request union.
+            tool_choice=(
+                "required"
+                if isinstance(request.tool_choice, ToolChoice)
+                else request.tool_choice
+            ),
             tools=request.tools,
             # fields for parity with v1/responses
             error=None,

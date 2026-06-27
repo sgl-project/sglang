@@ -142,5 +142,53 @@ class ResponsesResponseFromRequestTestCase(unittest.TestCase):
         self.assertFalse(response.parallel_tool_calls)
 
 
+class ResponsesToolChoiceTestCase(unittest.TestCase):
+    def test_flat_tool_choice_normalized_to_nested(self):
+        from sglang.srt.entrypoints.openai.protocol import ToolChoice
+
+        # OpenAI Responses API flat form {"type":"function","name":X}
+        request = ResponsesRequest(
+            model="x",
+            input="call get_weather",
+            tool_choice={"type": "function", "name": "get_weather"},
+            tools=[
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            store=False,
+        )
+        self.assertIsInstance(request.tool_choice, ToolChoice)
+        self.assertEqual(request.tool_choice.function.name, "get_weather")
+
+    def test_string_tool_choice_unchanged(self):
+        for choice in ("auto", "required", "none"):
+            request = ResponsesRequest(
+                model="x", input="hi", tool_choice=choice, store=False
+            )
+            self.assertEqual(request.tool_choice, choice)
+
+    def test_nested_tool_choice_accepted(self):
+        from sglang.srt.entrypoints.openai.protocol import ToolChoice
+
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            tool_choice={"type": "function", "function": {"name": "f"}},
+            tools=[
+                {
+                    "type": "function",
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            store=False,
+        )
+        self.assertIsInstance(request.tool_choice, ToolChoice)
+        self.assertEqual(request.tool_choice.function.name, "f")
+
+
 if __name__ == "__main__":
     unittest.main()
