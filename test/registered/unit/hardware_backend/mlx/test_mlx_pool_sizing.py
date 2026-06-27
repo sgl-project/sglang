@@ -375,7 +375,7 @@ class TestMlxSchedulerAdmissionGate(unittest.TestCase):
         req.set_finish_with_abort.assert_not_called()
 
     def test_skips_when_no_chunk_cap(self):
-        # Explicit pool / no auto-sizing -> max_safe_prefill_chunk is None -> the gate
+        # Radix on / no auto-derived cap -> max_safe_prefill_chunk is None -> the gate
         # is a no-op (startup sizing already governs); never touch the request.
         runner = self._runner(chunk=None)
         sched = self._scheduler(runner)

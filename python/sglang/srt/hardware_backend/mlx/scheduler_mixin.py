@@ -115,7 +115,7 @@ class SchedulerMlxOverlapMixin:
         """
         runner = getattr(self.tp_worker, "_mlx_runner", None)
         if runner is None or runner.max_safe_prefill_chunk is None:
-            return  # explicit pool / no auto-sizing -> startup sizing already governs
+            return  # radix on / no auto-derived cap -> startup sizing already governs
         chunk_cap = runner.max_safe_prefill_chunk
         for req in self.waiting_queue:
             if req.finished():

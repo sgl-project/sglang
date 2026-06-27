@@ -794,7 +794,7 @@ class MlxModelRunner:
     @property
     def max_safe_prefill_chunk(self) -> int | None:
         """Largest prefill chunk (tokens) that keeps activations within the Metal
-        working set, or None when not auto-derived (explicit pool / no context)."""
+        working set, or None when not auto-derived (radix on, or no context length)."""
         return self._max_safe_prefill_chunk
 
     @staticmethod
@@ -970,19 +970,6 @@ class MlxModelRunner:
                 self._max_safe_prefill_chunk,
             )
             return
-
-        # Radix on also keeps the shared pool resident (allocated lazily, after this probe);
-        # fold it in. Radix off (the default, and this fix's target) has no shared pool.
-        if not self.disable_radix_cache:
-            n_kv_heads, head_dim, dtype = self._get_attn_config()
-            bytes_per_slot = (
-                2
-                * self._cache_layout.num_attention_layers
-                * n_kv_heads
-                * head_dim
-                * dtype.size
-            )
-            baseline += (self._pool_size + 1) * bytes_per_slot
 
         # Ceil; measuring at ctx_reached (<= context_length) over-estimates the full-context
         # cost, so extrapolation below stays conservative.
