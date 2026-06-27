@@ -547,8 +547,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=buffers.seq_lens_cpu,
             encoder_lens=None,
-            # Metadata must read the same padded graph cache-loc buffer as the
-            # captured forward.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,

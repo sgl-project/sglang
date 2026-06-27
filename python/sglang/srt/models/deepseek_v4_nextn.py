@@ -7,6 +7,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -40,7 +41,7 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -92,15 +93,17 @@ class DeepseekV4ModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("h_proj", prefix),
         )
+        if isinstance(quant_config, ModelSlimConfig):
+            prefix = "mtp.0"
+        else:
+            prefix = add_prefix("decoder", prefix)
 
         self.decoder = DeepseekV4DecoderLayer(
             config,
             layer_id=0,
             quant_config=quant_config,
             is_nextn=True,
-            # NPU (DSV4-Flash modelslim ckpt) registers the NEXTN decoder under
-            # "mtp.0"; keep the original "decoder" prefix on other devices.
-            prefix="mtp.0" if isinstance(quant_config, ModelSlimConfig) else add_prefix("decoder", prefix),
+            prefix=prefix,
             alt_streams=None,
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )

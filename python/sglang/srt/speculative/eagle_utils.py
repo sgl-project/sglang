@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_v4
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
+)
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
+    alloc_paged_token_slots_extend_npu,
 )
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -36,6 +39,14 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+ALLOC_EXTEND_FUNCS = defaultdict(
+    lambda: alloc_paged_token_slots_extend,
+    {
+        "npu": alloc_paged_token_slots_extend_npu,
+    },
+)
 
 
 def per_step_draft_out_cache_loc(
@@ -637,22 +648,8 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             batch.req_pool_indices,
             cur_kv_lens_device,
         )
-        allocator = batch.token_to_kv_pool_allocator
-        dsv4_state_lens = (
-            allocator.compute_dsv4_state_lens_reserve(
-                batch.reqs, cur_kv_lens, nxt_kv_lens
-            )
-            if hasattr(allocator, "compute_dsv4_state_lens_reserve")
-            else None
-        )
-        alloc_extend_fn = alloc_paged_token_slots_extend
-        if _is_npu and is_deepseek_v4(batch.model_config.hf_config):
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
-                alloc_paged_token_slots_reserve_extend,
-            )
-
-            alloc_extend_fn = alloc_paged_token_slots_reserve_extend
-        out_cache_loc = alloc_extend_fn(
+        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
+        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
             batch.tree_cache,
             cur_kv_lens_device,
             cur_kv_lens_cpu,
@@ -661,7 +658,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             last_loc,
             num_needed_tokens,
             req_pool_indices=batch.req_pool_indices,
-            dsv4_state_lens=dsv4_state_lens,
             batch=batch,
         )
     assign_req_to_token_pool_func(

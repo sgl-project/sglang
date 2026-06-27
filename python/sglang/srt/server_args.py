@@ -3906,9 +3906,7 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
-            if is_npu():
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
-            elif is_sm120_supported():
+            if is_sm120_supported():
                 if self.moe_runner_backend == "auto":
                     self.moe_runner_backend = "marlin"
                     logger.info(
