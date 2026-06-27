@@ -322,7 +322,7 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
-        if hasattr(req_to_token_pool, "req_to_token_c4"):
+        if _is_npu and is_deepseek_v4(batch.model_config.hf_config):
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                 build_dsv4_verify_bundle,
             )
