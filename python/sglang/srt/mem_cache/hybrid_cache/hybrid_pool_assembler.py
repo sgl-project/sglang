@@ -262,8 +262,8 @@ def _deepseek_v4_num_host_pages(
             "use --hicache-ratio instead."
         )
     ratio = server_args.hicache_ratio
-    full_host_pages = max(int(device_full_pages * ratio), device_full_pages + 1)
-    swa_host_pages = max(int(device_swa_pages * ratio), device_swa_pages + 1)
+    full_host_pages = int(device_full_pages * ratio)
+    swa_host_pages = int(device_swa_pages * ratio)
     return full_host_pages, swa_host_pages
 
 

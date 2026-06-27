@@ -80,11 +80,11 @@ class TestFlashInferCommFusion(unittest.TestCase):
             flashinfer_allreduce_fusion_backend="auto", nnodes=2
         )
 
-        # Blackwell: trtllm on single-node, mnnvl on multi-node.
+        # Blackwell: mnnvl on both single-node and multi-node.
         with patch.object(fusion, "is_sm100_supported", return_value=True):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
-                "trtllm",
+                "mnnvl",
             )
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node), "mnnvl"
