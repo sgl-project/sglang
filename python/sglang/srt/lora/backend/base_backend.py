@@ -198,8 +198,19 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         dtype = compute_dtype
         num_experts = base.num_experts
 
+        # Under --enable-dp-attention the MoE runs on DP-GATHERED tokens (the global DP buffer of
+        # length up to max_bs * attn_dp_size), not the per-rank batch. The per-token LoRA routing
+        # buffers below are indexed by that gathered token count, so size them for the gathered
+        # maximum; otherwise the MoE-LoRA kernels read token_lora_mapping / sorted_token_ids past a
+        # per-rank-sized buffer -> cudaErrorIllegalInstruction during cuda-graph capture. Expert- and
+        # adapter-indexed buffers (cumsum_buffer, adapter_enabled, lora_ids) are unaffected.
+        from sglang.srt.layers.dp_attention import get_attention_dp_size
+
+        dp_size = max(1, get_attention_dp_size())
+        max_moe_tokens = max_bs * dp_size
+
         block_size_m = 64
-        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
+        max_num_tokens_padded = max_moe_tokens * top_k + num_experts * (block_size_m - 1)
         max_num_tokens_padded = (
             (max_num_tokens_padded + block_size_m - 1) // block_size_m
         ) * block_size_m
@@ -236,7 +247,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             # LongTensor.  weight_indices itself must stay int32 because the
             # CUDA moe_lora_align kernel casts it to int32_t*.
             "weight_indices_long": torch.zeros(
-                max_bs, dtype=torch.int64, device=device
+                max_moe_tokens, dtype=torch.int64, device=device
             ),
             "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
             "cumsum_buffer": torch.zeros(
@@ -245,14 +256,14 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
                 device=device,
             ),
             "token_mask": torch.empty(
-                (max_loras * max_bs * top_k,),
+                (max_loras * max_moe_tokens * top_k,),
                 dtype=torch.int32,
                 device=device,
             ),
             "max_num_tokens_padded": max_num_tokens_padded,
             "max_num_m_blocks": max_num_m_blocks,
             "token_lora_mapping": torch.full(
-                (max_bs,), -1, dtype=torch.int32, device=device
+                (max_moe_tokens,), -1, dtype=torch.int32, device=device
             ),
         }
 
@@ -294,6 +305,16 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             seg_indptr = batch_info.seg_indptr[: num_moe_segments + 1]
             req_to_lora = batch_info.weight_indices[:num_moe_segments]
 
+        # --enable-dp-attention all-gathers tokens into the MoE, so the MoE-LoRA kernels index
+        # token_lora_mapping by the GATHERED token count (global_dp_buffer_len), not the per-rank
+        # num_tokens. Size the mapping to the gathered count so those reads stay in-bounds (the
+        # per-rank segments still fill only [0, num_tokens); the gathered tail stays -1).
+        moe_num_tokens = (
+            forward_batch.global_dp_buffer_len
+            if getattr(forward_batch, "global_dp_buffer_len", None) is not None
+            else num_tokens
+        )
+
         adapter_enabled, token_lora_mapping = _compute_moe_lora_info(
             num_tokens,
             seg_indptr,
@@ -302,7 +323,20 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             adapter_enabled,
             token_lora_mapping,
             max_len=max_len,
+            mapping_len=moe_num_tokens,
         )
+
+        # Tier-1 (colocate RL, single active adapter): the DP-gathered tail [num_tokens, moe_num_tokens)
+        # covers OTHER dp ranks' tokens, which under colocate RL all use this batch's single adapter.
+        # The per-rank fill above only wrote [0, num_tokens), leaving the tail -1 (adapter-disabled) ->
+        # cross-rank gathered tokens would miss the LoRA delta on this rank's local experts. Broadcast
+        # the per-rank adapter id across the tail so every gathered token gets the adapter (uniform
+        # under a single adapter; padding rows are discarded in the dp-scatter). Multi-adapter batches
+        # are not covered by Tier-1 and keep the -1 tail.
+        if moe_num_tokens > num_tokens and num_tokens > 0:
+            token_lora_mapping[num_tokens:moe_num_tokens].copy_(
+                token_lora_mapping[num_tokens - 1]
+            )
 
         batch_info.moe_lora_info = MoELoRABatchInfo(
             seg_indptr=seg_indptr,
@@ -376,16 +410,28 @@ def _compute_moe_lora_info(
     adapter_enabled: torch.Tensor | None,
     token_lora_mapping: torch.Tensor | None,
     max_len: int,
+    mapping_len: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # ``num_tokens`` is the PER-RANK fill count (segments cover this rank's tokens). ``mapping_len``
+    # is the length of the token_lora_mapping the MoE-LoRA kernels actually index -- under
+    # --enable-dp-attention the MoE runs on DP-GATHERED tokens (mapping_len = global_dp_buffer_len
+    # >= num_tokens), so the returned mapping must span the gathered count to keep those kernels
+    # in-bounds. The DP-gathered tail [num_tokens, mapping_len) defaults to -1 (adapter-disabled).
+    if mapping_len is None:
+        mapping_len = num_tokens
+    assert mapping_len >= num_tokens
     if token_lora_mapping is not None:
         assert (
-            num_tokens <= token_lora_mapping.shape[0]
-        ), "num_tokens must be less than or equal to the shape of token_lora_mapping"
-        token_lora_mapping = token_lora_mapping[:num_tokens]
+            mapping_len <= token_lora_mapping.shape[0]
+        ), "mapping_len must be less than or equal to the shape of token_lora_mapping"
+        token_lora_mapping = token_lora_mapping[:mapping_len]
     else:
         token_lora_mapping = torch.empty(
-            (num_tokens,), dtype=torch.int32, device=seg_indptr.device
+            (mapping_len,), dtype=torch.int32, device=seg_indptr.device
         )
+    if mapping_len > num_tokens:
+        # clean the gathered tail before the per-rank fill writes [0, num_tokens)
+        token_lora_mapping.fill_(-1)
 
     if adapter_enabled is not None:
         assert (
@@ -443,8 +489,9 @@ def _compute_moe_lora_info(
         torch.searchsorted(seg_indptr.to(torch.int32), token_positions, right=True) - 1
     )
 
-    token_lora_mapping = torch.index_select(
-        weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping
+    # Fill only the per-rank prefix [0, num_tokens); the gathered tail keeps the -1 set above.
+    torch.index_select(
+        weight_indices.to(torch.int32), 0, req_indices, out=token_lora_mapping[:num_tokens]
     )
 
     return adapter_enabled, token_lora_mapping
