@@ -64,6 +64,25 @@ def _jit_main_k_norm_rope_flashmla_module(
 
 
 @cache_once
+def _jit_main_k_norm_rope_flashmla_bf16_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+):
+    """Main MLA path K kernel (BF16): rmsnorm + RoPE + write BF16 to FlashMLA paged cache."""
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_k_norm_rope_flashmla_bf16"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedKNormRopeFlashMLABF16Kernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant"""
     args = make_cpp_args(dtype, is_arch_support_pdl())
@@ -216,6 +235,25 @@ def fused_k_norm_rope_flashmla(
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     module = _jit_main_k_norm_rope_flashmla_module(
+        kv.dtype, head_dim, rope_dim, page_size
+    )
+    module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)
+
+
+def fused_k_norm_rope_flashmla_bf16(
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    head_dim = kv.shape[-1]
+    rope_dim = freqs_real.shape[-1]
+    module = _jit_main_k_norm_rope_flashmla_bf16_module(
         kv.dtype, head_dim, rope_dim, page_size
     )
     module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

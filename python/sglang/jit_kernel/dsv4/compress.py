@@ -42,6 +42,22 @@ def _jit_compress_norm_rope_module(
 
 
 @cache_once
+def _jit_compress_norm_rope_bf16_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+) -> Module:
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name(f"fused_norm_rope_v2_bf16"),
+        *args,
+        cuda_files=[f"deepseek_v4/fused_norm_rope_v2.cuh"],
+        cuda_wrappers=[("forward", f"FusedNormRopeBF16Kernel<{args}>::forward")],
+    )
+
+
+@cache_once
 def _jit_compress_module(
     head_dim: int,
     dtype_buffer: torch.dtype,
@@ -368,6 +384,36 @@ def compress_norm_rope_store(
     )
     fn = module.forward_fp4 if use_fp4 else module.forward
     fn(
+        kv,
+        plan[1],
+        norm_weight,
+        norm_eps,
+        freq_cis,
+        out_loc,
+        kvcache,
+        plan.is_decode,
+        plan.compress_ratio,
+    )
+
+
+def compress_norm_rope_store_bf16(
+    kv: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+    use_fp4: bool = False,
+    bf16_store: bool = False,
+) -> None:
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_compress_norm_rope_bf16_module(
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+    )
+    module.forward(
         kv,
         plan[1],
         norm_weight,

@@ -264,7 +264,6 @@ def _flash_mla_with_kvcache_sched_meta(
 
     if topk is not None:
         assert not causal, "causal must be False when sparse attention is enabled"
-        assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
         out, lse, new_tile_scheduler_metadata, new_num_splits = (
             torch.ops.sgl_kernel.sparse_decode_fwd.default(
                 q,

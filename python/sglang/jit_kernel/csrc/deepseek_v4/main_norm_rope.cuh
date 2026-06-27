@@ -411,6 +411,149 @@ struct FusedKNormRopeFlashMLAKernel {
 };
 
 // ============================================================================
+// FlashMLA BF16 variant: same as above but stores NoPE as BF16 (no FP8 quant).
+// Cache layout: 1024 bytes/token = 896 BF16 nope + 128 BF16 rope.
+// ============================================================================
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
+K_KERNEL void fused_k_norm_rope_flashmla_bf16(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
+  using namespace device;
+
+  constexpr int64_t kVecSize = 2;
+  constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
+  constexpr int64_t kBytesPerToken = 1024;
+  // BF16 mode: pages are tightly packed (no 576-byte alignment padding).
+  constexpr int64_t kPageBytes = kBytesPerToken << kPageBits;
+  static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * kVecSize);
+  static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
+  using Storage = AlignedVector<DType, kVecSize>;
+  using Float2 = AlignedVector<float, kVecSize>;
+
+  const auto tx = threadIdx.x;
+  const auto warp_id = tx / kWarpThreads;
+  const auto lane_id = tx % kWarpThreads;
+  const auto work_id = blockIdx.x;
+  if (work_id >= params.batch_size) return;
+
+  const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
+  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
+  const auto out_loc = params.out_loc[work_id];
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  PDLWaitPrimary<kUsePDL>();
+  Float2 data, freq;
+
+  // part 1: norm
+  {
+    __shared__ float partial_sums[kFusedKNumWarps];
+
+    Storage input_vec, weight_vec;
+    input_vec.load(input_ptr, tx);
+    weight_vec.load(params.kv_weight, tx);
+    if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
+
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto x = cast<float>(input_vec[i]);
+      sum_of_squares += x * x;
+    }
+    const auto warp_sum = warp::reduce_sum(sum_of_squares);
+    if (lane_id == 0) partial_sums[warp_id] = warp_sum;
+    __syncthreads();
+    sum_of_squares = warp::reduce_sum<kFusedKNumWarps>(partial_sums[lane_id % kFusedKNumWarps]);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto x = cast<float>(input_vec[i]);
+      const auto w = cast<float>(weight_vec[i]);
+      data[i] = x * norm_factor * w;
+    }
+  }
+
+  const int32_t page = out_loc >> kPageBits;
+  const int32_t offset = out_loc & ((1 << kPageBits) - 1);
+  const auto page_ptr = params.kvcache + page * kPageBytes;
+  const auto value_ptr = page_ptr + offset * kBytesPerToken;
+
+  PDLTriggerSecondary<kUsePDL>();
+
+  // part 2: rope on warp 7 (BF16 store), direct BF16 store on warps 0..6.
+  if (warp_id == kRopeWarp) {
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto freq_real = freq[0];
+    const auto freq_imag = freq[1];
+    data[0] = x_real * freq_real - x_imag * freq_imag;
+    data[1] = x_real * freq_imag + x_imag * freq_real;
+    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+    const auto rope_ptr = value_ptr + 896;
+    reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+  } else {
+    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = result;
+  }
+}
+
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+struct FusedKNormRopeFlashMLABF16Kernel {
+  static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
+  static constexpr int64_t kBytesPerToken = 1024;
+  // BF16 mode: no 576-byte alignment padding. Pages are tightly packed.
+  static constexpr int64_t kPageBytes = kBytesPerToken * kPageSize;
+  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+  static_assert(1 << kLogPageSize == kPageSize);
+  static_assert(kHeadDim == 512 && kRopeDim == 64, "BF16 FlashMLA layout requires (512, 64)");
+
+  template <typename PosT>
+  static constexpr auto kernel =
+      fused_k_norm_rope_flashmla_bf16<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL>;
+
+  static void forward(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({B, kHeadDim}).with_strides({-1, 1}).with_dtype<DType>().with_device(device_).verify(kv);
+    TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(kv_weight);
+    TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({B}).with_dtype<int32_t, int64_t>(pos_dtype).with_device(device_).verify(positions);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(out_loc);
+    TensorMatcher({-1, -1}).with_strides({kPageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    if (batch_size == 0) return;
+
+    const auto params = FusedKNormRopeFlashMLAParams{
+        .kv = kv.data_ptr(),
+        .kv_weight = kv_weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .out_loc = static_cast<const int32_t*>(out_loc.data_ptr()),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .kv_stride_batch = kv.stride(0),
+        .batch_size = batch_size,
+        .eps = eps,
+    };
+    const auto k_int32 = kernel<int32_t>;
+    const auto k_int64 = kernel<int64_t>;
+    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
+    LaunchKernel(batch_size, kFusedKBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(k, params);
+  }
+};
+
+// ============================================================================
 // Indexer Q kernel: warp-per-(token, head) RoPE + Hadamard + fp8 act-quant.
 // ============================================================================
 

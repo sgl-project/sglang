@@ -26,13 +26,18 @@ def _jit_metadata_module():
 
 @cache_once
 def _jit_fused_store_module(
-    name: Literal["flashmla", "indexer"],
+    name: Literal["flashmla", "flashmla_bf16", "indexer"],
     input_dtype: torch.dtype,
     index_dtype: torch.dtype,
     page_size: int,
 ):
     args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
-    cname = "FlashMLA" if name == "flashmla" else "Indexer"
+    if name == "flashmla":
+        cname = "FlashMLA"
+    elif name == "flashmla_bf16":
+        cname = "FlashMLABf16"
+    else:
+        cname = "Indexer"
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
     return load_jit(
         make_name("store_" + name),
@@ -57,7 +62,7 @@ def fused_store_cache(
     indices: torch.Tensor,
     *,
     page_size: int,
-    type: Literal["flashmla", "indexer"],
+    type: Literal["flashmla", "flashmla_bf16", "indexer"],
 ) -> None:
     if is_hip_runtime():
         from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache

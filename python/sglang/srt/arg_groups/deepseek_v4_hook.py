@@ -15,6 +15,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
     server_args.attention_backend = "dsv4"
     server_args.page_size = 256
+    if server_args.kv_cache_dtype == "bf16":
+        server_args.kv_cache_dtype = "bfloat16"
     if server_args.kv_cache_dtype == "auto":
         server_args.kv_cache_dtype = "fp8_e4m3"
         logger.warning(

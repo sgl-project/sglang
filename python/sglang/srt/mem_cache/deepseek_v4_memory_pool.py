@@ -6,14 +6,21 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.dsv4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.dsv4 import (
+    fused_k_norm_rope_flashmla,
+    fused_k_norm_rope_flashmla_bf16,
+    fused_store_cache,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
 from sglang.srt.layers.attention.dsv4 import (
     index_buf_accessor as dsv4_index_buf_accessor,
 )
-from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+    NopeBf16RopeBf16Pack,
+    SetKBf16,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -71,10 +78,24 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
 
-        self.scale_pad = 1
-        self.quantize_block_size = 64
-        self.rope_storage_dtype = torch.bfloat16
-        self.k_with_scale_buffer_dtype = torch.int8
+        server_args = get_global_server_args()
+        self.is_bf16_kv_cache = server_args.kv_cache_dtype == "bfloat16"
+
+        # DSV4 always uses uint8 byte-level storage for KV cache
+        # (regardless of compute dtype), because the layout is custom
+        # (nope + rope + optional scales packed as raw bytes)
+        self.store_dtype = torch.uint8
+
+        if self.is_bf16_kv_cache:
+            self.scale_pad = 0
+            self.quantize_block_size = qk_nope_head_dim  # no quantization
+            self.rope_storage_dtype = torch.bfloat16
+            self.k_with_scale_buffer_dtype = torch.int8
+        else:
+            self.scale_pad = 1
+            self.quantize_block_size = 64
+            self.rope_storage_dtype = torch.bfloat16
+            self.k_with_scale_buffer_dtype = torch.int8
         self._create_buffers()
 
     def _create_buffers(self):
@@ -92,24 +113,41 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
-        dim_per_token = (
-            self.qk_nope_head_dim
-            + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
-            + self.qk_nope_head_dim // self.quantize_block_size
-            + self.scale_pad
-        )
-        return dim_per_token
+        if self.is_bf16_kv_cache:
+            # BF16 layout: nope (448*2=896) + rope (64*2=128) = 1024 bytes/token
+            return self.qk_nope_head_dim * 2 + self.qk_rope_head_dim * 2
+        else:
+            # FP8 layout: nope (448 fp8) + rope (64*2=128 bf16) + scales (7+1) = 584
+            dim_per_token = (
+                self.qk_nope_head_dim
+                + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
+                + self.qk_nope_head_dim // self.quantize_block_size
+                + self.scale_pad
+            )
+            return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
-        self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
+        if self.is_bf16_kv_cache:
+            # BF16 mode: no padding needed. The 576-byte alignment is specific
+            # to FP8 per-token layout. BF16 pages (1024 bytes/token) are already
+            # well-aligned and padding would break contiguity needed for .view().
+            self.bytes_per_page_padded = bytes_per_page_non_padded
+        else:
+            self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
-        assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
-            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
-        )
+        if self.is_bf16_kv_cache:
+            assert bytes_per_token == 448 * 2 + 64 * 2, (
+                "DSV4 BF16 KV layout: qk_nope_head_dim BF16 (448*2) + qk_rope_head_dim BF16 "
+                "(64*2) = 1024 bytes/token"
+            )
+        else:
+            assert bytes_per_token == 448 + 64 * 2 + 8, (
+                "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+                "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            )
         assert self.store_dtype == torch.uint8
 
         return torch.zeros(
@@ -123,14 +161,22 @@ class DeepSeekV4SingleKVPool(KVCache):
         self,
         layer_id: int,
         loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        cache_nope_fp8_rope_bf16_pack,
     ):
-        dsv4_index_buf_accessor.SetKAndS.execute(
-            pool=self,
-            buf=self.kv_buffer[layer_id],
-            loc=loc,
-            nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
-        )
+        if isinstance(cache_nope_fp8_rope_bf16_pack, NopeBf16RopeBf16Pack):
+            SetKBf16.execute(
+                pool=self,
+                buf=self.kv_buffer[layer_id],
+                loc=loc,
+                nope_bf16_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
+            )
+        else:
+            dsv4_index_buf_accessor.SetKAndS.execute(
+                pool=self,
+                buf=self.kv_buffer[layer_id],
+                loc=loc,
+                nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
+            )
 
     def set_key_buffer_fused(
         self,
@@ -143,14 +189,14 @@ class DeepSeekV4SingleKVPool(KVCache):
             cache=self.kv_buffer[layer_id],
             indices=loc,
             page_size=self.page_size,
-            type="flashmla",
+            type="flashmla_bf16" if self.is_bf16_kv_cache else "flashmla",
         )
 
     def get_key_buffer(self, layer_id: int):
-        if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
-
-        return self.kv_buffer[layer_id]
+        # Always return the raw uint8 buffer. DSV4 uses custom byte-level packing
+        # (nope + rope + optional scales). The caller is responsible for viewing
+        # as the appropriate dtype (e.g., bf16) when needed by downstream kernels.
+        return self.kv_buffer[layer_id - self.start_layer]
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
         raise NotImplementedError()
@@ -933,7 +979,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self,
         layer_id: int,
         loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        cache_nope_fp8_rope_bf16_pack,
     ) -> None:
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
@@ -954,7 +1000,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self,
         layer_id: int,
         loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        cache_nope_fp8_rope_bf16_pack,
     ) -> None:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
@@ -1013,7 +1059,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self,
         layer_id: int,
         swa_loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        cache_nope_fp8_rope_bf16_pack,
     ) -> None:
         self.swa_kv_pool.set_key_buffer(
             self._swa_local_layer_id(layer_id), swa_loc, cache_nope_fp8_rope_bf16_pack
@@ -1043,7 +1089,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        fused_k_norm_rope_flashmla(
+        kernel_fn = (
+            fused_k_norm_rope_flashmla_bf16
+            if self.swa_kv_pool.is_bf16_kv_cache
+            else fused_k_norm_rope_flashmla
+        )
+        kernel_fn(
             kv=kv,
             kv_weight=kv_weight,
             eps=eps,

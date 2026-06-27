@@ -660,4 +660,193 @@ struct FusedNormRopeKernel {
   }
 };
 
+// ----------------------------------------------------------------------------
+// FlashMLA BF16 variant: kHeadDim = 512, 1 token per *block* (256 threads).
+// Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
+// Cache layout: 1024 bytes/token = 448 BF16 nope (896 bytes) + 64 BF16 rope (128 bytes).
+// No FP8 quantization; all values stored as BF16 directly.
+// ----------------------------------------------------------------------------
+template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL>
+FLASHMLA_KERNEL void fused_norm_rope_flashmla_bf16(const __grid_constant__ FusedNormRopeStoreParams params) {
+  using namespace device;
+  using enum ForwardMode;
+
+  constexpr int64_t kHeadDim = 512;
+  constexpr int64_t kRopeDim = 64;
+  constexpr int64_t kVecSize = 2;
+  constexpr uint32_t kRopeWarp = kNumWarps - 1;  // warp 7 handles rope
+  constexpr int64_t kBytesPerToken = 1024;       // 512 * sizeof(bf16)
+  // BF16 mode: no 576-byte alignment padding. Pages are tightly packed.
+  constexpr int64_t kPageBytes = kBytesPerToken << kPageBits;
+  static_assert(kHeadDim == kBlockSize * kVecSize);
+  static_assert(kRopeDim == kWarpThreads * kVecSize);
+  static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
+  using Storage = AlignedVector<DType, kVecSize>;
+  using Float2 = AlignedVector<float, kVecSize>;
+
+  const auto tx = threadIdx.x;
+  const auto warp_id = tx / kWarpThreads;
+  const auto lane_id = tx % kWarpThreads;
+  const auto work_id = blockIdx.x;
+
+  if (work_id >= params.num_tokens) return;
+
+  const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
+  int32_t position;
+  int32_t out_loc;
+  if constexpr (kMode == CompressExtend) {
+    const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
+    if (plan.is_invalid()) return;
+    position = plan.seq_len - params.compress_ratio;
+    out_loc = params.out_loc[plan.ragged_id];
+  } else if constexpr (kMode == CompressDecode) {
+    const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
+    if (plan.seq_len % params.compress_ratio != 0) return;
+    position = plan.seq_len - params.compress_ratio;
+    out_loc = params.out_loc[work_id];
+  } else {
+    static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
+  }
+  const auto freqs_cis = params.freqs_cis + position * kRopeDim;
+
+  PDLWaitPrimary<kUsePDL>();
+  Float2 data, freq;
+
+  // part 1: norm. Each thread owns one 2-elem pack (`tx`-th pack of input).
+  {
+    __shared__ float partial_sums[kNumWarps];
+
+    Storage input_vec, weight_vec;
+    input_vec.load(input, tx);
+    weight_vec.load(params.weight, tx);
+    if (warp_id == kRopeWarp) freq.load(freqs_cis, lane_id);
+
+    float sum_of_squares = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_input = cast<float>(input_vec[i]);
+      sum_of_squares += fp32_input * fp32_input;
+    }
+
+    const auto warp_sum = warp::reduce_sum(sum_of_squares);
+    if (lane_id == 0) partial_sums[warp_id] = warp_sum;
+    __syncthreads();
+    sum_of_squares = warp::reduce_sum<kNumWarps>(partial_sums[lane_id % kNumWarps]);
+    const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
+
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) {
+      const auto fp32_input = cast<float>(input_vec[i]);
+      const auto fp32_weight = cast<float>(weight_vec[i]);
+      data[i] = fp32_input * norm_factor * fp32_weight;
+    }
+  }
+
+  const int32_t page = out_loc >> kPageBits;
+  const int32_t offset = out_loc & ((1 << kPageBits) - 1);
+  const auto page_ptr = params.kvcache + page * kPageBytes;
+  // BF16 layout: each token occupies 1024 bytes contiguously
+  // [0..895] = 448 BF16 nope values, [896..1023] = 64 BF16 rope values
+  const auto value_ptr = page_ptr + offset * kBytesPerToken;
+
+  PDLTriggerSecondary<kUsePDL>();
+
+  // part 2: rope on the rope warp (BF16 store), or direct BF16 store for nope warps.
+  if (warp_id == kRopeWarp) {
+    // Apply RoPE rotation, then store as BF16 in the rope region.
+    const auto x_real = data[0];
+    const auto x_imag = data[1];
+    const auto freq_real = freq[0];
+    const auto freq_imag = freq[1];
+    data[0] = x_real * freq_real - x_imag * freq_imag;
+    data[1] = x_real * freq_imag + x_imag * freq_real;
+    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+    // Rope region starts at byte offset 896 (= 448 * sizeof(bf16))
+    const auto rope_ptr = value_ptr + 896;
+    reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+  } else {
+    // Non-rope warps: store NoPE values directly as BF16 (no quantization).
+    // Thread tx covers elements [tx*2, tx*2+1] of the 512-dim vector.
+    // Warps 0-6 cover elements [0, 447] which is exactly the NoPE region.
+    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = result;
+  }
+}
+
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+struct FusedNormRopeBF16Kernel {
+  static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
+  static constexpr bool kIsIndexer = (kHeadDim == 128);
+  // BF16: all values stored as bf16, bytes_per_token = head_dim * sizeof(bf16)
+  // Indexer: 128 * 2 = 256 bytes/token; FlashMLA: 512 * 2 = 1024 bytes/token
+  static constexpr int64_t kBytesPerToken = kHeadDim * 2;
+  // BF16 mode: no 576-byte alignment padding. Pages are tightly packed.
+  static constexpr int64_t kPageBytes = kBytesPerToken * kPageSize;
+
+  static_assert(kRopeDim == 64 && kHeadDim == 512, "BF16 fused norm+rope supports FlashMLA (head_dim=512) only");
+  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+
+  template <ForwardMode kMode>
+  static constexpr auto select_kernel() {
+    static_assert(!kIsIndexer, "BF16 indexer kernel removed; indexer uses FP8");
+    return fused_norm_rope_flashmla_bf16<DType, kMode, kLogPageSize, kUsePDL>;
+  }
+
+  static void forward(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView plan,
+      const tvm::ffi::TensorView weight,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      const bool is_decode,
+      const uint32_t compress_ratio) {
+    using namespace host;
+    using enum ForwardMode;
+
+    const auto mode = static_cast<ForwardMode>(is_decode);
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({N, kHeadDim}).with_dtype<DType>().with_device(device_).verify(input);
+    TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(weight);
+    TensorMatcher({-1, kRopeDim}).with_dtype<float>().with_device(device_).verify(freqs_cis);
+    TensorMatcher({-1}).with_dtype<int64_t>().with_device(device_).verify(out_loc);
+    TensorMatcher({-1, -1}).with_strides({kPageBytes, 1}).with_dtype<uint8_t>().with_device(device_).verify(kvcache);
+
+    switch (mode) {
+      case CompressExtend:
+        compress::verify_plan_c(plan, N, device_);
+        RuntimeCheck(out_loc.size(0) >= N.unwrap());
+        break;
+      case CompressDecode:
+        compress::verify_plan_d(plan, N, device_);
+        RuntimeCheck(out_loc.size(0) == N.unwrap());
+        break;
+    }
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) return;
+    const auto params = FusedNormRopeStoreParams{
+        .input = input.data_ptr(),
+        .handle = plan.data_ptr(),
+        .weight = weight.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .out_loc = static_cast<const int64_t*>(out_loc.data_ptr()),
+        .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
+        .eps = eps,
+        .compress_ratio = compress_ratio,
+        .num_tokens = num_tokens,
+    };
+    // Indexer packs kNumWarps tokens per block; FlashMLA uses 1 block per token
+    const uint32_t num_blocks = kIsIndexer ? div_ceil(num_tokens, kNumWarps) : num_tokens;
+    const auto device = device_.unwrap();
+    const auto kernel = mode == CompressExtend ? select_kernel<CompressExtend>() : select_kernel<CompressDecode>();
+    LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
 }  // namespace

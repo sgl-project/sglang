@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
+    split_nope_bf16_rope_bf16,
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
@@ -495,6 +496,7 @@ class DeepseekV4AttnBackend(
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        self.is_bf16_kv_cache = model_runner.server_args.kv_cache_dtype == "bfloat16"
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
@@ -1299,7 +1301,10 @@ class DeepseekV4AttnBackend(
                 cache_k=swa_k,
             )
         else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+            if self.is_bf16_kv_cache:
+                swa_k_pack = split_nope_bf16_rope_bf16(swa_k)
+            else:
+                swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
@@ -1351,6 +1356,9 @@ class DeepseekV4AttnBackend(
             swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
                 swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
             )
+            # FlashMLA BF16 kernel expects bf16 dtype; reinterpret the uint8 buffer
+            if self.is_bf16_kv_cache:
+                swa_k_cache = swa_k_cache.view(torch.bfloat16)
 
             if extra_k_cache is not None:
                 page_sizes = {
@@ -1365,6 +1373,8 @@ class DeepseekV4AttnBackend(
                     1,
                     k_cache_total_dim,
                 )
+                if self.is_bf16_kv_cache:
+                    extra_k_cache = extra_k_cache.view(torch.bfloat16)
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
@@ -1441,7 +1451,7 @@ class DeepseekV4AttnBackend(
                     cache_seqlens=None,
                     tile_scheduler_metadata=flashmla_metadata,
                     softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True,
+                    is_fp8_kvcache=not self.is_bf16_kv_cache,
                     indices=swa_page_indices,
                     topk_length=swa_topk_lengths,
                     attn_sink=attn_sink,
@@ -1451,6 +1461,128 @@ class DeepseekV4AttnBackend(
                 )[0]
 
             o = o.squeeze(1)
+            # # PyTorch reference implementation of flash_mla sparse decode attention
+            # # for BF16 KV cache. Correctness-first; performance will be addressed
+            # # later with a dedicated FlashMLA kernel for SM100.
+            # #
+            # # q: (batch_size, 1, num_heads_q, head_dim)
+            # # swa_k_cache: (num_pages, page_size, 1, head_dim) bf16
+            # # swa_page_indices: (batch_size, 1, topk) -- encodes page_idx * page_size + offset
+            # # swa_topk_lengths: (batch_size,)
+            # # extra_k_cache: (num_pages, extra_page_size, 1, head_dim) bf16 or None
+            # # extra_indices: (batch_size, 1, extra_topk) or None
+            # # extra_topk_lengths: (batch_size,) or None
+            # # attn_sink: (num_heads_q,) float32
+
+            # batch_size = q.shape[0]
+            # num_heads_q = q.shape[2]  # q is (B, 1, H, D)
+            # head_dim = q.shape[-1]
+
+            # # Flatten swa_k_cache: (num_pages, page_size, 1, head_dim) -> (total_tokens, head_dim)
+            # flat_swa_kv = swa_k_cache.reshape(
+            #     -1, head_dim
+            # )  # (num_pages * page_size, head_dim)
+
+            # # Gather SWA KV tokens using indices
+            # # swa_page_indices: (batch_size, 1, topk)
+            # swa_topk = swa_page_indices.shape[-1]
+            # flat_swa_indices = swa_page_indices.reshape(
+            #     batch_size, swa_topk
+            # )  # (B, topk)
+
+            # # Mark invalid indices (negative) and clamp for safe gather
+            # swa_valid_mask = flat_swa_indices >= 0  # (B, topk)
+            # safe_swa_indices = flat_swa_indices.clamp(min=0)  # (B, topk)
+
+            # # Gather: (B, topk, head_dim)
+            # gathered_swa_kv = flat_swa_kv[safe_swa_indices.reshape(-1)].reshape(
+            #     batch_size, swa_topk, head_dim
+            # )
+
+            # # Build topk validity mask from swa_topk_lengths
+            # topk_range = torch.arange(swa_topk, device=q.device).unsqueeze(
+            #     0
+            # )  # (1, topk)
+            # swa_length_mask = topk_range < swa_topk_lengths.unsqueeze(1)  # (B, topk)
+            # swa_mask = swa_valid_mask & swa_length_mask  # (B, topk)
+
+            # # Handle extra KV cache (C4 or C128 compressed tokens)
+            # if extra_k_cache is not None and extra_indices is not None:
+            #     flat_extra_kv = extra_k_cache.reshape(-1, head_dim)
+            #     extra_topk = extra_indices.shape[-1]
+            #     flat_extra_indices = extra_indices.reshape(batch_size, extra_topk)
+
+            #     extra_valid_mask = flat_extra_indices >= 0
+            #     safe_extra_indices = flat_extra_indices.clamp(min=0)
+
+            #     gathered_extra_kv = flat_extra_kv[
+            #         safe_extra_indices.reshape(-1)
+            #     ].reshape(batch_size, extra_topk, head_dim)
+
+            #     extra_range = torch.arange(extra_topk, device=q.device).unsqueeze(0)
+            #     extra_length_mask = extra_range < extra_topk_lengths.unsqueeze(1)
+            #     extra_mask = extra_valid_mask & extra_length_mask  # (B, extra_topk)
+
+            #     # Concatenate SWA and extra KV tokens
+            #     all_kv = torch.cat(
+            #         [gathered_swa_kv, gathered_extra_kv], dim=1
+            #     )  # (B, topk+extra_topk, D)
+            #     all_mask = torch.cat(
+            #         [swa_mask, extra_mask], dim=1
+            #     )  # (B, topk+extra_topk)
+            # else:
+            #     all_kv = gathered_swa_kv  # (B, topk, D)
+            #     all_mask = swa_mask  # (B, topk)
+
+            # # Compute attention scores
+            # # q: (B, 1, num_heads_q, head_dim) -> (B, num_heads_q, 1, head_dim)
+            # q_for_attn = q.squeeze(1).unsqueeze(2)  # (B, num_heads_q, 1, head_dim)
+            # # all_kv: (B, total_kv, head_dim) -> (B, 1, total_kv, head_dim) broadcast over heads
+            # kv_for_attn = all_kv.unsqueeze(1)  # (B, 1, total_kv, head_dim)
+
+            # # scores: (B, num_heads_q, 1, total_kv)
+            # scores = (
+            #     torch.matmul(q_for_attn, kv_for_attn.transpose(-2, -1))
+            #     * self.softmax_scale
+            # )
+
+            # # Apply mask: set invalid positions to -inf
+            # # all_mask: (B, total_kv) -> (B, 1, 1, total_kv)
+            # attn_mask = all_mask.unsqueeze(1).unsqueeze(2)
+            # scores = scores.masked_fill(~attn_mask, float("-inf"))
+
+            # # Softmax
+            # attn_weights = torch.softmax(
+            #     scores, dim=-1
+            # )  # (B, num_heads_q, 1, total_kv)
+            # # Handle all-masked rows (NaN from softmax of all -inf)
+            # attn_weights = attn_weights.nan_to_num(0.0)
+
+            # # Compute output: (B, num_heads_q, 1, head_dim_v)
+            # # V = KV[:, :head_dim_v]
+            # v_for_attn = kv_for_attn[
+            #     ..., : self.head_dim_v
+            # ]  # (B, 1, total_kv, head_dim_v)
+            # o = torch.matmul(
+            #     attn_weights, v_for_attn
+            # )  # (B, num_heads_q, 1, head_dim_v)
+            # o = o.squeeze(2)  # (B, num_heads_q, head_dim_v)
+
+            # # Apply attn_sink scaling: output *= exp(lse) / (exp(lse) + exp(attn_sink))
+            # # which equals sigmoid(lse - attn_sink)
+            # if attn_sink is not None:
+            #     # Compute lse = log(sum(exp(scores))) for valid positions
+            #     # scores: (B, num_heads_q, 1, total_kv)
+            #     lse = torch.logsumexp(scores, dim=-1).squeeze(-1)  # (B, num_heads_q)
+            #     # attn_sink: (num_heads_q,) -> (1, num_heads_q)
+            #     sink = attn_sink.unsqueeze(0)  # (1, num_heads_q)
+            #     # scale = exp(lse) / (exp(lse) + exp(attn_sink)) = sigmoid(lse - attn_sink)
+            #     scale = torch.sigmoid(lse - sink)  # (B, num_heads_q)
+            #     o = o * scale.unsqueeze(-1)  # (B, num_heads_q, head_dim_v)
+
+            # # Ensure output dtype matches input q dtype
+            # o = o.to(q.dtype)
+
             return o
 
         raise NotImplementedError("ragged attention")

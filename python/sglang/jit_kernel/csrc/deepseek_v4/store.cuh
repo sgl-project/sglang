@@ -202,4 +202,74 @@ struct FusedStoreCacheIndexerKernel {
   }
 };
 
+template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
+__global__ void fused_store_flashmla_bf16_cache(const __grid_constant__ FusedStoreCacheParam param) {
+  using namespace device;
+
+  // BF16 layout: 512 bf16 per token = 1024 bytes, no padding
+  constexpr int64_t kPageBytes = 1024 << kPageBits;
+
+  // 256 threads per block, each handles 2 bf16 elements (as bf16x2_t)
+  // 1 block per token, total 256 threads * 2 elems = 512 elems = full token
+  const auto& [input, cache, indices, num_tokens] = param;
+  const uint32_t bid = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const auto index = static_cast<const IndicesT*>(indices)[bid];
+  using Float2 = packed_t<Float>;
+  const auto elems = static_cast<const Float2*>(input)[tid + bid * 256];
+
+  // Direct bf16 store - no quantization
+  const int32_t page = index >> kPageBits;
+  const int32_t offset = index & ((1 << kPageBits) - 1);
+  const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+  const auto value_ptr = pointer::offset(page_ptr, offset * 1024);
+  static_cast<Float2*>(value_ptr)[tid] = elems;
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
+struct FusedStoreCacheFlashMLABf16Kernel {
+  static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+  static constexpr int64_t kPageBytes = 1024 * kPageSize;
+  static constexpr auto kernel = fused_store_flashmla_bf16_cache<Float, IndicesT, kLogSize, kUsePDL>;
+
+  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+  static_assert(1 << kLogSize == kPageSize);
+
+  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({N, 512})  // input
+        .with_dtype<Float>()
+        .with_device(device_)
+        .verify(input);
+    TensorMatcher({-1, -1})  // cache
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({N})  // indices
+        .with_dtype<IndicesT>()
+        .with_device(device_)
+        .verify(indices);
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto params = FusedStoreCacheParam{
+        .input = input.data_ptr(),
+        .cache = cache.data_ptr(),
+        .indices = indices.data_ptr(),
+        .num_tokens = num_tokens,
+    };
+    const auto kBlockSize = 256;
+    const auto num_blocks = num_tokens;
+    LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
 }  // namespace
