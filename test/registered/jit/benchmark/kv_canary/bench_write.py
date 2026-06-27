@@ -20,9 +20,13 @@ from sglang.jit_kernel.kv_canary.verify import (
     VerifyOrWriteContext,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
+# AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
+# Note: amd_ci_exec.sh sets SGLANG_IS_IN_CI, so this runs the CI-reduced range
+# (build_fast_matrix_cases via get_benchmark_range), same as CUDA nightly.
+register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
 _MATRIX_NAMES = (

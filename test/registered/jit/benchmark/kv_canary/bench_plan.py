@@ -17,9 +17,11 @@ from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
+# AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
+register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
 _TOTAL_TOKENS_AXIS: list[int] = [256, 4096, 65536, 262144]

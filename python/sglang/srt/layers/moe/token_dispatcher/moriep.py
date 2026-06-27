@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -35,10 +36,6 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 # Blockwise quantization group sizes: number of elements sharing one scale factor
@@ -52,6 +49,11 @@ if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
+
+
+def _should_record_expert_distribution() -> bool:
+    recorder = get_global_expert_distribution_recorder()
+    return recorder.recording or torch.get_device_module().is_current_stream_capturing()
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
@@ -212,8 +214,8 @@ def init_mori_op(
 
     import mori
 
-    world_size = get_moe_expert_parallel_world_size()
-    rank = get_moe_expert_parallel_rank()
+    world_size = get_parallel().moe_ep_size
+    rank = get_parallel().moe_ep_rank
 
     gpu_per_node = 8 if world_size >= 8 else world_size
 
@@ -252,7 +254,10 @@ def init_mori_op(
     data_type = fp8_dtype
     scale_type_size = torch.float32.itemsize
 
-    if dispatch_dtype == DispatchDtype.fp8:
+    if dispatch_dtype == DispatchDtype.bf16:
+        data_type = params_dtype
+        scale_dim = 0
+    elif dispatch_dtype == DispatchDtype.fp8:
         scale_dim = hidden_size // FP8_BLOCK_SIZE
     elif dispatch_dtype == DispatchDtype.fp4:
         # FP4 kernel still takes the original hidden size and do quantization
@@ -634,6 +639,8 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     ):
         done_event: Optional[torch.cuda.Event] = None
 
+        record = _should_record_expert_distribution()
+
         if self._comm_stream:
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream  # comm stream
@@ -668,7 +675,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     topk_weights,
                     scale,
                     topk_ids,
-                    call_local_expert_count=True,
+                    call_local_expert_count=record,
                 )
                 if self.enable_sdma:
                     self.mori_op.dispatch_recv()
@@ -700,16 +707,15 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 topk_weights,
                 scale,
                 topk_ids,
-                call_local_expert_count=True,
+                call_local_expert_count=record,
             )
 
-        # Use low_latency hook instead of normal since mori local_expert_count is
-        # a GPU tensor, while the normal hook expects a Python list (CPU).  The
-        # low_latency path accumulates counts directly on GPU via
-        # _DeepepLowLatencySinglePassGatherer, which is CUDA-graph safe.
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            self.mori_op.local_expert_count
-        )
+        # mori local_expert_count is a GPU tensor; route it through the
+        # low_latency hook only when the recorder is actually active.
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
 
         return (
             packed_recv_hidden,
@@ -888,11 +894,13 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             is mori.ops.EpDispatchCombineKernelType.AsyncLL
         ), "mori asyncll mismatch"
 
-        self.mori_op.dispatch_recv(call_local_expert_count=True)
+        record = _should_record_expert_distribution()
+        self.mori_op.dispatch_recv(call_local_expert_count=record)
 
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            self.mori_op.local_expert_count
-        )
+        if record:
+            get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                self.mori_op.local_expert_count
+            )
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
@@ -1037,7 +1045,7 @@ class MoriEPDispatcher(BaseDispatcher):
         # experts that are not local to this rank.
         self.expert_mask_gpu = None
         if _use_aiter and num_experts is not None and num_local_experts is not None:
-            ep_rank = get_moe_expert_parallel_rank()
+            ep_rank = get_parallel().moe_ep_rank
             expert_mask = torch.zeros(
                 num_experts,
                 device=torch.cuda.current_device(),

@@ -115,7 +115,6 @@ def test_gptq_marlin_gemm(
     assert max_diff < 0.04
 
 
-@pytest.mark.skip(reason="Skip, test pass locally but compiling takes too long in CI")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin fallback tests require CUDA SM8X/SM9X",
@@ -142,7 +141,6 @@ def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90(dtype):
         assert actual_global_scale.item() == 2.0**119
 
 
-@pytest.mark.skip(reason="Skip, test pass locally but compiling takes too long in CI")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin dense numeric test requires CUDA SM80, SM86, or SM90",
