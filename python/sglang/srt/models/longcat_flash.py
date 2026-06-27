@@ -476,7 +476,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         # first_mlp
         hidden_states = self.mlps[0](hidden_states)
         # TP all_reduce
-        if not enable_moe_dense_fully_dp():
+        if not self.enable_moe_dense_fully_dp:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # second_attn
