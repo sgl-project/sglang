@@ -51,43 +51,42 @@ class TopNSigmaLogitProcessor(CustomLogitProcessor):
         if not custom_param_list:
             return logits
 
-        # Collect per-request n-sigma values and their batch indices.
-        n_sigmas = []
-        rows = []
+        batch_size = logits.size(0)
+
+        # Pre-allocate per-row n-sigma and a boolean process_mask so we can
+        # operate on the full logits tensor in-place, avoiding GPU copies that
+        # advanced indexing would create.
+        n_sigmas = [0.0] * batch_size
+        process_mask = [False] * batch_size
         for i, params in enumerate(custom_param_list):
             if not params:
                 continue
             n = params.get("top_n_sigma")
             if n is None or not isinstance(n, (int, float)) or n <= 0:
                 continue
-            n_sigmas.append(n)
-            rows.append(i)
+            n_sigmas[i] = n
+            process_mask[i] = True
 
-        if not rows:
+        if not any(process_mask):
             return logits
 
-        rows_t = torch.tensor(rows, device=logits.device, dtype=torch.long)
-        selected = logits[rows_t]
-        n_sigmas_t = torch.tensor(n_sigmas, device=logits.device, dtype=selected.dtype)
+        n_sigmas_t = torch.tensor(n_sigmas, device=logits.device, dtype=logits.dtype)
+        process_mask_t = torch.tensor(process_mask, device=logits.device, dtype=torch.bool)
 
-        # Compute std once; reuse it for both the edge-case guard and the
-        # threshold formula to avoid scanning the vocab twice.
-        std_all = selected.std(dim=-1, keepdim=True)
+        # Compute std and max once over the full tensor (no row copies).
+        std_all = logits.std(dim=-1, keepdim=True)
+        max_logits = logits.max(dim=-1, keepdim=True).values
 
-        # Skip rows with NaN/Inf logits or all-equal logits (std == 0).
-        finite_mask = torch.isfinite(selected).all(dim=-1).unsqueeze(-1)
+        # Build a combined mask: only rows that are (a) in the process list,
+        # (b) have all-finite logits, and (c) have non-zero std.
+        finite_mask = torch.isfinite(logits).all(dim=-1, keepdim=True)
         nonzero_std_mask = std_all != 0
-        process_mask = finite_mask & nonzero_std_mask
+        guard_mask = process_mask_t.unsqueeze(-1) & finite_mask & nonzero_std_mask
 
-        max_logits = selected.max(dim=-1, keepdim=True).values
         thresholds = max_logits - n_sigmas_t.unsqueeze(-1) * std_all
-
-        # Mask tokens below threshold, only on rows that pass the guards.
-        selected.masked_fill_(
-            (selected < thresholds) & process_mask, float("-inf")
+        logits.masked_fill_(
+            (logits < thresholds) & guard_mask, float("-inf")
         )
-        # Advanced indexing produced a copy; write the modified rows back.
-        logits[rows_t] = selected
         return logits
 
 
@@ -113,7 +112,7 @@ def run_openai():
     """OpenAI-compatible chat completions endpoint."""
     import openai
 
-    client = openai.Client(base_url=url + "/v1", api_key="None")
+    client = openai.OpenAI(base_url=url + "/v1", api_key="None")
     response = client.chat.completions.create(
         model="default",
         messages=[{"role": "user", "content": "List 3 countries and their capitals."}],
