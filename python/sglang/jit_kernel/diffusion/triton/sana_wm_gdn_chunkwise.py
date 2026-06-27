@@ -1732,3 +1732,583 @@ def cam_scan_bidi_chunkwise(
         num_only=True,
     )
     return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
+def fused_gdn_func_chunkwise(
+    qkv,
+    q_inv_rms,
+    k_inv_rms,
+    q_norm_weight,
+    k_norm_weight,
+    rope_cos,
+    rope_sin,
+    beta,
+    decay,
+    F,
+    S,
+    k_scale,
+    eps=1e-6,
+    reverse=False,
+    dot_precision=None,
+):
+    """Single-direction chunkwise GDN — drop-in for `fused_gdn.fused_gdn_func`.
+
+    Computes only one scan direction (Phase B + Phase C × 1) and returns
+    `(num, den)` shape-compatible with the upstream function. dot_precision
+    defaults to this port's Sana-compatible environment precision setting.
+    """
+    if dot_precision is None:
+        dot_precision = _default_dot_prec()
+    direction = 2 if reverse else 1
+    I_P_kv, A, I_P_z, B_z = phase_a(
+        qkv,
+        beta,
+        q_inv_rms,
+        k_inv_rms,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        F=F,
+        S=S,
+        k_scale=k_scale,
+        dot_precision=dot_precision,
+    )
+    M_fwd, z_fwd, M_rev, z_rev = phase_b_triton(
+        I_P_kv,
+        A,
+        I_P_z,
+        B_z,
+        decay,
+        F=F,
+        dot_precision=dot_precision,
+        direction=direction,
+    )
+    M_use = M_rev if reverse else M_fwd
+    z_use = z_rev if reverse else z_fwd
+    num, den = phase_c(
+        qkv, q_inv_rms, q_norm_weight, rope_cos, rope_sin, M_use, z_use, F=F, S=S, dot_precision=dot_precision
+    )
+    return num, den
+
+
+def fused_gdn_stateful_chunkwise(
+    qkv,
+    q_inv_rms,
+    k_inv_rms,
+    q_norm_weight,
+    k_norm_weight,
+    rope_cos,
+    rope_sin,
+    beta,
+    decay,
+    F,
+    S,
+    k_scale,
+    eps=1e-6,
+    reverse=False,
+    init_state_kv=None,
+    init_state_z=None,
+    return_final_state=False,
+    dot_precision=None,
+):
+    """Single-direction chunkwise GDN with optional state cache — drop-in for
+    `fused_gdn.fused_gdn_stateful`. Forward direction supports state load/save
+    (used for autoregressive sampling); reverse direction always runs fresh
+    (per upstream's bidi state-cache convention).
+    """
+    if dot_precision is None:
+        dot_precision = _default_dot_prec()
+    direction = 2 if reverse else 1
+    if reverse and (init_state_kv is not None or return_final_state):
+        raise ValueError(
+            "fused_gdn_stateful_chunkwise: state cache is forward-only (matching "
+            "upstream's bidi convention); pass reverse=False or omit state args."
+        )
+    I_P_kv, A, I_P_z, B_z = phase_a(
+        qkv,
+        beta,
+        q_inv_rms,
+        k_inv_rms,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        F=F,
+        S=S,
+        k_scale=k_scale,
+        dot_precision=dot_precision,
+    )
+    # Pad caller-supplied state from (B,H,D,D)/(B,H,D,1) to (BH, BLOCK_D, BLOCK_D)/(BH, BLOCK_D).
+    # Needed because the state returned by this function is unpadded (B,H,D,D),
+    # but phase_b_triton's kernel expects the padded layout.
+    init_kv_padded, init_z_padded = init_state_kv, init_state_z
+    if init_state_kv is not None:
+        B_, H_, D_in, D_out = init_state_kv.shape
+        BLOCK_D_ = I_P_kv.shape[-1]
+        if D_in != BLOCK_D_ or D_out != BLOCK_D_:
+            pad_in = BLOCK_D_ - D_in
+            pad_out = BLOCK_D_ - D_out
+            init_kv_padded = torch.nn.functional.pad(
+                init_state_kv.transpose(-1, -2).reshape(B_ * H_, D_out, D_in), (0, pad_in, 0, pad_out)
+            ).contiguous()
+        else:
+            init_kv_padded = init_state_kv.transpose(-1, -2).reshape(B_ * H_, BLOCK_D_, BLOCK_D_).contiguous()
+        # z: (B, H, D) or (B, H, D, 1) → (BH, BLOCK_D)
+        z_ = init_state_z.squeeze(-1) if init_state_z.dim() == 4 else init_state_z
+        Bz_, Hz_, Dz_ = z_.shape
+        if Dz_ != BLOCK_D_:
+            init_z_padded = torch.nn.functional.pad(z_.reshape(Bz_ * Hz_, Dz_), (0, BLOCK_D_ - Dz_)).contiguous()
+        else:
+            init_z_padded = z_.reshape(Bz_ * Hz_, Dz_).contiguous()
+    if return_final_state:
+        M_fwd, z_fwd, M_rev, z_rev, final_kv, final_z = phase_b_triton(
+            I_P_kv,
+            A,
+            I_P_z,
+            B_z,
+            decay,
+            F=F,
+            dot_precision=dot_precision,
+            direction=direction,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
+            return_final_state=True,
+        )
+    else:
+        M_fwd, z_fwd, M_rev, z_rev = phase_b_triton(
+            I_P_kv,
+            A,
+            I_P_z,
+            B_z,
+            decay,
+            F=F,
+            dot_precision=dot_precision,
+            direction=direction,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
+        )
+    M_use = M_rev if reverse else M_fwd
+    z_use = z_rev if reverse else z_fwd
+    num, den = phase_c(
+        qkv, q_inv_rms, q_norm_weight, rope_cos, rope_sin, M_use, z_use, F=F, S=S, dot_precision=dot_precision
+    )
+    if return_final_state:
+        B = qkv.shape[0]
+        H = qkv.shape[3]
+        D = qkv.shape[4]
+        BLOCK_D = final_kv.shape[1]
+        state_kv = final_kv.view(B, H, BLOCK_D, BLOCK_D)[:, :, :D, :D].transpose(-1, -2).contiguous()
+        state_z = final_z.view(B, H, BLOCK_D)[:, :, :D].unsqueeze(-1).contiguous()
+        return num, den, state_kv, state_z
+    return num, den
+
+
+def fused_bidi_stateful_chunkwise_shared_phase_a(
+    qkv,
+    q_inv_rms,
+    k_inv_rms,
+    q_norm_weight,
+    k_norm_weight,
+    rope_cos,
+    rope_sin,
+    beta,
+    decay,
+    F,
+    S,
+    k_scale,
+    eps=1e-6,
+    init_state_kv=None,
+    init_state_z=None,
+    dot_precision=None,
+):
+    """Bidi state-cached chunkwise GDN with shared Phase A and combined-history
+    Phase B. Default chunkwise path for ``_fused_statecached_forward``.
+
+    Pipeline (per layer per step):
+      1. Phase A once over qkv  — K/V/RoPE pre-norm; was previously duplicated
+         across two streams.
+      2. Phase B with direction=0 + combined_history=True — single program does
+         fwd then rev; fwd writes M_hist; rev read-add-stores into the same
+         buffer so on exit M_hist[f] = M_fwd[f] + M_rev[f] (same for z).
+         Forward branch loads init_state and saves final state.
+      3. Phase C ONCE on M_hist/z_hist  — Phase C is linear in M/z so
+         `Q @ (M_fwd + M_rev) = Q @ M_fwd + Q @ M_rev`.
+
+    Returns ``(num_combined, den_combined, state_kv, state_z)`` — caller hands
+    the num/den pair to ``fused_bidi_merge(num, None, den, None, eps, gate)``
+    in PRE_SUMMED mode.
+
+    HBM-traffic delta vs the prior 2× Phase C version (per call, B=1 prod):
+      saved : 1× Phase C Q+RoPE pass (~90 MB)
+      saved : one (B,N,H,D) num and (B,H,N) den allocation
+      cost  : Phase B rev does read-add of M_hist (~14 MB extra per layer)
+      net   : ~76 MB saved + 1 fewer kernel launch
+
+    Measured speed on GB10 (sm_121) at H=20, S=920, D=112, vs the prior
+    shared-Phase-A-with-2×-Phase-C path, across production F values:
+      P0 IEEE fp32     : 1.26-1.42× (F=3,6,11; B=1,2)
+      P2 bf16+fp32-st  : 1.57-1.80×
+      P3 bf16+bf16-st  : 1.63-1.96×
+    Correctness cos ≥ 0.999997 across all cells, state_kv exact.
+    """
+    if dot_precision is None:
+        dot_precision = _default_dot_prec()
+
+    I_P_kv, A, I_P_z, B_z = phase_a(
+        qkv,
+        beta,
+        q_inv_rms,
+        k_inv_rms,
+        q_norm_weight,
+        k_norm_weight,
+        rope_cos,
+        rope_sin,
+        F=F,
+        S=S,
+        k_scale=k_scale,
+        dot_precision=dot_precision,
+    )
+
+    init_kv_padded, init_z_padded = init_state_kv, init_state_z
+    if init_state_kv is not None:
+        B_, H_, D_in, D_out = init_state_kv.shape
+        BLOCK_D_ = I_P_kv.shape[-1]
+        if D_in != BLOCK_D_ or D_out != BLOCK_D_:
+            pad_in = BLOCK_D_ - D_in
+            pad_out = BLOCK_D_ - D_out
+            init_kv_padded = torch.nn.functional.pad(
+                init_state_kv.transpose(-1, -2).reshape(B_ * H_, D_out, D_in), (0, pad_in, 0, pad_out)
+            ).contiguous()
+        else:
+            init_kv_padded = init_state_kv.transpose(-1, -2).reshape(B_ * H_, BLOCK_D_, BLOCK_D_).contiguous()
+        z_ = init_state_z.squeeze(-1) if init_state_z.dim() == 4 else init_state_z
+        Bz_, Hz_, Dz_ = z_.shape
+        if Dz_ != BLOCK_D_:
+            init_z_padded = torch.nn.functional.pad(z_.reshape(Bz_ * Hz_, Dz_), (0, BLOCK_D_ - Dz_)).contiguous()
+        else:
+            init_z_padded = z_.reshape(Bz_ * Hz_, Dz_).contiguous()
+
+    # combined_history=True routes the rev contribution into the fwd buffer →
+    # M_hist[f] = M_fwd[f] + M_rev[f]. M_rev/z_rev outputs are placeholders.
+    M_hist, z_hist, _, _, final_kv, final_z = phase_b_triton(
+        I_P_kv,
+        A,
+        I_P_z,
+        B_z,
+        decay,
+        F=F,
+        dot_precision=dot_precision,
+        direction=0,
+        init_state_kv=init_kv_padded,
+        init_state_z=init_z_padded,
+        return_final_state=True,
+        combined_history=True,
+    )
+
+    num, den = phase_c(
+        qkv, q_inv_rms, q_norm_weight, rope_cos, rope_sin, M_hist, z_hist, F=F, S=S, dot_precision=dot_precision
+    )
+
+    B = qkv.shape[0]
+    H = qkv.shape[3]
+    D = qkv.shape[4]
+    BLOCK_D = final_kv.shape[1]
+    state_kv = final_kv.view(B, H, BLOCK_D, BLOCK_D)[:, :, :D, :D].transpose(-1, -2).contiguous()
+    state_z = final_z.view(B, H, BLOCK_D)[:, :, :D].unsqueeze(-1).contiguous()
+    return num, den, state_kv, state_z
+
+
+def cam_scan_chunkwise(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    *,
+    reverse: bool = False,
+    init_state: torch.Tensor | None = None,
+    save_final_state: bool = False,
+    dot_precision: int | None = None,
+):
+    """Drop-in chunkwise replacement for `cam_scan_func`.
+
+    Args mirror `cam_scan_func` exactly:
+      q, k, v: ``(B, H, D, N)`` fp32 contiguous (cam-prep'd: RMSNorm+ReLU+UCPE+RoPE)
+      beta:    ``(B, H, F, S)`` fp32 contiguous
+      decay:   ``(B, H, F)`` fp32 contiguous
+      reverse: bwd flip-and-shift semantics (autograd path); not yet supported.
+      init_state:       optional ``(B*H, BLOCK_D, BLOCK_D)`` fp32 — cross-chunk AR state.
+      save_final_state: when True, also returns ``(out, final_state)``.
+
+    Returns ``out`` of shape ``(B, H, D, N)`` fp32, or
+    ``(out, final_state: (B*H, BLOCK_D, BLOCK_D))`` if save_final_state=True.
+    """
+    assert q.shape == k.shape == v.shape, f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
+    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    assert beta.is_contiguous() and decay.is_contiguous()
+    assert q.dtype == torch.float32, f"cam_scan_chunkwise requires fp32 q/k/v (got {q.dtype})"
+
+    if reverse and (init_state is not None or save_final_state):
+        raise NotImplementedError(
+            "cam_scan_chunkwise: state passing (init_state / save_final_state) is "
+            "only supported for the forward direction (reverse=False). The cam "
+            "branch's anti-causal pass resets per chunk; there is no global "
+            "cross-prefix state to cache for the reverse direction."
+        )
+
+    B, H, D, N = q.shape
+    F = beta.shape[2]
+    assert N % F == 0
+    S = N // F
+    assert beta.shape == (B, H, F, S)
+    assert decay.shape == (B, H, F)
+
+    BLOCK_D = triton.next_power_of_2(D)
+
+    if dot_precision is None:
+        dot_precision = _default_dot_prec()
+
+    # Repack (B, H, D, N) → (B, N, 3, H, D) for chunkwise's qkv layout.
+    # Avoid ``stack(...).permute(...).contiguous()`` because that materializes
+    # two large tensors. Direct packing allocates the destination once.
+    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
+    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
+    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
+    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
+
+    # Identity prep tables — make chunkwise's RMSNorm + RoPE no-ops.
+    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(B=B, N=N, H=H, D=D, device=q.device)
+
+    # Phase A (skip_relu=True for cam-prep'd K; skip_z=True since cam has no Z scan).
+    # k_scale=1.0 because cam_prep already applied K-scale.
+    I_P_kv, A_, I_P_z, B_z = phase_a(
+        qkv,
+        beta,
+        ones_inv_rms,
+        ones_inv_rms,
+        ones_nw,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        F=F,
+        S=S,
+        k_scale=1.0,
+        norm_eps=1e-5,
+        dot_precision=dot_precision,
+        skip_relu=True,
+        skip_z=True,
+    )
+
+    # Phase B (forward direction only; cam supports init_state on fwd, save_final
+    # on fwd; no rev). Pads (B*H, D, D) ↔ (B*H, BLOCK_D, BLOCK_D) inline.
+    init_kv_padded = None
+    init_z_padded = None
+    if init_state is not None:
+        if init_state.shape != (B * H, BLOCK_D, BLOCK_D):
+            raise ValueError(
+                f"cam_scan_chunkwise: init_state shape {tuple(init_state.shape)} "
+                f"!= expected (B*H, BLOCK_D, BLOCK_D) = {(B * H, BLOCK_D, BLOCK_D)}"
+            )
+        if init_state.dtype != torch.float32:
+            raise ValueError(f"cam_scan_chunkwise: init_state must be fp32 (got {init_state.dtype}).")
+        if not init_state.is_contiguous():
+            raise ValueError("cam_scan_chunkwise: init_state must be contiguous.")
+        # Cam stores state as M[K_feat, V_feat]. Chunkwise's Phase B kernel reads
+        # state with offs_dd = i*BLOCK_D + j where i is the fwd loop's M row.
+        # Storage layout matches cam's (row-major (D_K, D_V)), so a direct cast
+        # to fp32 contiguous is enough — no transpose needed.
+        init_kv_padded = init_state.to(torch.float32).contiguous()
+        # No Z state in cam — pass zeros to satisfy phase_b_triton.
+        init_z_padded = torch.zeros(B * H, BLOCK_D, device=q.device, dtype=torch.float32)
+
+    direction = 2 if reverse else 1
+    if save_final_state:
+        M_fwd, z_fwd_out, M_rev, z_rev_out, final_kv, _final_z = phase_b_triton(
+            I_P_kv,
+            A_,
+            I_P_z,
+            B_z,
+            decay,
+            F=F,
+            dot_precision=dot_precision,
+            direction=direction,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
+            return_final_state=True,
+            skip_z=True,
+        )
+    else:
+        M_fwd, z_fwd_out, M_rev, z_rev_out = phase_b_triton(
+            I_P_kv,
+            A_,
+            I_P_z,
+            B_z,
+            decay,
+            F=F,
+            dot_precision=dot_precision,
+            direction=direction,
+            init_state_kv=init_kv_padded,
+            init_state_z=init_z_padded,
+            skip_z=True,
+        )
+
+    # For reverse (flip-and-shift bwd), Phase B's reverse mode produces M_rev
+    # such that M_rev[F-1] = 0 and M_rev[t] = state computed from K/V at frames
+    # {F-1, F-2, ..., t+1} — exactly cam's REVERSE=1 semantics.
+    M_use = M_rev if reverse else M_fwd
+    z_use = z_rev_out if reverse else z_fwd_out
+
+    # Phase C — num-only (NUM_ONLY=True skips den compute + store).
+    # z is unused with NUM_ONLY but still required by the kernel signature.
+    num_out, _ = phase_c(
+        qkv,
+        ones_inv_rms,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        M_use,
+        z_use,
+        F=F,
+        S=S,
+        dot_precision=dot_precision,
+        skip_relu=True,
+        num_only=True,
+    )
+
+    # Convert chunkwise output (B, N, H, D) → cam's (B, H, D, N) layout, fp32.
+    out = num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
+
+    if save_final_state:
+        return out, final_kv  # final_kv already (B*H, BLOCK_D, BLOCK_D) fp32
+    return out
+
+
+def cam_scan_pair_chunkwise(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta_fwd: torch.Tensor,
+    decay_fwd: torch.Tensor,
+    beta_rev: torch.Tensor,
+    decay_rev: torch.Tensor,
+    *,
+    dot_precision: int | None = None,
+) -> torch.Tensor:
+    """Sum a forward camera scan and a separately-gated reverse scan.
+
+    Chunk-causal camera attention needs the reverse branch to use boundary-masked
+    gates while the forward branch uses the original gates. This wrapper keeps
+    that exact behavior but shares QKV packing, identity tables, and the final
+    output layout conversion across the two scans.
+    """
+    assert q.shape == k.shape == v.shape, f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
+    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    assert beta_fwd.is_contiguous() and decay_fwd.is_contiguous()
+    assert beta_rev.is_contiguous() and decay_rev.is_contiguous()
+    assert q.dtype == torch.float32, f"cam_scan_pair_chunkwise requires fp32 q/k/v (got {q.dtype})"
+
+    B, H, D, N = q.shape
+    F = beta_fwd.shape[2]
+    assert N % F == 0
+    S = N // F
+    assert beta_fwd.shape == beta_rev.shape == (B, H, F, S)
+    assert decay_fwd.shape == decay_rev.shape == (B, H, F)
+
+    if dot_precision is None:
+        dot_precision = _default_dot_prec()
+
+    qkv = torch.empty(B, N, 3, H, D, device=q.device, dtype=q.dtype)
+    qkv[:, :, 0].copy_(q.permute(0, 3, 1, 2))
+    qkv[:, :, 1].copy_(k.permute(0, 3, 1, 2))
+    qkv[:, :, 2].copy_(v.permute(0, 3, 1, 2))
+
+    ones_inv_rms, ones_nw, ones_cos, zeros_sin = _cam_identity_tables(B=B, N=N, H=H, D=D, device=q.device)
+
+    I_P_kv, A_, I_P_z, B_z = phase_a(
+        qkv,
+        beta_fwd,
+        ones_inv_rms,
+        ones_inv_rms,
+        ones_nw,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        F=F,
+        S=S,
+        k_scale=1.0,
+        norm_eps=1e-5,
+        dot_precision=dot_precision,
+        skip_relu=True,
+        skip_z=True,
+    )
+    M_fwd, z_fwd, _, _ = phase_b_triton(
+        I_P_kv,
+        A_,
+        I_P_z,
+        B_z,
+        decay_fwd,
+        F=F,
+        dot_precision=dot_precision,
+        direction=1,
+        skip_z=True,
+    )
+    num_out, _ = phase_c(
+        qkv,
+        ones_inv_rms,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        M_fwd,
+        z_fwd,
+        F=F,
+        S=S,
+        dot_precision=dot_precision,
+        skip_relu=True,
+        num_only=True,
+    )
+    del I_P_kv, A_, I_P_z, B_z, M_fwd, z_fwd
+
+    I_P_kv, A_, I_P_z, B_z = phase_a(
+        qkv,
+        beta_rev,
+        ones_inv_rms,
+        ones_inv_rms,
+        ones_nw,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        F=F,
+        S=S,
+        k_scale=1.0,
+        norm_eps=1e-5,
+        dot_precision=dot_precision,
+        skip_relu=True,
+        skip_z=True,
+    )
+    _, _, M_rev, z_rev = phase_b_triton(
+        I_P_kv,
+        A_,
+        I_P_z,
+        B_z,
+        decay_rev,
+        F=F,
+        dot_precision=dot_precision,
+        direction=2,
+        skip_z=True,
+    )
+    phase_c(
+        qkv,
+        ones_inv_rms,
+        ones_nw,
+        ones_cos,
+        zeros_sin,
+        M_rev,
+        z_rev,
+        F=F,
+        S=S,
+        dot_precision=dot_precision,
+        num_out=num_out,
+        accumulate=True,
+        skip_relu=True,
+        num_only=True,
+    )
+    return num_out.permute(0, 2, 3, 1).contiguous().to(torch.float32)
