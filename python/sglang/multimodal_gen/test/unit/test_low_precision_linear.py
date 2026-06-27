@@ -40,20 +40,6 @@ class TestTeNvfp4LinearTargetPolicy(unittest.TestCase):
             self.assertTrue(te_nvfp4_linear_target_enabled("ltx2.video_ffn"))
             self.assertTrue(te_nvfp4_linear_target_enabled("wan.video_ffn"))
 
-    def test_legacy_env_enables_only_callers_that_accept_it(self):
-        with patch.dict(
-            "os.environ",
-            {"SGLANG_LTX2_TE_NVFP4_VIDEO_FFN": "1"},
-            clear=True,
-        ):
-            self.assertTrue(
-                te_nvfp4_linear_target_enabled(
-                    "ltx2.video_ffn",
-                    legacy_env_vars=("SGLANG_LTX2_TE_NVFP4_VIDEO_FFN",),
-                )
-            )
-            self.assertFalse(te_nvfp4_linear_target_enabled("wan.video_ffn"))
-
     def test_cpu_input_short_circuits_before_te_or_distributed_setup(self):
         runner = TeNvfp4LinearRunner(target="unit.test")
         layer = nn.Linear(4, 4)

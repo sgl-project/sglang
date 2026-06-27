@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -31,15 +30,7 @@ def _target_tokens(value: str | None) -> set[str]:
     }
 
 
-def te_nvfp4_linear_target_enabled(
-    target: str,
-    *,
-    legacy_env_vars: tuple[str, ...] = (),
-) -> bool:
-    for env_var in legacy_env_vars:
-        if get_bool_env_var(env_var):
-            return True
-
+def te_nvfp4_linear_target_enabled(target: str) -> bool:
     tokens = _target_tokens(os.getenv(TE_NVFP4_LINEAR_TARGETS_ENV))
     normalized_target = target.strip().lower()
     return "*" in tokens or "all" in tokens or normalized_target in tokens
@@ -48,10 +39,9 @@ def te_nvfp4_linear_target_enabled(
 def maybe_get_te_nvfp4_linear_runner(
     target: str,
     *,
-    legacy_env_vars: tuple[str, ...] = (),
     pad_m_to: int = 16,
 ) -> TeNvfp4LinearRunner | None:
-    if not te_nvfp4_linear_target_enabled(target, legacy_env_vars=legacy_env_vars):
+    if not te_nvfp4_linear_target_enabled(target):
         return None
     return TeNvfp4LinearRunner(target=target, pad_m_to=pad_m_to)
 

@@ -54,7 +54,6 @@ ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
 
 _LTX2_TE_NVFP4_VIDEO_FFN_TARGET = "ltx2.video_ffn"
-_LTX2_TE_NVFP4_VIDEO_FFN_ENV = "SGLANG_LTX2_TE_NVFP4_VIDEO_FFN"
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
 
 
@@ -868,7 +867,6 @@ class LTX2FeedForward(nn.Module):
         mult: int = 4,
         quant_config: QuantizationConfig | None = None,
         te_nvfp4_target: str | None = None,
-        te_nvfp4_legacy_env_vars: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         if dim_out is None:
@@ -893,10 +891,7 @@ class LTX2FeedForward(nn.Module):
             and inner_dim == 16384
         ):
             self._te_nvfp4_linear: TeNvfp4LinearRunner | None = (
-                maybe_get_te_nvfp4_linear_runner(
-                    te_nvfp4_target,
-                    legacy_env_vars=te_nvfp4_legacy_env_vars,
-                )
+                maybe_get_te_nvfp4_linear_runner(te_nvfp4_target)
             )
         else:
             self._te_nvfp4_linear = None
@@ -1050,7 +1045,6 @@ class LTX2TransformerBlock(nn.Module):
             dim_out=dim,
             quant_config=quant_config,
             te_nvfp4_target=_LTX2_TE_NVFP4_VIDEO_FFN_TARGET,
-            te_nvfp4_legacy_env_vars=(_LTX2_TE_NVFP4_VIDEO_FFN_ENV,),
         )
         self.audio_ff = LTX2FeedForward(
             audio_dim,
