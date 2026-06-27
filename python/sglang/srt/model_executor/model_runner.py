@@ -1162,9 +1162,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_tokens,
             )
         except Exception as e:
-            logger.warning(
-                "NVFP4 KV cache calibration warmup failed; first real prefill "
-                "will remain the fallback for auto-calibration. Error: %s",
+            # A failed warmup silently drops us onto the first-real-prefill fallback,
+            # which under-samples the per-channel KV max (esp. K) and materially
+            # DEGRADES NVFP4 KV quality (measured ~-9pt GSM8K on Gemma-4-12B, with an
+            # elevated invalid/garble rate). The usual culprit is a build missing the
+            # dp_attention imports used by this warmup (NameError on DpPaddingMode /
+            # set_dp_buffer_len). Log loudly so a broken/stale build is caught instead
+            # of silently serving degraded KV.
+            logger.error(
+                "NVFP4 KV cache calibration warmup FAILED (%s). Falling back to "
+                "first-real-prefill auto-calibration, which under-samples the KV max "
+                "and DEGRADES NVFP4 KV accuracy (measured ~-9pt GSM8K on Gemma-4-12B, "
+                "with elevated invalid/garble). Fix the warmup (e.g. ensure the "
+                "dp_attention imports are present / rebuild a current image) or ship "
+                "calibrated k_scale/v_scale in the checkpoint.",
                 e,
             )
         finally:
