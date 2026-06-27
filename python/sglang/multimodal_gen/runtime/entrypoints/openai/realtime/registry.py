@@ -5,20 +5,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
-    RealtimeModelAdapter,
+    BaseRealtimeModelAdapter,
 )
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-_REALTIME_ADAPTER_REGISTRY: dict[type, type[RealtimeModelAdapter]] = {}
+_REALTIME_ADAPTER_REGISTRY: dict[type, type[BaseRealtimeModelAdapter]] = {}
 _BUILTIN_ADAPTERS_REGISTERED = False
 
 
 def register_realtime_model_adapter(
     pipeline_config_cls: type,
-    adapter_cls: type[RealtimeModelAdapter],
+    adapter_cls: type[BaseRealtimeModelAdapter],
 ) -> None:
     _REALTIME_ADAPTER_REGISTRY[pipeline_config_cls] = adapter_cls
 
@@ -31,20 +31,30 @@ def _register_builtin_realtime_model_adapters() -> None:
     from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
         LingBotWorldCausalDMDConfig,
     )
+    from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
+        SanaWMRealtimeConfig,
+    )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.lingbot_world_realtime_adapter import (
         LingBotWorldRealtimeAdapter,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.sana_wm_realtime_adapter import (
+        SanaWMRealtimeAdapter,
     )
 
     register_realtime_model_adapter(
         LingBotWorldCausalDMDConfig,
         LingBotWorldRealtimeAdapter,
     )
+    register_realtime_model_adapter(
+        SanaWMRealtimeConfig,
+        SanaWMRealtimeAdapter,
+    )
     _BUILTIN_ADAPTERS_REGISTERED = True
 
 
 def get_realtime_model_adapter(
     server_args: ServerArgs,
-) -> RealtimeModelAdapter:
+) -> BaseRealtimeModelAdapter:
     _register_builtin_realtime_model_adapters()
 
     pipeline_config = server_args.pipeline_config

@@ -98,6 +98,38 @@ def normalize_tool_content(role: str, content):
     return content
 
 
+def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
+    """Parse OpenAI tool call arguments for chat templates."""
+    try:
+        parsed_arguments = orjson.loads(arguments)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError(
+            "Assistant tool call function.arguments must be valid JSON."
+        ) from exc
+
+    if not isinstance(parsed_arguments, dict):
+        raise ValueError(
+            "Assistant tool call function.arguments must be a JSON object."
+        )
+
+    return parsed_arguments
+
+
+def normalize_assistant_tool_call_arguments(message: Dict[str, Any]) -> None:
+    """Normalize assistant history tool call arguments in-place."""
+    if message.get("role") != "assistant" or not isinstance(
+        message.get("tool_calls"), list
+    ):
+        return
+
+    for item in message["tool_calls"]:
+        function = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(function, dict):
+            continue
+        if "arguments" in function and isinstance(function["arguments"], str):
+            function["arguments"] = parse_tool_call_arguments(function["arguments"])
+
+
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
     vid_vals = []
@@ -328,6 +360,11 @@ class OpenAIServingChat(OpenAIServingBase):
             delta = content["text"][offset:]
             stream_offsets[index] = len(content["text"])
 
+        # Attach logprobs to the first chunk emitted this step (reasoning,
+        # tool-call, or content) so they aren't dropped when a parser is active
+        # nor duplicated across chunks; flush any leftover at the end.
+        remaining_logprobs = choice_logprobs
+
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
@@ -348,8 +385,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
 
         # Handle tool calls
         if request.tool_choice != "none" and request.tools and self.tool_call_parser:
@@ -391,9 +430,35 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     index=index,
                     content=delta,
-                    logprobs=choice_logprobs,
+                    logprobs=remaining_logprobs,
                     usage=usage,
                 )
+                remaining_logprobs = None
+
+        # Flush logprobs still unattached this step — only when a parser is
+        # active, since _process_tool_call_stream may consume the delta and emit
+        # no content chunk. On the plain path an empty-delta step has no chunk
+        # to attach to either way, and a standalone empty-delta logprobs chunk
+        # is not a shape clients expect.
+        if remaining_logprobs is not None and (
+            self.reasoning_parser or self.tool_call_parser
+        ):
+            usage = None
+            if continuous_usage_stats:
+                usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens.get(index, 0),
+                    reasoning_tokens=reasoning_tokens.get(index, 0),
+                    completion_tokens=completion_tokens.get(index, 0),
+                ).model_dump()
+
+            yield build_sse_content(
+                chunk_id=content["meta_info"]["id"],
+                created=int(time.time()),
+                model=request.model,
+                index=index,
+                logprobs=remaining_logprobs,
+                usage=usage,
+            )
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
@@ -547,6 +612,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
@@ -564,7 +630,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
 
-        self._patch_mistral_skip_special_tokens(request)
+        self._patch_reasoning_skip_special_tokens(request)
 
         thinking_mode = self._get_reasoning_from_request(request)
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
@@ -651,8 +717,12 @@ class OpenAIServingChat(OpenAIServingBase):
         thinking_mode = (
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
+        messages = [msg.model_dump() for msg in request.messages]
+        for message in messages:
+            normalize_assistant_tool_call_arguments(message)
+
         prompt_ids = self._encode_messages(
-            [msg.model_dump() for msg in request.messages], request, thinking_mode
+            copy.deepcopy(messages), request, thinking_mode
         )
 
         if prompt_ids is not None:
@@ -660,7 +730,7 @@ class OpenAIServingChat(OpenAIServingBase):
             pass
         elif self.chat_encoding_spec is not None:
             # dsv4/dsv32 encoding path
-            messages = [msg.model_dump() for msg in request.messages]
+            messages = copy.deepcopy(messages)
 
             # dsv4/dsv32 are text-only and consume string content; flatten
             # OpenAI parts-list content here so the encoder sees a plain string.
@@ -730,10 +800,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
-            for message in request.messages:
-                if message.content is None:
-                    message.content = ""
-                msg_dict = message.model_dump()
+            for msg_dict in copy.deepcopy(messages):
+                if msg_dict.get("content") is None:
+                    msg_dict["content"] = ""
 
                 # Process content based on detected template format
                 processed_msg = process_content_for_template_format(
@@ -748,24 +817,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 processed_msg["content"] = normalize_tool_content(
                     processed_msg["role"], processed_msg.get("content")
                 )
-
-                # per the Transformers docs & maintainers, tool call arguments in
-                # assistant-role messages with tool_calls need to be dicts not JSON str -
-                # this is how tool-use chat templates will expect them moving forwards
-                # so, for messages that have tool_calls, parse the string (which we get
-                # from openAI format) to dict
-                if (
-                    processed_msg["role"] == "assistant"
-                    and "tool_calls" in processed_msg
-                    and isinstance(processed_msg["tool_calls"], list)
-                ):
-                    for item in processed_msg["tool_calls"]:
-                        if "arguments" in item["function"] and isinstance(
-                            item["function"]["arguments"], str
-                        ):
-                            item["function"]["arguments"] = orjson.loads(
-                                item["function"]["arguments"]
-                            )
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -974,6 +1025,9 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        image_tokens = {}
+        audio_tokens = {}
+        video_tokens = {}
 
         stream_started = False
         try:
@@ -1000,6 +1054,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                image_tokens[index] = content["meta_info"].get("image_tokens", 0)
+                audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
+                video_tokens[index] = content["meta_info"].get("video_tokens", 0)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -1142,6 +1199,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if include_usage:
+                # Multimodal tokens are per-prompt (input side), so aggregate
+                # once per prompt (first choice), matching prompt/cached semantics.
+                total_image_tokens = sum(
+                    tok for idx, tok in image_tokens.items() if idx % request.n == 0
+                )
+                total_audio_tokens = sum(
+                    tok for idx, tok in audio_tokens.items() if idx % request.n == 0
+                )
+                total_video_tokens = sum(
+                    tok for idx, tok in video_tokens.items() if idx % request.n == 0
+                )
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     reasoning_tokens,
@@ -1149,6 +1217,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    image_tokens=total_image_tokens,
+                    audio_tokens=total_audio_tokens,
+                    video_tokens=total_video_tokens,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -1304,11 +1375,27 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             choices.append(choice_data)
 
-        # Calculate usage
+        # Calculate usage. Multimodal tokens are per-prompt (input side), so
+        # aggregate once per prompt (stride by n), matching prompt/cached semantics.
+        image_tokens = sum(
+            ret[i]["meta_info"].get("image_tokens", 0)
+            for i in range(0, len(ret), request.n)
+        )
+        audio_tokens = sum(
+            ret[i]["meta_info"].get("audio_tokens", 0)
+            for i in range(0, len(ret), request.n)
+        )
+        video_tokens = sum(
+            ret[i]["meta_info"].get("video_tokens", 0)
+            for i in range(0, len(ret), request.n)
+        )
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+            image_tokens=image_tokens,
+            audio_tokens=audio_tokens,
+            video_tokens=video_tokens,
         )
 
         return ChatCompletionResponse(
@@ -1546,17 +1633,128 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
-    def _patch_mistral_skip_special_tokens(
+    def _patch_reasoning_skip_special_tokens(
         self, request: ChatCompletionRequest
     ) -> None:
-        """Mistral uses special tokens ([THINK]/[/THINK]) for reasoning markers,
-        which get stripped when skip_special_tokens=True."""
+        """Keep parser-specific reasoning markers in the decoded text.
+
+        Some reasoning parsers rely on special-token delimiters that would be
+        removed during detokenization when ``skip_special_tokens=True``.
+        """
+        if self.reasoning_parser == "apertus2509":
+            request.skip_special_tokens = False
+
         if (
             self.reasoning_parser in ["mistral"]
             and request.reasoning_effort is not None
             and request.reasoning_effort != "none"
         ):
             request.skip_special_tokens = False
+
+    def wrap_reasoning_history(self, reasoning_text: str) -> str:
+        """Wrap prior-turn reasoning in the detector's own start/end tokens.
+
+        Pulling the delimiters from the detector keeps adapters in lockstep
+        with any future parser that ships non-``<think>`` markers — Mistral's
+        ``[THINK]``, Gemma4's ``think_start_self_label = "thought\\n"``, etc.
+        Falling back to a plain string is unsafe: it would let prior
+        thinking text reach a non-reasoning model as ordinary assistant
+        content, so the caller must surface this state, not paper over it.
+        """
+        if self._reasoning_detector is None:
+            raise ValueError(
+                "Cannot rewrap thinking history: no reasoning detector is "
+                "configured for this model"
+            )
+        d = self._reasoning_detector
+        return (
+            f"{d.think_start_token}{d.think_start_self_label}"
+            f"{reasoning_text}\n{d.think_end_token}"
+        )
+
+    def _reasoning_default_mode(self) -> Optional[str]:
+        if self._reasoning_detector is None:
+            return None
+        return self._reasoning_detector.reasoning_default
+
+    def _get_reasoning_toggle_param(self) -> Optional[str]:
+        """Resolve the chat-template kwarg that toggles reasoning, if any."""
+        config = self.template_manager.reasoning_config
+        if config is not None:
+            return config.toggle_param
+
+        mode = self._reasoning_default_mode()
+        if mode in ("thinking", "enable_thinking"):
+            return mode
+        if mode in ("explicit_thinking", "explicit_enable_thinking"):
+            return mode.replace("explicit_", "")
+        return None
+
+    def apply_reasoning_enabled(
+        self, request: ChatCompletionRequest, enabled: bool
+    ) -> None:
+        """Force the request into the requested reasoning-on/off mode.
+
+        Mirrors the read-side logic in ``_get_reasoning_from_request``;
+        the two must stay in sync. Always-on models cannot be disabled,
+        so explicit ``enabled=False`` raises rather than silently leaving
+        reasoning on.
+        """
+        if not self.reasoning_parser:
+            if enabled:
+                raise ValueError(
+                    "Anthropic thinking is not supported for models without "
+                    "a reasoning parser"
+                )
+            return
+
+        if self.reasoning_parser == "hunyuan":
+            request.reasoning_effort = "medium" if enabled else "no_think"
+            return
+
+        config = self.template_manager.reasoning_config
+        is_mistral = (config is not None and config.special_case == "mistral") or (
+            config is None and self._reasoning_default_mode() == "mistral"
+        )
+        if is_mistral:
+            request.reasoning_effort = "medium" if enabled else "none"
+            return
+
+        is_always_on = (config is not None and config.special_case == "always") or (
+            config is None and self._reasoning_default_mode() == "always"
+        )
+        if is_always_on:
+            if not enabled:
+                raise ValueError(
+                    f"Reasoning parser '{self.reasoning_parser}' is always-on "
+                    f"and cannot be disabled via Anthropic thinking"
+                )
+            return
+
+        toggle_param = self._get_reasoning_toggle_param()
+        # The read side (``_get_reasoning_from_request``) returns False
+        # whenever ``config.toggle_param is None`` OR
+        # ``config.default_enabled is None``. The write side must mirror
+        # both conditions: if ``default_enabled`` is unset we cannot
+        # actually honor an ``enabled=True`` request even when the toggle
+        # name itself is resolvable, so writing the kwarg would set up the
+        # template to emit reasoning tokens while the parser ignores them
+        # (literal ``<think>`` markers leak into the assistant text).
+        config = self.template_manager.reasoning_config
+        read_side_supported = toggle_param is not None and (
+            config is None or config.default_enabled is not None
+        )
+        if not read_side_supported:
+            if not enabled:
+                return
+            raise ValueError(
+                f"Anthropic thinking is not supported for reasoning parser "
+                f"'{self.reasoning_parser}'"
+            )
+
+        chat_template_kwargs = dict(request.chat_template_kwargs or {})
+        chat_template_kwargs[toggle_param] = enabled
+        request.chat_template_kwargs = chat_template_kwargs
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.

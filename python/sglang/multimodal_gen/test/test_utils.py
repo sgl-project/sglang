@@ -21,6 +21,7 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -33,7 +34,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "50aa0d4d5d4d260302d74b80d97747efd0f0ae45"
+SGL_TEST_FILES_CI_DATA_REVISION = "4a271ef34602043f19d253f0d30a5f653fe11325"
+
+if current_platform.is_npu():
+    SGL_TEST_FILES_CI_DATA_REVISION = "670d66a8a290b62c0c3c077b3e9b0f4a4d9a44e7"
+
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -51,7 +56,14 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND = (
 SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND = (
     f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated/ascend"
 )
+
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+
+if current_platform.is_npu():
+    SGL_TEST_FILES_CONSISTENCY_GT_BASE = (
+        SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND
+    )
+
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
@@ -153,6 +165,12 @@ DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers
 
 # MOVA video generation models
 DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
+
+# SANA-WM world model (TI2V with optional camera conditioning)
+DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirectional"
+DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/SANA-WM_streaming"
+)
 
 
 def print_value_formatted(description: str, value: int | float | str):
@@ -977,29 +995,58 @@ def _remote_consistency_gt_candidates(
     return [(filename, f"{base_url}/{filename}") for filename in filenames]
 
 
-def _remote_file_exists(url: str) -> bool:
-    for method in ("head", "get"):
-        try:
-            if method == "head":
-                resp = requests.head(url, timeout=10, allow_redirects=True)
-            else:
-                resp = requests.get(
-                    url,
-                    timeout=10,
-                    allow_redirects=True,
-                    headers={"Range": "bytes=0-0"},
-                    stream=True,
-                )
+def _is_ascend_consistency_case(case_id: str) -> bool:
+    return "npu" in case_id
+
+
+def _remote_file_exists(url: str) -> bool | None:
+    for _ in range(3):
+        for method in ("head", "get"):
             try:
-                if resp.status_code in (200, 206):
-                    return True
-                if resp.status_code not in (403, 405, 429) and resp.status_code < 500:
-                    return False
+                if method == "head":
+                    resp = requests.head(url, timeout=30, allow_redirects=True)
+                else:
+                    resp = requests.get(
+                        url,
+                        timeout=30,
+                        allow_redirects=True,
+                        headers={"Range": "bytes=0-0"},
+                        stream=True,
+                    )
+                try:
+                    if resp.status_code in (200, 206):
+                        return True
+                    if resp.status_code == 404:
+                        return False
+                    if (
+                        resp.status_code not in (403, 405, 429)
+                        and resp.status_code < 500
+                    ):
+                        return False
+                finally:
+                    resp.close()
+            except requests.RequestException:
+                pass
+    return None
+
+
+def _load_remote_gt_image(url: str) -> np.ndarray:
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            resp = requests.get(url, timeout=60)
+            try:
+                if resp.status_code == 200:
+                    image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                    return np.array(image)
+                last_error = FileNotFoundError(f"GT image not found: {url}")
+                if resp.status_code not in (403, 429) and resp.status_code < 500:
+                    break
             finally:
                 resp.close()
-        except requests.RequestException:
-            pass
-    return False
+        except requests.RequestException as exc:
+            last_error = exc
+    raise FileNotFoundError(f"GT image not found: {url}") from last_error
 
 
 def _find_remote_consistency_gt_files(
@@ -1008,22 +1055,34 @@ def _find_remote_consistency_gt_files(
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
-    if case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
+    if _is_ascend_consistency_case(case_id):
+        bases = (
+            SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND,
+            SGL_TEST_FILES_CONSISTENCY_GT_BASE,
+        )
+    elif case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
         bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
     else:
         # Avoid accidentally comparing non-comparable CI cases against official GT.
-        bases = (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
+        bases = (SGL_TEST_FILES_CONSISTENCY_GT_BASE,)
     for base_url in bases:
         candidates = _remote_consistency_gt_candidates(
             base_url, case_id, num_gpus, is_video, output_format
         )
         if is_video:
-            if all(_remote_file_exists(url) for _, url in candidates):
+            exists = [_remote_file_exists(url) for _, url in candidates]
+            if all(status is not False for status in exists):
                 return candidates
         else:
+            uncertain_candidate = None
             for filename, url in candidates:
-                if _remote_file_exists(url):
+                exists = _remote_file_exists(url)
+                if exists is True:
                     return [(filename, url)]
+                if exists is None and uncertain_candidate is None:
+                    uncertain_candidate = (filename, url)
+            if uncertain_candidate is not None:
+                return [uncertain_candidate]
     return []
 
 
@@ -1097,10 +1156,7 @@ def load_consistency_gt(
                 f"GT image not found for {case_id}. Tried: {', '.join(filenames)}"
             )
         for _, url in remote_files:
-            resp = requests.get(url, timeout=30)
-            if resp.status_code != 200:
-                raise FileNotFoundError(f"GT image not found: {url}")
-            images.append(np.array(Image.open(io.BytesIO(resp.content)).convert("RGB")))
+            images.append(_load_remote_gt_image(url))
         source_dir = remote_files[0][1].rsplit("/", 1)[0]
         logger.info(f"Loaded {len(images)} GT images for {case_id} from {source_dir}")
 

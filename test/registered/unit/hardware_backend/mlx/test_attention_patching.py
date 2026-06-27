@@ -384,6 +384,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
     def test_mlx_scheduler_init_overlap_keeps_future_map_relay(self):
         from sglang.srt.managers import scheduler as scheduler_module
+        from sglang.srt.managers.overlap_utils import RelayPayload
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -396,7 +397,8 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         scheduler.server_args = SimpleNamespace(
             enable_two_batch_overlap=False,
-            disable_piecewise_cuda_graph=True,
+            cuda_graph_config=None,
+            speculative_algorithm=None,
         )
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.req_to_token_pool = ReqToTokenPool(
@@ -416,13 +418,16 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.future_map)
         indices = torch.tensor([1], dtype=torch.int64)
-        scheduler.future_map.stash(indices, torch.tensor([7], dtype=torch.int64))
+        scheduler.future_map.stash(
+            indices, RelayPayload(bonus_tokens=torch.tensor([7], dtype=torch.int64))
+        )
         self.assertEqual(int(scheduler.future_map.output_tokens_buf[1].item()), 7)
 
     def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
         runner = object.__new__(MlxModelRunner)
         runner._req_token_ids = {"r0": [8]}
         runner._decode_step_ct = 0
+        runner._clear_steps = 0
         calls = []
         runner._store_auxiliary_state = lambda req_pool_idx, cache: calls.append(
             (req_pool_idx, cache)
@@ -1125,6 +1130,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         # (deferred input materialization) before launching the forward.
         # Without resolve_forward_inputs in _launch_fresh, input_ids stays
         # None and async_forward_batch_generation_mlx dereferences a None.
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
         class _StopLoop(Exception):
             pass
 
@@ -1151,7 +1158,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             prefill_input_ids_cpu=torch.tensor([1, 2, 3], dtype=torch.int64),
             input_ids=None,
             mix_running_indices=None,
-            is_spec_v2=False,
+            enable_overlap=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
             device="cpu",
         )
         scheduler.get_next_batch_to_run = lambda: batch
@@ -1177,7 +1185,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
-            hisparse_coordinator=None,
+            hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
             req_to_token_pool=None,
             decode_offload_manager=None,
             metrics_collector=None,
@@ -1192,33 +1200,61 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             output_streamer=None,
             abort_request=lambda req: None,
         )
+        # Stub out the methods _handle_finish_state_updated_req calls that
+        # are not relevant to this test.  SchedulerBatchResultProcessor is
+        # @dataclass(slots=True, frozen=True), so patches go on the class.
+        noop_stubs = {
+            "_mamba_prefix_cache_update": lambda *a, **k: None,
+            "_maybe_collect_routed_experts": lambda *a, **k: None,
+            "_maybe_collect_indexer_topk": lambda *a, **k: None,
+            "_maybe_collect_customized_info": lambda *a, **k: None,
+        }
+        saved = {
+            name: getattr(SchedulerBatchResultProcessor, name) for name in noop_stubs
+        }
+        for name, value in noop_stubs.items():
+            setattr(SchedulerBatchResultProcessor, name, value)
         req = SimpleNamespace(
             rid="r0",
             finished=lambda: True,
             multimodal_inputs=None,
             session=None,
             return_routed_experts=False,
+            mamba_lazy_is_insert=True,
             time_stats=SimpleNamespace(
                 set_completion_time=lambda: events.append(("completion", "r0"))
             ),
         )
+        batch = SimpleNamespace()
+        result = SimpleNamespace()
+        i = 0
+        logits_output = SimpleNamespace(customized_info=None)
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
+        original_get_server_args = batch_result_processor_module.get_global_server_args
 
-        def fake_release_kv_cache(release_req, tree_cache):
+        def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
             events.append(("release", release_req.rid))
             self.assertIs(tree_cache, processor.tree_cache)
 
         batch_result_processor_module.release_kv_cache = fake_release_kv_cache
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
+        batch_result_processor_module.get_global_server_args = lambda: SimpleNamespace(
+            enable_mamba_extra_buffer_lazy=lambda: False
+        )
         try:
-            SchedulerBatchResultProcessor._handle_finished_req(
-                processor, req, 0, SimpleNamespace(customized_info=None)
+            SchedulerBatchResultProcessor._handle_finish_state_updated_req(
+                processor, req, batch, result, i, logits_output
             )
         finally:
+            for name, original in saved.items():
+                setattr(SchedulerBatchResultProcessor, name, original)
             batch_result_processor_module.release_kv_cache = original_release
             batch_result_processor_module.get_global_indexer_capturer = (
                 original_get_indexer
+            )
+            batch_result_processor_module.get_global_server_args = (
+                original_get_server_args
             )
 
         self.assertEqual(

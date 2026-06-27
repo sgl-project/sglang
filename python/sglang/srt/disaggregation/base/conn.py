@@ -18,12 +18,17 @@ class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
     DSA = "dsa"
+    # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
+    # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
+    SWA_RING = "swa_ring"
 
 
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.
     transfer_latency_s: Optional[float] = None
+    # Backends that cannot isolate allocation wait latency can leave this as None.
+    alloc_latency_s: Optional[float] = None
     transfer_total_bytes: Optional[int] = None
 
 
@@ -95,7 +100,6 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -151,7 +155,6 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
-
     @abstractmethod
     def __init__(
         self,

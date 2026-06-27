@@ -305,7 +305,12 @@ python -m sglang.bench_serving \
   --max-concurrency 32
 ```
 
-<Note>`--dataset-name random` samples token IDs from the ShareGPT dataset to generate realistic input; the first run downloads ShareGPT from Hugging Face automatically. Set `export HF_ENDPOINT=https://hf-mirror.com` if network is not available.</Note>
+<Note>
+`--dataset-name random` samples token IDs from the ShareGPT dataset to generate realistic input; the first run downloads ShareGPT from Hugging Face automatically.
+
+1. If you have network issues, set `export HF_ENDPOINT=https://hf-mirror.com` to use domestic mirror.
+2. If downloading still fails, manually download the dataset file `ShareGPT_V3_unfiltered_cleaned_split.json` locally, upload it to your server, then specify the file directory via `--dataset-path` to run offline.
+</Note>
 
 <Tip>Set `--random-range-ratio 1` for fixed input/output lengths (recommended for consistent comparisons) or `0` (default) for uniform distribution. Add `--request-rate` to control the request rate. For all backends, datasets, and advanced options, see the full [Bench Serving Guide](/docs/developer_guide/bench_serving).</Tip>
 
@@ -353,7 +358,7 @@ Max ITL (ms):                            2229.30
 
 #### SGLang Serving Benchmark Result — Complete Reference
 
-The output format is **hardcoded in `bench_serving.py`. All formatting decisions — including column widths, alignment, and decimal precision — are statically defined in the source and cannot be changed via command-line arguments.
+The output format is **hardcoded in `bench_serving.py`**. All formatting decisions — including column widths, alignment, and decimal precision — are statically defined in the source and cannot be changed via command-line arguments.
 
 ##### Test Configuration
 

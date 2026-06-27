@@ -25,6 +25,11 @@ from torch.nn.modules.module import _IncompatibleKeys
 
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
+    attach_bitsandbytes_4bit_quant_states,
+    build_bitsandbytes_4bit_quant_states,
+    split_bitsandbytes_4bit_state,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
@@ -51,6 +56,13 @@ _QUANTIZED_DTYPES = (
 _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
 
 
+def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
+    if quant_config is None:
+        return False
+    quant_name_getter = getattr(type(quant_config), "get_name", None)
+    return bool(callable(quant_name_getter) and quant_name_getter() == "bitsandbytes")
+
+
 def _format_dtype_mismatch_summary(
     mismatch_counts: Counter[tuple[torch.dtype, torch.dtype]],
     mismatch_examples: dict[tuple[torch.dtype, torch.dtype], list[str]],
@@ -74,7 +86,10 @@ def _make_param_like(
     try:
         new_param = cls.__new__(cls, tensor, requires_grad=False)
     except TypeError:
-        new_param = cls.__new__(cls, tensor)
+        try:
+            new_param = cls.__new__(cls, tensor)
+        except TypeError:
+            new_param = nn.Parameter(tensor, requires_grad=False)
     new_param.__dict__.update(actual_param.__dict__)
     new_param.requires_grad = False
     return new_param
@@ -244,11 +259,21 @@ def maybe_load_fsdp_model(
             pin_cpu_memory=pin_cpu_memory,
         )
 
+    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     weight_iterator = safetensors_weights_iterator(weight_dir_list)
     preprocess_loaded_state_dict = getattr(model, "preprocess_loaded_state_dict", None)
     if preprocess_loaded_state_dict is not None:
         weight_iterator = preprocess_loaded_state_dict(weight_iterator)
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+    bnb_quant_states = None
+    if _is_bitsandbytes_quant_config(init_params.get("quant_config")):
+        normal_weights, raw_quant_state = split_bitsandbytes_4bit_state(weight_iterator)
+        bnb_quant_states = build_bitsandbytes_4bit_quant_states(
+            [name for name, _ in normal_weights],
+            raw_quant_state,
+            device,
+            param_names_mapping_fn,
+        )
+        weight_iterator = iter(normal_weights)
     load_model_from_full_model_state_dict(
         model,
         weight_iterator,
@@ -258,6 +283,10 @@ def maybe_load_fsdp_model(
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
+    if bnb_quant_states:
+        attach_bitsandbytes_4bit_quant_states(
+            dict(model.named_parameters()), bnb_quant_states
+        )
 
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
@@ -557,10 +586,15 @@ def load_model_from_full_model_state_dict(
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
 
-        requires_grad = False
-        sharded_sd[target_param_name] = nn.Parameter(
-            sharded_tensor, requires_grad=requires_grad
-        )
+        actual_param = param_dict.get(target_param_name)
+        if actual_param is not None:
+            sharded_sd[target_param_name] = _make_param_like(
+                actual_param, sharded_tensor
+            )
+        else:
+            sharded_sd[target_param_name] = nn.Parameter(
+                sharded_tensor, requires_grad=False
+            )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
 
