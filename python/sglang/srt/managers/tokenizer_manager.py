@@ -1843,6 +1843,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
+        # Monitor this loop's scheduling lag. This process (the lone
+        # TokenizerManager, or each TokenizerWorker in multi-tokenizer mode)
+        # stamps received_time on the same loop, so its lag is the engine-side
+        # view of delay that accrues before received_time. The MultiTokenizerRouter
+        # runs a separate forwarding loop that does not stamp received_time, so it
+        # is intentionally not monitored here.
+        if self.enable_metrics:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.watch_event_loop_lag))
+            )
+
+    async def watch_event_loop_lag(self, interval: float = 0.1):
+        """Sample this process's asyncio event-loop scheduling lag as a metric.
+
+        Each tick asks to sleep ``interval`` seconds. A healthy loop wakes on
+        time (lag ~0); a loop blocked by synchronous work or GIL contention wakes
+        late, and the overrun is how long it was unresponsive -- and thus unable
+        to stamp incoming requests' received_time.
+        """
+        loop = asyncio.get_running_loop()
+        next_tick = loop.time() + interval
+        while True:
+            await asyncio.sleep(interval)
+            now = loop.time()
+            lag = now - next_tick
+            self.metrics_collector.observe_event_loop_lag(lag if lag > 0.0 else 0.0)
+            next_tick = now + interval
+
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
