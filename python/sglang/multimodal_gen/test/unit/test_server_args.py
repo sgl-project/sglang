@@ -829,7 +829,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(
             LTX2PipelineConfig().dit_config.arch_config.enable_packed_qkv_input_a2a
         )
-        self.assertTrue(ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a)
+        self.assertFalse(
+            ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
