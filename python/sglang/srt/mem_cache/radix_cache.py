@@ -791,18 +791,29 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
+        session_evictable = getattr(self, "session_evictable_leaves", None)
+
         if node.evicted or node.lock_ref > 0:
             if node in self.evictable_leaves:
                 self.evictable_leaves.remove(node)
+            if session_evictable is not None:
+                session_evictable.discard(node)
             return
 
         for child in node.children.values():
             if not child.evicted:
                 if node in self.evictable_leaves:
                     self.evictable_leaves.remove(node)
+                if session_evictable is not None:
+                    session_evictable.discard(node)
                 return
 
-        if node not in self.evictable_leaves:
+        # Valid evictable leaf — route to session set or normal set.
+        if session_evictable is not None and getattr(node, "session_ids", None):
+            session_evictable.add(node)
+            if node in self.evictable_leaves:
+                self.evictable_leaves.remove(node)
+        elif node not in self.evictable_leaves:
             self.evictable_leaves.add(node)
 
     def _total_size_helper(self):

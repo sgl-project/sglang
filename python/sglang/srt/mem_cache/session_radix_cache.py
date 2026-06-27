@@ -1,7 +1,13 @@
 """Session radix cache (``--enable-session-radix-cache``): tag each request's KV
 by session_id; ``release_session`` (close) frees a session's tagged KV;
 ``preempt_sessions`` evicts idle sessions under memory pressure via a pluggable
-``SessionEvictionPolicy``."""
+``SessionEvictionPolicy``.
+
+Tiered eviction: session-tagged nodes live in ``session_evictable_leaves`` and
+are never touched by node-level LRU (``evict()``). Only ``preempt_sessions`` and
+``release_session`` free session KV, giving the policy full control over which
+agent pays the re-prefill cost.
+"""
 
 from __future__ import annotations
 
@@ -31,8 +37,14 @@ _CLOSED_SESSION_TOMBSTONE_LIMIT = 8192
 class SessionRadixCacheMixin:
     """Tags radix KV by session id; ``release_session`` (close) frees a session's
     tagged chains. A node holds the set of sessions on it, so a node shared by
-    several sessions is freed only when its last holder closes. Tagged KV is
-    ordinary LRU radix -- no pinning, no open. Mixed into RadixCache."""
+    several sessions is freed only when its last holder closes.
+
+    Tiered eviction: session-tagged nodes are kept in ``session_evictable_leaves``
+    and never appear in ``evictable_leaves``, so node-level LRU (``evict()``)
+    cannot fragment session KV. Only ``preempt_sessions`` / ``release_session``
+    free session nodes, giving the ``SessionEvictionPolicy`` full control.
+
+    Mixed into RadixCache."""
 
     def _reset_session_radix_state(
         self, eviction_policy: SessionEvictionPolicy | None = None
@@ -43,6 +55,7 @@ class SessionRadixCacheMixin:
         self._session_eviction_policy: SessionEvictionPolicy = (
             eviction_policy or LRUSessionEvictionPolicy()
         )
+        self.session_evictable_leaves: set = set()
 
     def _ensure_session_radix_state(self) -> None:
         if not hasattr(self, "_session_leaves"):
@@ -52,6 +65,10 @@ class SessionRadixCacheMixin:
         self._ensure_session_radix_state()
         self._session_eviction_policy = policy
 
+    def _is_evictable_leaf(self, node) -> bool:
+        """True if the node is in any evictable leaf set (normal or session tier)."""
+        return node in self.evictable_leaves or node in self.session_evictable_leaves
+
     # ------------------------------------------------------------------
     # Session lifecycle
     # ------------------------------------------------------------------
@@ -59,6 +76,7 @@ class SessionRadixCacheMixin:
     def register_session(self, session_id: str, priority: int = 0) -> None:
         self._ensure_session_radix_state()
         if session_id is None:
+            logger.warning("register_session called with session_id=None; ignoring")
             return
         self._closed_session_ids.pop(session_id, None)
         self._session_leaves.setdefault(session_id, set())
@@ -76,6 +94,9 @@ class SessionRadixCacheMixin:
     # ------------------------------------------------------------------
 
     def _discard_session_leaf(self, node) -> None:
+        # Always clean up the session tier set — called for all deletions.
+        self.session_evictable_leaves.discard(node)
+
         session_ids = getattr(node, "session_ids", None)
         if not session_ids:
             return
@@ -127,6 +148,9 @@ class SessionRadixCacheMixin:
             self._session_leaves[sid].add(node)
             meta = self._session_metadata.setdefault(sid, SessionMetadata())
             meta.last_active_time = time.monotonic()
+            # Move node from evictable_leaves → session_evictable_leaves now that
+            # it carries a session tag.
+            self._update_leaf_status(node)
             logger.debug(
                 "tag session %s: node=%d holders=%d indexed=%d",
                 sid,
@@ -158,11 +182,14 @@ class SessionRadixCacheMixin:
                     session_ids.discard(session_id)
                     if not session_ids:
                         delattr(node, "session_ids")
+                        # Node has no session owners; re-route to normal evictable set
+                        # so it is not orphaned (invisible to both LRU and preemption).
+                        self._update_leaf_status(node)
                 if (
                     node is self.root_node
                     or node.lock_ref != 0
                     or len(node.children) != 0
-                    or node not in self.evictable_leaves
+                    or not self._is_evictable_leaf(node)
                     or getattr(node, "session_ids", None)
                 ):
                     break
@@ -207,11 +234,13 @@ class SessionRadixCacheMixin:
                     session_ids.discard(session_id)
                     if not session_ids:
                         delattr(node, "session_ids")
+                        # Re-route to normal evictable set if node survives.
+                        self._update_leaf_status(node)
                 if (
                     node is self.root_node
                     or node.lock_ref != 0
                     or len(node.children) != 0
-                    or node not in self.evictable_leaves
+                    or not self._is_evictable_leaf(node)
                     or getattr(node, "session_ids", None)
                 ):
                     break
