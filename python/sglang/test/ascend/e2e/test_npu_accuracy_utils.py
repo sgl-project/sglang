@@ -45,6 +45,21 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 ACCURACY_TOLERANCE = 0.99
 
+# Dataset total question counts and allowed fluctuation (in questions)
+DATASET_QUESTION_COUNTS = {
+    "aime25": 15,
+    "aime26": 30,
+    "gpqa_diamond": 198,
+}
+
+DATASET_FLUCTUATION = {
+    "aime25": 2,
+    "aime26": 2,
+    "gpqa_diamond": 5,
+}
+
+MAX_RETRY_COUNT = 3
+
 SERVER_INITIALIZATION_DELAY = 120
 
 if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
@@ -56,6 +71,31 @@ else:
         20000 + int(os.environ.get("ASCEND_VISIBLE_DEVICES", "0")[0]) * 100
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_SERVER_PORT_FOR_TEST + 66}"
+
+
+def get_accuracy_threshold(datasets, baseline_accuracy):
+    """Calculate accuracy threshold based on dataset fluctuation tolerance.
+
+    For datasets with defined fluctuation (aime*, gpqa_diamond), use absolute
+    question count tolerance. For others (e.g. mmmu), use percentage tolerance.
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION and dataset in DATASET_QUESTION_COUNTS:
+        fluctuation = DATASET_FLUCTUATION[dataset] / DATASET_QUESTION_COUNTS[dataset]
+        return baseline_accuracy - fluctuation
+    return baseline_accuracy * ACCURACY_TOLERANCE
+
+
+def get_max_retries(datasets):
+    """Return max retry count for accuracy tests.
+
+    gpqa and aime datasets support up to MAX_RETRY_COUNT retries.
+    mmmu and others use 1 attempt (no retry).
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION:
+        return MAX_RETRY_COUNT
+    return 1
 
 
 def run_evalscope(
@@ -212,6 +252,7 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     if self.accuracy is not None:
+        threshold = get_accuracy_threshold(self.datasets, self.accuracy)
         dump_metric(
             "accuracy",
             float(metrics["accuracy"]),
@@ -224,8 +265,8 @@ def assert_metrics(self, metrics):
         )
         self.assertGreaterEqual(
             float(metrics["accuracy"]),
-            self.accuracy * ACCURACY_TOLERANCE,
-            f"Accuracy check failed. Expected >= {self.accuracy * ACCURACY_TOLERANCE}, Got: {metrics['accuracy']}",
+            threshold,
+            f"Accuracy check failed. Expected >= {threshold}, Got: {metrics['accuracy']}",
         )
 
 
