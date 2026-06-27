@@ -784,7 +784,7 @@ def main(args: argparse.Namespace):
 
     search_space = get_configs_compute_bound()
     if block_shape is not None:
-        block_k = block_shape[1]
+        block_n, block_k = block_shape[0], block_shape[1]
         search_space = [
             config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
         ]
