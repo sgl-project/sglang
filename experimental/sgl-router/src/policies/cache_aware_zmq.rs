@@ -479,6 +479,7 @@ mod tests {
             server: crate::config::ServerConfig {
                 host: "0".into(),
                 port: 0,
+                ..Default::default()
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {

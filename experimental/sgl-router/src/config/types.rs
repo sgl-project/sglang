@@ -138,6 +138,26 @@ pub enum PolicyKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Seconds to keep serving after SIGTERM — with `/readyz` flipped to 503 —
+    /// before the HTTP server stops accepting. The pause lets the EndpointSlice
+    /// controller deregister this pod so new requests stop arriving on a socket
+    /// about to close (the rolling-update race). Must be <=
+    /// `terminationGracePeriodSeconds`. Default 5 s; 0 disables the pause.
+    pub shutdown_drain_secs: u64,
+}
+
+pub fn default_shutdown_drain_secs() -> u64 {
+    5
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 30000,
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

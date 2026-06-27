@@ -99,6 +99,14 @@ impl AppContext {
         self.ready.store(true, Ordering::Relaxed);
     }
 
+    /// Inverse of [`mark_ready`](Self::mark_ready): flip `/readyz` back to 503.
+    /// Called on SIGTERM so the EndpointSlice controller deregisters this pod
+    /// before the server stops accepting, closing the rolling-update race where
+    /// new requests land on a socket that is about to close.
+    pub fn mark_not_ready(&self) {
+        self.ready.store(false, Ordering::Relaxed);
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
@@ -113,6 +121,7 @@ impl AppContext {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
                     port: 0,
+                    ..Default::default()
                 },
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
@@ -145,5 +154,25 @@ impl AppContext {
             metrics,
             ready: AtomicBool::new(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_not_ready_flips_readiness_back_off() {
+        let ctx = AppContext::stub();
+        // stub starts not-ready; mark_ready is the readiness on-switch.
+        ctx.mark_ready();
+        assert!(ctx.is_ready(), "mark_ready must report ready");
+        // The SIGTERM drain path needs the inverse so /readyz can flip to 503
+        // before the server stops accepting.
+        ctx.mark_not_ready();
+        assert!(
+            !ctx.is_ready(),
+            "mark_not_ready must flip readiness back off",
+        );
     }
 }

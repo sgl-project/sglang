@@ -10,11 +10,11 @@ use clap::Parser;
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::config::{
-    default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    default_tokenizer_shards, resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig,
-    CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig,
+    default_cb_cool_down, default_proxy_request_timeout_secs, default_shutdown_drain_secs,
+    default_stale_request_timeout_secs, default_tokenizer_shards, resolve_mode, ActiveLoadConfig,
+    AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig, Config, DiscoveryBackend,
+    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -134,6 +134,11 @@ pub struct Cli {
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
+    /// Seconds to keep serving after SIGTERM, with `/readyz` returning 503,
+    /// before the server stops accepting — so k8s deregisters this pod first.
+    /// Must be <= the pod's terminationGracePeriodSeconds. 0 disables the pause.
+    #[arg(long, default_value_t = default_shutdown_drain_secs())]
+    pub shutdown_drain_secs: u64,
 
     // ---- admission control ----
     /// Maximum in-flight requests dispatched to a single worker. When set,
@@ -289,6 +294,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.host,
                 port: self.port,
+                shutdown_drain_secs: self.shutdown_drain_secs,
             },
             observability: ObservabilityConfig {
                 log_level: self.log_level,
@@ -435,6 +441,22 @@ mod tests {
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+        assert_eq!(c.server.shutdown_drain_secs, 5);
+    }
+
+    #[test]
+    fn shutdown_drain_secs_maps_into_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--shutdown-drain-secs",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.server.shutdown_drain_secs, 0,
+            "--shutdown-drain-secs 0 must disable the drain pause",
+        );
     }
 
     #[test]

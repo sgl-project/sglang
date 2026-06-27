@@ -29,6 +29,7 @@ async fn failover_when_one_worker_dies() {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            ..Default::default()
         },
         observability: Default::default(),
         model: ModelConfig {

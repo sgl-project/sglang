@@ -200,23 +200,62 @@ async fn main() -> Result<()> {
 
     let (sigterm, sigint) = install_signal_handlers()?;
 
-    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(sigterm, sigint));
+    let drain = std::time::Duration::from_secs(cfg.server.shutdown_drain_secs);
+    let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(
+        sigterm,
+        sigint,
+        ctx.clone(),
+        drain,
+    ));
     let server_result = serve.await.context("axum serve");
 
     // Best-effort: cancel discovery + manager + janitor on shutdown.
     // The janitor handle's drop signals cancellation; we additionally
     // await `shutdown` so the task joins cleanly before the process
-    // exits — useful for tracing tail logs.
+    // exits — useful for tracing tail logs. Bound that join so a hung
+    // janitor can't turn a graceful shutdown into a silent SIGKILL.
     discovery_handle.abort();
     manager_handle.abort();
-    janitor_handle.shutdown().await;
+    let janitor_joined = sgl_router::server::shutdown::await_with_timeout(
+        janitor_handle.shutdown(),
+        std::time::Duration::from_secs(5),
+        "janitor shutdown",
+    )
+    .await;
+    if janitor_joined {
+        tracing::info!("shutdown complete");
+    } else {
+        tracing::info!("shutdown complete (with unfinished background tasks)");
+    }
     server_result
 }
 
-async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {
+/// Resolve when a termination signal arrives, then hand control to axum's
+/// graceful drain. On SIGTERM (k8s pod termination) first run the readiness
+/// drain — flip `/readyz` to 503 and pause `drain` so the EndpointSlice
+/// controller deregisters this pod before we stop accepting, closing the
+/// rolling-update race. SIGINT (local Ctrl-C) exits immediately for fast dev
+/// iteration.
+async fn shutdown_signal(
+    mut sigterm: Signal,
+    mut sigint: Signal,
+    ctx: Arc<sgl_router::server::app_context::AppContext>,
+    drain: std::time::Duration,
+) {
     tokio::select! {
-        _ = sigterm.recv() => tracing::info!("got SIGTERM, shutting down"),
-        _ = sigint.recv()  => tracing::info!("got SIGINT, shutting down"),
+        _ = sigterm.recv() => {
+            tracing::info!("got SIGTERM, shutting down");
+            // A second termination signal during the drain expedites it, so an
+            // operator watching a stuck rollout isn't stuck for the full window.
+            let expedite = async move {
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    _ = sigint.recv() => {}
+                }
+            };
+            sgl_router::server::shutdown::drain_for_termination(&ctx, drain, expedite).await;
+        }
+        _ = sigint.recv() => tracing::info!("got SIGINT, shutting down immediately"),
     }
 }
 

@@ -5,6 +5,25 @@ pub use types::*;
 
 use anyhow::{anyhow, Result};
 
+/// The k8s default `terminationGracePeriodSeconds`. A `shutdown_drain_secs`
+/// above this will be SIGKILLed mid-drain unless the operator has raised the
+/// grace period — the opposite of what the drain is for.
+const K8S_DEFAULT_GRACE_SECS: u64 = 30;
+
+/// Advisory (not a hard error: the router can't read the pod's actual
+/// `terminationGracePeriodSeconds`) for a `shutdown_drain_secs` that likely
+/// exceeds the grace period. Returns `Some(message)` to warn, `None` if safe.
+pub fn shutdown_drain_advisory(shutdown_drain_secs: u64) -> Option<String> {
+    (shutdown_drain_secs > K8S_DEFAULT_GRACE_SECS).then(|| {
+        format!(
+            "shutdown_drain_secs={shutdown_drain_secs} exceeds the k8s default \
+             terminationGracePeriodSeconds ({K8S_DEFAULT_GRACE_SECS}s); the pod will be \
+             SIGKILLed mid-drain unless terminationGracePeriodSeconds is raised to at \
+             least the drain plus in-flight request time"
+        )
+    })
+}
+
 impl Config {
     /// Check invariants the type system and `clap` don't already enforce.
     /// Called by [`cli::Cli::into_config`] after assembling the `Config`
@@ -14,6 +33,9 @@ impl Config {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.model.id.is_empty() {
             return Err(anyhow!("model id must be non-empty"));
+        }
+        if let Some(msg) = shutdown_drain_advisory(self.server.shutdown_drain_secs) {
+            tracing::warn!("{msg}");
         }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
@@ -79,6 +101,7 @@ mod tests {
             server: ServerConfig {
                 host: "127.0.0.1".into(),
                 port: 30000,
+                ..Default::default()
             },
             observability: ObservabilityConfig::default(),
             model: ModelConfig {
@@ -153,5 +176,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported scheme"), "got: {err}");
+    }
+
+    #[test]
+    fn shutdown_drain_advisory_is_silent_at_or_below_the_k8s_default_grace() {
+        // The default drain (5 s) and any value at or under the k8s default
+        // terminationGracePeriodSeconds (30 s) is safe without operator action.
+        assert!(shutdown_drain_advisory(default_shutdown_drain_secs()).is_none());
+        assert!(shutdown_drain_advisory(30).is_none());
+        assert!(shutdown_drain_advisory(0).is_none());
+    }
+
+    #[test]
+    fn shutdown_drain_advisory_warns_above_the_k8s_default_grace() {
+        // A drain past the 30 s k8s default will be SIGKILLed mid-drain unless
+        // the operator has raised terminationGracePeriodSeconds — surface it.
+        let msg = shutdown_drain_advisory(120).expect("120 s must produce an advisory");
+        assert!(
+            msg.contains("terminationGracePeriodSeconds"),
+            "advisory must name the k8s knob to raise: {msg}"
+        );
     }
 }
