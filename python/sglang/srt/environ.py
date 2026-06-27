@@ -297,6 +297,10 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
+    # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
+    # page tables (DP attn); paged backends like trtllm_mha consume it directly.
+    SGLANG_USE_HND_KVCACHE = EnvBool(False)
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
@@ -402,6 +406,14 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+
+    # Native web search (Exa). EXA_API_KEY is the vendor BYOK credential
+    # (kept as-is, not renamed to SGLANG_*); the SGLANG_EXA_* knobs tune the
+    # request defaults for the built-in GPT-OSS web_search tool.
+    EXA_API_KEY = EnvStr(None)
+    SGLANG_EXA_NUM_RESULTS = EnvInt(10)
+    SGLANG_EXA_SEARCH_TYPE = EnvStr("auto")
+    SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -874,6 +886,10 @@ class Envs:
 
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
+
+    # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
+    # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
+    SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
 
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
