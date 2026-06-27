@@ -307,6 +307,82 @@ class TestMlxPrefillAdmission(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestMlxLiveSafePrefillChunk(unittest.TestCase):
+    """Dynamic prefill-chunk sizing (``live_safe_prefill_chunk``): the largest chunk whose
+    worst-case activation peak fits live memory; grows above the static cap under light load.
+    """
+
+    def _runner(
+        self,
+        *,
+        static_cap=576,
+        per_tok_ctx=_PER_TOK_CTX,
+        context_length=32768,
+        cache_bytes=0,
+        cache_pool=None,
+    ):
+        r = mr.MlxModelRunner.__new__(mr.MlxModelRunner)
+        r._max_safe_prefill_chunk = static_cap
+        r._prefill_act_per_tok_ctx = per_tok_ctx
+        r._context_length = context_length
+        r.disable_radix_cache = True
+        r._radix_off_cache_bytes = cache_bytes
+        r._cache_pool = [] if cache_pool is None else cache_pool
+        return r
+
+    @contextlib.contextmanager
+    def _memory(self, *, used, free, limit=_LIMIT):
+        with mock.patch.object(
+            mr.mx,
+            "device_info",
+            return_value={"max_recommended_working_set_size": limit},
+        ), mock.patch.object(
+            mr.mx, "get_active_memory", return_value=used
+        ), mock.patch.object(
+            mr.psutil,
+            "virtual_memory",
+            return_value=types.SimpleNamespace(available=free),
+        ):
+            yield
+
+    def test_large_headroom_grows_chunk_above_static_cap(self):
+        # Idle high-memory box (ctx 32768): headroom allows a chunk far above the ~576 cap.
+        r = self._runner(static_cap=576, context_length=32768)
+        with self._memory(
+            used=8_000_000_000, free=180_000_000_000, limit=200_000_000_000
+        ):
+            dyn = r.live_safe_prefill_chunk()
+        self.assertEqual(dyn, 3218)
+        self.assertGreater(dyn, 576)
+        self.assertLessEqual(dyn, 32768)
+
+    def test_small_headroom_floors_at_minimum(self):
+        # Tight memory: the formula falls below the floor, so it clamps to the minimum.
+        r = self._runner(static_cap=398, context_length=2048)
+        with self._memory(used=8_000_000_000, free=400_000_000):
+            dyn = r.live_safe_prefill_chunk()
+        self.assertEqual(dyn, mr._MLX_MIN_PREFILL_CHUNK)
+
+    def test_returns_none_when_no_auto_cap(self):
+        # Radix on / no calibrated cost: nothing to adapt -> None.
+        self.assertIsNone(self._runner(static_cap=None).live_safe_prefill_chunk())
+        self.assertIsNone(self._runner(per_tok_ctx=0).live_safe_prefill_chunk())
+
+    def test_subtracts_new_cache_bytes(self):
+        # A fresh prefill's private cache is charged like the gate, so empty pool -> smaller.
+        charged = self._runner(context_length=8192, cache_bytes=4_000_000_000)
+        reused = self._runner(
+            context_length=8192, cache_bytes=4_000_000_000, cache_pool=[object()]
+        )
+        with self._memory(used=8_000_000_000, free=12_000_000_000):
+            dyn_charged = charged.live_safe_prefill_chunk()
+            dyn_reused = reused.live_safe_prefill_chunk()
+        self.assertEqual(dyn_charged, 500)
+        self.assertEqual(dyn_reused, 786)
+        self.assertLess(dyn_charged, dyn_reused)
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxSchedulerAdmissionGate(unittest.TestCase):
     """Pin the scheduler-side gate: a waiting prefill that does not fit live memory is
     aborted with set_finish_with_abort (the existing clean-rejection path); one that
@@ -394,6 +470,79 @@ class TestMlxSchedulerAdmissionGate(unittest.TestCase):
         with self._memory(used=8_000_000_000, free=500_000_000):
             self._reject(sched)
         req.set_finish_with_abort.assert_not_called()
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestMlxResizeChunkedPrefillBudget(unittest.TestCase):
+    """Scheduler-side resize (``_mlx_resize_chunked_prefill_budget``): sets
+    ``chunked_prefill_size`` from live memory before the gate; no-op when radix is on.
+    """
+
+    def _scheduler(self, runner, *, chunked_prefill_size):
+        from sglang.srt.hardware_backend.mlx.scheduler_mixin import (
+            SchedulerMlxOverlapMixin,
+        )
+
+        sched = types.SimpleNamespace()
+        sched.tp_worker = types.SimpleNamespace(_mlx_runner=runner)
+        sched.chunked_prefill_size = chunked_prefill_size
+        # non-empty queue: the caller gates the resize on it
+        sched.waiting_queue = [object()]
+        self._resize = SchedulerMlxOverlapMixin._mlx_resize_chunked_prefill_budget
+        return sched
+
+    def _runner(
+        self, *, static_cap=576, per_tok_ctx=_PER_TOK_CTX, context_length=32768
+    ):
+        r = mr.MlxModelRunner.__new__(mr.MlxModelRunner)
+        r._max_safe_prefill_chunk = static_cap
+        r._prefill_act_per_tok_ctx = per_tok_ctx
+        r._context_length = context_length
+        r.disable_radix_cache = True
+        r._radix_off_cache_bytes = 0
+        r._cache_pool = []
+        return r
+
+    @contextlib.contextmanager
+    def _memory(self, *, used, free, limit=_LIMIT):
+        with mock.patch.object(
+            mr.mx,
+            "device_info",
+            return_value={"max_recommended_working_set_size": limit},
+        ), mock.patch.object(
+            mr.mx, "get_active_memory", return_value=used
+        ), mock.patch.object(
+            mr.psutil,
+            "virtual_memory",
+            return_value=types.SimpleNamespace(available=free),
+        ):
+            yield
+
+    def test_raises_chunk_size_when_headroom_is_large(self):
+        # Idle high-memory box: resize lifts the chunk above the static cap.
+        runner = self._runner(static_cap=576, context_length=32768)
+        sched = self._scheduler(runner, chunked_prefill_size=576)
+        with self._memory(
+            used=8_000_000_000, free=180_000_000_000, limit=200_000_000_000
+        ):
+            self._resize(sched)
+        self.assertEqual(sched.chunked_prefill_size, 3218)
+
+    def test_shrinks_chunk_size_when_headroom_is_tight(self):
+        # Tight memory: resize lowers it toward the floor; gate declines misfits.
+        runner = self._runner(static_cap=398, context_length=2048)
+        sched = self._scheduler(runner, chunked_prefill_size=398)
+        with self._memory(used=8_000_000_000, free=400_000_000):
+            self._resize(sched)
+        self.assertEqual(sched.chunked_prefill_size, mr._MLX_MIN_PREFILL_CHUNK)
+
+    def test_noop_when_radix_on(self):
+        # Radix on -> no cap -> chunked_prefill_size left as the worker set it.
+        runner = self._runner(static_cap=None)
+        sched = self._scheduler(runner, chunked_prefill_size=512)
+        with self._memory(used=8_000_000_000, free=180_000_000_000):
+            self._resize(sched)
+        self.assertEqual(sched.chunked_prefill_size, 512)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)

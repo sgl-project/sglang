@@ -898,6 +898,27 @@ class MlxModelRunner:
         headroom = self._live_prefill_headroom_bytes()
         return estimate <= headroom, estimate, headroom
 
+    def live_safe_prefill_chunk(self) -> int | None:
+        """Largest prefill chunk that fits live GPU headroom now (None if no auto-derived
+        cap: radix on / uncalibrated). Same formula, measured cost, and full-context span as
+        the startup cap and the gate, so it stays safe; exceeds the static cap only under
+        light load. Floors at ``_MLX_MIN_PREFILL_CHUNK``, caps at ``context_length``.
+        """
+        context_length = self._context_length
+        if (
+            self._max_safe_prefill_chunk is None
+            or self._prefill_act_per_tok_ctx <= 0
+            or not context_length
+        ):
+            return None
+        # TODO: a per-request prompt-length span would be tighter (needs per-request sizing).
+        # Subtract the cache a fresh prefill allocates, like the admission gate does.
+        headroom = self._live_prefill_headroom_bytes() - self._prefill_new_cache_bytes()
+        dyn = self._safe_prefill_chunk_tokens(
+            headroom, self._prefill_act_per_tok_ctx, context_length
+        )
+        return min(max(dyn, _MLX_MIN_PREFILL_CHUNK), context_length)
+
     def _calibrate_prefill_chunk(self) -> None:
         """Measure the real prefill footprint in-server and refine the chunk cap.
 

@@ -99,6 +99,18 @@ class SchedulerMlxOverlapMixin:
         self.last_batch = pending.schedule_batch
         self.process_batch_result(pending.batch_copy, result)
 
+    def _mlx_resize_chunked_prefill_budget(self: Scheduler) -> None:
+        """Grow ``chunked_prefill_size`` to the largest chunk live GPU memory allows, so a
+        long prompt prefills in fewer forwards under light load. Radix off + overlap loop
+        only; runs just before the admission gate on the same live headroom. No-op otherwise.
+        """
+        runner = getattr(self.tp_worker, "_mlx_runner", None)
+        if runner is None or runner.max_safe_prefill_chunk is None:
+            return  # radix on / no auto-derived cap
+        dyn = runner.live_safe_prefill_chunk()
+        if dyn is not None:
+            self.chunked_prefill_size = dyn
+
     def _mlx_reject_unfittable_prefills(self: Scheduler) -> None:
         """Reject a queued prefill whose activation peak no longer fits live GPU memory,
         before it can abort the scheduler with an uncatchable command-buffer OOM.
@@ -234,9 +246,10 @@ class SchedulerMlxOverlapMixin:
             if self._engine_paused:
                 continue
 
-            # MLX prefill admission gate (proactive OOM guard): reject queued prefills
-            # that would overflow live GPU memory before they can crash the scheduler.
+            # MLX OOM guard: grow the prefill chunk to the largest size live memory allows,
+            # then reject any waiting prefill that still would not fit.
             if self.waiting_queue:
+                self._mlx_resize_chunked_prefill_budget()
                 self._mlx_reject_unfittable_prefills()
 
             # 1. If pending_curr is a pure decode AND no new prefill is waiting,
