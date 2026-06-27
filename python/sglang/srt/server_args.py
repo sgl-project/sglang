@@ -6882,6 +6882,27 @@ class ServerArgs:
             assert (
                 self.chunked_prefill_size % self.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+            # Setting chunked_prefill_size enables chunked prefill and limits
+            # the whole chunked-prefill step, not just a single request chunk.
+            # The actual difference from max_prefill_tokens is that
+            # chunked_prefill_size enables chunked prefill. Both parameters cap
+            # the chunked-prefill batch budget, so the effective prefill token
+            # budget is min(max_prefill_tokens, chunked_prefill_size), matching
+            # memory / graph sizing assumptions for one prefill forward.
+            if self.max_prefill_tokens > self.chunked_prefill_size:
+                logger.warning(
+                    "--max-prefill-tokens (%s) is greater than "
+                    "--chunked-prefill-size (%s). chunked_prefill_size enables "
+                    "chunked prefill and limits the whole chunked-prefill step, "
+                    "not just a single request chunk. The actual difference "
+                    "from max_prefill_tokens is that chunked_prefill_size "
+                    "enables chunked prefill. Both parameters cap the "
+                    "chunked-prefill batch budget, so the effective prefill "
+                    "token budget is min(max_prefill_tokens, "
+                    "chunked_prefill_size).",
+                    self.max_prefill_tokens,
+                    self.chunked_prefill_size,
+                )
 
         # Check pdmux
         if self.enable_pdmux:
