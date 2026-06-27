@@ -59,8 +59,21 @@ class Cosmos3Pipeline(ComposedPipelineBase):
         transformer = self.get_module("transformer")
         scheduler = self.get_module("scheduler")
 
-        # Guardrails on by default; opt out with SGLANG_DISABLE_COSMOS3_GUARDRAILS=1.
-        guardrails_on = os.environ.get("SGLANG_DISABLE_COSMOS3_GUARDRAILS", "0") != "1"
+        guardrails_disabled = (
+            os.environ.get("SGLANG_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+        )
+        guardrails_on = False
+        if not guardrails_disabled:
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
+                is_cosmos_guardrail_available,
+            )
+
+            guardrails_on = is_cosmos_guardrail_available()
+            if not guardrails_on:
+                logger.warning(
+                    "Cosmos3 guardrails disabled because cosmos-guardrail is not "
+                    "installed. Install it with: pip install cosmos-guardrail==0.3.1"
+                )
 
         self.add_stage(Cosmos3ImagePreprocessStage())
         self.add_stage(Cosmos3TokenizationStage(tokenizer=text_tokenizer))

@@ -11,8 +11,8 @@ export const MiMoV25Deployment = () => {
   //   so attention-TP per DP group must be 4; effective parallelism = TP/DP = 4.
   //     H200  → tp=8, dp=2, single-node, FP8 (verified)
   //     H100  → tp=8, dp=2, single-node, FP8
-  //     B200  → tp=4, dp=1, single-node, FP8
-  //     GB300 → tp=4, dp=1, single-node, FP8
+  //     B200  → tp=4, dp=1, single-node, FP8 (Blackwell: vision fa4)
+  //     GB300 → tp=4, dp=1, single-node, FP8 (Blackwell: vision fa4)
   //
   //   Optional toggles:
   //     EAGLE MTP — adds --speculative-* flags + SGLANG_ENABLE_SPEC_V2=1.
@@ -93,13 +93,17 @@ export const MiMoV25Deployment = () => {
   };
 
   // Per (variant, hardware): HF slug, tp, multinode info, Blackwell flag.
-  // V2.5 (base) checkpoint has TP=4-interleaved fused qkv_proj, so attention
-  // TP per DP group MUST be 4. Effective TP/DP = 4. With tp=8 → dp=2; tp=4 → dp=1.
+  // The attention qkv_proj is TP-interleaved, so attention-TP per DP group is
+  // fixed: V2.5 (base) is TP=4-interleaved, V2.5-Pro is TP=8-interleaved. When
+  // tp exceeds that factor, DP-attention is required with `dp = tp / factor`
+  // (Pro: tp/8, base: tp/4); when tp equals the factor there is a single
+  // attention group and no `dp` field is set. So Pro on Hopper (tp=16) needs
+  // dp=2, while Pro on Blackwell (tp=8) needs no dp-attention at all.
   // TPU rows go through the sgl-jax stack (`python -m sgl_jax.launch_server`),
   // not the CUDA `sglang serve` binary; tp == total JAX devices across nodes.
   const HW_VARIANT_SPEC = {
-    "pro|h200":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2,  blackwell: false, jax: false },
-    "pro|h100":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2,  blackwell: false, jax: false },
+    "pro|h200":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2,  blackwell: false, jax: false, dp: 2 },
+    "pro|h100":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2,  blackwell: false, jax: false, dp: 2 },
     "pro|b200":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: false,             blackwell: true,  jax: false },
     "pro|gb300":    { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: true,  nnodes: 2,  blackwell: true,  jax: false },
     "pro|tpu-v7x":  { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 32, multinode: true,  nnodes: 4,  blackwell: false, jax: true  },
@@ -132,13 +136,18 @@ export const MiMoV25Deployment = () => {
     const blackwell = spec ? spec.blackwell : false;
     const jax = spec ? spec.jax : false;
     const c = {};
-    if (!isPro) {
-      // V2.5 checkpoint is TP=4-interleaved; tp/dp must equal 4. With dp>1 we
-      // must use DP-attention; with dp=1 it must be off (single attention group).
-      if (spec && spec.dp > 1) {
-        c.dpAttention = { force: "enabled", reason: "V2.5 checkpoint is TP=4-interleaved; DP-attention is required (--dp = tp/4)." };
+    // Both checkpoints are TP-interleaved (Pro: 8, base: 4), so attention-TP per
+    // DP group must equal that factor. When the spec carries dp>1 (Pro/Hopper
+    // tp=16, base tp=8) DP-attention with `--dp = tp/factor` is required; without
+    // it a bare `--tp` gives attn_tp = tp != factor and the loader rejects the
+    // checkpoint. When no dp>1 (Pro/Blackwell tp=8, base tp=4) it's a single
+    // attention group and DP-attention must stay off.
+    if (spec && !jax) {
+      const factor = isPro ? 8 : 4;
+      if (spec.dp > 1) {
+        c.dpAttention = { force: "enabled", reason: `Checkpoint is TP=${factor}-interleaved; DP-attention is required (--dp = tp/${factor} = ${spec.dp}).` };
       } else {
-        c.dpAttention = { force: "disabled", reason: "Single attention group on this hardware (tp=4, dp=1)." };
+        c.dpAttention = { force: "disabled", reason: `Single attention group on this hardware (tp=${factor}, no dp-attention).` };
       }
     }
     if (blackwell) {
@@ -281,8 +290,10 @@ export const MiMoV25Deployment = () => {
     const useDeepep = !blackwell && deepep === "enabled";
     const useEp = isPro && !blackwell && expertParallelism === "enabled";
     const useDpAttn = dpAttention === "enabled";
-    // dp size: V2.5 picks tp/4 from spec; Pro picks tp.
-    const dpSize = !isPro ? spec.dp : tp;
+    // dp size = required DP-attention degree from the spec (tp/factor), for both
+    // variants. Only read when useDpAttn is on, which computeConstraints forces
+    // exactly for the specs that carry dp>1 (Pro/Hopper tp=16 → 2, base tp=8 → 2).
+    const dpSize = spec.dp;
 
     // ---- env (kept inline before `sglang serve`, matching the verified launch style) ----
     const envVars = [];
@@ -339,6 +350,7 @@ export const MiMoV25Deployment = () => {
         flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);
       }
     } else {
+      if (blackwell) flags.push("  --mm-attention-backend fa4");
       flags.push("  --mem-fraction-static 0.65");
       flags.push("  --chunked-prefill-size 16384");
     }

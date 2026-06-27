@@ -77,6 +77,19 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
     )
 
 
+@cache_once
+def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_fp4_quant"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardFp4QuantKernel<{args}>::forward"),
+        ],
+    )
+
+
 def fused_rope_inplace(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -154,6 +167,39 @@ def fused_q_indexer_rope_hadamard_quant(
             positions,
         )
     return q_fp8, weights_out
+
+
+def fused_q_indexer_rope_hadamard_fp4_quant(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    if _is_hip:
+        raise RuntimeError("DeepSeek V4 FP4 indexer requires the CUDA fused Q path.")
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    q_fp4 = torch.empty(
+        (*q_input.shape[:-1], q_input.shape[-1] // 2),
+        dtype=torch.int8,
+        device=q_input.device,
+    )
+    q_sf = torch.empty(q_input.shape[:-1], dtype=torch.int32, device=q_input.device)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    module = _jit_main_q_indexer_rope_hadamard_fp4_quant_module(q_input.dtype)
+    module.forward(
+        q_input,
+        q_fp4,
+        q_sf,
+        weight,
+        weights_out,
+        float(weight_scale),
+        freqs_real,
+        positions,
+    )
+    return (q_fp4, q_sf), weights_out
 
 
 def fused_k_norm_rope_flashmla(

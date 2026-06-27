@@ -32,9 +32,6 @@ from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention impo
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_mamba2_cuda_graph_decode_case,
 )
-from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_extend_runner import (
-    run_mamba2_eagle_draft_extend_case,
-)
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     run_mamba2_eagle_verify_case,
     run_mamba2_eagle_verify_cuda_graph_case,
@@ -128,33 +125,6 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             1,
         ),
     )
-    # EAGLE / Frozen-KV MTP DRAFT_EXTEND eager — `HybridLinearAttnBackend`
-    # raises `ValueError("Invalid forward mode")` for DRAFT_EXTEND CG
-    # capture (`hybrid_linear_attn_backend.py:509,572`), so CG is
-    # structurally blocked; only eager is exercised. Same EXTEND-style
-    # chunked-scan recurrence reference doubles as the DRAFT_EXTEND
-    # reference, like the verify path.
-    EAGLE_DRAFT_EXTEND_CASES = tuple(
-        (
-            Mamba2AttentionCase(
-                name=f"runner_{spec_kind}_draft_extend_mamba2",
-                backend="triton",
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                num_heads=DEFAULT_NUM_HEADS,
-                head_dim=DEFAULT_HEAD_DIM,
-                state_size=DEFAULT_STATE_SIZE,
-                n_groups=DEFAULT_N_GROUPS,
-                conv_kernel=DEFAULT_CONV_KERNEL,
-                mamba_chunk_size=DEFAULT_MAMBA_CHUNK_SIZE,
-                hidden_size=DEFAULT_HIDDEN_SIZE,
-                page_size=16,
-                prefix_lens=(4, 7),
-                extend_lens=(3, 3),
-            ),
-            spec_kind,
-        )
-        for spec_kind in ("eagle", "frozen_kv_mtp")
-    )
 
     def test_projected_mamba2_attention_cases(self):
         for case in self.CASES:
@@ -194,13 +164,6 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
                 run_mamba2_eagle_verify_cuda_graph_case(self, case, topk=topk)
 
-    def test_runner_mode_eagle_draft_extend_cases(self):
-        for case, spec_kind in self.EAGLE_DRAFT_EXTEND_CASES:
-            with self.subTest(
-                case=case.name, backend=case.backend, spec_kind=spec_kind
-            ):
-                run_mamba2_eagle_draft_extend_case(self, case, spec_kind=spec_kind)
-
     # PCG/BCG split-op extend is deliberately NOT covered. The
     # `MambaMixer2.forward` asserts `num_actual_tokens ==
     # projected_states.shape[0]` (`mamba.py:467`) — the projection step
@@ -216,7 +179,7 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
     # padding the `forward_batch.input_ids` / `out_cache_loc`.
 
     def test_mamba2_replay_metadata_padding_indices(self):
-        # Drive `init_forward_metadata_replay_cuda_graph` directly with
+        # Drive `init_forward_metadata_out_graph` (replay path) directly with
         # `seq_lens_cpu=[5, 1, 1]` (two trailing rows at the cuda-graph
         # fill value 1) so the padding-row count is observable in
         # `state_indices_list[bs - 1]`.
@@ -245,16 +208,17 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             req_pool_indices
         ] = torch.tensor([7, 0, 0], dtype=torch.int32, device=device)
 
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
+        fb = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=ForwardMode.DECODE,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            seq_lens_sum=int(seq_lens_cpu.sum().item()),
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=None,
             seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            spec_info=None,
+            encoder_lens=None,
         )
+        backend.init_forward_metadata_out_graph(fb)
 
         state_indices = backend.state_indices_list[bs - 1].cpu().tolist()
         self.assertEqual(
@@ -326,62 +290,44 @@ class TestTritonMamba2BackendCorrectness(CustomTestCase):
             linear_attn_backend.init_forward_metadata, sentinel_forward_batch
         )
 
+    def _make_sentinel_fb(self):
+        return SimpleNamespace(
+            batch_size=3,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=object(),
+            seq_lens=object(),
+            seq_lens_cpu=object(),
+            seq_lens_sum=42,
+            spec_info=object(),
+            encoder_lens=None,
+            positions=object(),
+            input_ids=object(),
+            out_cache_loc=None,
+        )
+
     def test_hybrid_dispatch_replay_init_forward_metadata_fan_out(self):
         backend, full_attn_backend, linear_attn_backend = (
             self._make_dispatch_spy_backend()
         )
 
-        sentinel_req_pool = object()
-        sentinel_seq_lens = object()
-        sentinel_seq_lens_cpu = object()
-        sentinel_spec_info = object()
-
-        backend.init_forward_metadata_replay_cuda_graph(
-            bs=3,
-            req_pool_indices=sentinel_req_pool,
-            seq_lens=sentinel_seq_lens,
-            seq_lens_sum=42,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=sentinel_spec_info,
-            seq_lens_cpu=sentinel_seq_lens_cpu,
-        )
+        fb = self._make_sentinel_fb()
+        backend.init_forward_metadata_out_graph(fb)
 
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_metadata_replay_cuda_graph,
-                sentinel_req_pool,
-                sentinel_seq_lens,
-                sentinel_seq_lens_cpu,
-                sentinel_spec_info,
-                ForwardMode.DECODE,
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
     def test_hybrid_dispatch_capture_init_forward_metadata_fan_out(self):
         backend, full_attn_backend, linear_attn_backend = (
             self._make_dispatch_spy_backend()
         )
-        sentinel_req_pool = object()
-        sentinel_seq_lens = object()
-        sentinel_spec_info = object()
-
-        backend.init_forward_metadata_capture_cuda_graph(
-            bs=3,
-            num_tokens=3,
-            req_pool_indices=sentinel_req_pool,
-            seq_lens=sentinel_seq_lens,
-            encoder_lens=None,
-            forward_mode=ForwardMode.DECODE,
-            spec_info=sentinel_spec_info,
-        )
+        fb = self._make_sentinel_fb()
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
 
         for sub_backend in (full_attn_backend, linear_attn_backend):
             self._assert_fanout_forwarded(
-                sub_backend.init_forward_metadata_capture_cuda_graph,
-                sentinel_req_pool,
-                sentinel_seq_lens,
-                sentinel_spec_info,
-                ForwardMode.DECODE,
+                sub_backend.init_forward_metadata_out_graph, fb
             )
 
 

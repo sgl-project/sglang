@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
+    SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
+    SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
@@ -240,6 +242,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
         "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
     ),
+    # Internal per-worker platform override used by disaggregated role launch.
+    # Empty means normal platform auto-detection.
+    "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
+        "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
+    ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
@@ -302,6 +309,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy aliases `cudnn` and `trtllm` are also accepted.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
+    # Experimental opt-in for W8A8 FP8 GEMM in diffusion weight-only FP8 linears.
+    # When disabled, FP8 weights are dequantized to compute dtype before matmul.
+    "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
+        "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

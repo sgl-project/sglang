@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import binascii
 import builtins
 import ctypes
 import functools
@@ -64,6 +65,7 @@ from typing import (
     Dict,
     Generic,
     List,
+    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -94,6 +96,7 @@ from typing_extensions import Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -103,19 +106,33 @@ logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
 
 
-def flatten_arrays_to_int64_tensor(
-    parts: List[array[int]], device, pin: bool
-) -> torch.Tensor:
-    """Flatten a list of array.array('q') buffers into one int64 tensor.
+class Range(NamedTuple):
+    start: int
+    end: int
 
-    Uses NumPy here to speed up the conversion by using memcpy
-    instead of a per-element PyLong-to-int64 walk.
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+
+def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
+    """Flatten array.array('q') buffers into one int64 CPU tensor.
+
+    NumPy memcpy instead of a per-element PyLong-to-int64 walk. Stays on
+    (optionally pinned) CPU; H2D is the caller's job.
     """
     combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in parts])
     cpu_t = torch.from_numpy(combined)
     if pin:
         cpu_t = cpu_t.pin_memory()
-    return cpu_t.to(device, non_blocking=True)
+    return cpu_t
+
+
+def flatten_arrays_to_int64_tensor(
+    parts: List[array[int]], device, pin: bool
+) -> torch.Tensor:
+    """Flatten a list of array.array('q') buffers into one int64 tensor on `device`."""
+    return flatten_arrays_to_pinned_cpu(parts, pin).to(device, non_blocking=True)
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -278,6 +295,11 @@ is_sm100_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
 )
+is_sm80_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+    )
+)
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -295,9 +317,9 @@ except:
     is_intel_amx_backend_available = False
 
 try:
-    # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
+    # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
-    is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
+    is_amx_tile_supported = torch.cpu._is_amx_tile_supported()
 except:
     is_amx_tile_supported = False
 
@@ -444,7 +466,7 @@ class DynamicGradMode(_DecoratorContextManager):
         else:
             torch.set_grad_enabled(self.prev)
 
-    def clone(self) -> "DynamicGradMode":
+    def clone(self) -> DynamicGradMode:
         r"""
         Create a copy of this class
         """
@@ -555,9 +577,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.cuda.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.cuda.current_device()}, ",
-                "which may cause useless memory allocation for torch CUDA context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch CUDA context.",
+                gpu_id,
+                torch.cuda.current_device(),
             )
 
         if empty_cache:
@@ -577,9 +601,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.xpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.xpu.current_device()}, ",
-                "which may cause useless memory allocation for torch XPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch XPU context.",
+                gpu_id,
+                torch.xpu.current_device(),
             )
 
         if empty_cache:
@@ -593,9 +619,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.hpu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
-                "which may cause useless memory allocation for torch HPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch HPU context.",
+                gpu_id,
+                torch.hpu.current_device(),
             )
 
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
@@ -610,9 +638,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.npu.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
-                "which may cause useless memory allocation for torch NPU context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch NPU context.",
+                gpu_id,
+                torch.npu.current_device(),
             )
         if empty_cache:
             empty_device_cache(torch.npu)
@@ -631,9 +661,11 @@ def get_available_gpu_memory(
         assert gpu_id < num_gpus
 
         if torch.musa.current_device() != gpu_id:
-            print(
-                f"WARNING: current device is not {gpu_id}, but {torch.musa.current_device()}, ",
-                "which may cause useless memory allocation for torch MUSA context.",
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch MUSA context.",
+                gpu_id,
+                torch.musa.current_device(),
             )
         if empty_cache:
             empty_device_cache(torch.musa)
@@ -648,8 +680,6 @@ def get_available_gpu_memory(
     elif device == "mps":
         free_gpu_memory = psutil.virtual_memory().available
     else:
-        from sglang.srt.platforms import current_platform
-
         if not current_platform.is_out_of_tree():
             raise ValueError(
                 f"Unsupported device type: {device!r}. "
@@ -750,6 +780,8 @@ def get_dispatch_device_backend():
         dispatch_key = "CUDA"
     elif is_xpu():
         dispatch_key = "XPU"
+    elif is_npu():
+        dispatch_key = "NPU"
     else:
         raise RuntimeError("No supported accelerator (CUDA/XPU) available")
     return dispatch_key
@@ -771,6 +803,22 @@ def set_random_seed(seed: int) -> None:
         torch.xpu.manual_seed_all(seed)
 
 
+_mm_http_session = threading.local()
+
+
+def get_mm_http_session() -> requests.Session:
+    """Per-thread HTTP session for multimodal downloads, to pool/reuse TCP
+    connections. Pid-checked so a forked worker rebuilds its own, not the parent's.
+    """
+    pid = os.getpid()
+    session = getattr(_mm_http_session, "session", None)
+    if session is None or getattr(_mm_http_session, "pid", None) != pid:
+        session = requests.Session()
+        _mm_http_session.session = session
+        _mm_http_session.pid = pid
+    return session
+
+
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -786,7 +834,7 @@ def load_audio(
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        with requests.get(audio_file, timeout=timeout) as response:
+        with get_mm_http_session().get(audio_file, timeout=timeout) as response:
             response.raise_for_status()
             source = response.content
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
@@ -947,7 +995,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
+        response = get_mm_http_session().get(image_file, timeout=timeout)
         try:
             response.raise_for_status()
             result = response.content
@@ -979,9 +1027,11 @@ def _normalize_video_input(
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            response = requests.get(video_file, stream=True, timeout=timeout)
-            response.raise_for_status()
-            return response.content
+            with get_mm_http_session().get(
+                video_file, stream=True, timeout=timeout
+            ) as response:
+                response.raise_for_status()
+                return response.content
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
@@ -1149,7 +1199,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.11.post1")
+        min_version: Minimum version required (e.g., "0.6.12")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1161,33 +1211,59 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
+def _still_holding_resources(procs):
+    """Procs still holding GPU context, pinned memory or fds.
+
+    A zombie has already had its resources freed by the kernel (only the exit
+    status lingers), so it counts as gone; NoSuchProcess / OSError (see
+    _wait_for_reap_or_raise) mean the same.
+    """
+    alive = []
+    for p in procs:
+        try:
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                alive.append(p)
+        except (psutil.NoSuchProcess, OSError):
+            pass
+    return alive
+
+
 def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
     """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
 
     SIGKILL is asynchronous -- children hold GPU context, pinned memory and
     fds until the kernel reaps them. Raise on timeout so a stuck process
     surfaces instead of leaving a latent race.
+
+    Polls /proc via is_running()/status() rather than psutil.wait_procs, whose
+    os.pidfd_open path (used for non-child procs) raises OSError(EINVAL) against
+    a just-killed process on some kernels and aborts the whole wait.
     """
     warn_at = min(10.0, wait_timeout / 2)
-    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
-    if not alive:
-        return
-    logger.warning(
-        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
-        "continuing to wait up to %.1fs total. pids=%s",
-        len(alive),
-        warn_at,
-        wait_timeout,
-        [p.pid for p in alive],
-    )
-    remaining = wait_timeout - warn_at
-    if remaining > 0:
-        _, alive = psutil.wait_procs(alive, timeout=remaining)
-    if alive:
-        raise RuntimeError(
-            f"kill_process_tree: {len(alive)} process(es) not reaped within "
-            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
-        )
+    deadline = time.monotonic() + wait_timeout
+    warn_deadline = time.monotonic() + warn_at
+    warned = False
+    while True:
+        alive = _still_holding_resources(procs)
+        if not alive:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(
+                f"kill_process_tree: {len(alive)} process(es) not reaped within "
+                f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+            )
+        if not warned and now >= warn_deadline:
+            logger.warning(
+                "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+                "continuing to wait up to %.1fs total. pids=%s",
+                len(alive),
+                warn_at,
+                wait_timeout,
+                [p.pid for p in alive],
+            )
+            warned = True
+        time.sleep(0.1)
 
 
 def kill_process_tree(
@@ -1203,6 +1279,11 @@ def kill_process_tree(
     `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
     for itself -- use `include_parent=False` if child reap must finish first.
     """
+    logger.info(
+        f"kill_process_tree called: parent_pid={parent_pid}, "
+        f"include_parent={include_parent}, pid={os.getpid()}"
+    )
+
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1479,7 +1560,7 @@ def delete_directory(dirpath):
         # This will remove the directory and all its contents
         shutil.rmtree(dirpath)
     except OSError as e:
-        print(f"Warning: {dirpath} : {e.strerror}")
+        logger.warning("Failed to delete directory %s: %s", dirpath, e.strerror)
 
 
 # Temporary directory for prometheus multiprocess mode
@@ -1852,8 +1933,6 @@ def get_mtgpu_memory_capacity():
 
 def get_device_memory_capacity(device: str = None):
     # OOT platforms provide their own memory query via the platform class.
-    from sglang.srt.platforms import current_platform
-
     if current_platform.is_out_of_tree():
         mem_bytes = current_platform.get_device_total_memory()
         if mem_bytes:
@@ -2038,7 +2117,12 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    try:
+        return current_platform.get_device(device_id)
+    except Exception:
+        raise RuntimeError(
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+        )
 
 
 @lru_cache(maxsize=1)
@@ -2104,8 +2188,6 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
-    from sglang.srt.platforms import current_platform
-
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
 
@@ -2317,6 +2399,39 @@ class MultiprocessingSerializer:
         return SafeUnpickler(io.BytesIO(data)).load()
 
 
+SerializedTensorPayload = Union[str, bytes, bytearray, memoryview]
+
+
+def _looks_like_pickle_payload(data: bytes) -> bool:
+    return len(data) >= 2 and data[0] == 0x80 and data[1] <= pickle.HIGHEST_PROTOCOL
+
+
+def normalize_serialized_named_tensor_payload(data: SerializedTensorPayload) -> bytes:
+    """Normalize a serialized tensor payload to raw MultiprocessingSerializer bytes."""
+    if isinstance(data, str):
+        return pybase64.b64decode(data, validate=True)
+
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        data = bytes(data)
+        if _looks_like_pickle_payload(data):
+            return data
+        try:
+            return pybase64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return data
+
+    raise TypeError(
+        "serialized_named_tensors entries must be base64 strings or bytes-like "
+        f"payloads, got {type(data).__name__}"
+    )
+
+
+def normalize_serialized_named_tensor_payloads(
+    payloads: List[SerializedTensorPayload],
+) -> List[bytes]:
+    return [normalize_serialized_named_tensor_payload(data) for data in payloads]
+
+
 class SafeUnpickler(pickle.Unpickler):
     ALLOWED_MODULE_PREFIXES = {
         # --- Python types ---
@@ -2474,30 +2589,24 @@ def human_readable_int(value: str) -> int:
         )
 
 
-def pyspy_dump_schedulers():
-    """py-spy dump on all scheduler in a local node."""
-    pid = psutil.Process().pid
-    for attempt, native_flag in enumerate(["--native", ""]):
-        try:
-            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, check=True
-            )
-            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
-            return
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
-    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
-
-
 def kill_itself_when_parent_died():
     if sys.platform == "linux":
         # sigkill this process when parent worker manager dies
         PR_SET_PDEATHSIG = 1
         libc = ctypes.CDLL("libc.so.6")
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    elif sys.platform == "darwin":
+        # macOS has no PR_SET_PDEATHSIG equivalent; the MLX backend provides a
+        # kqueue-based watchdog that SIGKILLs this worker once it is orphaned.
+        from sglang.srt.hardware_backend.mlx.parent_watchdog import (
+            start_parent_death_watcher,
+        )
+
+        start_parent_death_watcher()
     else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+        logger.warning(
+            "kill_itself_when_parent_died is only supported on linux and macOS."
+        )
 
 
 class UvicornAccessLogFilter(logging.Filter):
@@ -3047,13 +3156,14 @@ def dispose_tensor(x: torch.Tensor):
     interfering with torch.compile's memory tracking and graph recording.
     """
 
-    # Skip disposal during piecewise CUDA graph to avoid torch.compile issues
-    # we do local import to avoid circular import
-    from sglang.srt.compilation.piecewise_context_manager import (
-        is_in_piecewise_cuda_graph,
+    # Skip disposal during piecewise CUDA graph capture/replay: freeing the
+    # backing storage would invalidate addresses recorded in the graph.
+    # Local import avoids a circular dependency.
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        is_in_tc_piecewise_cuda_graph,
     )
 
-    if is_in_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph():
         return
 
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
@@ -3119,8 +3229,7 @@ def require_attn_tp_gather(server_args: ServerArgs):
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    assert server_args.moe_dense_tp_size in [1, None]
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size is not None:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
@@ -3359,6 +3468,27 @@ def configure_gc_logger():
 # COPIED FROM DeepGEMM
 def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
+
+
+def spec_decode_alloc_len_per_request(server_args) -> int:
+    """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
+    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned.
+    """
+    page_size = server_args.page_size
+    len_per_topk = server_args.speculative_num_steps or 1
+    spec_topk = server_args.speculative_eagle_topk or 1
+    spec_tokens = server_args.speculative_num_draft_tokens or 1
+
+    if page_size > 1 and spec_topk > 1:
+        # last partial page and ceil alignment
+        len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+    elif page_size > 1:
+        # only page alignment
+        len_per_topk = ceil_align(len_per_topk, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+
+    return max(len_per_topk * spec_topk, spec_tokens)
 
 
 # COPIED FROM DeepGEMM
@@ -3616,6 +3746,18 @@ def is_gfx95_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_gfx942_supported():
+    """
+    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
@@ -3632,6 +3774,9 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "kv_a_proj_with_mqa",
     "q_b_proj",
     "kv_b_proj",
+    "wq_b",
+    "wk",
+    "weights_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
@@ -3757,7 +3902,7 @@ def get_nvidia_driver_version() -> tuple:
 
 
 @lru_cache(maxsize=1)
-def get_nvidia_driver_version_str() -> str:
+def get_nvidia_driver_version_str() -> str | None:
     """Return the NVIDIA driver version string, e.g. '595.58.03'.
     Returns None on failure."""
     try:
@@ -3839,7 +3984,7 @@ def get_device_sm_nvidia_smi():
 
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
         # Handle cases where nvidia-smi isn't available or output is unexpected
-        print(f"Error getting compute capability: {e}")
+        logger.error("Error getting compute capability: %s", e)
         return (0, 0)  # Default/fallback value
 
 

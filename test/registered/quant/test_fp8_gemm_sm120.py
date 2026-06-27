@@ -33,7 +33,7 @@ class FP8GemmSM120Base:
             "--trust-remote-code",
             "--fp8-gemm-backend",
             cls.backend,
-            "--disable-piecewise-cuda-graph",
+            "--cuda-graph-backend-prefill=disabled",
         ]
         if cls.quantization:
             other_args += ["--quantization", cls.quantization]
