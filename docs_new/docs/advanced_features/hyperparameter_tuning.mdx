@@ -31,17 +31,39 @@ On the other hand, if you see `token usage` very high and you frequently see war
 If you see `KV cache pool is full. Retract requests.` occasionally but not frequently (~1 time per minute), it is okay.
 
 ### Tune `--mem-fraction-static` to increase KV cache pool capacity
-SGLang allocates memory as follows:
+SGLang splits the total GPU memory into four parts:
 
-Total memory usage = model weights + KV cache pool + CUDA graph buffers + activations
+```text
+GPU memory capacity = model weights + KV cache pool + activations + CUDA graph buffers
+```
 
-The `--mem-fraction-static` parameter determines how much memory is allocated to the first two components:
+`--mem-fraction-static` controls the **static** portion (the part that is pre-allocated and stays fixed during serving), which is exactly the first two components:
 
+```text
 mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity
+```
+
+Equivalently, it is the complement of the **dynamic** runtime overhead:
+
+```text
+mem_fraction_static = (GPU memory capacity - activations - CUDA graph buffers) / GPU memory capacity
+```
+
+So the breakdown of what each component is and whether it is counted in `--mem-fraction-static` is:
+
+| Component | Counted in `mem_fraction_static`? | Description |
+| --- | --- | --- |
+| Model weights | Yes (static) | The loaded model parameters. With speculative decoding, the draft model weights are also charged against this budget. |
+| KV cache pool | Yes (static) | The token memory pool that stores K/V cache. A larger fraction means more tokens fit, allowing longer context and higher concurrency. |
+| Activations | No (dynamic) | Intermediate tensors during the forward pass; their size grows with `--chunked-prefill-size`. |
+| CUDA graph buffers | No (dynamic) | Buffers used to capture CUDA graphs; their size grows with the decode `--cuda-graph-max-bs`. |
+
+Because model weights and the KV cache pool share the same static budget, the KV cache pool gets whatever is left after the weights are loaded. If the weights alone exceed the static budget, SGLang raises an error asking you to increase `--mem-fraction-static`.
 
 To support higher concurrency, you should maximize the KV cache pool capacity by setting `--mem-fraction-static` as high as possible while still reserving enough memory for activations and CUDA graph buffers.
 
-SGLang uses simple heuristics to set the default value of `--mem-fraction-static`, but you can optimize it for your use cases.
+SGLang uses simple heuristics to set the default value of `--mem-fraction-static` (roughly reserving `chunked_prefill_size * 1.5 + cuda_graph_max_bs * 2` GB for activations and CUDA graph buffers, and falling back to `0.88` when the GPU memory size is unknown), but you can optimize it for your use cases.
+Multimodal/VLM models reserve extra memory for image processing, so their default fraction is automatically reduced.
 As a rule of thumb, reserving 5–8 GB of memory for activations is typically sufficient. You can check this by inspecting the logs just before the server is ready.
 Look for log entries like this:
 
