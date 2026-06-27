@@ -2043,7 +2043,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 target_device = torch.device(self.device)
                 DefaultModelLoader.load_weights_and_postprocess(
-                    self.model, reconstructed_tensors, target_device
+                    self.model, weights, target_device
                 )
             return True, "Succeeded to update parameter online."
 
