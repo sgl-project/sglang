@@ -302,7 +302,6 @@ def fp8_mqa_logits_make_fused_kv(
     block_kv: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Pack [K bytes | scale bytes] per token, viewed as [B, page, 1, D+4] uint8."""
     num_phys_blocks = kv_fp8.shape[0]
     per_token_size = head_dim + 4
     block_bytes = block_kv * per_token_size

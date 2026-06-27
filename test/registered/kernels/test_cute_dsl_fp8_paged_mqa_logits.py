@@ -181,7 +181,7 @@ def _generate_test_data(
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
-@pytest.mark.parametrize("num_heads", [64])
+@pytest.mark.parametrize("num_heads", [32, 64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096])
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16])
 def test_cute_dsl_fp8_paged_mqa_logits(
