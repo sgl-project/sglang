@@ -13,8 +13,13 @@ class ZImageTurboSamplingParams(SamplingParams):
 
     num_frames: int = 1
     negative_prompt: str = None
-    # height: int = 720
-    # width: int = 1280
+    # Z-Image officially recommends starting at 1024x1024 (it accepts any
+    # /16-aligned resolution roughly in the 768-1280 grid, up to ~2MP).
+    # Declaring the default lets server-based warmup specialize kernels for the
+    # common request shape; supported_resolutions stays None ("all allowed") so
+    # other resolutions still work without spurious "unsupported" warnings.
+    height: int = 1024
+    width: int = 1024
     # fps: int = 24
 
     guidance_scale: float = 0.0
