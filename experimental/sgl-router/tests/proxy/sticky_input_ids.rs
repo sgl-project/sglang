@@ -92,6 +92,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(MODEL.into())],
             bootstrap_port: None,
+            min_priority: None,
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the

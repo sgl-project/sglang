@@ -56,6 +56,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     // Per-request worker URLs flow from the registry through
@@ -733,6 +734,7 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("ghost-7b".into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -1063,6 +1065,7 @@ async fn streaming_load_guard_persists_for_body_lifetime() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -1197,6 +1200,7 @@ async fn streaming_active_load_persists_for_body_lifetime() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -1334,6 +1338,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

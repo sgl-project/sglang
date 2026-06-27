@@ -93,6 +93,16 @@ pub struct Cli {
     // ---- discovery: static ----
     /// Static worker URLs (space-separated or repeated). Mutually
     /// exclusive with `--service-discovery`.
+    ///
+    /// Each entry may carry an optional minimum-priority capability
+    /// suffix `@min_priority=N`, e.g.
+    /// `http://rtx-01:30000@min_priority=100`. A worker tagged this way is
+    /// eligible only for requests whose body `priority` is `>= N`; lower
+    /// (or absent, treated as `0`) priority requests never route to it.
+    /// Use this to keep heterogeneous/low-context workers (e.g. RTX-6000)
+    /// serving only short high-priority production traffic. A malformed
+    /// suffix fails startup. Omit the suffix for a worker that accepts any
+    /// request.
     #[arg(long, num_args = 1..)]
     pub worker_urls: Vec<String>,
 

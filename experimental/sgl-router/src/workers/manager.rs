@@ -352,13 +352,18 @@ fn reconcile_unresolved_workers(
         // Rebuild a discovery-shaped spec: empty `model_ids` so
         // `register_one` re-resolves them from `/server_info`; current
         // mode + bootstrap_port as the seed (`register_one` re-applies
-        // any `/server_info` override).
+        // any `/server_info` override). `min_priority` is a config-time
+        // capability that `/server_info` never carries, so it MUST be
+        // carried over from the live worker — dropping it here would let a
+        // priority-gated worker (e.g. `@min_priority=100`) silently start
+        // accepting priority-0 traffic once it finishes re-introspecting.
         let spec = WorkerSpec {
             id: id.clone(),
             url: worker.url.clone(),
             mode: worker.mode(),
             model_ids: Vec::new(),
             bootstrap_port: worker.bootstrap_port(),
+            min_priority: worker.min_priority(),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for a worker
@@ -499,6 +504,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            min_priority: None,
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
@@ -566,6 +572,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -610,6 +617,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -659,6 +667,7 @@ mod tests {
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
                 bootstrap_port: None,
+                min_priority: None,
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -729,6 +738,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -830,6 +840,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -910,6 +921,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -1013,6 +1025,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1062,13 +1075,88 @@ mod tests {
         let _ = manager_handle.await;
     }
 
-    /// Resurrection safety: a `Removed` that arrives while a reconcile
-    /// re-introspection for the same id is in-flight must NOT resurrect
-    /// the worker. The `Removed` handler awaits the in-flight handle (which
-    /// re-adds the worker), then clears it — so the worker ends up gone and
-    /// stays gone. Guards the per-id ordering contract that `pending`
-    /// enforces for the reconcile path specifically (distinct from the
-    /// Added path's `removed_awaits_in_flight_added`).
+    /// Regression: a priority-gated worker (`min_priority = Some(100)`) that
+    /// first registers while `/server_info` is unavailable must KEEP its gate
+    /// after the reconcile loop re-introspects it. The reconcile path rebuilds
+    /// a discovery-shaped spec; if it dropped `min_priority` (→ `None`) the
+    /// worker would silently start accepting priority-0 traffic once it
+    /// resolved its model ids — defeating the isolation guarantee.
+    #[tokio::test]
+    async fn reconcile_preserves_min_priority_across_reintrospection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) =
+            spawn_switchable_server_info_worker(json!({"served_model_name": "m"}), ready.clone())
+                .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-gated".into());
+        let model = ModelId("m".into());
+        let spec = WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+            min_priority: Some(100),
+        };
+        tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
+
+        // Wait until the worker is registered (still model-less, /server_info
+        // failing). The gate must already be present at this stage.
+        let stuck = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() {
+                        return w.min_priority();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            stuck.ok().flatten(),
+            Some(100),
+            "gate must be present on initial (pre-resolve) registration",
+        );
+
+        // /server_info recovers; reconcile re-introspects and resolves models.
+        ready.store(true, Ordering::SeqCst);
+        let recovered = timeout(Duration::from_secs(3), async {
+            loop {
+                if !registry.workers_for(&model).is_empty() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(recovered.is_ok(), "reconcile must resolve the model id");
+
+        // The crux: the gate survived the reconcile spec rebuild.
+        assert_eq!(
+            registry.get(&id).unwrap().min_priority(),
+            Some(100),
+            "min_priority must survive reconcile re-introspection, not reset to None",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
     #[tokio::test]
     async fn reconcile_does_not_resurrect_worker_removed_mid_reintrospection() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1138,6 +1226,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         }))
         .await
         .unwrap();
@@ -1265,6 +1354,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         }))
         .await
         .unwrap();
@@ -1336,6 +1426,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            min_priority: None,
         }))
         .await
         .unwrap();

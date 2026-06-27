@@ -26,23 +26,67 @@ use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+/// Token separating a worker URL from an optional minimum-priority
+/// capability suffix in `--worker-urls` entries:
+/// `http://host:port@min_priority=100`. A distinctive literal (not a bare
+/// `@`) so it cannot collide with URL userinfo (`user:pass@host`).
+const MIN_PRIORITY_TOKEN: &str = "@min_priority=";
+
+/// Split a `--worker-urls` entry into its base URL and optional
+/// `min_priority` capability. `http://h:p@min_priority=100` yields
+/// `("http://h:p", Some(100))`; a plain URL yields `(url, None)`.
+///
+/// A present-but-unparseable suffix (e.g. `@min_priority=abc`) is a config
+/// error the caller surfaces, rather than silently dropping the isolation
+/// guarantee — a worker that should be priority-gated must never fall back
+/// to "accept everything" because of a typo. `rsplit_once` so a `@` inside
+/// the URL (userinfo) doesn't get mistaken for the capability token.
+///
+/// `pub(crate)` so config validation ([`crate::config::Config::validate`])
+/// can strip the suffix BEFORE URL-parsing/deduping the base URL — otherwise
+/// validation would run against the raw suffixed string and `url::Url` would
+/// misparse `host:port@min_priority=N` as userinfo, letting malformed base
+/// URLs and with/without-suffix duplicates slip past startup checks.
+pub(crate) fn parse_worker_entry(entry: &str) -> Result<(String, Option<i64>)> {
+    match entry.rsplit_once(MIN_PRIORITY_TOKEN) {
+        Some((url, prio_str)) => {
+            let prio = prio_str.trim().parse::<i64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid min_priority in worker URL entry {entry:?}: \
+                     {prio_str:?} is not an integer"
+                )
+            })?;
+            Ok((url.to_string(), Some(prio)))
+        }
+        None => Ok((entry.to_string(), None)),
+    }
+}
+
 /// Spawn the static-URLs producer task and return its `JoinHandle`.
 ///
 /// Returns `Result` for parity with [`crate::discovery::k8s::spawn`] (which
-/// can fail to construct a `kube::Client`); this backend itself is
-/// infallible.
+/// can fail to construct a `kube::Client`) AND because a malformed
+/// `@min_priority=` suffix is rejected here rather than ignored.
 pub async fn spawn(
     cfg: StaticUrlsDiscoveryConfig,
     tx: mpsc::Sender<DiscoveryEvent>,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    // Parse + validate every entry up front so a bad suffix fails startup
+    // loudly instead of after the task is detached.
+    let parsed: Vec<(String, Option<i64>)> = cfg
+        .urls
+        .iter()
+        .map(|e| parse_worker_entry(e))
+        .collect::<Result<_>>()?;
     let handle = tokio::spawn(async move {
-        for url in cfg.urls {
+        for (url, min_priority) in parsed {
             let spec = WorkerSpec {
                 id: WorkerId(url.clone()),
                 url,
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
                 bootstrap_port: None,
+                min_priority,
             };
             if tx.send(DiscoveryEvent::Added(spec)).await.is_err() {
                 tracing::info!(
@@ -77,6 +121,37 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_entry_plain_url_has_no_min_priority() {
+        let (url, prio) = parse_worker_entry("http://w0:30000").unwrap();
+        assert_eq!(url, "http://w0:30000");
+        assert_eq!(prio, None);
+    }
+
+    #[test]
+    fn parse_entry_extracts_min_priority_suffix() {
+        let (url, prio) = parse_worker_entry("http://rtx-01:30000@min_priority=100").unwrap();
+        assert_eq!(url, "http://rtx-01:30000");
+        assert_eq!(prio, Some(100));
+    }
+
+    #[test]
+    fn parse_entry_rejects_non_integer_min_priority() {
+        let err = parse_worker_entry("http://w:30000@min_priority=high")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("min_priority"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_entry_userinfo_at_is_not_mistaken_for_token() {
+        // A bare `@` (here in a hypothetical userinfo position) must not be
+        // treated as the capability token — only `@min_priority=` splits.
+        let (url, prio) = parse_worker_entry("http://user@host:30000").unwrap();
+        assert_eq!(url, "http://user@host:30000");
+        assert_eq!(prio, None);
+    }
 
     /// Task exits cleanly when the consumer drops the receiver mid-fanout.
     /// Without this early exit, the producer would block forever on the

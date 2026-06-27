@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, PriorityFilterOutcome, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -66,6 +66,12 @@ struct RequestProbe {
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    /// Request priority, captured as a raw JSON value so a malformed value
+    /// (string, object, …) is tolerated rather than rejected — eligibility
+    /// resolution treats anything non-integer as `0` (lowest). Used to gate
+    /// capacity-restricted workers (see [`filter_eligible`]).
+    #[serde(default)]
+    priority: Option<serde_json::Value>,
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -126,10 +132,46 @@ pub async fn chat_completions(
             },
         })?;
 
+    // Resolve the model's policy BEFORE priority filtering so an unknown /
+    // unsupported model still surfaces as 404 `ModelNotFound` rather than
+    // being masked by a 503 from the eligibility filter (which can empty the
+    // candidate set for a gated-but-policyless model). Order matters:
+    // "model not served here" is a different, earlier failure than "no
+    // eligible capacity for this priority".
     let policy = ctx
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
+
+    // Priority-eligibility filtering: capacity-restricted workers (e.g. an
+    // RTX-6000 tagged `min_priority=100`) are removed from the candidate
+    // set for requests below their threshold, BEFORE the policy scores the
+    // pool. Internal/long requests carry priority `0` and never reach such
+    // a worker; production traffic carries `priority=100`. Effective
+    // priority is read from the probe (absent/malformed → 0). Hard
+    // isolation: if filtering empties the candidate set (only gated workers
+    // are healthy and this request doesn't qualify) the request is REJECTED
+    // with 503 rather than spilled onto a gated worker — keeping long
+    // internal requests off the small-context worker even under degradation.
+    let request_priority = crate::policies::priority_from_value(probe.priority.as_ref());
+    let eligible = filter_eligible(&workers, request_priority);
+    if eligible.excluded_all {
+        tracing::warn!(
+            model = %model_str,
+            request_priority,
+            healthy_workers = workers.len(),
+            "priority filter removed all candidates; rejecting request (no eligible-capacity worker healthy for this priority)",
+        );
+        ctx.metrics
+            .record_priority_filtered(PriorityFilterOutcome::EmptySetRejected);
+        return Err(ApiError::NoHealthyWorkers {
+            model: model_str.clone(),
+        });
+    } else if eligible.excluded_any {
+        ctx.metrics
+            .record_priority_filtered(PriorityFilterOutcome::WorkerExcluded);
+    }
+    let workers = eligible.workers;
 
     // Tokenize once at ingress whenever it can pay off — decoupled from the
     // routing policy, because forwarding `input_ids` is a property of the
@@ -204,7 +246,7 @@ pub async fn chat_completions(
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
         Some(
             resolver
-                .decode_with_affinity(&model_id, &worker.url)
+                .decode_with_affinity(&model_id, &worker.url, request_priority)
                 .map_err(|e| match e {
                     PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
                         model: model_str.clone(),
@@ -631,7 +673,7 @@ pub async fn chat_completions(
 /// to thread the tokenizer's actual token count through (the
 /// cache-aware-zmq policy already tokenizes the prompt for tree
 /// matching — that count could be reused here).
-fn estimate_prefill_tokens(body: &Bytes) -> usize {
+pub(crate) fn estimate_prefill_tokens(body: &Bytes) -> usize {
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
 }
 

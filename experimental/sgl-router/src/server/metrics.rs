@@ -32,6 +32,7 @@
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_priority_filtered_total` | Counter | `reason` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -144,6 +145,33 @@ impl DecodeAffinityOutcome {
     }
 }
 
+/// Outcome of pre-selection priority-eligibility filtering
+/// (`filter_eligible`). Distinguishes a normal exclusion (at least one
+/// worker was gated out, eligible set still non-empty) from a hard-isolation
+/// rejection (filtering emptied the set, so the request was 503'd rather than
+/// spilled onto a gated worker).
+#[derive(Debug, Clone, Copy)]
+pub enum PriorityFilterOutcome {
+    /// At least one worker was excluded; a non-empty eligible subset was
+    /// passed to the policy.
+    WorkerExcluded,
+    /// Filtering removed every candidate from a non-empty pool; the request
+    /// was REJECTED (503) rather than spilled onto a gated worker. A loud,
+    /// actionable signal: either high-priority capacity is under-provisioned,
+    /// or an internal/low-priority request arrived while only gated workers
+    /// were healthy. Hard-isolation guarantee — see `filter_eligible`.
+    EmptySetRejected,
+}
+
+impl PriorityFilterOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerExcluded => "worker_excluded",
+            Self::EmptySetRejected => "empty_set_rejected",
+        }
+    }
+}
+
 /// Sticky-policy selection outcome — see `StickyPolicy::select` for the
 /// four branches.
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +245,7 @@ pub struct MetricsRegistry {
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    priority_filtered_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -451,6 +480,26 @@ impl MetricsRegistry {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_priority_filtered_total{reason}`.
+    ///
+    /// Counts requests affected by pre-selection priority-eligibility
+    /// filtering: `worker_excluded` when a gated worker (e.g. an RTX-6000
+    /// tagged `min_priority=100`) was removed from a low-priority request's
+    /// candidate set but eligible workers remained, and `empty_set_rejected`
+    /// when filtering emptied the candidate set so the request was rejected
+    /// (503) rather than spilled onto a gated worker. The latter staying near
+    /// zero is the health signal: a climbing `empty_set_rejected` means
+    /// eligible (e.g. B200) capacity is under-provisioned or unhealthy.
+    pub fn record_priority_filtered(&self, outcome: PriorityFilterOutcome) {
+        let mut guard = self.priority_filtered_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -730,6 +779,25 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // priority_filtered_total
+        out.push_str(
+            "# HELP sgl_router_priority_filtered_total Requests affected by pre-selection priority-eligibility filtering (worker_excluded = a gated worker removed from a low-priority request but eligible workers remained; empty_set_rejected = filtering emptied the candidate set so the request was rejected with 503 rather than spilled onto a gated worker).\n",
+        );
+        out.push_str("# TYPE sgl_router_priority_filtered_total counter\n");
+        let guard = self.priority_filtered_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (reason, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_priority_filtered_total{{reason=\"{}\"}} {}\n",
+                reason, value,
+            ));
+        }
+        drop(guard);
+
         out
     }
 }
@@ -796,6 +864,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_decode_affinity_total counter"));
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
+        assert!(out.contains("# TYPE sgl_router_priority_filtered_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
@@ -830,6 +899,23 @@ mod tests {
         assert!(out.contains(
             r#"sgl_router_request_duration_seconds_bucket{model_id="tiny",le="+Inf"} 3"#
         ));
+    }
+
+    #[test]
+    fn priority_filtered_counts_both_outcomes_separately() {
+        let reg = MetricsRegistry::new();
+        reg.record_priority_filtered(PriorityFilterOutcome::WorkerExcluded);
+        reg.record_priority_filtered(PriorityFilterOutcome::WorkerExcluded);
+        reg.record_priority_filtered(PriorityFilterOutcome::EmptySetRejected);
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_priority_filtered_total{reason="worker_excluded"} 2"#),
+            "got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_priority_filtered_total{reason="empty_set_rejected"} 1"#),
+            "got:\n{out}",
+        );
     }
 
     #[test]

@@ -37,7 +37,20 @@ impl Config {
                             "discovery.static_urls.urls contains an empty or whitespace-only entry"
                         ));
                     }
-                    let parsed = url::Url::parse(trimmed).map_err(|e| {
+                    // Strip the optional `@min_priority=N` capability suffix
+                    // BEFORE URL-parsing: the suffix is not part of the URL,
+                    // and leaving it on would make `url::Url` misparse
+                    // `host:port@min_priority=N` as userinfo (hiding a bad
+                    // base URL) and would let `http://x` and
+                    // `http://x@min_priority=100` dedupe as distinct. This
+                    // also surfaces a malformed suffix (`@min_priority=abc`)
+                    // at validate time, matching the discovery task's own
+                    // parse. Same parser → single source of truth.
+                    let (base, _min_priority) =
+                        crate::discovery::static_urls::parse_worker_entry(trimmed).map_err(
+                            |e| anyhow!("discovery.static_urls.urls entry {raw:?} is invalid: {e}"),
+                        )?;
+                    let parsed = url::Url::parse(&base).map_err(|e| {
                         anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
                     })?;
                     match parsed.scheme() {
@@ -151,5 +164,59 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported scheme"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_static_url_with_min_priority_suffix() {
+        // The `@min_priority=N` capability suffix is stripped before URL
+        // validation; a well-formed base URL + integer suffix is valid.
+        cfg("qwen3", &["http://rtx-01:30000@min_priority=100"])
+            .validate()
+            .expect("valid base URL + integer min_priority suffix should pass");
+    }
+
+    #[test]
+    fn rejects_static_url_malformed_min_priority_suffix() {
+        // A non-integer suffix is a config typo that must fail at startup,
+        // not silently drop the gate. Surfaced via the shared parser.
+        let err = cfg("qwen3", &["http://rtx-01:30000@min_priority=abc"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("min_priority") || err.contains("invalid"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_static_url_bad_base_hidden_by_suffix() {
+        // Regression: `http://host:notaport@min_priority=100`. With the
+        // suffix attached, `url::Url` would misparse it as userinfo
+        // (`host:notaport`) + host (`min_priority=100`) and PASS. Stripping
+        // the suffix first exposes the real base `http://host:notaport`,
+        // whose non-numeric port `url::Url` correctly rejects.
+        let err = cfg("qwen3", &["http://host:notaport@min_priority=100"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid URL"), "got: {err}");
+    }
+
+    #[test]
+    fn dedupes_static_url_base_across_min_priority_suffix() {
+        // `http://x:30000` and `http://x:30000@min_priority=100` resolve to
+        // the same base worker URL — registering both would point two
+        // registry entries at one SGLang. Dedup must catch it after the
+        // suffix is stripped (it would NOT if validation ran on the raw
+        // suffixed string).
+        let err = cfg(
+            "qwen3",
+            &["http://x:30000", "http://x:30000@min_priority=100"],
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
     }
 }

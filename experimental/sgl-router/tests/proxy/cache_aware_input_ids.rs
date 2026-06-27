@@ -77,6 +77,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
+        min_priority: None,
     });
     // Use the real loaded tokenizers (not the empty-registry test default) so
     // the cache-aware policy can tokenize at ingress.

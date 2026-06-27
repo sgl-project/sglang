@@ -118,6 +118,7 @@ mod tests {
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId("test".into())],
                     bootstrap_port: None,
+                    min_priority: None,
                 })
                 .expect("test worker accepted");
         }
