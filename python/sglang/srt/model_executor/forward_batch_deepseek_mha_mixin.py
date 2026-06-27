@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.utils.common import CUDA_GRID_DIM_YZ_LIMIT, get_device_sm
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -54,7 +55,12 @@ class ForwardBatchDeepSeekMHAMixin:
     mha_one_shot_kv_indices: Optional[torch.Tensor] = None
 
     def get_max_chunk_capacity(self):
-        return envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
+        capacity = envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
+        if get_device_sm() >= 100:
+            # FlashInfer TRT-LLM FMHA on Blackwell places token work on
+            # gridDim.z, whose CUDA limit is lower than the historical 128K.
+            capacity = min(capacity, CUDA_GRID_DIM_YZ_LIMIT)
+        return capacity
 
     def set_prefix_chunk_idx(self, idx: int):
         self.prefix_chunk_idx = idx

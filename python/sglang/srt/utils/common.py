@@ -103,6 +103,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+# CUDA gridDim.y and gridDim.z are limited to 65535 even when gridDim.x can be
+# much larger. Some FlashInfer TRT-LLM FMHA paths map token work to gridDim.z.
+CUDA_GRID_DIM_YZ_LIMIT = 65535
 torch_release = pkg_version.parse(torch.__version__).release
 
 

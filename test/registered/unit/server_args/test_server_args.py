@@ -16,6 +16,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+from sglang.srt.utils.common import CUDA_GRID_DIM_YZ_LIMIT
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -254,6 +255,59 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             server_args._validate_hisparse_kv_cache_dtype()
+
+
+class TestDPAttentionChunkedPrefillGuard(unittest.TestCase):
+    def _new_args(self, **overrides):
+        server_args = object.__new__(ServerArgs)
+        defaults = dict(
+            attention_backend="dsa",
+            chunked_prefill_size=-1,
+            device="cuda",
+            dp_size=4,
+            dsa_prefill_backend="trtllm",
+            enable_dp_attention=True,
+            enable_dp_lm_head=False,
+            max_prefill_tokens=8192,
+            schedule_conservativeness=0.3,
+            tp_size=4,
+        )
+        defaults.update(overrides)
+        for key, value in defaults.items():
+            setattr(server_args, key, value)
+        return server_args
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_disabled_chunked_prefill_is_restored_for_blackwell_dsa_trtllm(
+        self, _mock_sm100
+    ):
+        server_args = self._new_args(chunked_prefill_size=-1)
+
+        server_args._handle_data_parallelism()
+
+        self.assertEqual(server_args.chunked_prefill_size, 8192)
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_oversized_chunked_prefill_is_capped_after_dp_scaling(
+        self, _mock_sm100
+    ):
+        server_args = self._new_args(
+            chunked_prefill_size=(CUDA_GRID_DIM_YZ_LIMIT + 1) * 4
+        )
+
+        server_args._handle_data_parallelism()
+
+        self.assertEqual(server_args.chunked_prefill_size, CUDA_GRID_DIM_YZ_LIMIT)
+
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    def test_non_trtllm_backend_preserves_disabled_chunked_prefill(self, _mock_sm100):
+        server_args = self._new_args(
+            chunked_prefill_size=-1, dsa_prefill_backend="flashmla_kv"
+        )
+
+        server_args._handle_data_parallelism()
+
+        self.assertEqual(server_args.chunked_prefill_size, -1)
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):

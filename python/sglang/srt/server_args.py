@@ -61,6 +61,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
+    CUDA_GRID_DIM_YZ_LIMIT,
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     cpu_has_amx_support,
@@ -5226,6 +5227,42 @@ class ServerArgs:
 
         init_cp_strategy(self)
 
+    def _needs_trtllm_fmha_chunk_guard(self) -> bool:
+        return (
+            self.device == "cuda"
+            and self.attention_backend == "dsa"
+            and self.dsa_prefill_backend == "trtllm"
+            and is_sm100_supported()
+        )
+
+    def _guard_dp_attention_trtllm_prefill_chunk(self):
+        if not self._needs_trtllm_fmha_chunk_guard():
+            return
+
+        if self.chunked_prefill_size is None or self.chunked_prefill_size <= 0:
+            self.chunked_prefill_size = max(
+                1, self.max_prefill_tokens
+            ) * self.dp_size
+            logger.warning(
+                "Blackwell DSA TRT-LLM prefill cannot safely run with "
+                "--chunked-prefill-size disabled under DP attention because the "
+                "FlashInfer TRT-LLM FMHA kernel maps token work to CUDA gridDim.z. "
+                "Setting chunked_prefill_size to %s before DP scaling.",
+                self.chunked_prefill_size,
+            )
+
+        max_chunked_prefill_size = CUDA_GRID_DIM_YZ_LIMIT * self.dp_size
+        if self.chunked_prefill_size > max_chunked_prefill_size:
+            logger.warning(
+                "Capping chunked_prefill_size from %s to %s for Blackwell DSA "
+                "TRT-LLM prefill so each DP rank stays within CUDA gridDim.y/z "
+                "limit %s.",
+                self.chunked_prefill_size,
+                max_chunked_prefill_size,
+                CUDA_GRID_DIM_YZ_LIMIT,
+            )
+            self.chunked_prefill_size = max_chunked_prefill_size
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -5234,6 +5271,7 @@ class ServerArgs:
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
             assert self.tp_size % self.dp_size == 0
+            self._guard_dp_attention_trtllm_prefill_chunk()
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
