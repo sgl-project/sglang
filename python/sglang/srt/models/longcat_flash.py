@@ -45,7 +45,11 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    enable_moe_dense_fully_dp,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -133,6 +137,8 @@ class LongcatFlashMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = False,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -141,6 +147,8 @@ class LongcatFlashMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -149,6 +157,8 @@ class LongcatFlashMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -351,6 +361,11 @@ class LongcatFlashDecoderLayer(nn.Module):
             [RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for i in range(2)]
         )
 
+        if enable_moe_dense_fully_dp():
+            mlps_tp_rank, mlps_tp_size = 0, 1
+        else:
+            mlps_tp_rank, mlps_tp_size = None, None
+
         self.mlps = nn.ModuleList(
             [
                 LongcatFlashMLP(
@@ -363,6 +378,8 @@ class LongcatFlashDecoderLayer(nn.Module):
                         else quant_config
                     ),
                     prefix=add_prefix(f"mlps.{i}", prefix),
+                    tp_rank=mlps_tp_rank,
+                    tp_size=mlps_tp_size,
                 )
                 for i in range(2)
             ]
@@ -458,7 +475,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         # first_mlp
         hidden_states = self.mlps[0](hidden_states)
         # TP all_reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if not enable_moe_dense_fully_dp():
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         # second_attn
         hidden_states, residual = self.mlp_layer_communicator[1].prepare_attn(
@@ -478,7 +496,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         )
         hidden_states = self.mlps[1](hidden_states)
         # TP all_reduce
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if not enable_moe_dense_fully_dp():
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         hidden_states, residual = self.mlp_layer_communicator[1].postprocess_layer(
             hidden_states, residual, forward_batch
