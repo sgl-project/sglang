@@ -24,13 +24,14 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 _is_cuda = is_cuda()
 if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+_is_gfx95 = _is_hip and is_gfx95_supported()
 
 # GQA-grouped split-K verify kernel tunables (gfx950 / MI355X, ~50K-prefix
 # EAGLE3/MTP verify shape). A 54-combo sweep over
@@ -70,8 +71,17 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        BLOCK_M, BLOCK_N = (64, 64)
-        num_warps = 4
+        if _is_gfx95 and 128 < Lq <= 256:
+            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
+            # streamed per call (each workgroup reads the whole prefix); 8 warps
+            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
+            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
+            # unchanged). Other AMD archs / head dims keep the default below.
+            BLOCK_M, BLOCK_N = (128, 64)
+            num_warps = 8
+        else:
+            BLOCK_M, BLOCK_N = (64, 64)
+            num_warps = 4
     else:
         if _is_cuda and CUDA_CAPABILITY[0] == 12:
             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
@@ -241,6 +251,7 @@ def _fwd_kernel(
     K_Extend,
     V_Extend,
     O_Extend,
+    LSE_Extend,
     K_Buffer,
     V_Buffer,
     qo_indptr,
@@ -262,6 +273,8 @@ def _fwd_kernel(
     stride_vh,
     stride_obs,
     stride_oh,
+    stride_lse_bs,
+    stride_lse_h,
     stride_buf_kbs,
     stride_buf_kh,
     stride_buf_vbs,
@@ -279,6 +292,9 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+    SKIP_PREFIX: tl.constexpr,
+    SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
@@ -345,7 +361,8 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
+    for start_n in range(0, prefix_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
@@ -446,7 +463,8 @@ def _fwd_kernel(
         if not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
-    for start_n in range(0, cur_block_m_end, BLOCK_N):
+    extend_end = 0 if SKIP_EXTEND else cur_block_m_end
+    for start_n in range(0, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
@@ -546,6 +564,13 @@ def _fwd_kernel(
     if HAS_SINK:
         cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
+
+    if STORE_LSE:
+        offs_lse = (
+            cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
+        ) * stride_lse_bs + cur_head * stride_lse_h
+        lse = tl.log(deno) + e_max
+        tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
@@ -982,11 +1007,19 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    lse_extend=None,
+    skip_prefix=False,
+    skip_extend=False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
+
+    When ``lse_extend`` is provided, the per-query/head natural-log LSE is also
+    written to it (used by DCP to merge partial attention across ranks).
+    ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
+    respectively so DCP can compute those two parts separately.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -1017,6 +1050,9 @@ def extend_attention_fwd(
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     HAS_SINK = sinks is not None
+    STORE_LSE = lse_extend is not None
+    stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
+    stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     # GQA-grouped few-query path: load each KV head ONCE and compute all
     # kv_group_num query heads against it (query heads packed into the M
@@ -1152,6 +1188,7 @@ def extend_attention_fwd(
         k_extend,
         v_extend,
         o_extend,
+        lse_extend,
         k_buffer,
         v_buffer,
         qo_indptr,
@@ -1173,6 +1210,8 @@ def extend_attention_fwd(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
+        stride_lse_bs,
+        stride_lse_h,
         k_buffer.stride(0),
         k_buffer.stride(1),
         v_buffer.stride(0),
@@ -1190,6 +1229,9 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        STORE_LSE=STORE_LSE,
+        SKIP_PREFIX=skip_prefix,
+        SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,

@@ -13,9 +13,9 @@ this file is about the *mapping decisions*.
 | model-size / model-name radio | `variants` | One variant per deployable checkpoint family; single `{id:"default"}` when there's no variant axis (then `modelNames` keys drop the variant half). |
 | quantization radio | `quantizations` | Real precision ids (`bf16`/`fp8`/`fp4`/`int4`/…). One `fp4` id even when checkpoints differ per vendor — route via `hw\|variant\|quant` triple keys in `modelNames` (NVFP4 on Blackwell vs AMD MXFP4 is the precedent); per-hw greying falls out of which cells exist. |
 | toggle that **couples** with other parts of the command (changes TP/mem/EP), OR one the legacy page labels with **operating-point words** | `strategies` | The Playground applies pure flag diffs — it cannot do coupled changes. Example: Qwen3.5's MTP toggle bumps TP on three H100 combos → strategies `low-latency` (MTP on) / `high-throughput` (MTP off). **Naming counts like coupling**: GLM-5.1's / Kimi-K2.6's `dpattention` adds only `--dp N --enable-dp-attention` (uncoupled), but its options are subtitled "Low Latency" / "High Throughput" — the page's own named operating-point split → strategies; a flag-only spec toggle riding alongside it stays a Playground axis and bakes per its legacy default. GPU-count radios (GLM-4.7, MiniMax-M2.5/2.7) → budget-tier strategies with the legacy SUPPORT matrix preserved by which cells exist. Strategy count follows the page's operating points: 1 → `balanced`, 2 → `low-latency`+`high-throughput`, 3 → the full trio (§4). |
-| toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers and accuracy-degrading flags) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Accuracy-degrading toggles are never baked either — §2 caveats (axis-only, accuracy-safe cells). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → a strategy when the legacy page labels it as the operating-point split or when coupled (see the row above), else `attention.dpAttn`. **No fitting built-in axis ≠ drop the feature** — EVERY legacy control survives as an interactive control (a dimension or a Playground axis), never a tips-only mention. When none of the built-in axes fits (Nemotron3's "KV Cache DType" radio is the precedent), add the axis via the engine-axis flow: a separate PRIOR engine PR, then the migration config declares it (hard rule 4). |
+| toggle that only adds/removes its own flags | Playground axis (+ bake, EXCEPT parsers and accuracy-degrading flags) | **Parsers (`--reasoning-parser` / `--tool-call-parser`) are NEVER baked into cells** — Deployment commands ship without them regardless of the legacy default or the measured command; the `parsers` axis adds them on top (DSv4 convention; cells mirror the legacy generator's parsers-OFF output). Accuracy-degrading toggles are never baked either — §2 caveats (axis-only, accuracy-safe cells). Other flag-only toggles: legacy default ON → bake into cells AND declare the axis so users can strip (red strikethrough); default OFF → keep cells clean, axis preset only. MTP/EAGLE presets → `speculative` axis; dp-attention → a strategy when the legacy page labels it as the operating-point split or when coupled (see the row above), else `attention.dpAttn`. **EVERY legacy control survives as an interactive control** (a dimension or a Playground axis), never a tips-only mention — but a model-specific control is **config DATA, not engine code**: the axis handler reads options/flags/env/gating straight from `config.playgroundFeatures` (MegaMoE W4A4 is entirely DSv4 config data on the existing `moe` axis — no per-model engine edit). A control that fits an existing axis's data schema is therefore pure config, full stop. A **titled single-select that strips a flag family** (e.g. Nemotron3's "KV Cache DType" `--kv-cache-dtype`) is covered by the merged generic **`flagSelects`** axis → **config-only**: declare a `flagSelects` list of `{ id, title, stripPrefixes, options }` (see the Qwen3.5 mamba example), **no engine PR**. Only a control whose *shape* `flagSelects` still can't express would need a new ONE-TIME generic primitive (never a model-named handler) on a prior engine PR; the backward-compat reasoning (opt-in per key, not in the opt-out set) is in engine-axis.md. |
 | per-combo hidden option (e.g. spec hidden on Xeon) | absent cells | Don't create cells for combos the legacy widget couldn't produce; the engine greys them automatically. `# Error:` pseudo-commands → no cell + explanation in §2 tips and/or a chip `disable`/`disableReason`. |
-| coupled secondary knob (e.g. mamba cache V1/V2) | cells + Playground axis | Bake the correct value per cell following the legacy coupling (Qwen3.5: MTP ⇒ `--mamba-scheduler-strategy extra_buffer` on NVIDIA; AMD/Xeon ⇒ V1/no flag) and document the coupling in §2 tips — AND surface the knob as a Playground axis like every other legacy feature (row above; add the axis when none fits). Baking alone is NOT enough — the every-feature rule supersedes the pilot's cells+prose-only treatment of Qwen3.5's mamba knob (retrofit pending); Qwen3.6 / Qwen3-Coder-Next carry the same knob, so their migrations need the axis in place first. |
+| coupled secondary knob (e.g. mamba cache V1/V2) | cells + Playground axis | Bake the correct value per cell following the legacy coupling (Qwen3.5: MTP ⇒ `--mamba-scheduler-strategy extra_buffer` on NVIDIA; AMD/Xeon ⇒ V1/no flag) and document the coupling in §2 tips — AND surface the knob as a Playground axis like every other legacy feature (row above; add the axis when none fits). Baking alone is NOT enough — the every-feature rule supersedes the pilot's cells+prose-only treatment of Qwen3.5's mamba knob (retrofit pending). The mamba knob is the same single-select shape as KV Cache DType, so it rides the merged generic **`flagSelects`** axis — Qwen3.6 / Qwen3-Coder-Next declare it purely in config (a `flagSelects` block), **no engine PR**. |
 
 ## 2. Command rewrite table (the ONLY allowed normalizations)
 
@@ -25,6 +25,7 @@ this file is about the *mapping decisions*.
 | `--model X` / `--model-path X` | `--model-path {{MODEL_NAME}}` + `modelNames` key |
 | `--tp-size N` | `--tp N` |
 | `--speculative-algo X` (abbreviated) | `--speculative-algorithm X` — the Playground spec axis strips/derives by the full first token only; an abbreviated alias would survive toggles and double up |
+| `--speculative-algorithm NEXTN` | `--speculative-algorithm EAGLE` — **NEXTN is an alias of EAGLE** (same algorithm). Normalize cells + presets to EAGLE; never expose both NEXTN and EAGLE as separate `speculative` presets (they'd be duplicate chips). Keep a one-line "the bench reported NEXTN, an alias of EAGLE" provenance note where the measured command used it. |
 | `--expert-parallel-size N` | `--ep N` — the Playground EP knob recognizes/strips only `--ep`; the long form would survive toggles and double up |
 | (absent) | append `--host {{HOST_IP}}`, `--port {{PORT}}` to every cell |
 | `--nnodes N --node-rank … --dist-init-addr …` literals | delete; `match.nodes: "multi-N"` + `nodesOptions` entry — the engine injects the trio after the last parallelism anchor plus the multi-node header comment |
@@ -44,13 +45,12 @@ Caveats discovered in the pilot:
   asking:
   - offered as a legacy **selectable option/toggle** → never select it;
     cells mirror the accuracy-safe side (even if the legacy default was the
-    lossy side). The option itself **must survive as a Playground axis** — the user's choice may not degrade to a
-    tips mention. Use the existing axis when one fits (DSv4 gates W4A4
-    behind `megamoeQuant`); when the playground lacks one — e.g.
-    Nemotron3-Ultra's "KV Cache DType" radio (None default / fp8_e4m3 /
-    bf16) has no kv-cache axis today — **add the axis** via the engine-axis
-    flow: a separate PRIOR engine PR (hard rule 4, like accuracyLabels
-    #27842), then the migration config declares it;
+    lossy side). The option itself **must survive as a Playground control**
+    — the user's choice may not degrade to a tips mention. Express it as
+    config data on the fitting axis (DSv4 gates W4A4 behind `megamoeQuant`;
+    a single-select like Nemotron3-Ultra's "KV Cache DType" radio
+    None/fp8_e4m3/bf16 rides the merged generic **`flagSelects`** axis — declare
+    a `flagSelects` block, config-only, no engine PR);
   - baked into the recipe's **unconditional/default command** → keep it
     verbatim. The legacy measurements ran with it, and fp8 KV halves KV
     memory — stripping could OOM the recipe. Expect this pattern: legacy
@@ -73,9 +73,16 @@ variants/hw get `disable` + `disableReason` (per-chip constraints), not
 removal — e.g. MoE backend/EP greyed out on dense variants.
 
 `speculative` presets must include every algorithm that actually appears on
-the page — including the measured command's algorithm when it differs from
-the generator default (Qwen3.5 ships both NEXTN and EAGLE) — otherwise the
-verified cell's baseline can't be re-applied after a strip.
+the page (otherwise a stripped cell's baseline can't be re-applied) — but
+**collapse aliases**: NEXTN is an alias of EAGLE (§2 rewrite table), so a page
+benchmarked with NEXTN ships a single `eagle` preset, not both. (Pilot history:
+Qwen3.5 once shipped both; corrected to EAGLE-only.)
+
+**MTP `--max-running-requests` hint (engine, automatic):** when a cell's
+command turns speculative decoding on (`--speculative-algorithm` present)
+without `--max-running-requests`, the Deploy panel + Playground auto-render an
+amber callout (SGLang otherwise caps it at 48). It is FLAG-driven, not
+strategy-driven — nothing to author per page; do NOT duplicate it in §2 prose.
 
 The `parsers` axis is **add-only**: `--reasoning-parser` /
 `--tool-call-parser` are never part of any Deployment cell (see §1) — the
@@ -170,7 +177,7 @@ model-specific note — never toggle-/migration-centric explanations.
 | Family | strategies | Notes |
 |---|---|---|
 | Gemma4 | `low-latency` (MTP on — the legacy toggle's own "Lower Latency" subtitle) / `high-throughput` (MTP off); mi300x hides the toggle → its single recipe → `balanced` (trio union, Qwen3.5 Xeon pattern) | variants = e2b/e4b/12b/31b/26b-a4b; checkpoint radio Standard(BF16)/QAT(q4_0) → quant ids via `modelNames`; §3.3 prose carries AMD recipes beyond the widget's mi300x — maintainer call on cells-from-prose vs tips; vision/audio invocation prose carries over (deployment matrix is text-standard); "gemma4 branch" version → speed drops, MMLU/GSM8K accuracy keeps (mind the few-shot vs run_eval harness footnote); dedicated multi-arch dev images verbatim |
-| Nemotron3-Ultra | dpattention carries "Low latency"/"High throughput" subtitles (naming rule) but THREE perf controls stack — multi-value DP-Attention (2/4/8) × MTP × EP — design the tier mapping via the step-2 table; maintainer sign-off required | NVIDIA-only (h100→gb300) with a per-quant verified-hw SUPPORT matrix → absent cells; "Model" radio = the quant dim (BF16 / NVFP4 Blackwell-only); TP radio 8/16 — TP=16 is 2-node → `nodes` dim; **kvcache radio (None/fp8_e4m3/bf16) → NEW Playground axis, engine PR FIRST** (every-feature rule §1); `launch_server` + spec-V2 env prefix verbatim; dedicated `dev-nemotron3-ultra(+cu13)` images verbatim ("not in any stable release"); "main branch" version → speed drops, GSM8K accuracy keeps |
+| Nemotron3-Ultra | dpattention carries "Low latency"/"High throughput" subtitles (naming rule) but THREE perf controls stack — multi-value DP-Attention (2/4/8) × MTP × EP — design the tier mapping via the step-2 table; maintainer sign-off required | NVIDIA-only (h100→gb300) with a per-quant verified-hw SUPPORT matrix → absent cells; "Model" radio = the quant dim (BF16 / NVFP4 Blackwell-only); TP radio 8/16 — TP=16 is 2-node → `nodes` dim; **kvcache radio (None/fp8_e4m3/bf16) → `flagSelects` axis, config-only** (the generic primitive merged in #28128 — NO engine PR); `launch_server` + spec-V2 env prefix verbatim; dedicated `dev-nemotron3-ultra(+cu13)` images verbatim ("not in any stable release"); **"main branch" version is non-reproducible → drop the WHOLE measured result (speed AND accuracy)** unless it can be pinned to the support PR/commit (day-0 rule, §hard-rule-2) |
 | GLM-4.5, GLM-4.6 | `low-latency` (TP, + MTP from the legacy checkbox) / `high-throughput` (TP+DP+EP) | |
 | GLM-4.7 | `low-latency`(2 GPUs) / `balanced`(4) / `high-throughput`(8) — gpus 2/4/8 + SUPPORT matrix; confirm naming, tiers are GPU budgets | measured-best B200 TP=2 NVFP4 → the verified cell |
 | GLM-4.7-Flash | `low-latency` (tp1 + MTP from the legacy checkbox) / `high-throughput` (DP) | derive from the legacy dp/mtp checkboxes |
@@ -201,11 +208,12 @@ Decisions log, in the order they came up:
    Result: 186 cells = 87 low-latency + 87 high-throughput + 12 balanced; the
    page ships the full trio and the engine greys unused chips per selection.
 2. **Verified cell follows the measurement**: H200/397B/BF16/low-latency =
-   `SGLANG_USE_CUDA_IPC_TRANSPORT=1` env + `--speculative-algorithm NEXTN`
-   (normalized spelling) + measured flag set **minus the parser flags** (the
-   measured run had both parsers on; cells never carry them — noted in the
-   benchmarks header). All other cells = the generator's parsers-OFF output
-   verbatim with `EAGLE`. Both spec presets exposed on the speculative axis.
+   `SGLANG_USE_CUDA_IPC_TRANSPORT=1` env + `--speculative-algorithm EAGLE`
+   (the bench reported NEXTN, an alias of EAGLE — normalized to EAGLE, §2) +
+   measured flag set **minus the parser flags** (the measured run had both
+   parsers on; cells never carry them — noted in the benchmarks header). All
+   other cells = the generator's parsers-OFF output verbatim. A single `eagle`
+   spec preset on the speculative axis (the duplicate NEXTN preset was dropped).
 3. **FP4 single quant id** with `hw|variant|quant` modelNames keys →
    `nvidia/...NVFP4` (b200/b300) vs `amd/...MXFP4` (mi355x).
 4. **Xeon** as `config.hardware` `vendor:"intel"`; cells carry

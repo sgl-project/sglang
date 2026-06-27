@@ -423,13 +423,9 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     _fa_cp_attn,
                 )
             elif (
-                (
-                    forward_batch.extend_prefix_lens_cpu is not None
-                    and any(forward_batch.extend_prefix_lens_cpu)
-                )
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
+                forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+            ) or forward_batch.forward_mode.is_target_verify():
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -513,7 +509,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
             if (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_global_server_args().disable_chunked_prefix_cache
