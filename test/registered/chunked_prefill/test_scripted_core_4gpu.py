@@ -74,7 +74,7 @@ class TestScriptedPpChunkSweep(ScriptedTestCase):
                 mb is not None and not mb.is_empty() for mb in scheduler.mbs
             )
             queues_clear = (
-                scheduler.chunked_req is None
+                next(iter(scheduler.partially_extended_reqs()), None) is None
                 and len(scheduler.waiting_queue) == 0
                 and all(x.is_empty() for x in scheduler.running_mbs)
                 and (scheduler.cur_batch is None or scheduler.cur_batch.is_empty())

@@ -87,7 +87,7 @@ class TestScriptedSwaChunkedReqEarlyReturn(ScriptedTestCase):
         t.abort_all()
         for _ in range(_DRAIN_STEPS):
             if (
-                s.chunked_req is None
+                next(iter(s.partially_extended_reqs()), None) is None
                 and len(s.waiting_queue) == 0
                 and s.running_batch.is_empty()
             ):

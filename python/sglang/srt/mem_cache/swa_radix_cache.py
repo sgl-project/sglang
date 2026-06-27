@@ -484,14 +484,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         req.swa_prefix_lock_released = False
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(self, req: Req, is_partially_extended=False) -> None:
         """Cache request when it is unfinished."""
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.extend_range.end
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
             req.prefix_indices = kv_indices
             return
 
@@ -542,7 +542,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]

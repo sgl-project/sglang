@@ -509,7 +509,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
+            self.root_node,
+            key,
+            value,
+            mamba_value,
+            params.is_partially_extended,
+            prev_prefix_len,
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -630,7 +635,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(req.last_node)
 
-    def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+    def cache_unfinished_req(self, req: Req, is_partially_extended=False) -> None:
         """Cache request when it is unfinished."""
 
         def _skip_cache_unfinished_req(req: Req) -> None:
@@ -638,7 +643,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, : req.extend_range.end
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
@@ -704,7 +709,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
-                chunked=chunked,
+                is_partially_extended=is_partially_extended,
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
@@ -738,7 +743,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used in `PrefillAdder::add_resumed_extend_req` later
         # NOTE: this is needed for both page_size == 1 and page_size > 1
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]
@@ -1183,7 +1188,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         key: RadixKey,
         value,
         mamba_value,
-        chunked: bool = False,
+        is_partially_extended: bool = False,
         prev_prefix_len: int = 0,
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that

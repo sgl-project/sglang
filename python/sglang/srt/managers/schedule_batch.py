@@ -663,6 +663,29 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+class ReqPhase(Enum):
+    """Lifecycle phase of a request, written at scheduling decision points:
+    the PrefillAdder admit methods (EXTEND_*), prepare_for_decode (DECODE),
+    reset_for_retract (OTHERS), plus the disagg-decode prebuilt paths and the
+    disagg-prefill bootstrap-failure handler."""
+
+    # Catch-all for every state this enum does not track yet (just created,
+    # waiting in queue, retracted, transferring, finished, ...).
+    OTHERS = auto()
+    # Both EXTEND_* members mean "admitted to a prefill/extend batch". The
+    # NON_LAST / LAST distinction is frozen AT ADMISSION TIME (it reflects the
+    # scheduler's decision state), deliberately independent of when the forward
+    # finishes or its result is processed — under the overlap scheduler
+    # "completion" has no single well-defined instant.
+    # The admitted extend range did NOT cover the fill target known at
+    # admission (a middle chunk).
+    EXTEND_NON_LAST = auto()
+    # The admitted extend range covered the fill target known at admission
+    # (the final chunk, including ordinary single-chunk prefills).
+    EXTEND_LAST = auto()
+    DECODE = auto()  # entered decode
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -722,6 +745,7 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        self.phase: ReqPhase = ReqPhase.OTHERS
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
         # never mutates this array's length.
@@ -864,11 +888,6 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
-
-        # Whether or not if it is chunked. It increments whenever
-        # it is chunked, and decrement whenever chunked request is
-        # processed.
-        self.inflight_middle_chunks = 0
 
         # For retraction
         self.is_retracted = False
@@ -1093,6 +1112,7 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    # TODO: inline this method into its callers — it has no side effects, it only sets extend_range.
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
 
@@ -1447,6 +1467,7 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        self.phase = ReqPhase.OTHERS
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -1454,7 +1475,6 @@ class Req(ReqDllmMixin):
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
-        self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1470,6 +1490,8 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        self.start_send_idx = 0
+        self.tmp_end_idx = -1
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1582,6 +1604,25 @@ def set_mamba_track_indices_from_reqs(batch):
     )
 
 
+def _compute_is_extend_intermediate(
+    req: Req,
+    dllm_config: Optional[DllmConfig],
+    forward_mode: Optional[ForwardMode],
+) -> bool:
+    # dLLM extend steps never transition to autoregressive decode, so they are
+    # always intermediate (their output is committed via dllm_manager).
+    if dllm_config is not None:
+        return True
+
+    if forward_mode is not None and (
+        forward_mode.is_decode() or forward_mode.is_prebuilt()
+    ):
+        return False
+
+    # Non-final (middle) extend chunk is intermediate; the last chunk is not.
+    return req.extend_range.end < len(req.full_untruncated_fill_ids)
+
+
 def release_req(
     *,
     req: Req,
@@ -1606,29 +1647,6 @@ def release_req(
     req.reset_for_retract()
 
 
-def retract_all(
-    *,
-    reqs: List[Req],
-    server_args: ServerArgs,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
-) -> List[Req]:
-    retracted_reqs = reqs
-    for idx in range(len(reqs)):
-        release_req(
-            req=reqs[idx],
-            remaing_req_count=len(reqs) - idx,
-            server_args=server_args,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            tree_cache=tree_cache,
-            hisparse_coordinator=hisparse_coordinator,
-        )
-    return retracted_reqs
-
-
 def compute_extend_logprob_start_len(
     *,
     logprob_start_len: int,
@@ -1648,21 +1666,16 @@ def compute_extend_logprob_start_len(
     return min(resolved_start - prefix_len, extend_len)
 
 
-def _compute_chunked_req_next_prompt_token(
-    chunked_req: Optional[Req],
-    vocab_size: int,
+def _compute_next_extend_prompt_token(
+    partially_extended_req: Optional[Req],
 ) -> Optional[int]:
-    """Return the next real prompt token after the fill boundary, skipping
-    multimodal placeholder (hash) tokens that lie outside the model vocab."""
-    if chunked_req is None:
+    if partially_extended_req is None:
         return None
-    fill_len = chunked_req.extend_range.end
-    origin_ids = chunked_req.origin_input_ids
-    if fill_len >= len(origin_ids):
+    extend_fill_len = partially_extended_req.extend_range.end
+    fill_ids = partially_extended_req.full_untruncated_fill_ids
+    if extend_fill_len >= len(fill_ids):
         return None
-    if origin_ids[fill_len] < vocab_size:
-        return int(origin_ids[fill_len])
-    return None
+    return int(fill_ids[extend_fill_len])
 
 
 @dataclasses.dataclass
@@ -1695,8 +1708,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     batch_is_full: bool = False
 
     # For chunked prefill in PP
-    chunked_req: Optional[Req] = None
-    chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
 
     # For DP attention
@@ -1820,6 +1831,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_lens: List[int] = None
     extend_logprob_start_lens: List[int] = None
 
+    is_extend_intermediate: List[bool] = dataclasses.field(default_factory=list)
+
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
@@ -1847,10 +1860,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        forward_mode: Optional[ForwardMode] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
+
+        is_extend_intermediate = [
+            _compute_is_extend_intermediate(req, dllm_config, forward_mode)
+            for req in reqs
+        ]
 
         batch = cls(
             reqs=reqs,
@@ -1865,12 +1883,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
-            chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
-                chunked_req,
-                model_config.vocab_size,
-            ),
             dllm_config=dllm_config,
+            is_extend_intermediate=is_extend_intermediate,
         )
         return batch
 
@@ -2077,7 +2091,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
-                # fill_len/extend_input_len on chunk overflow but not input_embeds.
+                # extend_fill_len/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_range.length]
                 )
@@ -2450,18 +2464,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
-    def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = retract_all(
-            reqs=self.reqs,
-            server_args=server_args,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-            hisparse_coordinator=self.hisparse_coordinator,
-        )
-        self.reqs = []
-        return retracted_reqs
-
     def retract_decode(
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
@@ -2616,6 +2618,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
+        self.is_extend_intermediate = [False] * len(self.reqs)
+
+        # Must precede the spec early-return below so spec reqs also leave
+        # the EXTEND_* phases.
+        for req in self.reqs:
+            req.phase = ReqPhase.DECODE
+
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
@@ -2689,30 +2698,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
+        skip_extend_intermediate: bool = False,
     ):
         if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
+            is_extend_intermediate = self.is_extend_intermediate
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                and not (
+                    skip_extend_intermediate
+                    and is_extend_intermediate
+                    and is_extend_intermediate[i]
+                )
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
+            self.is_extend_intermediate = []
             return
 
         if len(keep_indices) == len(self.reqs):
             # No need to filter
             return
+
+        if self.is_extend_intermediate:
+            self.is_extend_intermediate = [
+                self.is_extend_intermediate[i] for i in keep_indices
+            ]
 
         keep_indices_device = torch.tensor(
             keep_indices,
@@ -2787,8 +2803,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
         # Cat only when both sides hold a real token tensor; otherwise drop to
         # None and let resolve_forward_inputs rebuild from the merged
-        # req_pool_indices. Mismatch arises e.g. with spec_v1, which keeps its
-        # tensor while a relay-staged side is None -- there the worker rebuilds.
+        # req_pool_indices (e.g. when one side keeps its tensor while a
+        # relay-staged side is None).
         if self.input_ids is not None and other.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
         else:
@@ -2822,6 +2838,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+        if other.is_extend_intermediate:
+            assert not any(other.is_extend_intermediate), (
+                "merge_batch requires the other batch to be decode-ready; "
+                f"got is_extend_intermediate={other.is_extend_intermediate}"
+            )
+            self.is_extend_intermediate.extend(other.is_extend_intermediate)
+
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,
@@ -2841,6 +2864,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
+            is_extend_intermediate=self.is_extend_intermediate[:],
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,

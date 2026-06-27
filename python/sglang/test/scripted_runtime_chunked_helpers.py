@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 DEFAULT_CHUNK_SIZE: int = 256
 
@@ -38,6 +38,24 @@ def run_until(handle, predicate, *, max_steps: int = DEFAULT_MAX_STEPS):
 
 def run_until_finished(handle, *, max_steps: int = DEFAULT_MAX_STEPS):
     yield from run_until(handle, lambda h: h.finished, max_steps=max_steps)
+
+
+def inflight_middle_chunks_of(req: Any) -> int:
+    from sglang.srt.managers.schedule_batch import ReqPhase
+
+    return int(req.phase is ReqPhase.EXTEND_NON_LAST)
+
+
+def extend_input_len_of(req: Any) -> Optional[int]:
+    return req.extend_range.length if req.extend_range is not None else None
+
+
+def chunked_req_of(scheduler: Any) -> Any:
+    reqs = scheduler.partially_extended_reqs()
+    assert len(reqs) <= 1, (
+        f"expected at most one partially-extended req, got " f"{[r.rid for r in reqs]}"
+    )
+    return reqs[0] if reqs else None
 
 
 def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_STEPS):

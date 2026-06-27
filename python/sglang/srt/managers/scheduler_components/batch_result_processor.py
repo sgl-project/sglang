@@ -78,6 +78,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    deactivate_req: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -92,6 +93,12 @@ class SchedulerBatchResultProcessor:
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                # The prebuilt batch is no longer filtered before merge, so a
+                # req that finishes immediately would otherwise linger in
+                # active_reqs forever (leak). deactivate_req only pops it from
+                # active_reqs and leaves batch.reqs intact, so the stream_output
+                # below still emits this finished req.
+                self.deactivate_req(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -215,16 +222,21 @@ class SchedulerBatchResultProcessor:
             # Check finish conditions
             logprob_pt = 0
 
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if (
-                    req.finished() and req.inflight_middle_chunks <= 0
-                ) or req.is_retracted:
+            for i, (req, next_token_id, is_extend_intermediate) in enumerate(
+                zip(
+                    batch.reqs,
+                    next_token_ids,
+                    batch.is_extend_intermediate,
+                    strict=True,
+                )
+            ):
+                if (req.finished() and not is_extend_intermediate) or req.is_retracted:
                     # Decode req in a mixed batch, or a retracted req. Keep an
                     # aborted middle chunk in the chunked branch long enough to
                     # drain its accounting without streaming it.
                     continue
 
-                if req.inflight_middle_chunks <= 0:
+                if not is_extend_intermediate:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
@@ -237,6 +249,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
+                        self.deactivate_req(req)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -272,9 +285,8 @@ class SchedulerBatchResultProcessor:
                         )
 
                 else:
-                    # being chunked reqs' prefill is not finished
-                    req.inflight_middle_chunks -= 1
-                    # There is only at most one request being currently chunked.
+                    # being partially-extended reqs' prefill is not finished
+                    # There is only at most one request being currently partially extended.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
@@ -306,14 +318,17 @@ class SchedulerBatchResultProcessor:
                     phs = phs.cpu().detach()
 
             # Check finish conditions
-            for i, req in enumerate(batch.reqs):
+            for i, (req, is_extend_intermediate) in enumerate(
+                zip(batch.reqs, batch.is_extend_intermediate, strict=True)
+            ):
                 if req.is_retracted:
                     continue
 
                 req.embedding = embeddings[i]
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
-                if req.inflight_middle_chunks <= 0:
+
+                if not is_extend_intermediate:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
@@ -321,12 +336,12 @@ class SchedulerBatchResultProcessor:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self.deactivate_req(req)
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
-                    # being chunked reqs' prefill is not finished
-                    req.inflight_middle_chunks -= 1
+                    # being partially-extended reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.output_streamer.stream_output(
@@ -426,38 +441,36 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        """Validate PP skip output comm correctness.
-
-        - When skip=True: all reqs must be middle chunks (inflight_middle_chunks > 0)
-          so placeholder zeros are never consumed via req.output_ids.append().
-        - When skip=False: at least one req should consume next_token_ids
-          (inflight_middle_chunks <= 0), otherwise warn.
-        """
         if not envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
             return
 
         if not getattr(result, "skipped_output_comm", False):
             if batch.forward_mode.is_extend() and not batch.forward_mode.is_prebuilt():
                 has_consumed_output = any(
-                    req.inflight_middle_chunks <= 0
-                    for req in batch.reqs
+                    not is_extend_intermediate
+                    for req, is_extend_intermediate in zip(
+                        batch.reqs, batch.is_extend_intermediate, strict=True
+                    )
                     if not req.finished() and not req.is_retracted
                 )
                 if not has_consumed_output and len(batch.reqs) > 0:
-                    chunks = list([r.inflight_middle_chunks for r in batch.reqs])
+                    flags = batch.is_extend_intermediate
                     logger.warning(
                         f"PP non-skip output comm: no req consumed next_token_ids. "
                         f"contains_last_prefill_chunk={batch.contains_last_prefill_chunk}, "
-                        f"num_reqs={len(batch.reqs)}, all inflight_middle_chunks={chunks}"
+                        f"num_reqs={len(batch.reqs)}, all is_extend_intermediate={flags}"
                     )
             return
 
-        for req in batch.reqs:
+        for req, is_extend_intermediate in zip(
+            batch.reqs, batch.is_extend_intermediate, strict=True
+        ):
             if not req.finished() and not req.is_retracted:
-                assert req.inflight_middle_chunks > 0, (
+                assert is_extend_intermediate, (
                     f"PP skip output comm invariant violated: req {req.rid} "
-                    f"has inflight_middle_chunks={req.inflight_middle_chunks} "
-                    f"but output was skipped (contains_last_prefill_chunk="
+                    f"has is_extend_intermediate={is_extend_intermediate} "
+                    f"(not intermediate) but output was skipped "
+                    f"(contains_last_prefill_chunk="
                     f"{batch.contains_last_prefill_chunk}). "
                     f"Placeholder zeros would be appended to output_ids."
                 )
@@ -852,6 +865,8 @@ class SchedulerBatchResultProcessor:
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+
+            self.deactivate_req(req)
 
             req.time_stats.set_completion_time()
 

@@ -1,13 +1,20 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ReqPhase,
+    _compute_is_extend_intermediate,
+    _compute_next_extend_prompt_token,
+)
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
@@ -84,6 +91,9 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.finished.return_value = False
+        req.phase = ReqPhase.OTHERS
+        req.is_dllm.return_value = False
+        req.host_hit_length = 0
         req.needs_host_load_back.return_value = False
         return req
 
@@ -101,6 +111,90 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def create_retracted_decode_req(
+        self, *, origin_len: int, output_len: int, extend_end: int
+    ) -> Req:
+        req = Req.__new__(Req)
+        req.rid = "retracted-decode"
+        req.dllm_config = None
+        req.origin_input_ids = array("q", range(origin_len))
+        req.output_ids = array("q", range(origin_len, origin_len + output_len))
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.extend_range = Range(0, extend_end)
+        req.phase = ReqPhase.EXTEND_NON_LAST
+        req.retracted_stain = True
+        return req
+
+    def test_retracted_decode_req_pending_bound_uses_full_fill_sequence(self):
+        """A retracted-decode replay uses the full fill sequence for its pending bound."""
+        req = self.create_retracted_decode_req(
+            origin_len=367,
+            output_len=438,
+            extend_end=600,
+        )
+
+        self.assertEqual(len(req.full_untruncated_fill_ids), 805)
+        self.assertTrue(
+            _compute_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
+        )
+        self.assertEqual(_compute_next_extend_prompt_token(req), 600)
+
+        req.extend_range = Range(0, 805)
+        # The PrefillAdder re-derives the phase at each chunk's admission.
+        req.phase = ReqPhase.EXTEND_LAST
+
+        self.assertFalse(
+            _compute_is_extend_intermediate(req, dllm_config=None, forward_mode=None)
+        )
+        self.assertIsNone(_compute_next_extend_prompt_token(req))
+
+    def test_decoded_req_output_ids_do_not_extend_chunked_prefill_bound(self):
+        """Accumulated output_ids never make a decode or last-chunk req look partially extended."""
+        req = Req.__new__(Req)
+        req.rid = "decoded-req"
+        req.dllm_config = None
+        req.origin_input_ids = array("q", range(128))
+        req.output_ids = array("q", range(128, 132))
+        req.phase = ReqPhase.DECODE
+        req.retracted_stain = False
+
+        # A completed-prompt decoding req has entered decode, so extend_range is
+        # None and it never counts as having a pending chunk, regardless of how
+        # many output_ids have accumulated past the prompt length.
+        req.extend_range = None
+
+        # The real scheduler builds decode batches with forward_mode=DECODE
+        # (scheduler.py passes ForwardMode.DECODE), which short-circuits
+        # _compute_is_extend_intermediate before it ever reads extend_range — so
+        # a decode req is reported not-intermediate even with extend_range=None.
+        self.assertFalse(
+            _compute_is_extend_intermediate(
+                req, dllm_config=None, forward_mode=ForwardMode.DECODE
+            )
+        )
+
+        # A fresh single-chunk prefill whose extend_range already covers the full
+        # prompt (no output yet) is the last chunk: not pending, no next token.
+        last_chunk_req = Req.__new__(Req)
+        last_chunk_req.rid = "last-chunk-req"
+        last_chunk_req.dllm_config = None
+        last_chunk_req.origin_input_ids = array("q", range(128))
+        last_chunk_req.output_ids = array("q", [])
+        last_chunk_req.full_untruncated_fill_ids = (
+            last_chunk_req.origin_input_ids + last_chunk_req.output_ids
+        )
+        last_chunk_req.extend_range = Range(0, len(last_chunk_req.origin_input_ids))
+        last_chunk_req.phase = ReqPhase.EXTEND_LAST
+        last_chunk_req.retracted_stain = False
+
+        self.assertEqual(len(last_chunk_req.full_untruncated_fill_ids), 128)
+        self.assertFalse(
+            _compute_is_extend_intermediate(
+                last_chunk_req, dllm_config=None, forward_mode=None
+            )
+        )
+        self.assertIsNone(_compute_next_extend_prompt_token(last_chunk_req))
 
     def test_preempt_success_high_priority_values_first(self):
         params = [
@@ -390,9 +484,7 @@ class TestPrefillAdder(CustomTestCase):
         req1.last_node = MagicMock()
         req1.sampling_params.ignore_eos = False
 
-        result1 = adder.add_one_req(
-            req1, has_chunked_req=False, truncation_align_size=None
-        )
+        result1 = adder.add_unstarted_extend_req(req1, truncation_align_size=None)
 
         self.assertEqual(len(adder.can_run_list), 1)
         self.assertEqual(adder.rem_chunk_tokens, 0)  # 56 - 56
@@ -423,9 +515,7 @@ class TestPrefillAdder(CustomTestCase):
         req2.last_node = MagicMock()
         req2.sampling_params.ignore_eos = False
 
-        result2 = adder2.add_one_req(
-            req2, has_chunked_req=False, truncation_align_size=None
-        )
+        result2 = adder2.add_unstarted_extend_req(req2, truncation_align_size=None)
 
         self.assertEqual(len(adder2.can_run_list), 1)
         self.assertEqual(adder2.rem_chunk_tokens, 3)  # 59 - 56 = 3 remaining
@@ -439,15 +529,13 @@ class TestPrefillAdder(CustomTestCase):
         req3.last_node = MagicMock()
         req3.sampling_params.ignore_eos = False
 
-        result3 = adder2.add_one_req(
-            req3, has_chunked_req=False, truncation_align_size=None
-        )
+        result3 = adder2.add_unstarted_extend_req(req3, truncation_align_size=None)
 
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
-    def _build_hybrid_swa_chunked_req(
+    def _build_hybrid_swa_resumed_req(
         self,
         *,
         page_size,
@@ -468,7 +556,8 @@ class TestPrefillAdder(CustomTestCase):
         )
         adder.is_hybrid_swa = is_hybrid_swa
 
-        req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
+        req = self.create_mock_req("resumed", priority=0, max_new_tokens=128)
+        req.phase = ReqPhase.EXTEND_NON_LAST
         req.prefix_indices = []
         req.full_untruncated_fill_ids = list(range(extend_input_len))
         # set_extend_range is the only writer of extend_range; the production
@@ -482,40 +571,65 @@ class TestPrefillAdder(CustomTestCase):
         )
         return adder, req
 
-    def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
+    def test_add_resumed_extend_req_hybrid_swa_reserves_page_for_alloc_extend(self):
+        """Hybrid-SWA resume caps the chunk at rem_swa_tokens minus one reserved page."""
         # alloc_extend needs extend_num_tokens + page_size per request. If the
         # scheduler hands out all of rem_swa_tokens, alloc_extend cannot get its
         # extra page and OOMs. With the fix, extend_input_len must cap at
         # rem_swa_tokens - page_size so the page is reserved.
         PAGE_SIZE = 64
         REM_SWA = 100
-        adder, req = self._build_hybrid_swa_chunked_req(
+        adder, req = self._build_hybrid_swa_resumed_req(
             page_size=PAGE_SIZE, rem_swa=REM_SWA
         )
 
-        result = adder.add_chunked_req(req)
+        result = adder.add_resumed_extend_req(req)
 
-        self.assertIs(result, req)  # truncated → chunked prefill continues
+        self.assertIsInstance(result, AddReqResult)
+        self.assertIn(req, adder.can_run_list)
         req.set_extend_range.assert_called_once()
         start, end = req.set_extend_range.call_args.args
         new_len = end - start
         self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
         self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
+        # Truncated below the full prompt: chunked prefill continues.
+        self.assertLess(end, len(req.full_untruncated_fill_ids))
 
-    def test_add_chunked_req_hybrid_swa_defers_when_swa_below_page(self):
+    def test_add_resumed_extend_req_hybrid_swa_defers_when_swa_below_page(self):
+        """Hybrid-SWA resume defers with NO_TOKEN when rem_swa_tokens <= page_size."""
         # When rem_swa_tokens <= page_size there is no room to serve even the
-        # reservation, so the chunked req must be deferred (returned unchanged)
-        # instead of falling back to rem_chunk_tokens and bypassing SWA budget.
+        # reservation, so the resumed req must be deferred instead of falling
+        # back to rem_chunk_tokens and bypassing the SWA budget.
         PAGE_SIZE = 64
-        adder, req = self._build_hybrid_swa_chunked_req(
+        adder, req = self._build_hybrid_swa_resumed_req(
             page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
         )
 
-        result = adder.add_chunked_req(req)
+        result = adder.add_resumed_extend_req(req)
 
-        self.assertIs(result, req)
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
         req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
+
+    def test_add_resumed_extend_req_non_hybrid_no_swa_reservation(self):
+        """Non-hybrid resume ignores the SWA-pool reservation and adds the full chunk."""
+        # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
+        # the fix would regress non-SWA models.
+        PAGE_SIZE = 16
+        adder, req = self._build_hybrid_swa_resumed_req(
+            page_size=PAGE_SIZE,
+            rem_swa=10,
+            rem_chunk=500,
+            extend_input_len=200,
+            is_hybrid_swa=False,
+            full_available=300,
+        )
+
+        result = adder.add_resumed_extend_req(req)
+
+        self.assertIsInstance(result, AddReqResult)
+        req.set_extend_range.assert_called_once_with(0, 200)
+        self.assertIn(req, adder.can_run_list)
 
     def test_swa_budget_for_req(self):
         cases = [
@@ -536,24 +650,6 @@ class TestPrefillAdder(CustomTestCase):
                     rem_chunk_tokens=rem_chunk,
                 )
                 self.assertEqual(adder._swa_budget_for_req(extend), expected)
-
-    def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
-        # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
-        # the fix would regress non-SWA models.
-        PAGE_SIZE = 16
-        adder, req = self._build_hybrid_swa_chunked_req(
-            page_size=PAGE_SIZE,
-            rem_swa=10,
-            rem_chunk=500,
-            extend_input_len=200,
-            is_hybrid_swa=False,
-            full_available=300,
-        )
-
-        result = adder.add_chunked_req(req)
-        self.assertIsNone(result)
-        req.set_extend_range.assert_called_once_with(0, 200)
-        self.assertIn(req, adder.can_run_list)
 
 
 if __name__ == "__main__":

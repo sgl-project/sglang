@@ -370,8 +370,8 @@ class HiMambaRadixCache(MambaRadixCache):
             last_node,
         )
 
-    def _inc_hit_count(self, node: TreeNode, chunked=False):
-        if self.cache_controller.write_policy == "write_back" or chunked:
+    def _inc_hit_count(self, node: TreeNode, is_partially_extended=False):
+        if self.cache_controller.write_policy == "write_back" or is_partially_extended:
             return
         node.hit_count += 1
 
@@ -851,7 +851,7 @@ class HiMambaRadixCache(MambaRadixCache):
         key: RadixKey,
         value,
         mamba_value,
-        chunked: bool = False,
+        is_partially_extended: bool = False,
         prev_prefix_len: int = 0,
     ) -> Tuple[int, bool]:
         assert mamba_value is not None, "Mamba value should not be None here."
@@ -889,7 +889,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     start = max(0, prev_prefix_len - total_prefix_length)
                     self.token_to_kv_pool_allocator.free(value[start:prefix_len])
                 total_prefix_length += prefix_len
-                self._inc_hit_count(node, chunked)
+                self._inc_hit_count(node, is_partially_extended)
 
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -900,7 +900,7 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_value_exist = False
         if len(key):
             new_node = self._add_new_node(node, key, value, mamba_value)
-            self._inc_hit_count(new_node, chunked)
+            self._inc_hit_count(new_node, is_partially_extended)
         elif node.mamba_value is None:
             node.mamba_value = mamba_value
             if not node.evicted:

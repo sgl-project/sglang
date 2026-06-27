@@ -63,14 +63,21 @@ def _eagle_prefill_tail_tokens(
 ) -> torch.Tensor:
     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
+    from sglang.srt.managers.schedule_batch import (
+        _compute_next_extend_prompt_token,
+    )
+
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
-    next_prompt_token = batch.chunked_req_next_prompt_token
-    if next_prompt_token is not None:
-        for i, r in enumerate(batch.reqs):
-            if r is batch.chunked_req:
-                tail_tokens = tail_tokens.clone()
-                tail_tokens[i] = next_prompt_token
-                break
+    for i, (req, is_extend_intermediate) in enumerate(
+        zip(batch.reqs, batch.is_extend_intermediate, strict=True)
+    ):
+        if not (is_extend_intermediate and not req.is_dllm()):
+            continue
+        next_prompt_token = _compute_next_extend_prompt_token(req)
+        if next_prompt_token is not None:
+            tail_tokens = tail_tokens.clone()
+            tail_tokens[i] = next_prompt_token
+        break
     return tail_tokens
 
 

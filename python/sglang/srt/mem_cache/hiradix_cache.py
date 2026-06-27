@@ -895,9 +895,9 @@ class HiRadixCache(RadixCache):
         host_value = torch.cat([n.host_value for n in chain])
         return top, key, hash_value, host_value
 
-    def _inc_hit_count(self, node: TreeNode, chunked=False):
-        # skip the hit count update for chunked requests
-        if self.cache_controller.write_policy == "write_back" or chunked:
+    def _inc_hit_count(self, node: TreeNode, is_partially_extended=False):
+        # skip the hit count update for partially-extended requests
+        if self.cache_controller.write_policy == "write_back" or is_partially_extended:
             return
         node.hit_count += 1
 
@@ -1703,7 +1703,7 @@ class HiRadixCache(RadixCache):
     def insert(self, params: InsertParams) -> InsertResult:
         key = params.key
         value = params.value
-        chunked = params.chunked
+        is_partially_extended = params.is_partially_extended
         priority = params.priority
 
         if priority is None:
@@ -1738,7 +1738,7 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
                 else:
-                    self._inc_hit_count(node, chunked)
+                    self._inc_hit_count(node, is_partially_extended)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -1753,7 +1753,7 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
                 else:
-                    self._inc_hit_count(new_node, chunked)
+                    self._inc_hit_count(new_node, is_partially_extended)
                     total_prefix_length += prefix_len
                 node = new_node
 
@@ -1781,7 +1781,7 @@ class HiRadixCache(RadixCache):
             self._record_store_event(new_node)
 
             if self.cache_controller.write_policy != "write_back":
-                self._inc_hit_count(new_node, chunked)
+                self._inc_hit_count(new_node, is_partially_extended)
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
