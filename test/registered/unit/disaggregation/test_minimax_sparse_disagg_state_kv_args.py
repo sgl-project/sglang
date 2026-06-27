@@ -52,8 +52,6 @@ def _make_kv_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
     )
 
 
-# MiniMaxSparseKVPool lives in the PR2 split (mem-cache); these tests resolve
-# only after PR2 merges to main and this branch rebases onto it.
 class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
     def test_setup_state_kv_args_single_minimax_component(self):
         pool = _make_k_only_pool()

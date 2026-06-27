@@ -656,7 +656,6 @@ def setup_state_kv_args(
     kv_args.state_dim_per_tensor = []
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
-        # K-only index buffers ride the state channel; K+V variant unsupported.
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
                 "PD disaggregation for MiniMax sparse layers with index value "
