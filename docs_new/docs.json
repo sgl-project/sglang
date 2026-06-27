@@ -202,6 +202,10 @@
       "destination": "/docs/advanced_features/vlm_query"
     },
     {
+      "source": "/basic_usage/unlimited_ocr.html",
+      "destination": "/cookbook/autoregressive/Baidu/Unlimited-OCR"
+    },
+    {
       "source": "/basic_usage/deepseek_ocr.html",
       "destination": "/cookbook/autoregressive/DeepSeek/DeepSeek-OCR"
     },
@@ -1060,6 +1064,12 @@
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Super"
+                    ]
+                  },
+                  {
+                    "group": "Baidu",
+                    "pages": [
+                      "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
                   {
