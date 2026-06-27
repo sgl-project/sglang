@@ -152,7 +152,7 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not _is_npu
 _MHC_POST_MULT_VALUE = 2.0
 
 
@@ -2144,7 +2144,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                     "head",
                     "hc_head",
                 ]
-                scale_target = "." + scale_suffix
                 is_nextn_spec = any(rest.startswith(p) for p in nextn_spec_prefixes)
                 if is_nextn_spec:
                     if rest.startswith("emb.tok_emb"):
