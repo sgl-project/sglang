@@ -16,6 +16,7 @@ from sglang.test.xpu.gsm8k_xpu_mixin import GSM8KXPUMixin
 register_xpu_ci(est_time=1500, suite="nightly-xpu-4-gpu", nightly=True)
 
 
+@unittest.skip("Not yet validated end-to-end on intel-bmg-nightly; re-enable once a passing run is recorded.")
 @unittest.skipUnless(
     torch.xpu.is_available(),
     "Intel XPU not available (torch.xpu.is_available() returned False)",

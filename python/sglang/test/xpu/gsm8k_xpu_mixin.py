@@ -51,7 +51,10 @@ class GSM8KXPUMixin(ABC):
     server_cmd: str = ""
     gsm8k_num_shots: int = 8
     num_questions: int = 200
-    gsm8k_parallel: int = 4
+    # Single-stream eval: with intel_xpu attention at TP>=2, concurrent prefill
+    # wedges the Level Zero driver inside ur_command_list_manager::appendUSMMemcpy.
+    # Subclasses may override on hardware that handles parallel prefill cleanly.
+    gsm8k_parallel: int = 1
     max_new_tokens: int = 512
 
     @classmethod
