@@ -30,8 +30,8 @@ def _assert_pp_decode_cached_tokens(result, history_len, output_len, label):
 class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Qwen3-32B + HiCache + PP + UnifiedRadixCache."""
 
-    hicache_io_backend = "direct"
-    hicache_mem_layout = "page_first_direct"
+    hicache_io_backend = "kernel"
+    hicache_mem_layout = "page_first"
     max_running_requests = 2
     kl_threshold = 0.005
     gsm8k_threshold = 0.7

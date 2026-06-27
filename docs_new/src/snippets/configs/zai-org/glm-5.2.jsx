@@ -6,7 +6,6 @@ export const config = {
 
   supportedHardware: [
     "h200", "b200", "gb300", "b300",
-    "mi355x", "mi325x", "mi300x",
   ],
 
   // Single released checkpoint — no size/mode split.
@@ -16,6 +15,7 @@ export const config = {
   quantizations: [
     { id: "fp8", label: "FP8" },
     { id: "bf16", label: "BF16" },
+    { id: "nvfp4", label: "NVFP4" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -30,6 +30,7 @@ export const config = {
   modelNames: {
     "default|fp8": "zai-org/GLM-5.2-FP8",
     "default|bf16": "zai-org/GLM-5.2",
+    "default|nvfp4": "nvidia/GLM-5.2-NVFP4",
   },
 
   placeholders: {
@@ -94,6 +95,9 @@ sgl-eval run aime25 \\
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
+    // NVFP4 needs the dev image with modelopt_fp4 support (per-quant override).
+    "b300|nvfp4":  "lmsysorg/sglang:dev-glm52-nvfp4",
+    "gb300|nvfp4": "lmsysorg/sglang:dev-glm52-nvfp4",
   },
 
   github: {
@@ -110,8 +114,8 @@ sgl-eval run aime25 \\
       knobs: [
         { id: "tp", label: "TP", values: [null, 4, 8] },
         { id: "cp", label: "CP (DSA prefill)", values: [null, 1, 2, 4, 8],
-          disable: { hw: ["b200", "gb300", "b300", "mi355x", "mi325x", "mi300x"] },
-          disableReason: "DSA prefill Context Parallel is verified on Hopper (H200); the Blackwell sm100 DSA-CP FP8 rope kernel is not yet adapted, and the ROCm DSA-CP path is not yet validated on AMD (MI300X/MI325X/MI355X)." },
+          disable: { hw: ["b200", "gb300", "b300"] },
+          disableReason: "DSA prefill Context Parallel is verified on Hopper (H200); the Blackwell sm100 DSA-CP FP8 rope kernel is not yet adapted." },
         { id: "dpAttn", label: "DP-Attention",
           values: [null, false, 4, 8],
           labels: { "auto": "Auto", "false": "Off" } },
@@ -146,14 +150,10 @@ sgl-eval run aime25 \\
         { id: "off",     label: "Off (greedy)" },
         { id: "mtp-516", label: "EAGLE / MTP 5-1-6 (low-latency)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 5",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet supported on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode kernel does not build and the DSA nextn draft path is CUDA-only." },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 6"] },
         { id: "mtp-112", label: "EAGLE / MTP 1-1-2 (balanced)",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
-          disable: { hw: ["mi355x", "mi325x", "mi300x"] },
-          disableReason: "MTP/EAGLE speculative decoding is not yet supported on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode kernel does not build and the DSA nextn draft path is CUDA-only." },
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
       ],
     },
 
@@ -638,21 +638,94 @@ sgl-eval run aime25 \\
     },
 
     // ====================================================================
+    // NVFP4 (Blackwell Ultra) — nvidia/GLM-5.2-NVFP4 (Model Optimizer).
+    // TP4 on B300 / GB300, low-latency + balanced. GB300 mirrors the B300
+    // recipe (same TP4 / flags; the 4-GPU GB300 node fits the ~381 GB build).
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 8192",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--chunked-prefill-size 8192",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--chunked-prefill-size 8192",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--quantization modelopt_fp4",
+        "--chunked-prefill-size 8192",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
     // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
-    // No MTP: disabled in the Speculative card for AMD (current gfx950 images are
-    // affected by the block-FP8 accuracy bug below, and num-steps>3 hits a
-    // separate spec-decode kernel build issue). Strategies differ only by
-    // batch-shaping levers (cuda-graph-max-bs / max-running-requests / chunked-prefill):
+    // No MTP: disabled in the Speculative card for AMD (the gfx950 spec-decode
+    // draft kernel is not yet validated, and num-steps>3 hits a separate build
+    // issue). Strategies differ only by batch-shaping levers
+    // (cuda-graph-max-bs / max-running-requests / chunked-prefill):
     //   low-latency      — large chunked-prefill, default bs.
     //   balanced         — chunked-prefill 32768 + bs128, max-running 80.
     //   high-throughput  — bs256, max-running 256.
-    // ACCURACY: all cells are verified:false. On MI350X/MI355X (gfx950), current
-    // SGLang ROCm images route block-FP8 to aiter gemm_a8w8_blockscale_bpreshuffle,
-    // which is numerically wrong on gfx950 (compounds across layers; GSM8K ~0) —
-    // see the Warning in the page body. gfx942 (MI300X/MI325X) is unaffected but
-    // not yet benchmarked. The configs are correct and will pass once the engine
-    // fix ships. BF16 (~1.51 TB) only fits single-node on MI325X (2 TB) / MI355X
-    // (2.3 TB); MI300X (1.5 TB) needs multi-node, so its BF16 cells are omitted.
+    // ACCURACY: the earlier gfx950 block-FP8 bpreshuffle miscompile (GSM8K ~0) is
+    // fixed as of the pinned mi355x image (...-20260618); MI355X FP8 low-latency is
+    // re-validated (GSM8K ~0.96, NIAH 15/15 to ~118K) and marked verified:true. The
+    // balanced/high-throughput, all BF16, and all gfx942 (MI325X/MI300X) cells are
+    // verified:false (not yet benchmarked, but correct). BF16 (~1.51 TB) only fits
+    // single-node on MI325X (2 TB) / MI355X (2.3 TB); MI300X (1.5 TB) needs
+    // multi-node, so its BF16 cells are omitted.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },

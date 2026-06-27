@@ -19,7 +19,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_vmm_utils imp
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
+from sglang.srt.utils import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,6 @@ class CustomAllReduceV2:
         )
         self._post_init_obj()
         self.disabled = False
-        log_info_on_rank0(logger, "Custom allreduce v2 initialized successfully")
 
     def override_shot(self, shot: int | None):
         if shot is None:
@@ -129,9 +128,6 @@ class CustomAllReduceV2:
         offsets_all = self._share_list(offsets)
         result = [list(zip(o, h)) for o, h in zip(offsets_all, handles_all)]
         self.obj.register_inputs(result)
-        log_info_on_rank0(
-            logger, f"Registered {len(pairs)} cuda graph addresses via IPC"
-        )
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
