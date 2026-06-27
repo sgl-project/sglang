@@ -766,14 +766,17 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )[0]
 
         if use_swiglu_oai:
-            hidden_states = npu_swiglu_oai(
-                hidden_states, swiglu_alpha, swiglu_limit
+            from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
+
+            hidden_states, swiglu_out_scale = swiglu_oai_quant(
+                hidden_states, swiglu_alpha, swiglu_limit,
+                group_list=group_list, group_list_type=group_list_type,
             )
         else:
             hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(
-            hidden_states
-        )
+            hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(
+                hidden_states
+            )
 
         # gmm2: down_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(
