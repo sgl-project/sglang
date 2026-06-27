@@ -3,8 +3,6 @@ import logging
 import math
 from typing import Tuple
 
-import tilelang
-import tilelang.language as T
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
@@ -14,15 +12,55 @@ from sglang.srt.layers.utils.common import strict_contiguous
 
 logger = logging.getLogger(__name__)
 
-tilelang.set_log_level("WARNING")
+# Tilelang isn't packaged on every platform (notably Ascend NPU images) but
+# this module is imported transitively from deepseek_v4.py — module-load
+# must succeed even when tilelang is missing. The kernels themselves still
+# require tilelang at runtime; we replace the package with a stub that lets
+# `@tilelang.jit` decorations and `tilelang.PassConfigKey.*` references parse
+# without ImportError, and any actual call into the kernels raises a clear
+# message at execution time instead of crashing on import.
+try:
+    import tilelang
+    import tilelang.language as T
 
-# Set once mhc_pre() has compiled every n_splits bucket at startup.
-_mhc_pre_warmed = False
+    tilelang.set_log_level("WARNING")
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
+    # Set once mhc_pre() has compiled every n_splits bucket at startup.
+    _mhc_pre_warmed = False
+
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+except ImportError:
+
+    class _TilelangMissing:
+        """Stub so module-level @tilelang.jit and PassConfigKey accesses parse."""
+
+        def __getattr__(self, name):
+            if name == "jit":
+
+                def _jit(*_args, **_kwargs):
+                    def _wrap(fn):
+                        def _raise(*a, **k):
+                            raise RuntimeError(
+                                "tilelang is not installed; this kernel cannot run "
+                                "on the current platform"
+                            )
+
+                        return _raise
+
+                    return _wrap
+
+                return _jit
+            return _TilelangMissing()
+
+        def __call__(self, *_args, **_kwargs):
+            return _TilelangMissing()
+
+    tilelang = _TilelangMissing()
+    T = _TilelangMissing()
+    pass_configs = None
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -1515,3 +1553,60 @@ def mhc_fused_post_pre(
         comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
         layer_input_cur.view(*outer_shape, hidden_size),
     )
+
+
+def npu_hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    hc_sinkhorn_iters: int,
+    rms_norm_eps: float,
+    hc_eps: float,
+    forward_batch=None,
+) -> tuple:
+    """NPU-accelerated hc_pre via the custom_ops kernel.
+
+    Returns (y, post, comb, norm_fused).  norm_fused is always False
+    because npu_hc_pre does not fold input_layernorm — the caller must
+    apply it separately.
+    """
+    shape, dtype = x.size(), x.dtype
+
+    # IDLE / empty short-circuit, mirroring the dsv4-flash source.
+    # The kernel emits post/comb in fp32 (sinkhorn iterates in fp32),
+    # so the dummies must too — otherwise downstream comb/post-aware
+    # ops see a silent fp32 ↔ bf16 split between idle and non-idle
+    # batches.
+    is_idle = forward_batch is not None and forward_batch.forward_mode.is_idle()
+    if is_idle or x.shape[0] == 0:
+        bs = x.shape[0]
+        y = torch.empty((bs, shape[-1]), dtype=dtype, device=x.device)
+        post = torch.empty((bs, hc_mult), dtype=torch.float32, device=x.device)
+        comb = torch.empty(
+            (bs, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        return y, post, comb, False
+
+    # Note the return order: (y, post, comb) — y is the (T, hidden)
+    # mixed activation, post / comb are the hc_post inputs. The
+    # fused kernel emits y in fp32 (sinkhorn iterates in fp32), so
+    # cast back to the input dtype before the downstream
+    # aclnnRmsNorm (which has no x=fp32 / gamma=bf16 overload).
+    y, post, comb = torch.ops.custom.npu_hc_pre(
+        x,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=hc_sinkhorn_iters,
+        norm_eps=rms_norm_eps,
+        hc_eps=hc_eps,
+    )
+    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
+    # not fold input_layernorm. Return norm_fused=False so the caller
+    # applies the layernorm itself, matching the deepgemm/torch paths.
+    return y.to(dtype), post, comb, False

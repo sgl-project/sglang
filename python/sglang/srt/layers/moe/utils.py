@@ -8,12 +8,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -409,7 +408,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
 
@@ -423,8 +422,8 @@ def should_use_dp_reduce_scatterv():
         not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
-        and get_attention_dp_size() > 1
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        and get_parallel().attn_dp_size > 1
+        and get_parallel().moe_ep_size == get_parallel().attn_dp_size
     )
 
 
