@@ -75,6 +75,7 @@ def _ltx2_residual_gate_add(
 
     return residual + update * gate
 
+
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
 
 
