@@ -6,11 +6,14 @@ logit processor's constrained-decoding state machine.
 
 import unittest
 
+import numpy as np
 import torch
 
 from sglang.srt.configs import LocateAnythingConfig
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.locate_anything import (
     LocateAnythingBoxGrammarLogitProcessor,
+    LocateAnythingForConditionalGeneration,
     LocateAnythingMultiModalProjector,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -196,6 +199,138 @@ class TestBoxGrammarLogitProcessor(CustomTestCase):
                 "none_token_id": config.none_token_id,
             },
         )
+
+
+class _StubVisionTower:
+    """Stand-in for MoonViT in get_image_feature.
+
+    The real vision tower has its own tests (kimi_vl_moonvit); here we only need
+    it to (a) expose ``dtype``/``device`` and (b) return one ``(N, merge, hidden)``
+    feature block per image so the projector + concat wiring is exercised with
+    real shapes. ``patches_per_image`` mirrors ``prod(image_grid_hws)``.
+
+    To keep the oracle honest, ``__call__`` asserts that get_image_feature fed
+    it the inputs we expect — a ``(sum(patches), hidden)`` pixel tensor and a
+    rank-2 ``(num_images, 2)`` ``image_grid_hws`` whose per-row product matches
+    ``patches_per_image`` — so a regression in how the feature/grid are wired or
+    coerced fails here rather than passing on a fabricated shape.
+    """
+
+    def __init__(self, hidden, merge, patches_per_image):
+        self.dtype = torch.float32
+        self.device = torch.device("cpu")
+        self._hidden = hidden
+        self._merge = merge
+        self._patches = patches_per_image
+
+    def __call__(self, pixel_values, image_grid_hws):
+        # The concatenated raw patches across all images must line up.
+        assert pixel_values.shape == (
+            sum(self._patches),
+            self._hidden,
+        ), pixel_values.shape
+        # image_grid_hws must be coerced to a rank-2 (num_images, 2) tensor whose
+        # rows multiply to the expected patch counts.
+        assert isinstance(image_grid_hws, torch.Tensor)
+        assert image_grid_hws.shape == (len(self._patches), 2), image_grid_hws.shape
+        assert image_grid_hws.prod(dim=-1).tolist() == list(self._patches)
+        # MoonViT yields a list of (num_merged_tokens, merge, hidden) per image.
+        return [
+            torch.zeros(p // self._merge, self._merge, self._hidden)
+            for p in self._patches
+        ]
+
+
+def _bare_model(config):
+    """A LocateAnythingForConditionalGeneration with a real projector but a
+    stubbed vision tower, bypassing the distributed Qwen2 __init__."""
+    model = LocateAnythingForConditionalGeneration.__new__(
+        LocateAnythingForConditionalGeneration
+    )
+    model.config = config
+    model.multi_modal_projector = LocateAnythingMultiModalProjector(config).eval()
+    return model
+
+
+def _image_item(feature, grid_hws):
+    return MultimodalDataItem(
+        modality=Modality.IMAGE,
+        offsets=[(0, 1)],
+        feature=feature,
+        model_specific_data={"image_grid_hws": grid_hws},
+    )
+
+
+class TestGetImageFeatureWiring(CustomTestCase):
+    """Forward-shape smoke test for get_image_feature.
+
+    Guards the production path (pixel concat -> vision tower -> projector) and
+    the precomputed-embedding passthrough so a future change to the wiring or
+    the numpy->tensor image_grid_hws coercion doesn't silently regress. The
+    heavy MoonViT forward is stubbed (covered by its own tests); the projector
+    is real.
+    """
+
+    HIDDEN = 8  # vision hidden_size, must match _small_config()
+    MERGE = 4  # merge_h * merge_w = 2 * 2
+    TEXT_HIDDEN = 16  # text_config hidden_size
+
+    def test_single_image_projects_to_text_hidden(self):
+        cfg = _small_config()
+        model = _bare_model(cfg)
+        # grid [[2, 2]] -> prod = 4 patches.
+        model.vision_tower = _StubVisionTower(self.HIDDEN, self.MERGE, [4])
+        feature = torch.randn(4, self.HIDDEN)  # one image's raw patches
+        out = model.get_image_feature([_image_item(feature, [[2, 2]])])
+        # 4 patches / merge(4) = 1 merged token, projected to text hidden width.
+        self.assertEqual(out.shape, (1, self.TEXT_HIDDEN))
+
+    def test_multi_image_features_concatenated_in_order(self):
+        cfg = _small_config()
+        model = _bare_model(cfg)
+        # Two images: [[2, 2]] -> 4 patches, [[4, 2]] -> 8 patches.
+        model.vision_tower = _StubVisionTower(self.HIDDEN, self.MERGE, [4, 8])
+        items = [
+            _image_item(torch.randn(4, self.HIDDEN), [[2, 2]]),
+            _image_item(torch.randn(8, self.HIDDEN), [[4, 2]]),
+        ]
+        out = model.get_image_feature(items)
+        # Merged tokens: 4/4 + 8/4 = 1 + 2 = 3, each projected to text hidden.
+        self.assertEqual(out.shape, (3, self.TEXT_HIDDEN))
+
+    def test_image_grid_hws_numpy_is_coerced(self):
+        # The HF image processor hands image_grid_hws back as a numpy array;
+        # get_image_feature must torch.as_tensor it before torch.cat (else the
+        # cat raises). A numpy grid must produce the same shape as a list grid.
+        cfg = _small_config()
+        model = _bare_model(cfg)
+        model.vision_tower = _StubVisionTower(self.HIDDEN, self.MERGE, [4])
+        feature = torch.randn(4, self.HIDDEN)
+        grid = np.array([[2, 2]], dtype=np.int64)
+        out = model.get_image_feature([_image_item(feature, grid)])
+        self.assertEqual(out.shape, (1, self.TEXT_HIDDEN))
+
+    def test_precomputed_embeddings_pass_through(self):
+        # Already-projected embeddings (dim==2, last dim == text hidden) must be
+        # returned untouched without invoking the vision tower forward. (dtype/
+        # device are still read for the cast, so the stub exposes them but raises
+        # if its forward is actually called.)
+        cfg = _small_config()
+        model = _bare_model(cfg)
+
+        class _NoCallTower:
+            dtype = torch.float32
+            device = torch.device("cpu")
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError(
+                    "vision_tower forward should not run on precomputed embeds"
+                )
+
+        model.vision_tower = _NoCallTower()
+        embeds = torch.randn(5, self.TEXT_HIDDEN)
+        out = model.get_image_feature([_image_item(embeds, [[2, 2]])])
+        self.assertTrue(torch.equal(out, embeds))
 
 
 if __name__ == "__main__":

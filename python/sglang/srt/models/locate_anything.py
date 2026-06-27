@@ -270,18 +270,36 @@ class LocateAnythingBoxGrammarLogitProcessor(CustomLogitProcessor):
     ``coord_end_token_id``, ``none_token_id``) so the processor stays generic.
     The ``__req__`` entry supplies the generated-so-far token ids.
 
-    This processor is **opt-in**: it is never attached server-side. A client
-    enables it by passing both the serialized processor and the matching token
-    ids. :meth:`build_sampling_params` wires both from a
-    :class:`LocateAnythingConfig` so callers don't hand-build the id dict::
+    This processor is **opt-in**: it is never attached server-side, and the
+    server must be started with ``--enable-custom-logit-processor`` (off by
+    default) or the tokenizer rejects the request. A client enables it by
+    passing both the serialized processor and the matching token ids.
+    :meth:`build_sampling_params` wires both from a
+    :class:`LocateAnythingConfig` so callers don't hand-build the id dict.
 
+    The two pieces live in **different** request fields, so do NOT spread them
+    both into ``sampling_params``: ``custom_logit_processor`` is a top-level
+    :class:`~sglang.srt.managers.io_struct.GenerateReqInput` field, while
+    ``custom_params`` is a :class:`SamplingParams` field. (Spreading both into
+    ``sampling_params`` raises ``TypeError: Unexpected keyword argument
+    'custom_logit_processor'`` because ``SamplingParams`` is a strict
+    ``msgspec.Struct``.) Wire them like the OpenAI ``to_sampling_params`` path::
+
+        from sglang.srt.managers.io_struct import GenerateReqInput
         from sglang.srt.models.locate_anything import (
             LocateAnythingBoxGrammarLogitProcessor,
         )
 
         extra = LocateAnythingBoxGrammarLogitProcessor.build_sampling_params(config)
-        # merge into the request's sampling_params, e.g.
-        #   sampling_params = {"max_new_tokens": 8192, **extra}
+        req = GenerateReqInput(
+            text=prompt,
+            image_data=image,
+            sampling_params={
+                "max_new_tokens": 8192,
+                "custom_params": extra["custom_params"],
+            },
+            custom_logit_processor=extra["custom_logit_processor"],
+        )
 
     Passing the processor without ``custom_params`` (or vice versa) silently
     no-ops — both must be present together.
@@ -289,11 +307,15 @@ class LocateAnythingBoxGrammarLogitProcessor(CustomLogitProcessor):
 
     @classmethod
     def build_sampling_params(cls, config: "LocateAnythingConfig") -> Dict[str, Any]:
-        """Build the sampling-param fields needed to enable constrained decoding.
+        """Build the two request fields needed to enable constrained decoding.
 
         Returns a dict with ``custom_logit_processor`` (the serialized
         processor) and ``custom_params`` (the box/coord/none token ids read from
-        ``config``). Spread it into a request's ``sampling_params``.
+        ``config``). These go to **different** request fields — put
+        ``custom_params`` inside ``sampling_params`` and pass
+        ``custom_logit_processor`` as a top-level ``GenerateReqInput`` field
+        (see the class docstring). The server also needs
+        ``--enable-custom-logit-processor``.
         """
         return {
             "custom_logit_processor": cls.to_str(),
