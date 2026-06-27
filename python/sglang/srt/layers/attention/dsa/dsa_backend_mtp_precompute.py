@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
+from sglang.srt.layers.attention.utils import seqlens_expand_triton
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -370,26 +371,19 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             page_indices, repeats=self.speculative_num_draft_tokens, dim=0
         ).contiguous()
 
-        # Generate expanded seqlens
-        extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-        seqlens_int32_cpu = [
-            self.speculative_num_draft_tokens + kv_len
-            for kv_len in seq_lens_cpu.tolist()
-        ]
-        seqlens_expanded = torch.cat(
-            [
-                torch.arange(
-                    kv_len - qo_len + 1,
-                    kv_len + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                for qo_len, kv_len in zip(
-                    extend_seq_lens_cpu,
-                    seqlens_int32_cpu,
-                    strict=True,
-                )
-            ]
+        # Generate expanded seqlens on device. seq_lens_cpu is optional for DSA
+        # CUDA graph replay, so this fallback must not require a host mirror.
+        extend_seq_lens = torch.full(
+            (bs,),
+            self.speculative_num_draft_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        seqlens_expanded = seqlens_expand_triton(
+            extend_seq_lens,
+            cache_seqlens,
+            bs * self.speculative_num_draft_tokens,
+            self.speculative_num_draft_tokens,
         )
 
         # Compute DSA seqlens
