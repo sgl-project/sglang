@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -396,6 +398,11 @@ def test_fused_precompute_decode_metadata(real_page_size):
     seq_lens_cpu = seq_lens.cpu()
 
     backend = _DummyDSAPrecomputeBackend(req_to_token, real_page_size, topk, next_n=3)
+    backend.decode_cuda_graph_metadata = {
+        bs: SimpleNamespace(
+            page_table_1=torch.empty((bs, max_len), dtype=torch.int32, device=device)
+        )
+    }
     metadata = backend._precompute_decode_mode(
         bs, req_pool_indices, seq_lens, seq_lens_cpu
     )
