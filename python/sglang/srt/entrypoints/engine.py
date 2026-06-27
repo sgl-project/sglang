@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
@@ -994,12 +995,14 @@ class Engine(EngineScoreMixin, EngineBase):
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
-        return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
-            **self._scheduler_init_result.scheduler_infos[0],
-            "internal_states": internal_states,
-            "version": __version__,
-        }
+        return msgspec_to_builtins(
+            {
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
+                **self._scheduler_init_result.scheduler_infos[0],
+                "internal_states": internal_states,
+                "version": __version__,
+            }
+        )
 
     def init_weights_update_group(
         self,
@@ -1259,6 +1262,11 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_NVLS_ENABLE"] = str(
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
+    if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or server_args.enable_symm_mem:
+        # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
+        # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
+        if server_args.dcp_size > 1:
+            os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
