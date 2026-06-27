@@ -195,6 +195,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -238,6 +239,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            speculative_eagle_topk=speculative_eagle_topk,
         )
 
     def clear(self):
@@ -376,9 +378,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
+        swa_reserved = self.num_reserved_decode_tokens
+        if self.scheduler.server_args.disable_radix_cache:
+            swa_reserved = 0
         return (
             full_len + self.num_reserved_decode_tokens,
-            swa_len + self.num_reserved_decode_tokens,
+            swa_len + swa_reserved,
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -1080,7 +1085,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     @property
     def num_tokens_pre_allocated(self):
-        return sum(decode_req.req.fill_len for decode_req in self.transfer_queue.queue)
+        return sum(
+            decode_req.req.extend_range.end for decode_req in self.transfer_queue.queue
+        )
 
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None
@@ -1379,6 +1386,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
                 )
+                req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
                     prefix_lens=torch.tensor(
@@ -1414,7 +1422,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
-        req.fill_len = req.kv_committed_len
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
@@ -1422,7 +1429,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        req.set_extend_input_len(req.fill_len - total_prefix_len)
+        req.set_extend_range(total_prefix_len, req.kv_committed_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1546,6 +1553,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        # Multimodal prompt token counts packed into cached_tokens slots 4-6
+        # by the prefill node (see MetadataBuffers.set_buf).
+        decode_req.req.mm_image_tokens = cached_tokens[4].item()
+        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
+        decode_req.req.mm_video_tokens = cached_tokens[6].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -1780,9 +1792,7 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -1900,8 +1910,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
-                    req.fill_len = req.kv_committed_len
-                    req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+                    req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
             else:
                 waiting_queue.append(req)
 

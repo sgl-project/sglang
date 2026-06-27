@@ -4,7 +4,9 @@ metatags:
   description: "Best Practice for Qwen3-30B-A3B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3-30B-A3B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3-30B-A3B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3-30B-A3B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_30b_a3b).
+</Note>
 
 ### Low Latency
 
@@ -20,8 +22,9 @@ This guide describes the best practice data for Qwen3-30B-A3B on the Ascend NPU.
 | Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 1K+100 | 10000ms | BF16 | [Optimal Configuration](#qwen3-30b-a3b-bf16-1p-in1k-out100) |
 | Qwen3-30B-A3B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-30b-a3b-w8a8-1p-in3k5-out1k5-50ms) |
 
-
 ## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3-30B-A3B BF16 1P IN1K OUT100
 
@@ -70,7 +73,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export ASCEND_LAUNCH_BLOCKING=0
 export DP_ROUND_ROBIN=1
 export GLOO_SOCKET_IFNAME=<network-interface>
-export HCCL_ALGO=level0:NA;level1:ring
+export HCCL_ALGO="level0:NA;level1:ring"
 export HCCL_SOCKET_IFNAME=<network-interface>
 export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:False
