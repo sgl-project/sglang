@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import ReqPhase
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
@@ -56,6 +57,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_active_reqs: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -224,18 +226,28 @@ class SchedulerInvariantChecker:
         # dataclass __eq__ compares tensor fields and raises on ambiguous bools.
         last_batch = self.get_last_batch()
         running_batch = self.get_running_batch()
-        batches = [last_batch]
+        req_groups = [list(last_batch.reqs)]
         if (
             running_batch is not None
             and running_batch is not last_batch
             and not running_batch.is_empty()
         ):
-            batches.append(running_batch)
+            req_groups.append(list(running_batch.reqs))
+        seen_ids = {id(req) for group in req_groups for req in group}
+        partially_extended_in_active = [
+            req
+            for req in self.get_active_reqs().values()
+            if req.phase is ReqPhase.EXTEND_NON_LAST
+            and req.req_pool_idx is not None
+            and id(req) not in seen_ids
+        ]
+        if partially_extended_in_active:
+            req_groups.append(partially_extended_in_active)
 
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
+        for group in req_groups:
+            for req in group:
                 assert req.kv_committed_freed == req.kv_overallocated_freed
                 if req.kv_committed_freed or req.req_pool_idx is None:
                     continue
@@ -253,10 +265,47 @@ class SchedulerInvariantChecker:
 
         return full_uncached, swa_uncached
 
+    def _check_phase_consistency(self):
+        # Cross-check Req.phase against the committed-KV inference it replaced:
+        # prepare_for_decode pre-claims the bonus slot, so committed KV moving
+        # past the extend frontier coincides with entering decode. A missed
+        # phase transition shows up here.
+        for req in self.get_active_reqs().values():
+            if req.is_dllm():
+                continue
+            assert req.extend_range is not None, (
+                f"active req without an admitted extend range: {req.rid=} "
+                f"{req.phase=}"
+            )
+            if req.phase is ReqPhase.DECODE:
+                assert req.kv_committed_len >= req.extend_range.end, (
+                    f"DECODE req behind its extend frontier: {req.rid=} "
+                    f"{req.kv_committed_len=} {req.extend_range=}"
+                )
+            elif req.phase in (ReqPhase.EXTEND_NON_LAST, ReqPhase.EXTEND_LAST):
+                assert req.extend_range.end > 0, (
+                    f"extend req with an empty admitted range: {req.rid=} "
+                    f"{req.extend_range=}"
+                )
+                assert req.kv_committed_len <= req.extend_range.end, (
+                    f"extend req past its extend frontier: {req.rid=} "
+                    f"{req.kv_committed_len=} {req.extend_range=}"
+                )
+            else:
+                # Every path that gives an active req an extend range also
+                # enters a tracked phase (prepare_for_extend, the disagg
+                # prebuilt paths, prepare_for_decode afterwards). An OTHERS
+                # req holding a range means a missed EXTEND transition.
+                raise AssertionError(
+                    f"req with an extend range stuck in {req.phase}: {req.rid=} "
+                    f"{req.kv_committed_len=} {req.extend_range=}"
+                )
+
     def self_check_during_busy(self):
         if self.get_last_batch() is None:
             return
 
+        self._check_phase_consistency()
         ps = self.pool_stats_observer.get_pool_stats()
         full_uncached, swa_uncached = self._get_total_uncached_sizes()
 

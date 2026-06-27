@@ -51,6 +51,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
     Req,
+    ReqPhase,
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import (
@@ -601,7 +602,7 @@ class SchedulerDisaggregationPrefillMixin:
         optimistic_reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
-            if req.pending_bootstrap and req.inflight_middle_chunks <= 0
+            if req.pending_bootstrap and req.phase is not ReqPhase.EXTEND_NON_LAST
         ]
         if optimistic_reqs:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -613,10 +614,15 @@ class SchedulerDisaggregationPrefillMixin:
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
-        for i, (req, next_token_id) in enumerate(
-            zip(batch.reqs, next_token_ids, strict=True)
+        for i, (req, next_token_id, is_extend_intermediate) in enumerate(
+            zip(
+                batch.reqs,
+                next_token_ids,
+                batch.is_extend_intermediate,
+                strict=True,
+            )
         ):
-            if req.inflight_middle_chunks <= 0:
+            if not is_extend_intermediate:
                 req.time_stats.set_prefill_finished_time()
 
                 # For optimistic requests, check bootstrap before side effects
@@ -662,6 +668,7 @@ class SchedulerDisaggregationPrefillMixin:
                     except ValueError as e:
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                         release_kv_cache(req, self.tree_cache)
+                        self._deactivate_req(req)
                         prepare_abort(
                             req,
                             error_message,
@@ -669,8 +676,7 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     req.grammar.finished = req.finished()
             else:
-                # being chunked reqs' prefill is not finished
-                req.inflight_middle_chunks -= 1
+                # being partially-extended reqs' prefill is not finished
 
                 # Overlap deferred release for optimistic requests stopped in process_prefill_chunk
                 if req.pending_bootstrap:
@@ -762,6 +768,7 @@ class SchedulerDisaggregationPrefillMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
+                self._deactivate_req(req)
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -783,6 +790,7 @@ class SchedulerDisaggregationPrefillMixin:
                     logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
+                self._deactivate_req(req)
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
@@ -879,6 +887,15 @@ class SchedulerDisaggregationPrefillMixin:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
+        # The stateless scheduler derives the current partially-extended req from
+        # partially_extended_reqs() = active_reqs entries in the EXTEND_NON_LAST
+        # phase, which ignores req.finished(). An aborted req still
+        # sitting in active_reqs with a non-None extend_range would be re-derived
+        # as a partially-extended req and crash process_prefill_chunk (req_pool_idx=None).
+        # Remove it from active_reqs and clear the extend state defensively.
+        req.extend_range = None
+        req.phase = ReqPhase.OTHERS
+        self._deactivate_req(req)
 
     def handle_pending_bootstrap(
         self: Scheduler, req: Req, poll: KVPoll, defer_release: bool
@@ -921,35 +938,31 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
     def process_prefill_chunk(self: Scheduler) -> None:
-        chunked_req_to_exclude = set()
-        if self.chunked_req:
-            chunked_req_to_exclude.add(self.chunked_req)
-            maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
-
-            if not self.check_bootstrap(self.chunked_req):
-                self.chunked_req = None  # stop the current chunked prefill
-            elif self.enable_overlap:
-                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                self.chunked_req.tmp_end_idx = min(
-                    self.chunked_req.extend_range.end,
-                    len(self.chunked_req.origin_input_ids),
-                )
-            else:
-                self.send_kv_chunk(self.chunked_req)
-
-            if self.chunked_req is not None:
+        partially_extended_req = next(iter(self.partially_extended_reqs()), None)
+        if partially_extended_req is not None:
+            maybe_cache_unfinished_req(
+                partially_extended_req, self.tree_cache, is_partially_extended=True
+            )
+            if self.check_bootstrap(partially_extended_req):
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                    partially_extended_req.tmp_end_idx = min(
+                        partially_extended_req.extend_range.end,
+                        len(partially_extended_req.origin_input_ids),
+                    )
+                else:
+                    self.send_kv_chunk(partially_extended_req)
                 self.running_batch.batch_is_full = False
+            else:
+                # Bootstrap not ready (deferred overlap poll) or failed: stop resuming
+                # this chunked prefill, mirroring the old `chunked_req = None`. The
+                # deferred optimistic_release_and_requeue (or the failure handler) owns
+                # the req from here; deactivating again there is an idempotent no-op.
+                self._deactivate_req(partially_extended_req)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
-
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            self.last_batch.filter_batch(skip_extend_intermediate=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -1088,6 +1101,12 @@ class SchedulerDisaggregationPrefillMixin:
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
+        # reset_for_retract() clears extend_range, but the req is still in
+        # active_reqs. Since the stateless scheduler derives partially_extended_reqs() from
+        # active_reqs, a requeued req that also remains active would be
+        # double-tracked (stale partially-extended req, load/accounting leak). Deactivate it
+        # before re-enqueue; get_next_batch_to_run reactivates it on reschedule.
+        self._deactivate_req(req)
         req.output_ids = array("q")
         req.start_send_idx = 0
         req.tmp_end_idx = -1

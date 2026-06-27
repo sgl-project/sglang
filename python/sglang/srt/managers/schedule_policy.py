@@ -37,7 +37,7 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ReqPhase, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -461,7 +461,6 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
-        self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
@@ -660,6 +659,12 @@ class PrefillAdder:
         )
 
         req.set_extend_range(prefix_len, prefix_len + trunc_len)
+        # A dllm block may or may not reach the fill target; decide here.
+        req.phase = (
+            ReqPhase.EXTEND_NON_LAST
+            if prefix_len + trunc_len < len(req.full_untruncated_fill_ids)
+            else ReqPhase.EXTEND_LAST
+        )
 
         self.can_run_list.append(req)
 
@@ -684,6 +689,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.phase = ReqPhase.EXTEND_NON_LAST if truncated else ReqPhase.EXTEND_LAST
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated
@@ -703,7 +709,11 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_resumed_extend_req(self, req: Req) -> AddReqResult:
+        assert (
+            req.phase is ReqPhase.EXTEND_NON_LAST and not req.is_dllm()
+        ), f"non-resume req {req.rid}"
+
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -714,11 +724,11 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+            # The partially_extended_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
-                    return req
+                    return AddReqResult.NO_TOKEN
                 _rem_tokens = self.rem_chunk_tokens
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
@@ -727,6 +737,7 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        req.phase = ReqPhase.EXTEND_NON_LAST if truncated else ReqPhase.EXTEND_LAST
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
@@ -739,8 +750,7 @@ class PrefillAdder:
             req.retracted_stain,
         )
 
-        # Return if chunked prefill not finished
-        return req if truncated else None
+        return self.budget_state()
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -839,6 +849,7 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
+            req.phase = ReqPhase.EXTEND_LAST
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
@@ -857,15 +868,20 @@ class PrefillAdder:
             req.set_extend_range(
                 len(req.prefix_indices), len(req.prefix_indices) + trunc_len
             )
+            req.phase = ReqPhase.EXTEND_NON_LAST
             self.can_run_list.append(req)
-            self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
 
         return self.budget_state()
 
-    def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
-    ):
+    def add_unstarted_extend_req(
+        self, req: Req, truncation_align_size: Optional[int]
+    ) -> AddReqResult:
+        assert req.phase is not ReqPhase.EXTEND_NON_LAST or req.is_dllm(), (
+            f"add_unstarted_extend_req called on partially-extended req {req.rid}; "
+            f"scheduler-side dispatch broken"
+        )
+
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -980,6 +996,7 @@ class PrefillAdder:
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
+                req.phase = ReqPhase.EXTEND_LAST
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
@@ -1021,9 +1038,9 @@ class PrefillAdder:
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.prefix_indices) + trunc_len
                 )
+                req.phase = ReqPhase.EXTEND_NON_LAST
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(

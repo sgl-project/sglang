@@ -12,7 +12,10 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     VERY_LONG_PROMPT_LEN,
     advance_to_decode_step,
     base_engine_kwargs,
+    chunked_req_of,
     exhaust_row_pool,
+    extend_input_len_of,
+    inflight_middle_chunks_of,
     run_until,
     run_until_finished,
 )
@@ -20,7 +23,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 
 def _load_inquirer_pending_for_rid(t: ScriptedContext, rid: str) -> int:
     s = t.scheduler
-    chunked = s.chunked_req
+    chunked = chunked_req_of(s)
     if chunked is not None and chunked.rid == rid:
         return chunked.seqlen - len(chunked.prefix_indices)
     for req in s.waiting_queue:
@@ -98,13 +101,17 @@ class TestSpecialCaseBasic(ScriptedTestCase):
 
         t.abort(r)
         for _ in range(12):
-            if t.scheduler.chunked_req is None and r.kv_pages == 0 and r.lock_refs == 0:
+            if (
+                chunked_req_of(t.scheduler) is None
+                and r.kv_pages == 0
+                and r.lock_refs == 0
+            ):
                 break
             yield
 
         assert (
-            t.scheduler.chunked_req is None
-        ), f"abort must clear the chunked slot; got {t.scheduler.chunked_req!r}"
+            chunked_req_of(t.scheduler) is None
+        ), f"abort must clear the chunked slot; got {chunked_req_of(t.scheduler)!r}"
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -121,8 +128,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
                 cur = (
-                    t.scheduler.chunked_req.rid
-                    if t.scheduler.chunked_req is not None
+                    chunked_req_of(t.scheduler).rid
+                    if chunked_req_of(t.scheduler) is not None
                     else None
                 )
                 assert cur in (None, r.rid), (
@@ -137,7 +144,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_match, "getter must return r.rid at least once while r.is_chunking"
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            chunked_req_of(t.scheduler).rid
+            if chunked_req_of(t.scheduler) is not None
+            else None
         ) is None
 
     @unittest.skip(
@@ -258,8 +267,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield
 
         assert (
-            t.scheduler.chunked_req is None
-        ), f"pause(retract) must clear chunked_req; got {t.scheduler.chunked_req!r}"
+            chunked_req_of(t.scheduler) is None
+        ), f"pause(retract) must clear chunked_req; got {chunked_req_of(t.scheduler)!r}"
         assert not r.finished, "retract must re-queue r, not finish or abort it"
         assert r.status == "waiting", (
             f"retracted chunked req must return to the waiting queue; "
@@ -283,7 +292,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             prompt_len=3 * DEFAULT_CHUNK_SIZE, max_new_tokens=2, prompt_token=180
         )
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
-        assert r.req.inflight_middle_chunks > 0
+        assert inflight_middle_chunks_of(r.req) > 0
         assert r.is_chunking
 
         t.pause_generation(mode="retract")
@@ -297,9 +306,9 @@ class TestSpecialCaseBasic(ScriptedTestCase):
             f"got status={r.status!r}"
         )
         req = t.find_req_by_rid(r.rid)
-        assert req is not None and req.inflight_middle_chunks == 0, (
+        assert req is not None and inflight_middle_chunks_of(req) == 0, (
             f"retract must reset inflight_middle_chunks; got "
-            f"{req.inflight_middle_chunks if req is not None else None}"
+            f"{inflight_middle_chunks_of(req) if req is not None else None}"
         )
 
         t.continue_generation()
@@ -324,7 +333,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         saw_chunking = False
         saw_dedup = False
         for _ in range(DEFAULT_MAX_STEPS):
-            chunked = t.scheduler.chunked_req
+            chunked = chunked_req_of(t.scheduler)
             if r.is_chunking and chunked is not None and chunked.rid == r.rid:
                 saw_chunking = True
                 pending = _load_inquirer_pending_for_rid(t, r.rid)
@@ -366,7 +375,7 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            chunked = s.chunked_req
+            chunked = chunked_req_of(s)
             if r.is_chunking and chunked is not None and chunked.rid == r.rid:
                 assert len(s.waiting_queue) == 0, (
                     "test requires an empty waiting_queue so the chunked req is "
@@ -401,14 +410,14 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking)
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            chunked = s.chunked_req
+            chunked = chunked_req_of(s)
             if (
                 r.is_chunking
                 and chunked is not None
                 and chunked.rid == r.rid
-                and chunked.extend_range.length > 0
+                and extend_input_len_of(chunked) > 0
             ):
-                deduct = chunked.extend_range.length
+                deduct = extend_input_len_of(chunked)
                 base = s.load_inquirer._get_num_pending_tokens()
                 deducted = s.load_inquirer._get_num_pending_tokens(chunk_deduct=deduct)
                 assert deducted == base - deduct, (
@@ -431,10 +440,10 @@ class TestSpecialCaseBasic(ScriptedTestCase):
     def _script_stage_a_inflight_middle_chunks_sync_invariant(t: ScriptedContext):
         def assert_invariant() -> None:
             req = t.find_req_by_rid(r.rid)
-            if req is not None and req.inflight_middle_chunks > 0:
+            if req is not None and inflight_middle_chunks_of(req) > 0:
                 assert r.is_chunking, (
                     f"invariant violated: inflight_middle_chunks="
-                    f"{req.inflight_middle_chunks} but is_chunking={r.is_chunking}"
+                    f"{inflight_middle_chunks_of(req)} but is_chunking={r.is_chunking}"
                 )
 
         r = t.start_req(
@@ -473,18 +482,17 @@ class TestSpecialCaseBasic(ScriptedTestCase):
                 r.is_chunking
                 and r.chunks_done >= 1
                 and req is not None
-                and req.extend_range is not None
+                and extend_input_len_of(req) is not None
             ):
                 saw_mid_chunk = True
-                assert (
-                    req.extend_range.end
-                    == len(req.prefix_indices) + req.extend_range.length
-                ), (
+                assert len(req.get_fill_ids()) == len(
+                    req.prefix_indices
+                ) + extend_input_len_of(req), (
                     f"init_next_round_input must rebuild fill_ids to the committed "
                     f"prefix plus the in-flight chunk; "
-                    f"fill_ids_len={req.extend_range.end}, "
+                    f"fill_ids_len={len(req.get_fill_ids())}, "
                     f"prefix_indices_len={len(req.prefix_indices)}, "
-                    f"extend_input_len={req.extend_range.length}, "
+                    f"extend_input_len={extend_input_len_of(req)}, "
                     f"chunks_done={r.chunks_done}"
                 )
             if r.finished:
@@ -517,8 +525,8 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         assert r.finished
         assert saw_chunking, "req should have occupied the chunked_req slot mid-chunk"
         assert (
-            s.chunked_req is None
-        ), f"chunked_req slot must clear after last chunk; got {s.chunked_req!r}"
+            chunked_req_of(s) is None
+        ), f"chunked_req slot must clear after last chunk; got {chunked_req_of(s)!r}"
 
     def test_second_chunked_admit_blocked_when_chunked_req_set(self):
         self.server.execute_script(
@@ -778,11 +786,11 @@ class TestSpecialCaseDeterministicFlashInfer(ScriptedTestCase):
         page_size = 16
         saw_chunking = False
         for _ in range(DEFAULT_MAX_STEPS):
-            if r.is_chunking and r.req.extend_range is not None:
+            if r.is_chunking and extend_input_len_of(r.req) is not None:
                 saw_chunking = True
-                assert r.req.extend_range.length % page_size == 0, (
+                assert extend_input_len_of(r.req) % page_size == 0, (
                     f"deterministic chunk boundary must be page-aligned; "
-                    f"got extend_input_len={r.req.extend_range.length}, page_size={page_size}"
+                    f"got extend_input_len={extend_input_len_of(r.req)}, page_size={page_size}"
                 )
             if r.finished:
                 break

@@ -348,16 +348,17 @@ class StreamingSession(BasePrefixCache):
         return True
 
     def try_cache_unfinished_req(
-        self, req: Req, chunked: bool = False, **kwargs
+        self, req: Req, is_partially_extended: bool = False, **kwargs
     ) -> bool:
         """Handles a streaming-session mid-flight cache op:
-          - chunked prefill: snapshot current KV as prefix, skip radix
+          - partially extended (mid chunked prefill): snapshot current KV as
+            prefix, skip radix
           - subsequent turn: skip radix (slot already holds KV)
-        Returns False for first-turn non-chunked (caller must run raw radix
-        insert to set up the initial tree lock)."""
+        Returns False for the first-turn prefill-complete case (caller must run
+        raw radix insert to set up the initial tree lock)."""
         if not _is_streaming(req):
             return False
-        if chunked:
+        if is_partially_extended:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : req.extend_range.end
             ]

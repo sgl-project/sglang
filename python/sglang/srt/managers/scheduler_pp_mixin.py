@@ -24,7 +24,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ReqPhase, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
@@ -612,6 +612,9 @@ class SchedulerPPMixin:
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
+                # This profiling req bypasses the PrefillAdder; the range
+                # covers the full fill, so it is admitted as the last chunk.
+                req.phase = ReqPhase.EXTEND_LAST
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(

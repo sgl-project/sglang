@@ -203,7 +203,6 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_manager.add_staging_reqs(can_run_list)
-            self.dllm_manager.increment_inflight_middle_chunks()
 
         self.adder = adder
         self.can_run_list = can_run_list
@@ -259,9 +258,8 @@ class SchedulerDllmMixin:
 
             # Prepare and add request
             req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
+            res = adder.add_unstarted_extend_req(
                 req,
-                has_chunked_req=True,
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -340,11 +338,6 @@ class DllmManager:
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
-
-    def increment_inflight_middle_chunks(self) -> None:
-        """Increment chunked count for all staging requests."""
-        for req in self.staging_queue:
-            req.inflight_middle_chunks += 1
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""

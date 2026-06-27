@@ -12,6 +12,8 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     SMALL_KV_POOL_MAX_TOTAL_TOKENS,
     VERY_LONG_PROMPT_LEN,
     base_engine_kwargs,
+    chunked_req_of,
+    inflight_middle_chunks_of,
     run_until,
     run_until_all_finished,
     run_until_finished,
@@ -250,7 +252,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
-        assert r.req is None or r.req.inflight_middle_chunks == 0
+        assert r.req is None or inflight_middle_chunks_of(r.req) == 0
 
     def test_abort_penultimate_chunk(self):
         self.server.execute_script(self._script_abort_penultimate_chunk)
@@ -423,7 +425,7 @@ class TestAbortBasic(ScriptedTestCase):
             r,
             lambda h: h.is_chunking and h.chunks_done >= 1,
         )
-        assert r.req.inflight_middle_chunks > 0
+        assert inflight_middle_chunks_of(r.req) > 0
 
         t.abort(r)
         yield from _drain_until_released(t, r)
@@ -437,8 +439,8 @@ class TestAbortBasic(ScriptedTestCase):
 
         if r.req is not None:
             assert (
-                r.req.inflight_middle_chunks == 0
-            ), f"inflight_middle_chunks not cleared; got {r.req.inflight_middle_chunks}"
+                inflight_middle_chunks_of(r.req) == 0
+            ), f"inflight_middle_chunks not cleared; got {inflight_middle_chunks_of(r.req)}"
 
     def test_abort_when_chunked_only_then_idle(self):
         self.server.execute_script(self._script_abort_when_chunked_only_then_idle)
@@ -449,18 +451,18 @@ class TestAbortBasic(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=250
         )
         yield from run_until(r, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
+        assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 1
 
         t.abort(r)
         yield from _drain_until_released(t, r)
 
         for _ in range(12):
-            if t.scheduler.chunked_req is None and t.is_idle:
+            if chunked_req_of(t.scheduler) is None and t.is_idle:
                 break
             yield
 
         assert r.kv_pages == 0
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 0
+        assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 0
         assert t.is_idle, "engine must be idle after the only chunked req is aborted"
 
     def test_chunked_req_then_abort_then_new_short_in_one_yield(self):
@@ -475,10 +477,12 @@ class TestAbortBasic(ScriptedTestCase):
         )
         yield from run_until(r1, lambda h: h.is_chunking)
         assert (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            chunked_req_of(t.scheduler).rid
+            if chunked_req_of(t.scheduler) is not None
+            else None
         ) == r1.rid, (
             f"r1 should hold the chunked slot before abort; got "
-            f"{(t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None)!r}"
+            f"{(chunked_req_of(t.scheduler).rid if chunked_req_of(t.scheduler) is not None else None)!r}"
         )
 
         t.abort(r1)
@@ -486,7 +490,9 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r1)
 
         cur = (
-            t.scheduler.chunked_req.rid if t.scheduler.chunked_req is not None else None
+            chunked_req_of(t.scheduler).rid
+            if chunked_req_of(t.scheduler) is not None
+            else None
         )
         assert cur != r1.rid, f"chunked slot still points to aborted r1; got {cur!r}"
         assert r1.kv_pages == 0
@@ -533,7 +539,7 @@ class TestAbortBasic(ScriptedTestCase):
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=281
         )
         yield from run_until(r1, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1
+        assert (1 if chunked_req_of(t.scheduler) is not None else 0) == 1
 
         t.abort(r1)
         yield from _drain_until_released(t, r1)

@@ -59,7 +59,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqPhase, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -79,6 +79,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -155,9 +156,8 @@ class DecodeReqToTokenPool:
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
-            for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+            reqs[i].kv_committed_len > 0 for i in reusing
+        ), "reusing request must have committed KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -1418,7 +1418,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_loc,
         )
 
-        # Truncate fill_len to kv_committed_len so cache_unfinished_req only
+        # Truncate extend_fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
@@ -1429,7 +1429,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
+        # TODO: start can transiently disagree with len(prefix_indices) under HiCache
+        # decode prefetch, but it is behavior-neutral — only .end is read before
+        # get_new_prebuilt_batch resets extend_range ahead of the prebuilt forward.
         req.set_extend_range(total_prefix_len, req.kv_committed_len)
+        # This prebuilt path never goes through the PrefillAdder, so enter
+        # the extend phase here; prepare_for_decode moves it to DECODE later.
+        # These reqs are not a real chunk sequence; NON_LAST keeps them visible
+        # as holders of not-yet-batched extend resources (pool stats / invariant
+        # checker) until prepare_for_decode flips them to DECODE.
+        req.phase = ReqPhase.EXTEND_NON_LAST
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1843,11 +1852,13 @@ class SchedulerDisaggregationDecodeMixin:
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
-            assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
-            new_prebuilt_batch.filter_batch()
+            is_extend_intermediate = new_prebuilt_batch.is_extend_intermediate or []
+            assert not any(
+                is_extend_intermediate
+            ), "prebuilt batch carries intermediate-mode reqs"
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch
@@ -1898,6 +1909,7 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
+                self._activate_req(req)
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
@@ -1906,11 +1918,15 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                # Truncate fill_len to kv_committed_len so cache_unfinished_req
+                # Truncate extend_fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
                 if req.kv_committed_len is not None:
                     req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
+                    # This prebuilt path never goes through the PrefillAdder,
+                    # so enter the extend phase here; prepare_for_decode moves
+                    # it to DECODE later.
+                    req.phase = ReqPhase.EXTEND_NON_LAST
             else:
                 waiting_queue.append(req)
 
@@ -1929,6 +1945,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
+            forward_mode=ForwardMode.PREBUILT,
         )
 
         # construct fake completed prefill

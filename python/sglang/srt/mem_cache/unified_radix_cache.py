@@ -776,8 +776,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
 
-    def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+    def cache_unfinished_req(
+        self, req: Req, is_partially_extended: bool = False, **kwargs
+    ) -> None:
+        if self.session.try_cache_unfinished_req(
+            req, is_partially_extended=is_partially_extended, **kwargs
+        ):
             return
 
         token_ids = req.get_fill_ids()
@@ -796,7 +800,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
-            chunked=chunked,
+            is_partially_extended=is_partially_extended,
             priority=getattr(req, "priority", 0) or 0,
         )
         effective_cache_len = len(token_ids)
@@ -1151,7 +1155,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         value_slice[dup_start:consumed_from]
                     )
 
-            self._inc_hit_count(node, params.chunked)
+            self._inc_hit_count(node, params.is_partially_extended)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -1199,7 +1203,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         if is_new_leaf:
-            self._inc_hit_count(target_node, params.chunked)
+            self._inc_hit_count(target_node, params.is_partially_extended)
         return result
 
     def _insert_helper_host(
@@ -1807,9 +1811,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return transfers
 
-    def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
+    def _inc_hit_count(
+        self, node: UnifiedTreeNode, is_partially_extended: bool = False
+    ) -> None:
         """Increment hit count; trigger write_backup when threshold reached."""
-        if node.evicted or chunked:
+        if node.evicted or is_partially_extended:
             return
         if (
             self.cache_controller is not None
