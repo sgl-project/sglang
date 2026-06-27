@@ -215,7 +215,7 @@ def maybe_write_dsv4_decode(
         )
 
 
-def build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
+def maybe_build_dsv4_verify_bundle(batch: ScheduleBatch, draft_token_num: int):
     """Build the DSV4 cache-location view for one target-verify pass.
 
     Spec-v2 reserves cache ahead of time, so target verify must select only the

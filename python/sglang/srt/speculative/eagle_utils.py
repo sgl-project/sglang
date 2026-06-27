@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.configs.model_config import is_deepseek_v4
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+    maybe_build_dsv4_verify_bundle,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -322,14 +325,9 @@ def eagle_prepare_for_verify(
             device=device,
         )
 
-        if _is_npu and is_deepseek_v4(batch.model_config.hf_config):
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                build_dsv4_verify_bundle,
-            )
-
-            batch.out_cache_loc_dsv4 = build_dsv4_verify_bundle(
-                batch, verify_input.draft_token_num
-            )
+        batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+            batch, verify_input.draft_token_num
+        )
 
         prepare_mamba_track_for_verify(batch)
 
