@@ -2889,7 +2889,7 @@ class ServerArgs:
             # crashes here. port + 10000 > 65535 implies port > 55535, so
             # port - 10000 > 45535 stays in range and differs from --port.
             self.grpc_port = (
-                self.port + 10000 if self.port + 10000 <= 65535 else self.port - 10000
+                self.port + 10000 if self.port <= 55535 else self.port - 10000
             )
 
         if not (1 <= self.grpc_port <= 65535):
