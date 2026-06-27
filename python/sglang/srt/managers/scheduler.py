@@ -2972,6 +2972,10 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        if self.tp_worker.model_runner.prefill_aware_swa:
+            for req in can_run_list:
+                req.swa_evict_floor = req.fill_len
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
