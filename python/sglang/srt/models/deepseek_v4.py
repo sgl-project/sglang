@@ -151,7 +151,6 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-import os
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
@@ -2121,10 +2120,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         num_hidden_layers: Optional[int] = None,
         scale_suffix: str = "weight_scale_inv",
     ) -> str:
-        # ModelSlim checkpoints use ".scale"; the in-model parameter name
-        # differs between FP8 ("weight_scale_inv") and int8/W8A8 compressed
-        # tensors ("weight_scale"). The caller selects the suffix from
-        # params_dict before loading.
         if name == "embed.weight":
             return "model.embed_tokens.weight"
         if name == "head.weight":
@@ -2134,6 +2129,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if name.startswith("hc_head_"):
             return "model." + name
 
+        scale_target = "." + scale_suffix
         if is_nextn and name.startswith("mtp."):
             parts = name.split(".", 2)
             if len(parts) >= 3:
@@ -2157,9 +2153,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     elif rest.startswith("head."):
                         rest = "shared_head.head.weight"
                     elif rest == "e_proj.scale":
-                        rest = "e_proj." + scale_suffix
+                        rest = "e_proj" + scale_target
                     elif rest == "h_proj.scale":
-                        rest = "h_proj." + scale_suffix
+                        rest = "h_proj" + scale_target
                 name = f"model.layers.{num_hidden_layers}." + rest
 
         if name.startswith("layers."):
@@ -2169,7 +2165,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        scale_target = "." + scale_suffix
         if "self_attn" in name:
             name = name.replace(".scale", scale_target)
 

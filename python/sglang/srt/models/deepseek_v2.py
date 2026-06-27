@@ -1258,7 +1258,7 @@ class DeepseekV2MoE(nn.Module):
                         (0, topk_output.topk_weights.shape[-1] + n)
                     ),
                 )
-                
+
         if sbo_overlap_dispatch_flag:
             shared_output = None
 

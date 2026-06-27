@@ -123,7 +123,6 @@ def maybe_write_dsv4_extend(
         )
 
 
-
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,
     seq_lens_cpu: torch.Tensor,
