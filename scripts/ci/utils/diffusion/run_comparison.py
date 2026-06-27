@@ -86,14 +86,10 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
         cmd += ["--num-gpus", str(case["num_gpus"])]
     if fw_cfg.get("serve_args", "").strip():
         cmd += fw_cfg["serve_args"].strip().split()
-    # Warm up at the exact measured resolution so server-based warmup primes
-    # kernels for the real request shape — eliminates a ~0.1s residual observed
-    # when synthetic warmup falls back to a default resolution. Relies on the
-    # --warmup dead-zone fix (server_args._adjust_warmup): `--warmup
-    # --warmup-resolutions WxH` now correctly runs server-based synthetic warmup
-    # at this resolution instead of running no warmup at all.
-    if case.get("width") and case.get("height"):
-        cmd += ["--warmup-resolutions", f"{case['width']}x{case['height']}"]
+    # No explicit --warmup-resolutions: server-based warmup now defaults to the
+    # model's sampling-default resolution (see warmup_request_builder), which
+    # already matches these single-resolution cases — the default warmup is
+    # sufficient, so we don't pin a resolution here.
     return cmd
 
 
