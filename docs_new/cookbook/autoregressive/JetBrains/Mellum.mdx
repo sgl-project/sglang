@@ -1,0 +1,143 @@
+---
+title: JetBrains Mellum
+metatags:
+    description: "Deploy JetBrains Mellum 1 and Mellum 2 code models with SGLang."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[JetBrains Mellum](https://huggingface.co/collections/JetBrains/mellum-1-6800a8e776831d46fd608726) is a family of code-focused language models from JetBrains.
+
+**Mellum 1** is a dense 4B code model family. The safetensors checkpoints use the standard `LlamaForCausalLM` architecture, so SGLang serves them through the existing Llama implementation.
+
+Common Mellum 1 checkpoints:
+
+- [`JetBrains/Mellum-4b-base`](https://huggingface.co/JetBrains/Mellum-4b-base)
+- [`JetBrains/Mellum-4b-sft-all`](https://huggingface.co/JetBrains/Mellum-4b-sft-all)
+- [`JetBrains/Mellum-4b-dpo-all`](https://huggingface.co/JetBrains/Mellum-4b-dpo-all)
+- [`JetBrains/Mellum-4b-sft-python`](https://huggingface.co/JetBrains/Mellum-4b-sft-python)
+- [`JetBrains/Mellum-4b-dpo-python`](https://huggingface.co/JetBrains/Mellum-4b-dpo-python)
+- [`JetBrains/Mellum-4b-sft-kotlin`](https://huggingface.co/JetBrains/Mellum-4b-sft-kotlin)
+
+**Mellum 2** is a 12B-A2.5B MoE code model family using `MellumForCausalLM`, hybrid sliding-window/full attention, 64 routed experts, and top-8 expert routing. It supports a 131K token context window in the published configs.
+
+Common Mellum 2 checkpoints:
+
+- [`JetBrains/Mellum2-12B-A2.5B-Base`](https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Base)
+- [`JetBrains/Mellum2-12B-A2.5B-Instruct`](https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Instruct)
+- [`JetBrains/Mellum2-12B-A2.5B-Thinking`](https://huggingface.co/JetBrains/Mellum2-12B-A2.5B-Thinking)
+
+<Note>
+The launch commands below target Hugging Face safetensors checkpoints. GGUF variants are separate repositories and are not covered by these commands.
+</Note>
+
+## 2. SGLang Installation
+
+Install SGLang from a build that includes Mellum 2 support. For the full Docker, pip, and source installation options, see the [official SGLang installation guide](../../../docs/get-started/install).
+
+```bash Command
+python3 -m pip install --upgrade pip
+python3 -m pip install "sglang[all]"
+```
+
+## 3. Model Deployment
+
+### 3.1 Mellum 1
+
+Mellum 1 safetensors checkpoints are Llama-compatible. For an instruction-tuned code model:
+
+```bash Command
+sglang serve \
+  --model-path JetBrains/Mellum-4b-sft-all \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+For a base completion model:
+
+```bash Command
+sglang serve \
+  --model-path JetBrains/Mellum-4b-base \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 3.2 Mellum 2
+
+For chat-style coding workloads, start with the Instruct checkpoint:
+
+```bash Command
+sglang serve \
+  --model-path JetBrains/Mellum2-12B-A2.5B-Instruct \
+  --tp 1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+For reasoning-oriented prompts, use the Thinking checkpoint:
+
+```bash Command
+sglang serve \
+  --model-path JetBrains/Mellum2-12B-A2.5B-Thinking \
+  --tp 1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+### 3.3 Configuration Tips
+
+- **Checkpoint choice**: Use Instruct or Thinking for chat-style prompts, and Base for raw completion or evaluation workflows.
+- **Context length vs memory**: Mellum 2 configs advertise 131K context. If GPU memory is constrained, lower `--context-length`, for example `--context-length 32768`.
+- **Tensor parallelism**: `--tp 1` is the simplest starting point. Increase `--tp` for longer context, larger batches, or throughput-oriented deployments.
+- **Architecture path**: Mellum 1 uses `LlamaForCausalLM`; Mellum 2 uses SGLang's native `MellumForCausalLM` implementation.
+
+## 4. Model Invocation
+
+The examples below assume the server is reachable at `http://localhost:30000/v1`.
+
+### 4.1 Chat
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.chat.completions.create(
+    model="JetBrains/Mellum2-12B-A2.5B-Instruct",
+    messages=[
+        {"role": "system", "content": "You are a helpful coding assistant."},
+        {
+            "role": "user",
+            "content": "Write a Python function that validates whether brackets are balanced.",
+        },
+    ],
+    temperature=0.2,
+    max_tokens=512,
+)
+
+print(resp.choices[0].message.content)
+```
+
+### 4.2 Completion
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+resp = client.completions.create(
+    model="JetBrains/Mellum-4b-base",
+    prompt="def binary_search(nums, target):\n",
+    temperature=0.2,
+    max_tokens=256,
+)
+
+print(resp.choices[0].text)
+```

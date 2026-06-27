@@ -3079,6 +3079,7 @@ def is_fa3_default_architecture(hf_config):
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "MixtralForCausalLM",
+        "MellumForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
