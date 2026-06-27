@@ -6,7 +6,12 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300-qwen35-fp8", nightly=True)
+register_cuda_ci(
+    est_time=7200,
+    suite="nightly-4-gpu-gb300-qwen35-fp8",
+    nightly=True,
+    disabled="temporarily disabled while debugging GB300 DSV4 Pro FP4 nightly",
+)
 
 MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
 
