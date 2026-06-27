@@ -116,6 +116,8 @@ def fused_dsa_decode_metadata(
     assert dsa_cu_seqlens_k.is_cuda
 
     if bs == 0:
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
         return
 
     has_real_page_table = real_page_size > 1
@@ -306,6 +308,8 @@ def fused_dsa_target_verify_metadata(
     assert dsa_cu_seqlens_k.is_cuda
 
     if bs == 0:
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
         return
     assert next_n > 0
 
@@ -403,6 +407,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     dsa_index_topk: tl.constexpr,
     real_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
+    STATIC_EXTEND_LEN: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
@@ -423,18 +428,26 @@ def _fused_dsa_draft_extend_metadata_kernel(
 
         offs_e = tl.arange(0, BLOCK_EXPANDED)
         mask_e = offs_e < total_len
-        req_row = tl.full((BLOCK_EXPANDED,), 0, tl.int32)
-        local_off = tl.full((BLOCK_EXPANDED,), 0, tl.int32)
-        qo_len_for_row = tl.full((BLOCK_EXPANDED,), 1, tl.int32)
-        prefix = tl.full((), 0, tl.int32)
+        if STATIC_EXTEND_LEN:
+            static_qo_len = tl.load(extend_seq_lens).to(tl.int32)
+            req_row = offs_e // static_qo_len
+            local_off = offs_e - req_row * static_qo_len
+            qo_len_for_row = tl.zeros((BLOCK_EXPANDED,), tl.int32) + static_qo_len
+        else:
+            req_row = tl.full((BLOCK_EXPANDED,), 0, tl.int32)
+            local_off = tl.full((BLOCK_EXPANDED,), 0, tl.int32)
+            qo_len_for_row = tl.full((BLOCK_EXPANDED,), 1, tl.int32)
+            prefix = tl.full((), 0, tl.int32)
 
-        for i in tl.range(0, bs):
-            qo_len = tl.load(extend_seq_lens + i * extend_seq_lens_stride).to(tl.int32)
-            in_row = (offs_e >= prefix) & (offs_e < prefix + qo_len)
-            req_row = tl.where(in_row, i, req_row)
-            local_off = tl.where(in_row, offs_e - prefix, local_off)
-            qo_len_for_row = tl.where(in_row, qo_len, qo_len_for_row)
-            prefix += qo_len
+            for i in tl.range(0, bs):
+                qo_len = tl.load(extend_seq_lens + i * extend_seq_lens_stride).to(
+                    tl.int32
+                )
+                in_row = (offs_e >= prefix) & (offs_e < prefix + qo_len)
+                req_row = tl.where(in_row, i, req_row)
+                local_off = tl.where(in_row, offs_e - prefix, local_off)
+                qo_len_for_row = tl.where(in_row, qo_len, qo_len_for_row)
+                prefix += qo_len
 
         base_seq = tl.load(
             seq_lens + req_row * seq_lens_stride,
@@ -458,16 +471,20 @@ def _fused_dsa_draft_extend_metadata_kernel(
     col_block = page_pid - req_row * num_col_blocks
     offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    prefix = tl.full((), 0, tl.int32)
-    for i in tl.range(0, bs):
-        qo_len = tl.load(extend_seq_lens + i * extend_seq_lens_stride).to(tl.int32)
-        prefix += tl.where(i < req_row, qo_len, 0)
-
     qo_len = tl.load(
         extend_seq_lens + req_row * extend_seq_lens_stride,
         mask=req_row < bs,
         other=0,
     ).to(tl.int32)
+    if STATIC_EXTEND_LEN:
+        prefix = req_row * qo_len
+    else:
+        prefix = tl.full((), 0, tl.int32)
+        for i in tl.range(0, bs):
+            prev_qo_len = tl.load(extend_seq_lens + i * extend_seq_lens_stride).to(
+                tl.int32
+            )
+            prefix += tl.where(i < req_row, prev_qo_len, 0)
     offs_r = tl.arange(0, BLOCK_ROWS)
     out_rows = prefix + offs_r
     row_mask = (req_row < bs) & (offs_r < qo_len) & (out_rows < total_len)
@@ -524,6 +541,7 @@ def fused_dsa_draft_extend_metadata(
     real_page_size: int,
     max_extend_len: int,
     max_total_len: int,
+    static_extend_len: bool = False,
 ) -> None:
     assert seq_lens.is_cuda
     assert extend_seq_lens.is_cuda
@@ -536,7 +554,16 @@ def fused_dsa_draft_extend_metadata(
     assert dsa_cache_seqlens.is_cuda
     assert dsa_cu_seqlens_k.is_cuda
 
-    if bs == 0 or total_len == 0:
+    if bs == 0:
+        cu_seqlens_k[:1].zero_()
+        dsa_cu_seqlens_k[:1].zero_()
+        return
+    if total_len == 0:
+        cache = seq_lens.to(torch.int32)
+        cache_seqlens.copy_(cache)
+        cu_seqlens_k[:1].zero_()
+        cu_seqlens_k[1 : bs + 1].copy_(torch.cumsum(cache, dim=0, dtype=torch.int32))
+        dsa_cu_seqlens_k[:1].zero_()
         return
     assert total_len <= max_total_len
     # Caller-owned graph metadata guarantees each request accepts at most
@@ -586,6 +613,7 @@ def fused_dsa_draft_extend_metadata(
         dsa_index_topk,
         real_page_size,
         has_real_page_table,
+        static_extend_len,
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_ROWS=block_rows,

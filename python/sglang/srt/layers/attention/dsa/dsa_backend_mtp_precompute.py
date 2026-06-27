@@ -266,9 +266,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         global _USE_FUSED_METADATA_GENERATION
         global _warned_fused_precompute_failure
 
-        max_seqlen_k = int(
-            seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-        )
+        max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
         if _USE_FUSED_METADATA_GENERATION and is_cuda():

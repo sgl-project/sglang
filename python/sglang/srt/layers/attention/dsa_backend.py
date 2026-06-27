@@ -121,6 +121,7 @@ _USE_FUSED_METADATA_GENERATION = (
     envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not _is_hip
 )
 _warned_fused_metadata_generation_failure = False
+_warned_deepgemm_schedule_out_failure = False
 
 
 @dataclass(frozen=True)
@@ -597,6 +598,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        global _warned_deepgemm_schedule_out_failure
+
         schedule_metadata_out = getattr(
             deep_gemm, "get_paged_mqa_logits_metadata_out", None
         )
@@ -612,8 +615,32 @@ class DeepseekSparseAttnBackend(
                     deep_gemm.get_num_sms(),
                 )
                 return
-            except (AttributeError, RuntimeError):
-                pass
+            except AttributeError as e:
+                if not _warned_deepgemm_schedule_out_failure:
+                    logger.warning(
+                        "DeepGEMM paged MQA schedule out API is unavailable; "
+                        "falling back to allocation-plus-copy refresh. Error: %s",
+                        e,
+                    )
+                    _warned_deepgemm_schedule_out_failure = True
+            except RuntimeError as e:
+                msg = str(e)
+                compatibility_failure = (
+                    "get_paged_mqa_logits_metadata_out" in msg
+                    or "num_sms" in msg
+                    or "size" in msg
+                    or "shape" in msg
+                )
+                if not compatibility_failure:
+                    raise
+                if not _warned_deepgemm_schedule_out_failure:
+                    logger.warning(
+                        "DeepGEMM paged MQA schedule out API rejected the existing "
+                        "buffer; falling back to allocation-plus-copy refresh. "
+                        "Error: %s",
+                        e,
+                    )
+                    _warned_deepgemm_schedule_out_failure = True
 
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
@@ -1455,6 +1482,7 @@ class DeepseekSparseAttnBackend(
                         real_page_size=self.real_page_size,
                         max_extend_len=self.speculative_num_draft_tokens,
                         max_total_len=bs * self.speculative_num_draft_tokens,
+                        static_extend_len=True,
                     )
                     cache_seqlens = metadata.cache_seqlens_int32
                     seqlens_expanded = metadata.dsa_seqlens_expanded[:total_extend_len]
