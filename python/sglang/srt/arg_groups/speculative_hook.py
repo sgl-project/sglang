@@ -152,14 +152,22 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding only supports CUDA and NPU devices."
         )
 
-    if resolved_view(server_args).enable_dp_attention:
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
-        )
-
     if server_args.pp_size != 1:
         raise ValueError(
             "Currently DFLASH speculative decoding only supports pp_size == 1."
+        )
+
+    view = resolved_view(server_args)
+    if view.enable_dp_attention and not view.enable_dp_lm_head:
+        # DFLASH draft greedy sampling manually reproduces a vocab-parallel argmax
+        # over the target lm_head inside the attention TP group (DP-local). That
+        # only matches when the lm_head is sharded over attn_tp_size; with the
+        # default global-tp lm_head sharding the all_gather would mix tokens across
+        # DP groups and hang whenever a peer DP group is IDLE. Force-enable it.
+        server_args.enable_dp_lm_head = True
+        logger.warning(
+            "DFLASH + dp_attention requires enable_dp_lm_head so the draft greedy "
+            "sampling stays within the attention TP group; enabling it automatically."
         )
 
     if server_args.speculative_draft_model_path is None:
