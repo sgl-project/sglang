@@ -2108,6 +2108,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
         elif load_format is None:
+            if _is_npu:
+                target_device = torch.device(self.device)
+                from sglang.srt.model_loader.loader import DefaultModelLoader
+    
+                DefaultModelLoader.load_weights_and_postprocess(
+                    self.model, named_tensors, target_device
+                )
+                return True, "Success"
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
