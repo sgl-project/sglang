@@ -2332,29 +2332,24 @@ class FlashInferAttnBackend(AttentionBackend):
         v: torch.Tensor,
         paged_kv_kwargs,
     ):
-        if not self.is_nvfp4_native or self.is_fp8_k_nvfp4_v or k is None or v is None:
-            if k is None or v is None:
-                return k, v, {}
-            return (
-                k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                {},
-            )
-
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
-
-        k3 = k.view(-1, layer.tp_k_head_num, layer.head_dim).contiguous()
-        v3 = v.view(-1, layer.tp_v_head_num, layer.head_dim).contiguous()
-        k_fp4, k_sf, _ = NVFP4KVQuantizeUtil.quantize(k3, paged_kv_kwargs["k_scale"])
-        v_fp4, v_sf, _ = NVFP4KVQuantizeUtil.quantize(v3, paged_kv_kwargs["v_scale"])
+        # On the cached-prefix merge path the SUFFIX (the new, uncached tokens)
+        # attends to itself in a ragged pass whose output is merge_state-combined
+        # with the fp4 cached prefix. Run that suffix pass in native bf16 k/v --
+        # exactly like the no-prefix ragged path above (and like vLLM's unified FA2
+        # path) -- instead of re-quantizing the suffix to NVFP4 first. The suffix is
+        # still written to the fp4 KV cache (set_kv_buffer) and read as fp4 during
+        # decode; only this prefill self-attention stays bf16. Re-quantizing the
+        # freshest, most attention-relevant tokens here (then merging them with the
+        # dequantized prefix) measurably degraded GSM8K -- radix-on 0.357 vs
+        # radix-off 0.480 (n=300, matched client), where radix-off == vLLM 0.457 ==
+        # bf16. Attending the suffix in bf16 closes that gap while keeping the
+        # prefix cached in fp4.
+        if k is None or v is None:
+            return k, v, {}
         return (
-            k_fp4.view(torch.uint8),
-            v_fp4.view(torch.uint8),
-            {
-                "kv_cache_sf": (k_sf, v_sf),
-                "k_scale": paged_kv_kwargs["k_scale"],
-                "v_scale": paged_kv_kwargs["v_scale"],
-            },
+            k.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v.view(-1, layer.tp_v_head_num, layer.head_dim),
+            {},
         )
 
     def _should_vo_split(self, layer: RadixAttention) -> bool:
