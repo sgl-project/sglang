@@ -727,13 +727,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.warmup = self.warmup_mode != "off"
                 self.server_warmup = self.warmup_mode == "server"
             elif self.warmup:
-                # Legacy --warmup/--server-warmup enabled warmup without an
-                # explicit --warmup-mode. Honor the resolved warmup_mode (e.g.
-                # ``serve``'s "server" default) for the server-vs-request split
-                # instead of silently staying request-based — otherwise
-                # ``serve --warmup`` would *downgrade* the production
-                # server-warmup default to request mode. (``--warmup false``
-                # keeps self.warmup False here and is left untouched.)
                 self.server_warmup = (
                     self.server_warmup or self.warmup_mode == "server"
                 )
