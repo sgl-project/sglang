@@ -361,7 +361,8 @@ class LongcatFlashDecoderLayer(nn.Module):
             [RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for i in range(2)]
         )
 
-        if enable_moe_dense_fully_dp():
+        self.enable_moe_dense_fully_dp = enable_moe_dense_fully_dp()
+        if self.enable_moe_dense_fully_dp:
             mlps_tp_rank, mlps_tp_size = 0, 1
         else:
             mlps_tp_rank, mlps_tp_size = None, None
