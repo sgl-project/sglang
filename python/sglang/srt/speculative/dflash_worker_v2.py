@@ -2266,13 +2266,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            # An idle DP rank runs the empty target prefill above to stay in
-            # the DP collective, but must skip the draft KV materialization,
-            # which needs per-request extend info.
-            if batch.forward_mode.is_idle():
-                batch_output.next_draft_input = DFlashDraftInputV2.create_idle_input(
-                    device=self.device
-                )
+            # The global extend flag can also bring local IDLE/DECODE ranks
+            # here. They participate in the target forward, but have no prompt
+            # tokens to materialize into the draft KV cache.
+            if not batch.forward_mode.is_extend():
+                logits_output.hidden_states = None
+                if batch.forward_mode.is_idle():
+                    batch_output.next_draft_input = (
+                        DFlashDraftInputV2.create_idle_input(device=self.device)
+                    )
+                else:
+                    batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                        bonus_tokens=next_token_ids,
+                        seq_lens=new_seq_lens,
+                    )
                 return batch_output
 
             if logits_output.hidden_states is None:
