@@ -86,13 +86,6 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
         cmd += ["--num-gpus", str(case["num_gpus"])]
     if fw_cfg.get("serve_args", "").strip():
         cmd += fw_cfg["serve_args"].strip().split()
-    # Prime the server's built-in (req-based) warmup at the exact measured
-    # resolution so kernels are specialized for the real request shape. This
-    # replaces the old client-side warmup loop; the built-in warmup goes through
-    # the internal path that bypasses sampling-param preset validation (e.g.
-    # Ideogram-4's preset-locked num_inference_steps).
-    if case.get("width") and case.get("height"):
-        cmd += ["--warmup-resolutions", f"{case['width']}x{case['height']}"]
     return cmd
 
 
@@ -798,14 +791,26 @@ def run_single(
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
 
-        # No client-side warmup: the server's built-in req-based warmup
-        # (enabled via --warmup and primed at the measured resolution through
-        # --warmup-resolutions) handles kernel specialization. This avoids
-        # re-implementing warmup here and the fragility of overriding params the
-        # model may reject (e.g. Ideogram-4's preset-locked num_inference_steps).
-        # NOTE: the built-in video warmup caps frames at SERVER_WARMUP_MAX_VIDEO_FRAMES
-        # (17) rather than the measured frame count, so watch video latencies for
-        # any first-request compilation creeping into the measurement.
+        # Warmup requests (not measured, no perf dump)
+        # Use few steps to be fast — server's own warmup (warmup_steps=3) handles
+        # torch.compile compilation; these external warmups just stabilize triton
+        # kernel specializations across requests.
+        WARMUP_STEPS = 3
+        if case.get("preset_locked_steps"):
+            # Some models (e.g. Ideogram-4 preset V4_DEFAULT_20) derive
+            # num_inference_steps from a preset and reject any override; warm up
+            # with the model's own preset step count instead of WARMUP_STEPS.
+            warmup_case = {k: v for k, v in case.items() if k != "num_inference_steps"}
+            warmup_label = "preset steps"
+        else:
+            warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
+            warmup_label = f"{WARMUP_STEPS} steps"
+        for wi in range(1, 3):
+            print(f"  Sending warmup request ({wi}/2, {warmup_label})...")
+            try:
+                send_request(base_url, warmup_case, framework, config)
+            except Exception as e:
+                raise RuntimeError(f"Warmup request {wi} failed: {e}") from e
 
         # Measured request — pass perf_dump_path for SGLang server-side timing
         if perf_dump_path and os.path.exists(perf_dump_path):
