@@ -1,3 +1,8 @@
+---
+title: "GLM-5.2 examples"
+description: "Deploy GLM-5.2 with SGLang on Ascend NPUs, including single-node, multi-node, and Prefill-Decode disaggregation modes."
+---
+
 # GLM-5.2 examples
 
 ## Introduction
@@ -10,14 +15,14 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 - `GLM-5.2`(BF16 version): [Download model weight](https://huggingface.co/collections/zai-org/glm-52).
 - `GLM-5.2-w8a8`(Quantized version without mtp): [Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/).
-- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
+- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model naively.
 
 
 ### Installation
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
-```{code-block} bash
+```bash
 #Atlas 800 A3
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-glm5.2-20260615
 #Atlas 800 A2
@@ -250,7 +255,6 @@ do
         break
     fi
 done
-
 ```
 
 ### Prefill-Decode Disaggregation
@@ -356,9 +360,6 @@ do
         break
     fi
 done
-
-exit 1
-
 ```
 
 ```shell
@@ -373,4 +374,4 @@ python3 -m sglang_router.launch_router \
 
 ### Using Benchmark
 
-Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.md) for details.
+Refer to [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling) for details.
