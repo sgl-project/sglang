@@ -6,6 +6,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -32,13 +33,14 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func, draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils.common import empty_context
 
 _is_npu = is_npu()
 
@@ -102,6 +104,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Draft runner (separate KV cache + attention backend).
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        # Draft is a dense transformer in plain TP mode. Keep dp_attention off so
+        # its KV backend writes full num_tokens rows (matching out_cache_loc);
+        # draft_tp_context() below still pins it to the attention TP group.
+        draft_server_args.enable_dp_attention = False
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
         if draft_backend is None:
@@ -143,23 +149,36 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        # Build the draft inside the attention TP group so its KV head count
+        # matches token_to_kv_pool.row_dim (both use attn_tp_size). Each DP group
+        # runs its own draft, as in EAGLE3 + dp_attention.
         saved_server_args = get_global_server_args()
-        self._draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
+        _init_ctx = (
+            draft_tp_context(get_attention_tp_group())
+            if server_args.enable_dp_attention
+            else empty_context()
         )
+        with _init_ctx:
+            self._draft_worker = TpModelWorker(
+                server_args=draft_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=0,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                dp_rank=dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+            )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
+        # Use the attn_tp_group for every draft op (forward / graph / sampling).
+        self.draft_tp_context = (
+            draft_tp_context if server_args.enable_dp_attention else empty_context
+        )
         self.draft_model = self.draft_model_runner.model
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -292,7 +311,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
+        with self.draft_tp_context(self.draft_model_runner.tp_group):
+            self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
@@ -305,9 +325,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        self._draft_worker.init_cuda_graphs(
-            capture_decode_cuda_graph=capture_decode_cuda_graph
-        )
+        with self.draft_tp_context(self.draft_model_runner.tp_group):
+            self._draft_worker.init_cuda_graphs(
+                capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -1224,19 +1245,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
+            # is_extend_in_batch is broadcast to all DP ranks, so an IDLE/DECODE
+            # rank can land here too. It has no prompt tokens to materialize --
+            # just seed the next decode round and return.
+            if not model_worker_batch.forward_mode.is_extend():
+                logits_output.hidden_states = None
+                device = next_token_ids.device
+                batch_output.next_draft_input = self._make_next_draft_input_prefill(
+                    bonus_tokens=next_token_ids,
+                    seq_lens=model_worker_batch.seq_lens,
+                    cur_allocated_seq_lens_cpu=model_worker_batch.seq_lens_cpu,
+                )
+                verify_done = torch.get_device_module(device).Event()
+                verify_done.record()
+                batch_output.next_draft_input.verify_done = verify_done
+                return batch_output
+
             if logits_output.hidden_states is None:
                 raise RuntimeError(
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
 
+            # Defensive: only real extend ranks reach here (IDLE/DECODE returned
+            # above), so extend_lens / prefix_lens must be populated.
             if (
                 model_worker_batch.extend_lens is None
                 or model_worker_batch.prefix_lens is None
             ):
                 raise RuntimeError(
-                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
-                    "but got None."
+                    "DFLASH expected extend_lens / prefix_lens to be populated in "
+                    "extend mode, but got None."
                 )
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
@@ -1259,8 +1298,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(model_worker_batch.extend_lens)),
             )
+
+            # With EP (moe_ep_size > 1) the target right-pads hidden_states to an
+            # alignment boundary; out_cache_loc only covers real tokens. Drop the
+            # trailing padding rows before indexing them into the draft KV.
+            target_hidden = logits_output.hidden_states
+            num_real_tokens = int(model_worker_batch.out_cache_loc.numel())
+            if target_hidden.shape[0] < num_real_tokens:
+                raise ValueError(
+                    "DFLASH target hidden has fewer rows than cache_loc: "
+                    f"target_hidden={target_hidden.shape[0]}, "
+                    f"cache_loc={num_real_tokens}."
+                )
+            if target_hidden.shape[0] != num_real_tokens:
+                target_hidden = target_hidden[:num_real_tokens]
+
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
+                target_hidden=target_hidden,
                 cache_loc=model_worker_batch.out_cache_loc,
                 positions=positions,
             )
@@ -1293,8 +1347,31 @@ class DFlashWorkerV2(BaseSpecWorker):
         if model_worker_batch.forward_mode.is_idle():
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
+
+            # The target verify is a full-TP collective, so an IDLE DP rank must
+            # still run it or the active DP groups hang. (The draft forward is
+            # attn_tp-local and is safely skipped.) capture_hidden_mode MUST be
+            # FULL to match the active path: a mismatch triggers a graph recapture
+            # whose internal barrier the active ranks never enter -> deadlock.
+            if self.server_args.enable_dp_attention:
+                idle_verify_input = DFlashVerifyInput(
+                    draft_token=empty_ids,
+                    positions=empty_ids,
+                    draft_token_num=int(self.block_size),
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
+                    model_worker_batch, self.target_worker
+                )
+                self.target_worker.forward_batch_generation(
+                    batch=None,
+                    forward_batch=verify_forward_batch,
+                    is_verify=True,
+                    skip_attn_backend_init=True,
+                )
+
             next_draft_input = self._make_next_draft_input_decode(
-                bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
+                bonus_tokens=empty_ids,
                 new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
             )
             if on_publish is not None:
@@ -1479,19 +1556,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-        with torch.inference_mode():
+        # Run draft forward + greedy sampling inside draft_tp_context (attn_tp
+        # group). Both the draft model and lm_head are sharded over attn_tp_size;
+        # a global all_gather here would mix tokens across DP groups and hang.
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), torch.inference_mode():
             draft_logits_output = self.draft_model_runner.forward(
                 forward_batch
             ).logits_output
 
-        draft_hidden = draft_logits_output.hidden_states
-        if draft_hidden is None:
-            raise RuntimeError("DFLASH draft model returned no hidden states.")
-        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, int(self.block_size) - 1)
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(
+                    -1, draft_hidden.shape[-1]
+                ),
+                lm_head=lm_head,
+            ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
