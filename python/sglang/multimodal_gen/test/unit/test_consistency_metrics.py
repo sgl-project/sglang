@@ -26,6 +26,34 @@ def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
     assert revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 
 
+def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
+    class Response:
+        status_code = 404
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(test_utils.requests, "head", lambda *args, **kwargs: Response())
+
+    assert test_utils._remote_file_exists("https://example.com/missing.png") is False
+
+
+def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
+    monkeypatch.setattr(test_utils, "_remote_file_exists", lambda url: None)
+
+    files = test_utils._find_remote_consistency_gt_files(
+        "unit_video",
+        1,
+        is_video=True,
+    )
+
+    assert [filename for filename, _ in files] == [
+        "unit_video_1gpu_frame_0.png",
+        "unit_video_1gpu_frame_mid.png",
+        "unit_video_1gpu_frame_last.png",
+    ]
+
+
 def test_pixel_metrics_identical_image():
     image = _solid_image(128)
 

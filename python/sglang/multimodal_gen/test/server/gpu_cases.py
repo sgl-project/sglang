@@ -232,6 +232,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            modality="video",
         ),
     ),
     DiffusionTestCase(
