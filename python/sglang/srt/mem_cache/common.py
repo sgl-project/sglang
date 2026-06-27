@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.triton_ops.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
@@ -321,6 +322,17 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         # Standard allocator
         if allocator.available_size() < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens))
+        # Session-level LRU preemption: if tree eviction alone was insufficient,
+        # preempt idle sessions oldest-first then do a second eviction pass to
+        # reclaim any newly-exposed parent nodes.
+        if allocator.available_size() < num_tokens and isinstance(
+            tree_cache, SessionRadixCacheMixin
+        ):
+            remaining = num_tokens - allocator.available_size()
+            tree_cache.preempt_sessions(remaining)
+            if allocator.available_size() < num_tokens:
+                remaining = num_tokens - allocator.available_size()
+                tree_cache.evict(EvictParams(num_tokens=remaining))
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
