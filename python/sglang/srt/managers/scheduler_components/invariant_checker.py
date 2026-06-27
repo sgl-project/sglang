@@ -12,6 +12,8 @@ from typing import (
     Tuple,
 )
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -92,15 +94,37 @@ class SchedulerInvariantChecker:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
-        return self._check_pool_invariant(
+        full_evictable_size = ps.full_evictable_size
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
+            # DCP stores logical tokens in widened physical pages.  Prefix cache
+            # counters are logical-token based, while the allocator frees whole
+            # physical pages, so round cached tokens up to physical page units.
+            full_evictable_size = (
+                (full_evictable_size + allocator.page_size - 1)
+                // allocator.page_size
+                * allocator.page_size
+            )
+        leak, msg = self._check_pool_invariant(
             "full",
             ps.full_available_size,
-            ps.full_evictable_size,
+            full_evictable_size,
             protected,
             session_held,
             total,
             uncached,
         )
+        if (
+            leak
+            and getattr(self.server_args, "dcp_size", 1) > 1
+            and allocator.page_size > 1
+        ):
+            # Radix/Mamba cache accounting is logical-token based while DCP full
+            # KV allocation is physical-page based. Partial physical pages can
+            # leave a small page-level slack even when all pages are owned by
+            # either the allocator or the prefix cache.
+            return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+        return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         return self._check_pool_invariant(
@@ -262,6 +286,105 @@ class SchedulerInvariantChecker:
 
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
+
+        if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
+            self._check_kv_page_invariants()
+
+    def _check_kv_page_invariants(self):
+        """committed<=allocated for every req/slot, and no double free:
+          A. no owner references a page that is in the free pool (use-after-free).
+          B. the free pool has no duplicate pages (two owners freed the same page).
+        All heavy work runs on GPU to avoid per-token device->host sync."""
+        rtt = self.req_to_token_pool.req_to_token
+        row_width = rtt.shape[1]
+
+        def _add_owner(req_or_slot, label, rpi, committed, allocated):
+            assert 0 <= committed <= allocated <= row_width
+            owners.append((label, rpi, allocated))
+
+        owners: list[tuple[str, Optional[int], int]] = []
+        batch = self.get_last_batch()
+        if batch is not None:
+            for req in batch.reqs:
+                _add_owner(
+                    req,
+                    f"req {req.rid}",
+                    req.req_pool_idx,
+                    req.kv_committed_len,
+                    req.kv_allocated_len,
+                )
+        sess = getattr(self.tree_cache, "slots", None)
+        if sess:
+            for sid, slot in sess.items():
+                if getattr(slot, "is_holding_kv", False):
+                    _add_owner(
+                        slot,
+                        f"slot {sid[:8]}",
+                        slot.req_pool_idx,
+                        slot.kv_committed_len,
+                        slot.kv_allocated_len,
+                    )
+
+        active = [
+            (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0
+        ]
+        if not active:
+            return
+
+        idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
+        allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
+        mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
+        owner_pages = rtt[idx][mask] // self.page_size
+
+        # Sub-allocators to check: a flat allocator is its own single sub; a
+        # hybrid-SWA wrapper exposes full_attn_allocator + swa_attn_allocator.
+        alloc = self.token_to_kv_pool_allocator
+        sub_allocs = (
+            [alloc]
+            if getattr(alloc, "free_pages", None) is not None
+            else [
+                sub
+                for n in ("full_attn_allocator", "swa_attn_allocator")
+                if (sub := getattr(alloc, n, None)) is not None
+                and getattr(sub, "free_pages", None) is not None
+            ]
+        )
+        if not sub_allocs:
+            return
+
+        def _free_pages(a):
+            free = a.free_pages
+            release = getattr(a, "release_pages", None)
+            return (
+                torch.cat((free, release))
+                if release is not None and len(release) > 0
+                else free
+            )
+
+        # Check B: every sub-pool's free set has no duplicate pages.
+        for i, sub in enumerate(sub_allocs):
+            free = _free_pages(sub)
+            uniq = torch.unique(free)
+            if uniq.numel() != free.numel():
+                raise_error_or_warn(
+                    self,
+                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                    "count_memory_leak_warnings",
+                    f"KV double free: sub-pool {i} has {free.numel() - uniq.numel()} duplicate pages.",
+                )
+
+        # Check A: owner pages (full-pool indices) must not be in the full free
+        # set (sub_allocs[0] is the full pool, even on hybrid-SWA).
+        full_unique = torch.unique(_free_pages(sub_allocs[0]))
+        stale = owner_pages[torch.isin(owner_pages, full_unique)]
+        if stale.numel() > 0:
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                "count_memory_leak_warnings",
+                f"KV page use-after-free: {stale.numel()} owner page refs are in "
+                f"the free pool, sample pages={torch.unique(stale)[:8].tolist()}.",
+            )
 
     def _check_req_pool(self):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
