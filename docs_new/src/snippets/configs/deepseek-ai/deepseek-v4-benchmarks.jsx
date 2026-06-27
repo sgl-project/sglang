@@ -136,10 +136,42 @@ export const benchmarks = [
     match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "multi-2" },
   },
   // ====================================================================
+  // GB200 + NVFP4
+  // ====================================================================
+  {
+    match: { hw: "gb200", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #25820",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 323.85, tpot_ms: 3.62, tokens_per_sec_per_gpu: 496 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 397.31, tpot_ms: 8.11, tokens_per_sec_per_gpu: 3663 },
+    ],
+    accuracy: { gsm8k_pct: 96.66 },
+  },
+  {
+    match: { hw: "gb200", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+    sglang_version: "PR #25820",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 338.20, tpot_ms: 6.25, tokens_per_sec_per_gpu: 161 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 524.85, tpot_ms: 14.45, tokens_per_sec_per_gpu: 1015 },
+    ],
+    accuracy: { gsm8k_pct: 95.98 },
+  },
+  // ====================================================================
   // GB300 + FP4
   // ====================================================================
   {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "0.5.13.post1",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 463, tpot_ms: 4.19, tokens_per_sec_per_gpu: 35 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 436, tpot_ms: 8.93, tokens_per_sec_per_gpu: 336 },
+    ],
   },
   {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
@@ -169,6 +201,31 @@ export const benchmarks = [
   },
   {
     match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+  },
+  // ====================================================================
+  // GB300 + NVFP4
+  // ====================================================================
+  {
+    match: { hw: "gb300", variant: "flash", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #25820",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 361.72 , tpot_ms: 3.62, tokens_per_sec_per_gpu: 480 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 422.96, tpot_ms: 8.19, tokens_per_sec_per_gpu: 3733 },
+    ],
+    accuracy: { gsm8k_pct: 96.44 },
+  },
+  {
+    match: { hw: "gb300", variant: "pro", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #25820",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 364.33, tpot_ms: 5.33, tokens_per_sec_per_gpu: 381 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 694.58, tpot_ms: 16.03, tokens_per_sec_per_gpu: 1654 },
+    ],
+    accuracy: { gsm8k_pct: 96.36 },
   },
   // ====================================================================
   // H200 + FP8
