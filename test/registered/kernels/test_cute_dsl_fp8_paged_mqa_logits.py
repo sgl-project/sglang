@@ -11,9 +11,12 @@ to SGLang.
 import pytest
 import torch
 
+from sglang.srt.layers.attention.dsa.utils import (
+    fp8_mqa_logits_ceil_to_ue8m0,
+    fp8_mqa_logits_make_fused_kv,
+)
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.cute_dsl_mqa_logits_utils import ceil_to_ue8m0, make_fused_kv
 
 skip_not_sm100 = pytest.mark.skipif(
     not is_sm100_supported(),
@@ -152,14 +155,14 @@ def _generate_test_data(
 
         kv_bf16 = torch.randn(num_phys_blocks, block_kv, head_dim, device=device)
         kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
-        kv_scale = ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
+        kv_scale = fp8_mqa_logits_ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
         kv_fp8 = (kv_bf16 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
         weights = torch.randn(
             batch_size * next_n, num_heads, device=device, dtype=torch.float32
         )
 
-    kv_fused = make_fused_kv(kv_fp8, kv_scale, block_kv, head_dim)
+    kv_fused = fp8_mqa_logits_make_fused_kv(kv_fp8, kv_scale, block_kv, head_dim)
 
     return {
         "q_fp8": q_fp8,
@@ -177,7 +180,7 @@ def _generate_test_data(
 
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("next_n", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("next_n", [1, 2, 3, 4])
 @pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096])
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16])

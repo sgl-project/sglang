@@ -9,8 +9,11 @@ import numpy as np
 import torch
 
 import sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits  # noqa: F401
+from sglang.srt.layers.attention.dsa.utils import (
+    fp8_mqa_logits_ceil_to_ue8m0,
+    fp8_mqa_logits_make_fused_kv,
+)
 from sglang.srt.utils import is_sm100_supported
-from sglang.test.cute_dsl_mqa_logits_utils import ceil_to_ue8m0, make_fused_kv
 
 
 def _generate_bench_data(
@@ -64,10 +67,10 @@ def _generate_bench_data(
         total_blocks, block_kv, head_dim, device=device, dtype=torch.bfloat16
     )
     kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
-    kv_scales = ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
+    kv_scales = fp8_mqa_logits_ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
     kv_fp8 = (kv_bf16 / kv_scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
 
-    kv_fused = make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim)
+    kv_fused = fp8_mqa_logits_make_fused_kv(kv_fp8, kv_scales, block_kv, head_dim)
 
     return {
         "q_fp8": q_fp8,

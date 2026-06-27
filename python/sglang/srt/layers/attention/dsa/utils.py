@@ -290,3 +290,30 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return True
     else:
         return False
+
+
+def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
+
+def fp8_mqa_logits_make_fused_kv(
+    kv_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    block_kv: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Pack [K bytes | scale bytes] per token, viewed as [B, page, 1, D+4] uint8."""
+    num_phys_blocks = kv_fp8.shape[0]
+    per_token_size = head_dim + 4
+    block_bytes = block_kv * per_token_size
+    scale_offset = block_kv * head_dim
+
+    fused = torch.zeros(
+        num_phys_blocks, block_bytes, dtype=torch.uint8, device=kv_fp8.device
+    )
+    for blk in range(num_phys_blocks):
+        fused[blk, :scale_offset] = kv_fp8[blk].view(torch.uint8).reshape(-1)
+        fused[blk, scale_offset:] = (
+            kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
+        )
+    return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
