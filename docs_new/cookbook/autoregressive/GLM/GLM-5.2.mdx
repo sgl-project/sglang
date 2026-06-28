@@ -52,6 +52,10 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+  **NVFP4 (B300 / GB300)** deploys on the dev image **`lmsysorg/sglang:dev-glm52-nvfp4`** — the command panel's **Docker** toggle selects it automatically. The FP8 / BF16 recipes use the release **`lmsysorg/sglang:latest`** (the `docker pull` in Install above).
+</Note>
+
 ## Playground
 
 The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
@@ -62,7 +66,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup.
+**GLM-5.2** is Z.ai's flagship Mixture-of-Experts model built on **DeepSeek Sparse Attention (DSA)**: a lightning indexer selects a sparse set of key tokens per query (top-2048), so attention cost stays near-constant as context grows. It ships in two precisions — **FP8** (`zai-org/GLM-5.2-FP8`) and full **BF16** (`zai-org/GLM-5.2`) — both with **78 transformer layers**, **256 routed experts** (8 active per token), a **1M-token context window**, and a single **MTP (Multi-Token Prediction)** layer for built-in EAGLE-style speculative decoding. FP8 is the recommended deployment; BF16 (~1.5 TB) needs an 8×B300 node or a multi-node setup. For Blackwell, NVIDIA also publishes an **NVFP4** build (`nvidia/GLM-5.2-NVFP4`) that quantizes only the MoE experts' linear weights and activations to 4-bit (the shared expert stays unquantized), holding accuracy within ~1 point of the FP8 baseline on GPQA Diamond, SciCode, and IFBench.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -83,12 +87,17 @@ import { Playground } from "/src/snippets/_playground.jsx";
       <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · BF16</td>
       <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong><a href="https://huggingface.co/nvidia/GLM-5.2-NVFP4">GLM-5.2-NVFP4</a></strong></td>
+      <td style={{padding: "9px 12px"}}>MoE · DSA · 256 experts (top-8) · MTP · NVFP4</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>1,048,576</td>
+    </tr>
   </tbody>
 </table>
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95` (the checkpoint's `generation_config.json` defaults; informational — do not hardcode in client code).
 
-**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2).
+**Resources:** [GLM-5.2-FP8](https://huggingface.co/zai-org/GLM-5.2-FP8) · [GLM-5.2 (BF16)](https://huggingface.co/zai-org/GLM-5.2) · [GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4).
 
 ## 2. Configuration Tips
 
@@ -201,3 +210,27 @@ Tool calls: [
 ### 3.3 HiCache (Hierarchical KV Caching)
 
 For long-context, prefix-heavy workloads, enable hierarchical KV caching to spill cold KV blocks to host memory (toggle the **Hierarchical KV Cache** card in the [Playground above](#playground)). Useful given GLM-5.2's 1M-token window; pair `--hicache-ratio` with a write policy that matches your reuse pattern.
+
+### 3.4 Claude Code Integration
+
+GLM-5.2's strong reasoning + tool-calling makes it a good backend for [Claude Code](https://code.claude.com/docs/en/overview), Anthropic's agentic CLI. SGLang exposes the Anthropic-compatible `/v1/messages` endpoint on every server, so Claude Code can talk to a GLM-5.2 server with only environment variables — no code change. Launch the server with `--reasoning-parser glm45 --tool-call-parser glm47` (any recipe from the Deployment panel above works), then:
+
+```bash Command
+export ANTHROPIC_BASE_URL="http://127.0.0.1:30000"
+export ANTHROPIC_AUTH_TOKEN="dummy"
+export API_TIMEOUT_MS="3000000"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW="1000000"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-5.2[1m]"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="glm-5.2[1m]"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.2[1m]"
+claude
+```
+
+Two of these matter specifically for GLM-5.2:
+
+- **`CLAUDE_CODE_ATTRIBUTION_HEADER=0`** — Claude Code prepends a per-request attribution block to the system prompt. GLM-5.2's chat template renders `tools` **before** `system`, so that per-request hash is the first token to diverge between turns and the radix prefix cache re-prefills the whole system + history every turn. This env removes the block and restores prefix-cache reuse.
+- **`glm-5.2[1m]`** as the model name — the `[1m]` suffix is the client-side hint that enables Claude Code's 1M-context beta, matching GLM-5.2's 1,048,576-token window. Without it, context is capped well below 1M. SGLang does not validate the `model` field, so any name is accepted server-side.
+
+For the full setup (streaming, tool-use, count_tokens, persisting env in `~/.claude/settings.json`, troubleshooting), see [Anthropic-Compatible API](../../../docs/basic_usage/anthropic_api).

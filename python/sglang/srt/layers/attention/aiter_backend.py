@@ -2323,6 +2323,11 @@ class AiterAttnBackend(AttentionBackend):
                 page_table = self.forward_metadata.swa_page_table
 
             extra_kwargs = {}
+            attn_out = getattr(forward_batch, "_attn_output", None)
+            if attn_out is not None and q.dtype != fp8_dtype:
+                extra_kwargs["out"] = attn_out.view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
