@@ -1,7 +1,9 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -414,17 +416,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mixed_qkv_to_track
                 )
 
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
-                activation=layer.activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            if is_batch_invariant_mode_enabled():
+                dim, total_len = mixed_qkv.shape
+                width = layer.conv_weights.shape[1]
+                padding = width - 1
+                x = mixed_qkv.unsqueeze(0)
+                conv_out = F.conv1d(
+                    input=x,
+                    weight=layer.conv_weights.unsqueeze(1),
+                    bias=layer.bias,
+                    padding=padding,
+                    groups=dim,
+                )
+                mixed_qkv = F.silu(conv_out[..., :total_len]).squeeze(0).transpose(0, 1)[:seq_len]
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    layer.conv_weights,
+                    layer.bias,
+                    activation=layer.activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
 
         query, key, value = torch.split(
             mixed_qkv,
