@@ -72,10 +72,7 @@ def _resolve_default_warmup_resolution(
     warmup used to shrink this to an area cap (``SERVER_WARMUP_IMAGE_MAX_AREA``,
     768x768) to bound startup, but that left a residual first-request
     cold-start when the real request is larger (e.g. 1024x1024 paid ~0.1s of
-    first-shape kernel autotuning, measured on H100). Warm images at the model
-    default instead. Video keeps the area/frame caps (a full-resolution video
-    warmup is far more expensive), and area-capped representative selection
-    remains the fallback when no default width/height is exposed.
+    first-shape kernel autotuning, measured on H100).
     """
     width = sampling_defaults.width
     height = sampling_defaults.height
