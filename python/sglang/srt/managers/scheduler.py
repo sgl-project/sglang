@@ -266,6 +266,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
@@ -2971,6 +2972,10 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        if self.tp_worker.model_runner.prefill_aware_swa:
+            for req in can_run_list:
+                req.swa_evict_floor = req.fill_len
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
@@ -3752,7 +3757,7 @@ class Scheduler(
         # This field is not serializable.
         ret.pop("model_config", None)
 
-        return GetInternalStateReqOutput(internal_state=ret)
+        return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -3801,7 +3806,7 @@ class Scheduler(
         server_args.pop("model_config", None)
         return SetInternalStateReqOutput(
             updated=if_success,
-            server_args=server_args,
+            server_args=msgspec_to_builtins(server_args),
         )
 
     def save_remote_model(self, **kwargs):

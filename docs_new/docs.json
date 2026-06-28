@@ -202,6 +202,10 @@
       "destination": "/docs/advanced_features/vlm_query"
     },
     {
+      "source": "/basic_usage/unlimited_ocr.html",
+      "destination": "/cookbook/autoregressive/Baidu/Unlimited-OCR"
+    },
+    {
       "source": "/basic_usage/deepseek_ocr.html",
       "destination": "/cookbook/autoregressive/DeepSeek/DeepSeek-OCR"
     },
@@ -809,7 +813,8 @@
                 "group": "Development",
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
-                  "docs/developer_guide/development_jit_kernel_guide"
+                  "docs/developer_guide/development_jit_kernel_guide",
+                  "docs/developer_guide/quantization_contribution_guide"
                 ]
               },
               {
@@ -1058,6 +1063,12 @@
                     ]
                   },
                   {
+                    "group": "Baidu",
+                    "pages": [
+                      "cookbook/autoregressive/Baidu/Unlimited-OCR"
+                    ]
+                  },
+                  {
                     "group": "Ernie",
                     "pages": [
                       "cookbook/autoregressive/Ernie/Ernie4.5",
@@ -1179,6 +1190,13 @@
                     "group": "LTX",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3"
+                    ]
+                  },
+                  {
+                    "group": "JoyEcho",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
                   },
                   {
