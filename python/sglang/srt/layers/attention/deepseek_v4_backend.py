@@ -76,6 +76,8 @@ SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
+_DSPARK_BLOCK_FULL_ATTN = 0
+
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
@@ -1692,6 +1694,19 @@ class DeepseekV4AttnBackend(
 
         raw_positions = seq_lens_casual - 1
         swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+
+        block_full = _DSPARK_BLOCK_FULL_ATTN
+        n_qo = seq_lens_casual.size(0)
+        if block_full and n_qo % block_full == 0:
+            bs_blk = n_qo // block_full
+            last_row = (
+                torch.arange(
+                    bs_blk, device=seq_lens_casual.device, dtype=torch.long
+                ).repeat_interleave(block_full)
+                + 1
+            ) * block_full - 1
+            swa_page_indices = swa_page_indices[last_row]
+            swa_topk_lengths = swa_topk_lengths[last_row]
 
         page_table = req_to_token[
             req_pool_indices_repeated, : max_seq_len : self.page_size

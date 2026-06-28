@@ -407,6 +407,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -919,6 +920,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dspark()
                 else max_num_tokens
             )
             bs = self._pad_to_bucket(int(max_batch_size), self.capture_bs)
@@ -1100,6 +1102,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if self.model_runner.is_draft_worker
                     else CaptureHiddenMode.FULL
                 ),
+            )
+
+        elif self.model_runner.spec_algorithm.is_dspark():
+            from sglang.srt.speculative.dspark_info import DSparkVerifyInput
+
+            spec_info = DSparkVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

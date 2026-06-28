@@ -108,3 +108,8 @@ class DeepSeekV4Config(PretrainedConfig):
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: List[int] = field(default_factory=list)
+    dspark_markov_rank: int = 0
