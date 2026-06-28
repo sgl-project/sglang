@@ -1328,7 +1328,7 @@ mod tests {
                 .lines()
                 .any(|l| l.starts_with("sgl_router_worker_requests_total")
                     && l.contains(r#"outcome="error""#)),
-            "a pre-routing 400 must be counted in requests_total{{outcome=error}}; got:\n{metrics}"
+            "a pre-routing 400 must be counted in worker_requests_total{{outcome=error}}; got:\n{metrics}"
         );
     }
 }

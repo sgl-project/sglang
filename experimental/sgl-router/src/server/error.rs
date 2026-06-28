@@ -225,6 +225,31 @@ impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         self.class().status()
     }
+
+    /// The worker's *own* status to echo in `x-router-upstream-status`, for the
+    /// case where the router synthesized its own status over a worker that did
+    /// respond. Today only the mid-body-drop (`UpstreamStatus`) carries one. This
+    /// is an exhaustive, wildcard-free match (not an `if let` at the call site) so
+    /// a future "synthesized over a responding worker" variant is forced to decide
+    /// whether it echoes a status, rather than silently inheriting `None`.
+    fn upstream_status(&self) -> Option<StatusCode> {
+        match self {
+            ApiError::UpstreamStatus { status } => Some(*status),
+            ApiError::BadRequest(_)
+            | ApiError::ModelNotFound(_)
+            | ApiError::UpstreamUnreachable { .. }
+            | ApiError::UpstreamTimeout { .. }
+            | ApiError::NoHealthyWorkers { .. }
+            | ApiError::NoPrefillWorkersAvailable { .. }
+            | ApiError::NoDecodeWorkersAvailable { .. }
+            | ApiError::StaleRequestExpired { .. }
+            | ApiError::PolicySelectionFailed { .. }
+            | ApiError::BreakerOpen { .. }
+            | ApiError::WorkerMisconfigured { .. }
+            | ApiError::ServiceOverloaded { .. }
+            | ApiError::Internal(_) => None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -335,10 +360,10 @@ impl IntoResponse for ApiError {
             .into_response();
         resp.headers_mut()
             .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
-        // Preserve the worker's real status when we synthesized our own. Only
-        // the mid-body-drop case has one: the worker sent a status, then dropped
-        // the body, so we report a 502 but don't throw away what it said.
-        if let ApiError::UpstreamStatus { status: upstream } = &self {
+        // Preserve the worker's real status when we synthesized our own (today,
+        // only the mid-body-drop case: the worker sent a status, then dropped the
+        // body, so we report a 502 but don't throw away what it said).
+        if let Some(upstream) = self.upstream_status() {
             resp.headers_mut().insert(
                 X_ROUTER_UPSTREAM_STATUS,
                 HeaderValue::from(upstream.as_u16()),

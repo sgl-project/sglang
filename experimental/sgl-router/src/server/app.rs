@@ -44,6 +44,27 @@ fn is_infra_path(path: &str) -> bool {
     matches!(path, "/healthz" | "/readyz" | "/metrics")
 }
 
+/// Collapse an HTTP method to a bounded allow-list for use as a metric label.
+/// `http::Method` accepts any RFC-7230 extension token, and this middleware runs
+/// before axum's method-router rejects an unknown verb with 405 — so the raw
+/// method on `requests_total` / `responses_total` would be attacker-influenced
+/// unbounded-cardinality input. Unknown verbs collapse to `other`.
+fn normalize_method(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::TRACE => "TRACE",
+        Method::CONNECT => "CONNECT",
+        _ => "other",
+    }
+}
+
 /// Outermost middleware: the single edge-counting + access-log site.
 ///
 /// Runs for EVERY request — all routes, plus responses produced before any
@@ -74,13 +95,18 @@ async fn access_log_and_record(
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    // Matched route template (e.g. `/v1/chat/completions`), not the raw URI, so
-    // `requests_total` / `responses_total` stay low-cardinality; `unmatched` for a 404.
+    // Metric labels must stay low-cardinality. `route` is the matched route
+    // template (`/v1/chat/completions`, …), not the raw URI — `unmatched` for a
+    // 404. `method` is collapsed to a known-verb allow-list (`normalize_method`):
+    // an arbitrary RFC-7230 extension token reaches this middleware before axum's
+    // method-router returns 405, so the raw method is untrusted unbounded input.
+    // The access log below keeps the real method.
     let route = req
         .extensions()
         .get::<MatchedPath>()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".to_owned());
+    let method_label = normalize_method(&method);
     let request_id = req
         .headers()
         .get("x-request-id")
@@ -91,7 +117,7 @@ async fn access_log_and_record(
 
     // ENTRY: true intake — counted before the handler can park/shed/drop it, so
     // a never-answered request still shows up (intake - responses = the gap).
-    metrics.record_ingress(&route, method.as_str());
+    metrics.record_ingress(&route, method_label);
 
     let resp = next.run(req).await;
 
@@ -99,7 +125,7 @@ async fn access_log_and_record(
     let latency_ms = start.elapsed().as_millis() as u64;
     // Edge responses count ALL routes (incl. infra) so the intake/response
     // population matches; filter infra by `route` in PromQL.
-    metrics.record_response(&route, method.as_str(), status.as_u16());
+    metrics.record_response(&route, method_label, status.as_u16());
 
     if is_infra_path(&path) {
         tracing::debug!(
@@ -289,6 +315,22 @@ mod tests {
         assert!(
             !m.contains(r#"sgl_router_responses_total{route="/v1/chat/completions""#),
             "a never-answered request must NOT appear in responses_total; got:\n{m}",
+        );
+    }
+
+    /// Metric labels must stay bounded: standard verbs pass through, but an
+    /// arbitrary RFC-7230 extension token (which reaches this middleware before
+    /// axum's 405) collapses to `other` so it can't explode label cardinality.
+    #[test]
+    fn normalize_method_collapses_unknown_verbs() {
+        use axum::http::Method;
+        assert_eq!(normalize_method(&Method::GET), "GET");
+        assert_eq!(normalize_method(&Method::POST), "POST");
+        let exotic = Method::from_bytes(b"BREW").unwrap();
+        assert_eq!(
+            normalize_method(&exotic),
+            "other",
+            "an unknown verb must collapse to `other`, not mint a new label series",
         );
     }
 }

@@ -641,7 +641,7 @@ impl MetricsRegistry {
         }
         drop(guard);
 
-        // requests_total
+        // worker_requests_total
         out.push_str(
             "# HELP sgl_router_worker_requests_total Total chat-completions requests dispatched to a worker.\n",
         );
@@ -1229,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn record_request_emits_labelled_counter_line() {
+    fn record_worker_request_emits_labelled_counter_line() {
         let reg = MetricsRegistry::new();
         reg.record_worker_request(
             "http://worker-a:30000",

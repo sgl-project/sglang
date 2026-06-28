@@ -1468,7 +1468,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
             r#"sgl_router_worker_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="cancelled"}}"#,
             worker.url
         )),
-        "stale 504 must be counted in requests_total as outcome=cancelled: {m}",
+        "stale 504 must be counted in worker_requests_total as outcome=cancelled: {m}",
     );
 }
 
@@ -1689,7 +1689,7 @@ async fn admission_shed_503_is_counted_in_responses_total() {
             .any(|l| l.starts_with("sgl_router_worker_requests_total{")
                 && l.contains(r#"worker_url="""#)
                 && l.contains(r#"outcome="error""#)),
-        "shed must be counted in requests_total with empty worker_url + outcome=error: {m}",
+        "shed must be counted in worker_requests_total with empty worker_url + outcome=error: {m}",
     );
 
     // Drain A to release resources cleanly.
@@ -1753,13 +1753,15 @@ async fn success_200_counted_once_per_request_in_responses_total() {
     );
 }
 
-/// Infra paths (`/healthz`, `/readyz`, `/metrics`) are health/scrape probes, not
-/// API traffic: the middleware counts them in `responses_total{status_code}` (so
-/// a failing probe stays observable) but deliberately skips `requests_total` —
+/// Infra paths (`/healthz`, `/readyz`, `/metrics`) are health/scrape probes. The
+/// middleware counts them in the edge counters `requests_total{route,method}` and
+/// `responses_total{route,method,status_code}` (so a failing probe stays
+/// observable), but deliberately skips the per-worker `worker_requests_total` —
 /// otherwise probe successes would swamp the by-outcome view. A `/healthz` 200
-/// must therefore appear in `responses_total` yet leave `requests_total` empty.
+/// must therefore appear in the edge counters yet leave `worker_requests_total`
+/// empty.
 #[tokio::test]
-async fn infra_path_counted_in_responses_total_but_not_requests_total() {
+async fn infra_path_counted_in_edge_counters_but_not_worker_requests_total() {
     let ctx = build_ctx_with_worker("http://placeholder:0");
 
     let req = Request::builder()
@@ -1772,20 +1774,52 @@ async fn infra_path_counted_in_responses_total_but_not_requests_total() {
     let _ = res.into_body().collect().await.unwrap();
 
     let m = ctx.metrics.render();
-    // Counted in responses_total — a failing probe must stay observable there.
+    // Counted in the edge counters — a probe must stay observable there.
+    assert!(
+        m.contains(r#"sgl_router_requests_total{route="/healthz",method="GET"} 1"#),
+        "infra intake must be counted in requests_total: {m}",
+    );
     assert!(
         m.contains(
             r#"sgl_router_responses_total{route="/healthz",method="GET",status_code="200"} 1"#
         ),
         "infra 200 must be counted in responses_total: {m}",
     );
-    // ...but NOT in requests_total: when the only traffic is an infra probe, no
-    // request series may exist (the `# TYPE` line starts with `#`, not the metric
-    // name, so it is not matched here).
+    // ...but NOT in the per-worker counter: probe successes must not swamp the
+    // by-outcome view (the `# TYPE` line starts with `#`, not the metric name, so
+    // it is not matched here).
     assert!(
         !m.lines()
             .any(|l| l.starts_with("sgl_router_worker_requests_total{")),
-        "infra path must NOT be counted in requests_total: {m}",
+        "infra path must NOT be counted in worker_requests_total: {m}",
+    );
+}
+
+/// A request to a path the router does not serve (a true 404) collapses to the
+/// `route="unmatched"` label — NOT the raw URI — so scanner / fuzzer traffic
+/// can't explode the metric label cardinality. It is still counted at the edge.
+#[tokio::test]
+async fn unrouted_path_collapses_to_unmatched_label() {
+    let ctx = build_ctx_with_worker("http://placeholder:0");
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/no/such/route")
+        .body(Body::empty())
+        .unwrap();
+    let res = build_router(ctx.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let _ = res.into_body().collect().await.unwrap();
+
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(r#"sgl_router_requests_total{route="unmatched",method="GET"} 1"#),
+        "an unrouted path must collapse to route=\"unmatched\": {m}",
+    );
+    // The raw URI must never become a metric label (cardinality safety).
+    assert!(
+        !m.contains("/no/such/route"),
+        "raw unrouted URI must not appear as a label: {m}",
     );
 }
 
