@@ -1182,8 +1182,13 @@ class TestDoubleSparsityRequestSummary(unittest.TestCase):
                 {"sparsity_rate": 0.5, "selected_tokens": 8, "dense_fallback": 1},
             ],
         }
-        # Verify the field exists on BatchTokenIDOutput (dataclass attribute).
-        fields = {f.name for f in BatchTokenIDOutput.__dataclass_fields__.values()}
+        # Verify the field exists on BatchTokenIDOutput (msgspec.Struct upstream,
+        # dataclass on older bases — accept either).
+        fields = (
+            set(BatchTokenIDOutput.__struct_fields__)
+            if hasattr(BatchTokenIDOutput, "__struct_fields__")
+            else {f.name for f in BatchTokenIDOutput.__dataclass_fields__.values()}
+        )
         self.assertIn(
             "per_request_summary",
             fields,

@@ -8,8 +8,12 @@ import torch
 
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
+    get_minimax_sparse_attention_config,
+    get_minimax_sparse_disable_value_layer_ids,
+    get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import (
     get_world_group,
@@ -24,7 +28,10 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import (
+    PureSWATokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -34,6 +41,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NoOpMHATokenToKVPool,
@@ -404,6 +412,8 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    enable_linear_replayssm=self.server_args.enable_linear_replayssm,
+                    linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
@@ -731,6 +741,33 @@ class ModelRunnerKVCacheMixin:
                     ),
                     **kwargs,
                 )
+            elif is_minimax_sparse(self.model_config.hf_config):
+                _hf_config = self.model_config.hf_config
+                sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
+                dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(
+                    sparse_cfg
+                )
+                disable_value_sparse_layer_ids = (
+                    get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
+                )
+                self.token_to_kv_pool = MiniMaxSparseKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    index_dtype=self.dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    idx_head_dim=sparse_cfg["sparse_index_dim"],
+                    dense_layer_ids=dense_layer_ids,
+                    sparse_layer_ids=sparse_layer_ids,
+                    disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
             elif config := self.mambaish_config:
                 extra_args = {}
                 if self.use_mla_backend:
@@ -866,7 +903,16 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
             else:
-                if self.is_hybrid_swa:
+                if self.is_hybrid_swa and self.full_max_total_num_tokens == 0:
+                    self.token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
+                        self.swa_max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                elif self.is_hybrid_swa:
                     self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,

@@ -281,7 +281,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
@@ -915,12 +917,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
-                return forward(
+                out = forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     **kwargs,
                 )
+                dflash_sampler = getattr(
+                    self.model_runner, "dflash_draft_sampler", None
+                )
+                if dflash_sampler is not None:
+                    # Must be captured here, or replay leaves a stale output buffer
+                    # the worker would read as valid tokens -- fail loudly instead.
+                    if (
+                        not isinstance(out, LogitsProcessorOutput)
+                        or out.hidden_states is None
+                    ):
+                        raise RuntimeError(
+                            "DFLASH draft sampler set but the draft forward has no "
+                            "hidden_states to capture into the graph."
+                        )
+                    dflash_sampler(out.hidden_states)
+                return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
             canary_ctx = (
