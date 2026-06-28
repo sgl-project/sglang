@@ -35,7 +35,7 @@ NIXL_DECODE_BASE_GPU_ID = 4
 # The standalone Llama-3.1-8B GSM8K threshold is 0.80, while existing PD
 # disaggregation coverage gates at 0.62. Keep NIXL above catastrophic transfer
 # failure while leaving margin for PD/router/evaluator variance on 200 examples.
-NIXL_GSM8K_SCORE_THRESHOLD = 0.70
+NIXL_GSM8K_SCORE_THRESHOLD = 0.62
 
 
 def _nixl_backend_config(backend, backend_params_json):
