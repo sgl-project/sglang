@@ -1191,10 +1191,16 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         # On SM100+ with a bf16 state pool, recover via the FlashInfer MTP kernel
         # (PR #3502). Otherwise fall back to the Triton recurrence kernel.
+        # SGLANG_GDN_FI_RECOVERY=0 forces the Triton recover kernel even on the
+        # FlashInfer decode path — the hybrid (FI WY verify + Triton recovery)
+        # that keeps the WY output-only verify win without the slower FI recovery.
+        from sglang.srt.environ import envs
+
         dispatcher = getattr(self.linear_attn_backend, "kernel_dispatcher", None)
         decode_kernel = getattr(dispatcher, "decode_kernel", None)
         use_fi_recovery = (
-            decode_kernel is not None
+            envs.SGLANG_GDN_FI_RECOVERY.get()
+            and decode_kernel is not None
             and decode_kernel.__class__.__name__ == "FlashInferGDNKernel"
             and getattr(decode_kernel, "use_state_pool", False)
         )

@@ -430,6 +430,16 @@ class Envs:
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
 
+    # GDN MTP (gated delta net, speculative verify + state recovery)
+    # Route the gdn_mtp_cache_mode=none output-only verify to the PR#3720 WY
+    # kernel (faster output-only path). False forces the bf16 state kernel.
+    SGLANG_GDN_WY_VERIFY = EnvBool(True)
+    # Use the FlashInfer MTP kernel for accepted-state recovery when the decode
+    # kernel is FlashInferGDNKernel on a bf16 state pool. False forces the Triton
+    # recurrence recover kernel — the hybrid (FI WY verify + Triton recovery)
+    # that avoids the slower FlashInfer recovery path.
+    SGLANG_GDN_FI_RECOVERY = EnvBool(True)
+
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)

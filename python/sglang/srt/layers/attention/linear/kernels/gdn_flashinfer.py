@@ -27,6 +27,7 @@ _flashinfer_gdn_available: Optional[bool] = None
 _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
+_WYDBG = {"n": 0}  # (local debug) WY-vs-state verify comparison counter
 
 
 def _get_flashinfer_gdn_kernels():
@@ -297,9 +298,25 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                     "FlashInfer GDN MTP kernel requires a, b, A_log, dt_bias."
                 )
 
-            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-                gated_delta_rule_mtp as gated_delta_rule_mtp_bf16_state,
+            # cache_mode=none: the verify is purely output-only -> use the faster
+            # PR#3720 WY output-only kernel. full keeps the state kernel.
+            # SGLANG_GDN_WY_VERIFY=0 forces the state kernel even for none
+            # (used to capture the pre-WY baseline trace). Default: WY on for none.
+            from sglang.srt.environ import envs
+            from sglang.srt.server_args import get_global_server_args
+
+            _use_wy = (
+                get_global_server_args().gdn_mtp_cache_mode == "none"
+                and envs.SGLANG_GDN_WY_VERIFY.get()
             )
+            if _use_wy:
+                from flashinfer.gdn_kernels import (
+                    gated_delta_rule_mtp_wy_output_only as gated_delta_rule_mtp_bf16_state,
+                )
+            else:
+                from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                    gated_delta_rule_mtp as gated_delta_rule_mtp_bf16_state,
+                )
 
             seq_len = q.shape[1]
             batch_size = query_start_loc.shape[0] - 1
@@ -314,6 +331,43 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             value_mtp = v.view(batch_size, draft_token_num, num_v_heads, head_v_dim)
             a_mtp = a.view(batch_size, draft_token_num, num_v_heads)
             b_mtp = b.view(batch_size, draft_token_num, num_v_heads)
+
+            # (local debug) compare WY vs state on the REAL verify inputs + save them.
+            if os.environ.get("SGLANG_GDN_WY_DEBUG", "0") != "0" and _WYDBG["n"] < 6:
+                import sys
+
+                from flashinfer.gdn_kernels import (
+                    gated_delta_rule_mtp_wy_output_only as _wyk,
+                )
+                from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                    gated_delta_rule_mtp as _stk,
+                )
+
+                _ckw = dict(
+                    A_log=A_log.detach().float(), a=a_mtp, dt_bias=dt_bias.detach(),
+                    q=query_mtp, k=key_mtp, v=value_mtp, b=b_mtp,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices[:batch_size],
+                    disable_state_update=True, use_qk_l2norm_in_kernel=True,
+                    scale=None, output=None,
+                )
+                _ost = _stk(output_state_indices=None, intermediate_states_buffer=None, **_ckw).float()
+                _owy = _wyk(**_ckw).float()
+                _d = (_owy - _ost).abs()
+                print(
+                    f"[WYDBG {_WYDBG['n']}] B={batch_size} T={draft_token_num} H={num_heads} HV={num_v_heads} "
+                    f"max|wy-st|={_d.max().item():.4e} mean={_d.mean().item():.4e} "
+                    f"st_norm={_ost.norm().item():.3e} wy_norm={_owy.norm().item():.3e} "
+                    f"qstride={tuple(query_mtp.stride())} qcontig={query_mtp.is_contiguous()} "
+                    f"idx0={int(cache_indices[0])} h0norm={ssm_states.float().norm().item():.3e}",
+                    file=sys.stderr, flush=True,
+                )
+                if _WYDBG["n"] == 0:
+                    torch.save(
+                        {kk: (vv.detach().cpu() if torch.is_tensor(vv) else vv) for kk, vv in _ckw.items()},
+                        "/scratch/fsw/portfolios/coreai/projects/coreai_comparch_infarch/users/ameyn/bench_gdn_recovery_397b/results/wy_real_inputs.pt",
+                    )
+                _WYDBG["n"] += 1
 
             # bf16 kernel expects: q/k/v/a/b bf16, A_log/dt_bias float32,
             # initial_state_source bf16 pool [pool_size, HV, V, K]. Input prep
@@ -335,7 +389,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 scale=None,
                 output=None,
             )
-            return output_fi.view(1, seq_len, num_v_heads, head_v_dim)
+            # reshape (not view): the WY output-only kernel returns a non-contiguous
+            # layout that .view() rejects; reshape is a safe superset.
+            return output_fi.reshape(1, seq_len, num_v_heads, head_v_dim)
 
         # SM90: MTP verify using FlashInfer gated_delta_rule_mtp kernel.
         if retrieve_parent_token is not None:
