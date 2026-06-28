@@ -416,10 +416,13 @@ def load_model_from_full_model_state_dict(
     param_dict = dict(model.named_parameters())
 
     # map names from checkpoint to customized names
-    custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
-        full_sd_iterator,
-        param_names_mapping,
-        valid_target_names=set(meta_sd.keys()),
+    custom_param_sd, reverse_param_names_mapping, checkpoint_name_resolver = (
+        hf_to_custom_state_dict(
+            full_sd_iterator,
+            param_names_mapping,
+            valid_target_names=set(meta_sd.keys()),
+            return_resolver=True,
+        )
     )  # type: ignore
 
     is_fsdp_model = isinstance(model, FSDPModule) or any(
@@ -597,6 +600,9 @@ def load_model_from_full_model_state_dict(
             )
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
+    model.checkpoint_source_param_shards_by_target = dict(
+        checkpoint_name_resolver.source_param_shards_by_target
+    )
 
     if non_quantized_dtype_mismatch_counts:
         logger.debug(
