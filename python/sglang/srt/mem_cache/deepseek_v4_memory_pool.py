@@ -946,34 +946,24 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.online_c128_mtp_pending_seq_lens is not None
         return self.online_c128_mtp_pending_seq_lens
 
-    def clear_c128_req_states(self, req_pool_indices: List[int]) -> None:
-        """Reset request-scoped C128 states for newly allocated req slots."""
-        if not req_pool_indices:
-            return
-
+    def clear_c128_req_state(self, req_pool_idx: int) -> None:
+        """Reset request-scoped C128 state for one req slot."""
         for pool in self.compress_state_pools:
             if pool is None or pool.ratio != 128:
                 continue
 
             state = pool.kv_score_buffer.kv_score
-            req_indices = torch.tensor(
-                req_pool_indices, dtype=torch.long, device=state.device
-            )
             if ONLINE_C128:
-                head_dim = state.shape[-1] // 3
-                state[req_indices, :head_dim] = float("-inf")
-                state[req_indices, head_dim:] = 0
+                row = state[req_pool_idx]
+                head_dim = row.shape[-1] // 3
+                row[:head_dim].fill_(float("-inf"))
+                row[head_dim:].zero_()
             else:
-                offsets = torch.arange(pool.ring_size, device=state.device)
-                row_indices = (
-                    req_indices[:, None] * pool.ring_size + offsets[None, :]
-                ).reshape(-1)
-                half = state.shape[-1] // 2
-                state[row_indices, :half] = 0
-                state[row_indices, half:] = float("-inf")
-
-    def clear_c128_req_state(self, req_pool_idx: int) -> None:
-        self.clear_c128_req_states([req_pool_idx])
+                start = req_pool_idx * pool.ring_size
+                rows = state[start : start + pool.ring_size]
+                half = rows.shape[-1] // 2
+                rows[:, :half].zero_()
+                rows[:, half:].fill_(float("-inf"))
 
     def clear_unaccepted_c128_draft_states(
         self,
