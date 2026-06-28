@@ -726,6 +726,8 @@ class ServerArgs(DisaggServerArgsMixin):
             if mode_explicit or not legacy_explicit:
                 self.warmup = self.warmup_mode != "off"
                 self.server_warmup = self.warmup_mode == "server"
+            elif self.warmup:
+                self.server_warmup = self.server_warmup or self.warmup_mode == "server"
 
         # Explicit resolutions imply warmup is on (request-based).
         if self.warmup_resolutions is not None:
