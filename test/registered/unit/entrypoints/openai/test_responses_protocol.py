@@ -122,6 +122,28 @@ class ResponsesSamplingParamsTestCase(unittest.TestCase):
         )
         self.assertEqual(params["structural_tag"], '{"type": "structural_tag"}')
 
+    def test_none_default_and_no_max_output_leaves_max_new_tokens_none(self):
+        # With neither a default budget nor max_output_tokens, max_new_tokens
+        # stays None so the scheduler clamps against the real input length
+        # (mirrors Chat Completions). See issue #29287.
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        params = request.to_sampling_params(default_max_tokens=None)
+        self.assertIsNone(params["max_new_tokens"])
+
+    def test_none_default_with_max_output_tokens_honored(self):
+        request = ResponsesRequest(
+            model="x", input="hi", store=False, max_output_tokens=100
+        )
+        params = request.to_sampling_params(default_max_tokens=None)
+        # 100 minus the 2-token BOS/EOS headroom.
+        self.assertEqual(params["max_new_tokens"], 98)
+
+    def test_default_budget_still_caps_when_provided(self):
+        # Backwards compatible: an explicit default budget still applies.
+        request = ResponsesRequest(model="x", input="hi", store=False)
+        params = request.to_sampling_params(default_max_tokens=128)
+        self.assertEqual(params["max_new_tokens"], 126)
+
 
 class ResponsesResponseFromRequestTestCase(unittest.TestCase):
     def test_parallel_tool_calls_false_preserved(self):
