@@ -68,6 +68,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -2009,6 +2010,20 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         del self.k_scale_buffer
         del self.v_scale_buffer
 
+    supports_fp4_decode_attention = True
+
+    def get_key_fp4_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_value_fp4_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_key_scale_buffer(self, layer_id: int):
+        return self.k_scale_buffer[layer_id - self.start_layer]
+
+    def get_value_scale_buffer(self, layer_id: int):
+        return self.v_scale_buffer[layer_id - self.start_layer]
+
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
@@ -2139,7 +2154,9 @@ class HybridLinearKVPool(KVCache):
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-            TokenToKVPoolClass = MHATokenToKVPool
+            TokenToKVPoolClass = (
+                MHATokenToKVPoolFP4 if is_float4_e2m1fn_x2(dtype) else MHATokenToKVPool
+            )
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
@@ -2228,6 +2245,33 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    def _full_pool_supports_fp4_decode_attention(self):
+        return getattr(self.full_kv_pool, "supports_fp4_decode_attention", False)
+
+    @property
+    def supports_fp4_decode_attention(self):
+        return self._full_pool_supports_fp4_decode_attention()
+
+    def get_key_fp4_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_key_fp4_buffer(layer_id)
+
+    def get_value_fp4_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_value_fp4_buffer(layer_id)
+
+    def get_key_scale_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_key_scale_buffer(layer_id)
+
+    def get_value_scale_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_value_scale_buffer(layer_id)
+
     def get_key_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
@@ -2307,6 +2351,10 @@ class HybridLinearKVPool(KVCache):
             self.mamba_pool.load_cpu_copy(mamba_cpu, mamba_indices)
 
     def get_v_head_dim(self):
+        if hasattr(self.full_kv_pool, "v_head_dim"):
+            return self.full_kv_pool.v_head_dim
+        if hasattr(self.full_kv_pool, "kv_lora_rank"):
+            return self.full_kv_pool.kv_lora_rank
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
 
     def set_mla_kv_buffer(
