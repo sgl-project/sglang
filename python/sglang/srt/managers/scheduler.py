@@ -1110,7 +1110,7 @@ class Scheduler(
         )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool, _ = kv_cache_builder.get_draft_kv_pool(
+        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
