@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -22,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPOutputDtype,
     get_deepep_output_dtype,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -45,6 +49,15 @@ except ImportError:
     use_deepep_v2 = False
 
 logger = logging.getLogger(__name__)
+
+
+def _should_record_stat_approx() -> bool:
+    try:
+        return (
+            get_global_server_args().expert_distribution_recorder_mode == "stat_approx"
+        )
+    except ValueError:
+        return False
 
 
 class DeepEPV2Buffer:
@@ -243,6 +256,14 @@ class DeepEPV2Dispatcher(BaseDispatcher):
             recv_x, recv_x_scale = recv_x
         else:
             recv_x_scale = None
+
+        if _should_record_stat_approx():
+            get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+                self.handle.num_recv_tokens_per_expert_list,
+                num_tokens_per_rank=None,
+                num_tokens_per_rdma_rank=None,
+                num_tokens_per_expert=None,
+            )
 
         return DeepEPNormalDispatchOutput(
             recv_x,
