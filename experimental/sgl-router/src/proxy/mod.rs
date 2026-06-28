@@ -259,10 +259,16 @@ impl Proxy {
         req = req
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
-        let resp = req.send().await.map_err(|e| {
-            breaker.record_failure();
-            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
-        })?;
+        // Diagnostic: count time blocked in upstream send (connect + write body +
+        // await response headers). Scoped so it decrements the instant send
+        // resolves, whether it returns headers or errors.
+        let resp = {
+            let _send_phase = crate::diag::PhaseGuard::in_send();
+            req.send().await.map_err(|e| {
+                breaker.record_failure();
+                Self::classify_reqwest_error_for(worker_url.clone(), e, path)
+            })?
+        };
         let status = resp.status();
         let upstream_ct = resp
             .headers()
@@ -313,9 +319,17 @@ impl Proxy {
         } else {
             None
         };
+        // Diagnostic: count this stream as an active SSE pump for its whole
+        // lifetime by packing a pump-phase guard into the stream guards (created
+        // post-headers, dropped when the pump task ends).
+        let pump_phase = crate::diag::PhaseGuard::pump();
+        let guards: Option<Box<dyn Send + 'static>> = match stream_guards {
+            Some(g) => Some(Box::new((g, pump_phase))),
+            None => Some(Box::new(pump_phase)),
+        };
         let body = sse::bytes_stream_to_body(
             sse::idle_timeout_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT),
-            stream_guards,
+            guards,
             on_complete,
             first_byte_hook,
         );

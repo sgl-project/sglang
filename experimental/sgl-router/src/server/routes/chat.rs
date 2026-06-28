@@ -236,6 +236,11 @@ async fn chat_completions_inner(
         .acquire(&workers, policy.as_ref(), &selection_ctx, &model_str)
         .await?;
     let at_post_admit = start.elapsed();
+    // Diagnostic: count this request as holding a slot inside the synchronous
+    // handler (post-acquire → response returned). Drops when the function
+    // returns (headers time for streaming), so HANDLER_INFLIGHT reflects slots
+    // stuck before the SSE pump takes over.
+    let _handler_phase = crate::diag::PhaseGuard::handler();
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -579,12 +584,17 @@ async fn chat_completions_inner(
     // is logged separately as `sse_pump_timing`.
     let at_post_dispatch = start.elapsed();
     if PHASE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PHASE_LOG_SAMPLE == 0 {
+        let (handler_inflight, in_send, pump_inflight) = crate::diag::snapshot();
         tracing::info!(
             tokenize_ms = at_post_tokenize.saturating_sub(at_pre_tokenize).as_millis() as u64,
             admit_ms = at_post_admit.saturating_sub(at_post_tokenize).as_millis() as u64,
             build_ms = at_post_build.saturating_sub(at_post_admit).as_millis() as u64,
             dispatch_to_headers_ms = at_post_dispatch.saturating_sub(at_post_build).as_millis() as u64,
             to_headers_total_ms = at_post_dispatch.as_millis() as u64,
+            // process-wide phase gauges: where do held admission slots sit?
+            g_handler_inflight = handler_inflight,
+            g_in_send = in_send,
+            g_pump_inflight = pump_inflight,
             streaming,
             worker = %metrics_worker_url,
             model = %metrics_model,
