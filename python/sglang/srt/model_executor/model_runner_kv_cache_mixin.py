@@ -1033,13 +1033,9 @@ class ModelRunnerKVCacheMixin:
     ) -> int:
         """Cap per-rank decode concurrency for the DeepEP low_latency path.
 
-        num_max (the dispatch cap, sized from this concurrency) must hold every
-        rank's decode batch or DeepEP asserts, yet the all-to-all buffer is
-        collective so all EP ranks must size it identically. Clamp to the
-        FINISHED_SUM_TAG bound, then take the EP-group minimum: the result is
-        uniform and <= every rank's own concurrency, so the buffer fits and no
-        rank overruns it. The cap also lets the post-KV auto-tune read the
-        already-synced request-pool size without its own reduction.
+        The all-to-all buffer is collective, so after bounding each rank by
+        FINISHED_SUM_TAG we take the EP-group MIN: the result is uniform and <=
+        every rank's concurrency, so the buffer fits and no rank overruns it.
         """
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
@@ -1048,9 +1044,8 @@ class ModelRunnerKVCacheMixin:
         if not self._is_deepep_low_latency():
             return max_num_reqs
 
-        # The per-rank dispatch is concurrency * num_tokens_per_bs (spec/MTP verify
-        # packs num_tokens_per_bs tokens per request); bound that product by
-        # FINISHED_SUM_TAG, so the concurrency ceiling shrinks by the spec multiplier.
+        # Each request dispatches num_tokens_per_bs tokens, so the concurrency
+        # ceiling shrinks by that multiplier.
         tokens_per_req = (
             self.server_args.max_speculative_num_draft_tokens
             or self.server_args.speculative_num_draft_tokens
@@ -1059,10 +1054,8 @@ class ModelRunnerKVCacheMixin:
         capped = min(
             max_num_reqs, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req
         )
-        # Also cap to the num_max the auto mem_fraction reserved the buffer for, so
-        # the runtime decode batch can never dispatch more tokens than that buffer
-        # holds (which would OOM at capture / overrun the buffer). num_max is a
-        # per-rank token cap; divide by tokens_per_req to get a request count.
+        # Also honor the num_max the auto mem_fraction reserved for, else the decode
+        # batch could dispatch past the buffer and OOM at capture.
         hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
         if hard is not None:
             capped = min(capped, max(1, hard // tokens_per_req))

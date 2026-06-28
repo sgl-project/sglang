@@ -71,10 +71,7 @@ def _deepep_runner(
     reserved_num_max=None,
     **extra,
 ):
-    # max_speculative_num_draft_tokens is a cached_property on the real ServerArgs:
-    # it returns the startup value for non-adaptive spec and a larger ceiling for
-    # adaptive spec. Default the mock to the startup value; max_draft_tokens models
-    # the adaptive case. reserved_num_max models the auto mem_fraction reservation
+    # max_draft_tokens models the adaptive-spec ceiling; reserved_num_max models the
     # ceiling published by ServerArgs._adjust_mem_fraction_for_deepep_capture.
     runner = SimpleNamespace(
         server_args=SimpleNamespace(

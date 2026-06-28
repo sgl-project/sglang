@@ -903,8 +903,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         because they capture their own decode-style graphs separately.
         """
 
-        # Pick the DeepEP low_latency dispatch cap before any DeepEP buffer is
-        # created or the capture list is built — both read the env downstream.
+        # Must precede any DeepEP buffer / capture-list build — both read the env.
         self._maybe_auto_tune_deepep_num_max_dispatch_tokens()
 
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
@@ -948,15 +947,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.canary_manager.mark_init_finished()
 
     def _maybe_auto_tune_deepep_num_max_dispatch_tokens(self):
-        """Size the DeepEP low_latency dispatch cap to the scheduler's decode concurrency.
-
-        num_max must cover the largest per-rank decode dispatch the scheduler can
-        run (req_to_token_pool.size * num_tokens_per_bs): nothing clamps the runtime
-        decode batch to num_max, so a smaller value lets an eager decode batch
-        dispatch more tokens than the buffer holds and trip a DeepEP assert. Capped
-        at DeepEP's FINISHED_SUM_TAG ceiling (1024). User env wins; only ever raised
-        above the default.
-        """
+        """Auto-size the DeepEP low_latency dispatch cap when the user didn't set it."""
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
         )
@@ -967,28 +958,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self._is_deepep_low_latency():
             return
 
-        # num_max is a per-rank token cap, not a request count: spec/MTP verify
-        # dispatches num_tokens_per_bs tokens per request, so size it to
-        # concurrency * num_tokens_per_bs. The concurrency cap divided by the same
-        # multiplier, so this stays within FINISHED_SUM_TAG.
+        # num_max is a per-rank token cap, not a request count: spec/MTP verify packs
+        # num_tokens_per_bs tokens per request, so size it by that multiplier.
         tokens_per_req = (
             self.server_args.max_speculative_num_draft_tokens
             or self.server_args.speculative_num_draft_tokens
             or 1
         )
-        # Cap at the num_max the auto mem_fraction actually reserved the buffer for
-        # (ServerArgs._adjust_mem_fraction_for_deepep_capture). Going above it would
-        # allocate a larger low_latency buffer than was reserved and OOM at capture.
+        # Honor the num_max the auto mem_fraction reserved the buffer for; a larger
+        # value would allocate a buffer beyond the reservation and OOM at capture.
         hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
         num_max = min(
             self.req_to_token_pool.size * tokens_per_req,
             DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
             hard if hard is not None else DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS,
         )
-        # With a reserved ceiling (hard), the buffer was sized for exactly that
-        # num_max, so the runtime must honor it even when it drops below the env
-        # default. Without one, keep the original "only raise above the default"
-        # behavior -- a larger default buffer is harmless when nothing reserved it.
+        # With a reserved ceiling, honor it even below the env default (the buffer was
+        # sized for it); without one, only raise above the default.
         should_write = num_max > env.get() or (
             hard is not None and num_max != env.get()
         )
@@ -1003,10 +989,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._warn_on_deepep_buffer_size_drift(env.get())
 
     def _warn_on_deepep_buffer_size_drift(self, num_max: int):
-        """Cross-check the pure-Python low_latency buffer-size replica (used by the
-        auto mem_fraction reservation in ServerArgs) against DeepEP's native hint.
-        Loud warn on drift so an upstream config.hpp change is caught instead of
-        silently mis-reserving the buffer.
+        """Warn if the pure-Python buffer-size replica drifts from DeepEP's native
+        hint, so an upstream config.hpp change is caught not silently mis-reserved.
         """
         try:
             from deep_ep import Buffer
@@ -2713,9 +2697,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._validate_deepep_capture_reservation(after_mem)
 
     def _validate_deepep_capture_reservation(self, after_mem_gb: float):
-        """Post-capture check that the auto mem_fraction left enough headroom for
-        the DeepEP low_latency path. ERROR (not raise) so the diagnostic surfaces
-        without killing a serve that may still run.
+        """Warn if the auto mem_fraction left too little post-capture headroom for
+        DeepEP. ERROR (not raise) so the diagnostic surfaces without killing the serve.
         """
         if not self._is_deepep_low_latency():
             return

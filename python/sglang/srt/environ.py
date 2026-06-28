@@ -611,18 +611,14 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False) # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
-    # Auto-reserve the DeepEP low_latency RDMA buffer + decode cuda-graph capture
-    # footprint in the auto mem_fraction so deepep+DP serves without hand-tuning
-    # --mem-fraction-static / --cuda-graph-max-bs / --max-running-requests.
+    # Auto-reserve the DeepEP low_latency buffer + capture footprint in the auto
+    # mem_fraction so deepep+DP serves without hand-set mem/concurrency flags.
     SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE = EnvBool(True)
-    # Multiplier on the grouped-GEMM size (num_experts * moe_intermediate * hidden)
-    # used to estimate the decode capture + deep_gemm warmup footprint. Calibrated
-    # on GB300: ~32 GiB for DeepSeek-V4-class, ~12 GiB for GLM-5.2-class.
+    # Multiplier on grouped-GEMM size (num_experts * moe_intermediate * hidden) for
+    # the capture estimate. Calibrated GB300: ~32 GiB DeepSeek-V4, ~12 GiB GLM-5.2.
     SGLANG_DEEPEP_CAPTURE_COEF = EnvFloat(4.0)
-    # Cap on the total auto mem reservation (fraction of GPU memory) so a large
-    # capture estimate can't squeeze out model weights on long-context / spec
-    # configs. The reservation already credits the chunked over-reservation slack,
-    # so the net change never lifts mem_fraction above the un-divided baseline.
+    # Cap on the auto reservation; bounded so it never lifts mem_fraction above the
+    # un-divided baseline (the reservation credits the chunked over-reservation slack).
     SGLANG_DEEPEP_MAX_RESERVE_FRACTION = EnvFloat(0.12)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the

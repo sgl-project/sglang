@@ -2665,8 +2665,7 @@ class ServerArgs:
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
-        # After the deepep auto-flip is final, reserve its buffer + capture in the
-        # auto mem_fraction so deepep+DP serves without hand-set memory flags.
+        # After _handle_a2a_moe so the deepep auto-flip is final.
         self._adjust_mem_fraction_for_deepep_capture()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
@@ -3438,20 +3437,15 @@ class ServerArgs:
                 if gpu_mem is not None
                 else 0.88
             )
-            # Remember the auto inputs so _adjust_mem_fraction_for_deepep_capture
-            # (run after the deepep auto-flip is known) can reserve the deepep
-            # buffer + capture footprint this crude reserved_mem under-counts.
-            # Left unset on the user-set / unknown-capacity path, which no-ops it.
+            # Stash the auto inputs for _adjust_mem_fraction_for_deepep_capture;
+            # left unset on the user-set / unknown-capacity path, which no-ops it.
             if gpu_mem is not None:
                 self._auto_mem_fraction_gpu_mib = gpu_mem
                 self._auto_mem_fraction_reserved_mib = reserved_mem
-                # reserved_mem above counts the un-divided chunked_prefill_size, but
-                # under DP attention _handle_data_parallelism divides it by dp_size,
-                # so each rank only uses a per-rank slice. The over-reserved slack is
-                # headroom the deepep buffer/capture reservation can draw from instead
-                # of double-counting (which would push mem_fraction below the weights
-                # for large chunked sizes). Only EP MoE (deepep) actually shrinks the
-                # per-rank batch; TP MoE all-gathers the global batch so keeps no slack.
+                # reserved_mem counts the un-divided chunked_prefill_size, but DP
+                # attention divides it per-rank, so the over-reservation is slack the
+                # deepep reservation draws from instead of double-counting. Only EP MoE
+                # shrinks the per-rank batch; TP MoE all-gathers, so keeps no slack.
                 self._auto_mem_chunked_slack_mib = 0.0
                 if (
                     self.chunked_prefill_size > 0
@@ -3479,15 +3473,11 @@ class ServerArgs:
             )
 
     def _adjust_mem_fraction_for_deepep_capture(self):
-        """Reserve the DeepEP low_latency RDMA buffer + decode cuda-graph capture
-        footprint in the auto mem_fraction.
-
-        The low_latency buffer (nvshmem::alloc, outside the torch allocator, sized
-        by num_max) and the decode capture are allocated after the KV pool, so the
-        crude reserved_mem heuristic under-counts them and deepep+DP serving OOMs
-        at capture unless --mem-fraction-static / --cuda-graph-max-bs are hand-set.
-        Runs after _handle_a2a_moe so the deepep auto-flip is final; only shrinks
-        the auto value and no-ops for a user-set mem_fraction.
+        """Reserve the DeepEP low_latency buffer + decode capture in the auto
+        mem_fraction. Both are allocated after the KV pool (the buffer via
+        nvshmem, outside the torch allocator), so the reserved_mem heuristic
+        under-counts them and deepep+DP OOMs at capture without hand-set flags.
+        Only shrinks the auto value; no-ops for a user-set mem_fraction.
         """
         if not envs.SGLANG_ENABLE_DEEPEP_AUTO_MEM_RESERVE.get():
             return
@@ -3522,14 +3512,9 @@ class ServerArgs:
             estimate_low_latency_rdma_size_bytes,
         )
 
-        # Decode capture + deep_gemm grouped-GEMM warmup footprint. This is driven
-        # by the grouped-GEMM size (num_experts * moe_intermediate * hidden), NOT
-        # num_layers * hidden: a deep small-MoE model (GLM-5.2: 78 layers, 256x2048)
-        # needs far less capture headroom than a shallow large-MoE one (DeepSeek-V4:
-        # 61 layers, 384x3072), and a layer-based estimate inverts that ordering.
-        # The coefficient folds in fp8 A/B staging + bf16 output across the warmup
-        # kernels (compile_utils.get_memory_requirement); the warmup peak is
-        # ~max_bs-independent because expert-weight staging dominates.
+        # Capture + deep_gemm warmup footprint is driven by the grouped-GEMM size
+        # (num_experts * moe_intermediate * hidden), NOT num_layers * hidden — a
+        # layer-based estimate inverts the GLM-5.2 vs DeepSeek-V4 ordering.
         moe_intermediate = (
             getattr(hf_config, "moe_intermediate_size", None)
             or getattr(hf_config, "intermediate_size", None)
@@ -3538,17 +3523,12 @@ class ServerArgs:
         coef = envs.SGLANG_DEEPEP_CAPTURE_COEF.get()
         capture_mib = coef * num_experts * moe_intermediate * hidden / (1024**2)
 
-        # Credit the chunked over-reservation already baked into the auto
-        # mem_fraction (see _auto_mem_chunked_slack_mib): the un-divided
-        # chunked_prefill_size reserved upstream is slack the runtime never uses
-        # under deepep+DP, so only reserve the shortfall beyond it. This keeps the
-        # net adjustment a *reduction* of mem_fraction (never above the un-divided
-        # baseline that main ships), so we cannot OOM a config that main passed,
-        # while still topping up where buffer + capture exceed that slack.
+        # Credit the chunked over-reservation already baked into mem_fraction (slack
+        # the runtime never uses under deepep+DP) so the net change stays a reduction
+        # — never above main's un-divided baseline, so we can't OOM a config main passed.
         slack_mib = getattr(self, "_auto_mem_chunked_slack_mib", 0.0)
         max_reserve_mib = envs.SGLANG_DEEPEP_MAX_RESERVE_FRACTION.get() * gpu_mem
-        # deep_gemm runs a transient grouped-GEMM warmup right after capture; keep a
-        # little headroom beyond buffer+capture so it can't tip capture into OOM.
+        # Headroom for the transient deep_gemm warmup that runs right after capture.
         safety_mib = 2 * 1024
 
         spec_mult = (
@@ -3563,14 +3543,11 @@ class ServerArgs:
         else:
             user_cap = DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS
 
-        # Pick the largest num_max whose buffer + capture reservation still fits under
-        # the cap. A short-context / high-concurrency config (e.g. V3.2 TBO) would
-        # otherwise size num_max at the 1024 ceiling, whose ~14 GiB nvshmem buffer is
-        # clamped by the cap and starves capture; tiering down keeps the reservation
-        # un-clamped so the full buffer+capture headroom is honored. The post-KV
-        # auto-tune and concurrency clamp shrink runtime dispatch to this ceiling, so a
-        # smaller num_max only trims decode batch (never correctness), and on
-        # wide-memory cards the loop selects the 1024 ceiling unchanged.
+        # Largest num_max whose buffer + capture still fits under the cap. Pinning a
+        # tight, high-concurrency config (V3.2 TBO) at the 1024 ceiling lets the cap
+        # clamp its ~14 GiB buffer and starve capture; tiering down keeps the
+        # reservation un-clamped. Wide-memory cards still select 1024. Safe because
+        # the runtime clamps decode dispatch to this ceiling (only trims batch).
         num_max_upper = min(user_cap, 128)
         for candidate in (1024, 512, 256, 128):
             if candidate > user_cap:
@@ -3583,11 +3560,8 @@ class ServerArgs:
                 num_max_upper = candidate
                 break
 
-        # Publish the num_max we reserved the buffer for as a hard ceiling the
-        # post-KV num_max auto-tune (model_runner) and the decode-concurrency clamp
-        # must honor. Otherwise a short-context / high-concurrency config can
-        # auto-tune num_max above what this buffer reservation covers and OOM at
-        # capture (the reservation is sized for THIS num_max, not the runtime one).
+        # Publish as the hard ceiling the post-KV auto-tune + concurrency clamp honor,
+        # so the runtime can't size num_max past what this reservation covers.
         self._deepep_reserved_num_max = num_max_upper
         deepep_mib = estimate_low_latency_rdma_size_bytes(
             num_max_upper, hidden, num_experts

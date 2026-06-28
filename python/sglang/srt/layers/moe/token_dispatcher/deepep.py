@@ -67,20 +67,15 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
-# DeepEP low_latency dispatch asserts once a rank's token count reaches the
-# FINISHED_SUM_TAG sentinel; bounds num_max and the decode concurrency feeding it.
+# DeepEP's FINISHED_SUM_TAG: low_latency dispatch asserts at this token count.
 DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS = 1024
 
 
 def estimate_low_latency_rdma_size_bytes(
     num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
 ) -> int:
-    """Pure-Python replica of DeepEP's C++ LowLatencyLayout.total_bytes.
-
-    Lets the auto mem_fraction heuristic size the low_latency RDMA buffer before
-    deep_ep is importable (ServerArgs runs pre-load). num_ranks is passed to the
-    C++ ctor but never referenced in total_bytes, so it is omitted here. Validated
-    against the native Buffer.get_low_latency_rdma_size_hint at runtime.
+    """Replica of DeepEP's C++ LowLatencyLayout.total_bytes, for the auto
+    mem_fraction heuristic to size the buffer before deep_ep is importable.
     """
     num_scales = hidden // 128
     bytes_per_dispatch = 16 + max(hidden * 2, hidden + num_scales * 4)
@@ -382,8 +377,7 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        # Resolved lazily: model_runner may auto-tune the env after construction
-        # but before the first forward.
+        # Resolved lazily: model_runner may auto-tune the env before first forward.
         self._num_max_dispatch_tokens_per_rank: Optional[int] = None
 
         self.handle = None
