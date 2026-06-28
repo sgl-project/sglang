@@ -5,7 +5,7 @@ Usage:
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs, prepare_server_args
@@ -26,15 +26,15 @@ _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
 
 
-class TestKeepAliveDefault(unittest.TestCase):
-    def test_env_default_is_65s(self):
+class TestHttpTuningConfig(unittest.TestCase):
+    # Defaults, CLI parsing, and CLI-vs-env resolution for the new tunables.
+
+    def test_env_keep_alive_default_is_65s(self):
         # 65s aligns with Go net/http (90s), reqwest (90s), Node (60s)
         # client pool defaults. Old 5s default tripped pool-reuse races.
         self.assertEqual(envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(), 65)
 
-
-class TestHttpTuningDefaults(unittest.TestCase):
-    def test_defaults_are_unset(self):
+    def test_dataclass_defaults_are_unset(self):
         # None == "use server default" for everything except backlog (2048
         # matches uvicorn/Granian's own default and is explicit to make the
         # value discoverable without reading uvicorn source).
@@ -46,9 +46,7 @@ class TestHttpTuningDefaults(unittest.TestCase):
         self.assertIsNone(args.http2_max_concurrent_streams)
         self.assertIsNone(args.http2_max_frame_size)
 
-
-class TestHttpTuningCliFlags(unittest.TestCase):
-    def test_all_flags_parse(self):
+    def test_all_cli_flags_parse(self):
         args = prepare_server_args(
             [
                 "--model-path",
@@ -74,40 +72,30 @@ class TestHttpTuningCliFlags(unittest.TestCase):
         self.assertEqual(args.http2_max_concurrent_streams, 256)
         self.assertEqual(args.http2_max_frame_size, 65536)
 
+    def test_keep_alive_cli_overrides_env(self):
+        from sglang.srt.utils.http_server_tuning import resolved_keep_alive_timeout
 
-class TestKeepAliveResolution(unittest.TestCase):
-    # The CLI flag overrides the env var; the env var is the fallback when
-    # the CLI flag isn't set. The resolution logic lives in
-    # _setup_and_run_http_server; we exercise it directly here so changes
-    # don't silently regress.
-
-    @staticmethod
-    def _resolve(server_args):
-        if server_args.timeout_keep_alive is not None:
-            return server_args.timeout_keep_alive
-        return envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
-
-    def test_cli_flag_wins(self):
+        # CLI value wins regardless of env var.
         args = ServerArgs(model_path="dummy", timeout_keep_alive=999)
-        self.assertEqual(self._resolve(args), 999)
+        self.assertEqual(resolved_keep_alive_timeout(args), 999)
 
-    def test_env_var_used_when_cli_unset(self):
+        # CLI unset → env var (which has its own default).
         args = ServerArgs(model_path="dummy")
-        self.assertEqual(self._resolve(args), envs.SGLANG_TIMEOUT_KEEP_ALIVE.get())
+        self.assertEqual(
+            resolved_keep_alive_timeout(args), envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
+        )
 
 
 class TestUvicornWiring(unittest.TestCase):
-    # Verify the uvicorn-side tuning kwargs flow through to uvicorn.run.
-    # Granian-side wiring is covered by TestGranianHttp2Settings below.
-    # _run_setup mocks uvicorn.run + skips _execute_server_warmup so we
-    # can inspect the kwargs without actually starting a server.
+    # Verify the tuning kwargs actually flow into uvicorn.run. Without
+    # this, the resolution helpers could be subtly wrong (e.g. assembling
+    # kwargs that uvicorn doesn't accept) and no test would catch it
+    # until a real server startup.
 
     @staticmethod
     def _run_setup(server_args, mock_uvicorn_run):
         from sglang.srt.entrypoints.http_server import _setup_and_run_http_server
 
-        # _setup_and_run_http_server tries to set up logging + middleware
-        # before calling uvicorn. Stub out the pieces we don't care about.
         with patch("uvicorn.run", mock_uvicorn_run), patch(
             "sglang.srt.entrypoints.http_server.set_global_state"
         ), patch(
@@ -130,23 +118,20 @@ class TestUvicornWiring(unittest.TestCase):
                 pass
 
     def test_default_no_flags_set(self):
-        from unittest.mock import MagicMock
-
         args = ServerArgs(model_path="dummy")
         mock = MagicMock()
         self._run_setup(args, mock)
         self.assertTrue(mock.called)
         kwargs = mock.call_args.kwargs
-        # Default behavior: keep-alive from env (65 with new default),
-        # backlog=2048, no limit_concurrency or timeout_graceful_shutdown.
+        # keep-alive comes from env (65 by default), backlog from the
+        # dataclass default (2048), no limit_concurrency or
+        # timeout_graceful_shutdown unless the operator set them.
         self.assertEqual(kwargs["timeout_keep_alive"], 65)
         self.assertEqual(kwargs["backlog"], 2048)
         self.assertNotIn("limit_concurrency", kwargs)
         self.assertNotIn("timeout_graceful_shutdown", kwargs)
 
     def test_all_uvicorn_flags_threaded_through(self):
-        from unittest.mock import MagicMock
-
         args = ServerArgs(
             model_path="dummy",
             timeout_keep_alive=120,
@@ -166,9 +151,8 @@ class TestUvicornWiring(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
 class TestGranianHttp2Settings(unittest.TestCase):
-    # Regression guard: Granian's HTTP/2 tunables go through
-    # http2_settings=HTTP2Settings(...), NOT as flat top-level kwargs.
-    # Force the multi-worker path (tokenizer_worker_num=2) so we hit
+    # Granian's HTTP/2 tunables go through http2_settings=HTTP2Settings(...),
+    # NOT as flat top-level kwargs. Force the multi-worker path so we hit
     # granian.Granian (mockable) rather than the embedded server.
 
     def test_passes_http2_settings_when_tunables_set(self):
@@ -182,8 +166,10 @@ class TestGranianHttp2Settings(unittest.TestCase):
                 port=30000,
                 log_level="info",
                 tokenizer_worker_num=2,
-                http2_max_concurrent_streams=256,
-                http2_max_frame_size=65536,
+                http2_settings_kwargs={
+                    "max_concurrent_streams": 256,
+                    "max_frame_size": 65536,
+                },
             )
 
         kwargs = MockGranian.call_args.kwargs

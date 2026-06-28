@@ -168,6 +168,11 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.http_server_tuning import (
+    granian_http2_settings_kwargs,
+    resolved_keep_alive_timeout,
+    uvicorn_tuning_kwargs,
+)
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -2193,8 +2198,7 @@ def _run_granian_server(
     ssl_verify=False,  # MTls is not supported
     backlog=2048,
     backpressure=2048,
-    http2_max_concurrent_streams=None,
-    http2_max_frame_size=None,
+    http2_settings_kwargs=None,
 ):
     """Serve the in-process ASGI app with Granian (embedded mode) over HTTP/2.
 
@@ -2233,12 +2237,8 @@ def _run_granian_server(
         backpressure=backpressure,
     )
     # HTTP/2-specific tunables go through Granian's HTTP2Settings, not as
-    # top-level kwargs. Only attach when the operator set at least one.
-    http2_settings_kwargs = {}
-    if http2_max_concurrent_streams is not None:
-        http2_settings_kwargs["max_concurrent_streams"] = http2_max_concurrent_streams
-    if http2_max_frame_size is not None:
-        http2_settings_kwargs["max_frame_size"] = http2_max_frame_size
+    # top-level kwargs. The kwargs dict is built by the caller; we
+    # construct HTTP2Settings here so the granian import stays lazy.
     if http2_settings_kwargs:
         granian_kwargs["http2_settings"] = HTTP2Settings(**http2_settings_kwargs)
 
@@ -2335,21 +2335,8 @@ def _setup_and_run_http_server(
             port_args, server_args, scheduler_infos[0]
         )
 
-    # CLI flag overrides the env var; env var falls back to its default.
-    keep_alive_timeout = (
-        server_args.timeout_keep_alive
-        if server_args.timeout_keep_alive is not None
-        else envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
-    )
-    # Uvicorn-only tuning knobs. Pass through only when the operator set
-    # them, so we don't pin uvicorn's defaults from our side.
-    uvicorn_tuning_kwargs = {"backlog": server_args.http_backlog}
-    if server_args.http_limit_concurrency is not None:
-        uvicorn_tuning_kwargs["limit_concurrency"] = server_args.http_limit_concurrency
-    if server_args.http_timeout_graceful_shutdown is not None:
-        uvicorn_tuning_kwargs["timeout_graceful_shutdown"] = (
-            server_args.http_timeout_graceful_shutdown
-        )
+    keep_alive_timeout = resolved_keep_alive_timeout(server_args)
+    uvicorn_kwargs = uvicorn_tuning_kwargs(server_args)
 
     try:
         # Update logging configs
@@ -2378,8 +2365,7 @@ def _setup_and_run_http_server(
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                     ssl_verify=False,  # No MTLS supported for now.
                     backlog=server_args.http_backlog,
-                    http2_max_concurrent_streams=server_args.http2_max_concurrent_streams,
-                    http2_max_frame_size=server_args.http2_max_frame_size,
+                    http2_settings_kwargs=granian_http2_settings_kwargs(server_args),
                 )
             elif server_args.enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
@@ -2395,7 +2381,7 @@ def _setup_and_run_http_server(
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
-                    **uvicorn_tuning_kwargs,
+                    **uvicorn_kwargs,
                 )
                 config.load()  # Creates the SSLContext
 
@@ -2433,7 +2419,7 @@ def _setup_and_run_http_server(
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
-                    **uvicorn_tuning_kwargs,
+                    **uvicorn_kwargs,
                 )
         else:
             # Multiple tokenizer and http processes
@@ -2467,8 +2453,7 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                     backlog=server_args.http_backlog,
-                    http2_max_concurrent_streams=server_args.http2_max_concurrent_streams,
-                    http2_max_frame_size=server_args.http2_max_frame_size,
+                    http2_settings_kwargs=granian_http2_settings_kwargs(server_args),
                 )
             else:
                 uvicorn.run(
@@ -2485,7 +2470,7 @@ def _setup_and_run_http_server(
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
-                    **uvicorn_tuning_kwargs,
+                    **uvicorn_kwargs,
                 )
     finally:
         if server_args.tokenizer_worker_num > 1:
