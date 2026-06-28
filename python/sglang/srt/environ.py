@@ -766,7 +766,13 @@ class Envs:
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 
     # HTTP Server
-    SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    # 65s aligns with Go net/http (90s), reqwest (90s), and Node (60s) client
+    # pool defaults plus a small safety margin. The prior 5s default tripped
+    # pool-reuse races: clients with 60–90s idle keep-alive would race
+    # server-initiated FINs on every reused connection, costing one
+    # RTT + TLS handshake per "lost race". httpx (5s) is the only common
+    # client matching the old default.
+    SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(65)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)

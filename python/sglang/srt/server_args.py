@@ -542,6 +542,36 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
+    # HTTP server tuning
+    # -------------------------------------------------------------------------
+    # Operator-facing knobs for uvicorn / Granian that are otherwise hidden
+    # behind the embedded server defaults. None means "use server default".
+    timeout_keep_alive: A[
+        Optional[int],
+        "Override SGLANG_TIMEOUT_KEEP_ALIVE for the public HTTP listener (seconds). Default is the env var (65s).",
+    ] = None
+    http_backlog: A[
+        int,
+        "TCP listen-queue depth for the public HTTP listener. At high RPS bursts the kernel accept queue overflows and clients see connect-refused; raise this for sustained >5k RPS.",
+    ] = 2048
+    http_limit_concurrency: A[
+        Optional[int],
+        "(uvicorn only) Max concurrent ASGI handlers. Unbounded by default. Set when fronting an embedding endpoint or any path that allows large client-controlled concurrency, to bound memory pressure.",
+    ] = None
+    http_timeout_graceful_shutdown: A[
+        Optional[int],
+        "(uvicorn only) Drain time on SIGTERM in seconds. None = abrupt drop of in-flight requests. Set this for LLM workloads with long-running streaming responses so connections drain rather than die.",
+    ] = None
+    http2_max_concurrent_streams: A[
+        Optional[int],
+        "(Granian only, --enable-http2) Cap on concurrent HTTP/2 streams per connection. None = Granian default (~100). Raise for clients that multiplex aggressively.",
+    ] = None
+    http2_max_frame_size: A[
+        Optional[int],
+        "(Granian only, --enable-http2) HTTP/2 frame size in bytes. None = Granian default. Larger frames reduce overhead for chunky JSON request/response bodies.",
+    ] = None
+
+    # -------------------------------------------------------------------------
     # SSL/TLS
     # -------------------------------------------------------------------------
     ssl_keyfile: A[Optional[str], "The file path to the SSL key file."] = None
