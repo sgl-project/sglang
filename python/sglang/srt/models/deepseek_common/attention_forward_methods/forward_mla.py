@@ -73,6 +73,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_TRTLLM_STYLE_DSA_MLA_BACKENDS = {"trtllm"}
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -958,12 +959,14 @@ class DeepseekMLAForwardMixin:
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
         """
-        Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
+        Check if we should skip rope and do fused rope+quantize for TRTLLM-style MLA decode in fp8_e4m3 path.
         """
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_global_server_args().dsa_decode_backend == "trtllm"
-                or get_global_server_args().dsa_prefill_backend == "trtllm"
+                get_global_server_args().dsa_decode_backend
+                in _TRTLLM_STYLE_DSA_MLA_BACKENDS
+                or get_global_server_args().dsa_prefill_backend
+                in _TRTLLM_STYLE_DSA_MLA_BACKENDS
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (

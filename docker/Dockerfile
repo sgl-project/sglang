@@ -251,6 +251,54 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
 
+# Optional source override for DeepGEMM changes that are not available in a
+# released sgl-deep-gemm wheel yet. Pass DEEPGEMM_SOURCE_REF as an immutable
+# commit hash for reproducible builds. Defaults stay empty, so official builds
+# keep using the pinned package version from python/pyproject.toml.
+ARG DEEPGEMM_SOURCE_REPO
+ARG DEEPGEMM_SOURCE_REF
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${DEEPGEMM_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/deepgemm_src && \
+        git clone --recursive "${DEEPGEMM_SOURCE_REPO}" /tmp/deepgemm_src && \
+        cd /tmp/deepgemm_src && \
+        if [ -n "${DEEPGEMM_SOURCE_REF}" ]; then \
+            git checkout --detach "${DEEPGEMM_SOURCE_REF}"; \
+        fi && \
+        echo "Using DeepGEMM source commit $(git rev-parse HEAD)" && \
+        git submodule update --init --recursive && \
+        DG_FORCE_BUILD=1 python3 -m pip install --no-build-isolation --no-deps --force-reinstall -v . && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/deepgemm_src; \
+    fi
+
+# Optional source override for FlashInfer changes that are not available in a
+# released flashinfer-python wheel yet. Pass FLASHINFER_SOURCE_REF as an
+# immutable commit hash for reproducible builds. Defaults stay empty, so
+# official builds keep using the pinned package versions from
+# python/pyproject.toml.
+ARG FLASHINFER_SOURCE_REPO
+ARG FLASHINFER_SOURCE_REF
+ARG FLASHINFER_CUDA_ARCH_LIST
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${FLASHINFER_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/flashinfer_src && \
+        git clone --recursive "${FLASHINFER_SOURCE_REPO}" /tmp/flashinfer_src && \
+        cd /tmp/flashinfer_src && \
+        if [ -n "${FLASHINFER_SOURCE_REF}" ]; then \
+            git checkout --detach "${FLASHINFER_SOURCE_REF}"; \
+        fi && \
+        echo "Using FlashInfer source commit $(git rev-parse HEAD)" && \
+        git submodule update --init --recursive && \
+        python3 -m pip install --upgrade "setuptools>=77,<82" build && \
+        export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-12.0f}" && \
+        python3 -m pip install --no-build-isolation --no-deps --force-reinstall -v ".[cu13]" && \
+        python3 -m pip install --no-build-isolation --no-deps --force-reinstall -v ./flashinfer-cubin && \
+        python3 -m pip install --no-build-isolation --no-deps --force-reinstall -v ./flashinfer-jit-cache && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/flashinfer_src; \
+    fi
+
 ########################################################
 # PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
 ########################################################

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -75,6 +76,32 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+
+
+@lru_cache(maxsize=None)
+def _flashinfer_trtllm_mla_accepts_kwarg(name: str) -> bool:
+    import inspect
+
+    import flashinfer.decode
+
+    signature = inspect.signature(
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla
+    )
+    return name in signature.parameters
+
+
+def _normalize_flashinfer_sparse_mla_page_table(
+    page_table: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    block_tables_i32 = page_table.to(torch.int32)
+    seq_lens = (block_tables_i32 >= 0).sum(dim=-1).to(torch.int32)
+    block_tables = (
+        torch.clamp(block_tables_i32, min=0)
+        .contiguous()
+        .view(page_table.shape[0], 1, -1)
+    )
+    return block_tables, seq_lens
+
 
 if _is_hip:
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -296,7 +323,12 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashinfer_sparse_mla",
+    "fa3",
+    "tilelang",
+    "trtllm",
 ]
 
 
@@ -323,6 +355,13 @@ class DeepseekSparseAttnBackend(
         self.real_page_size = model_runner.page_size
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
+        )
+        architectures = getattr(
+            model_runner.model_config.hf_config, "architectures", []
+        )
+        model_arch = architectures[0] if architectures else None
+        self.flashinfer_sparse_mla_kv_scale_format = (
+            "arbitrary_fp32" if model_arch == "GlmMoeDsaForCausalLM" else "auto"
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
@@ -1574,7 +1613,7 @@ class DeepseekSparseAttnBackend(
             else self.dsa_prefill_impl
         )
 
-        if dsa_impl == "trtllm" and not self.use_mha:
+        if dsa_impl in ("trtllm", "flashinfer_sparse_mla") and not self.use_mha:
             return self._forward_trtllm(
                 q,
                 k,
@@ -1590,6 +1629,9 @@ class DeepseekSparseAttnBackend(
                 is_neox,
                 llama_4_scaling,
                 is_prefill=True,
+                flashinfer_backend=(
+                    "sparse" if dsa_impl == "flashinfer_sparse_mla" else "trtllm-gen"
+                ),
             )
 
         if k is not None:
@@ -1800,7 +1842,7 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
-        if self.dsa_decode_impl == "trtllm":
+        if self.dsa_decode_impl in ("trtllm", "flashinfer_sparse_mla"):
             return self._forward_trtllm(
                 q,
                 k,
@@ -1815,6 +1857,11 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                flashinfer_backend=(
+                    "sparse"
+                    if self.dsa_decode_impl == "flashinfer_sparse_mla"
+                    else "trtllm-gen"
+                ),
             )
 
         if k is not None:
@@ -2353,14 +2400,16 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         is_prefill: bool = False,
+        flashinfer_backend: str = "trtllm-gen",
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
 
         metadata = self.forward_metadata
+        use_flashinfer_sparse_mla = flashinfer_backend == "sparse"
 
         merge_query = q_rope is not None
-        if self.kv_cache_dtype == torch.float8_e4m3fn:
+        if self.kv_cache_dtype == torch.float8_e4m3fn and not use_flashinfer_sparse_mla:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
@@ -2437,10 +2486,44 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
-        q = q_all.view(batch_size, 1, num_heads, head_dim)
-        kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
-        block_tables = page_table_1.unsqueeze(1)
-        seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        extra_kwargs = {}
+        if use_flashinfer_sparse_mla:
+            if not _flashinfer_trtllm_mla_accepts_kwarg("kv_scale_format"):
+                raise RuntimeError(
+                    "flashinfer_sparse_mla requires FlashInfer sparse MLA SM120 "
+                    "support with the kv_scale_format argument. Install a "
+                    "FlashInfer build that includes flashinfer-ai/flashinfer#3395."
+                )
+            if q_all.dtype != torch.bfloat16:
+                raise ValueError(
+                    "flashinfer_sparse_mla requires BF16 query input for the "
+                    f"native SM120 sparse MLA kernel, got {q_all.dtype}."
+                )
+            if self.real_page_size != 64:
+                raise ValueError(
+                    "flashinfer_sparse_mla requires page_size=64 for the native "
+                    f"SM120 sparse MLA kernel, got {self.real_page_size}."
+                )
+            if self.kv_cache_dim != 656:
+                raise ValueError(
+                    "flashinfer_sparse_mla requires packed GLM/DSv3.2 FP8 KV "
+                    f"cache rows with 656 bytes per token, got {self.kv_cache_dim}."
+                )
+
+            q = q_all.view(batch_size, 1, num_heads, head_dim)
+            kv = kv_cache.view(torch.uint8).view(
+                -1, 1, self.real_page_size, self.kv_cache_dim
+            )
+            block_tables, seq_lens = _normalize_flashinfer_sparse_mla_page_table(
+                page_table_1
+            )
+            bmm1_scale = float(layer.scaling)
+            extra_kwargs["kv_scale_format"] = self.flashinfer_sparse_mla_kv_scale_format
+        else:
+            q = q_all.view(batch_size, 1, num_heads, head_dim)
+            kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+            block_tables = page_table_1.unsqueeze(1)
+            seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
@@ -2454,8 +2537,9 @@ class DeepseekSparseAttnBackend(
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.dsa_index_topk,
             bmm1_scale=bmm1_scale,
-            backend="trtllm-gen",
+            backend=flashinfer_backend,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            **extra_kwargs,
         )
 
         return out

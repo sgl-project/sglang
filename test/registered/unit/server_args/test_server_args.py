@@ -12,6 +12,7 @@ from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
+    Phase,
     PhaseConfig,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -165,6 +166,124 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
         self.assertEqual(server_args.dsa_decode_backend, "flashmla_kv")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_dsa_defaults_to_flashinfer_sparse_mla_on_sm120_fp8(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy")
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=12)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "flashinfer_sparse_mla")
+        self.assertEqual(server_args.dsa_decode_backend, "flashinfer_sparse_mla")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_dsa_sm120_fp8_preserves_user_backend(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            dsa_prefill_backend="flashmla_kv",
+        )
+
+        server_args._set_default_dsa_backends(kv_cache_dtype="fp8_e4m3", major=12)
+
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_kv")
+        self.assertEqual(server_args.dsa_decode_backend, "flashinfer_sparse_mla")
+
+    def test_glm_sm120_dsa_caps_default_decode_cuda_graph_memory(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args.cuda_graph_config.decode.max_bs = 512
+        server_args.cuda_graph_config.decode.bs = (
+            server_args._generate_decode_cuda_graph_batch_sizes(512)
+        )
+        server_args._cuda_graph_config_locked = set()
+        server_args._mem_fraction_static_user_set = False
+        server_args.mem_fraction_static = 0.839
+
+        server_args._apply_glm_dsa_sm120_cuda_graph_memory_defaults()
+
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(server_args.cuda_graph_config.decode.max_bs, 256)
+        self.assertEqual(max(server_args.cuda_graph_config.decode.bs), 256)
+        self.assertEqual(server_args.mem_fraction_static, 0.8)
+
+    def test_glm_sm120_dsa_preserves_explicit_decode_cuda_graph_backend(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args.cuda_graph_config.decode.backend = Backend.FULL
+        server_args.cuda_graph_config.decode.max_bs = 512
+        server_args.cuda_graph_config.decode.bs = (
+            server_args._generate_decode_cuda_graph_batch_sizes(512)
+        )
+        server_args._cuda_graph_config_locked = {(Phase.DECODE, "backend")}
+        server_args._mem_fraction_static_user_set = False
+        server_args.mem_fraction_static = 0.839
+
+        server_args._apply_glm_dsa_sm120_cuda_graph_memory_defaults()
+
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(server_args.cuda_graph_config.decode.max_bs, 256)
+        self.assertEqual(max(server_args.cuda_graph_config.decode.bs), 256)
+        self.assertEqual(server_args.mem_fraction_static, 0.8)
+
+    def test_glm_sm120_dsa_preserves_explicit_tc_piecewise_decode_backend(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args.cuda_graph_config.decode.backend = Backend.TC_PIECEWISE
+        server_args.cuda_graph_config.decode.max_bs = 512
+        server_args.cuda_graph_config.decode.bs = (
+            server_args._generate_decode_cuda_graph_batch_sizes(512)
+        )
+        server_args._cuda_graph_config_locked = {(Phase.DECODE, "backend")}
+        server_args._mem_fraction_static_user_set = False
+        server_args.mem_fraction_static = 0.839
+
+        server_args._apply_glm_dsa_sm120_cuda_graph_memory_defaults()
+
+        self.assertEqual(
+            server_args.cuda_graph_config.decode.backend, Backend.TC_PIECEWISE
+        )
+        self.assertEqual(server_args.cuda_graph_config.decode.max_bs, 256)
+        self.assertEqual(max(server_args.cuda_graph_config.decode.bs), 256)
+        self.assertEqual(server_args.mem_fraction_static, 0.8)
+
+    def test_glm_sm120_dsa_preserves_disabled_decode_cuda_graph(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args.cuda_graph_config.decode.backend = Backend.DISABLED
+        server_args.cuda_graph_config.decode.max_bs = 512
+        server_args.cuda_graph_config.decode.bs = (
+            server_args._generate_decode_cuda_graph_batch_sizes(512)
+        )
+        server_args._cuda_graph_config_locked = {(Phase.DECODE, "backend")}
+        server_args._mem_fraction_static_user_set = False
+        server_args.mem_fraction_static = 0.839
+
+        server_args._apply_glm_dsa_sm120_cuda_graph_memory_defaults()
+
+        self.assertEqual(
+            server_args.cuda_graph_config.decode.backend, Backend.DISABLED
+        )
+        self.assertEqual(server_args.cuda_graph_config.decode.max_bs, 512)
+        self.assertEqual(max(server_args.cuda_graph_config.decode.bs), 512)
+        self.assertEqual(server_args.mem_fraction_static, 0.839)
+
+    def test_glm_sm120_dsa_preserves_explicit_decode_cuda_graph(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args.cuda_graph_config.decode.max_bs = 512
+        server_args.cuda_graph_config.decode.bs = (
+            server_args._generate_decode_cuda_graph_batch_sizes(512)
+        )
+        server_args._cuda_graph_config_locked = {(Phase.DECODE, "max_bs")}
+        server_args._mem_fraction_static_user_set = False
+        server_args.mem_fraction_static = 0.839
+
+        server_args._apply_glm_dsa_sm120_cuda_graph_memory_defaults()
+
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(server_args.cuda_graph_config.decode.max_bs, 512)
+        self.assertEqual(max(server_args.cuda_graph_config.decode.bs), 512)
+        self.assertEqual(server_args.mem_fraction_static, 0.839)
 
     @patch("sglang.srt.server_args.is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):

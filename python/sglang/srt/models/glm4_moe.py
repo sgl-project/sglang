@@ -110,6 +110,18 @@ _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
 
+
+def _modelopt_fp4_excludes_shared_experts(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    if quant_config is None or quant_config.get_name() != "modelopt_fp4":
+        return False
+    return any(
+        "shared_experts" in pattern
+        for pattern in (getattr(quant_config, "exclude_modules", None) or [])
+    )
+
+
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
@@ -1215,6 +1227,11 @@ class Glm4MoeForCausalLM(nn.Module):
             disable_reason = "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif _modelopt_fp4_excludes_shared_experts(self.quant_config):
+            disable_reason = (
+                "GLM ModelOpt FP4 checkpoint excludes shared experts from "
+                "quantization, so they cannot be fused into routed FP4 expert slots."
+            )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -1476,6 +1493,19 @@ class Glm4MoeForCausalLM(nn.Module):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     def determine_num_fused_shared_experts(self):
+        if get_global_server_args().disable_shared_experts_fusion:
+            self.num_fused_shared_experts = 0
+            return
+        if _modelopt_fp4_excludes_shared_experts(self.quant_config):
+            get_global_server_args().disable_shared_experts_fusion = True
+            self.num_fused_shared_experts = 0
+            log_info_on_rank0(
+                logger,
+                "GLM ModelOpt FP4 checkpoint excludes shared experts from "
+                "quantization, so they cannot be fused into routed FP4 expert slots. "
+                "Shared experts fusion optimization is disabled.",
+            )
+            return
         super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
 
 

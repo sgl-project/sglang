@@ -177,11 +177,53 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
     return config.index_topk
 
 
+def _normalize_dsa_indexer_type(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip().lower()
+    if value in ("f", "full", "full_indexer", "full-indexer"):
+        return "F"
+    if value in (
+        "s",
+        "skip",
+        "shared",
+        "share",
+        "skip_topk",
+        "skip-topk",
+        "shared_indexer",
+        "shared-indexer",
+    ):
+        return "S"
+    return None
+
+
+def get_dsa_index_topk_pattern(config) -> Optional[str]:
+    """Return an explicit or checkpoint-derived DSA top-k sharing pattern.
+
+    GLM-5.2 checkpoints may ship ``index_topk_pattern: null`` while carrying
+    the same IndexShare layout in ``indexer_types``. Normalize that metadata so
+    all skip-topk consumers use the checkpoint's layer layout by default.
+    """
+    pattern = _hf_attr(config, "index_topk_pattern")
+    if pattern is not None:
+        return pattern
+
+    indexer_types = _hf_attr(config, "indexer_types")
+    if not indexer_types:
+        return None
+
+    normalized = [_normalize_dsa_indexer_type(value) for value in indexer_types]
+    if any(value is None for value in normalized):
+        return None
+    return "".join(normalized)
+
+
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
 
-    pattern = getattr(config, "index_topk_pattern", None)
+    pattern = get_dsa_index_topk_pattern(config)
     if pattern is not None:
         return layer_id < len(pattern) and pattern[layer_id] == "S"
 

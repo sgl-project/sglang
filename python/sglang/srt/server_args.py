@@ -297,6 +297,7 @@ DSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
@@ -2611,6 +2612,8 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
+        self._mem_fraction_static_user_set = self.mem_fraction_static is not None
+
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
@@ -3567,7 +3570,12 @@ class ServerArgs:
             self.dsa_prefill_backend = "tilelang"
             self.dsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            if major >= 10:
+            if major == 12:
+                if not user_set_prefill:
+                    self.dsa_prefill_backend = "flashinfer_sparse_mla"
+                if not user_set_decode:
+                    self.dsa_decode_backend = "flashinfer_sparse_mla"
+            elif major >= 10:
                 if not user_set_prefill:
                     self.dsa_prefill_backend = "trtllm"
                 if not user_set_decode:
@@ -3606,8 +3614,50 @@ class ServerArgs:
 
         validate_hisparse_kv_cache_dtype(self)
 
+    def _apply_glm_dsa_sm120_cuda_graph_memory_defaults(self):
+        user_set_decode_batch_sizes = (
+            Phase.DECODE,
+            "max_bs",
+        ) in self._cuda_graph_config_locked or (
+            Phase.DECODE,
+            "bs",
+        ) in self._cuda_graph_config_locked
+
+        if (
+            not user_set_decode_batch_sizes
+            and self.cuda_graph_config.decode.backend != Backend.DISABLED
+            and self.cuda_graph_config.decode.max_bs is not None
+            and self.cuda_graph_config.decode.max_bs > 256
+        ):
+            self.cuda_graph_config.decode.max_bs = 256
+            self.cuda_graph_config.decode.bs = (
+                self._generate_decode_cuda_graph_batch_sizes(256)
+            )
+            logger.warning(
+                "Setting decode CUDA graph max_bs to 256 for GLM DSA on SM120 "
+                "to leave enough memory for CUDA graph capture."
+            )
+
+        if (
+            not getattr(
+                self,
+                "_mem_fraction_static_user_set",
+                self.mem_fraction_static is not None,
+            )
+            and not user_set_decode_batch_sizes
+            and self.cuda_graph_config.decode.backend != Backend.DISABLED
+            and self.mem_fraction_static is not None
+            and self.mem_fraction_static > 0.8
+        ):
+            self.mem_fraction_static = 0.8
+            logger.warning(
+                "Capping auto mem_fraction_static at 0.8 for GLM DSA on SM120 "
+                "to leave enough memory for CUDA graph capture."
+            )
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
+            get_dsa_index_topk_pattern,
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_dsa,
         )
@@ -3667,7 +3717,7 @@ class ServerArgs:
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
                 index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+                index_topk_pattern = get_dsa_index_topk_pattern(hf_config)
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1
                     or (index_topk_pattern is not None and "S" in index_topk_pattern)
@@ -3749,6 +3799,8 @@ class ServerArgs:
                     major, _ = torch.cuda.get_device_capability()
                     self._set_default_dsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_dsa_backends(self.kv_cache_dtype, major)
+                    if model_arch == "GlmMoeDsaForCausalLM" and major == 12:
+                        self._apply_glm_dsa_sm120_cuda_graph_memory_defaults()
 
                 if self.enable_prefill_cp:
                     assert (
