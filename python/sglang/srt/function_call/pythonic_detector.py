@@ -214,6 +214,14 @@ class PythonicDetector(BaseFormatDetector):
             }
         elif isinstance(val, ast.List):
             return [self._get_parameter_value(v) for v in val.elts]
+        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, (ast.UAdd, ast.USub)):
+            operand = self._get_parameter_value(val.operand)
+            if isinstance(operand, bool):
+                raise ValueError("Tool call arguments must be literals")
+            try:
+                return +operand if isinstance(val.op, ast.UAdd) else -operand
+            except TypeError as exc:
+                raise ValueError("Tool call arguments must be literals") from exc
         else:
             raise ValueError("Tool call arguments must be literals")
 

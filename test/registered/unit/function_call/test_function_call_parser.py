@@ -260,6 +260,38 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(params2["query"], "test")
         self.assertEqual(params2["filters"], ["a", "b"])
 
+    def test_detect_and_parse_signed_numeric_arguments(self):
+        """Test parsing pythonic calls with signed numeric literals."""
+        text = (
+            "[get_weather(location='Oslo', temperature=-5, delta=+2), "
+            "search(query='coordinates', bounds=[-1.5, +2.25], "
+            "config={'offset': -3})]"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 2)
+
+        params1 = json.loads(result.calls[0].parameters)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(params1["location"], "Oslo")
+        self.assertEqual(params1["temperature"], -5)
+        self.assertEqual(params1["delta"], 2)
+
+        params2 = json.loads(result.calls[1].parameters)
+        self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual(params2["query"], "coordinates")
+        self.assertEqual(params2["bounds"], [-1.5, 2.25])
+        self.assertEqual(params2["config"]["offset"], -3)
+
+    def test_detect_and_parse_rejects_signed_boolean_arguments(self):
+        """Unary operators should not coerce booleans into integers."""
+        text = "[get_weather(location='Oslo', enabled=-True)]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.calls, [])
+
     def test_parse_streaming_partial_nested_brackets(self):
         """Test parsing partial tool calls with nested brackets across chunks."""
         # First chunk with nested brackets but incomplete
