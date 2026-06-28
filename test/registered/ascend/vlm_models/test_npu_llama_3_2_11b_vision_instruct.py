@@ -6,7 +6,7 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ascend.vlm_utils import TestVLMModels
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 
 class TestLlama3211BVisionInstruct(TestVLMModels):
@@ -19,6 +19,8 @@ class TestLlama3211BVisionInstruct(TestVLMModels):
     model = LLAMA_3_2_11B_VISION_INSTRUCT_WEIGHTS_PATH
     mmmu_accuracy = 0.2
     other_args = [
+        "--tp-size",
+        "2",
         "--trust-remote-code",
         "--mem-fraction-static",
         "0.8",
