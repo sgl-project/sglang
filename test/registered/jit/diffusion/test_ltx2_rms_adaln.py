@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -63,3 +65,7 @@ def test_ltx2_rms_adaln_fallback_for_unsupported_hidden_size():
     actual = ltx2._ltx2_rms_adaln(rms_norm, x, scale, shift, eps)
     expected = _reference(x, scale, shift, eps)
     torch.testing.assert_close(actual, expected, atol=0.125, rtol=0.05)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
