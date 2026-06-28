@@ -736,6 +736,8 @@ def generate_tree_mask_func(req_masks, tree_masks, batch, draft_token_num, outpu
         draft_token_num,
         output_ptr,
     )
+
+
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
