@@ -8,7 +8,6 @@ from PIL import Image, ImageDraw, ImageFont
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import TestOpenAIMLLMServerBase
 
-
 register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
 
 
