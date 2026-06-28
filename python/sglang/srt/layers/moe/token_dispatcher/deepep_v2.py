@@ -35,6 +35,7 @@ try:
         raise ImportError("DeepEP v2 ElasticBuffer is GPU-only")
 
     from deep_ep import ElasticBuffer
+
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
