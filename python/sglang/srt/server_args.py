@@ -6115,6 +6115,16 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
+        if self.enable_deepseek_v4_fp4_indexer and (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        ):
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer requires the DeepGEMM indexer "
+                "path and cannot be combined with FP8 TileLang, AITER, or torch "
+                "paged MQA logits fallback envs."
+            )
         # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
         if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
             if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():

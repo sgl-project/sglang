@@ -17,7 +17,10 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
-from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.dsv4.metadata import (
+    PagedIndexerMetadata,
+    use_deep_gemm_fp8_indexer,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
@@ -495,14 +498,38 @@ class C4IndexerBackendMixin:
         use_fp4_indexer = c4_indexer.use_fp4_indexer
         head_dim_with_sf = 68 if use_fp4_indexer else 132
 
+        query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
+        c4_seq_lens_unflattened = getattr(
+            indexer_metadata, "c4_seq_lens_unflattened", None
+        )
+        use_unflattened_deep_gemm_indexer = (
+            (use_fp4_indexer or use_deep_gemm_fp8_indexer())
+            and c4_seq_lens_unflattened is not None
+            and c4_seq_lens_unflattened.dim() == 2
+            and query_rows == c4_seq_lens_unflattened.numel()
+        )
+
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
             assert len(q_fp4.shape) == 3
             assert len(q_sf.shape) == 2
-            q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
+            if use_unflattened_deep_gemm_indexer:
+                batch_size, next_n = c4_seq_lens_unflattened.shape
+                q = (
+                    q_fp4.view(batch_size, next_n, q_fp4.shape[1], q_fp4.shape[2]),
+                    q_sf.view(batch_size, next_n, q_sf.shape[1]),
+                )
+            else:
+                q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
         else:
             assert len(q_indexer.shape) == 3
-            q = q_indexer.unsqueeze(1)
+            if use_unflattened_deep_gemm_indexer:
+                batch_size, next_n = c4_seq_lens_unflattened.shape
+                q = q_indexer.view(
+                    batch_size, next_n, q_indexer.shape[1], q_indexer.shape[2]
+                )
+            else:
+                q = q_indexer.unsqueeze(1)
 
         c4_indexer_kv_cache = c4_indexer_kv_cache.view(
             c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
@@ -528,8 +555,6 @@ class C4IndexerBackendMixin:
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
-        query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
-
         def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
             if tensor.shape[0] == query_rows:
                 return tensor
@@ -541,6 +566,19 @@ class C4IndexerBackendMixin:
         c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
+        logits_page_table = page_table
+        if use_unflattened_deep_gemm_indexer:
+            assert c4_seq_lens_unflattened is not None
+            next_n = c4_seq_lens_unflattened.shape[1]
+            _c4sl = c4_seq_lens_unflattened
+            page_table_unflattened = getattr(
+                indexer_metadata, "c4_page_table_unflattened", None
+            )
+            logits_page_table = (
+                page_table_unflattened
+                if page_table_unflattened is not None
+                else page_table[::next_n].contiguous()
+            )
         c4_sparse_page_indices = match_num_queries(
             core_metadata.c4_sparse_page_indices, value=-1
         )
@@ -550,12 +588,24 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
+        if use_unflattened_deep_gemm_indexer:
+            batch_size, next_n = _c4sl.shape
+            assert logits_page_table.shape[0] == batch_size
+            assert page_table.shape[0] == batch_size * next_n
+            assert weights.shape[0] == batch_size * next_n
+            if use_fp4_indexer:
+                assert isinstance(q, tuple)
+                assert q[0].shape[:2] == (batch_size, next_n)
+                assert q[1].shape[:2] == (batch_size, next_n)
+            else:
+                assert isinstance(q, torch.Tensor)
+                assert q.shape[:2] == (batch_size, next_n)
         logits = fn(
             q,
             c4_indexer_kv_cache,
             weights,
             _c4sl,
-            page_table,
+            logits_page_table,
             indexer_metadata.deep_gemm_metadata,
             indexer_metadata.max_c4_seq_len,
             False,
