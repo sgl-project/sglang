@@ -94,7 +94,10 @@ def prepare_fp8_dit_weights(
     # unchanged (see _unfuse_self_attn_qkv_for_cosmos).
     cpu_state = _unfuse_self_attn_qkv_for_cosmos(cpu_state)
     return prepare_cosmos_quantized_streaming_weights(
-        cpu_state, num_blocks=num_blocks, device=None, linear_policy=linear_policy,
+        cpu_state,
+        num_blocks=num_blocks,
+        device=None,
+        linear_policy=linear_policy,
     )
 
 
@@ -139,7 +142,9 @@ def dequantize_fp8_weights_to_bf16(
                 result[key] = dequant.contiguous()
                 dequant_count += 1
             else:
-                logger.warning("FP8 weight %s has no scale %s; skipping", key, scale_key)
+                logger.warning(
+                    "FP8 weight %s has no scale %s; skipping", key, scale_key
+                )
         elif key.endswith(".weight_prepared"):
             # bf16 transposed prepared weight — skip (model uses .weight layout)
             continue
@@ -160,6 +165,7 @@ def dequantize_fp8_weights_to_bf16(
         len(result),
     )
     return result
+
 
 # ============================================================================
 # FP8-compute linears (folded from omnidreams_fp8_compute.py)
@@ -218,7 +224,9 @@ def _scaled_mm_available() -> bool:
     return callable(fn)
 
 
-def _quantize_activation_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_activation_per_token(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-token (per-row) dynamic E4M3 activation quant.
 
     ``x`` is reshaped to ``[M, K]``; returns ``(x_fp8 [M,K] float8_e4m3fn,
@@ -313,15 +321,19 @@ class OmniDreamsFP8ComputeLinear(nn.Module):
 
     def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None = None) -> None:
         super().__init__()
-        self.weight = nn.Parameter(weight.detach().to(torch.bfloat16), requires_grad=False)
+        self.weight = nn.Parameter(
+            weight.detach().to(torch.bfloat16), requires_grad=False
+        )
         if bias is not None:
-            self.bias = nn.Parameter(bias.detach().to(torch.bfloat16), requires_grad=False)
+            self.bias = nn.Parameter(
+                bias.detach().to(torch.bfloat16), requires_grad=False
+            )
         else:
             self.bias = None
         self._fp8_compute_cache: tuple | None = None
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "OmniDreamsFP8ComputeLinear":
+    def from_linear(cls, linear: nn.Linear) -> OmniDreamsFP8ComputeLinear:
         return cls(linear.weight.data, getattr(linear, "bias", None))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

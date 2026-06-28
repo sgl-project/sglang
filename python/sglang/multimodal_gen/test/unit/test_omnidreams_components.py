@@ -117,9 +117,10 @@ def _fd_reference_shift_t_freqs(
     dim_t, dim_h, dim_w = rope_dims(head_dim)
 
     def _freqs(dim, ratio):
-        dim_range = torch.arange(0, dim, 2, dtype=torch.float32, device=device)[
-            : dim // 2
-        ] / dim
+        dim_range = (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device)[: dim // 2]
+            / dim
+        )
         theta = 10000.0 * (ratio ** (dim / (dim - 2)))
         return 1.0 / (theta**dim_range)
 
@@ -171,7 +172,9 @@ def test_shift_t_freqs_matches_fd_reference_formula():
             ar_idx=ar,
         )
         assert got.shape == ref.shape == (2 * 4 * 5, 1, 1, 128)
-        assert torch.allclose(got, ref, atol=1e-5), f"ar={ar} diverged from fd reference"
+        assert torch.allclose(
+            got, ref, atol=1e-5
+        ), f"ar={ar} diverged from fd reference"
 
 
 def test_shift_t_freqs_uses_noninterleaved_cat_freqs_layout():
@@ -191,12 +194,20 @@ def test_shift_t_freqs_applies_h_w_ntk_extrapolation():
     # old code called build_freqs which DROPS theta_rescale_factor, leaving h/w
     # angles identical regardless of the extrapolation ratio.
     r1 = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=1.0, w_extrapolation_ratio=1.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=1.0,
+        w_extrapolation_ratio=1.0,
     )
     r3 = RotaryPositionEmbedding3D(
-        head_dim=128, len_h=4, len_w=5, len_t=2,
-        h_extrapolation_ratio=3.0, w_extrapolation_ratio=3.0,
+        head_dim=128,
+        len_h=4,
+        len_w=5,
+        len_t=2,
+        h_extrapolation_ratio=3.0,
+        w_extrapolation_ratio=3.0,
     )
     f1 = r1.shift_t_freqs(0).reshape(-1, 128)
     f3 = r3.shift_t_freqs(0).reshape(-1, 128)
@@ -895,13 +906,17 @@ def test_encode_hdmap_broadcasts_single_frame_across_len_t(monkeypatch):
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams as od_mod
 
     monkeypatch.setattr(
-        od_mod, "_vae_encode_normalized", lambda x, vae, cache=None, is_first_chunk=True: torch.zeros(1, 16, 1, 2, 2)
+        od_mod,
+        "_vae_encode_normalized",
+        lambda x, vae, cache=None, is_first_chunk=True: torch.zeros(1, 16, 1, 2, 2),
     )
     dev = torch.device("cpu")
     b = types.SimpleNamespace(hdmap_path=1, hdmap_pixels=None)
     tokens_per_frame = (2 // 2) * (2 // 2)  # = 1
     for len_t in (1, 2, 3):
-        toks, pixel = stage._encode_hdmap(b, dev, torch.float32, torch.float32, 1, len_t, 2, 2)
+        toks, pixel = stage._encode_hdmap(
+            b, dev, torch.float32, torch.float32, 1, len_t, 2, 2
+        )
         assert toks[0].shape[1] == len_t * tokens_per_frame
 
 

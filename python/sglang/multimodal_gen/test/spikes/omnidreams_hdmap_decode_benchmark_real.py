@@ -61,10 +61,10 @@ def main():
     # (label, total_pixel, target (H,W)). native is 1280x720 (the real mp4).
     # 13 latent -> total_pixel = 1+(13-1)*4 = 49 ; 49 latent -> 193.
     cases = [
-        ("tp=49  native(no-rs)",  49,  (720, 1280)),
-        ("tp=49  720p(704,rs)",   49,  (704, 1280)),
-        ("tp=193 native(no-rs)",  193, (720, 1280)),
-        ("tp=193 720p(704,rs)",   193, (704, 1280)),
+        ("tp=49  native(no-rs)", 49, (720, 1280)),
+        ("tp=49  720p(704,rs)", 49, (704, 1280)),
+        ("tp=193 native(no-rs)", 193, (720, 1280)),
+        ("tp=193 720p(704,rs)", 193, (704, 1280)),
     ]
     print(f"sample: {path}")
     header = f"{'case':<22} {'variant':<16} {'median_ms':>10} {'vs_base':>8} {'drift_maxabs':>13}"
@@ -84,7 +84,9 @@ def main():
             speedup = f"{base_ms / ms:.2f}x" if base_ms else "-"
             print(f"{label:<22} {name:<16} {ms:>10.1f} {speedup:>8} {drift:>13}")
         print()
-    print("Done. B/AB drift ~0 (bit-identical); A drift = cv2-vs-PIL lanczos (resize only).")
+    print(
+        "Done. B/AB drift ~0 (bit-identical); A drift = cv2-vs-PIL lanczos (resize only)."
+    )
 
 
 if __name__ == "__main__":

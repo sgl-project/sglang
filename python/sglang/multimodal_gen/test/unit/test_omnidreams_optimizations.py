@@ -34,14 +34,14 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
-    CUDAGraphWrapper,
-    set_or_copy,
-)
 from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     BlockKVCache,
     RotaryPositionEmbedding3D,
     apply_rope_freqs,
+)
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
+    CUDAGraphWrapper,
+    set_or_copy,
 )
 
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -581,8 +581,10 @@ class _ToyDecoder(torch.nn.Module):
         b, _, t, h, w = x.shape
         u = self.upsample
         y = self.proj(x).view(b, self.out_ch, u, u, t, h, w)
-        return y.permute(0, 1, 4, 5, 2, 6, 3).contiguous().view(
-            b, self.out_ch, t, h * u, w * u
+        return (
+            y.permute(0, 1, 4, 5, 2, 6, 3)
+            .contiguous()
+            .view(b, self.out_ch, t, h * u, w * u)
         )
 
 
@@ -628,9 +630,9 @@ def test_decode_cpu_offload_bounds_gpu_memory_without_precision_loss():
     frame_ratio = frame_counts[-1] / frame_counts[0]
     noff_ratio = noff[frame_counts[-1]] / max(noff[frame_counts[0]], 1e-6)
     # No-offload (= SP-path equivalent) grows ~linearly with frames.
-    assert noff_ratio > frame_ratio * 0.7, (
-        f"expected ~linear growth (~{frame_ratio:.0f}x), got {noff_ratio:.2f}x"
-    )
+    assert (
+        noff_ratio > frame_ratio * 0.7
+    ), f"expected ~linear growth (~{frame_ratio:.0f}x), got {noff_ratio:.2f}x"
 
     # Offload keeps GPU peak bounded and ~constant across frames.
     off_peak = max(off.values())
@@ -638,9 +640,9 @@ def test_decode_cpu_offload_bounds_gpu_memory_without_precision_loss():
         f"offload peak {off_peak:.1f}MB not bounded vs "
         f"{noff[frame_counts[-1]]:.1f}MB"
     )
-    assert abs(off[frame_counts[-1]] - off[frame_counts[0]]) < off_peak * 0.5 + 5, (
-        "offload peak should not scale with frame count"
-    )
+    assert (
+        abs(off[frame_counts[-1]] - off[frame_counts[0]]) < off_peak * 0.5 + 5
+    ), "offload peak should not scale with frame count"
 
 
 if __name__ == "__main__":

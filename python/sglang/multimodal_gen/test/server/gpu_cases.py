@@ -891,9 +891,7 @@ ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 # SGLANG_OMNIDREAMS_ACCEL_E2E=1 to register them. Perf/consistency are off until
 # baselines + ground-truth are generated on the target GPU (mirrors the hdmap
 # case); the first goal is a clean no-crash generation per path.
-_OMNIDREAMS_CONFIG_DIR = (
-    Path(__file__).resolve().parents[1] / "test_files"
-)
+_OMNIDREAMS_CONFIG_DIR = Path(__file__).resolve().parents[1] / "test_files"
 _OMNIDREAMS_ACCEL_CONFIGS = {
     "omnidreams_2b_i2v_dit_fp8": "omnidreams_dit_fp8.json",
     "omnidreams_2b_i2v_lightvae_lighttae": "omnidreams_lightvae_lighttae.json",

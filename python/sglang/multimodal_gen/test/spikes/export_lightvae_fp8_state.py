@@ -33,24 +33,56 @@ STATE_SCALE_MAX_KEY = "__omnidreams_vae_fp8_scale_max__"
 MODEL_KIND_LIGHTVAE_ENCODER = 1
 
 DEFAULT_LATENTS_MEAN = [
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-    0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+    -0.7571,
+    -0.7089,
+    -0.9113,
+    0.1075,
+    -0.1745,
+    0.9653,
+    -0.1517,
+    1.5508,
+    0.4134,
+    -0.0715,
+    0.5517,
+    -0.3632,
+    -0.1922,
+    -0.9497,
+    0.2503,
+    -0.2921,
 ]
 DEFAULT_LATENTS_STD = [
-    2.8184, 2.7649, 2.5679, 0.9361, 0.9143, 0.8458, 0.8740, 0.9163,
-    0.8754, 0.8767, 0.8802, 0.9088, 0.8728, 0.9371, 0.8904, 0.8554,
+    2.8184,
+    2.7649,
+    2.5679,
+    0.9361,
+    0.9143,
+    0.8458,
+    0.8740,
+    0.9163,
+    0.8754,
+    0.8767,
+    0.8802,
+    0.9088,
+    0.8728,
+    0.9371,
+    0.8904,
+    0.8554,
 ]
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--ckpt", type=Path, required=True,
+        "--ckpt",
+        type=Path,
+        required=True,
         help="LightVAE encoder checkpoint (lightvaew2_1.pth).",
     )
     parser.add_argument("--out", type=Path, required=True, help="Output .pt path.")
     parser.add_argument(
-        "--calibration-video", type=Path, required=True,
+        "--calibration-video",
+        type=Path,
+        required=True,
         help="Video for per-channel activation amax collection.",
     )
     parser.add_argument("--device", default="cuda")
@@ -175,9 +207,7 @@ def _collect_activation_amax(
         handles.append(module.register_forward_hook(hook(full)))
         if name == "middle.1.proj":
             handles.append(
-                module.register_forward_pre_hook(
-                    pre_hook("encoder.middle.1.sdpa")
-                )
+                module.register_forward_pre_hook(pre_hook("encoder.middle.1.sdpa"))
             )
         if hasattr(module, "cache_step"):
             handles.append(module.register_forward_hook(hook(full)))
@@ -320,12 +350,16 @@ def main() -> None:
     )
 
     # Instantiate SGLang's LightVAEEncoder on the target device.
-    encoder: nn.Module = LightVAEEncoder(
-        checkpoint_path=str(args.ckpt),
-        latents_mean=DEFAULT_LATENTS_MEAN,
-        latents_std=DEFAULT_LATENTS_STD,
-        dtype=torch.float16,
-    ).to(device).eval()
+    encoder: nn.Module = (
+        LightVAEEncoder(
+            checkpoint_path=str(args.ckpt),
+            latents_mean=DEFAULT_LATENTS_MEAN,
+            latents_std=DEFAULT_LATENTS_STD,
+            dtype=torch.float16,
+        )
+        .to(device)
+        .eval()
+    )
 
     video_path = args.calibration_video.expanduser().resolve()
     video_bcthw = _load_video_prefix_bcthw(

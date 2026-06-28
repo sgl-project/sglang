@@ -73,7 +73,9 @@ def run_shape(name, M, K, N, with_gelu, device, iters):
     static_scale = torch.tensor(64.0, device=device)
 
     def gemm_only():
-        return torch._scaled_mm(a8, bt, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+        return torch._scaled_mm(
+            a8, bt, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16
+        )
 
     # FUSED proxy: the single-launch ideal == just the GEMM producing final out.
     t_fused_proxy = _bench(gemm_only, iters)
@@ -119,6 +121,7 @@ def run_shape(name, M, K, N, with_gelu, device, iters):
     if not with_gelu:
         sr = torch.tensor(1.0 / 64.0, device=device)
         try:
+
             def fused_real():
                 return torch._scaled_mm(
                     a8, bt, scale_a=sa, scale_b=sb, scale_result=sr, out_dtype=FP8
@@ -127,11 +130,15 @@ def run_shape(name, M, K, N, with_gelu, device, iters):
             fused_real()
             t_fused_real = _bench(fused_real, iters)
 
-            cast_c = torch.compile(lambda cc: (cc * static_scale).to(FP8), fullgraph=True)
+            cast_c = torch.compile(
+                lambda cc: (cc * static_scale).to(FP8), fullgraph=True
+            )
             cast_c(c)
 
             def reuse_real():
-                bf = torch._scaled_mm(a8, bt, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+                bf = torch._scaled_mm(
+                    a8, bt, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16
+                )
                 return cast_c(bf)
 
             t_reuse_real = _bench(reuse_real, iters)
@@ -162,9 +169,13 @@ def main():
     device = "cuda"
     H, F = args.hidden, args.ffn
     cap = torch.cuda.get_device_capability(0)
-    print(f"# device={torch.cuda.get_device_name(0)} cap={cap} torch={torch.__version__}")
+    print(
+        f"# device={torch.cuda.get_device_name(0)} cap={cap} torch={torch.__version__}"
+    )
     print(f"# hidden={H} ffn={F}  (OmniDreams DiT: 28 blocks, 7 GEMMs/block)")
-    print("# fusion_ceiling = max % a fully-fused kernel can save vs reuse(GEMM)+sep epilogue\n")
+    print(
+        "# fusion_ceiling = max % a fully-fused kernel can save vs reuse(GEMM)+sep epilogue\n"
+    )
 
     # M = tokens per AR chunk (sweep latency-bound -> compute-bound)
     for M in (256, 1024, 4096, 16384):

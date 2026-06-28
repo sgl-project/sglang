@@ -286,3 +286,5 @@ artifacts/
 
 # Superpowers working notes — local only, not tracked
 docs/superpowers/
+.omc/
+**/omni-log/

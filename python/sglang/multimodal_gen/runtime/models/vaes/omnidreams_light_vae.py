@@ -116,9 +116,10 @@ class Resample(nn.Module):
     """Spatial 2x resample, optionally with temporal downsample (encode path)."""
 
     def __init__(self, dim: int, mode: str):
-        assert mode in ("downsample2d", "downsample3d"), (
-            f"encode-only Resample mode must be downsample2d/3d; got {mode}"
-        )
+        assert mode in (
+            "downsample2d",
+            "downsample3d",
+        ), f"encode-only Resample mode must be downsample2d/3d; got {mode}"
         super().__init__()
         self.dim = dim
         self.mode = mode

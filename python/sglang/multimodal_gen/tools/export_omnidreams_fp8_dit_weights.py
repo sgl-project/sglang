@@ -183,7 +183,9 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"weights": fp8_weights, "meta": meta}, output_path)
     print(f"Done. Export saved to {output_path}")
-    print(f"  Fingerprint: size={fingerprint['file_size']}, mtime={fingerprint['mtime']}")
+    print(
+        f"  Fingerprint: size={fingerprint['file_size']}, mtime={fingerprint['mtime']}"
+    )
     print(f"  dropped_bf16_prepared={not args.keep_bf16_prepared}")
 
 

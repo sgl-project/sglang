@@ -70,11 +70,11 @@ def main():
     device, dtype = torch.device("cpu"), torch.float32
     # (label, frames_in_mp4, total_pixel, native (H,W), target (H,W))
     cases = [
-        ("short no-resize",        9,  9,  (16, 32),  (16, 32)),
-        ("short resize",           9,  9,  (16, 32),  (32, 48)),
-        ("long(60) need-9 no-rs",  60, 9,  (16, 32),  (16, 32)),
-        ("long(60) need-9 rs",     60, 9,  (16, 32),  (32, 48)),
-        ("long(200) need-49 rs",   200, 49, (32, 48),  (64, 96)),
+        ("short no-resize", 9, 9, (16, 32), (16, 32)),
+        ("short resize", 9, 9, (16, 32), (32, 48)),
+        ("long(60) need-9 no-rs", 60, 9, (16, 32), (16, 32)),
+        ("long(60) need-9 rs", 60, 9, (16, 32), (32, 48)),
+        ("long(200) need-49 rs", 200, 49, (32, 48), (64, 96)),
     ]
 
     header = f"{'case':<24} {'variant':<16} {'median_ms':>10} {'vs_base':>8} {'drift_maxabs':>13}"
@@ -98,7 +98,9 @@ def main():
             print()
 
     print("Done. Drift = max|variant - baseline| (resize-backend-only; B/AB are ~0).")
-    print("Decision rule: wire variant in if speedup is material AND drift is acceptable.")
+    print(
+        "Decision rule: wire variant in if speedup is material AND drift is acceptable."
+    )
 
 
 if __name__ == "__main__":

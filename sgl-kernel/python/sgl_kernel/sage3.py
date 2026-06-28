@@ -12,6 +12,7 @@ The two ops exposed are intentionally GENERIC (no OmniDreams-specific packing):
 Model-specific glue (packed-QKV layout, RoPE-fused quant, KV-cache stitching)
 stays in the model layer and calls these ops.
 """
+
 from typing import Optional
 
 import torch
@@ -64,8 +65,19 @@ def sage3_mha_fwd(
     """
     _check_loaded()
     return torch.ops.sgl_kernel.sage3_mha_fwd.default(
-        q, k, v, sfq, sfk, sfv, delta_s, unpadded_k, out,
-        softmax_scale, is_causal, per_block_mean, is_bf16,
+        q,
+        k,
+        v,
+        sfq,
+        sfk,
+        sfv,
+        delta_s,
+        unpadded_k,
+        out,
+        softmax_scale,
+        is_causal,
+        per_block_mean,
+        is_bf16,
     )
 
 
@@ -83,5 +95,9 @@ def scaled_fp4_quant(
     """
     _check_loaded()
     torch.ops.sgl_kernel.scaled_fp4_quant.default(
-        input, output, output_sf, tensor_layout, variant,
+        input,
+        output,
+        output_sf,
+        tensor_layout,
+        variant,
     )

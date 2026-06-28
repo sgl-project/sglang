@@ -18,11 +18,11 @@ so baseline per-pixel = frame/255*2-1 == (frame-127.5)/127.5 == the numpy path.
    A vs baseline differ only by cv2 vs PIL lanczos when a resize is needed.
 """
 
+import cv2
 import imageio.v2 as imageio
 import numpy as np
 import PIL.Image
 import torch
-import cv2
 
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
@@ -71,40 +71,42 @@ def _preprocess_pil(frames_np, h, w, device, dtype):
     per = []
     for f in frames_np:
         img = PIL.Image.fromarray(f)
-        img = resize(img, h, w)                       # PIL LANCZOS
-        arr = pil_to_numpy(img)                       # [1, h, w, 3] float32 in [0,1]
-        x = numpy_to_pt(arr)                          # [1, 3, h, w] in [0,1]
-        x = normalize(x)                              # -> [-1,1]
-        per.append(x)                                 # [1,3,h,w]
-    clip = torch.cat(per, dim=0)                      # [T, 3, h, w]
+        img = resize(img, h, w)  # PIL LANCZOS
+        arr = pil_to_numpy(img)  # [1, h, w, 3] float32 in [0,1]
+        x = numpy_to_pt(arr)  # [1, 3, h, w] in [0,1]
+        x = normalize(x)  # -> [-1,1]
+        per.append(x)  # [1,3,h,w]
+    clip = torch.cat(per, dim=0)  # [T, 3, h, w]
     return clip.unsqueeze(0).to(device=device, dtype=dtype)  # [1, T, 3, h, w]
 
 
 def decode_hdmap_baseline(path, total_pixel, h, w, device, dtype):
     """Current production behavior: PIL roundtrip, decode ALL frames, truncate."""
-    frames = _read_frames_numpy(path)                 # all frames
+    frames = _read_frames_numpy(path)  # all frames
     frames = _clamp_to_total(frames, total_pixel)
-    clip = _preprocess_pil(frames, h, w, device, dtype)         # [1, T, 3, h, w]
-    return clip.permute(0, 2, 1, 3, 4)                          # [1, 3, T, h, w]
+    clip = _preprocess_pil(frames, h, w, device, dtype)  # [1, T, 3, h, w]
+    return clip.permute(0, 2, 1, 3, 4)  # [1, 3, T, h, w]
 
 
 def _preprocess_numpy(frames_np, h, w, device, dtype):
     """A path: cv2.resize (LANCZOS4) on numpy, bulk numpy->torch, normalize.
     No PIL anywhere. Math matches baseline (arr/255*2-1) so output is bit-identical
     to baseline when the resize is a no-op (target == native res)."""
-    resized = [cv2.resize(f, (w, h), interpolation=cv2.INTER_LANCZOS4) for f in frames_np]
-    arr = np.stack(resized, axis=0).astype(np.float32) / 255.0   # [T,h,w,3] in [0,1]
-    x = torch.from_numpy(arr).permute(0, 3, 1, 2)                  # [T,3,h,w] in [0,1]
-    x = 2.0 * x - 1.0                                              # -> [-1,1]
-    return x.unsqueeze(0).to(device=device, dtype=dtype)           # [1,T,3,h,w]
+    resized = [
+        cv2.resize(f, (w, h), interpolation=cv2.INTER_LANCZOS4) for f in frames_np
+    ]
+    arr = np.stack(resized, axis=0).astype(np.float32) / 255.0  # [T,h,w,3] in [0,1]
+    x = torch.from_numpy(arr).permute(0, 3, 1, 2)  # [T,3,h,w] in [0,1]
+    x = 2.0 * x - 1.0  # -> [-1,1]
+    return x.unsqueeze(0).to(device=device, dtype=dtype)  # [1,T,3,h,w]
 
 
 def decode_hdmap_numpy(path, total_pixel, h, w, device, dtype):
     """A: numpy->torch direct (cv2.resize), decode ALL frames, truncate."""
     frames = _read_frames_numpy(path)
     frames = _clamp_to_total(frames, total_pixel)
-    clip = _preprocess_numpy(frames, h, w, device, dtype)         # [1,T,3,h,w]
-    return clip.permute(0, 2, 1, 3, 4)                            # [1,3,T,h,w]
+    clip = _preprocess_numpy(frames, h, w, device, dtype)  # [1,T,3,h,w]
+    return clip.permute(0, 2, 1, 3, 4)  # [1,3,T,h,w]
 
 
 def decode_hdmap_limited(path, total_pixel, h, w, device, dtype):

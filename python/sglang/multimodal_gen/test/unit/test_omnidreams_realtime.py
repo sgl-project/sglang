@@ -31,7 +31,6 @@ Local macOS .venv is CUDA-incompatible (pinned CUDA base deps).
 from __future__ import annotations
 
 import types
-from typing import Any
 
 import pytest
 import torch
@@ -51,7 +50,6 @@ requires_gpu = pytest.mark.skipif(
 # All sglang imports are placed here; they don't touch CUDA at import time.
 # ---------------------------------------------------------------------------
 from sglang.multimodal_gen.runtime.realtime.causal_state import (
-    RealtimeCausalDecodeState,
     RealtimeCausalDiTState,
 )
 from sglang.multimodal_gen.runtime.realtime.condition_events import (
@@ -65,16 +63,17 @@ from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSessionCache,
 )
 
-
 # ===========================================================================
 # Shared tiny-model fixtures (CPU-safe; mirrors test_omnidreams_components.py)
 # ===========================================================================
+
 
 def _tiny_arch():
     """Shared tiny DiT arch: head_dim = 24/2 = 12 keeps the RoPE 6-way split valid."""
     from sglang.multimodal_gen.configs.models.dits.omnidreams import (
         OmniDreamsDiTArchConfig,
     )
+
     return OmniDreamsDiTArchConfig(
         in_channels=4,
         out_channels=4,
@@ -92,15 +91,12 @@ def _tiny_arch():
 def _tiny_dit(arch=None):
     """A small CPU-constructible OmniDreamsDiT, random-initialised."""
     from sglang.multimodal_gen.configs.models.dits.omnidreams import (
-        OmniDreamsDiTArchConfig,
         OmniDreamsDiTConfig,
     )
     from sglang.multimodal_gen.runtime.models.dits.omnidreams import OmniDreamsDiT
 
     arch = arch or _tiny_arch()
-    model = OmniDreamsDiT(
-        config=OmniDreamsDiTConfig(arch_config=arch), hf_config={}
-    )
+    model = OmniDreamsDiT(config=OmniDreamsDiTConfig(arch_config=arch), hf_config={})
     model.post_load_weights()
     model = model.to(_DEVICE)
     with torch.no_grad():
@@ -114,6 +110,7 @@ def _tiny_scheduler():
     from sglang.multimodal_gen.runtime.models.schedulers.scheduling_omnidreams_flow_match import (
         OmniDreamsFlowMatchScheduler,
     )
+
     return OmniDreamsFlowMatchScheduler()
 
 
@@ -172,6 +169,7 @@ def _before_stage_setup(arch, dit, scheduler, monkeypatch):
     stage.encoder = None
     stage.config = None
     from collections import OrderedDict
+
     stage._text_embed_cache = OrderedDict()
     stage._component_residency_manager = None
     return stage
@@ -194,7 +192,9 @@ def _make_batch(
     tokens_per_frame = hp * wp
     batch = types.SimpleNamespace(
         scheduler=None,
-        prompt_embeds=[torch.randn(1, 5, arch.crossattn_proj_in_channels, device=_DEVICE)],
+        prompt_embeds=[
+            torch.randn(1, 5, arch.crossattn_proj_in_channels, device=_DEVICE)
+        ],
         negative_prompt_embeds=None,
         image_embeds=[],
         do_classifier_free_guidance=False,
@@ -240,6 +240,7 @@ def _make_batch(
 # ===========================================================================
 # Test 1: test_realtime_offline_equivalence  (GPU-only)
 # ===========================================================================
+
 
 @requires_gpu
 @pytest.mark.gpu
@@ -294,7 +295,7 @@ def test_realtime_offline_equivalence(monkeypatch):
     # Pre-stash runtime_cache (mirrors OmniDreamsBeforeDenoisingStage on block_idx==0).
     cache_state = session.get_or_create_state(RealtimeCausalDiTState)
     cache_state.runtime_cache = {
-        "rope": None,          # built lazily on first chunk
+        "rope": None,  # built lazily on first chunk
         "text_embeds": text_embeds.detach(),
         "image_token": None,
         "image_full": None,
@@ -304,7 +305,7 @@ def test_realtime_offline_equivalence(monkeypatch):
         "hdmap_zero": None,
         "cross_attn_kv": None,
         "scheduler": scheduler,
-        "generator": rt_gen,   # persists across calls; mutated in-place
+        "generator": rt_gen,  # persists across calls; mutated in-place
         "hdmap_encode_cache": None,
         "arch_constants": {
             "hp": hp,
@@ -365,6 +366,7 @@ def test_realtime_offline_equivalence(monkeypatch):
 # Test 2: test_session_kv_reuse  (CPU-safe)
 # ===========================================================================
 
+
 @torch.no_grad()
 def test_session_kv_reuse(monkeypatch):
     """The same RealtimeCausalDiTState object is returned across all chunks
@@ -398,7 +400,7 @@ def test_session_kv_reuse(monkeypatch):
     # Pre-stash initial runtime_cache (mirrors BeforeStage on block_idx==0).
     cache_state_initial = session.get_or_create_state(RealtimeCausalDiTState)
     cache_state_initial.runtime_cache = {
-        "rope": None,          # built lazily on the first chunk
+        "rope": None,  # built lazily on the first chunk
         "text_embeds": text_embeds.detach(),
         "image_token": None,
         "image_full": None,
@@ -408,7 +410,7 @@ def test_session_kv_reuse(monkeypatch):
         "hdmap_zero": None,
         "cross_attn_kv": None,
         "scheduler": scheduler,
-        "generator": gen,      # persists across calls; mutated in-place
+        "generator": gen,  # persists across calls; mutated in-place
         "hdmap_encode_cache": None,
         "arch_constants": {
             "hp": hp,
@@ -449,28 +451,29 @@ def test_session_kv_reuse(monkeypatch):
         state_objects.append(cache_state)
 
     # All three references must be the SAME object (no re-creation across chunks).
-    assert state_objects[0] is state_objects[1], (
-        "RealtimeCausalDiTState was replaced between chunk 0 and chunk 1"
-    )
-    assert state_objects[1] is state_objects[2], (
-        "RealtimeCausalDiTState was replaced between chunk 1 and chunk 2"
-    )
+    assert (
+        state_objects[0] is state_objects[1]
+    ), "RealtimeCausalDiTState was replaced between chunk 0 and chunk 1"
+    assert (
+        state_objects[1] is state_objects[2]
+    ), "RealtimeCausalDiTState was replaced between chunk 1 and chunk 2"
 
     # chunk_idx must have advanced to 3 after 3 forward calls.
     final_state = state_objects[-1]
-    assert final_state.chunk_idx == 3, (
-        f"Expected chunk_idx==3 after 3 realtime chunks; got {final_state.chunk_idx}"
-    )
+    assert (
+        final_state.chunk_idx == 3
+    ), f"Expected chunk_idx==3 after 3 realtime chunks; got {final_state.chunk_idx}"
 
     # kv_cache must have been populated on chunk 0 and persisted.
-    assert final_state.kv_cache is not None, (
-        "kv_cache was not initialized during the first realtime chunk"
-    )
+    assert (
+        final_state.kv_cache is not None
+    ), "kv_cache was not initialized during the first realtime chunk"
 
 
 # ===========================================================================
 # Test 3: test_session_lifecycle  (CPU-safe)
 # ===========================================================================
+
 
 def test_session_lifecycle():
     """RealtimeSessionCache.attach creates a session on block_idx==0,
@@ -487,7 +490,9 @@ def test_session_lifecycle():
         session=None,
     )
     cache.attach(req0)
-    assert req0.session is not None, "attach() must populate req.session on block_idx==0"
+    assert (
+        req0.session is not None
+    ), "attach() must populate req.session on block_idx==0"
     assert isinstance(req0.session, RealtimeSession)
     session_ref = req0.session
 
@@ -498,9 +503,9 @@ def test_session_lifecycle():
         session=None,
     )
     cache.attach(req1)
-    assert req1.session is session_ref, (
-        "attach() on block_idx>0 must return the same session created on block_idx==0"
-    )
+    assert (
+        req1.session is session_ref
+    ), "attach() on block_idx>0 must return the same session created on block_idx==0"
 
     # --- release disposes the session and returns True ---
     released = cache.release(session_id)
@@ -508,9 +513,9 @@ def test_session_lifecycle():
 
     # --- double-release returns False (idempotent) ---
     released_again = cache.release(session_id)
-    assert released_again is False, (
-        "release() must return False when the session was already released"
-    )
+    assert (
+        released_again is False
+    ), "release() must return False when the session was already released"
 
     # --- attach on block_idx>0 without a prior block_idx==0 raises ValueError ---
     req_orphan = types.SimpleNamespace(
@@ -535,9 +540,9 @@ def test_session_lifecycle_dispose_clears_state():
     session.dispose()
 
     # The state object is gone from the session after dispose.
-    assert session.get_state(RealtimeCausalDiTState) is None, (
-        "dispose() must clear internal state registry"
-    )
+    assert (
+        session.get_state(RealtimeCausalDiTState) is None
+    ), "dispose() must clear internal state registry"
     # The state itself has been reset by its own dispose().
     assert state.kv_cache is None
     assert state.chunk_idx == 0
@@ -563,15 +568,16 @@ def test_session_lifecycle_block_idx0_resets_existing_session():
         realtime_session_id=session_id, block_idx=0, session=new_session
     )
     cache.attach(req_restart)
-    assert req_restart.session is new_session, (
-        "block_idx==0 with a new session object must replace the cached session"
-    )
+    assert (
+        req_restart.session is new_session
+    ), "block_idx==0 with a new session object must replace the cached session"
     assert req_restart.session is not old_session
 
 
 # ===========================================================================
 # Test 4: test_hdmap_condition_queue  (CPU-safe)
 # ===========================================================================
+
 
 def test_hdmap_condition_queue_sample_returns_length_chunk_size():
     """sample_chunk('hdmap', ConditionSamplingParams(chunk_size=2)) returns a
@@ -588,9 +594,9 @@ def test_hdmap_condition_queue_sample_returns_length_chunk_size():
 
     for chunk_idx, result in enumerate(results):
         assert result is not None, f"chunk {chunk_idx}: sample_chunk returned None"
-        assert len(result) == 2, (
-            f"chunk {chunk_idx}: expected 2 items, got {len(result)}"
-        )
+        assert (
+            len(result) == 2
+        ), f"chunk {chunk_idx}: expected 2 items, got {len(result)}"
 
 
 def test_hdmap_condition_queue_seq_id_advances():
@@ -608,9 +614,11 @@ def test_hdmap_condition_queue_seq_id_advances():
         queue.sample_chunk("hdmap", params)
         seen_seq_ids.append(queue.last_sampled_seq_id("hdmap"))
 
-    assert seen_seq_ids == [0, 1, 2], (
-        f"seq_ids did not advance monotonically: {seen_seq_ids}"
-    )
+    assert seen_seq_ids == [
+        0,
+        1,
+        2,
+    ], f"seq_ids did not advance monotonically: {seen_seq_ids}"
 
 
 def test_hdmap_condition_queue_repeat_last_fallback_when_empty():
@@ -639,9 +647,9 @@ def test_hdmap_condition_queue_repeat_last_fallback_when_empty():
     result_no_repeat = queue.sample_chunk("hdmap", params_no_repeat)
     # The "hdmap" kind has been seen (seen_kinds is populated on push); no pending
     # events remain and repeat_last=False, so None is the correct fallback.
-    assert result_no_repeat is None, (
-        "repeat_last=False on an empty known-kind queue must return None"
-    )
+    assert (
+        result_no_repeat is None
+    ), "repeat_last=False on an empty known-kind queue must return None"
 
 
 def test_hdmap_condition_queue_three_chunks_full_coverage():
@@ -672,9 +680,9 @@ def test_hdmap_condition_queue_three_chunks_full_coverage():
     # defaults to False, so result is None (no padding across empty chunks).
     c2 = queue.sample_chunk("hdmap", params)
     # repeat_last_across_empty_chunks=False (default): empty queue -> None.
-    assert c2 is None, (
-        "Exhausted queue with repeat_last_across_empty_chunks=False must return None"
-    )
+    assert (
+        c2 is None
+    ), "Exhausted queue with repeat_last_across_empty_chunks=False must return None"
 
 
 # ===========================================================================
@@ -685,6 +693,7 @@ def test_hdmap_condition_queue_three_chunks_full_coverage():
 # (torch.is_tensor check at omnidreams.py:898). Mirrors the stage's
 # _preprocess_hdmap_clip / _preprocess_pixels exactly.
 # ===========================================================================
+
 
 def _png_bytes(size_hw: tuple[int, int], color: tuple[int, int, int]) -> bytes:
     """Render a solid-color PNG image to bytes (CPU, no sglang deps)."""
@@ -706,7 +715,10 @@ def test_hdmap_decode_bytes_to_clip_tensor():
 
     h, w = 16, 24
     len_t = 2
-    frames = [_png_bytes((h, w), color=(255, 0, 0)), _png_bytes((h, w), color=(0, 0, 255))]
+    frames = [
+        _png_bytes((h, w), color=(255, 0, 0)),
+        _png_bytes((h, w), color=(0, 0, 255)),
+    ]
 
     tensor = _decode_hdmap_chunk(frames, h, w)
 

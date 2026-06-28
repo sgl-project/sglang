@@ -26,15 +26,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     save_image_to_path,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    prepare_request,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     load_image,
     normalize,
     numpy_to_pt,
     pil_to_numpy,
     resize,
-)
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    prepare_request,
 )
 from sglang.multimodal_gen.runtime.realtime.condition_events import (
     ConditionEvent,

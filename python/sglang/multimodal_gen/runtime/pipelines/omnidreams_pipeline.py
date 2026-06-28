@@ -226,7 +226,11 @@ class OmniDreamsPipeline(ComposedPipelineBase):
         # Phase 6: populate memory budgets (GiB, approximate) for the
         # ComponentResidencyManager offload scheduler. Exact values are
         # TODO(gpu): measure on the target GPU with torch.cuda.memory_stats().
-        impl_image = pipeline_config.image_encoder_config.impl if pipeline_config.image_encoder_config else "wanvae"
+        impl_image = (
+            pipeline_config.image_encoder_config.impl
+            if pipeline_config.image_encoder_config
+            else "wanvae"
+        )
         impl_encoder = pipeline_config.encoder_config.impl
         impl_decoder = pipeline_config.decoder_config.impl
 

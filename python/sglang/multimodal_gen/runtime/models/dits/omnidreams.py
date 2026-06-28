@@ -79,9 +79,7 @@ def _resolve_sage3_impl():
     return _SAGE3_IMPL
 
 
-def _sage3_self_attn(
-    q: Tensor, k: Tensor, v: Tensor, backend: str
-) -> Tensor | None:
+def _sage3_self_attn(q: Tensor, k: Tensor, v: Tensor, backend: str) -> Tensor | None:
     """Run sage3 self-attention, or return None to fall back to ``F.sdpa``.
 
     ``q``/``k``/``v`` are ``[B, n, S, d]`` (post-RoPE, post-cache-assemble), the
@@ -1078,9 +1076,12 @@ class RotaryPositionEmbedding3D:
             theta = 10000.0
             if ratio != 1.0:
                 theta = theta * (ratio ** (axis_dim / (axis_dim - 2)))
-            dim_range = torch.arange(
-                0, axis_dim, 2, dtype=torch.float32, device=pos.device
-            )[: axis_dim // 2] / axis_dim
+            dim_range = (
+                torch.arange(0, axis_dim, 2, dtype=torch.float32, device=pos.device)[
+                    : axis_dim // 2
+                ]
+                / axis_dim
+            )
             base_freqs = 1.0 / (theta**dim_range)  # [dim//2]
             angles = torch.outer(pos[:, axis_idx].float(), base_freqs)  # [L, dim//2]
             halves.append(angles)
@@ -1115,6 +1116,7 @@ def apply_rope_freqs(x: Tensor, cos_sin: Tensor) -> Tensor:
     return _apply_rotary_emb(
         x.reshape(B * S, H, D), cos, sin, is_neox_style=True, interleaved=False
     ).reshape(B, S, H, D)
+
 
 # ============================================================================
 # Block KV cache (folded from omnidreams_kvcache.py)
@@ -1423,6 +1425,7 @@ class BlockKVCache:
         self._n_cached = 0
         self._curr_chunk_idx = None
 
+
 # ============================================================================
 # SageAttention-3 self-attention (folded from omnidreams_sage3_attn.py)
 # ============================================================================
@@ -1503,7 +1506,11 @@ def sage3_self_attn(
     Mk = k.size(2)
     if D not in _SAGE3_SGL_KERNEL_HEAD_DIMS:
         raise ValueError(f"sage3 head_dim must be 64 or 128, got {D}")
-    if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+    ):
         raise ValueError("sage3_self_attn requires bfloat16 q/k/v")
     softmax_scale = scale if scale and scale > 0 else 1.0 / math.sqrt(D)
 
@@ -1538,7 +1545,20 @@ def sage3_self_attn(
     scaled_fp4_quant(v_padded.contiguous(), v_fp4, v_sf, 1, 2)  # trans (V)
 
     out = sage3_mha_fwd(
-        q_fp4, k_fp4, v_fp4, q_sf, k_sf, v_sf, delta_s, Mk, None,
-        softmax_scale, is_causal, True, True,
-    )[0]  # [B, H, QL, D]
+        q_fp4,
+        k_fp4,
+        v_fp4,
+        q_sf,
+        k_sf,
+        v_sf,
+        delta_s,
+        Mk,
+        None,
+        softmax_scale,
+        is_causal,
+        True,
+        True,
+    )[
+        0
+    ]  # [B, H, QL, D]
     return out[:, :, :Mq].contiguous()

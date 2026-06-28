@@ -295,7 +295,7 @@ class TAEHV(nn.Module):
     TEMPORAL_COMPRESSION_RATIO = 4
     SPATIAL_COMPRESSION_RATIO = 8
 
-    decoder: "Decoder"
+    decoder: Decoder
 
     def __init__(
         self,

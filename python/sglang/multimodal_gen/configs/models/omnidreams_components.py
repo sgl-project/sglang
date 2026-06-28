@@ -21,7 +21,6 @@ from typing import Any, Literal
 
 import torch
 import torch.nn as nn
-
 from loguru import logger
 
 from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEArchConfig
@@ -70,6 +69,7 @@ def normalize_native_acceleration_mode(mode: str) -> str:
         )
     return mode
 
+
 # Canonical latent normalization stats from Wan 2.1 (single source of truth).
 _DEFAULT_LATENTS_MEAN = list(WanVAEArchConfig().latents_mean)
 _DEFAULT_LATENTS_STD = list(WanVAEArchConfig().latents_std)
@@ -109,9 +109,7 @@ def resolve_light_ckpt_path(
         raise FileNotFoundError(f"{config_key} not found: {explicit}")
     base = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
     for root in (base, os.path.dirname(base)):
-        matches = sorted(
-            glob.glob(os.path.join(root, "**", glob_name), recursive=True)
-        )
+        matches = sorted(glob.glob(os.path.join(root, "**", glob_name), recursive=True))
         if matches:
             return matches[0]
     raise FileNotFoundError(
@@ -265,9 +263,7 @@ class _OmniDreamsVAEComponentConfig:
     latents_mean: list[float] = field(
         default_factory=lambda: list(_DEFAULT_LATENTS_MEAN)
     )
-    latents_std: list[float] = field(
-        default_factory=lambda: list(_DEFAULT_LATENTS_STD)
-    )
+    latents_std: list[float] = field(default_factory=lambda: list(_DEFAULT_LATENTS_STD))
 
     # Resolved at pipeline load time.
     model_path: str | None = None

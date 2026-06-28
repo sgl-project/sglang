@@ -92,7 +92,9 @@ def test_numpy_variant_matches_baseline_when_no_resize(tmp_path):
     """A == baseline bit-identical when target res == native res (no resize)."""
     p = str(tmp_path / "v.mp4")
     _write_synthetic_mp4(p, num_frames=9, h=16, w=32)
-    kw = dict(total_pixel=9, h=16, w=32, device=torch.device("cpu"), dtype=torch.float32)
+    kw = dict(
+        total_pixel=9, h=16, w=32, device=torch.device("cpu"), dtype=torch.float32
+    )
     base = decode_hdmap_baseline(p, **kw)
     a = decode_hdmap_numpy(p, **kw)
     assert a.shape == base.shape == (1, 3, 9, 16, 32)
@@ -103,7 +105,9 @@ def test_numpy_variant_with_resize_is_close(tmp_path):
     """A differs from baseline only by cv2-vs-PIL lanczos when res differs."""
     p = str(tmp_path / "v.mp4")
     _write_synthetic_mp4(p, num_frames=9, h=16, w=32)
-    kw = dict(total_pixel=9, h=32, w=48, device=torch.device("cpu"), dtype=torch.float32)
+    kw = dict(
+        total_pixel=9, h=32, w=48, device=torch.device("cpu"), dtype=torch.float32
+    )
     base = decode_hdmap_baseline(p, **kw)
     a = decode_hdmap_numpy(p, **kw)
     assert a.shape == base.shape
@@ -121,7 +125,9 @@ def test_limited_equals_baseline_first_total_pixel(tmp_path):
     """B decodes fewer frames but its output == baseline bit-identical."""
     p = str(tmp_path / "v.mp4")
     _write_synthetic_mp4(p, num_frames=60, h=16, w=32)  # long clip, only need 9
-    kw = dict(total_pixel=9, h=16, w=32, device=torch.device("cpu"), dtype=torch.float32)
+    kw = dict(
+        total_pixel=9, h=16, w=32, device=torch.device("cpu"), dtype=torch.float32
+    )
     base = decode_hdmap_baseline(p, **kw)
     b = decode_hdmap_limited(p, **kw)
     assert b.shape == base.shape
@@ -132,7 +138,9 @@ def test_numpy_limited_equals_numpy_all(tmp_path):
     """AB == A bit-identical (same first total_pixel frames)."""
     p = str(tmp_path / "v.mp4")
     _write_synthetic_mp4(p, num_frames=60, h=32, w=48)
-    kw = dict(total_pixel=9, h=32, w=48, device=torch.device("cpu"), dtype=torch.float32)
+    kw = dict(
+        total_pixel=9, h=32, w=48, device=torch.device("cpu"), dtype=torch.float32
+    )
     a = decode_hdmap_numpy(p, **kw)
     ab = decode_hdmap_numpy_limited(p, **kw)
     assert ab.shape == a.shape

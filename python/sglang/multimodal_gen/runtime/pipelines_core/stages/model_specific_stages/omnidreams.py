@@ -43,11 +43,11 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
-    CUDAGraphWrapper,
-)
 from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     RotaryPositionEmbedding3D,
+)
+from sglang.multimodal_gen.runtime.models.dits.omnidreams_cuda_graph import (
+    CUDAGraphWrapper,
 )
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     full_concat_embeddings,
@@ -60,11 +60,7 @@ from sglang.multimodal_gen.runtime.models.vision_utils import (
     pil_to_numpy,
     resize,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams_hdmap_decode import (
-    decode_hdmap_ab,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     DecodingStage,
@@ -72,12 +68,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     scale_and_shift_latents,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.omnidreams_hdmap_decode import (
+    decode_hdmap_ab,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.realtime.causal_state import (
     RealtimeCausalDecodeState,
     RealtimeCausalDiTState,
@@ -178,9 +178,9 @@ def _vae_encode_normalized(
     mean = torch.tensor(
         vae.latents_mean, device=latent.device, dtype=latent.dtype
     ).view(1, -1, 1, 1, 1)
-    std = torch.tensor(
-        vae.latents_std, device=latent.device, dtype=latent.dtype
-    ).view(1, -1, 1, 1, 1)
+    std = torch.tensor(vae.latents_std, device=latent.device, dtype=latent.dtype).view(
+        1, -1, 1, 1, 1
+    )
     normed = (latent - mean) / std
     _log_omnidreams_stats("vae_encode_normed", normed)
     return normed
@@ -211,7 +211,9 @@ def _is_realtime(batch: Req) -> bool:
     (``realtime_vae.py``, ``causal_denoising.py``): a non-empty
     ``realtime_session_id`` plus an attached ``session`` object.
     """
-    return bool(getattr(batch, "realtime_session_id", None)) and batch.session is not None
+    return (
+        bool(getattr(batch, "realtime_session_id", None)) and batch.session is not None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -488,8 +490,10 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         """
         if isinstance(hdmap, (list, tuple)):
             items = list(hdmap)
-            if len(items) == 1 and isinstance(items[0], str) and items[0].lower().endswith(
-                _HDMAP_VIDEO_EXTS
+            if (
+                len(items) == 1
+                and isinstance(items[0], str)
+                and items[0].lower().endswith(_HDMAP_VIDEO_EXTS)
             ):
                 return items[0]
             return None
@@ -558,7 +562,8 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
             except Exception:
                 logger.exception(
                     "OmniDreams: A+B HD-map decode failed for %s; falling back to "
-                    "legacy load_video path.", video_path
+                    "legacy load_video path.",
+                    video_path,
                 )
                 clip = None
             if clip is not None:
@@ -576,7 +581,9 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                     "(all chunks fall back to zeros). Check hdmap input."
                 )
                 return None, None
-            latent = _vae_encode_normalized(x, self.encoder).to(dit_dtype)  # [B,16,1,h,w]
+            latent = _vae_encode_normalized(x, self.encoder).to(
+                dit_dtype
+            )  # [B,16,1,h,w]
             if num_latent > 1 and latent.ndim == 5 and latent.shape[2] == 1:
                 latent = latent.repeat(1, 1, num_latent, 1, 1)
             if latent.shape[2] != num_latent:
@@ -708,9 +715,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         # the AR loop (FlashDreams replay: one-shot decode + per-step encode);
         # the degenerate single-image fallback returns precomputed per-chunk
         # tokens. No HD-map input -> (None, None) (AR stage uses zeros).
-        with self.use_declared_component(
-            component_name="encoder", module=self.encoder
-        ):
+        with self.use_declared_component(component_name="encoder", module=self.encoder):
             hdmap_tokens, hdmap_pixel = self._encode_hdmap(
                 batch, device, vae_dtype, dit_dtype, num_chunks, len_t, height, width
             )
@@ -785,9 +790,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
                     * arch.patch_temporal
                     * arch.patch_spatial**2,
                     "mask_d": arch.patch_temporal * arch.patch_spatial**2,
-                    "context_noise": float(
-                        getattr(batch, "context_noise", 128)
-                    ),
+                    "context_noise": float(getattr(batch, "context_noise", 128)),
                     "window_size_t": int(getattr(batch, "window_size_t", 6)),
                     "sink_size_t": int(getattr(batch, "sink_size_t", 0)),
                 },
@@ -835,9 +838,7 @@ class OmniDreamsBeforeDenoisingStage(PipelineStage):
         rc.clear()
         rc["rope"] = rope
         rc["text_embeds"] = text_embeds.detach()
-        rc["image_token"] = (
-            image_token.detach() if image_token is not None else None
-        )
+        rc["image_token"] = image_token.detach() if image_token is not None else None
         rc["image_full"] = image_full
         rc["inject_mask"] = inject_mask
         rc["cond_mask_c0"] = cond_mask_c0
@@ -1266,13 +1267,18 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     ckpt_dir = model_path
                 fp8_prepared_path = os.path.join(ckpt_dir, "omnidreams_fp8_dit.pt")
             # Cache: skip reload if weights already dequantized on a prior call.
-            already_loaded = getattr(self.transformer, "_weight_only_fp8_applied", False)
+            already_loaded = getattr(
+                self.transformer, "_weight_only_fp8_applied", False
+            )
             if already_loaded:
-                logger.debug("OmniDreams: weight_only_fp8 weights already loaded, skipping.")
+                logger.debug(
+                    "OmniDreams: weight_only_fp8 weights already loaded, skipping."
+                )
             elif fp8_prepared_path and os.path.exists(fp8_prepared_path):
                 from sglang.multimodal_gen.runtime.models.dits.omnidreams_fp8 import (
                     dequantize_fp8_weights_to_bf16,
                 )
+
                 payload = torch.load(
                     fp8_prepared_path, map_location="cpu", weights_only=True
                 )
@@ -1322,17 +1328,15 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             # Self-attn backend: explicit env override wins, else config field.
             # (envs.SGLANG_OMNIDREAMS_ATTN_BACKEND defaults to "sdpa", so read the
             # raw env var to distinguish "unset" from "explicitly sdpa".)
-            attn_backend = os.environ.get(
-                "SGLANG_OMNIDREAMS_ATTN_BACKEND"
-            ) or getattr(config, "omnidreams_attn_backend", "sdpa")
+            attn_backend = os.environ.get("SGLANG_OMNIDREAMS_ATTN_BACKEND") or getattr(
+                config, "omnidreams_attn_backend", "sdpa"
+            )
             if not installed:
                 attn_backend = "sdpa"
             for block in self.transformer.blocks:
                 block.self_attn._attn_backend = attn_backend
             if installed:
-                logger.info(
-                    "OmniDreams: fp8_compute active (attn=%s).", attn_backend
-                )
+                logger.info("OmniDreams: fp8_compute active (attn=%s).", attn_backend)
             elif device.type == "cuda":
                 logger.info(
                     "OmniDreams: fp8_compute requested but unavailable; eager bf16."
@@ -1374,7 +1378,9 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                     self.encoder,
                     cache=hdmap_encode_cache,
                     is_first_chunk=is_first,
-                ).to(dit_dtype)  # [B,16,len_t,h,w]
+                ).to(
+                    dit_dtype
+                )  # [B,16,len_t,h,w]
                 hdmap_chunk = self.transformer.patchify(chunk_latent)
             elif st["hdmap_tokens"] is not None:
                 hdmap_chunk = st["hdmap_tokens"][chunk_idx].to(
@@ -1391,9 +1397,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             # replays for every chunk after.
             for c in caches:
                 c.before_update(chunk_idx)
-            steady_now = (
-                cuda_graph_runner is not None and caches[0].is_steady_state()
-            )
+            steady_now = cuda_graph_runner is not None and caches[0].is_steady_state()
 
             def _call_dit(hidden_states, timestep):
                 if steady_now:
@@ -1466,9 +1470,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
     # Realtime (streaming) path                                          #
     # ------------------------------------------------------------------ #
     @torch.no_grad()
-    def _realtime_denoise_forward(
-        self, batch: Req, server_args: ServerArgs
-    ) -> Req:
+    def _realtime_denoise_forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Process exactly one AR chunk per call using persistent session state.
 
         Numerical parity invariant: the per-chunk body (BlockKVCache
@@ -1489,14 +1491,10 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         transformer_use = None
         encoder_use = None
         if residency_manager is not None:
-            transformer_use = self._declared_component_use(
-                component_name="transformer"
-            )
+            transformer_use = self._declared_component_use(component_name="transformer")
             residency_manager.begin_use(transformer_use, self.transformer)
             if self.encoder is not None:
-                encoder_use = self._declared_component_use(
-                    component_name="encoder"
-                )
+                encoder_use = self._declared_component_use(component_name="encoder")
                 residency_manager.begin_use(encoder_use, self.encoder)
 
         try:
@@ -1612,13 +1610,10 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
             # Initialize the persistent HD-map streaming encode cache (per-frame
             # video path only) once per session.
-            if (
-                st.get("hdmap_pixel") is not None
-                and hasattr(self.encoder, "initialize_ar_encode_cache")
+            if st.get("hdmap_pixel") is not None and hasattr(
+                self.encoder, "initialize_ar_encode_cache"
             ):
-                rc["hdmap_encode_cache"] = (
-                    self.encoder.initialize_ar_encode_cache()
-                )
+                rc["hdmap_encode_cache"] = self.encoder.initialize_ar_encode_cache()
 
             # FP8 weight-only mode: dequantize once on the first chunk (same
             # logic as the offline path; the result persists on self.transformer
@@ -1655,9 +1650,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
                 .expand(B, -1)
             )
 
-        ctx_noise_t = torch.tensor(
-            context_noise, device=device, dtype=dit_dtype
-        )
+        ctx_noise_t = torch.tensor(context_noise, device=device, dtype=dit_dtype)
 
         # CUDA-graph + FP8 mode resolution (same as offline). cuda_graph_runner
         # and fp8 state persist as instance attrs; in realtime the steady-state
@@ -1670,6 +1663,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         mode = getattr(config, "native_dit_acceleration", "disabled")
         if mode in ("weight_only_fp8", "fp8_compute"):
             use_cuda_graph = False
+
         # Per-call runner: in realtime we cannot persist a captured graph
         # across calls via a local closure (the captured graph references the
         # call-scoped caches/text tensors which are now session-persistent, so
@@ -1750,9 +1744,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         # Roll the per-block KV window BEFORE deciding capture eligibility.
         for c in caches:
             c.before_update(chunk_idx)
-        steady_now = (
-            cuda_graph_runner is not None and caches[0].is_steady_state()
-        )
+        steady_now = cuda_graph_runner is not None and caches[0].is_steady_state()
 
         def _call_dit(hidden_states, timestep):
             if steady_now:
@@ -1804,9 +1796,7 @@ class OmniDreamsDenoisingStage(DenoisingStage):
 
         return batch
 
-    def _maybe_load_weight_only_fp8(
-        self, batch: Req, server_args: ServerArgs
-    ) -> None:
+    def _maybe_load_weight_only_fp8(self, batch: Req, server_args: ServerArgs) -> None:
         """Dequantize FP8 weights into the DiT once (weight_only_fp8 mode).
 
         Extracted from the offline forward; idempotent via the
@@ -1869,17 +1859,15 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         )
 
         installed = install_fp8_compute_on_dit(self.transformer)
-        attn_backend = os.environ.get(
-            "SGLANG_OMNIDREAMS_ATTN_BACKEND"
-        ) or getattr(config, "omnidreams_attn_backend", "sdpa")
+        attn_backend = os.environ.get("SGLANG_OMNIDREAMS_ATTN_BACKEND") or getattr(
+            config, "omnidreams_attn_backend", "sdpa"
+        )
         if not installed:
             attn_backend = "sdpa"
         for block in self.transformer.blocks:
             block.self_attn._attn_backend = attn_backend
         if installed:
-            logger.info(
-                "OmniDreams: fp8_compute active (attn=%s).", attn_backend
-            )
+            logger.info("OmniDreams: fp8_compute active (attn=%s).", attn_backend)
         elif device.type == "cuda":
             logger.info(
                 "OmniDreams: fp8_compute requested but unavailable; eager bf16."
@@ -1901,13 +1889,9 @@ class OmniDreamsDenoisingStage(DenoisingStage):
         if self.vae is None:
             return  # decoder not wired (e.g. LightTAE path handles decode elsewhere)
 
-        decode_state = batch.session.get_or_create_state(
-            RealtimeCausalDecodeState
-        )
+        decode_state = batch.session.get_or_create_state(RealtimeCausalDecodeState)
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        self.vae = self.vae.to(
-            device=get_local_torch_device(), dtype=vae_dtype
-        )
+        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
         latents = batch.latents.to(get_local_torch_device())
 
         # Reset the causal VAE conv cache on the first chunk so the streaming
@@ -2034,7 +2018,9 @@ class OmniDreamsDenoisingStage(DenoisingStage):
             if isinstance(sample, torch.Tensor):
                 # [C, T, H, W] -> [T, H, W, C] uint8
                 arr = (
-                    (sample * 255).clamp(0, 255).to(torch.uint8)
+                    (sample * 255)
+                    .clamp(0, 255)
+                    .to(torch.uint8)
                     .permute(1, 2, 3, 0)
                     .contiguous()
                     .cpu()

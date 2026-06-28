@@ -50,16 +50,17 @@ def test_fp8_linear_keys_compatible_with_sglang_dit():
     sgl_keys = set(dit.state_dict().keys())
     # Q/K/V are fused into a single to_qkv.weight (post-4be84c0c3).
     for i in range(28):
-        assert f"blocks.{i}.self_attn.to_qkv.weight" in sgl_keys, (
-            f"blocks.{i}.self_attn.to_qkv.weight missing from state dict"
-        )
+        assert (
+            f"blocks.{i}.self_attn.to_qkv.weight" in sgl_keys
+        ), f"blocks.{i}.self_attn.to_qkv.weight missing from state dict"
     # The FP8 quantizer operates on un-fused per-projection keys (q_proj, k_proj,
     # v_proj) while SGLang's DiT fuses them into to_qkv.  The quantizer will fuse
     # them internally; we check that all non-self-attn-proj keys match the SGLang
     # state dict.
     req = set(cosmos_block_fp8_linear_keys(28))
     non_self_attn_proj = {
-        k for k in req
+        k
+        for k in req
         if "qkv_proj" not in k
         and not any(k.endswith(f"{x}_proj.weight") for x in ("q", "k", "v"))
     }
@@ -81,10 +82,18 @@ def _fake_fused_dit_state_dict(num_blocks: int, *, qdim: int = 64, inner: int = 
         k = torch.randn(inner, qdim, dtype=torch.bfloat16)
         v = torch.randn(inner, qdim, dtype=torch.bfloat16)
         sd[p + "self_attn.to_qkv.weight"] = torch.cat([q, k, v], dim=0).contiguous()
-        sd[p + "self_attn.output_proj.weight"] = torch.randn(qdim, inner, dtype=torch.bfloat16)
-        sd[p + "cross_attn.q_proj.weight"] = torch.randn(inner, qdim, dtype=torch.bfloat16)
-        sd[p + "cross_attn.to_kv.weight"] = torch.randn(2 * inner, qdim, dtype=torch.bfloat16)
-        sd[p + "cross_attn.output_proj.weight"] = torch.randn(qdim, inner, dtype=torch.bfloat16)
+        sd[p + "self_attn.output_proj.weight"] = torch.randn(
+            qdim, inner, dtype=torch.bfloat16
+        )
+        sd[p + "cross_attn.q_proj.weight"] = torch.randn(
+            inner, qdim, dtype=torch.bfloat16
+        )
+        sd[p + "cross_attn.to_kv.weight"] = torch.randn(
+            2 * inner, qdim, dtype=torch.bfloat16
+        )
+        sd[p + "cross_attn.output_proj.weight"] = torch.randn(
+            qdim, inner, dtype=torch.bfloat16
+        )
         sd[p + "mlp.layer1.weight"] = torch.randn(inner * 2, qdim, dtype=torch.bfloat16)
         sd[p + "mlp.layer2.weight"] = torch.randn(qdim, inner * 2, dtype=torch.bfloat16)
         sd[p + "self_attn.q_norm.weight"] = torch.ones(inner, dtype=torch.bfloat16)
@@ -108,7 +117,9 @@ def test_prepare_fp8_dit_weights_unfuses_to_qkv_into_qkv_proj():
     nb = 2
     inner = 48  # matches _fake_fused_dit_state_dict default
     sd = _fake_fused_dit_state_dict(nb)
-    fused_snapshot = {i: sd[f"blocks.{i}.self_attn.to_qkv.weight"].clone() for i in range(nb)}
+    fused_snapshot = {
+        i: sd[f"blocks.{i}.self_attn.to_qkv.weight"].clone() for i in range(nb)
+    }
 
     out = prepare_fp8_dit_weights(sd, num_blocks=nb, linear_policy="all")
 
@@ -125,10 +136,9 @@ def test_prepare_fp8_dit_weights_unfuses_to_qkv_into_qkv_proj():
             assert f"blocks.{i}.self_attn.{rel}.weight" not in out
         # dequant recovers the original to_qkv within e4m3 precision, with the
         # q/k/v shard boundaries intact (q rows 0..inner, k inner..2*inner, ...).
-        deq = (
-            out[qk].view(torch.float8_e4m3fn).to(torch.float32)
-            * out[sk].to(torch.float32).unsqueeze(1)
-        )
+        deq = out[qk].view(torch.float8_e4m3fn).to(torch.float32) * out[sk].to(
+            torch.float32
+        ).unsqueeze(1)
         orig = fused_snapshot[i].to(torch.float32)
         assert (deq - orig).abs().max().item() < 1.0, f"block {i} dequant drift"
         assert torch.allclose(deq[:inner], orig[:inner], atol=1.0)
@@ -161,7 +171,9 @@ def test_prepare_fp8_dit_weights_unfused_matches_split_path_bytes():
             assert torch.equal(a, b), f"fp8 byte mismatch: {key}"
             sk = key + "_scale"
             if sk in got_fused:
-                assert torch.equal(got_fused[sk], got_split[sk]), f"scale mismatch: {sk}"
+                assert torch.equal(
+                    got_fused[sk], got_split[sk]
+                ), f"scale mismatch: {sk}"
 
 
 # --------------------------------------------------------------------------- #
@@ -419,8 +431,9 @@ def test_vae_encoder_wanvae_setup_routes_and_threads_latents():
     )
 
     cfg = OmniDreamsVAEEncoderConfig(impl="wanvae", model_path="/fake/model")
-    with patch.object(comp, "resolve_wan_vae_path", return_value="/fake/vae") as rp, \
-         patch.object(comp, "load_wan_vae", return_value=MagicMock()) as lw:
+    with patch.object(
+        comp, "resolve_wan_vae_path", return_value="/fake/vae"
+    ) as rp, patch.object(comp, "load_wan_vae", return_value=MagicMock()) as lw:
         cfg.setup()
     rp.assert_called_once()
     lw.assert_called_once()
@@ -439,8 +452,9 @@ def test_vae_encoder_wanvae_setup_honors_explicit_checkpoint_path():
     )
 
     cfg = OmniDreamsVAEEncoderConfig(impl="wanvae", checkpoint_path="/explicit/vae")
-    with patch.object(comp, "resolve_wan_vae_path") as rp, \
-         patch.object(comp, "load_wan_vae", return_value=MagicMock()) as lw:
+    with patch.object(comp, "resolve_wan_vae_path") as rp, patch.object(
+        comp, "load_wan_vae", return_value=MagicMock()
+    ) as lw:
         cfg.setup()
     rp.assert_not_called()
     assert lw.call_args.args[1] == "/explicit/vae"

@@ -609,9 +609,11 @@ def prepare_cosmos_quantized_streaming_weights(
     if device is not None:
         target_device = torch.device(device)
         quantized = {
-            key: value.to(device=target_device).contiguous()
-            if isinstance(value, torch.Tensor)
-            else value
+            key: (
+                value.to(device=target_device).contiguous()
+                if isinstance(value, torch.Tensor)
+                else value
+            )
             for key, value in quantized.items()
         }
     else:
@@ -821,6 +823,7 @@ def move_cosmos_fp8_weights_(
         value = weights.get(key)
         if isinstance(value, torch.Tensor):
             weights[key] = value.to(device=target).contiguous()
+
 
 # ============================================================================
 # Cosmos streaming weight prep (folded from omnidreams_cosmos_weights.py)

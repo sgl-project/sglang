@@ -44,8 +44,8 @@ from sglang.multimodal_gen.runtime.models.dits.omnidreams import (
     OmniDreamsDiT,
     TimestepEmbedding,
     Timesteps,
+    rope_dims,
 )
-from sglang.multimodal_gen.runtime.models.dits.omnidreams import rope_dims
 from sglang.multimodal_gen.runtime.models.encoders.omnidreams_text import (
     COSMOS_REASON1_HIDDEN,
 )
@@ -55,7 +55,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.o
     OmniDreamsBeforeDenoisingStage,
 )
 
-_KEY_FIXTURE = os.path.join(os.path.dirname(__file__), "data", "omnidreams_dit_keys.txt")
+_KEY_FIXTURE = os.path.join(
+    os.path.dirname(__file__), "data", "omnidreams_dit_keys.txt"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -339,9 +341,7 @@ def test_load_wan_vae_raises_helpful_error_on_key_mismatch(tmp_path, monkeypatch
     save_file({"original_wan_key": torch.zeros(1)}, str(f))
 
     with pytest.raises(RuntimeError, match="diffusers format"):
-        load_wan_vae(
-            object(), str(f), torch.device("cpu"), torch.float32
-        )
+        load_wan_vae(object(), str(f), torch.device("cpu"), torch.float32)
 
 
 # --------------------------------------------------------------------------- #
