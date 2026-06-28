@@ -268,7 +268,6 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
             head_dim=cfg.head_dim,
             swa_attention_layer_ids=cfg.non_full_layer_ids,
             full_attention_layer_ids=cfg.full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
         )
         allocator = SWATokenToKVPoolAllocator(
@@ -288,7 +287,6 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
             head_num=cfg.head_num,
             head_dim=cfg.head_dim,
             full_attention_layer_ids=cfg.full_attention_layer_ids,
-            enable_kvcache_transpose=False,
             device=device,
             enable_memory_saver=False,
             mamba_pool=req_to_token_pool.mamba_pool,
