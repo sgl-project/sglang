@@ -156,7 +156,48 @@ sgl-eval run aime25 \\
       ],
     },
 
-    // ----- Card 5: "Hierarchical KV Cache" -----
+    // ----- Card 5: "PD Disaggregation" -----
+    // GLM-5.2 is a DSA model (same family as DeepSeek-V3.2/V4) and supports
+    // prefill/decode disaggregation. Owns the `--disaggregation-*` flags; the
+    // engine also pins role-specific serving ports (spaced apart) so prefill +
+    // decode don't collide on one host.
+    pdDisagg: {
+      modes: [
+        { id: "off",     label: "Off" },
+        { id: "prefill", label: "Prefill role" },
+        { id: "decode",  label: "Decode role" },
+      ],
+      transferBackends: [
+        // Mooncake (recommended). The NCCL/MNNVL env is only needed on the
+        // NVLink-multinode Grace-Blackwell platform (GB300 here).
+        { id: "mooncake", label: "Mooncake",
+          env: [
+            "NCCL_MNNVL_ENABLE=1",
+            "NCCL_CUMEM_ENABLE=1",
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+            "MC_FORCE_MNNVL=1",
+          ],
+          envWhen: { hw: ["gb300"] } },
+        { id: "nixl",     label: "NiXL" },
+      ],
+      // No IB-device knob: mooncake auto-detects the HCA. Pass
+      // --disaggregation-ib-device only if discovery picks the wrong NIC
+      // (see Configuration Tips).
+      // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
+      router: {
+        port: 8000,
+        command:
+`python3 -m sglang_router.launch_router \\
+  --pd-disaggregation \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
+  --disable-circuit-breaker \\
+  --health-check-interval-secs 999999`,
+      },
+    },
+
+    // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
       backends: [
         { id: null,       label: "Auto" },
