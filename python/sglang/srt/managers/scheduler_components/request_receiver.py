@@ -256,6 +256,18 @@ class SchedulerRequestReceiver:
                 and has_shm_features(recv_reqs)
             ):
                 barrier(group=self.tp_cpu_group)
+            elif (
+                    self.server_args.enable_dp_attention
+                    and self.model_config.is_multimodal
+                    and has_shm_features(recv_reqs)
+            ):
+                # Under disagg_prefill, there is no subsequent control_reqs broadcast
+                # on tp_cpu_group to act as an implicit barrier, so we must explicitly
+                # synchronize after each broadcast layer before calling shm_unlink.
+                if self.ps.attn_tp_size > 1:
+                    barrier(group=self.attn_tp_cpu_group)
+                if self.ps.attn_cp_size > 1:
+                    barrier(group=self.attn_cp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
 
