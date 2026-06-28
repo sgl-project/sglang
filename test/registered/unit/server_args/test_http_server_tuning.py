@@ -96,6 +96,74 @@ class TestKeepAliveResolution(unittest.TestCase):
         self.assertEqual(self._resolve(args), envs.SGLANG_TIMEOUT_KEEP_ALIVE.get())
 
 
+class TestUvicornWiring(unittest.TestCase):
+    # Verify the uvicorn-side tuning kwargs flow through to uvicorn.run.
+    # Granian-side wiring is covered by TestGranianHttp2Settings below.
+    # _run_setup mocks uvicorn.run + skips _execute_server_warmup so we
+    # can inspect the kwargs without actually starting a server.
+
+    @staticmethod
+    def _run_setup(server_args, mock_uvicorn_run):
+        from sglang.srt.entrypoints.http_server import _setup_and_run_http_server
+
+        # _setup_and_run_http_server tries to set up logging + middleware
+        # before calling uvicorn. Stub out the pieces we don't care about.
+        with patch("uvicorn.run", mock_uvicorn_run), patch(
+            "sglang.srt.entrypoints.http_server.set_global_state"
+        ), patch(
+            "sglang.srt.entrypoints.http_server.set_uvicorn_logging_configs"
+        ), patch(
+            "sglang.srt.entrypoints.http_server.add_prometheus_track_response_middleware"
+        ):
+            try:
+                _setup_and_run_http_server(
+                    server_args,
+                    tokenizer_manager=None,
+                    template_manager=None,
+                    port_args=None,
+                    scheduler_infos=[{}],
+                    subprocess_watchdog=None,
+                )
+            except Exception:
+                # The test only cares about the kwargs at the uvicorn.run
+                # boundary; any post-call exception is irrelevant.
+                pass
+
+    def test_default_no_flags_set(self):
+        from unittest.mock import MagicMock
+
+        args = ServerArgs(model_path="dummy")
+        mock = MagicMock()
+        self._run_setup(args, mock)
+        self.assertTrue(mock.called)
+        kwargs = mock.call_args.kwargs
+        # Default behavior: keep-alive from env (65 with new default),
+        # backlog=2048, no limit_concurrency or timeout_graceful_shutdown.
+        self.assertEqual(kwargs["timeout_keep_alive"], 65)
+        self.assertEqual(kwargs["backlog"], 2048)
+        self.assertNotIn("limit_concurrency", kwargs)
+        self.assertNotIn("timeout_graceful_shutdown", kwargs)
+
+    def test_all_uvicorn_flags_threaded_through(self):
+        from unittest.mock import MagicMock
+
+        args = ServerArgs(
+            model_path="dummy",
+            timeout_keep_alive=120,
+            http_backlog=4096,
+            http_limit_concurrency=500,
+            http_timeout_graceful_shutdown=30,
+        )
+        mock = MagicMock()
+        self._run_setup(args, mock)
+        self.assertTrue(mock.called)
+        kwargs = mock.call_args.kwargs
+        self.assertEqual(kwargs["timeout_keep_alive"], 120)
+        self.assertEqual(kwargs["backlog"], 4096)
+        self.assertEqual(kwargs["limit_concurrency"], 500)
+        self.assertEqual(kwargs["timeout_graceful_shutdown"], 30)
+
+
 @unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
 class TestGranianHttp2Settings(unittest.TestCase):
     # Regression guard: Granian's HTTP/2 tunables go through
