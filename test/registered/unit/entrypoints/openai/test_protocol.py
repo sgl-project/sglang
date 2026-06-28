@@ -179,6 +179,20 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
 
+    def test_chat_completion_tito_extensions(self):
+        """Test chat completion with pre-tokenized prompt extensions."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            input_ids=[101, 102, 103],
+            return_prompt_token_ids=True,
+            return_meta_info=True,
+        )
+        self.assertEqual(request.input_ids, [101, 102, 103])
+        self.assertTrue(request.return_prompt_token_ids)
+        self.assertTrue(request.return_meta_info)
+
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -370,6 +384,28 @@ class TestModelSerialization(unittest.TestCase):
         data = response.model_dump(exclude_none=True)
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
+
+    def test_prompt_token_ids_and_meta_info_serialization(self):
+        """Test that prompt_token_ids and meta_info serialize only when set."""
+        default_choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+        )
+        default_data = default_choice.model_dump()
+        self.assertNotIn("prompt_token_ids", default_data)
+        self.assertNotIn("meta_info", default_data)
+
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+            prompt_token_ids=[1, 2, 3],
+            meta_info={"prompt_tokens": 3},
+        )
+        data = choice.model_dump()
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
 
 
 class TestFunctionDeferLoading(unittest.TestCase):

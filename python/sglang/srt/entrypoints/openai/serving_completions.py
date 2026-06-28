@@ -130,6 +130,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
         )
 
         return adapted_request, request
@@ -164,9 +165,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
+            json_schema = request.response_format.json_schema
+            schema = getattr(json_schema, "schema_", None)
+            if schema is None:
+                raise ValueError(
+                    "schema_ is required for json_schema response format request."
+                )
+            sampling_params["json_schema"] = convert_json_schema_to_str(schema)
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif (

@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from sglang.multimodal_gen.configs.models.fsdp import (
@@ -14,10 +15,17 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
+    SanaWMPipelineConfig,
+    SanaWMRealtimeConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_2_TI2V_5B_Config,
@@ -38,12 +46,62 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
+@contextmanager
+def _mock_cuda_platform(
+    *,
+    memory_gb: int = 80,
+    available_memory_gb: int | dict[int, int] | None = None,
+):
+    def get_available_gpu_memory(device_id=0, **_kwargs):
+        if isinstance(available_memory_gb, dict):
+            return available_memory_gb[device_id]
+        if available_memory_gb is not None:
+            return available_memory_gb
+        return memory_gb
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
+            return_value=False,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
+            return_value=True,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
+            return_value=memory_gb * 1024**3,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
+            side_effect=get_available_gpu_memory,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_for_wan_by_default",
+            return_value=True,
+        ),
+    ):
+        yield
+
+
+def _from_dict_without_model_resolution(
+    kwargs, pipeline_config: PipelineConfig | None = None
+):
+    pipeline_config = pipeline_config or QwenImagePipelineConfig()
+    with (
+        patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+        _mock_cuda_platform(),
+    ):
+        return ServerArgs.from_dict(kwargs)
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
-        with patch.object(
-            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-        ):
-            return ServerArgs.from_dict(kwargs)
+        return _from_dict_without_model_resolution(kwargs)
 
     def test_tilde_model_path_is_expanded(self):
         args = self._from_dict_without_model_resolution(
@@ -441,6 +499,155 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertFalse(server_args.server_warmup)
 
 
+class TestWarmupModeNormalization(unittest.TestCase):
+    """`_adjust_warmup` resolves the canonical warmup_mode and its derived booleans."""
+
+    def _resolve(
+        self,
+        *,
+        warmup_mode=None,
+        warmup=False,
+        server_warmup=False,
+        warmup_resolutions=None,
+        disagg_role=None,
+        explicit=(),
+    ):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.warmup_mode = warmup_mode
+        sa.warmup = warmup
+        sa.server_warmup = server_warmup
+        sa.warmup_resolutions = warmup_resolutions
+        sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
+        sa._explicit_arg_names = set(explicit)
+        sa._adjust_warmup()
+        return sa
+
+    def test_explicit_mode_off_disables_all(self):
+        sa = self._resolve(warmup_mode="off", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_mode_request(self):
+        sa = self._resolve(warmup_mode="request", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_mode_server(self):
+        sa = self._resolve(warmup_mode="server", explicit=("warmup_mode",))
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_explicit_mode_overrides_explicit_legacy(self):
+        sa = self._resolve(
+            warmup_mode="request",
+            warmup=True,
+            server_warmup=True,
+            explicit=("warmup_mode", "warmup", "server_warmup"),
+        )
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_explicit_legacy_false_beats_defaulted_mode(self):
+        # serve defaults warmup_mode="server" (not explicit); `--warmup false` wins.
+        sa = self._resolve(
+            warmup_mode="server",
+            warmup=False,
+            server_warmup=False,
+            explicit=("warmup",),
+        )
+        self.assertEqual(sa.warmup_mode, "off")
+        self.assertFalse(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_defaulted_mode_applies_without_legacy_flags(self):
+        # bare `sglang serve`: warmup_mode="server" defaulted, no legacy override.
+        sa = self._resolve(warmup_mode="server")
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_legacy_only_maps_to_request(self):
+        sa = self._resolve(warmup_mode=None, warmup=True, explicit=("warmup",))
+        self.assertEqual(sa.warmup_mode, "request")
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+
+    def test_resolutions_force_warmup_on(self):
+        sa = self._resolve(
+            warmup_mode="off",
+            warmup_resolutions=["512x512"],
+            explicit=("warmup_mode",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_legacy_warmup_on_uses_defaulted_server_mode(self):
+        # `serve --warmup` (legacy ON, mode defaulted to "server" but not
+        # explicit) must resolve to server-based warmup, not silently downgrade
+        # to request mode.
+        sa = self._resolve(warmup_mode="server", warmup=True, explicit=("warmup",))
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_legacy_warmup_with_resolutions_runs_server_warmup(self):
+        # Dead-zone regression: `serve --warmup --warmup-resolutions X` must run
+        # server-based (synthetic) warmup, not end up with no warmup at all
+        # (request-based warmup bails out when warmup_resolutions is set).
+        sa = self._resolve(
+            warmup_mode="server",
+            warmup=True,
+            warmup_resolutions=["1024x1024"],
+            explicit=("warmup",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "server")
+
+    def test_disagg_role_disables_server_warmup(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        sa = self._resolve(
+            warmup_mode="server",
+            disagg_role=RoleType.DENOISER,
+            explicit=("warmup_mode",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertFalse(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_invalid_mode_raises(self):
+        with self.assertRaises(ValueError):
+            self._resolve(warmup_mode="bogus", explicit=("warmup_mode",))
+
+
+class TestWarmupImageIsModelValid(unittest.TestCase):
+    """The server-warmup placeholder image must be large enough for real pipelines."""
+
+    def test_minimum_warmup_image_is_at_least_64px(self):
+        import base64
+        import struct
+
+        from sglang.multimodal_gen.runtime.server_warmup import (
+            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+        )
+
+        payload = MINIMUM_PICTURE_BASE64_FOR_WARMUP.split(",", 1)[-1]
+        raw = base64.b64decode(payload)
+        self.assertEqual(raw[:8], b"\x89PNG\r\n\x1a\n")
+        # IHDR width/height are the two big-endian uint32 after the chunk header.
+        width, height = struct.unpack(">II", raw[16:24])
+        self.assertGreaterEqual(width, 64)
+        self.assertGreaterEqual(height, 64)
+
+
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_pipeline_config(
         self,
@@ -559,7 +766,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["image_encoder", "vae"])
 
-    def test_layerwise_components_disable_matching_cpu_offloads(self):
+    def test_layerwise_components_disable_matching_non_dit_cpu_offloads(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,
@@ -580,10 +787,33 @@ class TestOffloadDefaults(unittest.TestCase):
         args._adjust_layerwise_offload_components()
 
         self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.dit_cpu_offload)
+        # dit_cpu_offload is complementary to DiT layerwise offload (keeps
+        # weights off-device during load), so it must be preserved here.
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
+
+    def test_dit_layerwise_offload_preserves_dit_cpu_offload(self):
+        """Combining --dit-cpu-offload with --dit-layerwise-offload must keep both on.
+
+        dit_cpu_offload controls initial residency (host memory), while
+        dit_layerwise_offload only swaps layers on/off device at inference.
+        Force-disabling dit_cpu_offload here would push the full DiT to GPU at
+        load time and OOM low-VRAM cards.
+        """
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2I,
+            memory_gb=32,
+            kwargs={
+                "dit_cpu_offload": True,
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
@@ -591,6 +821,8 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        ltx23_config = LTX23PipelineConfig()
+        sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
@@ -611,6 +843,91 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+        self.assertEqual(
+            ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1), (8, 1))
+        )
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(4), 1)
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(8), 1)
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(2), 2)
+        self.assertFalse(
+            LTX2PipelineConfig().dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
+        self.assertFalse(
+            ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
+
+        self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
+        self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
+
+    def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMPipelineConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_cache_dit_rejects_explicit_fsdp(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            with self.assertRaisesRegex(ValueError, "FSDP inference"):
+                self._from_dict_with_pipeline_config(
+                    SanaWMPipelineConfig(),
+                    kwargs={
+                        "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                        "num_gpus": 2,
+                        "use_fsdp_inference": True,
+                    },
+                )
+
+    def test_cache_dit_auto_disables_implicit_fsdp(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            args = self._from_dict_with_pipeline_config(
+                SanaWMPipelineConfig(),
+                kwargs={
+                    "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
+        args = self._from_dict_with_pipeline_config(
+            SanaWMRealtimeConfig(),
+            kwargs={
+                "model_path": "Efficient-Large-Model/SANA-WM_streaming",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
+
+    def test_auto_ltx23_large_gpu_counts_prefer_sp_over_cfg_parallel(self):
+        for num_gpus in (4, 8):
+            with self.subTest(num_gpus=num_gpus):
+                args = self._from_dict_with_pipeline_config(
+                    LTX2PipelineConfig(),
+                    kwargs={
+                        "model_path": "Lightricks/LTX-2.3",
+                        "num_gpus": num_gpus,
+                        "performance_mode": "auto",
+                    },
+                )
+
+                self.assertFalse(args.enable_cfg_parallel)
+                self.assertEqual(args.cfg_parallel_degree, 1)
+                self.assertEqual(args.sp_degree, num_gpus)
+                self.assertEqual(args.ulysses_degree, num_gpus)
+                self.assertEqual(args.ring_degree, 1)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
@@ -648,7 +965,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_ltx_snapshot_keeps_dit_offload_and_replaces_encoder_cpu_offload(
+    def test_auto_ltx_original_replaces_component_cpu_offload(
         self,
     ):
         args = self._from_dict_with_pipeline_config(
@@ -657,13 +974,12 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
                 "pipeline_class_name": "LTX2TwoStageHQPipeline",
-                "ltx2_two_stage_device_mode": "snapshot",
                 "performance_mode": "auto",
             },
         )
 
-        self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
+        self.assertFalse(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -704,7 +1020,10 @@ class TestOffloadDefaults(unittest.TestCase):
 
                 self.assertTrue(args.layerwise_offload_components)
                 self.assertFalse(args.use_fsdp_inference)
-                self.assertFalse(args.dit_cpu_offload)
+                # dit_cpu_offload is complementary to DiT layerwise offload:
+                # layerwise only moves layers on/off device at runtime, while
+                # dit_cpu_offload keeps the initial weights on host memory.
+                self.assertTrue(args.dit_cpu_offload)
                 self.assertFalse(args.text_encoder_cpu_offload)
                 self.assertFalse(args.image_encoder_cpu_offload)
                 self.assertEqual(args.dit_offload_prefetch_size, 2)
@@ -744,7 +1063,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -839,7 +1158,9 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.dit_cpu_offload)
+        # dit_cpu_offload defaults to True from _adjust_offload and is now
+        # preserved alongside DiT layerwise offload (the two are complementary).
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
     def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
@@ -875,7 +1196,7 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertTrue(args.text_encoder_cpu_offload)
         self.assertTrue(args.image_encoder_cpu_offload)
@@ -935,6 +1256,25 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_ltx23_snapshot_device_mode_is_deprecated_alias_for_original(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            memory_gb=140,
+            available_memory_gb=134,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+                "ltx2_two_stage_device_mode": "snapshot",
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
@@ -1124,7 +1464,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.layerwise_offload_components)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
@@ -1203,6 +1543,49 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(server_args.use_fsdp_inference)
         self.assertFalse(server_args.enable_cfg_parallel)
 
+    def test_ltx23_snapshot_device_mode_cli_alias_is_accepted(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Lightricks/LTX-2.3",
+            "--pipeline-class-name",
+            "LTX2TwoStagePipeline",
+            "--ltx2-two-stage-device-mode",
+            "snapshot",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=140 * 1024**3,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                return_value=134,
+            ),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
+
 
 class TestFSDPShardConditions(unittest.TestCase):
     def test_helpers_match_only_direct_block_entries(self):
@@ -1267,6 +1650,10 @@ class TestModelIdResolution(unittest.TestCase):
         info = _get_config_info(path)
         self.assertIsNotNone(info)
 
+    def test_sana_wm_model_path_resolves_registry(self):
+        info = _get_config_info("Efficient-Large-Model/SANA-WM_bidirectional")
+        self.assertIs(info.pipeline_config_cls, SanaWMPipelineConfig)
+
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection
         # with an unresolvable path, expect RuntimeError from the detector step
@@ -1278,10 +1665,7 @@ class TestPerRoleParallelism(unittest.TestCase):
     """Test per-role parallelism args and get_role_parallelism helper."""
 
     def _from_dict(self, kwargs):
-        with patch.object(
-            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-        ):
-            return ServerArgs.from_dict(kwargs)
+        return _from_dict_without_model_resolution(kwargs)
 
     def test_defaults_are_none(self):
         args = self._from_dict({"model_path": "/fake"})
@@ -1323,14 +1707,33 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(par["ring_degree"], 2)
 
     def test_decoder_overrides(self):
-        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
+        args = self._from_dict({"model_path": "/fake", "decoder_sp": 2})
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         par = args.get_role_parallelism(RoleType.DECODER)
-        self.assertEqual(par["tp_size"], 2)
-        self.assertIsNone(par["sp_degree"])
+        self.assertIsNone(par["tp_size"])
+        self.assertEqual(par["sp_degree"], 2)
         self.assertIsNone(par["ulysses_degree"])
         self.assertIsNone(par["ring_degree"])
+
+    def test_decoder_tp_is_alias_of_decoder_sp(self):
+        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        self.assertEqual(args.decoder_sp, 2)
+        par = args.get_role_parallelism(RoleType.DECODER)
+        self.assertIsNone(par["tp_size"])
+        self.assertEqual(par["sp_degree"], 2)
+
+    def test_conflicting_decoder_tp_and_decoder_sp_raise(self):
+        with self.assertRaisesRegex(ValueError, "decoder_tp is deprecated"):
+            self._from_dict(
+                {
+                    "model_path": "/fake",
+                    "decoder_tp": 2,
+                    "decoder_sp": 4,
+                }
+            )
 
     def test_monolithic_returns_all_none(self):
         args = self._from_dict({"model_path": "/fake", "encoder_tp": 2})
@@ -1347,14 +1750,72 @@ class TestPerRoleParallelism(unittest.TestCase):
                 "model_path": "/fake",
                 "encoder_tp": 1,
                 "denoiser_tp": 2,
-                "decoder_tp": 4,
+                "decoder_sp": 4,
             }
         )
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         self.assertEqual(args.get_role_parallelism(RoleType.ENCODER)["tp_size"], 1)
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
-        self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["tp_size"], 4)
+        self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
+
+    def test_disagg_args_import_path_stays_compatible(self):
+        from sglang.multimodal_gen.runtime.disaggregation import disagg_args
+        from sglang.multimodal_gen.runtime.server_args_disagg import (
+            DisaggServerArgsMixin,
+        )
+
+        self.assertIs(disagg_args.DisaggArgsMixin, DisaggServerArgsMixin)
+        self.assertIs(
+            disagg_args.DISAGG_RESULT_PORT_OFFSETS,
+            DisaggServerArgsMixin.DISAGG_RESULT_PORT_OFFSETS,
+        )
+
+    def test_gpu_ids_normalize_lists_and_commas(self):
+        args = self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "6", "7 8"]})
+
+        self.assertEqual(args.gpu_ids, [0, 1, 6, 7, 8])
+
+    def test_gpu_ids_reject_duplicates(self):
+        with self.assertRaisesRegex(ValueError, "duplicate GPU ids"):
+            self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "1"]})
+
+    def test_pool_endpoints_use_role_and_scheduler_ports(self):
+        args = self._from_dict(
+            {
+                "model_path": "/fake",
+                "disagg_role": "denoiser",
+                "disagg_server_addr": "tcp://127.0.0.1:30000",
+                "scheduler_port": 5600,
+                "host": "0.0.0.0",
+                "disagg_p2p_hostname": "10.0.0.7",
+            }
+        )
+
+        self.assertEqual(args.derive_pool_result_endpoint(), "tcp://127.0.0.1:30002")
+        self.assertEqual(
+            args.derive_pool_work_endpoint(),
+            f"tcp://0.0.0.0:{args.scheduler_port}",
+        )
+        self.assertEqual(
+            args.derive_pool_control_endpoint(),
+            f"tcp://0.0.0.0:{args.scheduler_port + 1}",
+        )
+        self.assertEqual(
+            args.derive_pool_control_advertised_endpoint(),
+            f"tcp://10.0.0.7:{args.scheduler_port + 1}",
+        )
+
+    def test_pool_result_endpoint_validates_addr_and_role(self):
+        args = self._from_dict({"model_path": "/fake", "disagg_server_addr": "bad"})
+        with self.assertRaisesRegex(ValueError, "disagg_server_addr must be"):
+            args.derive_pool_result_endpoint()
+
+        args = self._from_dict(
+            {"model_path": "/fake", "disagg_server_addr": "127.0.0.1:30000"}
+        )
+        with self.assertRaisesRegex(ValueError, "only defined for encoder"):
+            args.derive_pool_result_endpoint()
 
     def test_cli_args_parsed(self):
         """Per-role parallelism args are parsed from CLI."""
@@ -1373,6 +1834,8 @@ class TestPerRoleParallelism(unittest.TestCase):
             "2",
             "--encoder-tp",
             "1",
+            "--decoder-sp",
+            "8",
         ]
         args, unknown = parser.parse_known_args(argv)
         self.assertEqual(args.denoiser_tp, 2)
@@ -1380,6 +1843,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.denoiser_ulysses, 2)
         self.assertEqual(args.denoiser_ring, 2)
         self.assertEqual(args.encoder_tp, 1)
+        self.assertEqual(args.decoder_sp, 8)
         self.assertIsNone(args.decoder_tp)
 
 
@@ -1397,7 +1861,10 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             "768",
         ]
 
-        with patch.object(sys, "argv", ["sglang"] + argv):
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            _mock_cuda_platform(),
+        ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
@@ -1413,12 +1880,81 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             "true",
         ]
 
-        with patch.object(sys, "argv", ["sglang"] + argv):
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            _mock_cuda_platform(),
+        ):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertTrue(server_args.pipeline_config.disable_autocast)
         self.assertTrue(server_args.disable_autocast)
+
+
+class TestDisaggTimeoutArgs(unittest.TestCase):
+    def test_disagg_defaults_match_reviewed_values(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.disagg_max_slots_per_instance, 8)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 1800)
+        self.assertEqual(args.disagg_timeout, 3600)
+
+    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-downstream-wait-timeout",
+            "45",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
+
+    def test_disagg_timeout_help_uses_current_defaults(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        help_text = parser.format_help()
+
+        self.assertIn("Default: 3600.", help_text)
+        self.assertIn("Default: 1800.", help_text)
+
+    def test_disagg_role_alias_cli_arg_is_accepted(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            ["--model-path", "/fake", "--disagg-role", "denoising"]
+        )
+
+        self.assertEqual(args.disagg_role, "denoising")
+
+    def test_disagg_role_alias_normalizes_to_denoiser(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "disagg_role": "denoising"}
+        )
+
+        self.assertEqual(args.disagg_role, RoleType.DENOISER)
+
+
+class TestDisaggTransferBackendArgs(unittest.TestCase):
+    def test_transfer_backend_defaults_to_auto(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.disagg_transfer_backend, "auto")
+
+    def test_transfer_backend_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-transfer-backend",
+            "mock",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
 if __name__ == "__main__":
