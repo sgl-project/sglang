@@ -18,7 +18,7 @@ classifiers = [
 dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
-  "apache-tvm-ffi==0.1.9",
+  "apache-tvm-ffi==0.1.11",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
@@ -65,7 +65,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-deep-gemm==0.1.3",
+  "sgl-deep-gemm==0.1.4rc0",
   "sglang-kernel==0.4.4",
   "smg-grpc-servicer>=0.5.0",
   "soundfile==0.13.1",
