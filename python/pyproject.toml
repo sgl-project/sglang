@@ -139,6 +139,7 @@ fastokens = [
 test = [
   "accelerate",
   "addict",
+  "auto-round>=0.13.1",
   "bitsandbytes",
   "diff-cover",
   "expecttest",

@@ -34,6 +34,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -187,11 +188,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 if self.model_runner.server_args.speculative_use_rejection_sampling
                 else None
             )
-            _hidden_size = EagleDraftInput.hidden_size_for(self.eagle_worker)
+            _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                model_runner
+            )
             hidden_states = (
                 torch.zeros(
                     (self.max_bs, _hidden_size),
-                    dtype=EagleDraftInput.dtype_for(self.eagle_worker),
+                    dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
                 else None
@@ -564,11 +567,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
             buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
 
+        # Save the raw seq_lens_sum; it is restored after replay. While the graph
+        # runs it must reflect the padded fake rows (set below), since draft decode
+        # backends read seq_lens_sum to size/slice kv_indices.
+        raw_seq_lens_sum = forward_batch.seq_lens_sum
+
         if bs != raw_bs:
             forward_batch.batch_size = bs
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            if raw_seq_lens_sum is not None:
+                forward_batch.seq_lens_sum = (
+                    raw_seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+                )
             if buffers.rids_int is not None and forward_batch.rids_int is not None:
                 forward_batch.rids_int = buffers.rids_int[:bs]
             if (
@@ -617,5 +629,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 ]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
+            forward_batch.seq_lens_sum = raw_seq_lens_sum
 
         return out

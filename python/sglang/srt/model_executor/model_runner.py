@@ -192,6 +192,7 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.state_capturer.routed_experts import (
     RoutedExpertsCapturer,
+    disable_routed_experts_capture_for_draft,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
@@ -374,6 +375,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dcp_size = server_args.dcp_size
+        self.dcp_rank = self.tp_rank % self.dcp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_rank = dp_rank
@@ -532,6 +535,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
+
+        # Set float32 matmul precision
+        if server_args.enable_tf32_matmul:
+            torch.set_float32_matmul_precision("high")
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
@@ -693,6 +700,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.load_model()
         self._prepare_moe_topk()
 
+        # Must run before backend/graph init so no draft graph records a
+        # routed-experts capture-write kernel.
+        if self.is_draft_worker:
+            disable_routed_experts_capture_for_draft(self.model)
+
         # Load the expert backup client
         self.expert_backup_client = (
             ExpertBackupClient(self.server_args, self)
@@ -844,6 +856,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                swap_in_block_size=hisparse_cfg.swap_in_block_size,
             )
 
         self.init_routed_experts_capturer()
@@ -954,6 +967,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
+        if self.is_draft_worker:
+            # Capture is target-only. The draft worker runs in the same process
+            # as its target and inits after it, so installing a capturer here
+            # would overwrite the target's process-global one.
+            return
+
         if not self.server_args.disable_shared_experts_fusion and hasattr(
             self.model, "num_fused_shared_experts"
         ):
@@ -1235,6 +1254,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
+                decode_context_parallel_size=self.dcp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
@@ -1485,6 +1505,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
             )
+
+        self.prefill_aware_swa = (
+            hasattr(self.model, "is_prefill_aware_swa")
+            and self.model.is_prefill_aware_swa()
+        )
 
         self.dtype = self.model_config.dtype
 
@@ -2303,7 +2328,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens
+            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
             return self.max_total_num_tokens
 
@@ -2958,7 +2983,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        if (experts_capturer := get_global_experts_capturer()) is not None:
+        if (
+            not self.is_draft_worker
+            and (experts_capturer := get_global_experts_capturer()) is not None
+        ):
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
@@ -3050,13 +3078,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and get_cp_strategy() is None
             ):
+                category = (
+                    "target_verify"
+                    if forward_batch.forward_mode.is_target_verify()
+                    else "extend"
+                )
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
                 # TODO: device_timer.wrap is too broad here — it also includes
                 # load_batch time. Move timing into the prefill cuda graph runner
                 # to capture only the model.forward part.
                 ctx = (
-                    self.device_timer.wrap(metadata={"category": "extend"})
+                    self.device_timer.wrap(metadata={"category": category})
                     if self.device_timer
                     else contextlib.nullcontext()
                 )

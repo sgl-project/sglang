@@ -18,6 +18,8 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    CachedTokensDetails,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -55,7 +57,7 @@ class SchedulerOutputStreamer:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+    def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
@@ -157,7 +159,6 @@ class SchedulerOutputStreamer:
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
-            has_reqs=bool(reqs),
         )
         if payload is not None:
             self.send_to_detokenizer.send_output(payload)
@@ -202,27 +203,34 @@ class SchedulerOutputStreamer:
                 if phs is not None:
                     has_phs = True
 
-        # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
-        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
-        # *every* entry is non-None (homogeneous batch); mixed batches
-        # (some requests want PHS, others don't) keep the raw list so
-        # positional indexing on the receiver side stays correct.
+        # Optimize pooled hidden states (PHS) for IPC serialization.
+        # Two formats, disambiguated on the receiver side by length:
+        #   Stacked:     [stacked_tensor(N, ...)] — len 1, N > 1 requests
+        #   Non-stacked: [tensor_0, tensor_1, ...] — len == N
+        # Stacking reduces N pickle/__reduce_ex__ calls to 1.
+        # Only possible when all entries are non-None and same shape.
+        # See paired receiver logic in tokenizer_manager.py.
         stacked_phs = None
         if has_phs:
             all_have_phs = all(t is not None for t in phs_list)
             if all_have_phs:
-                if all(t.shape == phs_list[0].shape for t in phs_list):
-                    stacked_phs = torch.stack(phs_list)
+                if len(phs_list) > 1 and all(
+                    t.shape == phs_list[0].shape for t in phs_list
+                ):
+                    # Stacked: single tensor, wrapped in a list.
+                    stacked_phs = [torch.stack(phs_list)]
                 else:
+                    # Non-stacked: 1 request, mixed shapes, or mixed None.
                     stacked_phs = phs_list
             else:
+                # Non-stacked: some requests don't have PHS (None entries).
                 stacked_phs = phs_list
 
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=time_stats,
+                time_stats=wrap_as_pickle(time_stats),
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
@@ -246,7 +254,7 @@ class _GenerationStreamAccumulator:
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    get_cached_tokens_details: Callable[[Req], Optional[dict]]
+    get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
 
     rids: list = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
@@ -498,9 +506,9 @@ class _GenerationStreamAccumulator:
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
     def to_payload(
-        self, *, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
-        if not (has_reqs or is_idle_batch):
+        if not (self.rids or is_idle_batch):
             return None
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
@@ -509,7 +517,7 @@ class _GenerationStreamAccumulator:
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
-            time_stats=self.time_stats,
+            time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
@@ -542,7 +550,9 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
-            customized_info=self.customized_info,
+            customized_info=(
+                wrap_as_pickle(self.customized_info) if self.customized_info else None
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,

@@ -262,6 +262,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
+            scoring_func=self.score_function,
             routed_scaling_factor=self.routed_scaling_factor,
         )
 

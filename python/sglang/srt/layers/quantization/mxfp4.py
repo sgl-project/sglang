@@ -1039,7 +1039,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         ):
             # Register the fused func at runner construction so the FusedOpPool
             # lookup at `MoeRunner.__init__` finds it.
-            import sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4  # noqa: F401
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -1051,12 +1051,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
         path (PR #3084). Routed through the unified ``MoeRunner`` -- this
         helper only builds the quant_info; the actual kernel call lives in
-        :mod:`sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4`."""
-        from sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4 import (
-            FlashInferMxfp4CutlassMoeQuantInfo,
+        :mod:`sglang.srt.layers.moe.moe_runner.flashinfer_cutlass`."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            FlashInferCutlassMxfp4MoeQuantInfo,
         )
 
-        quant_info = FlashInferMxfp4CutlassMoeQuantInfo(
+        quant_info = FlashInferCutlassMxfp4MoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,

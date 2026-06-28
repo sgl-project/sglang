@@ -25,6 +25,48 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 
+def sync_fixed_hicache_size(size: int, host_size: int) -> int:
+    """Sync fixed-size HiCache token capacity across PP ranks.
+
+    A fixed --hicache-size is specified in GB, but each PP stage may have a
+    different bytes/token because it owns different layers. Use the global
+    minimum token capacity within the PP group so all stages expose the same
+    host-cache capacity.
+    Ratio-based sizing already derives from the synced device pool size.
+    """
+    if host_size <= 0 or not torch.distributed.is_available():
+        return size
+
+    if not torch.distributed.is_initialized():
+        return size
+
+    try:
+        from sglang.srt.distributed.parallel_state import get_pp_group
+
+        pp_group = get_pp_group()
+    except AssertionError:
+        return size
+
+    if pp_group.world_size <= 1:
+        return size
+
+    tensor = torch.tensor(size, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        tensor,
+        op=torch.distributed.ReduceOp.MIN,
+        group=pp_group.cpu_group,
+    )
+    synced_size = int(tensor.item())
+
+    if synced_size != size:
+        logger.info(
+            "Sync fixed-size HiCache host token capacity from %d to %d.",
+            size,
+            synced_size,
+        )
+    return synced_size
+
+
 def synchronized(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -58,7 +100,9 @@ class HostKVCache(abc.ABC):
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
@@ -67,9 +111,14 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "L2 cache effectiveness is reduced."
+                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                self.size,
+                device_pool.size,
+            )
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()

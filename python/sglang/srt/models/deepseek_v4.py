@@ -57,6 +57,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
+    dp_reduce_scatter_tensor,
     dp_scatter,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
@@ -67,7 +68,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.mhc import mhc_fused_post_pre, npu_hc_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -112,9 +112,12 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
 from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
-from sglang.srt.models.triton_ops.deepseek_v4 import (
-    rms_normalize_triton as rms_normalize_triton,
+from sglang.srt.models.deepseek_v2 import (
+    ParallelLMHead,
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+    _is_xpu,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -123,12 +126,18 @@ if not _is_hip:
         prepare_context_parallel_metadata,
     )
 
+if _is_xpu:
+    from sgl_kernel import hc_split_sinkhorn
+else:
+    from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
+
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
     is_gfx95_supported,
+    is_gfx942_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -157,7 +166,12 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
+# gather instead of on the gathered global buffer. Requires
+# SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
+_SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx942_supported = is_gfx942_supported()
 
 if _use_aiter:
     if _is_gfx95_supported:
@@ -684,7 +698,7 @@ class MQALayer(nn.Module):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
-            swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+            swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
             q = fused_qk_norm_rope_swa_store(
@@ -785,7 +799,7 @@ class MQALayer(nn.Module):
                 swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
                 swa_page_size, bf16_store = 1, True
             else:
-                swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+                swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
                 swa_page_size, bf16_store = (
                     token_to_kv_pool.swa_kv_pool.page_size,
@@ -947,7 +961,14 @@ class MQALayer(nn.Module):
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # Only [0:n_local_heads] is written below. Uninitialized padded TP
+            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
+            # there; other archs tolerate new_empty and skip the per-forward
+            # memset.
+            if _is_gfx942_supported:
+                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+            else:
+                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
             if self._attn_sink_local is None:
@@ -1378,8 +1399,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
-
         pre, post, comb = hc_split_sinkhorn(
             mixes,
             hc_scale,
@@ -1575,11 +1594,43 @@ class DeepseekV4DecoderLayer(nn.Module):
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
         # MUST tell the MoE to skip it (use_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
-        _use_gatherv_pair = (
+        _use_reduce_scatterv = (
             _use_tp_moe_gather
             and is_dp_gatherv_active()
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
+        )
+        # SGLANG_DP_USE_REDUCE_SCATTER: in the MAX_LEN decode path (equal per-rank
+        # padding, gatherv inactive, no EP), replace the MoE-internal post-experts
+        # all_reduce + dp_scatter with an equal-chunk reduce_scatter. On ROCm this
+        # uses the aiter custom kernel (so BOTH gather and combine are aiter custom),
+        # elsewhere RCCL reduce_scatter; either way it cuts combine traffic ~2x vs
+        # all_reduce. tp_size==attn_dp_size required so the global buffer splits
+        # evenly into per-rank chunks.
+        _use_reduce_scatter = (
+            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            and _use_tp_moe_gather
+            and not _use_reduce_scatterv
+            and not should_use_dp_reduce_scatterv()
+            and forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len()
+            and get_parallel().tp_size == get_parallel().attn_dp_size
+        )
+        # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
+        # on LOCAL hidden before the gather and add it back after the combine
+        # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
+        # Applies to BOTH prefill and decode: the shared expert is a per-token MLP,
+        # so computing it on this rank's local tokens (M_local rows) is identical to
+        # computing it on the gathered global buffer (M_global rows) and keeping the
+        # local slice -- but costs 1/dp_size the rows. With a replicated (TP1) shared
+        # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
+        # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
+        _shared_local = None
+        _do_shared_local = (
+            _SHARED_EXPERT_LOCAL
+            and _use_tp_moe_gather
+            and getattr(self.mlp, "shared_experts", None) is not None
+            and getattr(self.mlp, "_shared_expert_tp1", False)
         )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
@@ -1594,6 +1645,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
+            if _do_shared_local and local_hidden_states.shape[0] > 0:
+                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
@@ -1608,8 +1661,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
             # Skip the MoE-internal post-experts all_reduce when we will do the
-            # reduce via reduce_scatterv at the combine below (else double-reduce).
-            use_reduce_scatter=_use_cp or _use_gatherv_pair,
+            # reduce via reduce_scatterv/reduce_scatter at the combine below
+            # (else double-reduce).
+            use_reduce_scatter=_use_cp or _use_reduce_scatterv or _use_reduce_scatter,
+            skip_shared_experts=_do_shared_local,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
@@ -1618,7 +1673,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv() or _use_gatherv_pair:
+            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (use_reduce_scatter above).
@@ -1628,8 +1683,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                     output=hidden_states,
                     sizes=get_dp_global_num_tokens(),
                 )
+            elif _use_reduce_scatter:
+                # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
+                # expert outputs AND scatter each rank its own (MAX_LEN-padded)
+                # token chunk in one op (symmetric inverse of the MAX_LEN
+                # all_gather). Correct because the MoE-internal all_reduce was
+                # skipped (use_reduce_scatter above). dp_reduce_scatter_tensor
+                # routes to the equal-chunk reduce_scatter_tensor here (its
+                # variable-length reduce_scatterv branch is gated by
+                # is_dp_gatherv_active(), which is False under MAX_LEN), which in
+                # turn uses the aiter custom kernel when it fits (else RCCL).
+                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
             else:
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            # PoC: add the locally-computed shared-expert output to this rank's
+            # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
+            # above). Covers both prefill (gatherv) and decode (dp_scatter).
+            if _shared_local is not None:
+                n = hidden_states.shape[0]
+                hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]

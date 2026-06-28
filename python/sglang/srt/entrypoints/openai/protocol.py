@@ -361,6 +361,8 @@ class CompletionRequest(BaseModel):
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
 
+    images_config: Optional[Dict] = None
+
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
@@ -735,6 +737,8 @@ class ChatCompletionRequest(BaseModel):
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
+
+    images_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

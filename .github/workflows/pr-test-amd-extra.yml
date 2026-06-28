@@ -12,11 +12,13 @@ name: PR Test Extra (AMD)
 #
 # Stage: extra-a. Each job mirrors the container bring-up of pr-test-amd.yml
 # and dispatches `run_suite.py --hw amd --suite extra-a-test-{config}-amd`:
-#   - 1-gpu-small: mock-model / kv_canary *unit* tests
+#   - 1-gpu-small: mock-model / kv_canary unit + single-GPU canary e2e tests
 #   - 1-gpu-large: single-GPU model e2e tests (quant fp8kv-triton,
-#                  sessions streaming-session, spec standalone triton)
-# The canary *e2e* tests still need the canary JIT kernel ported to ROCm
-# first, so they remain CUDA-only for now.
+#                  sessions streaming-session, spec standalone triton,
+#                  kv_canary self-bench)
+#   - 2-gpu-large: multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests
+# kv_canary e2e is registered to the same extra-a stage as its CUDA siblings
+# (it now exercises the ROCm canary kernels end-to-end).
 
 on:
   pull_request:
@@ -81,8 +83,12 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  group: pr-test-amd-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.ref || 'all' }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  # Mirror pr-test-amd.yml: schedule/dispatch runs key on run_id (unique group,
+  # never cancel each other); PR runs share a per-branch group so pushes cancel
+  # stale runs. (In a reusable workflow github.event_name is the originating
+  # event, never workflow_call, so the guard keys off the real events.)
+  group: pr-test-amd-extra-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.head_ref || github.ref_name || inputs.ref || 'default' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   actions: write
@@ -177,6 +183,36 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
+  # =============================================== extra-a (2-gpu-large) ===============================================
+  # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests. Mirrors CUDA's
+  # extra-a 2-gpu-large stage; runs on the 2-GPU AMD pool.
+  extra-a-test-2-gpu-large-amd:
+    name: ${{ format('extra-a-test-2-gpu-large-amd{0} (linux-{1}-2gpu-sglang)', inputs.rocm_version && format('-{0}', inputs.rocm_version) || '', inputs.runner_arch || 'mi325') }}
+    needs: [call-gate]
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi325') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh ${{ inputs.rocm_version && format('--rocm-version {0}', inputs.rocm_version) || '' }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job
   # rather than every matrix leg. Fails if any dependent failed or was
@@ -187,6 +223,7 @@ jobs:
         call-gate,
         extra-a-test-1-gpu-small-amd,
         extra-a-test-1-gpu-large-amd,
+        extra-a-test-2-gpu-large-amd,
       ]
     if: always()
     runs-on: ubuntu-latest
