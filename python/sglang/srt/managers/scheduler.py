@@ -355,10 +355,6 @@ class Scheduler(
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
-
-        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
-        self.gracefully_exit = False
 
         # Distributed rank info
         attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
@@ -394,27 +390,11 @@ class Scheduler(
         self.init_model_config()
 
         # Init metrics stats
-        self.metrics_collector_context = SchedulerMetricsCollector.init_new(
-            server_args=self.server_args,
-            ps=self.ps,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
-            dp_rank=dp_rank,
-            enable_priority_scheduling=self.enable_priority_scheduling,
-            enable_lora=self.enable_lora,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
-        )
-        self.metrics_collector = self.metrics_collector_context.collector
+        self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
-
-        self.mm_receiver = None
-        self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_inflight_queue = None
-        self.disagg_decode_prealloc_queue = None
-        self.disagg_decode_transfer_queue = None
 
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
@@ -477,10 +457,7 @@ class Scheduler(
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
-        if self.enable_hisparse:
-            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
-            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+        self.init_hisparse_coordinator()
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -519,14 +496,7 @@ class Scheduler(
         # Init diffusion LLM
         self.init_diffusion_llm()
 
-        self.metrics_reporter = SchedulerMetricsReporter(
-            scheduler=self,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
-            dp_rank=dp_rank,
-            metrics_collector_context=self.metrics_collector_context,
-            metrics_collector=self.metrics_collector,
-        )
+        self.init_metrics_reporter(tp_rank, pp_rank, dp_rank)
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -614,6 +584,21 @@ class Scheduler(
                     )
                     self.page_size = self.dllm_config.block_size
                     self.server_args.page_size = self.dllm_config.block_size
+
+    def init_metrics_collector(
+        self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        self.metrics_collector_context = SchedulerMetricsCollector.init_new(
+            server_args=self.server_args,
+            ps=self.ps,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            enable_priority_scheduling=self.enable_priority_scheduling,
+            enable_lora=self.enable_lora,
+            enable_hierarchical_cache=self.enable_hierarchical_cache,
+        )
+        self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
         is_rank_zero = (
@@ -969,7 +954,18 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
+    def init_hisparse_coordinator(self) -> None:
+        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        if not self.enable_hisparse:
+            return
+
+        # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
+        self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+        self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
     def init_running_status(self):
+        # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
+        self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -1026,6 +1022,19 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    def init_metrics_reporter(
+        self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+    ) -> None:
+        # Override point for deployments that need a specialized reporter.
+        self.metrics_reporter = SchedulerMetricsReporter(
+            scheduler=self,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+            metrics_collector_context=self.metrics_collector_context,
+            metrics_collector=self.metrics_collector,
+        )
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
@@ -1101,6 +1110,12 @@ class Scheduler(
             configure_gc_logger()
 
     def init_disaggregation(self):
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
