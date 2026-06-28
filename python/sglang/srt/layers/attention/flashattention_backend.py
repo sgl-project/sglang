@@ -2277,6 +2277,17 @@ class FlashAttentionBackend(AttentionBackend):
 
         return metadata, metadata_expand
 
+    @staticmethod
+    def _host_max_seq_len(
+        seq_lens_cpu: Optional[torch.Tensor], seq_lens: torch.Tensor
+    ) -> int:
+        """Host-side max KV length. Prefers the published CPU mirror; falls back
+        to a local D2H when it is absent (the GPU-only path). Used by the topk>1
+        / draft-extend branches that still need a host max for buffer sizing --
+        not the dflash overlap hot path (topk=1, device-side build)."""
+        src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu()
+        return src.max().item()
+
     def _fill_page_table_device(
         self,
         metadata: FlashAttentionMetadata,
@@ -2386,10 +2397,8 @@ class FlashAttentionBackend(AttentionBackend):
                     # metadata.cu_seqlens_q already set in capture
                     # metadata.cu_seqlens_k is not needed
 
-                    metadata.max_seq_len_k = (
-                        (seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu())
-                        .max()
-                        .item()
+                    metadata.max_seq_len_k = self._host_max_seq_len(
+                        seq_lens_cpu, seq_lens
                     )
                     max_seq_pages = (
                         metadata.max_seq_len_k + self.page_size - 1
@@ -2525,11 +2534,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
                 # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
-                metadata.max_seq_len_k = (
-                    (seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu())
-                    .max()
-                    .item()
-                )
+                metadata.max_seq_len_k = self._host_max_seq_len(seq_lens_cpu, seq_lens)
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -2615,11 +2620,7 @@ class FlashAttentionBackend(AttentionBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = (
-                (seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu())
-                .max()
-                .item()
-            )
+            metadata.max_seq_len_k = self._host_max_seq_len(seq_lens_cpu, seq_lens)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
