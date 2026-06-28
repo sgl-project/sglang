@@ -75,12 +75,12 @@ def _ltx2_get_fused_qknorm_split_rope():
     if _LTX2_FUSED_QKNORM_SPLIT_ROPE is None:
         try:
             from sglang.jit_kernel.diffusion.triton.ltx2_qknorm import (
-                ltx2_split_rope_pair,
+                ltx2_qknorm_split_rope_pair,
             )
         except Exception:
             _LTX2_FUSED_QKNORM_SPLIT_ROPE_UNAVAILABLE = True
             return None
-        _LTX2_FUSED_QKNORM_SPLIT_ROPE = ltx2_split_rope_pair
+        _LTX2_FUSED_QKNORM_SPLIT_ROPE = ltx2_qknorm_split_rope_pair
     return _LTX2_FUSED_QKNORM_SPLIT_ROPE
 
 
@@ -99,6 +99,8 @@ def _ltx2_try_fused_qknorm_split_rope(
         or _ltx2_get_tp_world_size_or_one() != 1
         or not isinstance(q_norm, torch.nn.RMSNorm)
         or not isinstance(k_norm, torch.nn.RMSNorm)
+        or q_norm.eps != eps
+        or k_norm.eps != eps
         or q.ndim != 3
         or k.ndim != 3
         or q.shape[0] != k.shape[0]
@@ -131,23 +133,43 @@ def _ltx2_try_fused_qknorm_split_rope(
         or q_sin.device != q.device
         or k_cos.device != q.device
         or k_sin.device != q.device
+        or q_cos.stride(-1) != 1
+        or q_sin.stride(-1) != 1
+        or k_cos.stride(-1) != 1
+        or k_sin.stride(-1) != 1
     ):
         return None
 
-    ltx2_split_rope_pair = _ltx2_get_fused_qknorm_split_rope()
-    if ltx2_split_rope_pair is None:
+    q_weight = q_norm.weight
+    k_weight = k_norm.weight
+    hidden = int(q.shape[-1])
+    if (
+        q_weight is None
+        or k_weight is None
+        or q_weight.device != q.device
+        or k_weight.device != k.device
+        or q_weight.dtype != q.dtype
+        or k_weight.dtype != k.dtype
+        or q_weight.numel() != hidden
+        or k_weight.numel() != hidden
+    ):
+        return None
+
+    ltx2_qknorm_split_rope_pair = _ltx2_get_fused_qknorm_split_rope()
+    if ltx2_qknorm_split_rope_pair is None:
         return None
 
     try:
-        q = q_norm(q)
-        k = k_norm(k)
-        return ltx2_split_rope_pair(
-            q.contiguous(),
-            k.contiguous(),
+        return ltx2_qknorm_split_rope_pair(
+            q,
+            k,
+            q_weight,
+            k_weight,
             q_cos,
             q_sin,
             k_cos,
             k_sin,
+            eps,
         )
     except Exception as exc:
         _LTX2_FUSED_QKNORM_SPLIT_ROPE_RUNTIME_DISABLED = True

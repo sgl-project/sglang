@@ -242,7 +242,7 @@ def _ltx2_split_rope_pair_kernel(
 
 
 def _num_warps_for_hidden(hidden: int) -> int:
-    return 4 if hidden >= 4096 else 8
+    return 8 if hidden >= 4096 else 4
 
 
 def ltx2_qknorm_split_rope_pair(
@@ -271,9 +271,14 @@ def ltx2_qknorm_split_rope_pair(
         or q_sin.shape != q_cos.shape
         or k_cos.ndim != 4
         or k_sin.shape != k_cos.shape
+        or q_cos.stride(-1) != 1
+        or q_sin.stride(-1) != 1
+        or k_cos.stride(-1) != 1
+        or k_sin.stride(-1) != 1
     ):
         raise ValueError(
-            "cos/sin tensors must have shape [batch, heads, seq, half_dim]"
+            "cos/sin tensors must have shape [batch, heads, seq, half_dim] "
+            "and be last-dim contiguous"
         )
 
     batch, q_seq, hidden = q.shape
