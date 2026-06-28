@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -82,7 +84,6 @@ def test_ltx2_fused_qknorm_split_rope_rejects_interleaved_rope():
     )
     assert actual is None
 
-
 @torch.no_grad()
 def test_ltx2_fused_qknorm_split_rope_rejects_fp32_norm_weight():
     hidden_size = 4096
@@ -97,3 +98,7 @@ def test_ltx2_fused_qknorm_split_rope_rejects_fp32_norm_weight():
         q, k, q_norm, k_norm, EPS, (cos, sin), None
     )
     assert actual is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
