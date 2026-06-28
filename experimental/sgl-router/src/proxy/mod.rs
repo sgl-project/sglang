@@ -176,7 +176,7 @@ impl Proxy {
         headers: &HeaderMap,
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
-        on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+        on_first_token: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -233,9 +233,10 @@ impl Proxy {
             };
         // Only record TTFT for successful streams — a 4xx/5xx error body
         // streaming back is not a generated token, so drop the hook for
-        // non-2xx responses.
-        let first_byte_hook = if status.is_success() {
-            on_first_byte
+        // non-2xx responses. The pump narrows further: it fires the hook on
+        // the first chunk carrying an actual content token, not the first byte.
+        let first_token_hook = if status.is_success() {
+            on_first_token
         } else {
             None
         };
@@ -243,7 +244,7 @@ impl Proxy {
             resp.bytes_stream(),
             stream_guards,
             on_complete,
-            first_byte_hook,
+            first_token_hook,
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;
