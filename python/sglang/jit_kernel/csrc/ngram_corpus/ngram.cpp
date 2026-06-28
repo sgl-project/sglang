@@ -328,33 +328,6 @@ Result Ngram::batchMatch(
   return merged;
 }
 
-std::vector<std::vector<int32_t>> Ngram::batchRootCandidates(
-    const std::vector<int64_t>& state_ids,
-    const std::vector<std::vector<int32_t>>& tokens,
-    const std::vector<size_t>& total_lens,
-    size_t max_candidates) {
-  if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
-    throw std::runtime_error("batchRootCandidates expects state_ids, tokens, and total_lens to match in size");
-  }
-
-  std::unique_lock<std::mutex> lock(mutex_);
-
-  std::vector<std::vector<int32_t>> batch_candidates;
-  batch_candidates.reserve(tokens.size());
-
-  for (size_t i = 0; i < state_ids.size(); ++i) {
-    const auto& suffix = tokens[i];
-    if (suffix.empty()) {
-      throw std::runtime_error("batchRootCandidates received an empty token tail");
-    }
-
-    auto& state = match_state_[state_ids[i]];
-    batch_candidates.emplace_back(buildRootCandidatesUnlocked(suffix, total_lens[i], state, max_candidates));
-  }
-
-  return batch_candidates;
-}
-
 PrecomputeDraftsStats Ngram::precomputeDrafts(
     const std::vector<int64_t>& state_ids,
     const std::vector<std::vector<int32_t>>& base_tokens,
@@ -564,6 +537,24 @@ SelectPrecomputedDraftsResult Ngram::selectPrecomputedDrafts(
     std::copy(res.mask.begin(), res.mask.end(), out.result.mask.begin() + i * d * d);
   }
 
+  return out;
+}
+
+std::vector<int32_t> Ngram::precomputedRootBonusTokens(const std::vector<int64_t>& state_ids) const {
+  std::unique_lock<std::mutex> lock(mutex_);
+  std::vector<int32_t> out;
+  out.reserve(state_ids.size());
+  const std::vector<int32_t> root_path_cols{0};
+
+  for (const auto state_id : state_ids) {
+    const PathKey key{state_id, root_path_cols};
+    auto iter = precomputed_bonus_candidates_.find(key);
+    if (iter == precomputed_bonus_candidates_.end() || iter->second.empty()) {
+      out.emplace_back(-1);
+    } else {
+      out.emplace_back(iter->second.front());
+    }
+  }
   return out;
 }
 

@@ -6,7 +6,6 @@
 #include <tvm/ffi/reflection/registry.h>
 
 #include "ngram.h"
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -75,35 +74,6 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 
     auto result = ngram_->batchMatch(state_ids, tokens, total_lens);
     write_result_(result, out_tokens, out_mask);
-  }
-
-  void batch_root_candidates_stateful(
-      const tvm::ffi::TensorView state_ids_tv,
-      const tvm::ffi::TensorView tokens_flat,
-      const tvm::ffi::TensorView offsets,
-      const tvm::ffi::TensorView total_lens_tv,
-      int64_t max_candidates,
-      const tvm::ffi::TensorView out_tokens,
-      const tvm::ffi::TensorView out_counts) {
-    if (max_candidates < 0) {
-      throw std::runtime_error("max_candidates must be non-negative");
-    }
-    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
-    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
-    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
-    auto* tlens = static_cast<const int64_t*>(total_lens_tv.data_ptr());
-    int64_t batch_size = offsets.size(0) - 1;
-
-    std::vector<int64_t> state_ids(sid, sid + batch_size);
-    std::vector<std::vector<int32_t>> tokens(batch_size);
-    std::vector<size_t> total_lens(batch_size);
-    for (int64_t i = 0; i < batch_size; ++i) {
-      tokens[i].assign(data + offs[i], data + offs[i + 1]);
-      total_lens[i] = static_cast<size_t>(tlens[i]);
-    }
-
-    auto result = ngram_->batchRootCandidates(state_ids, tokens, total_lens, static_cast<size_t>(max_candidates));
-    write_root_candidates_(result, static_cast<size_t>(max_candidates), out_tokens, out_counts);
   }
 
   void precompute_drafts_stateful(
@@ -202,6 +172,22 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     stats_out[3] = result.precomputed_cache_total_ct;
   }
 
+  void precomputed_root_bonus_tokens_stateful(
+      const tvm::ffi::TensorView state_ids_tv, const tvm::ffi::TensorView out_tokens) {
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
+    auto* out = static_cast<int32_t*>(out_tokens.data_ptr());
+    int64_t batch_size = state_ids_tv.size(0);
+    if (out_tokens.size(0) < batch_size) {
+      throw std::runtime_error("out_tokens buffer too small for precomputed_root_bonus_tokens_stateful");
+    }
+
+    std::vector<int64_t> state_ids(sid, sid + batch_size);
+    auto result = ngram_->precomputedRootBonusTokens(state_ids);
+    if (!result.empty()) {
+      std::memcpy(out, result.data(), result.size() * sizeof(int32_t));
+    }
+  }
+
   void erase_match_state(const tvm::ffi::TensorView state_ids_tv) {
     auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
     int64_t n = state_ids_tv.size(0);
@@ -273,30 +259,6 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     std::memcpy(out_msk, result.mask.data(), result.mask.size() * sizeof(uint8_t));
   }
 
-  void write_root_candidates_(
-      const std::vector<std::vector<int32_t>>& result,
-      size_t max_candidates,
-      const tvm::ffi::TensorView& out_tokens,
-      const tvm::ffi::TensorView& out_counts) {
-    auto* out_tok = static_cast<int32_t*>(out_tokens.data_ptr());
-    auto* out_cnt = static_cast<int64_t*>(out_counts.data_ptr());
-    const size_t batch_size = result.size();
-    if (out_tokens.size(0) < static_cast<int64_t>(batch_size * max_candidates)) {
-      throw std::runtime_error("out_tokens buffer too small for root candidates");
-    }
-    if (out_counts.size(0) < static_cast<int64_t>(batch_size)) {
-      throw std::runtime_error("out_counts buffer too small for root candidates");
-    }
-    std::fill(out_tok, out_tok + batch_size * max_candidates, 0);
-    for (size_t i = 0; i < batch_size; ++i) {
-      const auto n = std::min(result[i].size(), max_candidates);
-      out_cnt[i] = static_cast<int64_t>(n);
-      if (n > 0) {
-        std::memcpy(out_tok + i * max_candidates, result[i].data(), n * sizeof(int32_t));
-      }
-    }
-  }
-
   void write_flags_(const std::vector<uint8_t>& result, const tvm::ffi::TensorView& out_flags) {
     auto* out = static_cast<uint8_t*>(out_flags.data_ptr());
     if (out_flags.size(0) < static_cast<int64_t>(result.size())) {
@@ -316,9 +278,9 @@ void register_ngram_corpus() {
       .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
-      .def("batch_root_candidates_stateful", &NgramCorpusObj::batch_root_candidates_stateful)
       .def("precompute_drafts_stateful", &NgramCorpusObj::precompute_drafts_stateful)
       .def("select_precomputed_drafts_stateful", &NgramCorpusObj::select_precomputed_drafts_stateful)
+      .def("precomputed_root_bonus_tokens_stateful", &NgramCorpusObj::precomputed_root_bonus_tokens_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)

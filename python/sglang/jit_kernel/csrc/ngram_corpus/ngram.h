@@ -111,12 +111,6 @@ class Ngram {
       const std::vector<std::vector<int32_t>>& tokens,
       const std::vector<size_t>& total_lens);
 
-  std::vector<std::vector<int32_t>> batchRootCandidates(
-      const std::vector<int64_t>& state_ids,
-      const std::vector<std::vector<int32_t>>& tokens,
-      const std::vector<size_t>& total_lens,
-      size_t max_candidates);
-
   PrecomputeDraftsStats precomputeDrafts(
       const std::vector<int64_t>& state_ids,
       const std::vector<std::vector<int32_t>>& base_tokens,
@@ -133,6 +127,8 @@ class Ngram {
       const std::vector<int64_t>& accept_index,
       const std::vector<std::vector<int32_t>>& fallback_tokens,
       const std::vector<size_t>& fallback_total_lens);
+
+  std::vector<int32_t> precomputedRootBonusTokens(const std::vector<int64_t>& state_ids) const;
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 

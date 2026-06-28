@@ -106,27 +106,6 @@ class NgramCorpus:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
 
-    def batch_get_temporary(
-        self,
-        batch_tokens: List[List[int]],
-        total_lens: List[int],
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Run a batch lookup with throwaway match states.
-
-        Precompute probes enumerate hypothetical token paths. They must not
-        advance the per-request incremental match state used by real decode
-        lookups.
-        """
-        state_ids = list(
-            range(self._next_state_id, self._next_state_id + len(batch_tokens))
-        )
-        self._next_state_id += len(batch_tokens)
-        try:
-            return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
-        finally:
-            if state_ids:
-                self._obj.erase_states(state_ids)
-
     @staticmethod
     def direct_child_tokens(
         tokens: np.ndarray,
@@ -151,34 +130,6 @@ class NgramCorpus:
                 break
         return child_tokens
 
-    def batch_get_root_candidates_temporary(
-        self,
-        batch_tokens: List[List[int]],
-        total_lens: List[int],
-        max_candidates: int,
-    ) -> List[List[int]]:
-        """Return width-first bonus candidates with throwaway match states.
-
-        The candidates prioritize root direct children for the given context.
-        If fewer than max_candidates root children exist, the C++ side fills
-        the remaining slots from deeper continuations as low-confidence
-        backoff candidates.
-        """
-        if max_candidates <= 0:
-            return [[] for _ in batch_tokens]
-
-        state_ids = list(
-            range(self._next_state_id, self._next_state_id + len(batch_tokens))
-        )
-        self._next_state_id += len(batch_tokens)
-        try:
-            return self._obj.root_candidates_stateful(
-                state_ids, batch_tokens, total_lens, max_candidates
-            )
-        finally:
-            if state_ids:
-                self._obj.erase_states(state_ids)
-
     def precompute_drafts(
         self,
         req_ids: List[str],
@@ -199,6 +150,10 @@ class NgramCorpus:
             bonus_topk,
             max_trie_depth,
         )
+
+    def precomputed_root_bonus_tokens(self, req_ids: List[str]) -> List[int]:
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.precomputed_root_bonus_tokens_stateful_wrapper(state_ids)
 
     def select_precomputed_drafts(
         self,

@@ -682,71 +682,6 @@ class TestNgramCorpusIncremental(CustomTestCase):
             f"Expected token 4 after extension, got {inc_ids.tolist()}",
         )
 
-    def test_temporary_lookup_does_not_register_req_state(self):
-        corpus = _make_corpus("BFS", max_trie_depth=4, draft_token_num=4)
-        corpus.batch_put([[1, 2, 3, 4, 5, 6], [9, 3, 4, 7, 8]])
-        corpus.synchronize()
-
-        req_id = "real-req"
-        _batch_get_with_state(corpus, req_id, [1, 2, 3], 3)
-        state_map_before = dict(corpus._req_id_to_state_id)
-
-        temp_ids, temp_masks = corpus.batch_get_temporary([[3, 4]], [99])
-        self.assertEqual(corpus._req_id_to_state_id, state_map_before)
-
-        expected_ids, expected_masks = _batch_get(corpus, [[3, 4]])
-
-        np.testing.assert_array_equal(temp_ids, expected_ids)
-        np.testing.assert_array_equal(temp_masks, expected_masks)
-
-        inc_ids, inc_masks = _batch_get_with_state(corpus, req_id, [1, 2, 3, 4], 4)
-        full_ids, full_masks = _batch_get(corpus, [[1, 2, 3, 4]])
-        np.testing.assert_array_equal(inc_ids, full_ids)
-        np.testing.assert_array_equal(inc_masks, full_masks)
-
-    def test_root_candidates_temporary_returns_direct_children(self):
-        corpus = _make_corpus("BFS", max_trie_depth=4, draft_token_num=4)
-        corpus.batch_put([[1, 2, 3, 4, 5], [9, 2, 3, 7, 8]])
-        corpus.synchronize()
-
-        req_id = "real-req"
-        _batch_get_with_state(corpus, req_id, [1, 2, 3], 3)
-        state_map_before = dict(corpus._req_id_to_state_id)
-
-        candidates = corpus.batch_get_root_candidates_temporary([[2, 3]], [2], 2)
-
-        self.assertEqual(corpus._req_id_to_state_id, state_map_before)
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(set(candidates[0]), {4, 7})
-
-    def test_root_candidates_prefer_width_before_depth(self):
-        corpus = _make_corpus("BFS", max_trie_depth=6, draft_token_num=4)
-        corpus.batch_put(
-            [
-                [1, 2, 3, 10, 11, 12],
-                [1, 2, 3, 20],
-                [1, 2, 3, 30],
-            ]
-        )
-        corpus.synchronize()
-
-        candidates = corpus.batch_get_root_candidates_temporary([[1, 2, 3]], [3], 3)
-
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(set(candidates[0]), {10, 20, 30})
-        self.assertNotIn(11, candidates[0])
-
-    def test_root_candidates_fill_from_deep_continuation(self):
-        corpus = _make_corpus("BFS", max_trie_depth=6, draft_token_num=4)
-        corpus.batch_put([[1, 2, 3, 10, 11, 12]])
-        corpus.synchronize()
-
-        candidates = corpus.batch_get_root_candidates_temporary([[1, 2, 3]], [3], 3)
-
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0][0], 10)
-        self.assertEqual(set(candidates[0]), {10, 11, 12})
-
     def test_stale_state_rebuilds_after_eviction(self):
         corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6, draft_token_num=4)
         corpus.batch_put([list(range(5000, 5030))])
@@ -769,7 +704,7 @@ class TestNgramCorpusIncremental(CustomTestCase):
 
 
 class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
-    """Verify precomputed draft trees match fresh batch_get trees."""
+    """Verify selected precomputed root draft trees match fresh batch_get trees."""
 
     @staticmethod
     def _make_branchy_corpus(
@@ -801,141 +736,18 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
         corpus.synchronize()
         return corpus, prefix
 
-    @staticmethod
-    def _path_cols(tree_mask: np.ndarray, node: int) -> list[int]:
-        return [int(x) for x in np.nonzero(tree_mask[node])[0].tolist()]
-
-    def _first_precomputed_bonus(
-        self,
-        corpus: NgramCorpus,
-        base_tokens: list[int],
-        base_total_len: int,
-        req_draft: np.ndarray,
-        req_mask: np.ndarray,
-        node: int,
-        path_cols: list[int],
-        bonus_topk: int,
-        max_trie_depth: int,
-        fail_on_missing: bool = True,
-    ):
-        path_draft_tokens = [int(req_draft[col]) for col in path_cols if col != 0]
-        check_tokens = (base_tokens + path_draft_tokens)[-max_trie_depth:]
-        check_total_len = base_total_len + len(path_draft_tokens)
-        candidates = corpus.batch_get_root_candidates_temporary(
-            [check_tokens],
-            [check_total_len],
-            bonus_topk + len(req_draft),
-        )[0]
-        current_child_tokens = set(
-            corpus.direct_child_tokens(req_draft, req_mask, node)
-        )
-        seen = set()
-        for candidate in candidates:
-            if candidate in current_child_tokens or candidate in seen:
-                continue
-            seen.add(candidate)
-            return int(candidate), path_draft_tokens
-        if not fail_on_missing:
-            return None
-        self.fail(
-            f"Expected residual bonus candidate for node={node}, "
-            f"path_cols={path_cols}, candidates={candidates}, "
-            f"current_child_tokens={sorted(current_child_tokens)}"
-        )
-
-    def _find_non_root_precompute_case(
-        self,
-        corpus: NgramCorpus,
-        base_tokens: list[int],
-        base_total_len: int,
-        req_draft: np.ndarray,
-        req_mask: np.ndarray,
-        bonus_topk: int,
-        max_trie_depth: int,
-    ) -> tuple[list[int], int, list[int]]:
-        for node in range(1, len(req_draft)):
-            if req_mask[node, node] == 0:
-                continue
-            path_cols = self._path_cols(req_mask, node)
-            if not path_cols or path_cols[0] != 0:
-                continue
-            result = self._first_precomputed_bonus(
-                corpus,
-                base_tokens,
-                base_total_len,
-                req_draft,
-                req_mask,
-                node,
-                path_cols,
-                bonus_topk,
-                max_trie_depth,
-                fail_on_missing=False,
-            )
-            if result is None:
-                continue
-            bonus_token, path_draft_tokens = result
-            return path_cols, bonus_token, path_draft_tokens
-        self.fail(
-            "Expected at least one non-root precompute path with a bonus candidate"
-        )
-
-    @staticmethod
-    def _fill_accept_payload(
-        req_idx: int,
-        draft_token_num: int,
-        req_draft: np.ndarray,
-        path_cols: list[int],
-        bonus_token: int,
-        accept_tokens: np.ndarray,
-        accept_lens: np.ndarray,
-        accept_index: np.ndarray,
-    ) -> None:
-        accept_lens[req_idx] = len(path_cols)
-        for slot, col in enumerate(path_cols):
-            accept_index[req_idx, slot] = req_idx * draft_token_num + col
-            if slot + 1 < len(path_cols):
-                accept_tokens[req_idx, slot] = int(req_draft[path_cols[slot + 1]])
-            else:
-                accept_tokens[req_idx, slot] = bonus_token
-
-    def test_precomputed_hit_tree_matches_fresh_batch_get(self):
+    def test_precomputed_root_hit_tree_matches_fresh_batch_get(self):
         draft_token_num = 8
         max_trie_depth = 8
         bonus_topk = 3
         corpus, prefix = self._make_branchy_corpus(draft_token_num, max_trie_depth)
 
-        bs = 2
-        req_ids = ["precompute-root", "precompute-non-root"]
+        bs = 3
+        req_ids = [f"precompute-root-{i}" for i in range(bs)]
         base_tokens = [prefix[:] for _ in range(bs)]
         base_total_lens = [len(prefix)] * bs
         current_drafts, current_masks = corpus.batch_get(
             req_ids, base_tokens, base_total_lens
-        )
-        current_drafts_2d = current_drafts.reshape(bs, draft_token_num)
-        current_masks_3d = current_masks.reshape(bs, draft_token_num, draft_token_num)
-
-        root_path_cols = [0]
-        root_bonus, root_path_tokens = self._first_precomputed_bonus(
-            corpus,
-            base_tokens[0],
-            base_total_lens[0],
-            current_drafts_2d[0],
-            current_masks_3d[0],
-            node=0,
-            path_cols=root_path_cols,
-            bonus_topk=bonus_topk,
-            max_trie_depth=max_trie_depth,
-        )
-        non_root_path_cols, non_root_bonus, non_root_path_tokens = (
-            self._find_non_root_precompute_case(
-                corpus,
-                base_tokens[1],
-                base_total_lens[1],
-                current_drafts_2d[1],
-                current_masks_3d[1],
-                bonus_topk,
-                max_trie_depth,
-            )
         )
 
         stats = corpus.precompute_drafts(
@@ -948,41 +760,22 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
             max_trie_depth,
         )
         self.assertGreaterEqual(stats[2], bs)
+        root_bonus_tokens = corpus.precomputed_root_bonus_tokens(req_ids)
+        self.assertTrue(
+            all(token >= 0 for token in root_bonus_tokens),
+            f"Expected root bonus cache entries, got {root_bonus_tokens}",
+        )
 
         accept_tokens = np.zeros((bs, draft_token_num), dtype=np.int32)
-        accept_lens = np.zeros(bs, dtype=np.int64)
+        accept_lens = np.ones(bs, dtype=np.int64)
         accept_index = np.full((bs, draft_token_num), -1, dtype=np.int64)
-        self._fill_accept_payload(
-            0,
-            draft_token_num,
-            current_drafts_2d[0],
-            root_path_cols,
-            root_bonus,
-            accept_tokens,
-            accept_lens,
-            accept_index,
-        )
-        self._fill_accept_payload(
-            1,
-            draft_token_num,
-            current_drafts_2d[1],
-            non_root_path_cols,
-            non_root_bonus,
-            accept_tokens,
-            accept_lens,
-            accept_index,
-        )
-
-        fallback_tokens = [
-            (base_tokens[0] + root_path_tokens + [root_bonus])[-max_trie_depth:],
-            (base_tokens[1] + non_root_path_tokens + [non_root_bonus])[
-                -max_trie_depth:
-            ],
-        ]
-        fallback_total_lens = [
-            base_total_lens[0] + len(root_path_tokens) + 1,
-            base_total_lens[1] + len(non_root_path_tokens) + 1,
-        ]
+        fallback_tokens = []
+        fallback_total_lens = []
+        for i, bonus_token in enumerate(root_bonus_tokens):
+            accept_tokens[i, 0] = bonus_token
+            accept_index[i, 0] = i * draft_token_num
+            fallback_tokens.append((base_tokens[i] + [bonus_token])[-max_trie_depth:])
+            fallback_total_lens.append(base_total_lens[i] + 1)
 
         (
             precomputed_tokens,
@@ -999,16 +792,18 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
             fallback_total_lens,
         )
         self.assertEqual(hit_stats, (bs, bs, bs, bs))
-        self.assertEqual(bonus_hits, [1, 1])
-        self.assertEqual(cache_hits, [1, 1])
+        self.assertEqual(bonus_hits, [1] * bs)
+        self.assertEqual(cache_hits, [1] * bs)
 
-        fresh_tokens, fresh_masks = corpus.batch_get_temporary(
+        fresh_req_ids = [f"fresh-precompute-root-{i}" for i in range(bs)]
+        fresh_tokens, fresh_masks = corpus.batch_get(
+            fresh_req_ids,
             fallback_tokens,
             fallback_total_lens,
         )
+        corpus.erase_match_state(fresh_req_ids)
         debug_context = (
-            f"root_path={root_path_cols}, root_bonus={root_bonus}, "
-            f"non_root_path={non_root_path_cols}, non_root_bonus={non_root_bonus}, "
+            f"root_bonus_tokens={root_bonus_tokens}, "
             f"fallback_tokens={fallback_tokens}, fallback_total_lens={fallback_total_lens}"
         )
         np.testing.assert_array_equal(
@@ -1285,38 +1080,6 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
         corpus.synchronize()
         return corpus
 
-    def _root_residual_bonus_tokens(
-        self,
-        corpus: NgramCorpus,
-        base_tokens: list[list[int]],
-        total_lens: list[int],
-        draft_tokens: np.ndarray,
-        tree_mask: np.ndarray,
-        draft_token_num: int,
-    ) -> list[int]:
-        candidates_per_req = corpus.batch_get_root_candidates_temporary(
-            base_tokens,
-            total_lens,
-            draft_token_num * 2,
-        )
-        drafts_2d = draft_tokens.reshape(len(base_tokens), draft_token_num)
-        masks_3d = tree_mask.reshape(len(base_tokens), draft_token_num, draft_token_num)
-        bonus_tokens = []
-        for i, candidates in enumerate(candidates_per_req):
-            direct_children = set(
-                corpus.direct_child_tokens(drafts_2d[i], masks_3d[i], parent=0)
-            )
-            residual = next(
-                (token for token in candidates if token not in direct_children),
-                None,
-            )
-            self.assertIsNotNone(
-                residual,
-                "Perf corpus should expose residual root candidates for cache hits",
-            )
-            bonus_tokens.append(int(residual))
-        return bonus_tokens
-
     @staticmethod
     def _build_select_payload(
         base_tokens: list[list[int]],
@@ -1378,14 +1141,6 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
                 repeats,
             )
             draft_tokens, tree_mask = batch_result
-            root_bonus_tokens = self._root_residual_bonus_tokens(
-                corpus,
-                base_tokens,
-                total_lens,
-                draft_tokens,
-                tree_mask,
-                draft_token_num,
-            )
 
             precompute_ms, precompute_stats = self._avg_ms(
                 lambda: corpus.precompute_drafts(
@@ -1398,6 +1153,11 @@ class TestNgramCorpusPrecomputePerf(CustomTestCase):
                     max_trie_depth,
                 ),
                 precompute_repeats,
+            )
+            root_bonus_tokens = corpus.precomputed_root_bonus_tokens(req_ids)
+            self.assertTrue(
+                all(token >= 0 for token in root_bonus_tokens),
+                f"Perf corpus should expose root bonus cache hits, got {root_bonus_tokens}",
             )
 
             hit_counts = sorted({0, bs // 2, bs})

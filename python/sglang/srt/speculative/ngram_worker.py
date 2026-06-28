@@ -377,10 +377,11 @@ class NGRAMWorker(BaseSpecWorker):
         fallback_tokens = []
         fallback_total_lens = []
         stride = d
+        use_prev_tokens = self.enable_overlap and not batch.has_grammar
         for i, req in enumerate(batch.reqs):
             prev_tokens = (
                 prev_token_ids_list[i * stride : i * stride + prev_accept_lens_list[i]]
-                if not batch.has_grammar
+                if use_prev_tokens
                 else []
             )
             check_token = self._efficient_concat_last_n(
@@ -419,16 +420,16 @@ class NGRAMWorker(BaseSpecWorker):
         self.prev_accept_lens = prev_accept_lens_list
 
         if hit_count == bs:
-            logger.info(f"Precomputed draft cache HIT for all {bs} requests")
+            logger.debug(f"Precomputed draft cache HIT for all {bs} requests")
             return result_drafts, result_masks
         elif hit_count == 0:
-            logger.info(
+            logger.debug(
                 f"Precomputed draft cache MISS for all {bs} requests, "
                 "used C++ fallback generation"
             )
             return result_drafts, result_masks
         else:
-            logger.info(
+            logger.debug(
                 f"Precomputed draft cache partial HIT: {hit_count}/{bs} requests"
             )
             return result_drafts, result_masks
@@ -657,11 +658,12 @@ class NGRAMWorker(BaseSpecWorker):
         base_tokens_batch = []
         base_total_lens = []
         stride = d
+        use_prev_tokens = self.enable_overlap and not batch.has_grammar
         for req_idx in range(bs):
             req = batch.reqs[req_idx]
 
             # batch_{K-1}'s verified tokens (will be added to output_ids by scheduler)
-            if not batch.has_grammar:
+            if use_prev_tokens:
                 prev_tokens = self.prev_token_ids[
                     req_idx * stride : req_idx * stride + self.prev_accept_lens[req_idx]
                 ]
@@ -701,7 +703,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
         )
 
-        logger.info(
+        logger.debug(
             f"Precomputed {num_cache_entries} draft combos from "
             f"{num_phase2_contexts} phase2 contexts and {num_paths} paths "
             f"for {bs} requests"
