@@ -153,6 +153,9 @@ class GenerateReqInput:
     # Request ID(s). If omitted, generated during normalization. For batch
     # requests, a string is expanded to per-item IDs using it as a prefix.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    # Stable identity shared by requests in the same session. Unlike
+    # session_params, this does not alter or reconstruct the prompt.
+    session_id: Optional[str] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -292,6 +295,9 @@ class GenerateReqInput:
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
 
+    # For Unlimited-OCR
+    images_config: Optional[dict] = None
+
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
@@ -335,6 +341,8 @@ class GenerateReqInput:
         """
         self._validate_inputs()
         self._determine_batch_size()
+        if self.session_id is not None and self.session_params is not None:
+            raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -690,6 +698,7 @@ class GenerateReqInput:
             return cache[i]
         sub = GenerateReqInput(
             rid=self.rid[i],
+            session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -797,6 +806,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
+    session_id: Optional[str] = field(default=None, kw_only=True)
     session_params: Optional[SessionParams] = None
 
     # LoRA related
