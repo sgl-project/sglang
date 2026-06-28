@@ -620,10 +620,24 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            if is_batch_invariant_mode_enabled():
+                x = x + residual
+                residual = x.clone()
+                out = rms_norm_batch_invariant(
+                    x, self.gemma_weight, self.variance_epsilon
+                )
+                return out, residual
             gemma_fused_add_rmsnorm(
                 x, residual, self.weight.data, self.variance_epsilon
             )
             return x, residual
+        if is_batch_invariant_mode_enabled():
+            out = rms_norm_batch_invariant(
+                x, self.gemma_weight, self.variance_epsilon
+            )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         out = gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             out = out.reshape(original_shape)
