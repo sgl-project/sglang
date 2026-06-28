@@ -1,0 +1,330 @@
+---
+title: "MiMo-V2-Flash"
+metatags:
+  description: "Best Practice for MiMo-V2-Flash on Ascend NPU"
+---
+
+This guide describes the best practice data for MiMo-V2-Flash on the Ascend NPU.
+
+### Low Latency
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 16K+1 | 974ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode) |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 32K+1 | 2,147ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-32k-1-2147ms-on-a3-24-cards-disaggregation-mode) |
+
+### High Throughput
+
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 16K+1K | 16ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-16k-1k-16ms-on-a3-24-cards-disaggregation-mode) |
+| MiMo-V2-Flash | Atlas 800I A3 | 24 | PD Disaggregation | 32K+1K | 12ms | W8A8 INT8 | [Optimal Configuration](#mimo-v2-flash-32k-1k-12ms-on-a3-24-cards-disaggregation-mode) |
+
+## Optimal Configuration
+
+<a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
+
+### MiMo-V2-Flash 16K+1 974ms on A3 24 Cards Disaggregation Mode
+
+**Model**: MiMo-V2-Flash
+
+**Hardware**: Atlas 800I A3 24 Cards (8 cards for prefill node, 16 cards for decode node)
+
+**Deploy Mode**: PD Disaggregation
+
+**Dataset**: random
+
+**Input/Output Length**: 16K+1
+
+**TTFT**: 974ms (P99: 2,068ms)
+
+**Quantization**: W8A8 INT8
+
+#### Model Deployment
+
+```bash Command
+# ============================================================
+# Before running, update the following variables:
+#   P_IP: prefill node IP address
+#   D_IP: decode node IP address
+#   ASCEND_MF_STORE_URL: prefill node IP with port
+#   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
+# ============================================================
+
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+P_IP=('<your prefill ip>')
+D_IP=('<your decode ip>')
+
+export ASCEND_MF_STORE_URL="tcp://<your prefill ip>:24669"
+
+MODEL_PATH=/path/to/model-weights
+
+LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
+LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
+echo "${LOCAL_HOST1}"
+echo "${LOCAL_HOST2}"
+
+# Prefill node
+for i in "${!P_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
+    then
+        echo "${P_IP[$i]}"
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+        export HCCL_BUFFSIZE=1024
+        export HCCL_OP_EXPANSION_MODE=AIV
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+        export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
+        export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export SGLANG_DEEPEP_BF16_DISPATCH=0
+        export SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1
+        export HCCL_CONNECT_TIMEOUT=1800
+        export ASCEND_USE_FIA=1
+
+        python3 -m sglang.launch_server \
+            --model-path ${MODEL_PATH} \
+            --attention-backend ascend \
+            --device npu \
+            --tp-size 8 --nnodes 1 --node-rank 0 \
+            --chunked-prefill-size 8192 \
+            --trust-remote-code --port 10000 \
+            --host ${P_IP[$i]} --max-running-requests 64 \
+            --mem-fraction-static 0.8 \
+            --swa-full-tokens-ratio 0.3 \
+            --disaggregation-mode prefill --disaggregation-transfer-backend ascend \
+            --disaggregation-bootstrap-port 8996 \
+            --disable-radix-cache \
+            --disable-cuda-graph \
+            --disable-piecewise-cuda-graph \
+            --dp-size 2
+        NODE_RANK=$i
+        break
+    fi
+done
+
+# Decode node
+for i in "${!D_IP[@]}";
+do
+    if [[ "$LOCAL_HOST1" == "${D_IP[$i]}" || "$LOCAL_HOST2" == "${D_IP[$i]}" ]];
+    then
+        echo "${D_IP[$i]}"
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+        export HCCL_BUFFSIZE=800
+        export HCCL_OP_EXPANSION_MODE=AIV
+        export HCCL_SOCKET_IFNAME=<network-interface>
+        export GLOO_SOCKET_IFNAME=<network-interface>
+        export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
+        export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
+        export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600
+        export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600
+        export SGLANG_ENABLE_SPEC_V2=1
+        export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
+        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+        export SGLANG_DEEPEP_BF16_DISPATCH=0
+        export HCCL_CONNECT_TIMEOUT=1800
+        export ASCEND_USE_FIA=1
+
+        python3 -m sglang.launch_server \
+            --model-path ${MODEL_PATH} \
+            --attention-backend ascend \
+            --device npu \
+            --tp-size 16 --nnodes 1 --node-rank 0 \
+            --trust-remote-code --port 10001 \
+            --host ${D_IP[$i]} --max-running-requests 64 \
+            --mem-fraction-static 0.8 \
+            --swa-full-tokens-ratio 0.3 \
+            --cuda-graph-bs 1 2 4 8 12 16 20 24 28 32 \
+            --disaggregation-mode decode --disaggregation-transfer-backend ascend \
+            --disaggregation-bootstrap-port 8996 \
+            --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+            --enable-multi-layer-eagle \
+            --disable-radix-cache \
+            --dp-size 2 --enable-dp-attention --enable-dp-lm-head \
+            --moe-a2a-backend deepep --deepep-mode low_latency
+        NODE_RANK=$i
+        break
+    fi
+done
+```
+
+```shell Command
+# ============================================================
+# Before running, replace the following placeholders:
+#   <your prefill ip>: prefill node IP address
+#   <your decode ip>: decode node IP address
+# ============================================================
+
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill http://<your prefill ip>:10000 \
+    --decode  http://<your decode ip>:10001 \
+    --host 127.0.0.1 \
+    --port 9903 \
+    --health-check-interval-secs 3600 \
+    --mini-lb
+```
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset with throughput focus (0.4 request rate).
+
+```shell Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 9903 \
+    --dataset-name random \
+    --tokenize-prompt \
+    --random-input-len 16000 \
+    --random-output-len 1 \
+    --request-rate 0.4 \
+    --random-range-ratio 1 \
+    --num-prompts 128 \
+    --max-concurrency 64
+```
+
+### MiMo-V2-Flash 32K+1 2,147ms on A3 24 Cards Disaggregation Mode
+
+**Model**: MiMo-V2-Flash
+
+**Hardware**: Atlas 800I A3 24 Cards (8 cards for prefill node, 16 cards for decode node)
+
+**Deploy Mode**: PD Disaggregation
+
+**Dataset**: random
+
+**Input/Output Length**: 32K+1
+
+**TTFT**: 2,147ms (P99: 4,546ms)
+
+**Quantization**: W8A8 INT8
+
+#### Model Deployment
+
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset with throughput focus (0.4 request rate).
+
+```shell Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 9903 \
+    --dataset-name random \
+    --tokenize-prompt \
+    --random-input-len 32000 \
+    --random-output-len 1 \
+    --request-rate 0.4 \
+    --random-range-ratio 1 \
+    --num-prompts 128 \
+    --max-concurrency 64
+```
+
+### MiMo-V2-Flash 16K+1K 16ms on A3 24 Cards Disaggregation Mode
+
+**Model**: MiMo-V2-Flash
+
+**Hardware**: Atlas 800I A3 24 Cards (8 cards for prefill node, 16 cards for decode node)
+
+**Deploy Mode**: PD Disaggregation
+
+**Dataset**: random
+
+**Input/Output Length**: 16K+1K
+
+**TTFT**: 11,326ms (P99: 28,160ms)
+
+**TPOT**: 16ms (P99: 23ms)
+
+**Quantization**: W8A8 INT8
+
+#### Model Deployment
+
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset with low latency focus (infinite request rate).
+
+```shell Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 9903 \
+    --dataset-name random \
+    --tokenize-prompt \
+    --random-input-len 16000 \
+    --random-output-len 1000 \
+    --request-rate inf \
+    --random-range-ratio 1 \
+    --num-prompts 128 \
+    --max-concurrency 64
+```
+
+### MiMo-V2-Flash 32K+1K 12ms on A3 24 Cards Disaggregation Mode
+
+**Model**: MiMo-V2-Flash
+
+**Hardware**: Atlas 800I A3 24 Cards (8 cards for prefill node, 16 cards for decode node)
+
+**Deploy Mode**: PD Disaggregation
+
+**Dataset**: random
+
+**Input/Output Length**: 32K+1K
+
+**TTFT**: 35,144ms (P99: 55,004ms)
+
+**TPOT**: 12ms (P99: 17ms)
+
+**Quantization**: W8A8 INT8
+
+#### Model Deployment
+
+Same deployment configuration as [MiMo-V2-Flash 16K+1 974ms](#mimo-v2-flash-16k-1-974ms-on-a3-24-cards-disaggregation-mode).
+
+#### Benchmark
+
+We tested it based on the `RANDOM` dataset with low latency focus (infinite request rate).
+
+```shell Command
+python3 -m sglang.bench_serving \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 9903 \
+    --dataset-name random \
+    --tokenize-prompt \
+    --random-input-len 32000 \
+    --random-output-len 1000 \
+    --request-rate inf \
+    --random-range-ratio 1 \
+    --num-prompts 128 \
+    --max-concurrency 64
+```
