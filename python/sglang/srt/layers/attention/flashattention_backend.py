@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
@@ -212,10 +212,6 @@ class FlashAttentionBackend(AttentionBackend):
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
 
-    # Page table is built on-device (the shared kernel self-guards per request),
-    # so the seq_lens_cpu D2H is never needed -- like trtllm_mha / trtllm_mla.
-    needs_cpu_seq_lens: bool = False
-
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -253,6 +249,11 @@ class FlashAttentionBackend(AttentionBackend):
         self.max_num_pages = (
             self.max_context_len + self.page_size - 1
         ) // self.page_size
+        # Opt out of the seq_lens_cpu D2H only for dflash (the worker adapted to
+        # the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the CPU mirror.
+        self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
+            model_runner.server_args.speculative_algorithm
+        ).is_dflash()
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.attn_cp_size
