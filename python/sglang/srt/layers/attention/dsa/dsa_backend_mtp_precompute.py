@@ -90,7 +90,8 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         """
         # Slice inputs to batch size
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Dispatch to mode-specific precomputation
@@ -113,7 +114,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         seq_lens_cpu: torch.Tensor,
     ) -> PrecomputedMetadata:
         """Precompute metadata for normal decode mode."""
-        max_len = int(seq_lens_cpu.max().item())
+        max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
         # Convert to int32 and compute cumsum
         cache_seqlens = seq_lens.to(torch.int32)

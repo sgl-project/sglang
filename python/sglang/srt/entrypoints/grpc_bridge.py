@@ -15,6 +15,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+
 logger = logging.getLogger(__name__)
 
 
@@ -383,9 +385,9 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dict(dataclasses.asdict(self.server_args))
+        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
         result.update(self.scheduler_info)
-        return json.dumps(result, default=str)
+        return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
         from sglang.srt.managers.tokenizer_manager import ServerStatus
