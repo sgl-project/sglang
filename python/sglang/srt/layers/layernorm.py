@@ -243,24 +243,23 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
+        if is_batch_invariant_mode_enabled():
+            if residual is not None:
+                return self.forward_native(x, residual, post_residual_addition)
+            out = rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         if (
             self.weight.dtype != x.dtype
             or self.cast_x_before_out_mul
             or self.override_orig_dtype is not None
         ):
             return self.forward_native(x, residual, post_residual_addition)
-        if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or self.cast_x_before_out_mul
-                or is_true_on_policy_enabled()
-            ):
-                return self.forward_native(x, residual, post_residual_addition)
-            return rms_norm_batch_invariant(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-            )
         if self.cast_x_before_out_mul and residual is None:
             # Use HF-semantics kernel (cast to dtype before weight multiply).
             if (
