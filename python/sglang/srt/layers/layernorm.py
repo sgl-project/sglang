@@ -431,12 +431,6 @@ class RMSNorm(MultiPlatformOp):
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
-        # The vLLM/aiter rms_norm kernels are not batch-invariant on ROCm: the
-        # per-row normalization reduction depends on batch shape, so identical
-        # rows can yield different outputs across batches. When batch-invariant
-        # mode is enabled, mirror forward_cuda: use the batch-invariant Triton
-        # rms_norm kernel where possible, and only fall back to the native path
-        # for the cases it cannot handle.
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
