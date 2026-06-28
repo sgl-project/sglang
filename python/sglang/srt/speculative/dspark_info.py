@@ -34,6 +34,7 @@ class DSparkVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
     num_tokens_per_batch: int = -1
+    block_full_attn: int = 0
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DSPARK_VERIFY)

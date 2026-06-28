@@ -1114,6 +1114,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                 custom_mask=None,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                block_full_attn=self.model_runner.server_args.speculative_num_draft_tokens,
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

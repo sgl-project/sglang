@@ -33,6 +33,7 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.dspark_info import DSparkDraftInputV2, DSparkVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+        capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        if is_cuda() and capture_decode_cuda_graph:
+            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            if available_mem < 1.0:
+                capture_decode_cuda_graph = False
+                logger.warning(
+                    "Disable DSpark draft cuda graph because only %.2f GB GPU "
+                    "memory is available after target backend initialization.",
+                    available_mem,
+                )
+        self._draft_worker.init_cuda_graphs(
+            capture_decode_cuda_graph=capture_decode_cuda_graph
+        )
 
     def clear_cache_pool(self):
         pass
@@ -218,15 +231,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        reserved_seq_lens_cpu: Optional[torch.Tensor] = None,
+        reserved_seq_lens_sum: Optional[int] = None,
     ) -> torch.Tensor:
         device = self.device
-        seq_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
+        if reserved_seq_lens_cpu is not None:
+            seq_lens_cpu = reserved_seq_lens_cpu
+        else:
+            seq_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
+        if reserved_seq_lens_sum is not None:
+            seq_lens_sum = int(reserved_seq_lens_sum)
+        else:
+            seq_lens_sum = int(seq_lens_cpu.sum().item())
         draft_block_spec_info = DSparkVerifyInput(
             draft_token=block_ids.reshape(-1),
             positions=positions,
             draft_token_num=int(self.block_size),
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            block_full_attn=int(self.block_size),
         )
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -235,7 +258,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=req_pool_indices,
             seq_lens=prefix_lens,
             out_cache_loc=verify_out_cache_loc,
-            seq_lens_sum=int(seq_lens_cpu.sum().item()),
+            seq_lens_sum=seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
@@ -243,14 +266,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-        from sglang.srt.layers.attention import deepseek_v4_backend as _dsv4_be
-
-        _dsv4_be._DSPARK_BLOCK_FULL_ATTN = int(self.block_size)
-        try:
-            with torch.inference_mode():
-                draft_runner_out = self.draft_model_runner.forward(draft_forward_batch)
-        finally:
-            _dsv4_be._DSPARK_BLOCK_FULL_ATTN = 0
+        with torch.inference_mode():
+            draft_runner_out = self.draft_model_runner.forward(draft_forward_batch)
 
         raw = draft_runner_out.logits_output
         block_hidden = raw if isinstance(raw, torch.Tensor) else raw.hidden_states
@@ -473,6 +490,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_out_cache_loc=verify_out_cache_loc,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
+            reserved_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+            reserved_seq_lens_sum=draft_input.reserved_seq_lens_sum,
         )
 
         candidates, confidence = self._refine_block_markov(
