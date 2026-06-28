@@ -25,7 +25,10 @@ pub mod wire;
 pub use block_size_oracle::BlockSizeOracle;
 pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
-pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64};
+pub use hash::{
+    compute_block_hashes, compute_block_hashes_bigram, compute_block_hashes_bigram_with_extra_key,
+    compute_block_hashes_with_extra_key, sha256_to_i64,
+};
 pub use index::KvEventIndex;
 pub use subscriber::{KvEventSubscriberRegistry, WorkerEvent};
 pub use tree::{HashTree, KvWorkerId, MatchResult};
