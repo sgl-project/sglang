@@ -185,6 +185,10 @@ The generator currently picks values on the **conservative** side (mirroring an 
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP runs on the v2 speculative path.
 
+**DSpark speculative decoding**
+
+DeepSeek-V4 also ships DSpark block speculative decoding in the `*-DSpark` checkpoints (`deepseek-ai/DeepSeek-V4-Flash-DSpark`, `deepseek-ai/DeepSeek-V4-Pro-DSpark`). Enable it with `--speculative-algorithm DSPARK`; the drafter lives inside the checkpoint, so there is no separate draft model. It is greedy and lossless and gives roughly 1.5x to 1.8x single-stream speedup. See [DSpark Decoding](../../../docs/advanced_features/speculative_decoding#dspark-decoding-deepseek-v4).
+
 **Compressed attention state dtype**
 
 DeepSeek-V4 uses hybrid compressed attention for long-context efficiency. `SGLANG_DSV4_COMPRESS_STATE_DTYPE` controls the dtype of the C4 / C128 compressed attention state pools. Supported values are `float32` / `fp32` (default: `float32`) and `bfloat16` / `bf16`. For BF16 on the offline compression path:
