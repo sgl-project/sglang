@@ -1000,29 +1000,7 @@ def _is_ascend_consistency_case(case_id: str) -> bool:
 
 
 def _remote_file_exists(url: str) -> bool | None:
-    """Probe whether a remote GT file exists, robust to transient failures.
-
-    Returns:
-      * ``True``  -- a 200/206 was observed (the file exists).
-      * ``False`` -- the file was *consistently* reported absent (a clean 4xx
-        such as 404/410 seen on every attempt, with no success in between) ->
-        genuinely missing.
-      * ``None``  -- existence could not be determined (only transient failures:
-        timeouts, connection errors, 403/405/429, 5xx). Callers treat ``None``
-        as "assume present" so a network blip never looks like a missing GT.
-
-    Two robustness properties matter here, because a single false ``False`` is
-    reported to CI as a misleading "GT not found, add GT" failure even though
-    the very same file resolves fine moments later (consistency failures are
-    classified non-retryable, so the in-job retry framework does not cover it):
-
-    1. Retries use exponential backoff to ride out rate-limit / CDN windows
-       (the previous tight 3-shot loop could exhaust during a brief 429 burst).
-    2. A 404 is *not* trusted on first sight -- raw.githubusercontent.com can
-       serve a transient 404 for a freshly-pinned commit before its CDN edge is
-       warm -- so absence is only believed if it survives every attempt and no
-       200/206 ever arrives. A 200/206 on any attempt immediately wins.
-    """
+    """Probe whether a remote GT file exists, robust to transient failures."""
     attempts = 5
     backoff = 1.0
     saw_absent = False  # observed a clean (non-rate-limit) 4xx at least once
@@ -1048,8 +1026,7 @@ def _remote_file_exists(url: str) -> bool | None:
                     ):
                         # Clean 4xx -> "absent", but don't trust it yet: a
                         # freshly-pinned commit can briefly 404 on the CDN.
-                        # Keep retrying and let a later 200 win; only believe
-                        # absence if it persists across all attempts.
+                        # Keep retrying and let a later 200 win
                         saw_absent = True
                     # 403/405/429/5xx -> transient; keep retrying.
                 finally:
