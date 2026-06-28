@@ -64,6 +64,8 @@ class DFlashDraftInputV2(SpecInput):
     _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    _prepare_latest_output_ids_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_latest_output_ids_gpu_buf: Optional[torch.Tensor] = None
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
@@ -117,6 +119,40 @@ class DFlashDraftInputV2(SpecInput):
                 (capacity,), dtype=torch.int32, device=device
             )
 
+        if needs_cpu_alloc(self._prepare_latest_output_ids_cpu_buf):
+            capacity = grown_capacity(self._prepare_latest_output_ids_cpu_buf)
+            self._prepare_latest_output_ids_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
+            )
+
+        if needs_gpu_alloc(self._prepare_latest_output_ids_gpu_buf):
+            capacity = grown_capacity(self._prepare_latest_output_ids_gpu_buf)
+            self._prepare_latest_output_ids_gpu_buf = torch.empty(
+                (capacity,), dtype=torch.int64, device=device
+            )
+
+    def _cumulate_latest_output_tokens_for_penalties(
+        self, batch: ScheduleBatch, bs: int
+    ) -> None:
+        sampling_info = batch.sampling_info
+        if sampling_info is None:
+            return
+        penalizer_orchestrator = sampling_info.penalizer_orchestrator
+        if penalizer_orchestrator is None or not penalizer_orchestrator.is_required:
+            return
+
+        assert self._prepare_latest_output_ids_cpu_buf is not None
+        assert self._prepare_latest_output_ids_gpu_buf is not None
+        output_ids_cpu = self._prepare_latest_output_ids_cpu_buf[:bs]
+        for i, req in enumerate(batch.reqs):
+            output_ids_cpu[i] = (
+                req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
+            )
+
+        output_ids = self._prepare_latest_output_ids_gpu_buf[:bs]
+        output_ids.copy_(output_ids_cpu, non_blocking=True)
+        penalizer_orchestrator.cumulate_output_tokens(output_ids)
+
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
         return cls(
@@ -146,6 +182,7 @@ class DFlashDraftInputV2(SpecInput):
         if bs == 0:
             return
         self._ensure_prepare_length_buffers(bs, batch.device)
+        self._cumulate_latest_output_tokens_for_penalties(batch, bs)
         assert self._prepare_committed_kv_lens_cpu_buf is not None
         assert self._prepare_planning_kv_lens_cpu_buf is not None
         assert self._prepare_batch_seq_lens_cpu_buf is not None

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -115,9 +116,9 @@ def apply_dflash_verify_logits_adjustments(
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
-    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    This keeps DFlash spec-v2 verify aligned with other speculative paths while
+    using precomputed penalty tensors broadcast over the verify block instead of
+    allocating repeated `[bs * draft_token_num, vocab]` buffers every step.
     """
     if sampling_info is None:
         return
@@ -143,7 +144,8 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
+    acc_scaling_penalties = getattr(sampling_info, "acc_scaling_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     vocab_mask = getattr(sampling_info, "vocab_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
@@ -156,33 +158,42 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
+    # Fallback for callers that have not gone through copy_for_forward().
+    # The normal spec-v2 path carries precomputed acc_* penalty tensors.
     if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or vocab_mask is not None:
-        linear_penalty = torch.zeros(
-            (bs, next_token_logits.shape[1]),
-            dtype=torch.float32,
-            device=next_token_logits.device,
-        )
-        sampling_info.apply_logits_bias(linear_penalty)
-        get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
-        )
-        return
+        penalizer is not None
+        and penalizer.is_required
+        and acc_additive_penalties is None
+        and acc_scaling_penalties is None
+    ):
+        penalizer.apply(next_token_logits, repeat=draft_token_num)
 
-    if acc_linear_penalties is not None:
+    if acc_additive_penalties is not None:
         if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
+            acc_additive_penalties.device != next_token_logits.device
+            or acc_additive_penalties.dtype != next_token_logits.dtype
         ):
-            acc_linear_penalties = acc_linear_penalties.to(
+            acc_additive_penalties = acc_additive_penalties.to(
                 device=next_token_logits.device,
                 dtype=next_token_logits.dtype,
             )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+        get_logits_3d().add_(acc_additive_penalties[:, None, :])
+
+    if acc_scaling_penalties is not None:
+        if acc_scaling_penalties.device != next_token_logits.device:
+            acc_scaling_penalties = acc_scaling_penalties.to(
+                device=next_token_logits.device
+            )
+        apply_scaling_penalties(get_logits_3d(), acc_scaling_penalties[:, None, :])
+
+    if vocab_mask is not None:
+        mask_bias = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=next_token_logits.dtype,
+            device=next_token_logits.device,
+        )
+        sampling_info.apply_mask_func(logits=mask_bias, vocab_mask=vocab_mask)
+        get_logits_3d().add_(mask_bias[:, None, :])
 
     if logit_bias is not None:
         if (
