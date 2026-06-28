@@ -801,16 +801,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         for tool in request.tools:
             if tool.type != "function":
                 continue
+            function_kwargs = dict(
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.parameters,
+            )
+            # Only forward ``strict`` when the caller actually set it. Always
+            # passing it would bake it into ``model_fields_set`` and leak the
+            # default into the chat-template tool schema (train-serving
+            # mismatch). See https://github.com/sgl-project/sglang/issues/29061.
+            if "strict" in tool.model_fields_set:
+                function_kwargs["strict"] = tool.strict
             chat_tools.append(
-                Tool(
-                    type="function",
-                    function=Function(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.parameters,
-                        strict=tool.strict,
-                    ),
-                )
+                Tool(type="function", function=Function(**function_kwargs))
             )
         return chat_tools
 

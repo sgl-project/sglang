@@ -156,6 +156,27 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     return img_max_dynamic_patch, vid_max_dynamic_patch
 
 
+def _tool_to_chat_template_format(tool) -> Dict[str, Any]:
+    """Serialize a tool for ``apply_chat_template`` without leaking defaults.
+
+    ``model_dump()`` emits ``strict`` (defaults to ``False``) and a ``Tool``-level
+    ``defer_loading`` (defaults to ``None``) even when the caller never sent them.
+    Those extra keys land in the tool schema rendered into the prompt and change
+    the tokens, causing a train-serving mismatch. Drop them unless explicitly
+    provided, while leaving the general ``model_dump()`` output (used by the
+    function-call parser) untouched.
+    See https://github.com/sgl-project/sglang/issues/29061.
+    """
+    data = tool.model_dump()
+    # ``Tool`` has no model_serializer, so a null ``defer_loading`` leaks here.
+    if tool.defer_loading is None:
+        data.pop("defer_loading", None)
+    function = data.get("function")
+    if isinstance(function, dict) and "strict" not in tool.function.model_fields_set:
+        function.pop("strict", None)
+    return data
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -648,12 +669,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
-                    item.model_dump()
+                    _tool_to_chat_template_format(item)
                     for item in request.tools
                     if item.function.name == request.tool_choice.function.name
                 ]
             else:
-                tools = [item.model_dump() for item in request.tools]
+                tools = [_tool_to_chat_template_format(item) for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
@@ -764,7 +785,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
-                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+                messages[0]["tools"] = [
+                    _tool_to_chat_template_format(tool) for tool in request.tools
+                ]
 
             # Default encoding (dsv4/dsv32)
             if self.chat_encoding_spec == "dsv4":
