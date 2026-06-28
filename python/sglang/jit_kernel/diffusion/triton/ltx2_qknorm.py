@@ -242,7 +242,7 @@ def _ltx2_split_rope_pair_kernel(
 
 
 def _num_warps_for_hidden(hidden: int) -> int:
-    return 8 if hidden >= 4096 else 4
+    return 4 if hidden >= 4096 else 8
 
 
 def ltx2_qknorm_split_rope_pair(
