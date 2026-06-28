@@ -52,6 +52,114 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def torch_gdn_gating(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    A_log_bf16 = A_log.to(torch.bfloat16)
+    dt_bias_bf16 = dt_bias.to(torch.bfloat16)
+    g = -A_log_bf16.exp() * F.softplus(a.float() + dt_bias_bf16)
+    beta = b.to(torch.bfloat16).sigmoid()
+    return g.unsqueeze(0), beta.unsqueeze(0)
+
+
+def torch_chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, None]:
+    """Pure PyTorch chunked gated delta rule matching Megatron's deterministic implementation."""
+    initial_dtype = query.dtype
+    query = query.float()
+    key = key.float()
+    query = query * torch.rsqrt((query * query).sum(dim=-1, keepdim=True) + 1e-6)
+    key = key * torch.rsqrt((key * key).sum(dim=-1, keepdim=True) + 1e-6)
+    query = query.to(initial_dtype)
+    key = key.to(initial_dtype)
+    num_v_heads = value.shape[2]
+    num_k_heads = key.shape[2]
+    if num_v_heads // num_k_heads > 1:
+        repeat = num_v_heads // num_k_heads
+        query = query.repeat_interleave(repeat, dim=2)
+        key = key.repeat_interleave(repeat, dim=2)
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
+    )
+
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+
+    initial_state = ssm_states[cache_indices].to(value) if ssm_states is not None else None
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+    )
+
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state, None
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -471,17 +579,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-            )
+            if is_batch_invariant_mode_enabled():
+                g, beta = torch_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                core_attn_out, last_recurrent_state, h = torch_chunk_gated_delta_rule(
+                    query, key, value, g=g, beta=beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                )
+            else:
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
