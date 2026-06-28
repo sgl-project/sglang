@@ -84,6 +84,7 @@ def test_ltx2_fused_qknorm_split_rope_rejects_interleaved_rope():
     )
     assert actual is None
 
+
 @torch.no_grad()
 def test_ltx2_fused_qknorm_split_rope_rejects_fp32_norm_weight():
     hidden_size = 4096
