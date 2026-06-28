@@ -10,6 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.jit_kernel.diffusion.residual_gate_add import (
+    can_use_residual_gate_add_cuda,
+    residual_gate_add_cuda,
+)
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -48,6 +52,29 @@ logger = init_logger(__name__)
 
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
+_LTX2_RESIDUAL_GATE_CUDA_DISABLED = False
+
+
+def _ltx2_residual_gate_add(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    global _LTX2_RESIDUAL_GATE_CUDA_DISABLED
+
+    if not _LTX2_RESIDUAL_GATE_CUDA_DISABLED and can_use_residual_gate_add_cuda(
+        residual, update, gate
+    ):
+        try:
+            return residual_gate_add_cuda(residual, update, gate)
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            logger.warning_once(f"Disabling LTX2 residual-gate CUDA fast path: {exc}")
+            _LTX2_RESIDUAL_GATE_CUDA_DISABLED = True
+
+    return residual + update * gate
+
 
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
 
@@ -577,6 +604,7 @@ class LTX2Attention(nn.Module):
         qk_norm: bool = True,
         use_local_attention: bool = False,
         apply_gated_attention: bool = False,
+        enable_packed_qkv_input_a2a: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -592,6 +620,7 @@ class LTX2Attention(nn.Module):
         self.qk_norm = bool(qk_norm)
         self.use_local_attention = bool(use_local_attention)
         self.apply_gated_attention = bool(apply_gated_attention)
+        self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
         self.prefix = prefix
 
         tp_size = get_tp_world_size()
@@ -679,6 +708,7 @@ class LTX2Attention(nn.Module):
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn",
+                enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
             )
@@ -904,6 +934,7 @@ class LTX2TransformerBlock(nn.Module):
         cross_attention_adaln: bool = False,
         use_local_av_cross_attention: bool = False,
         force_sdpa_v2a_cross_attention: bool = False,
+        enable_packed_qkv_input_a2a: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -924,6 +955,7 @@ class LTX2TransformerBlock(nn.Module):
             norm_eps=norm_eps,
             qk_norm=qk_norm,
             apply_gated_attention=apply_gated_attention,
+            enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn1",
             quant_config=quant_config,
@@ -935,6 +967,7 @@ class LTX2TransformerBlock(nn.Module):
             norm_eps=norm_eps,
             qk_norm=qk_norm,
             apply_gated_attention=apply_gated_attention,
+            enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_attn1",
             quant_config=quant_config,
@@ -980,6 +1013,7 @@ class LTX2TransformerBlock(nn.Module):
             qk_norm=qk_norm,
             use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
+            enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_to_video_attn",
             quant_config=quant_config,
@@ -993,6 +1027,7 @@ class LTX2TransformerBlock(nn.Module):
             qk_norm=qk_norm,
             use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
+            enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             supported_attention_backends=(
                 {AttentionBackendEnum.TORCH_SDPA}
                 if force_sdpa_v2a_cross_attention
@@ -1108,7 +1143,9 @@ class LTX2TransformerBlock(nn.Module):
             gather_context_kv_for_sp=audio_replicated_for_sp,
             context_replicated_prefix_len=video_memory_prefix_len,
         )
-        hidden_states = hidden_states + attn_hidden_states * vgate_msa
+        hidden_states = _ltx2_residual_gate_add(
+            hidden_states, attn_hidden_states, vgate_msa
+        )
 
         if audio_ada_values is None:
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
@@ -1128,7 +1165,9 @@ class LTX2TransformerBlock(nn.Module):
             all_perturbed=skip_audio_self_attn,
             skip_sequence_parallel_override=audio_replicated_for_sp,
         )
-        audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * agate_msa
+        audio_hidden_states = _ltx2_residual_gate_add(
+            audio_hidden_states, attn_audio_hidden_states, agate_msa
+        )
         # 2. Prompt Cross-Attention
         if self.cross_attention_adaln:
             # LTX2.3
@@ -1156,7 +1195,9 @@ class LTX2TransformerBlock(nn.Module):
                 context=mod_encoder_hidden_states,
                 mask=encoder_attention_mask,
             )
-            hidden_states = hidden_states + attn_hidden_states * vgate_q
+            hidden_states = _ltx2_residual_gate_add(
+                hidden_states, attn_hidden_states, vgate_q
+            )
 
             if audio_ada_values is None:
                 ashift_q, ascale_q, agate_q = self.get_ada_values(
@@ -1182,8 +1223,8 @@ class LTX2TransformerBlock(nn.Module):
                 context=mod_audio_encoder_hidden_states,
                 mask=audio_encoder_attention_mask,
             )
-            audio_hidden_states = (
-                audio_hidden_states + attn_audio_hidden_states * agate_q
+            audio_hidden_states = _ltx2_residual_gate_add(
+                audio_hidden_states, attn_audio_hidden_states, agate_q
             )
         else:
             norm_hidden_states = self.rms_norm(hidden_states, self.norm_eps)
@@ -1284,7 +1325,9 @@ class LTX2TransformerBlock(nn.Module):
                 a2v_attn_hidden_states = (
                     a2v_attn_hidden_states * a2v_cross_attn_perturbation_mask
                 )
-            hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
+            hidden_states = _ltx2_residual_gate_add(
+                hidden_states, a2v_attn_hidden_states, a2v_gate
+            )
 
         # V2A
         mod_norm_hidden_states = (
@@ -1308,8 +1351,8 @@ class LTX2TransformerBlock(nn.Module):
                 v2a_attn_hidden_states = (
                     v2a_attn_hidden_states * v2a_cross_attn_perturbation_mask
                 )
-            audio_hidden_states = (
-                audio_hidden_states + v2a_gate * v2a_attn_hidden_states
+            audio_hidden_states = _ltx2_residual_gate_add(
+                audio_hidden_states, v2a_attn_hidden_states, v2a_gate
             )
         # 4. Feedforward
         if video_ada_values is None:
@@ -1322,7 +1365,7 @@ class LTX2TransformerBlock(nn.Module):
             self.rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
         )
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = hidden_states + ff_output * vgate_mlp
+        hidden_states = _ltx2_residual_gate_add(hidden_states, ff_output, vgate_mlp)
 
         if audio_ada_values is None:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
@@ -1335,7 +1378,9 @@ class LTX2TransformerBlock(nn.Module):
             + ashift_mlp
         )
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
-        audio_hidden_states = audio_hidden_states + audio_ff_output * agate_mlp
+        audio_hidden_states = _ltx2_residual_gate_add(
+            audio_hidden_states, audio_ff_output, agate_mlp
+        )
         return hidden_states, audio_hidden_states
 
 
@@ -1628,6 +1673,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     force_sdpa_v2a_cross_attention=bool(
                         getattr(arch, "force_sdpa_v2a_cross_attention", False)
                     ),
+                    enable_packed_qkv_input_a2a=arch.enable_packed_qkv_input_a2a,
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=config.prefix,
                     quant_config=quant_config,

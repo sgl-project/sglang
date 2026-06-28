@@ -303,6 +303,11 @@ _DSA_IMPL_T: TypeAlias = Literal[
 class DeepseekSparseAttnBackend(
     DeepseekSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
+    # Decode/verify/draft graph replay rebuilds metadata from static buffers
+    # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
+    # the D2H sync. The eager fallback derives lengths from GPU seq_lens.
+    needs_cpu_seq_lens: bool = False
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -642,8 +647,15 @@ class DeepseekSparseAttnBackend(
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-        assert forward_batch.seq_lens_cpu is not None
-        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+        if forward_batch.seq_lens_cpu is not None:
+            max_seqlen_k = int(
+                forward_batch.seq_lens_cpu.max().item() + draft_token_num
+            )
+        else:
+            # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
+            # batches; graph replay uses the static page-table width, so only this
+            # eager (e.g. over-capture-bs) fallback needs a length here.
+            max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
         # [b, max_seqlen_k]
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -1187,8 +1199,6 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
-        assert seq_lens_cpu is not None
-
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -1206,14 +1216,13 @@ class DeepseekSparseAttnBackend(
         self.set_dsa_prefill_impl(forward_batch=None)
 
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            max_len = int(seq_lens_cpu.max().item())
+            max_len = metadata.page_table_1.shape[1]
 
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1228,9 +1237,7 @@ class DeepseekSparseAttnBackend(
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
-            max_seqlen_k = int(
-                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
-            )
+            max_seqlen_k = metadata.page_table_1.shape[1]
 
             cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
@@ -1244,12 +1251,18 @@ class DeepseekSparseAttnBackend(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
+            # Fill the constant per-req qo lengths (num_draft_tokens) on-device;
+            # torch.tensor(list, device=cuda) does a pageable H2D copy that
+            # blocks the host on the whole queued stream.
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
-                ),
+                extend_seq_lens,
                 cache_seqlens,
                 self.speculative_num_draft_tokens * bs,
                 self.speculative_num_draft_tokens,
@@ -1260,39 +1273,44 @@ class DeepseekSparseAttnBackend(
             )
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
         elif forward_mode.is_draft_extend_v2():
-            max_seqlen_k = int(seq_lens_cpu.max().item())
+            # V2 draft-extend processes the full padded tree width
+            # (speculative_num_draft_tokens) per req -- a static shape, like
+            # target-verify -- so graph replay stays host-sync-free. seq_lens
+            # already includes the draft KV written by prepare_for_draft_extend;
+            # the per-req accept length is handled downstream by output
+            # selection, not by reshaping the page table here.
+            max_seqlen_k = metadata.page_table_1.shape[1]
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
 
-            extend_seq_lens = spec_info.num_accept_tokens[:bs]
-            extend_seq_lens_cpu = extend_seq_lens.tolist()
-
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
             page_indices = torch.repeat_interleave(
-                page_indices, repeats=extend_seq_lens, dim=0
+                page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
-            metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
-                page_indices
-            )
+            metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
 
+            # See target-verify note: fill on-device to avoid the blocking
+            # pageable H2D from torch.tensor(list, device=cuda).
+            extend_seq_lens = torch.full(
+                (bs,),
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             seqlens_expanded = seqlens_expand_triton(
                 extend_seq_lens,
                 cache_seqlens,
-                sum(extend_seq_lens_cpu),
+                self.speculative_num_draft_tokens * bs,
                 self.speculative_num_draft_tokens,
             )
-            metadata.dsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
-                seqlens_expanded
-            )
+            metadata.dsa_seqlens_expanded.copy_(seqlens_expanded)
             dsa_cache_seqlens = compute_dsa_seqlens(
                 seqlens_expanded, self.dsa_index_topk
             )
-            metadata.dsa_cache_seqlens_int32[: seqlens_expanded.shape[0]].copy_(
-                dsa_cache_seqlens
-            )
+            metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
         if is_cuda() and (
@@ -2587,6 +2605,10 @@ class DeepseekSparseAttnBackend(
 
 
 class DeepseekSparseAttnMultiStepBackend:
+
+    # Per-step draft decode replays from precomputed GPU metadata; opt out so
+    # decide_needs_cpu_seq_lens' OR over the backends stays False.
+    needs_cpu_seq_lens: bool = False
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
