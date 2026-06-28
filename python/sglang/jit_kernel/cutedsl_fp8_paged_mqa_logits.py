@@ -216,6 +216,7 @@ class FP8MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        enable_pdl: bool = True,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -235,6 +236,7 @@ class FP8MQALogitsKernel:
         self.next_n = next_n
         self.N = next_n * num_heads
         self.num_sms = num_sms
+        self.enable_pdl = enable_pdl
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
@@ -538,6 +540,7 @@ class FP8MQALogitsKernel:
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
+            use_pdl=self.enable_pdl,
         )
 
     @cute.kernel
@@ -941,6 +944,9 @@ class FP8MQALogitsKernel:
         has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
 
         # ===== WARP-SPECIALIZED EXECUTION =====
 
@@ -1799,6 +1805,9 @@ class FP8MQALogitsKernel:
                 if q_idx < batch_size:
                     q_pipeline.consumer_release(q_cons_state)
                     q_cons_state.advance()
+
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
 
             # TMEM dealloc: math warps are allocator + last consumer
             tmem.relinquish_alloc_permit()
