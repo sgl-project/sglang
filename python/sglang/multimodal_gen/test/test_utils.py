@@ -93,6 +93,14 @@ DEFAULT_PSNR_THRESHOLD_VIDEO = 24.0
 DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
 _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
+# Case keys whose remote GT has been positively confirmed present. Cached so a
+# case that probes GT existence more than once in a single run — e.g. a
+# consistency check followed by the LoRA basic-API check, which re-validates
+# after merge/set_lora — does not re-hit the remote store. A single transient
+# miss on a *later* probe must not turn an already-confirmed GT into a spurious
+# "GT not found". Only positive (exists) results are cached; misses are not, so
+# a genuinely-absent GT is still reported.
+_gt_exists_remote_cache: set[str] = set()
 
 
 def _load_clip_processor_with_roberta_processing_compat(
@@ -1209,9 +1217,17 @@ def gt_exists(
             return all((gt_dir / c).exists() for c in candidates)
         return any((gt_dir / c).exists() for c in candidates)
 
-    return bool(
+    cache_key = _get_consistency_gt_cache_key(
+        case_id, num_gpus, is_video, output_format
+    )
+    if cache_key in _gt_exists_remote_cache:
+        return True
+    found = bool(
         _find_remote_consistency_gt_files(case_id, num_gpus, is_video, output_format)
     )
+    if found:
+        _gt_exists_remote_cache.add(cache_key)
+    return found
 
 
 def extract_key_frames_from_video(
