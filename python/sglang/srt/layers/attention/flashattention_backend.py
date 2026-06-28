@@ -2470,9 +2470,16 @@ class FlashAttentionBackend(AttentionBackend):
                             dst_kv_lens=metadata.cache_seqlens_int32,
                         )
                 else:
-                    # Static upper bound; the fused kernel self-guards on
-                    # seq_lens, so no host max / D2H sync is needed.
-                    metadata.max_seq_len_k = self.max_context_len
+                    # Page table uses the static max_num_pages bound (the fused
+                    # kernel self-guards on seq_lens, no D2H). max_seq_len_k only
+                    # drives the FA3 scheduler_metadata precompute below, so use
+                    # the free CPU mirror for a tight split heuristic when it is
+                    # published, else fall back to the static upper bound.
+                    metadata.max_seq_len_k = (
+                        seq_lens_cpu.max().item()
+                        if seq_lens_cpu is not None
+                        else self.max_context_len
+                    )
                     normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
