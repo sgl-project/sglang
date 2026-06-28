@@ -1104,7 +1104,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         model=request.model,
                         index=index,
                         role="assistant",
-                        content="",
                     )
                     stream_started = True
 
