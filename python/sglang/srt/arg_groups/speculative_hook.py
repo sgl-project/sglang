@@ -229,6 +229,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
+    _handle_dflash_tree(server_args)
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
@@ -240,6 +242,28 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         logger.warning(
             "Mixed chunked prefill is disabled because of using dflash speculative decoding."
         )
+
+
+def _handle_dflash_tree(server_args: ServerArgs) -> None:
+    """Startup guard for DFLASH tree drafting (#29524).
+
+    The host-side tree-construction core (``sglang.srt.speculative.dflash_tree``) and
+    the verify-input bridge (``dflash_info.build_dflash_tree_verify_input``) are
+    implemented and unit-tested, but the live verify-loop integration in
+    ``dflash_worker_v2`` (CUDA-graph capture sized for a variable tree, plus the
+    non-contiguous accepted-path KV commit) is the GPU-validated follow-up and is not
+    yet wired. Guard tree mode off at startup so the flag cannot trigger an
+    unimplemented path; chain mode (``tree_width <= 1``) is unaffected.
+    """
+    tree_width = server_args.speculative_dflash_tree_width or 1
+    if tree_width <= 1:
+        return
+    raise ValueError(
+        "--speculative-dflash-tree-width > 1 (DFlash tree drafting) is not yet "
+        "runnable: the host-side tree-construction core is implemented and tested, "
+        "but the live verify-loop integration is the #29524 GPU follow-up. "
+        "Use --speculative-dflash-tree-width 1 (linear chain)."
+    )
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
