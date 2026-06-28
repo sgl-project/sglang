@@ -244,6 +244,59 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
 
+    def test_abort_releases_lora_request_usage(self):
+        """Waiting-queue abort should release the LoRA usage counter once."""
+        tm = _make_tokenizer_manager()
+        tm.server_args.enable_lora = True
+        tm.lora_registry = Mock()
+        tm.lora_registry.release = AsyncMock()
+        rid = "abort_lora_rid"
+        state = _make_req_state(rid)
+        state.obj.lora_path = "test-lora"
+        state.obj.lora_id = "lora-0"
+        tm.rid_to_state[rid] = state
+
+        async def drive_abort():
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+        asyncio.run(drive_abort())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertTrue(state.event.is_set())
+        tm.lora_registry.release.assert_awaited_once_with("lora-0")
+
+    def test_abort_without_lora_does_not_release_usage(self):
+        """Non-LoRA abort cleanup should not touch the LoRA registry."""
+        tm = _make_tokenizer_manager()
+        tm.server_args.enable_lora = True
+        tm.lora_registry = Mock()
+        tm.lora_registry.release = AsyncMock()
+        rid = "abort_no_lora_rid"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm.lora_registry.release.assert_not_awaited()
+
+    def test_abort_without_lora_path_attr_does_not_release_usage(self):
+        """Abort cleanup should tolerate future request objects without lora_path."""
+        tm = _make_tokenizer_manager()
+        tm.server_args.enable_lora = True
+        tm.lora_registry = Mock()
+        tm.lora_registry.release = AsyncMock()
+        rid = "abort_missing_lora_path_rid"
+        state = _make_req_state(rid)
+        del state.obj.lora_path
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm.lora_registry.release.assert_not_awaited()
+
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
@@ -514,6 +567,33 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # All sub-request entries created by _init_req_state are cleaned up.
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
+
+    def test_single_failure_after_lora_acquire_releases_usage(self):
+        tm = _make_tm_for_generate()
+        tm.server_args.enable_lora = True
+        tm.lora_registry = Mock()
+        tm.lora_registry.release = AsyncMock()
+        rid = "single_lora_overlen"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.lora_path = "test-lora"
+        tm._tokenize_one_request = AsyncMock(side_effect=ValueError("input too long"))
+        tm._send_one_request = Mock()
+
+        async def acquire_lora(_):
+            obj.lora_id = "lora-0"
+
+        tm._validate_and_resolve_lora = AsyncMock(side_effect=acquire_lora)
+
+        async def drive():
+            with self.assertRaises(ValueError):
+                await tm.generate_request(obj).__anext__()
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm._send_one_request.assert_not_called()
+        tm.lora_registry.release.assert_awaited_once_with("lora-0")
 
 
 if __name__ == "__main__":
