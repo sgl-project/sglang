@@ -243,6 +243,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -1120,6 +1121,17 @@ class Scheduler(
         if model_config is None:
             model_config = self.model_config
 
+        if self.spec_algorithm.carries_draft_hidden_states():
+            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
+            # worker, so a single accessor covers both shapes.
+            draft_runner = self.draft_worker.draft_worker.draft_runner
+            disagg_hidden_size, disagg_hidden_states_dtype = (
+                get_draft_recurrent_hidden_state_spec(draft_runner)
+            )
+        else:
+            disagg_hidden_size = 16  # minimal padding size for RDMA
+            disagg_hidden_states_dtype = torch.float32
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1129,16 +1141,8 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else torch.float32
-                ),
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -1182,16 +1186,8 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else torch.float32
-                ),
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -1491,9 +1487,10 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        # DFLASH fences its shared req_to_token writes with verify_done /
-        # plan-stream deps, so the global WAR barrier only serializes plan
-        # overlap. TODO: generalize this global-barrier enablement policy.
+        # The global WAR barrier fences the scheduler's next shared-buffer write
+        # on the forward's read-done event. DFLASH opts out: it fences its own
+        # req_to_token writes with verify_done / plan-stream deps, so the global
+        # barrier would only serialize plan overlap without adding correctness.
         self._war_barrier_enabled = (
             is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         ) and not self.spec_algorithm.is_dflash()
@@ -2626,8 +2623,9 @@ class Scheduler(
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
-            # so there is nothing new to cache and stashing would be a no-op.
+            # hybrid-SWA early-return) leaves extend_range.end ==
+            # len(prefix_indices), so there is nothing new to cache and
+            # stashing would be a no-op.
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
@@ -2974,7 +2972,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.swa_evict_floor = req.fill_len
+                req.swa_evict_floor = req.extend_range.end
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
