@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -337,6 +341,12 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
+        try:
+            self.dsa_index_n_heads = get_dsa_index_n_heads(
+                model_runner.model_config.hf_config
+            )
+        except Exception:
+            self.dsa_index_n_heads = 0
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -645,6 +655,7 @@ class DeepseekSparseAttnBackend(
             max_ctx=max_seq_len_k,
             num_sms=num_sms,
             kernel_atoms=(1, 2, 3, 4),
+            num_heads=self.dsa_index_n_heads,
         )
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:

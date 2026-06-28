@@ -11,7 +11,7 @@ and the context is long.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -30,6 +30,7 @@ def _pick_dsl_expand(
     max_ctx: int = 0,
     num_sms: int = 148,
     kernel_atoms: Tuple[int, ...] = (1, 2, 3, 4),
+    num_heads: int = 0,
 ) -> Tuple[int, int]:
     """Pick (expand_factor, effective_next_n) for the DSL paged kernel
     using a wave-aware strategy.
@@ -56,6 +57,35 @@ def _pick_dsl_expand(
                 return next_n // eff, eff
         return next_n, 1
 
+    # Measured override for next_n=6, num_heads=32 on SM100 (~148 SMs): the
+    # min-waves heuristic picks 3/1->2 (atom=3) but the kernel's atom=2 path
+    # wins by up to ~20% in a jagged (batch, ctx) region the wave model can't
+    # see. These bounds are empirical (autotuned), not analytic; outside them
+    # min-waves is optimal. Reduces mean split-regret 1.0%->0.05% on the grid.
+    if next_n == 6:
+        # Native single-launch next_n=6 (factor=1) reads KV once vs 2-3x for the
+        # split, and with weights-in-SMEM (see _propose_epi_config) it beats the
+        # split by +17..44% once there is enough work to fill the SMs. Requires
+        # N=6*num_heads<=256 (the single-MMA TMEM limit), i.e. num_heads<=42.
+        # Below the work threshold (few SMs busy) the split's extra tasks win.
+        if 0 < num_heads * 6 <= 256:
+            native_wins = (
+                batch_size >= 16
+                or (batch_size >= 4 and max_ctx >= 32768)
+                or (batch_size >= 2 and max_ctx >= 131072)
+            )
+            if native_wins:
+                return 1, 6
+        use_atom2 = (
+            (batch_size >= 45 and max_ctx <= (batch_size - 44) * 32768)
+            or (batch_size == 16 and max_ctx >= 49152)
+            or (batch_size == 10 and max_ctx >= 90000)
+            or (batch_size == 17 and 49152 <= max_ctx <= 110000)
+            or (batch_size == 7 and max_ctx >= 120000)
+        )
+        if use_atom2 and 2 in kernel_atoms:
+            return 3, 2
+
     SPLIT_KV_TOKENS = 256
     cands = []
     for eff in kernel_atoms:
@@ -81,6 +111,64 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.float32: cutlass.Float32,
 }
 
+# Epilogue pipeline-flag presets for the auto-tuner (see _propose_epi_config).
+_EPI_KV_UMMA_SUB = dict(
+    max_kv_pipeline=True, max_umma_pipeline=True, smem_subpartition_opt=True
+)
+_EPI_NOWAIT = dict(_EPI_KV_UMMA_SUB, remove_kv_wait_in_epilogue=True)
+
+
+def _propose_epi_config(
+    num_heads: int,
+    next_n_k: int,
+    batch_split: int,
+    max_ctx: int,
+    num_sms: int,
+) -> Tuple[int, Dict]:
+    """Auto-tune (num_epi_subtiles, pipeline_flags) for the FP8 MQA epilogue.
+
+    Tuned on B300 (~148 SMs) for the GLM-5.2 32-head path; ``next_n_k`` and
+    ``batch_split`` are the post-split atom and batch reaching the kernel.
+    Wins +3..14% vs the untuned base config across the next_n=6 (atom 2/3)
+    grid. num_heads>32 is left at the safe baseline (no change).
+    """
+    # Only the <=32-head path is tuned; leave wider indexers untouched.
+    if num_heads > 32 or num_heads % 8 != 0:
+        return 1, {}
+    # Native next_n=6 (single launch, N=6*heads<=256): the per-token weight cache
+    # is 6*heads regs and spills to local/GMEM (3x slowdown). Reading weights from
+    # SMEM instead (max_w_in_reg=8) avoids the spill; combined with the 1x KV read
+    # (vs the split's 2-3x) this beats the split by +17..44% at HBM-bound shapes.
+    if next_n_k == 6 and num_heads * 6 <= 256:
+        return 1, {"max_w_in_reg": 8}
+    # num_epi_subtiles=2 interleaves LDTM with FP32 FMA on the multi-slot
+    # (atom != 2) epilogue; neutral elsewhere, slightly negative on atom==2.
+    nst = 2 if next_n_k != 2 else 1
+    if (num_heads // nst) % 4 != 0:
+        nst = 1
+    waves = (batch_split * ((max_ctx + 255) // 256) + num_sms - 1) // num_sms
+    # The nowait + deep KV/UMMA pipeline wins broadly below grid saturation, but
+    # above ~130 waves the win flips non-monotonically with occupancy (deep_gemm
+    # scheduler resonance — not modelable by waves/work/fill). Measured on B300
+    # (~148 SM, hd=32, dense ctx=131k saturated sweep): the 2/3-split (atom 3)
+    # resonates positively exactly when post-split batch % 24 == 0 (Bs 48,72 win
+    # +10..16%; 40,44,52,56,60,64,80,88 all regress 3-6%); the 3/2-split (atom 2)
+    # only resonates at Bs % 144 == 0 (144 wins +12%; 48 regresses). Whitelist
+    # those; otherwise fall back to the exact baseline at saturation.
+    if next_n_k == 3:
+        resonant = batch_split % 24 == 0
+    elif next_n_k == 2:
+        resonant = batch_split % 144 == 0
+    else:
+        resonant = False
+    if waves >= 130 and not resonant:
+        return 1, {}
+    # The multi-slot (atom>=3) epilogue benefits at any sub-saturation occupancy;
+    # the atom==2 epilogue only benefits once there is enough work to hide the
+    # flag overhead (it dominates at ~1 wave).
+    flags = _EPI_NOWAIT if (next_n_k >= 3 or waves >= 50) else {}
+    return nst, flags
+
 
 class CuteDSLPagedMQALogitsRunner:
     """Runner for CuTe DSL FP8 Paged MQA Logits kernel (Blackwell SM100).
@@ -104,8 +192,10 @@ class CuteDSLPagedMQALogitsRunner:
         epi_dtype,
         acc_dtype,
         output_dtype,
+        pipeline_flags=None,
     ):
         """Compile kernel using fake tensors + TVM FFI."""
+        pipeline_flags = pipeline_flags or {}
         key = (
             compute_block_kv,
             phys_block_kv,
@@ -117,6 +207,7 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype,
             acc_dtype,
             output_dtype,
+            tuple(sorted(pipeline_flags.items())),
         )
         if key in cls.kernel_cache:
             return
@@ -179,6 +270,7 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype=to_cutlass[epi_dtype],
             acc_dtype=to_cutlass[acc_dtype],
             output_dtype=to_cutlass[output_dtype],
+            **pipeline_flags,
         )
 
         compiled = cute.compile(
@@ -212,7 +304,7 @@ class CuteDSLPagedMQALogitsRunner:
         block_table: torch.Tensor,
         schedule_meta: torch.Tensor,
         max_context_len: int,
-        num_epi_subtiles: int = 1,
+        num_epi_subtiles: Optional[int] = None,
         epi_dtype: torch.dtype = torch.float32,
         acc_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
@@ -227,7 +319,7 @@ class CuteDSLPagedMQALogitsRunner:
             block_table: [B, max_blocks] int32
             schedule_meta: [num_sms+1, 2] int32
             max_context_len: int
-            num_epi_subtiles: epilogue sub-tile count (1, 2, or 4)
+            num_epi_subtiles: epilogue sub-tile count (1, 2, or 4); None auto-tunes
             epi_dtype: epilogue compute dtype
             acc_dtype: MMA accumulator dtype
             output_dtype: output logits dtype
@@ -240,6 +332,17 @@ class CuteDSLPagedMQALogitsRunner:
         compute_block_kv = 128
         num_phys_blocks = kv_fused.shape[0]
         num_sms = HardwareInfo().get_device_multiprocessor_count()
+
+        # Auto-tune (num_epi_subtiles, pipeline flags) for the epilogue when the
+        # caller leaves num_epi_subtiles unset; an explicit value disables the
+        # flag auto-tuning and is honored as-is.
+        auto_nst, pipeline_flags = _propose_epi_config(
+            H, next_n, B, max_context_len, num_sms
+        )
+        if num_epi_subtiles is None:
+            num_epi_subtiles = auto_nst
+        else:
+            pipeline_flags = {}
 
         # Reshape Q: [B, next_n, H, D] -> [B, N, D] -> [N, D, B]
         q_3d = q.reshape(B, N, D).permute(1, 2, 0)
@@ -275,6 +378,7 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype,
             acc_dtype,
             output_dtype,
+            tuple(sorted(pipeline_flags.items())),
         )
         if key not in cls.kernel_cache:
             cls._compile(
@@ -288,6 +392,7 @@ class CuteDSLPagedMQALogitsRunner:
                 epi_dtype,
                 acc_dtype,
                 output_dtype,
+                pipeline_flags,
             )
         compiled = cls.kernel_cache[key]
 
@@ -325,7 +430,7 @@ def cute_dsl_fp8_paged_mqa_logits(
     block_table: torch.Tensor,
     schedule_meta: torch.Tensor,
     max_context_len: int,
-    num_epi_subtiles: int = 1,
+    num_epi_subtiles: Optional[int] = None,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
     output_dtype: torch.dtype = torch.float32,
@@ -356,7 +461,7 @@ def _(
     block_table: torch.Tensor,
     schedule_meta: torch.Tensor,
     max_context_len: int,
-    num_epi_subtiles: int = 1,
+    num_epi_subtiles: Optional[int] = None,
     epi_dtype: torch.dtype = torch.float32,
     acc_dtype: torch.dtype = torch.float32,
     output_dtype: torch.dtype = torch.float32,

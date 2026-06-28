@@ -177,6 +177,19 @@ def add_f16x2(
     )
 
 
+def relu2_fma_f32x2(v0, v1, v2, v3, w0, w1, w2, w3, s0x, s0y, s1x, s1y):
+    # ReLU+weighted-accumulate of 4 heads via packed f32x2 (DeepGEMM SM100 pattern).
+    # relu(x) = (x + |x|) * 0.5; here we accumulate 2*relu (the 0.5 is folded into
+    # the output scale by the caller). abs folds into the add_packed_f32x2 source
+    # modifier, so the ReLU stays on the FMA pipe instead of emitting scalar FMNMX
+    # on the ALU pipe (the SM100 bottleneck for this kernel).
+    r01 = cute.arch.add_packed_f32x2((v0, v1), (cute.math.absf(v0), cute.math.absf(v1)))
+    r23 = cute.arch.add_packed_f32x2((v2, v3), (cute.math.absf(v2), cute.math.absf(v3)))
+    s0x, s0y = cute.arch.fma_packed_f32x2(r01, (w0, w1), (s0x, s0y), rnd="rn")
+    s1x, s1y = cute.arch.fma_packed_f32x2(r23, (w2, w3), (s1x, s1y), rnd="rn")
+    return s0x, s0y, s1x, s1y
+
+
 class FP8MQALogitsKernel:
     """FP8 paged MQA logits kernel for Blackwell (SM100).
 
@@ -198,6 +211,7 @@ class FP8MQALogitsKernel:
         smem_subpartition_opt: bool = False,
         max_kv_pipeline: bool = False,
         max_umma_pipeline: bool = False,
+        max_w_in_reg: int = 0,
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
@@ -215,6 +229,7 @@ class FP8MQALogitsKernel:
         self.remove_kv_wait_in_epilogue = remove_kv_wait_in_epilogue
         self.early_tmem_copy = early_tmem_copy
         self.smem_subpartition_opt = smem_subpartition_opt
+        self.max_w_in_reg = max_w_in_reg
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.next_n = next_n
@@ -1311,6 +1326,8 @@ class FP8MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
+                if cutlass.const_expr(self.max_w_in_reg > 0):
+                    MAX_NUM_W_IN_REG = self.max_w_in_reg
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
@@ -1451,32 +1468,20 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                    )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
                                     r0 = t * NUM_W_IN_REG + h_g
-                                    w0 = w_cache[r0]
-                                    w1 = w_cache[r0 + 1]
-                                    w2 = w_cache[r0 + 2]
-                                    w3 = w_cache[r0 + 3]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1),
-                                        (w0, w1),
-                                        (s0x, s0y),
-                                        rnd="rn",
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3),
-                                        (w2, w3),
-                                        (s1x, s1y),
-                                        rnd="rn",
+                                    s0x, s0y, s1x, s1y = relu2_fma_f32x2(
+                                        acc_vec[n0],
+                                        acc_vec[n0 + 1],
+                                        acc_vec[n0 + 2],
+                                        acc_vec[n0 + 3],
+                                        w_cache[r0],
+                                        w_cache[r0 + 1],
+                                        w_cache[r0 + 2],
+                                        w_cache[r0 + 3],
+                                        s0x,
+                                        s0y,
+                                        s1x,
+                                        s1y,
                                     )
                             # SMEM-path: weights from shared mem
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1508,38 +1513,28 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                    )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
-                                    w0 = sW[(t * num_heads + h_g, q_stage_local)]
-                                    w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
-                                    w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
-                                    w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1),
-                                        (w0, w1),
-                                        (s0x, s0y),
-                                        rnd="rn",
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3),
-                                        (w2, w3),
-                                        (s1x, s1y),
-                                        rnd="rn",
+                                    s0x, s0y, s1x, s1y = relu2_fma_f32x2(
+                                        acc_vec[n0],
+                                        acc_vec[n0 + 1],
+                                        acc_vec[n0 + 2],
+                                        acc_vec[n0 + 3],
+                                        sW[(t * num_heads + h_g, q_stage_local)],
+                                        sW[(t * num_heads + h_g + 1, q_stage_local)],
+                                        sW[(t * num_heads + h_g + 2, q_stage_local)],
+                                        sW[(t * num_heads + h_g + 3, q_stage_local)],
+                                        s0x,
+                                        s0y,
+                                        s1x,
+                                        s1y,
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)
                             sum_lo, sum_hi = unpack_f16x2(ps_sum)
                             result_t = sum_lo + sum_hi
                         else:
-                            result_t = s0x + s0y + s1x + s1y
+                            # 0.5 here completes relu(x)=(x+|x|)*0.5 folded across
+                            # the packed-f32x2 ReLU accumulation in relu2_fma_f32x2.
+                            result_t = (s0x + s0y + s1x + s1y) * cutlass.Float32(0.5)
                         out_row = q_idx * next_n + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             mLogits[(out_row, kv_pos)] = self.output_dtype(
@@ -1588,6 +1583,8 @@ class FP8MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
+                if cutlass.const_expr(self.max_w_in_reg > 0):
+                    MAX_NUM_W_IN_REG = self.max_w_in_reg
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
@@ -1709,32 +1706,20 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                    )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
                                     r0 = t * NUM_W_IN_REG + h_g
-                                    w0 = w_cache[r0]
-                                    w1 = w_cache[r0 + 1]
-                                    w2 = w_cache[r0 + 2]
-                                    w3 = w_cache[r0 + 3]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1),
-                                        (w0, w1),
-                                        (s0x, s0y),
-                                        rnd="rn",
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3),
-                                        (w2, w3),
-                                        (s1x, s1y),
-                                        rnd="rn",
+                                    s0x, s0y, s1x, s1y = relu2_fma_f32x2(
+                                        acc_vec[n0],
+                                        acc_vec[n0 + 1],
+                                        acc_vec[n0 + 2],
+                                        acc_vec[n0 + 3],
+                                        w_cache[r0],
+                                        w_cache[r0 + 1],
+                                        w_cache[r0 + 2],
+                                        w_cache[r0 + 3],
+                                        s0x,
+                                        s0y,
+                                        s1x,
+                                        s1y,
                                     )
                             # SMEM-path
                             smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
@@ -1766,38 +1751,28 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                    )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
-                                    w0 = sW[(t * num_heads + h_g, q_stage_local)]
-                                    w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
-                                    w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
-                                    w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1),
-                                        (w0, w1),
-                                        (s0x, s0y),
-                                        rnd="rn",
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3),
-                                        (w2, w3),
-                                        (s1x, s1y),
-                                        rnd="rn",
+                                    s0x, s0y, s1x, s1y = relu2_fma_f32x2(
+                                        acc_vec[n0],
+                                        acc_vec[n0 + 1],
+                                        acc_vec[n0 + 2],
+                                        acc_vec[n0 + 3],
+                                        sW[(t * num_heads + h_g, q_stage_local)],
+                                        sW[(t * num_heads + h_g + 1, q_stage_local)],
+                                        sW[(t * num_heads + h_g + 2, q_stage_local)],
+                                        sW[(t * num_heads + h_g + 3, q_stage_local)],
+                                        s0x,
+                                        s0y,
+                                        s1x,
+                                        s1y,
                                     )
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             ps_sum = add_f16x2(ps0, ps1)
                             sum_lo, sum_hi = unpack_f16x2(ps_sum)
                             result_t = sum_lo + sum_hi
                         else:
-                            result_t = s0x + s0y + s1x + s1y
+                            # 0.5 here completes relu(x)=(x+|x|)*0.5 folded across
+                            # the packed-f32x2 ReLU accumulation in relu2_fma_f32x2.
+                            result_t = (s0x + s0y + s1x + s1y) * cutlass.Float32(0.5)
                         out_row = q_idx * next_n + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                             mLogits[(out_row, kv_pos)] = self.output_dtype(
