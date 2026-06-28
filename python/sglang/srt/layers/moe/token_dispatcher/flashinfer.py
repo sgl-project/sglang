@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
@@ -211,7 +212,11 @@ class FlashinferDispatcher(BaseDispatcher):
             # DP attention: multiple DP ranks with different token counts.
             # Use the max across ranks so the A2A workspace fits the fattest.
             self.runtime_max_tokens_per_rank = max(dp_global)
-        elif self.ep_size > 1 and not require_mlp_tp_gather(get_global_server_args()):
+        elif (
+            self.ep_size > 1
+            and not get_is_capture_mode()
+            and not require_mlp_tp_gather(get_global_server_args())
+        ):
             # require_mlp_tp_gather is False, so the scheduler collapsed
             # global_num_tokens to the local count; x.shape[0] then differs
             # across EP ranks and breaks the fixed-geometry MoeAlltoAll. Use
