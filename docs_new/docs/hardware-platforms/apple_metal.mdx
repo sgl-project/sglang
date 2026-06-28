@@ -4,7 +4,7 @@ metatags:
     description: "Run SGLang on Apple Silicon using the Metal backend."
 ---
 
-This document describes how run SGLang on Apple Silicon using [Metal (MLX)](https://opensource.apple.com/projects/mlx/). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+This document describes how to run SGLang on Apple Silicon using [Metal (MLX)](https://opensource.apple.com/projects/mlx/). If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## Prerequisites
 
@@ -89,9 +89,9 @@ The MLX backend supports two quantization paths on Apple Silicon:
 
 ## Benchmarking with Requests
 
-`sglang.benchmark_one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.
+`sglang.bench_one_batch` calls the synchronous prefill/decode methods directly without going through the scheduler and the overlap code path.
 
-`sglang.benchmark_offline_throughput` can toggle overlap scheduling as it uses the scheduler and the overlap code path by using the flag `--disable-overlap-schedule`.
+`sglang.bench_offline_throughput` can toggle overlap scheduling as it uses the scheduler and the overlap code path by using the flag `--disable-overlap-schedule`.
 
 ### Throughput Testing
 
