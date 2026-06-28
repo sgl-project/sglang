@@ -204,7 +204,7 @@ async fn chat_completions_inner(
     // shed request's pre-admission time (the latency the access log shows on a
     // 503) is attributable to tokenize vs. the rest.
     if PHASE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PHASE_LOG_SAMPLE == 0 {
-        tracing::info!(
+        tracing::debug!(
             tokenize_ms = at_post_tokenize.saturating_sub(at_pre_tokenize).as_millis() as u64,
             pre_admit_total_ms = at_post_tokenize.as_millis() as u64,
             want_tokens,
@@ -585,7 +585,7 @@ async fn chat_completions_inner(
     let at_post_dispatch = start.elapsed();
     if PHASE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PHASE_LOG_SAMPLE == 0 {
         let (handler_inflight, in_send, pump_inflight) = crate::diag::snapshot();
-        tracing::info!(
+        tracing::debug!(
             tokenize_ms = at_post_tokenize.saturating_sub(at_pre_tokenize).as_millis() as u64,
             admit_ms = at_post_admit.saturating_sub(at_post_tokenize).as_millis() as u64,
             build_ms = at_post_build.saturating_sub(at_post_admit).as_millis() as u64,

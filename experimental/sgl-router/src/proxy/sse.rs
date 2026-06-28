@@ -306,7 +306,7 @@ where
             if PUMP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PUMP_LOG_SAMPLE == 0 {
                 let first_byte_ms =
                     first_byte_at.map(|t| t.duration_since(task_start).as_millis() as u64);
-                tracing::info!(
+                tracing::debug!(
                     reason = exit_reason,
                     chunks = n_chunks,
                     bytes = n_bytes,
