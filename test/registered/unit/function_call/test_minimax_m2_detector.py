@@ -16,11 +16,11 @@ def _minimax_call(func_name: str, params: dict[str, str]) -> str:
         f'\n<parameter name="{k}">{v}</parameter>' for k, v in params.items()
     )
     return (
-        f'<minimax:tool_call>\n'
+        f"<minimax:tool_call>\n"
         f'<invoke name="{func_name}">'
-        f'{param_lines}\n'
-        f'</invoke>\n'
-        f'</minimax:tool_call>'
+        f"{param_lines}\n"
+        f"</invoke>\n"
+        f"</minimax:tool_call>"
     )
 
 
@@ -29,9 +29,7 @@ class TestHasToolCall(CustomTestCase):
         self.detector = MinimaxM2Detector()
 
     def test_returns_true_when_start_token_present(self):
-        self.assertTrue(
-            self.detector.has_tool_call("<minimax:tool_call>something")
-        )
+        self.assertTrue(self.detector.has_tool_call("<minimax:tool_call>something"))
 
     def test_returns_false_for_plain_text(self):
         self.assertFalse(self.detector.has_tool_call("The weather is nice today."))
@@ -214,7 +212,9 @@ class TestTypeConversion(CustomTestCase):
         self.assertEqual(result, [1, 2, 3])
 
     def test_invalid_integer_falls_back_to_string(self):
-        result = self.detector._convert_param_value_with_types("not_a_number", ["integer"])
+        result = self.detector._convert_param_value_with_types(
+            "not_a_number", ["integer"]
+        )
         self.assertEqual(result, "not_a_number")
 
 
@@ -228,9 +228,7 @@ class TestExtractTypesFromSchema(CustomTestCase):
         )
 
     def test_type_array(self):
-        types = self.detector._extract_types_from_schema(
-            {"type": ["string", "null"]}
-        )
+        types = self.detector._extract_types_from_schema({"type": ["string", "null"]})
         self.assertIn("string", types)
         self.assertIn("null", types)
 
@@ -242,9 +240,7 @@ class TestExtractTypesFromSchema(CustomTestCase):
         self.assertIn("null", types)
 
     def test_enum_infers_types(self):
-        types = self.detector._extract_types_from_schema(
-            {"enum": ["a", 1, None, True]}
-        )
+        types = self.detector._extract_types_from_schema({"enum": ["a", 1, None, True]})
         self.assertIn("string", types)
         self.assertIn("integer", types)
         self.assertIn("null", types)
@@ -316,9 +312,7 @@ class TestStreamingIncrement(CustomTestCase):
 
     def test_streaming_normal_text_before_tool_call(self):
         detector = MinimaxM2Detector()
-        result = detector.parse_streaming_increment(
-            "Here is the info: ", self.tools
-        )
+        result = detector.parse_streaming_increment("Here is the info: ", self.tools)
         self.assertEqual(result.normal_text, "Here is the info: ")
         self.assertEqual(len(result.calls), 0)
 
