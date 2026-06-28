@@ -161,8 +161,10 @@ def process_content_for_template_format(
                     image_obj = chunk.get("image_url") or {}
                     if isinstance(image_obj, str):
                         image_obj = {"url": image_obj, "detail": chunk.get("detail")}
-                    mdp = image_obj.get("max_dynamic_patch", None)
                     # Also allow flat style: chunk["max_dynamic_patch"]
+                    mdp = image_obj.get(
+                        "max_dynamic_patch", chunk.get("max_dynamic_patch", None)
+                    )
                     image_data.append(
                         ImageData(
                             url=image_obj["url"],
