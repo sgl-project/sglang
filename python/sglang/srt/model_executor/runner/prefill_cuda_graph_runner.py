@@ -883,6 +883,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ie_idx = self._input_embeds_arg_idx
 
                 def replay_layer_forward(*args, **layer_kwargs):
+                    # The captured BCG graph reads activations from the static
+                    # input_embeds slot. The outer model.forward (run eagerly)
+                    # passes the live embeddings into layer_model.forward as the
+                    # 4th positional arg (or input_embeds kwarg): for multimodal
+                    # batches these are the composed text+vision embeds, for
+                    # text-only batches they are get_input_embeddings()(input_ids).
+                    # Copy them into the slot before replay so the graph sees the
+                    # current request's embeddings (mirrors main's BCG closure).
                     if self.buffer_registry.has_slot("input_embeds"):
                         ie = layer_kwargs.get("input_embeds")
                         if ie is None and ie_idx is not None and len(args) > ie_idx:
