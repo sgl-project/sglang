@@ -72,7 +72,13 @@ class TestBenchServing2GPU(CustomTestCase):
                 f"### test_pp_offline_throughput_default_decode\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            self.assertGreater(res["output_throughput"], 6700)
+            # MI325 is slower than the NVIDIA SKU this bound was originally
+            # tuned for; measured ~5100-5400 token/s on MI325 with Mixtral-8x7B
+            # PP=2. See PR triage for sgl-project/sglang#29275.
+            if is_in_amd_ci():
+                self.assertGreater(res["output_throughput"], 5000)
+            else:
+                self.assertGreater(res["output_throughput"], 6700)
 
     def test_pp_long_context_prefill(self):
         res = run_bench_serving(

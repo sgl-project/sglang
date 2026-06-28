@@ -124,6 +124,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             TokenizedGenerateReqInput(
                 input_text="",
                 input_ids=[1, 2],
+                input_embeds=None,
                 mm_inputs=dict(),
                 sampling_params=SamplingParams(),
                 return_logprob=False,
@@ -150,6 +151,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
                     TokenizedGenerateReqInput(
                         input_text="",
                         input_ids=[1, 2],
+                        input_embeds=None,
                         mm_inputs=dict(),
                         sampling_params=SamplingParams(),
                         return_logprob=False,
