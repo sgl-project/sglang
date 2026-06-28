@@ -4,11 +4,20 @@
 //! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
 
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
+
+/// Sampling counter for the diagnostic `sse_pump_timing` log. ~1-in-`SAMPLE`
+/// pump completions are logged with their first-byte / drain / exit timing and
+/// exit reason, so we can see whether an admission slot lingers in the pump
+/// (engine streaming slowly, or the task not being polled) without flooding.
+static PUMP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PUMP_LOG_SAMPLE: u64 = 64;
 
 /// Max time the pump waits to hand a chunk to the client before giving up.
 ///
@@ -142,6 +151,15 @@ where
             // underscore suppresses the "unused variable" lint while
             // keeping intent explicit.
             let _hold = stream_guards;
+            // Diagnostic timing for this stream's lifetime. `task_start` ≈ when
+            // upstream headers landed (the task is spawned right after). These
+            // localize whether the admission slot (held by `_hold`) lingers
+            // because the engine streams slowly or the task isn't being polled.
+            let task_start = Instant::now();
+            let mut first_byte_at: Option<Instant> = None;
+            let mut n_chunks: u64 = 0;
+            let mut n_bytes: u64 = 0;
+            let mut exit_reason = "upstream_end";
             let mut on_first_byte = on_first_byte;
             let mut s = stream;
             while let Some(chunk) = s.next().await {
@@ -160,6 +178,13 @@ where
                 // carries a token.
                 if matches!(&item, Ok(b) if b.is_empty()) {
                     continue;
+                }
+                n_chunks += 1;
+                if let Ok(b) = &item {
+                    n_bytes += b.len() as u64;
+                    if first_byte_at.is_none() {
+                        first_byte_at = Some(Instant::now());
+                    }
                 }
                 // Fire the time-to-first-token hook on the first successful
                 // chunk from upstream. `take()` makes it fire at most once;
@@ -200,6 +225,7 @@ where
                             // Client disconnected while we were blocked on the
                             // budget — clean client-side cancel, not a fault.
                             tracing::debug!("SSE client disconnected mid-stream");
+                            exit_reason = "client_disconnect_blocked";
                             break;
                         }
                         res = tokio::time::timeout(
@@ -222,6 +248,7 @@ where
                             tracing::error!(
                                 "SSE read-ahead semaphore closed unexpectedly; aborting pump"
                             );
+                            exit_reason = "semaphore_closed";
                             break;
                         }
                         Err(_elapsed) => {
@@ -244,6 +271,7 @@ where
                             let _ = tx.send(Err(std::io::Error::other(
                                 "SSE downstream stalled; stream aborted before completion",
                             )));
+                            exit_reason = "downstream_stall";
                             break;
                         }
                     }
@@ -261,12 +289,31 @@ where
                     if !is_err_chunk {
                         tracing::debug!("SSE client disconnected mid-stream");
                     }
+                    exit_reason = "client_gone";
                     break;
                 }
                 if is_err_chunk {
                     // Surfaced upstream error to client; stop reading.
+                    exit_reason = "upstream_error";
                     break;
                 }
+            }
+            // Diagnostic: this stream's lifetime, sampled. `pump_exit_ms` is how
+            // long the admission slot (held by `_hold`, dropped when this block
+            // exits) was occupied by the pump; compare to the engine's own
+            // per-request latency to spot slots lingering long after the engine
+            // finished. `first_byte_ms` is headers→first token.
+            if PUMP_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PUMP_LOG_SAMPLE == 0 {
+                let first_byte_ms =
+                    first_byte_at.map(|t| t.duration_since(task_start).as_millis() as u64);
+                tracing::info!(
+                    reason = exit_reason,
+                    chunks = n_chunks,
+                    bytes = n_bytes,
+                    first_byte_ms = ?first_byte_ms,
+                    pump_exit_ms = task_start.elapsed().as_millis() as u64,
+                    "sse_pump_timing",
+                );
             }
         });
         let pump_result = pump.catch_unwind().await;

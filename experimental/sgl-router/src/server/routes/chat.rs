@@ -18,7 +18,14 @@ use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// Sampling counter for the diagnostic `phase_*` timing logs below. Logs roughly
+/// 1-in-`PHASE_LOG_SAMPLE` requests so a steady flood doesn't drown the access
+/// log while still yielding a representative latency-phase breakdown.
+static PHASE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PHASE_LOG_SAMPLE: u64 = 64;
 
 /// Observability header carrying the decode-pool URL selected via host
 /// affinity for a PD-disaggregated request. The router fans the
@@ -173,6 +180,7 @@ async fn chat_completions_inner(
     // body. When parsed, this single value is reused for the routing
     // tokenization and the outgoing-body injection below (and PD bootstrap
     // injection). `parse_probe` already validated the object shape.
+    let at_pre_tokenize = start.elapsed();
     let want_tokens = ctx.tokenizers.has_chat_encoder(&model_str) || policy.needs_request_tokens();
     let request_value: Option<serde_json::Value> = if want_tokens {
         Some(serde_json::from_slice(&body).map_err(|_| {
@@ -190,6 +198,20 @@ async fn chat_completions_inner(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+    let at_post_tokenize = start.elapsed();
+    // Diagnostic: ingress-tokenize cost, sampled. Fires for EVERY request that
+    // reaches here — including those about to be shed at admission below — so a
+    // shed request's pre-admission time (the latency the access log shows on a
+    // 503) is attributable to tokenize vs. the rest.
+    if PHASE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PHASE_LOG_SAMPLE == 0 {
+        tracing::info!(
+            tokenize_ms = at_post_tokenize.saturating_sub(at_pre_tokenize).as_millis() as u64,
+            pre_admit_total_ms = at_post_tokenize.as_millis() as u64,
+            want_tokens,
+            model = %model_str,
+            "phase_pre_admit",
+        );
+    }
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -213,6 +235,7 @@ async fn chat_completions_inner(
         .admission
         .acquire(&workers, policy.as_ref(), &selection_ctx, &model_str)
         .await?;
+    let at_post_admit = start.elapsed();
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -384,6 +407,7 @@ async fn chat_completions_inner(
     // untouched when neither applies.
     let outgoing_body =
         build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+    let at_post_build = start.elapsed();
 
     let result = if let Some(decode_worker) = decode_peer {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
@@ -547,6 +571,26 @@ async fn chat_completions_inner(
             _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
         }
     };
+
+    // Diagnostic: phase breakdown up to response headers, for ADMITTED requests
+    // (those that got a slot). `dispatch_to_headers_ms` is connect + send-body +
+    // wait-for-upstream-headers; for streaming this is the whole synchronous cost
+    // before the SSE pump takes over. The pump's own first-byte/drain/exit timing
+    // is logged separately as `sse_pump_timing`.
+    let at_post_dispatch = start.elapsed();
+    if PHASE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed) % PHASE_LOG_SAMPLE == 0 {
+        tracing::info!(
+            tokenize_ms = at_post_tokenize.saturating_sub(at_pre_tokenize).as_millis() as u64,
+            admit_ms = at_post_admit.saturating_sub(at_post_tokenize).as_millis() as u64,
+            build_ms = at_post_build.saturating_sub(at_post_admit).as_millis() as u64,
+            dispatch_to_headers_ms = at_post_dispatch.saturating_sub(at_post_build).as_millis() as u64,
+            to_headers_total_ms = at_post_dispatch.as_millis() as u64,
+            streaming,
+            worker = %metrics_worker_url,
+            model = %metrics_model,
+            "phase_dispatch",
+        );
+    }
 
     // The stale-request janitor fired and we observed it user-side (a 504).
     // Record the global `expired` count; the per-request `cancelled` outcome and
