@@ -1613,18 +1613,17 @@ class AutoencoderKLWan(ParallelTiledVAE):
                         feat_idx.set(0)
                         first_chunk.set(i == 0)
                         chunk = self.decoder(x[:, :, i : i + 1, :, :])
-                        # Stream each decoded chunk to CPU so the GPU holds only one
-                        # chunk activation at a time (the causal feature cache lives
-                        # in conv state, not the output). Keep the assembled video on
-                        # CPU through cat/float/clamp to avoid the .to()+.float() GPU
-                        # spike that OOMs long rollouts; downstream saves via
-                        # .cpu().numpy() so a CPU tensor is safe.
-                        # Only when SP decode is off — SP needs the per-rank height
-                        # shard on GPU for the post-decode all-gather.
+                        # Non-SP path: stream chunks to CPU so out_chunks (grows
+                        # ~linearly with frames) doesn't OOM. SP keeps shards on
+                        # GPU for intra-layer halo/all-gather.
                         if not use_sp:
                             chunk = chunk.cpu()
                         out_chunks.append(chunk)
-                    out = torch.cat(out_chunks, 2)
+                    out = (
+                        torch.cat(out_chunks, 2)
+                        if len(out_chunks) > 1
+                        else out_chunks[0]
+                    )
 
             if self.config.patch_size is not None:
                 out = unpatchify(out, patch_size=self.config.patch_size)

@@ -565,5 +565,83 @@ def test_lightvae_checkpoint_key_coverage_and_encode_shape():
     assert z2.shape == (1, 16, 2, 8, 8) and torch.isfinite(z2).all()
 
 
+# =========================================================================== #
+# Long-video OOM fix -- WanVAE.decode() per-chunk CPU offload
+# =========================================================================== #
+class _ToyDecoder(torch.nn.Module):
+    """Conv3d 1x1 + pixel-shuffle upsampling; mimics WanVAE decoder output
+    growth (out_ch * u * u per input voxel) without the real VAE."""
+
+    def __init__(self, in_ch=16, out_ch=3, upsample=8):
+        super().__init__()
+        self.upsample, self.out_ch = upsample, out_ch
+        self.proj = torch.nn.Conv3d(in_ch, out_ch * upsample * upsample, 1)
+
+    def forward(self, x):
+        b, _, t, h, w = x.shape
+        u = self.upsample
+        y = self.proj(x).view(b, self.out_ch, u, u, t, h, w)
+        return y.permute(0, 1, 4, 5, 2, 6, 3).contiguous().view(
+            b, self.out_ch, t, h * u, w * u
+        )
+
+
+def _decode_loop(decoder, x, *, offload):
+    """Mirror AutoencoderKLWan.decode()'s feature-cache loop; only .cpu() differs."""
+    out_chunks = []
+    for i in range(x.shape[2]):
+        chunk = decoder(x[:, :, i : i + 1, :, :])
+        if offload:
+            chunk = chunk.cpu()
+        out_chunks.append(chunk)
+    return torch.cat(out_chunks, 2) if len(out_chunks) > 1 else out_chunks[0]
+
+
+def _loop_peak_mb(decoder, x, *, offload):
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    with torch.no_grad():
+        out = _decode_loop(decoder, x, offload=offload)
+    torch.cuda.synchronize()
+    return out, (torch.cuda.max_memory_allocated() - base) / 1e6
+
+
+@requires_gpu
+def test_decode_cpu_offload_bounds_gpu_memory_without_precision_loss():
+    """decode() streams chunks to CPU so GPU peak stays bounded (not ~linear in
+    frames) and is byte-exact vs no-offload. The no-offload curve also pins the
+    SP-path behavior (chunks stay on GPU, peak grows ~linearly; SP divides by
+    world_size, doesn't bound) — update this if SP-safe offload lands."""
+    torch.manual_seed(0)
+    decoder = _ToyDecoder().to(_DEVICE).eval()
+
+    frame_counts = [8, 64]
+    noff, off = {}, {}
+    for n in frame_counts:
+        x = torch.randn(1, 16, n, 60, 104, device=_DEVICE)
+        out_noff, mb_noff = _loop_peak_mb(decoder, x, offload=False)
+        out_off, mb_off = _loop_peak_mb(decoder, x, offload=True)
+        assert torch.equal(out_noff.cpu(), out_off)  # offload keeps result
+        noff[n], off[n] = mb_noff, mb_off
+        del x, out_noff, out_off
+
+    frame_ratio = frame_counts[-1] / frame_counts[0]
+    noff_ratio = noff[frame_counts[-1]] / max(noff[frame_counts[0]], 1e-6)
+    # No-offload (= SP-path equivalent) grows ~linearly with frames.
+    assert noff_ratio > frame_ratio * 0.7, (
+        f"expected ~linear growth (~{frame_ratio:.0f}x), got {noff_ratio:.2f}x"
+    )
+
+    # Offload keeps GPU peak bounded and ~constant across frames.
+    off_peak = max(off.values())
+    assert off_peak < noff[frame_counts[-1]] * 0.5, (
+        f"offload peak {off_peak:.1f}MB not bounded vs "
+        f"{noff[frame_counts[-1]]:.1f}MB"
+    )
+    assert abs(off[frame_counts[-1]] - off[frame_counts[0]]) < off_peak * 0.5 + 5, (
+        "offload peak should not scale with frame count"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
