@@ -29,7 +29,10 @@ dynamo-parsers = { git = "https://github.com/ai-dynamo/dynamo", rev = "1efdd4dcb
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
-axum = { version = "0.8", features = ["macros", "tracing"] }
+# http2: serve h2c (cleartext HTTP/2) on the inbound listener via axum::serve's
+# auto builder, not just dial it outbound. Explicit so inbound h2c never depends
+# on feature unification from the reqwest/hyper outbound deps happening to be present.
+axum = { version = "0.8", features = ["macros", "tracing", "http2"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "request-id"] }
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
