@@ -264,7 +264,7 @@ class PrefillBootstrapQueue:
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
-        assert req.pending_bootstrap, f"finalize_bootstrap is not idempotent"
+        assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
         if not self.ensure_metadata_buffer(req):
             return False
 
@@ -469,8 +469,6 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -502,7 +500,6 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
             # Receive requests
@@ -740,7 +737,6 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -934,7 +930,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
-                    self.chunked_req.fill_len,
+                    self.chunked_req.extend_range.end,
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
@@ -956,6 +952,22 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
+    def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        # Only bootstrap-finalized requests; staging excluded.
+        if (
+            not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get()
+            or self.enable_staging
+            or req.pending_bootstrap
+        ):
+            return
+
+        # Device-resident prefix only; page-aligned so start_send_idx stays exact.
+        cached_end = len(req.prefix_indices) - req.host_hit_length
+        if cached_end <= req.start_send_idx:
+            return
+        assert cached_end % self.token_to_kv_pool_allocator.page_size == 0
+        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -970,7 +982,7 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx = (
             end_idx
             if end_idx is not None
-            else min(req.fill_len, len(req.origin_input_ids))
+            else min(req.extend_range.end, len(req.origin_input_ids))
         )
 
         if not last_chunk:
@@ -1001,7 +1013,7 @@ class SchedulerDisaggregationPrefillMixin:
             # length here avoids emitting an extra state page when the sampled
             # token crosses a page boundary, which mismatched src/dst lengths in
             # group_concurrent_contiguous.
-            seq_len = min(req.fill_len, len(req.origin_input_ids))
+            seq_len = min(req.extend_range.end, len(req.origin_input_ids))
 
             def _mamba_payload():
                 return [

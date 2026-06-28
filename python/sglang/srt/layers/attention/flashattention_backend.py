@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -40,6 +42,95 @@ from sglang.jit_kernel.flash_attention import (
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
 
+@triton.jit
+def _build_pa_page_table_kernel(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    prefill_lens_ptr,
+    dst_page_table_ptr,
+    kv_lens_ptr,
+    window_size: tl.constexpr,
+    req_to_token_stride,
+    dst_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Build PA-SWA page_table directly from req_to_token.
+
+    For each request, dst row = [0..prefill_len) ∪ [decode_start..seq_len).
+    decode_start = max(prefill_len, seq_len - window_size)
+
+    prefill_lens_ptr is the full pool-sized buffer, prefill_len is loaded
+    via indirect indexing using req_idx.
+    """
+    bid = tl.program_id(0)
+    req_idx = tl.load(req_pool_indices_ptr + bid)
+    sl = tl.load(seq_lens_ptr + bid).to(tl.int32)
+    pf = tl.load(prefill_lens_ptr + req_idx).to(tl.int32)
+
+    decode_start = tl.maximum(pf, sl - window_size)
+    gap = tl.where(decode_start > pf, decode_start - pf, 0)
+    kv_len = sl - gap
+
+    tl.store(kv_lens_ptr + bid, kv_len)
+
+    src_base = req_idx * req_to_token_stride
+    dst_base = bid * dst_stride
+
+    for start in tl.range(0, kv_len, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < kv_len
+        pos = tl.where(offs < pf, offs, offs + gap)
+        kv_loc = tl.load(
+            req_to_token_ptr + src_base + pos,
+            mask=mask,
+            other=0,
+        )
+        tl.store(dst_page_table_ptr + dst_base + offs, kv_loc.to(tl.int32), mask=mask)
+
+
+def _build_pa_page_table(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    prefill_lens: torch.Tensor,
+    window_size: int,
+    bs: int,
+    pa_max_len: int,
+    device: torch.device,
+    dst_page_table: Optional[torch.Tensor] = None,
+    dst_kv_lens: Optional[torch.Tensor] = None,
+):
+    """Build prefill-aware page_table from req_to_token.
+
+    When dst_page_table/dst_kv_lens are None, allocates new tensors (non-CUDA-graph).
+    When provided, writes in-place into existing buffers (CUDA-graph replay).
+
+    prefill_lens is the full pool-sized buffer; the kernel indexes it via
+    req_pool_indices values (indirect indexing, avoids external gather).
+
+    Returns (page_table, kv_lens).
+    """
+    if dst_page_table is None:
+        dst_page_table = torch.zeros(bs, pa_max_len, dtype=torch.int32, device=device)
+    if dst_kv_lens is None:
+        dst_kv_lens = torch.empty(bs, dtype=torch.int32, device=device)
+    if bs > 0 and pa_max_len > 0:
+        _build_pa_page_table_kernel[(bs,)](
+            req_to_token,
+            req_pool_indices.contiguous(),
+            seq_lens.to(torch.int32),
+            prefill_lens,
+            dst_page_table,
+            dst_kv_lens,
+            window_size,
+            req_to_token.stride(0),
+            dst_page_table.stride(0),
+            BLOCK_SIZE=256,
+        )
+    return dst_page_table, dst_kv_lens
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -68,6 +159,9 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
+
+    pa_swa_page_table: torch.Tensor = None
+    pa_swa_cache_seqlens: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: torch.Tensor = None
     # Precomputed FA3 scheduler metadata (avoids per-layer prepare_varlen_num_blocks)
@@ -180,6 +274,18 @@ class FlashAttentionBackend(AttentionBackend):
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
+
+        self.is_prefill_aware_swa = getattr(model_runner, "prefill_aware_swa", False)
+        if self.is_prefill_aware_swa:
+            assert self.page_size == 1, (
+                "Prefill-aware SWA requires page_size=1, "
+                f"got page_size={self.page_size}"
+            )
+            max_bs = model_runner.req_to_token_pool.size
+            self._pa_swa_prefill_lens = torch.zeros(
+                max_bs, dtype=torch.int32, device=model_runner.device
+            )
+            self._pa_swa_max_prefill_len = 0
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
@@ -486,6 +592,25 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+
+                if self.is_prefill_aware_swa and self.has_swa:
+                    pa_max_len = min(
+                        self._pa_swa_max_prefill_len + self.sliding_window_size,
+                        metadata.max_seq_len_k,
+                    )
+
+                    pa_page_table, pa_kv_lens = _build_pa_page_table(
+                        self.req_to_token,
+                        forward_batch.req_pool_indices[:batch_size],
+                        forward_batch.seq_lens,
+                        self._pa_swa_prefill_lens,
+                        self.sliding_window_size,
+                        batch_size,
+                        pa_max_len,
+                        device,
+                    )
+                    metadata.pa_swa_page_table = pa_page_table
+                    metadata.pa_swa_cache_seqlens = pa_kv_lens
                 # Precompute FA3 scheduler metadata to avoid per-layer
                 # prepare_varlen_num_blocks kernel calls
                 metadata.scheduler_metadata = self._compute_scheduler_metadata(
@@ -670,6 +795,14 @@ class FlashAttentionBackend(AttentionBackend):
             # Setup local attention if enabled
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
+
+            if self.is_prefill_aware_swa:
+                self._pa_swa_prefill_lens[
+                    forward_batch.req_pool_indices[:batch_size]
+                ] = forward_batch.seq_lens[:batch_size].to(torch.int32)
+                max_pf = int(forward_batch.seq_lens_cpu[:batch_size].max().item())
+                if max_pf > self._pa_swa_max_prefill_len:
+                    self._pa_swa_max_prefill_len = max_pf
 
         # Encoder metadata for cross attention. Supports per-request varlen
         # encoder lengths (e.g. MossVL with different image sizes per request).
@@ -1477,6 +1610,14 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
+
+                pa_swa_active = False
+                if self.is_prefill_aware_swa and metadata.pa_swa_page_table is not None:
+                    page_table = metadata.pa_swa_page_table
+                    cache_seqlens = metadata.pa_swa_cache_seqlens
+                    window_size = (-1, -1)
+                    pa_swa_active = True
+
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
@@ -1506,6 +1647,7 @@ class FlashAttentionBackend(AttentionBackend):
                     and not is_swa_layer
                     and not use_cascade_attn
                     and not sparse_active
+                    and not pa_swa_active
                 ):
                     sched_meta = metadata.scheduler_metadata
                 result = flash_attn_with_kvcache(
@@ -2040,6 +2182,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                if self.is_prefill_aware_swa:
+                    metadata.pa_swa_page_table = metadata.page_table
+                    metadata.pa_swa_cache_seqlens = metadata.cache_seqlens_int32
                 if self.use_sliding_window_kv_pool:
                     metadata.swa_page_table = self.decode_cuda_graph_metadata[
                         "swa_page_table"
@@ -2298,20 +2443,43 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table.shape[1],
                     "FA3 decode page_table",
                 )
-                normal_decode_set_metadata(
-                    metadata.cache_seqlens_int32,
-                    metadata.cu_seqlens_k,
-                    metadata.page_table,
-                    self.req_to_token,
-                    req_pool_indices,
-                    self.decode_cuda_graph_metadata["strided_indices"],
-                    max_seq_pages,
-                    seq_lens,
-                    0,
-                    self.page_size,
-                    metadata.swa_page_table,
-                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
-                )
+                if self.is_prefill_aware_swa:
+                    pa_max_len = min(
+                        self._pa_swa_max_prefill_len + self.sliding_window_size,
+                        max_len,
+                    )
+                    if pa_max_len > 0:
+                        _build_pa_page_table(
+                            self.req_to_token,
+                            req_pool_indices,
+                            seq_lens,
+                            self._pa_swa_prefill_lens,
+                            self.sliding_window_size,
+                            bs,
+                            pa_max_len,
+                            device,
+                            dst_page_table=metadata.page_table,
+                            dst_kv_lens=metadata.cache_seqlens_int32,
+                        )
+                else:
+                    normal_decode_set_metadata(
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        self.decode_cuda_graph_metadata["strided_indices"],
+                        max_seq_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                        metadata.swa_page_table,
+                        (
+                            self.token_to_kv_pool
+                            if self.use_sliding_window_kv_pool
+                            else None
+                        ),
+                    )
 
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
