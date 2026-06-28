@@ -817,7 +817,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self._pa_swa_prefill_lens[
                     forward_batch.req_pool_indices[:batch_size]
                 ] = forward_batch.seq_lens[:batch_size].to(torch.int32)
-                max_pf = int(forward_batch.seq_lens_cpu[:batch_size].max().item())
+                max_pf = int(seq_lens_cpu[:batch_size].max().item())
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
 
