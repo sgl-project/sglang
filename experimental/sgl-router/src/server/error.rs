@@ -23,11 +23,10 @@ pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
 /// is a pure function of the class, so two conditions that mean the same thing
 /// — e.g. a per-request timeout and a stale-deadline cancel — can never drift to
 /// different status codes. The *precise* condition travels in
-/// `x-router-error-code` (see [`ApiError::error_code`]); since the router is
-/// always behind a gateway, that header is the authoritative signal the gateway
-/// converts on, and the status is only a self-sufficient HTTP-honest default for
-/// a direct caller. The class never contradicts the precise code — it only
-/// generalizes it.
+/// `x-router-error-code` (see [`ApiError::error_code`]): a gateway in front
+/// converts on that header (the authoritative signal), while the status stays a
+/// self-sufficient HTTP-honest default for a direct caller. The class never
+/// contradicts the precise code — it only generalizes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ErrorClass {
     /// 400 — request rejected at ingress as malformed / invalid.

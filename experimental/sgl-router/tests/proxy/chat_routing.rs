@@ -991,6 +991,60 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
     );
 }
 
+/// Client-visible contract of a streaming mid-body drop, through `build_router`.
+/// This is the asymmetric half of the non-streaming case: headers were already
+/// sent as 200, so the client keeps a 200 (NOT the synthesized 502 of the
+/// non-streaming path), there is NO `x-router-error-code` / `x-router-upstream-status`,
+/// and `responses_total` counts it as a 200 (the breaker / duration metrics
+/// capture the mid-stream failure — see the breaker test above).
+#[tokio::test]
+async fn streaming_mid_body_drop_stays_200_with_no_router_headers() {
+    let worker = crate::common::mock_worker::MockWorker::start_returning_partial_body(
+        StatusCode::OK,
+        b"data: hi\n\n",
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "streaming mid-drop: headers were already sent as 200, so the client keeps 200",
+    );
+    assert!(
+        res.headers().get("x-router-error-code").is_none(),
+        "a 200-then-drop stream is not router-originated — no x-router-error-code",
+    );
+    assert!(
+        res.headers().get("x-router-upstream-status").is_none(),
+        "no status was synthesized over the worker, so no x-router-upstream-status",
+    );
+    let _ = res.into_body().collect().await;
+
+    let m = ctx.metrics.render();
+    assert!(
+        m.contains(
+            r#"sgl_router_responses_total{route="/v1/chat/completions",method="POST",status_code="200"} 1"#
+        ),
+        "a streaming mid-drop counts as a 200 at the edge: {m}",
+    );
+}
+
 #[tokio::test]
 async fn forward_json_to_records_failure_on_5xx() {
     use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
