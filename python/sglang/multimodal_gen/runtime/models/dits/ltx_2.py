@@ -49,6 +49,8 @@ logger = init_logger(__name__)
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
 
+_LTX2_FUSED_RMS_ADALN = None
+_LTX2_FUSED_RMS_ADALN_UNAVAILABLE = False
 _LTX2_FUSED_RMS_ADALN_RUNTIME_DISABLED = False
 
 
@@ -56,6 +58,22 @@ def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
     return ADALN_NUM_BASE_PARAMS + (
         ADALN_NUM_CROSS_ATTN_PARAMS if cross_attention_adaln else 0
     )
+
+
+def _ltx2_get_fused_rms_adaln():
+    global _LTX2_FUSED_RMS_ADALN, _LTX2_FUSED_RMS_ADALN_UNAVAILABLE
+    if _LTX2_FUSED_RMS_ADALN_UNAVAILABLE:
+        return None
+    if _LTX2_FUSED_RMS_ADALN is None:
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_norm_scale_shift,
+            )
+        except Exception:
+            _LTX2_FUSED_RMS_ADALN_UNAVAILABLE = True
+            return None
+        _LTX2_FUSED_RMS_ADALN = fused_norm_scale_shift
+    return _LTX2_FUSED_RMS_ADALN
 
 
 def _ltx2_try_fused_rms_adaln(
@@ -85,11 +103,25 @@ def _ltx2_try_fused_rms_adaln(
     ):
         return None
 
+    fused_norm_scale_shift = _ltx2_get_fused_rms_adaln()
+    if fused_norm_scale_shift is None:
+        return None
+
     try:
-        return F.rms_norm(x.contiguous(), (x.shape[-1],), eps=eps) * (1 + scale) + shift
+        return fused_norm_scale_shift(
+            x.contiguous(),
+            None,
+            None,
+            scale.contiguous(),
+            shift.contiguous(),
+            "rms",
+            eps,
+        )
+    except ValueError:
+        return None
     except Exception as exc:
         _LTX2_FUSED_RMS_ADALN_RUNTIME_DISABLED = True
-        logger.warning_once(
+        logger.warning(
             f"Disabling LTX2 fused RMS AdaLN fast path after runtime failure: {exc}"
         )
         return None
