@@ -43,6 +43,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_in_seq_split,
     pad_dsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.utils import (
@@ -2454,6 +2455,17 @@ class DeepseekSparseAttnBackend(
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+
+        if (
+            dsa_use_prefill_cp(forward_batch)
+            and is_dsa_prefill_cp_in_seq_split()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            cp_meta = forward_batch.attn_cp_metadata
+            seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
+            seq_lens = torch.cat(
+                [seq_chunks[i] for i in cp_meta.zigzag_index], dim=0
+            )
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
