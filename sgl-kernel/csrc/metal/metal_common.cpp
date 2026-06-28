@@ -1,20 +1,8 @@
 #include "metal_common.h"
 
-#include <nanobind/nanobind.h>
-#include <nanobind/stl/string.h>
-
-namespace nb = nanobind;
-
-NB_MODULE(_metal, m) {
-  m.def("register_library", &sglang::metal_common::register_library, nb::arg("path"));
-  register_rope_pool_fused(m);
-  register_paged_attention(m);
-}
-
 #include <algorithm>
 #include <stdexcept>
 
-#include "metal_common.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/mlx.h"
 
@@ -58,6 +46,10 @@ MTL::Size pick_tg(uint32_t gx, uint32_t gy, uint32_t gz) {
   while (tz > 1 && (gz % tz) != 0)
     --tz;
   return MTL::Size::Make(tx, std::max<uint32_t>(ty, 1u), std::max<uint32_t>(tz, 1u));
+}
+
+metal::CommandEncoder& command_encoder(Stream stream) {
+  return metal::device(stream.device).get_command_encoder(stream.index);
 }
 
 nb::object wrap_array(array&& value) {

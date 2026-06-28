@@ -41,7 +41,7 @@ class PagedAttentionDecode : public Primitive {
     out.set_data(allocator::malloc(out.nbytes()));
 
     auto& d = metal::device(stream().device);
-    auto& enc = d.get_command_encoder(stream().index);
+    auto& enc = command_encoder(stream());
 
     const uint32_t hd = static_cast<uint32_t>(head_dim_);
     const uint32_t nq = static_cast<uint32_t>(num_qo_heads_);

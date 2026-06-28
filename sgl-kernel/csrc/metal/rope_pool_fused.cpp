@@ -104,7 +104,7 @@ class RopePoolFused : public Primitive {
     uint32_t hpt = std::min(hpt_q, hpt_k);
     if (nq % hpt != 0 || nk % hpt != 0) hpt = 1;
 
-    auto& enc = d.get_command_encoder(stream().index);
+    auto& enc = command_encoder(stream());
 
     const bool use_rect_dispatch = q.dtype() == bfloat16 && hd >= 128 && nk >= 8 && num_tokens >= 256;
     if (use_rect_dispatch) {

@@ -86,15 +86,6 @@ class MlxTpModelWorker(TpModelWorker):
         """Override since the stub ModelRunner has no real model."""
         return None
 
-    def alloc_memory_pool(self, memory_pool_config=None, **kwargs):
-        """MLX initializes scheduler pools in the stub and KV pools lazily.
-
-        The generic PyTorch path tries to allocate GPU KV caches on the stub
-        model runner, which is intentionally not used for MLX inference.
-        """
-        self.req_to_token_pool = self._model_runner.req_to_token_pool
-        self.token_to_kv_pool_allocator = self._model_runner.token_to_kv_pool_allocator
-
     def _ensure_mlx_pool_initialized(self):
         """Lazily initialize MLX cache pools after the stub pools are ready."""
         if not self._mlx_pool_initialized:
