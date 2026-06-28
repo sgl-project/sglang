@@ -170,6 +170,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self.default_chat_template_kwargs = (
+            self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
+        )
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
@@ -625,6 +628,13 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        # Apply server-level --default-chat-template-kwargs; per-request values win.
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
