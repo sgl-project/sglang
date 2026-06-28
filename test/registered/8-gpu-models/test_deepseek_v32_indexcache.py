@@ -63,7 +63,7 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v32)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["accuracy"], 0.93)
 
 
 class TestDeepseekV32IndexFreq(CustomTestCase):

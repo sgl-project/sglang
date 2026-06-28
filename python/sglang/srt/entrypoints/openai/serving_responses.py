@@ -137,6 +137,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+    @staticmethod
+    def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:
+        return any(tool.type in tool_types for tool in (request.tools or []))
+
     # error helpers dedicated for v1/responses
     def create_error_response(
         self,
@@ -192,6 +196,18 @@ class OpenAIServingResponses(OpenAIServingChat):
             return self.create_error_response(
                 'tool_choice="required" requires at least one tool with '
                 'type="function"; other built-in tool types cannot be forced.'
+            )
+
+        if (
+            self.use_harmony
+            and self._has_response_tool(request, "web_search", "web_search_preview")
+            and not self.supports_browsing
+        ):
+            return self.create_error_response(
+                "web_search requires a browser backend. Set EXA_API_KEY on the "
+                "SGLang server to enable native Exa-backed web search, or "
+                "configure a browser MCP tool server. Create an Exa API key at "
+                "https://dashboard.exa.ai/api-keys."
             )
 
         # Handle the previous response ID
