@@ -102,6 +102,7 @@ export const DeepSeekR1BasicDeployment = () => {
     }
 
     const isXeon = hardware === 'xeon';
+    const enableB200Fp4Dp = hardware === 'b200' && quantization === 'fp4' && strategyValues.includes('dp');
     const modelPath =
       quantization === 'fp4'
         ? 'nvidia/DeepSeek-R1-0528-FP4-v2'
@@ -113,10 +114,22 @@ export const DeepSeekR1BasicDeployment = () => {
     command += `  --model-path ${modelPath}`;
 
     if (strategyValues.includes('tp')) {
-      command += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
+      if (enableB200Fp4Dp) {
+        command += ' \\\n  --tensor-parallel-size 8';
+      } else {
+        command += isXeon ? ' \\\n  --tp 6' : ' \\\n  --tp 8';
+      }
     }
     if (strategyValues.includes('dp')) {
-      command += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
+      if (enableB200Fp4Dp) {
+        command +=
+          ' \\\n  --data-parallel-size 8' +
+          ' \\\n  --enable-dp-attention' +
+          ' \\\n  --enable-dp-attention-local-control-broadcast' +
+          ' \\\n  --enable-dp-lm-head';
+      } else {
+        command += ' \\\n  --dp 8 \\\n  --enable-dp-attention';
+      }
     }
     if (strategyValues.includes('ep')) {
       command += ' \\\n  --ep 8';

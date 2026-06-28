@@ -95,7 +95,7 @@ DeepSeek-R1 shares the same MoE architecture as DeepSeek-V3, so the same hardwar
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-R1 --tp 8 --trust-remote-code
 ```
 
-**Data Parallelism Attention (`--enable-dp-attention`):** Recommended for high-throughput scenarios. Use `--enable-dp-attention --tp 8 --dp 8` on a single 8-GPU node.
+**Data Parallelism Attention (`--enable-dp-attention`):** For B200 NVFP4, enable DP Attention for best performance with `--tensor-parallel-size <TP>`, `--data-parallel-size <TP>`, `--enable-dp-attention`, `--enable-dp-attention-local-control-broadcast`, and `--enable-dp-lm-head`.
 
 **NCCL timeout:** If model loading is slow, increase: `--dist-timeout 3600`.
 
