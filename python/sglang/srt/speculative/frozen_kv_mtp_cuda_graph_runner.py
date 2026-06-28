@@ -192,7 +192,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
                 self.topk * self.topk
@@ -336,7 +336,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)
         return parent_list, top_scores_index, draft_tokens
 
-    def replay(self, forward_batch: ForwardBatch):
+    def execute(self, forward_batch: ForwardBatch):
         self.deepep_adapter.replay()
         buffers = self.buffers
 

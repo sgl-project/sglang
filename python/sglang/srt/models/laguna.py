@@ -304,7 +304,7 @@ class LagunaAttention(nn.Module):
                 g_proj_dim,
                 bias=False,
                 gather_output=False,
-                quant_config=None,
+                quant_config=quant_config,
                 tp_rank=attn_tp_rank,
                 tp_size=attn_tp_size,
                 prefix=add_prefix("g_proj", prefix),
