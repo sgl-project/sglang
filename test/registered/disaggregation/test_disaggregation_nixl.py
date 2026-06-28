@@ -25,7 +25,17 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=700, stage="base-c", runner_config="8-gpu-h20")
-#stage-c required for RDMA 
+# base-c 8-GPU runner is required for TP4 prefill + TP4 decode.
+
+NIXL_PREFILL_TP_SIZE = 4
+NIXL_DECODE_TP_SIZE = 4
+NIXL_DECODE_BASE_GPU_ID = 4
+
+# This is a PD transfer functional gate, not the standalone model-quality gate.
+# The standalone Llama-3.1-8B GSM8K threshold is 0.80, while existing PD
+# disaggregation coverage gates at 0.62. Keep NIXL above catastrophic transfer
+# failure while leaving margin for PD/router/evaluator variance on 200 examples.
+NIXL_GSM8K_SCORE_THRESHOLD = 0.70
 
 
 def _nixl_backend_config(backend, backend_params_json):
@@ -94,6 +104,8 @@ def _require_configured_nixl_backend():
 
 
 def _clear_disagg_failure_env():
+    # Failure injection is scoped to the failure test; clear inherited env so
+    # Basic/Accuracy cannot run with injected transfer failures.
     os.environ.pop("SGLANG_TEST_DISAGG_FAILURE_PROB", None)
     os.environ.pop("DISAGGREGATION_TEST_FAILURE_PROB", None)
 
@@ -102,9 +114,9 @@ _HAS_CONFIGURED_NIXL_BACKEND = is_in_ci() or _has_configured_nixl_backend()
 
 
 class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
-    prefill_tp_size = 4
-    decode_tp_size = 4
-    decode_base_gpu_id = 4
+    prefill_tp_size = NIXL_PREFILL_TP_SIZE
+    decode_tp_size = NIXL_DECODE_TP_SIZE
+    decode_base_gpu_id = NIXL_DECODE_BASE_GPU_ID
 
     @classmethod
     def start_prefill(cls):
@@ -253,7 +265,7 @@ class TestDisaggregationNixlAccuracy(NixlPDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
         self.assertGreaterEqual(
             metrics["score"],
-            0.70,
+            NIXL_GSM8K_SCORE_THRESHOLD,
             f"Expected NIXL PD transfer to preserve GSM8K accuracy, got {metrics}",
         )
 
