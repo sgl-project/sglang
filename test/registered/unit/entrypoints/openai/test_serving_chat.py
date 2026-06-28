@@ -92,12 +92,6 @@ class _MockTemplateManager:
         self.force_reasoning = False
 
 
-class _MockTokenizerManagerWithBadKwargs(_MockTokenizerManager):
-    def __init__(self):
-        super().__init__()
-        self.server_args.default_chat_template_kwargs = ["not", "a", "dict"]
-
-
 class ServingChatTestCase(unittest.TestCase):
     # ------------- common fixtures -------------
     def setUp(self):
@@ -413,13 +407,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.chat._process_messages(req, is_multimodal=False)
 
         self.assertEqual(req.reasoning_effort, "high")
-
-    def test_default_chat_template_kwargs_init_rejects_non_dict(self):
-        with self.assertRaises(ValueError):
-            OpenAIServingChat(
-                _MockTokenizerManagerWithBadKwargs(),
-                _MockTemplateManager(),
-            )
 
     def test_kimi_tool_call_keeps_explicit_template_thinking(self):
         self.template_manager.chat_template_name = None

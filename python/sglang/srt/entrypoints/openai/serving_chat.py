@@ -170,13 +170,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-        default_ctk = self.tokenizer_manager.server_args.default_chat_template_kwargs
-        if default_ctk is not None and not isinstance(default_ctk, dict):
-            raise ValueError(
-                f"default_chat_template_kwargs must be a dict, got "
-                f"{type(default_ctk).__name__}"
-            )
-        self.default_chat_template_kwargs = default_ctk or {}
+        self.default_chat_template_kwargs = (
+            self.tokenizer_manager.server_args.default_chat_template_kwargs or {}
+        )
         self._reasoning_detector = None
         if self.reasoning_parser:
             try:
