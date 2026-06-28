@@ -2068,6 +2068,8 @@ class Scheduler(
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
+                return_token_ids_in_logprobs=recv_req.return_token_ids_in_logprobs,
+                return_text_in_logprobs=recv_req.return_text_in_logprobs,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,

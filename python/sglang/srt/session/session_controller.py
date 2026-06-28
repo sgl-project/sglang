@@ -302,6 +302,8 @@ class Session:
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            return_token_ids_in_logprobs=req.return_token_ids_in_logprobs,
+            return_text_in_logprobs=req.return_text_in_logprobs,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
             require_reasoning=req.require_reasoning,
