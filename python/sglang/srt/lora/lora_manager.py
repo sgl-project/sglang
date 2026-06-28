@@ -617,8 +617,8 @@ class LoRAManager:
             if _use_dsa_indexer_fusion:
                 raise ValueError(
                     f"LoRA targets the DSA indexer ({sorted(indexer_targets)}), which is "
-                    "incompatible with DSA indexer Q/K fusion. Set "
-                    "SGLANG_DISABLE_DSA_INDEXER_FUSION=1 to disable fusion and use indexer LoRA."
+                    "incompatible with DSA indexer Q/K fusion. Leave "
+                    "SGLANG_ENABLE_DSA_INDEXER_FUSION unset (or set to 0) to use indexer LoRA."
                 )
 
         if max_lora_rank is not None:
