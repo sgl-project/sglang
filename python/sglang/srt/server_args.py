@@ -1870,6 +1870,16 @@ class ServerArgs:
         int,
         "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
     ] = 16
+    # ReplaySSM spec-verify (Part B of RFC #28511): GDN linear-chain target-verify
+    # via a per-slot circular (d, k, g) ring + periodic flush instead of per-draft
+    # full-state snapshots. GDN only; linear-chain (topk <= 1) only. Reuses the
+    # `linear_replayssm` ring (replayssm_d/k/g + write_pos) and adds two per-slot
+    # cursors (cache_base, is_flush); the ring length reuses
+    # `linear_replayssm_cache_len`.
+    enable_gdn_replayssm_spec: A[
+        bool,
+        "Enable the ReplaySSM GDN spec-verify kernel (Part B of RFC #28511): a per-slot circular (d, k, g) ring + periodic flush replacing the recurrent verify's per-draft full-state snapshots. GDN only, linear-chain (--speculative-eagle-topk in {None, 1}) only. Reuses --linear-replayssm-cache-len for the ring length.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
@@ -5154,6 +5164,53 @@ class ServerArgs:
                 # flow that is not yet validated for ReplaySSM (follow-up).
                 raise ValueError(
                     "--enable-linear-replayssm is not supported under PD "
+                    "disaggregation yet (follow-up). Got "
+                    f"--disaggregation-mode={self.disaggregation_mode!r}."
+                )
+            if self.linear_replayssm_cache_len < 1:
+                raise ValueError(
+                    "--linear-replayssm-cache-len must be >= 1, got "
+                    f"{self.linear_replayssm_cache_len}."
+                )
+
+        # ReplaySSM spec-verify (Part B of #28511): GDN-only, linear-chain target
+        # verify. Reuses the `linear_replayssm` ring (replayssm_d/k/g + write_pos)
+        # plus two extra per-slot cursors (cache_base, is_flush) and the chunked
+        # (I+A)^-1 reconstruction verify kernel. The intra-window interaction uses a
+        # strictly-lower causal mask, so it is valid ONLY for a linear draft chain
+        # (speculative_eagle_topk in {None, 1}, i.e. NEXTN / MTP); EAGLE tree verify
+        # (topk > 1) must fall back to the recurrent verify. GDN-only is enforced at
+        # runtime (KDA routes through kda_backend, which never enters this path; the
+        # pool gate also checks `not cache_params.is_kda`). The ring length reuses
+        # --linear-replayssm-cache-len (no separate flag).
+        if self.enable_gdn_replayssm_spec:
+            if self.speculative_eagle_topk not in (None, 1):
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires a linear draft chain "
+                    "(--speculative-eagle-topk in {None, 1}); the chunked verify "
+                    "kernel uses a strictly-lower causal mask and is invalid for "
+                    "EAGLE tree verify. Got "
+                    f"--speculative-eagle-topk={self.speculative_eagle_topk!r}."
+                )
+            if decode != "triton":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec requires the Triton linear-attn "
+                    "decode backend, got "
+                    f"--linear-attn-decode-backend={decode!r}."
+                )
+            if self.enable_mamba_extra_buffer():
+                # The spec-verify path does not yet implement the device-side
+                # force-flush needed to keep `temporal` consistent with the ring at
+                # radix mamba-track boundaries, so it is incompatible with
+                # extra_buffer (radix prefix caching).
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not yet compatible with mamba "
+                    "extra_buffer (radix prefix caching); use --disable-radix-cache "
+                    "or --mamba-radix-cache-strategy no_buffer."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-gdn-replayssm-spec is not supported under PD "
                     "disaggregation yet (follow-up). Got "
                     f"--disaggregation-mode={self.disaggregation_mode!r}."
                 )
