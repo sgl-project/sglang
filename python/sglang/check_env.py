@@ -581,15 +581,38 @@ class MPSEnv(BaseEnv):
         return {}
 
 
-if __name__ == "__main__":
+class CPUEnv(BaseEnv):
+    """Environment checker for CPU-only hosts."""
+
+    def get_info(self):
+        info = {"CPU available": True}
+        try:
+            output = subprocess.check_output(["lscpu"], text=True)
+            for line in output.splitlines():
+                if line.startswith("Model name:"):
+                    info["CPU"] = line.split(":", 1)[1].strip()
+                    break
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+        return info
+
+    def get_topology(self):
+        return {}
+
+
+def get_env_checker():
     if is_cuda_v2():
-        env = GPUEnv()
-    elif is_hip():
-        env = HIPEnv()
-    elif is_npu():
-        env = NPUEnv()
-    elif is_musa():
-        env = MUSAEnv()
-    elif is_mps():
-        env = MPSEnv()
-    env.check_env()
+        return GPUEnv()
+    if is_hip():
+        return HIPEnv()
+    if is_npu():
+        return NPUEnv()
+    if is_musa():
+        return MUSAEnv()
+    if is_mps():
+        return MPSEnv()
+    return CPUEnv()
+
+
+if __name__ == "__main__":
+    get_env_checker().check_env()
