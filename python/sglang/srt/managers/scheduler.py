@@ -123,7 +123,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
-    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -243,6 +242,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
@@ -266,6 +266,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
@@ -454,6 +455,7 @@ class Scheduler(
             enable_metrics=self.server_args.enable_metrics,
             enable_kv_cache_events=bool(
                 self.server_args.kv_events_config
+                and self.ps.pp_rank == 0
                 and self.ps.attn_tp_rank == 0
                 and self.ps.attn_cp_rank == 0
             ),
@@ -1118,6 +1120,17 @@ class Scheduler(
         if model_config is None:
             model_config = self.model_config
 
+        if self.spec_algorithm.carries_draft_hidden_states():
+            # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
+            # worker, so a single accessor covers both shapes.
+            draft_runner = self.draft_worker.draft_worker.draft_runner
+            disagg_hidden_size, disagg_hidden_states_dtype = (
+                get_draft_recurrent_hidden_state_spec(draft_runner)
+            )
+        else:
+            disagg_hidden_size = 16  # minimal padding size for RDMA
+            disagg_hidden_states_dtype = torch.float32
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1127,16 +1140,8 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else torch.float32
-                ),
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -1180,16 +1185,8 @@ class Scheduler(
             )
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
-                hidden_size=(
-                    model_config.spec_hidden_size
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else 16  # minimal padding size for RDMA
-                ),
-                hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.carries_draft_hidden_states()
-                    else torch.float32
-                ),
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
@@ -1211,6 +1208,8 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -1487,12 +1486,9 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        # DFLASH fences its shared req_to_token writes with verify_done /
-        # plan-stream deps, so the global WAR barrier only serializes plan
-        # overlap. TODO: generalize this global-barrier enablement policy.
-        self._war_barrier_enabled = (
-            is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
-        ) and not self.spec_algorithm.is_dflash()
+        # The global WAR barrier fences the scheduler's next shared-buffer write
+        # on the previous forward's read of the shared pool.
+        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1763,7 +1759,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2014,36 +2010,11 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native session: session_id is just a tag; KV bulk-freed on close.
+        # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
-            session_id is not None and self.server_args.enable_session_radix_cache
+            recv_req.session_id is not None
+            and self.server_args.enable_session_radix_cache
         )
-        if radix_native_session:
-            sp = recv_req.session_params
-            if (
-                sp.rid is not None
-                or sp.offset is not None
-                or sp.replace is not None
-                or sp.drop_previous_output is not None
-            ):
-                error_msg = (
-                    "Invalid request: radix-native sessions do not support "
-                    "session_params rid/offset/replace/drop_previous_output; "
-                    "send full context each turn."
-                )
-                req = Req(
-                    recv_req.rid,
-                    recv_req.input_text,
-                    recv_req.input_ids,
-                    recv_req.sampling_params,
-                    vocab_size=self.model_config.vocab_size,
-                    http_worker_ipc=recv_req.http_worker_ipc,
-                )
-                req.tokenizer = self.tokenizer
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
 
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
@@ -2066,6 +2037,7 @@ class Scheduler(
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
@@ -2097,8 +2069,6 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
-            if radix_native_session:
-                req.session_id = session_id
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2622,8 +2592,9 @@ class Scheduler(
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
-            # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
-            # so there is nothing new to cache and stashing would be a no-op.
+            # hybrid-SWA early-return) leaves extend_range.end ==
+            # len(prefix_indices), so there is nothing new to cache and
+            # stashing would be a no-op.
             if self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
@@ -2968,6 +2939,10 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        if self.tp_worker.model_runner.prefill_aware_swa:
+            for req in can_run_list:
+                req.swa_evict_floor = req.extend_range.end
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
@@ -3203,6 +3178,11 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in batch.reqs:
+                self.maybe_send_cached_prefix_chunk(req)
 
         # Run forward
         if self.is_generation:
@@ -3744,7 +3724,7 @@ class Scheduler(
         # This field is not serializable.
         ret.pop("model_config", None)
 
-        return GetInternalStateReqOutput(internal_state=ret)
+        return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -3793,7 +3773,7 @@ class Scheduler(
         server_args.pop("model_config", None)
         return SetInternalStateReqOutput(
             updated=if_success,
-            server_args=server_args,
+            server_args=msgspec_to_builtins(server_args),
         )
 
     def save_remote_model(self, **kwargs):
@@ -4075,24 +4055,17 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
-            # Radix-native: open is implicit; explicit open only permits id reuse.
-            session_id = recv_req.session_id
-            self.tree_cache.register_session(session_id)
-            output = OpenSessionReqOutput(
-                session_id=session_id, success=session_id is not None
-            )
-        else:
-            output = self.session_controller.open(recv_req)
+        output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.server_args.enable_session_radix_cache:
-            # "Close" just triggers eviction of the session's tagged KV.
-            self.tree_cache.release_session(recv_req.session_id)
-        else:
+            self.tree_cache.release_radix_session(recv_req.session_id)
+        if recv_req.session_id in self.session_controller or not (
+            self.server_args.enable_session_radix_cache
+        ):
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):

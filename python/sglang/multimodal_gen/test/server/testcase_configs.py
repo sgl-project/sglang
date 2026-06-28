@@ -536,6 +536,17 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+JOY_ECHO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=T2V_PROMPT,
+    output_size="640x384",
+    num_frames=33,
+    extras={
+        "num_inference_steps": 8,
+        "seed": 42,
+        "enable_memory_bank": False,
+    },
+)
+
 MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
