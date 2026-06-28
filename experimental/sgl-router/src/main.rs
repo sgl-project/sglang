@@ -149,9 +149,10 @@ async fn main() -> Result<()> {
         .context("construct proxy")?,
     );
 
-    // Spawn discovery + manager tasks. The manager resolves the fleet's wire
-    // protocol from the first worker introspection to complete and installs
-    // the matching forwarding client on the proxy, so the proxy is built first.
+    // Spawn discovery + manager tasks. The manager resolves each worker's wire
+    // protocol from its `/server_info` and stamps it onto the registered
+    // worker; the proxy holds a client per protocol and selects by the worker's
+    // protocol per request, so the manager needs no proxy handle.
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
@@ -163,7 +164,6 @@ async fn main() -> Result<()> {
         Some(Arc::new(cfg.clone())),
         kv_index_opt,
         Some(Arc::clone(&active_load)),
-        Some(Arc::clone(&proxy)),
     ));
 
     let ctx = Arc::new(

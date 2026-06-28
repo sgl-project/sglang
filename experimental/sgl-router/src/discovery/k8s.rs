@@ -912,7 +912,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             introspector,
         ));
 
@@ -1155,7 +1154,6 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
             drx,
             registry.clone(),
-            None,
             None,
             None,
             None,

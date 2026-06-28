@@ -6,6 +6,52 @@ use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Wire protocol the router uses when forwarding requests to a worker's HTTP
+/// interface.
+///
+/// Resolved per worker from its `/server_info` introspection (`enable_http2`)
+/// and the dialed URL scheme, not from the discovery backend — see
+/// [`crate::workers::manager`]. The [`crate::proxy::Proxy`] holds one
+/// forwarding client per protocol and picks the matching one for each request
+/// from the selected worker's [`Worker::protocol`]. Defaults to
+/// [`WireProtocol::Http1`], which is always safe: an engine launched with
+/// `--enable-http2` (Granian `HTTPModes.auto`) accepts HTTP/1.1 too, so the
+/// only mismatch that fails is speaking h2c to an HTTP/1.1-only Uvicorn engine
+/// — which we avoid by upgrading to [`WireProtocol::H2c`] only when the engine
+/// itself reports `enable_http2 == true` on a cleartext URL. Per-worker
+/// resolution means one worker that transiently failed introspection stays on
+/// HTTP/1.1 without dragging the rest of the fleet off h2c.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireProtocol {
+    /// HTTP/1.1 (reqwest default). Safe for every engine.
+    #[default]
+    Http1,
+    /// Cleartext HTTP/2 with prior knowledge (h2c). Used only when a worker
+    /// reports `--enable-http2` on a cleartext URL.
+    H2c,
+}
+
+impl WireProtocol {
+    fn as_u8(self) -> u8 {
+        match self {
+            WireProtocol::Http1 => 0,
+            WireProtocol::H2c => 1,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`]. The only writers of the underlying
+    /// `AtomicU8` are `as_u8`-derived values, so any out-of-range byte
+    /// indicates memory corruption or a stale store from an incompatible
+    /// build — fail loudly rather than silently mislabel the protocol.
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => WireProtocol::Http1,
+            1 => WireProtocol::H2c,
+            other => unreachable!("invalid WireProtocol discriminant {other}"),
+        }
+    }
+}
+
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
 /// fallback chain: parse as-is, retry with `http://` prefix if missing,
 /// fall back to `"localhost"` if both fail. The fallback is defensive —
@@ -29,28 +75,6 @@ fn parse_bootstrap_host(url: &str) -> String {
         "Failed to parse worker URL for bootstrap_host; defaulting to 'localhost'"
     );
     "localhost".to_string()
-}
-
-/// Wire protocol the router uses when forwarding requests to workers' HTTP
-/// interfaces.
-///
-/// Resolved once for the whole fleet from `/server_info` introspection
-/// (`enable_http2`), not from the discovery backend, and consumed by the
-/// [`crate::proxy::Proxy`] to build its single forwarding client (the fleet is
-/// assumed homogeneous). Defaults to [`WireProtocol::Http1`], which is always
-/// safe: an engine launched with `--enable-http2` (Granian `HTTPModes.auto`)
-/// accepts HTTP/1.1 too, so the only mismatch that fails is speaking h2c to an
-/// HTTP/1.1-only Uvicorn engine — which we avoid by upgrading to
-/// [`WireProtocol::H2c`] only when the engine itself reports
-/// `enable_http2 == true`. Resolution lives in [`crate::workers::manager`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WireProtocol {
-    /// HTTP/1.1 (reqwest default). Safe for every engine.
-    #[default]
-    Http1,
-    /// Cleartext HTTP/2 with prior knowledge (h2c). Used only when the fleet
-    /// is launched with `--enable-http2`.
-    H2c,
 }
 
 /// RAII guard that increments `active_requests` on construction and
@@ -107,6 +131,13 @@ pub struct Worker {
     /// Interior-mutable mode so `ModeChanged` can update in place without
     /// dropping the Worker (which would reset `active_requests` + breaker).
     mode: AtomicU8,
+    /// Interior-mutable forwarding wire protocol (HTTP/1.1 vs cleartext h2c),
+    /// resolved from this worker's own `/server_info`. Per-worker so a single
+    /// worker that transiently failed introspection (and so stays HTTP/1.1)
+    /// does not force the rest of the fleet off h2c, and so a re-introspection
+    /// can upgrade it in place once the engine is ready. See
+    /// [`crate::workers::manager`].
+    protocol: AtomicU8,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -143,6 +174,10 @@ impl Worker {
             id: spec.id,
             url: spec.url,
             mode: AtomicU8::new(spec.mode.as_u8()),
+            // Defaults to the always-safe HTTP/1.1; the worker manager calls
+            // `set_protocol` from `/server_info` introspection before (and on
+            // reconcile, after) the worker becomes routable.
+            protocol: AtomicU8::new(WireProtocol::default().as_u8()),
             model_ids: spec.model_ids,
             breaker,
             active_requests: Arc::new(AtomicUsize::new(0)),
@@ -177,6 +212,27 @@ impl Worker {
         self.mode.store(m.as_u8(), Ordering::Relaxed);
     }
 
+    /// The wire protocol the proxy should use when forwarding to this worker.
+    ///
+    /// Uses `Relaxed` ordering: protocol resolution is a rare discovery /
+    /// reconcile event and does not need to synchronise with any other memory
+    /// access — a request that reads a just-superseded value picks a client
+    /// the worker still accepts (Granian's `auto` mode serves both h2c and
+    /// HTTP/1.1).
+    pub fn protocol(&self) -> WireProtocol {
+        WireProtocol::from_u8(self.protocol.load(Ordering::Relaxed))
+    }
+
+    /// Update the worker's forwarding protocol in place.
+    ///
+    /// Lets a reconcile re-introspection upgrade a worker that first resolved
+    /// HTTP/1.1 (transient `/server_info` failure) to h2c once the engine is
+    /// ready, without dropping the `Arc<Worker>` (which would reset
+    /// `active_requests` + breaker state).
+    pub fn set_protocol(&self, p: WireProtocol) {
+        self.protocol.store(p.as_u8(), Ordering::Relaxed);
+    }
+
     pub fn active_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
     }
@@ -194,6 +250,7 @@ impl std::fmt::Debug for Worker {
             .field("id", &self.id)
             .field("url", &self.url)
             .field("mode", &self.mode())
+            .field("protocol", &self.protocol())
             .field("active_load", &self.active_load())
             .finish()
     }
@@ -252,6 +309,24 @@ mod tests {
         assert_eq!(w.mode(), WorkerMode::Decode);
         w.set_mode(WorkerMode::Plain);
         assert_eq!(w.mode(), WorkerMode::Plain);
+    }
+
+    #[test]
+    fn protocol_defaults_to_http1_and_updates_in_place() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+        });
+        // Always-safe default until the manager resolves /server_info.
+        assert_eq!(w.protocol(), WireProtocol::Http1);
+        // A reconcile re-introspection can upgrade in place (and back).
+        w.set_protocol(WireProtocol::H2c);
+        assert_eq!(w.protocol(), WireProtocol::H2c);
+        w.set_protocol(WireProtocol::Http1);
+        assert_eq!(w.protocol(), WireProtocol::Http1);
     }
 
     #[test]

@@ -4,14 +4,15 @@
 //! Cleartext-HTTP/2 (h2c) forwarding tests for [`Proxy`].
 //!
 //! These spin up an **HTTP/2-only** server (hyper's `http2::Builder`, no
-//! HTTP/1.1 path) and drive `forward_json_to` against it after resolving the
-//! proxy's single client via `set_protocol`. Together the two tests prove
-//! what the `set_protocol` unit test in `src/proxy/mod.rs` cannot: that an
-//! h2c-resolved proxy genuinely speaks HTTP/2 on the wire (not just that the
-//! protocol value was recorded), and that an HTTP/1.1-resolved proxy cannot
-//! reach an h2c worker — so a regression that dropped the `http2` Cargo
-//! feature, removed `http2_prior_knowledge()`, or mismatched `build_client`'s
-//! arms would fail here rather than slip through.
+//! HTTP/1.1 path) and drive `forward_json_to` against it with an explicit
+//! per-request [`WireProtocol`]. Together the two tests prove what a value-only
+//! unit test cannot: that the proxy's h2c client genuinely speaks HTTP/2 on the
+//! wire when a request selects [`WireProtocol::H2c`] (not just that the value
+//! was threaded through), and that the HTTP/1.1 client cannot reach an h2c
+//! worker — so a regression that dropped the `http2` Cargo feature, removed
+//! `http2_prior_knowledge()`, or mismatched `build_client`'s arms would fail
+//! here rather than slip through. They also pin the per-worker design: the
+//! protocol is chosen per `forward_json_to` call, not committed fleet-wide.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -57,14 +58,14 @@ async fn spawn_h2c_only_server() -> String {
 async fn h2c_client_reaches_http2_only_worker() {
     let url = spawn_h2c_only_server().await;
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
-    // Resolve the fleet to h2c, as the manager would for an --enable-http2
-    // engine on a cleartext URL.
-    proxy.set_protocol(WireProtocol::H2c);
     let breaker = CircuitBreaker::new();
 
+    // Select h2c per request, as the chat handler does for a worker whose
+    // `/server_info` reported --enable-http2 on a cleartext URL.
     let resp = proxy
         .forward_json_to(
             &url,
+            WireProtocol::H2c,
             &breaker,
             "/v1/chat/completions",
             &axum::http::HeaderMap::new(),
@@ -79,17 +80,16 @@ async fn h2c_client_reaches_http2_only_worker() {
 async fn http1_client_cannot_reach_http2_only_worker() {
     let url = spawn_h2c_only_server().await;
     let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
-    // Leave the proxy on its HTTP/1.1 default (no h2c worker resolved).
-    proxy.set_protocol(WireProtocol::Http1);
     let breaker = CircuitBreaker::new();
 
     // The HTTP/1.1 client never sends the HTTP/2 preface, so the h2c-only
-    // server cannot serve it. This is what makes resolving the protocol
+    // server cannot serve it. This is what makes selecting the protocol
     // meaningful: Http1 and H2c are different protocols on the wire, not the
     // same client pointed at the same endpoint.
     let res = proxy
         .forward_json_to(
             &url,
+            WireProtocol::Http1,
             &breaker,
             "/v1/chat/completions",
             &axum::http::HeaderMap::new(),

@@ -6,7 +6,6 @@ use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
-use crate::proxy::Proxy;
 use crate::workers::introspect::{DisaggregationRole, WorkerIntrospector};
 use crate::workers::{WireProtocol, WorkerRegistry};
 use std::collections::HashMap;
@@ -66,15 +65,18 @@ fn resolve_protocol(enable_http2: Option<bool>, worker_url: &str) -> WireProtoco
 }
 
 pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistry>) {
-    run_with_config(rx, registry, None, None, None, None).await;
+    run_with_config(rx, registry, None, None, None).await;
 }
 
 /// Run the worker manager, optionally honoring per-model circuit-breaker
 /// configuration from `cfg`, an optional KV-event index that is notified
-/// on every worker add / remove, an optional active-load registry
-/// that is asked to forget per-worker counters on `Removed`, and an
-/// optional proxy whose single forwarding client's wire protocol is
-/// resolved from the first worker's `/server_info`.
+/// on every worker add / remove, and an optional active-load registry
+/// that is asked to forget per-worker counters on `Removed`.
+///
+/// The forwarding wire protocol (HTTP/1.1 vs cleartext h2c) is resolved per
+/// worker from its `/server_info` and stamped onto the registered
+/// [`crate::workers::Worker`] (see `register_one`), so the manager does not
+/// need a handle to the proxy.
 ///
 /// When `kv_index` is `None` the cache-aware-zmq path is disabled
 /// (selection falls through to the non-cache-aware policies); when
@@ -82,9 +84,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
 /// `cfg` is `None` the default CB config is used for every worker
-/// (threshold = 3); when `proxy` is `None` the resolved protocol is
-/// discarded (tests that don't forward) and the proxy keeps its HTTP/1.1
-/// default.
+/// (threshold = 3).
 ///
 /// Uses the default HTTP client (2-second timeout) for `/server_info`
 /// introspection.  Tests that want a tighter timeout call
@@ -95,7 +95,6 @@ pub async fn run_with_config(
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
-    proxy: Option<Arc<Proxy>>,
 ) {
     run_with_introspector(
         rx,
@@ -103,7 +102,6 @@ pub async fn run_with_config(
         cfg,
         kv_index,
         active_load,
-        proxy,
         Arc::new(WorkerIntrospector::default()),
     )
     .await
@@ -120,7 +118,6 @@ pub async fn run_with_introspector(
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
-    proxy: Option<Arc<Proxy>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     run_with_introspector_and_reconcile(
@@ -129,7 +126,6 @@ pub async fn run_with_introspector(
         cfg,
         kv_index,
         active_load,
-        proxy,
         introspector,
         RECONCILE_INTERVAL,
     )
@@ -157,7 +153,7 @@ pub async fn run_with_introspector(
 ///   `pending` with the discovery events so re-registrations stay
 ///   serialized per id against concurrent `Added` / `Removed`.
 // Each argument is a distinct collaborator threaded into the loop (event
-// source, registry, plus the optional cfg / kv-index / active-load / proxy
+// source, registry, plus the optional cfg / kv-index / active-load
 // injections and the introspector + reconcile cadence). Bundling them into a
 // struct purely to satisfy the arg-count heuristic would add indirection
 // without clarity.
@@ -168,7 +164,6 @@ pub async fn run_with_introspector_and_reconcile(
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
-    proxy: Option<Arc<Proxy>>,
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
@@ -209,7 +204,6 @@ pub async fn run_with_introspector_and_reconcile(
                     &cfg,
                     &kv_index,
                     &active_load,
-                    &proxy,
                     &introspector,
                     &mut pending,
                 )
@@ -221,7 +215,6 @@ pub async fn run_with_introspector_and_reconcile(
                     &registry,
                     &cfg,
                     &kv_index,
-                    &proxy,
                     &introspector,
                     &mut pending,
                 );
@@ -253,7 +246,6 @@ async fn handle_discovery_event(
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
     active_load: &Option<Arc<ActiveLoadRegistry>>,
-    proxy: &Option<Arc<Proxy>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -271,10 +263,9 @@ async fn handle_discovery_event(
             let registry_t = registry.clone();
             let cfg_t = cfg.clone();
             let kv_index_t = kv_index.clone();
-            let proxy_t = proxy.clone();
             let introspector_t = introspector.clone();
             let handle = tokio::spawn(async move {
-                register_one(spec, registry_t, cfg_t, kv_index_t, proxy_t, introspector_t).await;
+                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
             });
             pending.insert(id, handle);
         }
@@ -382,7 +373,6 @@ fn reconcile_unresolved_workers(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
-    proxy: &Option<Arc<Proxy>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -420,10 +410,9 @@ fn reconcile_unresolved_workers(
         let registry_t = registry.clone();
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
-        let proxy_t = proxy.clone();
         let introspector_t = introspector.clone();
         let handle = tokio::spawn(async move {
-            register_one(spec, registry_t, cfg_t, kv_index_t, proxy_t, introspector_t).await;
+            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
         });
         pending.insert(id, handle);
     }
@@ -439,7 +428,6 @@ async fn register_one(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
-    proxy: Option<Arc<Proxy>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     let worker_url = spec.url.clone();
@@ -478,14 +466,10 @@ async fn register_one(
         }
     }
     // Pick cleartext h2c vs HTTP/1.1 from the engine's self-report and the
-    // dialed scheme (see `resolve_protocol`) and install it on the proxy's
-    // single forwarding client. HTTP/1.1 is the always-safe default:
-    // Granian's `auto` mode accepts it, and it negotiates fine over TLS — so
-    // the only mismatch that would fail (cleartext h2c to a non-h2c endpoint)
-    // is exactly what the cleartext-scheme gate prevents. The fleet is
-    // assumed homogeneous, so `set_protocol` keeps the first resolved value;
-    // do it before the registry insert so the client is ready before the
-    // worker becomes routable.
+    // dialed scheme (see `resolve_protocol`). HTTP/1.1 is the always-safe
+    // default: Granian's `auto` mode accepts it, and it negotiates fine over
+    // TLS — so the only mismatch that would fail (cleartext h2c to a non-h2c
+    // endpoint) is exactly what the cleartext-scheme gate prevents.
     let protocol = resolve_protocol(info.enable_http2, &worker_url);
     match protocol {
         WireProtocol::H2c => tracing::info!(
@@ -499,10 +483,8 @@ async fn register_one(
         ),
         WireProtocol::Http1 => {}
     }
-    if let Some(proxy) = &proxy {
-        proxy.set_protocol(protocol);
-    }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
+    let worker_id = spec.id.clone();
     if let Err(e) = registry.add_with_cb(spec, cb) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
@@ -516,6 +498,16 @@ async fn register_one(
             "worker manager: refused to register worker due to mixed PD/plain configuration",
         );
         return;
+    }
+    // Stamp the resolved protocol onto the freshly-registered worker. Per
+    // worker (not a fleet-wide client): a worker that transiently failed
+    // introspection stays HTTP/1.1 without forcing the rest of the fleet off
+    // h2c, and a reconcile re-introspection upgrades the worker in place once
+    // the engine is ready. `add_with_cb` is an upsert that builds a new
+    // `Worker` (resetting its protocol to the Http1 default), so we set the
+    // protocol on the post-insert entry.
+    if let Some(w) = registry.get(&worker_id) {
+        w.set_protocol(protocol);
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
@@ -674,7 +666,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             fast_introspector(),
         ));
 
@@ -716,7 +707,6 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
-            None,
             None,
             None,
             None,
@@ -765,7 +755,6 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
-            None,
             None,
             None,
             None,
@@ -841,7 +830,6 @@ mod tests {
             None,
             Some(kv_index.clone()),
             None,
-            None,
         ));
 
         let spec = WorkerSpec {
@@ -902,7 +890,6 @@ mod tests {
             None,
             Some(kv_index.clone()),
             None,
-            None,
         ));
 
         tx.send(DiscoveryEvent::Removed {
@@ -942,7 +929,6 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&active_load)),
-            None,
             fast_introspector(),
         ));
 
@@ -1019,7 +1005,6 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector(
             rx,
             registry.clone(),
-            None,
             None,
             None,
             None,
@@ -1125,7 +1110,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             fast_introspector(),
             Duration::from_millis(150),
         ));
@@ -1181,6 +1165,93 @@ mod tests {
             registry.get(&id).unwrap().model_ids,
             vec![ModelId("m".into())],
             "recovered worker must carry the resolved model id",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    /// A worker that failed its initial `/server_info` (so registered with the
+    /// HTTP/1.1 default) must be UPGRADED to h2c by the reconcile loop once the
+    /// engine is ready and reports `enable_http2: true`. This is the second
+    /// half of the production fix: per-worker protocol resolution that is
+    /// re-resolvable, so a transient startup failure does not strand an
+    /// h2c-capable engine on HTTP/1.1 forever.
+    #[tokio::test]
+    async fn reconcile_upgrades_worker_to_h2c_after_transient_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        // While not-ready the worker answers 503 (introspection fails → Http1,
+        // empty model_ids); once ready it reports a model AND enable_http2.
+        let ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) = spawn_switchable_server_info_worker(
+            json!({"served_model_name": "m", "enable_http2": true}),
+            ready.clone(),
+        )
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-warming".into());
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+        }))
+        .await
+        .unwrap();
+
+        // Phase 1: the warming worker is registered on the safe HTTP/1.1
+        // default (introspection failed → empty model_ids, no h2c).
+        let stuck = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if w.model_ids.is_empty() && w.protocol() == WireProtocol::Http1 {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            stuck.is_ok(),
+            "a worker that failed initial /server_info must register on the HTTP/1.1 default",
+        );
+
+        // The engine finishes coming up.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: reconcile re-introspects and upgrades the worker to h2c.
+        let upgraded = timeout(Duration::from_secs(3), async {
+            loop {
+                if registry
+                    .get(&id)
+                    .is_some_and(|w| w.protocol() == WireProtocol::H2c)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            upgraded.is_ok(),
+            "reconcile must upgrade the worker to h2c once /server_info reports enable_http2; got {:?}",
+            registry.get(&id).map(|w| w.protocol()),
         );
 
         drop(tx);
@@ -1248,7 +1319,6 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
             rx,
             registry.clone(),
-            None,
             None,
             None,
             None,
@@ -1381,7 +1451,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             introspector,
             Duration::from_millis(60),
         ));
@@ -1449,7 +1518,6 @@ mod tests {
         let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
             rx,
             registry.clone(),
-            None,
             None,
             None,
             None,
