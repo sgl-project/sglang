@@ -206,10 +206,19 @@ class MessageQueue:
             # message. otherwise, we will only receive the first subscription
             # see http://api.zeromq.org/3-3:zmq-setsockopt for more details
             self.local_socket.setsockopt(XPUB_VERBOSE, True)
-            local_subscribe_port = get_open_port()
-            socket_addr = f"tcp://127.0.0.1:{local_subscribe_port}"
-            logger.debug("Binding to %s", socket_addr)
-            self.local_socket.bind(socket_addr)
+            # Bind atomically to avoid get_open_port()'s check-then-bind race;
+            # search from SGLANG_PORT to keep the existing port range.
+            sglang_port = os.getenv("SGLANG_PORT")
+            if sglang_port is not None:
+                base = int(sglang_port)
+                local_subscribe_port = self.local_socket.bind_to_random_port(
+                    "tcp://127.0.0.1", min_port=base, max_port=base + 8
+                )
+            else:
+                local_subscribe_port = self.local_socket.bind_to_random_port(
+                    "tcp://127.0.0.1"
+                )
+            logger.debug("Bound to tcp://127.0.0.1:%d", local_subscribe_port)
             self.current_idx = 0
 
         else:
