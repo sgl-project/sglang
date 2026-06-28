@@ -212,9 +212,8 @@ class FlashAttentionBackend(AttentionBackend):
     - For each forward batch, init_replay_cuda_graph will be called first and then replay the graph.
     """
 
-    # Build the page table on-device from seq_lens via the shared
-    # build_trtllm_mha_page_table kernel (self-guards per request), so the
-    # seq_lens_cpu D2H sync is never needed. matches trtllm_mha / trtllm_mla.
+    # Page table is built on-device (the shared kernel self-guards per request),
+    # so the seq_lens_cpu D2H is never needed -- like trtllm_mha / trtllm_mla.
     needs_cpu_seq_lens: bool = False
 
     def __init__(
@@ -502,9 +501,8 @@ class FlashAttentionBackend(AttentionBackend):
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
-        # Eager (non-cuda-graph) path may need a host-side max for dynamic
-        # page-table sizing. Use the published mirror when available, else
-        # sync from the GPU tensor (this path is not the overlap hot path).
+        # Eager path needs a host int for dynamic page-table sizing: the CPU
+        # mirror when published, else a local D2H (not the overlap hot path).
         seq_lens_cpu = (
             forward_batch.seq_lens_cpu
             if forward_batch.seq_lens_cpu is not None
@@ -2281,10 +2279,9 @@ class FlashAttentionBackend(AttentionBackend):
     def _host_max_seq_len(
         seq_lens_cpu: Optional[torch.Tensor], seq_lens: torch.Tensor
     ) -> int:
-        """Host-side max KV length. Prefers the published CPU mirror; falls back
-        to a local D2H when it is absent (the GPU-only path). Used by the topk>1
-        / draft-extend branches that still need a host max for buffer sizing --
-        not the dflash overlap hot path (topk=1, device-side build)."""
+        """Host-side max KV length: the CPU mirror when published, else a local
+        D2H. For cold paths (topk>1, draft-extend, eager) that need a host max --
+        not the dflash hot path (topk=1, device-side build)."""
         src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu()
         return src.max().item()
 
@@ -2294,15 +2291,10 @@ class FlashAttentionBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         cache_seqlens: torch.Tensor,
     ):
-        """Build the page table on-device from per-request KV lengths (no sync).
-
-        Fills ``metadata.page_table`` (a [bs, max_num_pages] buffer) in place
-        with block ids derived from ``cache_seqlens`` (a GPU tensor); for SWA
-        models it also fills ``metadata.swa_page_table`` via the full->SWA
-        lookup. The Triton kernel self-guards per request on the device-side
-        length, so the grid and buffer width use the static ``max_num_pages``
-        upper bound while the actual writes stay bounded by ``cache_seqlens``
-        — no host-side max / D2H sync.
+        """Fill metadata.page_table (and swa_page_table for SWA models) in place
+        on-device from cache_seqlens, no D2H. The Triton kernel self-guards per
+        request, so the grid/buffer width use the static max_num_pages bound
+        while writes stay bounded by cache_seqlens.
         """
         has_swa = self.use_sliding_window_kv_pool
         build_trtllm_mha_page_table(
@@ -2361,11 +2353,9 @@ class FlashAttentionBackend(AttentionBackend):
                 if self.topk <= 1:
                     # When topk = 1, we use the normal decode metadata
                     metadata = self.decode_cuda_graph_metadata[bs]
-                    # Page table built on-device below (self-guards on
-                    # cache_seqlens). max_seq_len_k is intentionally left unset:
-                    # the FA3 kernel reads cache_seqlens + page_table only, and
-                    # scheduler_metadata is normal-decode-only, so nothing
-                    # consumes it on this path.
+                    # Page table built on-device (self-guards on cache_seqlens);
+                    # max_seq_len_k left unset -- unread here (scheduler_metadata
+                    # is normal-decode-only).
                     normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
@@ -2471,11 +2461,9 @@ class FlashAttentionBackend(AttentionBackend):
                             dst_kv_lens=metadata.cache_seqlens_int32,
                         )
                 else:
-                    # Page table uses the static max_num_pages bound (the fused
-                    # kernel self-guards on seq_lens, no D2H). max_seq_len_k only
-                    # drives the FA3 scheduler_metadata precompute below, so use
-                    # the free CPU mirror for a tight split heuristic when it is
-                    # published, else fall back to the static upper bound.
+                    # Page table uses the static max_num_pages bound (no D2H).
+                    # max_seq_len_k only feeds scheduler_metadata below, so use
+                    # the free CPU mirror for a tight split heuristic when present.
                     metadata.max_seq_len_k = (
                         seq_lens_cpu.max().item()
                         if seq_lens_cpu is not None
@@ -2528,10 +2516,9 @@ class FlashAttentionBackend(AttentionBackend):
                     (seq_lens + self.speculative_num_draft_tokens)
                 )
 
-                # Page table built on-device below (self-guards on cache_seqlens).
-                # max_seq_len_k is intentionally left unset: the FA3 kernel reads
-                # cache_seqlens + page_table only, and scheduler_metadata is
-                # normal-decode-only, so nothing consumes it on this path.
+                # Page table built on-device (self-guards on cache_seqlens);
+                # max_seq_len_k left unset -- unread here (scheduler_metadata is
+                # normal-decode-only).
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
