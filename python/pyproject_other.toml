@@ -26,7 +26,6 @@ runtime_common = [
   "build",
   "compressed-tensors",
   "datasets",
-  "easydict",
   "einops",
   "fastapi",
   "gguf",
@@ -88,6 +87,10 @@ tracing = [
   "opentelemetry-exporter-otlp",
   "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-sdk",
+]
+
+remote-models = [
+  "easydict",  # Required by some trust_remote_code model repos, e.g. DeepSeek-OCR.
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -173,10 +176,23 @@ test = [
   "tabulate",
 ]
 
-all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
-all_hpu = ["sglang[srt_hpu]"]
-all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
-all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
+all_hip = [
+  "sglang[diffusion_hip]",
+  "sglang[remote-models]",
+  "sglang[srt_hip]",
+  "sglang[tracing]",
+]
+all_hpu = ["sglang[remote-models]", "sglang[srt_hpu]"]
+all_musa = [
+  "sglang[diffusion_musa]",
+  "sglang[remote-models]",
+  "sglang[srt_musa]",
+]
+all_mps = [
+  "sglang[diffusion_mps]",
+  "sglang[remote-models]",
+  "sglang[srt_mps]",
+]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]

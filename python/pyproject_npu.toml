@@ -24,7 +24,6 @@ dependencies = [
   "compressed-tensors",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
-  "easydict",
   "einops",
   "fastapi",
   "gguf",
@@ -93,6 +92,10 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+remote-models = [
+  "easydict",  # Required by some trust_remote_code model repos, e.g. DeepSeek-OCR.
+]
+
 test = [
   "accelerate",
   "expecttest",
@@ -108,7 +111,7 @@ test = [
 
 # https://docs.sglang.io/platforms/ascend_npu.html
 srt_npu = []
-all_npu = ["sglang[diffusion]"]
+all_npu = ["sglang[diffusion]", "sglang[remote-models]"]
 dev_npu = ["sglang[all_npu]", "sglang[test]"]
 
 [project.urls]

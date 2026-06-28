@@ -23,7 +23,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "easydict",
   "einops",
   "fastapi",
   "gguf",
@@ -98,6 +97,10 @@ tracing = [
   "opentelemetry-exporter-otlp-proto-grpc",
   "opentelemetry-sdk",
 ]
+remote-models = [
+  "easydict",  # Required by some trust_remote_code model repos, e.g. DeepSeek-OCR.
+]
+
 test = [
   "accelerate",
   "expecttest",
@@ -108,7 +111,11 @@ test = [
   "pytest",
   "sentence_transformers",
 ]
-all = []
+all = [
+  "sglang-cpu[diffusion]",
+  "sglang-cpu[remote-models]",
+  "sglang-cpu[tracing]",
+]
 dev = ["sglang[test]"]
 
 [project.urls]

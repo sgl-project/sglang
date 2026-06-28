@@ -25,6 +25,14 @@ pip install uv
 uv pip install sglang
 ```
 
+Some model repositories loaded with `--trust-remote-code` require optional
+third-party packages. If a remote-code model such as DeepSeek-OCR requires
+`easydict`, install the remote-models extra:
+
+```bash Command
+uv pip install "sglang[remote-models]"
+```
+
 The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
 ```bash Command
 pip install --upgrade pip
