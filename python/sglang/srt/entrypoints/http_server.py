@@ -2210,6 +2210,7 @@ def _run_granian_server(
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
+    from granian.http import HTTP2Settings
     from granian.server.embed import Server as GranianEmbeddedServer
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
@@ -2231,10 +2232,15 @@ def _run_granian_server(
         backlog=backlog,
         backpressure=backpressure,
     )
+    # HTTP/2-specific tunables go through Granian's HTTP2Settings, not as
+    # top-level kwargs. Only attach when the operator set at least one.
+    http2_settings_kwargs = {}
     if http2_max_concurrent_streams is not None:
-        granian_kwargs["http2_max_concurrent_streams"] = http2_max_concurrent_streams
+        http2_settings_kwargs["max_concurrent_streams"] = http2_max_concurrent_streams
     if http2_max_frame_size is not None:
-        granian_kwargs["http2_max_frame_size"] = http2_max_frame_size
+        http2_settings_kwargs["max_frame_size"] = http2_max_frame_size
+    if http2_settings_kwargs:
+        granian_kwargs["http2_settings"] = HTTP2Settings(**http2_settings_kwargs)
 
     if tokenizer_worker_num > 1:
         granian_kwargs["workers"] = tokenizer_worker_num

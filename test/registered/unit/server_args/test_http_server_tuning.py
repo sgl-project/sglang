@@ -12,6 +12,13 @@ from sglang.srt.server_args import ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
+try:
+    import granian  # noqa: F401
+
+    _HAS_GRANIAN = True
+except ImportError:
+    _HAS_GRANIAN = False
+
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners.
@@ -87,6 +94,55 @@ class TestKeepAliveResolution(unittest.TestCase):
     def test_env_var_used_when_cli_unset(self):
         args = ServerArgs(model_path="dummy")
         self.assertEqual(self._resolve(args), envs.SGLANG_TIMEOUT_KEEP_ALIVE.get())
+
+
+@unittest.skipUnless(_HAS_GRANIAN, "granian not installed (pip install sglang[http2])")
+class TestGranianHttp2Settings(unittest.TestCase):
+    # Regression guard: Granian's HTTP/2 tunables go through
+    # http2_settings=HTTP2Settings(...), NOT as flat top-level kwargs.
+    # Force the multi-worker path (tokenizer_worker_num=2) so we hit
+    # granian.Granian (mockable) rather than the embedded server.
+
+    def test_passes_http2_settings_when_tunables_set(self):
+        from granian.http import HTTP2Settings
+
+        from sglang.srt.entrypoints.http_server import _run_granian_server
+
+        with patch("granian.Granian") as MockGranian:
+            _run_granian_server(
+                host="127.0.0.1",
+                port=30000,
+                log_level="info",
+                tokenizer_worker_num=2,
+                http2_max_concurrent_streams=256,
+                http2_max_frame_size=65536,
+            )
+
+        kwargs = MockGranian.call_args.kwargs
+        self.assertIn("http2_settings", kwargs)
+        self.assertIsInstance(kwargs["http2_settings"], HTTP2Settings)
+        self.assertEqual(kwargs["http2_settings"].max_concurrent_streams, 256)
+        self.assertEqual(kwargs["http2_settings"].max_frame_size, 65536)
+        # Don't smuggle the same values as flat kwargs (that'd be a TypeError
+        # from Granian and is the bug this test guards against).
+        self.assertNotIn("http2_max_concurrent_streams", kwargs)
+        self.assertNotIn("http2_max_frame_size", kwargs)
+
+    def test_no_http2_settings_when_tunables_unset(self):
+        from sglang.srt.entrypoints.http_server import _run_granian_server
+
+        with patch("granian.Granian") as MockGranian:
+            _run_granian_server(
+                host="127.0.0.1",
+                port=30000,
+                log_level="info",
+                tokenizer_worker_num=2,
+            )
+
+        kwargs = MockGranian.call_args.kwargs
+        # When the operator sets nothing, we let Granian use its defaults
+        # rather than pinning them from our side.
+        self.assertNotIn("http2_settings", kwargs)
 
 
 if __name__ == "__main__":
