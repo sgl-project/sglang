@@ -342,27 +342,111 @@ def get_mla_kv_buffer_kernel(
     rope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    """Block-split gather: grid (n_loc, ceil(total_dim/BLOCK)).
+
+    Each CTA reads BLOCK contiguous elements from one kv_buffer row and
+    scatters them into cache_k_nope or cache_k_rope. More CTAs/loc fills SMs
+    better at decode batch sizes. Requires BLOCK to divide nope_dim so each
+    block is purely nope or purely rope, with masking on the trailing rope
+    block.
+    """
     pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
+    src = tl.load(kv_buffer_ptr + loc * buffer_stride + offs, mask=mask)
+
+    if base + BLOCK <= nope_dim:
+        tl.store(cache_k_nope_ptr + pid_loc * nope_stride + offs, src, mask=mask)
+    else:
+        offs_rope = offs - nope_dim
+        tl.store(cache_k_rope_ptr + pid_loc * rope_stride + offs_rope, src, mask=mask)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
+def get_mla_kv_buffer_per_loc_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    n_loc,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    BLOCK_LOC: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    """Each CTA gathers BLOCK_LOC locs from kv_buffer into cache_k_nope/rope.
+
+    Grid is ceil(n_loc / BLOCK_LOC). Fat [BLOCK_LOC, dim] tiles saturate
+    bandwidth at prefill chunk sizes; num_warps/num_stages are tuned in the
+    wrapper. Pairs with the block-split get_mla_kv_buffer_kernel above.
+    """
+    pid = tl.program_id(0)
+    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_mask = loc_indices < n_loc
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
+    locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
 
     nope_offs = tl.arange(0, nope_dim)
-    nope_src_ptr = loc_src_ptr + nope_offs
-    nope_src = tl.load(nope_src_ptr)
-
+    src_nope = tl.load(
+        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_offs[None, :],
+        mask=loc_mask[:, None],
+    )
     tl.store(
-        cache_k_nope_ptr + pid_loc * nope_stride + nope_offs,
-        nope_src,
+        cache_k_nope_ptr + loc_indices[:, None] * nope_stride + nope_offs[None, :],
+        src_nope,
+        mask=loc_mask[:, None],
     )
 
     rope_offs = tl.arange(0, rope_dim)
-    rope_src_ptr = loc_src_ptr + nope_dim + rope_offs
-    rope_src = tl.load(rope_src_ptr)
-    tl.store(
-        cache_k_rope_ptr + pid_loc * rope_stride + rope_offs,
-        rope_src,
+    src_rope = tl.load(
+        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
+        mask=loc_mask[:, None],
     )
+    tl.store(
+        cache_k_rope_ptr + loc_indices[:, None] * rope_stride + rope_offs[None, :],
+        src_rope,
+        mask=loc_mask[:, None],
+    )
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+# Dispatch tuned with BF16 Kimi K2.5 / DSv3 MLA rows (nope=512, rope=64).
+#   n_loc <  256  : block-split kernel - more CTAs/loc fills SMs at decode bs.
+#   n_loc >= 256  : per-loc kernel - fat tiles saturate bandwidth at larger bs.
+_GET_MLA_KV_PER_LOC_MIN_LOCS = 256
+_GET_MLA_KV_BLOCK_SPLIT_BLOCK = 512
+_GET_MLA_KV_BLOCK_SPLIT_NUM_WARPS = 4
+
+
+def _get_mla_kv_per_loc_config(n_loc: int) -> tuple[int, int, int]:
+    if n_loc >= 8192:
+        return 8, 2, 1
+    if n_loc >= 2048:
+        return 4, 8, 2
+    return 2, 4, 2
 
 
 def get_mla_kv_buffer_triton(
@@ -371,12 +455,39 @@ def get_mla_kv_buffer_triton(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ):
-    # The source data type will be implicitly converted to the target data type.
-    nope_dim = cache_k_nope.shape[-1]  # 512
-    rope_dim = cache_k_rope.shape[-1]  # 64
+    """Gather MLA paged-KV rows into separate nope/rope output buffers."""
     n_loc = loc.numel()
-    grid = (n_loc,)
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
+    if n_loc >= _GET_MLA_KV_PER_LOC_MIN_LOCS:
+        block_loc, num_warps, num_stages = _get_mla_kv_per_loc_config(n_loc)
+        grid = (triton.cdiv(n_loc, block_loc),)
+        get_mla_kv_buffer_per_loc_kernel[grid](
+            kv_buffer,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            n_loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            cache_k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            BLOCK_LOC=block_loc,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            **pdl_kwargs,
+        )
+        return
+
+    block = _GET_MLA_KV_BLOCK_SPLIT_BLOCK
+    assert (
+        nope_dim % block == 0
+    ), f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({block})"
+    grid = (n_loc, triton.cdiv(nope_dim + rope_dim, block))
     get_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
@@ -387,4 +498,7 @@ def get_mla_kv_buffer_triton(
         cache_k_rope.stride(0),
         nope_dim,
         rope_dim,
+        BLOCK=block,
+        num_warps=_GET_MLA_KV_BLOCK_SPLIT_NUM_WARPS,
+        **pdl_kwargs,
     )
