@@ -369,13 +369,19 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
             self.deepep_adapter.capture(is_extend_in_batch=True)
             shape_key = self._make_graph_key(bs)
+            post_warmup_hook = getattr(
+                self.attn_backend, "on_after_cuda_graph_warmup", None
+            )
+            self._maybe_flashinfer_autotune_speculative_draft(
+                run_once,
+                post_warmup_hook=post_warmup_hook,
+                skip_logits=False,
+            )
             self.backend.capture_one(
                 shape_key,
                 run_once,
                 dummies=None,
-                post_warmup_hook=getattr(
-                    self.attn_backend, "on_after_cuda_graph_warmup", None
-                ),
+                post_warmup_hook=post_warmup_hook,
             )
 
     def replay(self, bs: int, seq_lens_sum: int, spec_info: EagleDraftExtendInput):

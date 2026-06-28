@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import inspect
@@ -253,6 +254,19 @@ class BaseRunner(ABC):
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
         mr = self.model_runner
+        if not self._flashinfer_autotune_is_applicable():
+            return False
+
+        if mr.spec_algorithm.is_speculative():
+            return not mr.is_draft_worker
+
+        return True
+
+    def _flashinfer_autotune_is_applicable(self) -> bool:
+        """Return whether this runner uses FlashInfer kernels worth autotuning."""
+        mr = self.model_runner
+        if str(mr.device).split(":")[0] != "cuda":
+            return False
         if mr.server_args.disable_flashinfer_autotune:
             return False
 
@@ -313,19 +327,9 @@ class BaseRunner(ABC):
             or (model_uses_modelopt_fp8 and is_sm100_supported())
         )
 
-        if not (
+        return (
             moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
-        ):
-            return False
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 9:
-            return False
-
-        if mr.spec_algorithm.is_speculative():
-            return not mr.is_draft_worker
-
-        return True
+        ) and torch.cuda.get_device_capability()[0] >= 9
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
@@ -335,9 +339,15 @@ class BaseRunner(ABC):
         Supplied by warmup() (the decode runner's captured buffers when a graph
         runner exists; a freshly-allocated dummy set in the eager path).
         """
-        from flashinfer.autotuner import autotune
 
-        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        def forward_fn():
+            self._dummy_run(batch_size=batch_size, buffers=buffers)
+
+        self._run_flashinfer_autotune_forward(forward_fn, skip_logits=True)
+
+    @contextlib.contextmanager
+    def _flashinfer_autotune_context(self, *, skip_logits: bool):
+        from flashinfer.autotuner import autotune
 
         mr = self.model_runner
         cache_path = self._flashinfer_autotune_cache_path()
@@ -361,14 +371,60 @@ class BaseRunner(ABC):
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         mr.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(mr.device).stream(mr.forward_stream):
-            with (
-                torch.inference_mode(),
-                autotune(True, cache=str(autotune_cache)),
-                autotune_dummy_run_mode(),
-            ):
-                self._dummy_run(batch_size=batch_size, buffers=buffers)
+            maybe_skip_logits = contextlib.nullcontext()
+            if skip_logits:
+                from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+
+                maybe_skip_logits = autotune_dummy_run_mode()
+            with torch.inference_mode(), autotune(
+                True, cache=str(autotune_cache)
+            ), maybe_skip_logits:
+                yield
         torch.cuda.current_stream().wait_stream(mr.forward_stream)
         logger.info("FlashInfer autotune completed.")
+
+    def _run_flashinfer_autotune_forward(self, forward_fn, *, skip_logits: bool):
+        with self._flashinfer_autotune_context(skip_logits=skip_logits):
+            forward_fn()
+
+    def _maybe_flashinfer_autotune_speculative_draft(
+        self,
+        forward_fn,
+        *,
+        post_warmup_hook=None,
+        skip_logits: bool = False,
+    ) -> None:
+        """Run one concrete speculative-draft forward under FlashInfer autotune.
+
+        Speculative draft graph runners have algorithm-specific inputs that the
+        generic target-verify dummy forward cannot represent, so they call this
+        after building their real capture-time ForwardBatch and before graph
+        capture. The per-runner-phase flag keeps autotune one-shot for repeated
+        graph shapes while still allowing draft and draft-extend to tune their
+        different token shapes.
+        """
+        mr = self.model_runner
+        phase_key = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+        tuned_phases = getattr(mr, "_flashinfer_spec_draft_autotuned_phases", None)
+        if tuned_phases is None:
+            tuned_phases = set()
+            mr._flashinfer_spec_draft_autotuned_phases = tuned_phases
+        if phase_key in tuned_phases:
+            return
+        if (
+            not mr.spec_algorithm.is_speculative()
+            or not mr.is_draft_worker
+            or not self._flashinfer_autotune_is_applicable()
+        ):
+            return
+
+        def run_and_reset():
+            forward_fn()
+            if post_warmup_hook is not None:
+                post_warmup_hook()
+
+        self._run_flashinfer_autotune_forward(run_and_reset, skip_logits=skip_logits)
+        tuned_phases.add(phase_key)
 
     def _flashinfer_autotune_cache_path(self) -> Path:
         import flashinfer
