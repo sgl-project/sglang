@@ -917,16 +917,35 @@ def rms_norm(
     return output.reshape(original_shape)
 
 
+@triton.jit
+def _mean_last_dim_kernel(
+    input_ptr,
+    output_ptr,
+    N,
+    input_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Compute mean along last dimension. Matches Megatron's mean_kernel reduction pattern."""
+    row_idx = tl.program_id(0)
+    row_start = input_ptr + row_idx * input_stride
+
+    acc = 0.0
+    for n_start in range(0, N, BLOCK_SIZE):
+        n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
+        mask = n_offsets < N
+        vals = tl.load(row_start + n_offsets, mask=mask, other=0.0)
+        acc += tl.sum(vals)
+
+    mean_val = acc / N
+    tl.store(output_ptr + row_idx, mean_val)
+
+
 def rms_norm_batch_invariant(
     input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
-    """
-    Batch-invariant wrapper for RMS normalization.
+    """Batch-invariant RMS normalization matching Megatron's BatchInvariantRMSNormFn.
 
-    This function provides a deterministic, batch-invariant implementation
-    of RMS normalization for use with the batch_invariant mode.
-
-    Adapted from @https://github.com/vllm-project/vllm/blob/66a168a197ba214a5b70a74fa2e713c9eeb3251a/vllm/model_executor/layers/batch_invariant.py#L649
+    Uses decomposed ops: Triton mean kernel + torch.rsqrt + element-wise multiply.
 
     Args:
         input: Input tensor of shape (..., hidden_size)
@@ -936,7 +955,29 @@ def rms_norm_batch_invariant(
     Returns:
         RMS normalized tensor
     """
-    return rms_norm(input, weight, eps=eps)
+    original_shape = input.shape
+    x = input.reshape(-1, input.shape[-1]).contiguous()
+    x_fp32 = x.float()
+    w_fp32 = weight.to(device=x.device, dtype=torch.float32)
+
+    M, N = x_fp32.shape
+    x_sq = x_fp32 * x_fp32
+
+    ms = torch.empty(M, device=x.device, dtype=torch.float32)
+    BLOCK_SIZE = 1024
+    _mean_last_dim_kernel[(M,)](
+        x_sq,
+        ms,
+        N,
+        x_sq.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    ms = ms.unsqueeze(1)
+
+    rsigma = torch.rsqrt(ms + eps)
+    out_fp32 = (x_fp32 * rsigma) * w_fp32
+    out = out_fp32.to(input.dtype)
+    return out.reshape(original_shape)
 
 
 _ONES_CACHE: dict[Tuple, torch.Tensor] = {}
