@@ -567,7 +567,7 @@ async fn chat_completions_inner(
     }
 
     // Routing context for the outermost middleware: it records
-    // `requests_total{worker_url,model_id,mode,outcome}` and the access-log line
+    // `worker_requests_total{worker_url,model_id,mode,outcome}` and the access-log line
     // for this request. Attaching it here (rather than recording directly) keeps
     // all request accounting at one site that also covers pre-routing
     // rejections, so the by-outcome view reflects ALL ingress.
@@ -1326,7 +1326,7 @@ mod tests {
         assert!(
             metrics
                 .lines()
-                .any(|l| l.starts_with("sgl_router_requests_total")
+                .any(|l| l.starts_with("sgl_router_worker_requests_total")
                     && l.contains(r#"outcome="error""#)),
             "a pre-routing 400 must be counted in requests_total{{outcome=error}}; got:\n{metrics}"
         );

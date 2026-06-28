@@ -26,7 +26,7 @@ pub struct AppContext {
     /// the stale-request janitor (which sweeps expired entries).
     pub active_load: Arc<ActiveLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
-    /// `/metrics`. Shared with the chat handler (requests_total),
+    /// `/metrics`. Shared with the chat handler (worker_requests_total),
     /// cache-aware-zmq policy (overlap_blocks), active-load registry
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).

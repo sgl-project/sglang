@@ -18,8 +18,8 @@
 //!
 //! | Metric | Type | Labels |
 //! |---|---|---|
-//! | `sgl_router_intake_total` | Counter | `route`, `method` |
-//! | `sgl_router_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
+//! | `sgl_router_requests_total` | Counter | `route`, `method` |
+//! | `sgl_router_worker_requests_total` | Counter | `worker_url`, `model_id`, `mode`, `outcome` |
 //! | `sgl_router_request_duration_seconds` | Histogram | `model_id` |
 //! | `sgl_router_ttft_seconds` | Histogram | `model_id` |
 //! | `sgl_router_responses_total` | Counter | `route`, `method`, `status_code` |
@@ -145,7 +145,7 @@ impl WorkerModeLabel {
 /// (the request reached a worker); absent on requests rejected before routing
 /// (a body-validation 400, an admission 503 shed, model-not-found), which the
 /// middleware records with an empty `worker_url`. Recording in one place — the
-/// middleware — is what makes `requests_total` cover EVERY request, so
+/// middleware — is what makes `worker_requests_total` cover EVERY request, so
 /// `sum by (outcome)` reflects all ingress, not just dispatched traffic.
 #[derive(Debug, Clone)]
 pub struct RequestLogContext {
@@ -252,17 +252,17 @@ impl ActiveLoadKind {
 pub struct MetricsRegistry {
     // Edge intake, counted at the `access_log_and_record` middleware BEFORE the
     // handler runs, so it includes requests parked/shed/cancelled/dropped before
-    // a response is produced. `intake_total - responses_total` (per route,method)
-    // = received but never answered, which the post-dispatch `requests_total`
+    // a response is produced. `requests_total - responses_total` (per route,method)
+    // = received but never answered, which the post-dispatch `worker_requests_total`
     // cannot see.
-    intake_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
+    requests_total: Mutex<HashMap<EdgeKey, Arc<AtomicU64>>>,
     // Per-worker dispatch outcomes. Recorded after a worker is picked, so blind
-    // to pre-dispatch drops (see `intake_total`).
-    requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
+    // to pre-dispatch drops (see `requests_total`).
+    worker_requests_total: Mutex<HashMap<RequestKey, Arc<AtomicU64>>>,
     // Keyed by `model_id` only: a model's pool is either all-plain or all-PD
     // (the registry rejects mixed pools), so the worker `mode` would be a pure
     // function of `model_id` here — a redundant label. Per-worker `mode` lives
-    // on `requests_total` / the worker gauges instead.
+    // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
     // Edge responses by route/method/status (incl. early-exit 400/413/503 and the
@@ -292,7 +292,7 @@ struct RequestKey {
     outcome: &'static str,
 }
 
-/// Labels for the edge `intake_total` counter. `route` is the matched route
+/// Labels for the edge `requests_total` counter. `route` is the matched route
 /// template (a small fixed set), not the raw URI, so cardinality stays bounded.
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 struct EdgeKey {
@@ -384,8 +384,8 @@ impl MetricsRegistry {
         Arc::new(Self::default())
     }
 
-    /// Bump `sgl_router_requests_total` for the given worker / model / mode / outcome.
-    pub fn record_request(
+    /// Bump `sgl_router_worker_requests_total` for the given worker / model / mode / outcome.
+    pub fn record_worker_request(
         &self,
         worker_url: &str,
         model_id: &str,
@@ -398,7 +398,7 @@ impl MetricsRegistry {
             mode: mode.as_str(),
             outcome: outcome.as_str(),
         };
-        let mut guard = self.requests_total.lock();
+        let mut guard = self.worker_requests_total.lock();
         let counter = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -455,17 +455,17 @@ impl MetricsRegistry {
         hist.observe(seconds);
     }
 
-    /// Bump `sgl_router_intake_total{route,method}` — true edge intake, counted
+    /// Bump `sgl_router_requests_total{route,method}` — true edge intake, counted
     /// by the `access_log_and_record` middleware BEFORE the handler runs, so a
     /// request that is parked/shed/cancelled/dropped before producing a response
-    /// is still counted. `intake_total - responses_total` is the
+    /// is still counted. `requests_total - responses_total` is the
     /// received-but-not-answered gap.
-    pub fn record_intake(&self, route: &str, method: &str) {
+    pub fn record_ingress(&self, route: &str, method: &str) {
         let key = EdgeKey {
             route: route.to_owned(),
             method: method.to_owned(),
         };
-        let mut guard = self.intake_total.lock();
+        let mut guard = self.requests_total.lock();
         let counter = guard
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -620,12 +620,12 @@ impl MetricsRegistry {
     pub fn render_with_workers(&self, workers: &[WorkerSnapshot]) -> String {
         let mut out = String::new();
 
-        // intake_total — true edge intake (every request, counted before the handler)
+        // requests_total — true edge intake (every request, counted before the handler)
         out.push_str(
-            "# HELP sgl_router_intake_total Requests received at the router HTTP edge, counted before the handler runs (true intake; includes requests dropped/shed/cancelled before a response).\n",
+            "# HELP sgl_router_requests_total Requests received at the router HTTP edge, counted before the handler runs (true intake; includes requests dropped/shed/cancelled before a response).\n",
         );
-        out.push_str("# TYPE sgl_router_intake_total counter\n");
-        let guard = self.intake_total.lock();
+        out.push_str("# TYPE sgl_router_requests_total counter\n");
+        let guard = self.requests_total.lock();
         let mut entries: Vec<(&EdgeKey, u64)> = guard
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
@@ -633,7 +633,7 @@ impl MetricsRegistry {
         entries.sort_by(|a, b| (&a.0.route, &a.0.method).cmp(&(&b.0.route, &b.0.method)));
         for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_intake_total{{route=\"{}\",method=\"{}\"}} {}\n",
+                "sgl_router_requests_total{{route=\"{}\",method=\"{}\"}} {}\n",
                 escape_label(&key.route),
                 escape_label(&key.method),
                 value,
@@ -643,10 +643,10 @@ impl MetricsRegistry {
 
         // requests_total
         out.push_str(
-            "# HELP sgl_router_requests_total Total chat-completions requests dispatched to a worker.\n",
+            "# HELP sgl_router_worker_requests_total Total chat-completions requests dispatched to a worker.\n",
         );
-        out.push_str("# TYPE sgl_router_requests_total counter\n");
-        let guard = self.requests_total.lock();
+        out.push_str("# TYPE sgl_router_worker_requests_total counter\n");
+        let guard = self.worker_requests_total.lock();
         // Sort for stable output — easier for tests.
         let mut entries: Vec<(&RequestKey, u64)> = guard
             .iter()
@@ -662,7 +662,7 @@ impl MetricsRegistry {
         });
         for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_requests_total{{worker_url=\"{}\",model_id=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n",
+                "sgl_router_worker_requests_total{{worker_url=\"{}\",model_id=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n",
                 escape_label(&key.worker_url),
                 escape_label(&key.model_id),
                 key.mode,
@@ -1011,6 +1011,7 @@ mod tests {
         let out = reg.render();
         // Should at least carry HELP / TYPE for every metric family.
         assert!(out.contains("# TYPE sgl_router_requests_total counter"));
+        assert!(out.contains("# TYPE sgl_router_worker_requests_total counter"));
         assert!(out.contains("# TYPE sgl_router_request_duration_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_ttft_seconds histogram"));
         assert!(out.contains("# TYPE sgl_router_responses_total counter"));
@@ -1165,15 +1166,16 @@ mod tests {
     }
 
     #[test]
-    fn record_intake_counts_by_route_method() {
+    fn record_ingress_counts_by_route_method() {
         let reg = MetricsRegistry::new();
-        reg.record_intake("/v1/chat/completions", "POST");
-        reg.record_intake("/v1/chat/completions", "POST");
-        reg.record_intake("/v1/models", "GET");
+        reg.record_ingress("/v1/chat/completions", "POST");
+        reg.record_ingress("/v1/chat/completions", "POST");
+        reg.record_ingress("/v1/models", "GET");
         let out = reg.render();
-        assert!(out
-            .contains(r#"sgl_router_intake_total{route="/v1/chat/completions",method="POST"} 2"#));
-        assert!(out.contains(r#"sgl_router_intake_total{route="/v1/models",method="GET"} 1"#));
+        assert!(out.contains(
+            r#"sgl_router_requests_total{route="/v1/chat/completions",method="POST"} 2"#
+        ));
+        assert!(out.contains(r#"sgl_router_requests_total{route="/v1/models",method="GET"} 1"#));
     }
 
     #[test]
@@ -1229,13 +1231,13 @@ mod tests {
     #[test]
     fn record_request_emits_labelled_counter_line() {
         let reg = MetricsRegistry::new();
-        reg.record_request(
+        reg.record_worker_request(
             "http://worker-a:30000",
             "tiny",
             WorkerModeLabel::Prefill,
             RequestOutcome::Success,
         );
-        reg.record_request(
+        reg.record_worker_request(
             "http://worker-a:30000",
             "tiny",
             WorkerModeLabel::Prefill,
@@ -1243,7 +1245,7 @@ mod tests {
         );
         let out = reg.render();
         assert!(
-            out.contains(r#"sgl_router_requests_total{worker_url="http://worker-a:30000",model_id="tiny",mode="prefill",outcome="success"} 2"#),
+            out.contains(r#"sgl_router_worker_requests_total{worker_url="http://worker-a:30000",model_id="tiny",mode="prefill",outcome="success"} 2"#),
             "render did not include the expected counter line; got:\n{out}",
         );
     }
@@ -1404,7 +1406,7 @@ mod tests {
     #[test]
     fn label_values_escape_quotes_and_backslashes() {
         let reg = MetricsRegistry::new();
-        reg.record_request(
+        reg.record_worker_request(
             r#"http://"weird":30000"#,
             r"back\slash",
             WorkerModeLabel::Plain,

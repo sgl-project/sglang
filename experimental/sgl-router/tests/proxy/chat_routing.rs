@@ -469,7 +469,7 @@ async fn non_streaming_upstream_500_preserved() {
 
 /// A response the router FORWARDS from a worker with a non-2xx status is an
 /// `Ok(Response)` at the router layer (only transport failures become `Err`).
-/// The per-worker `sgl_router_requests_total` outcome must be derived from the
+/// The per-worker `sgl_router_worker_requests_total` outcome must be derived from the
 /// client-visible HTTP status, not from `Result::Ok`/`Err` — so a forwarded 5xx
 /// is counted `outcome="error"`, NOT credited as a success.
 #[tokio::test]
@@ -501,7 +501,7 @@ async fn forwarded_5xx_records_outcome_error_not_success() {
 
     let m = ctx.metrics.render();
     let error_line = format!(
-        r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="error"}} 1"#,
+        r#"sgl_router_worker_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="error"}} 1"#,
         worker.url,
     );
     assert!(
@@ -509,7 +509,7 @@ async fn forwarded_5xx_records_outcome_error_not_success() {
         "a forwarded 5xx must be counted as outcome=\"error\"; got:\n{m}",
     );
     let success_line = format!(
-        r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}}"#,
+        r#"sgl_router_worker_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}}"#,
         worker.url,
     );
     assert!(
@@ -1465,7 +1465,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     let m = ctx.metrics.render();
     assert!(
         m.contains(&format!(
-            r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="cancelled"}}"#,
+            r#"sgl_router_worker_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="cancelled"}}"#,
             worker.url
         )),
         "stale 504 must be counted in requests_total as outcome=cancelled: {m}",
@@ -1609,7 +1609,7 @@ async fn admission_parks_second_request_until_first_stream_frees_the_slot() {
 /// A request shed by the admission gate (503 `service_overloaded`) must show up
 /// in the dedicated `sgl_router_backpressure_rejected_total` counter, the general
 /// `sgl_router_responses_total{status_code="503"}` series, AND
-/// `sgl_router_requests_total{outcome="error"}` with an empty `worker_url`. The
+/// `sgl_router_worker_requests_total{outcome="error"}` with an empty `worker_url`. The
 /// shed returns via `?` before reaching a worker, so only the outermost
 /// `access_log_and_record` middleware can count it — which is what makes
 /// `sum by (outcome)` include sheds instead of undercounting them.
@@ -1686,7 +1686,7 @@ async fn admission_shed_503_is_counted_in_responses_total() {
     // the line that makes `sum by (outcome)` include sheds.
     assert!(
         m.lines()
-            .any(|l| l.starts_with("sgl_router_requests_total{")
+            .any(|l| l.starts_with("sgl_router_worker_requests_total{")
                 && l.contains(r#"worker_url="""#)
                 && l.contains(r#"outcome="error""#)),
         "shed must be counted in requests_total with empty worker_url + outcome=error: {m}",
@@ -1736,7 +1736,7 @@ async fn success_200_counted_once_per_request_in_responses_total() {
     );
     // Both successes are also true intake (counted at entry, through build_router).
     assert!(
-        m.contains(r#"sgl_router_intake_total{route="/v1/chat/completions",method="POST"} 2"#),
+        m.contains(r#"sgl_router_requests_total{route="/v1/chat/completions",method="POST"} 2"#),
         "two successes must each be counted as intake: {m}",
     );
     // A routed success must carry its per-worker labels in requests_total — the
@@ -1745,7 +1745,7 @@ async fn success_200_counted_once_per_request_in_responses_total() {
     // empty worker_url (which would blank the per-worker convergence panels).
     assert!(
         ctx.metrics.render().contains(&format!(
-            r#"sgl_router_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}} 2"#,
+            r#"sgl_router_worker_requests_total{{worker_url="{}",model_id="tiny",mode="plain",outcome="success"}} 2"#,
             worker.url
         )),
         "two routed successes must count to 2 with full per-worker labels: {}",
@@ -1784,7 +1784,7 @@ async fn infra_path_counted_in_responses_total_but_not_requests_total() {
     // name, so it is not matched here).
     assert!(
         !m.lines()
-            .any(|l| l.starts_with("sgl_router_requests_total{")),
+            .any(|l| l.starts_with("sgl_router_worker_requests_total{")),
         "infra path must NOT be counted in requests_total: {m}",
     );
 }

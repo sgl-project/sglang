@@ -35,11 +35,11 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 /// Infra endpoints excluded from the access log (logged at DEBUG instead) and
-/// from `requests_total`. They are polled constantly — Prometheus scrapes
+/// from `worker_requests_total`. They are polled constantly — Prometheus scrapes
 /// `/metrics`, the kubelet hits `/healthz` + `/readyz` every few seconds — so
 /// logging them at INFO would bury real API traffic and counting them in
-/// `requests_total` would swamp the by-outcome view with probe successes. They
-/// are still counted in `responses_total{status_code}`.
+/// `worker_requests_total` would swamp the by-outcome view with probe successes. They
+/// are still counted in `responses_total{route,method,status_code}`.
 fn is_infra_path(path: &str) -> bool {
     matches!(path, "/healthz" | "/readyz" | "/metrics")
 }
@@ -52,15 +52,15 @@ fn is_infra_path(path: &str) -> bool {
 /// handler short-circuits that return via `?` (a 503 admission shed, a 400
 /// body-validation, a 404 model-not-found).
 ///
-/// At ENTRY (before the handler runs) it counts `intake_total{route,method}` —
+/// At ENTRY (before the handler runs) it counts `requests_total{route,method}` —
 /// true intake, so a request parked/shed/cancelled/dropped before producing a
 /// response is still counted. `route` is the matched [`MatchedPath`] template
 /// (bounded cardinality), `unmatched` for a 404. At EXIT it:
 ///   * counts `responses_total{route,method,status_code}` (every response, incl.
-///     infra); `intake_total - responses_total` is the received-but-not-answered
+///     infra); `requests_total - responses_total` is the received-but-not-answered
 ///     gap;
 ///   * for non-infra paths, counts
-///     `requests_total{worker_url,model_id,mode,outcome}` — reading the
+///     `worker_requests_total{worker_url,model_id,mode,outcome}` — reading the
 ///     per-worker labels a routed handler attached via [`RequestLogContext`], or
 ///     an empty `worker_url` when the request was rejected before routing; and
 ///   * emits one access-log line (INFO; DEBUG for infra).
@@ -75,7 +75,7 @@ async fn access_log_and_record(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // Matched route template (e.g. `/v1/chat/completions`), not the raw URI, so
-    // `intake_total` / `responses_total` stay low-cardinality; `unmatched` for a 404.
+    // `requests_total` / `responses_total` stay low-cardinality; `unmatched` for a 404.
     let route = req
         .extensions()
         .get::<MatchedPath>()
@@ -91,7 +91,7 @@ async fn access_log_and_record(
 
     // ENTRY: true intake — counted before the handler can park/shed/drop it, so
     // a never-answered request still shows up (intake - responses = the gap).
-    metrics.record_intake(&route, method.as_str());
+    metrics.record_ingress(&route, method.as_str());
 
     let resp = next.run(req).await;
 
@@ -125,7 +125,7 @@ async fn access_log_and_record(
     let model = ctx.map(|c| c.model_id.as_str()).unwrap_or("");
     let mode = ctx.map(|c| c.mode).unwrap_or(WorkerModeLabel::Plain);
 
-    metrics.record_request(worker, model, mode, outcome);
+    metrics.record_worker_request(worker, model, mode, outcome);
     tracing::info!(
         request_id = %request_id,
         method = %method,
@@ -176,8 +176,9 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         // synthesized 500 is observed and counted.
         .layer(CatchPanicLayer::new())
         // Outermost layer: the single access-log + metric site. Logs every
-        // request and counts both `responses_total{status_code}` and
-        // `requests_total{...,outcome}`, so error short-circuits (admission
+        // request and counts `requests_total{route,method}` (intake),
+        // `responses_total{route,method,status_code}`, and
+        // `worker_requests_total{...,outcome}`, so error short-circuits (admission
         // 503s, 413s, client-dropped-upload 400s, …) and synthesized panic-500s
         // are logged and counted alongside successes.
         .layer(middleware::from_fn_with_state(
@@ -247,8 +248,8 @@ mod tests {
 
     /// The point of counting intake at ENTRY: a request that never produces a
     /// response — client disconnect / cancellation drops the in-flight handler
-    /// future at its `.await` — is still counted in `intake_total`, while
-    /// `responses_total` stays empty. `intake_total - responses_total` is the
+    /// future at its `.await` — is still counted in `requests_total`, while
+    /// `responses_total` stays empty. `requests_total - responses_total` is the
     /// received-but-not-answered gap that exit-only counting can never show. A
     /// handler that sleeps far past our abandon timeout models the dropped future.
     #[tokio::test]
@@ -280,7 +281,9 @@ mod tests {
 
         let m = metrics.render();
         assert!(
-            m.contains(r#"sgl_router_intake_total{route="/v1/chat/completions",method="POST"} 1"#),
+            m.contains(
+                r#"sgl_router_requests_total{route="/v1/chat/completions",method="POST"} 1"#
+            ),
             "intake must be counted at entry even when the request never completes; got:\n{m}",
         );
         assert!(

@@ -20,7 +20,7 @@ The dashboard graphs every family the router emits:
 
 | Metric | Type | What it shows |
 |---|---|---|
-| `sgl_router_requests_total` | Counter | Dispatches by `worker_url`, `model_id`, `mode`, `outcome` |
+| `sgl_router_worker_requests_total` | Counter | Dispatches by `worker_url`, `model_id`, `mode`, `outcome` |
 | `sgl_router_request_duration_seconds` | Histogram | End-to-end request latency by `model_id` |
 | `sgl_router_ttft_seconds` | Histogram | Time to first token (streaming) by `model_id` |
 | `sgl_router_responses_total` | Counter | Client-visible HTTP `status_code` |

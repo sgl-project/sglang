@@ -94,7 +94,7 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&body).unwrap();
         // Every metric family should at least carry its HELP/TYPE lines.
-        assert!(body.contains("# TYPE sgl_router_requests_total counter"));
+        assert!(body.contains("# TYPE sgl_router_worker_requests_total counter"));
         assert!(body.contains("# TYPE sgl_router_overlap_blocks histogram"));
         assert!(body.contains("# TYPE sgl_router_active_load gauge"));
     }
@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_reflects_recorded_counters() {
         let ctx = Arc::new(AppContext::stub());
-        ctx.metrics.record_request(
+        ctx.metrics.record_worker_request(
             "http://w-test:30000",
             "tiny",
             WorkerModeLabel::Prefill,
