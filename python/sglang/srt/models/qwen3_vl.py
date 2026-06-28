@@ -281,7 +281,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.act_fn = nn.GELU()
+        self.act_fn = nn.GELU(approximate="tanh")
         self.linear_fc2 = RowParallelLinear(
             self.padded_context_dim,
             dim,

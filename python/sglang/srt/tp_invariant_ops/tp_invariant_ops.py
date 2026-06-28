@@ -381,6 +381,9 @@ def matmul_kernel_tp_persistent_optim(
         tl.store(c_ptr, acc.to(OUT_DTYPE), mask=mask_c)
 
 
+_DEEPGEMM_TMA_ALIGNMENT_BF16 = 16 // torch.bfloat16.itemsize  # 8 elements
+
+
 def _matmul_tp_persistent_impl(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -389,6 +392,26 @@ def _matmul_tp_persistent_impl(
     use_optim_kernel: bool = False,
 ):
     assert A.shape[-1] == B.shape[-2], "Dim doesn't match"
+
+    M, K = A.shape
+    _, N = B.shape
+
+    if (
+        not fp32_accum
+        and A.dtype == torch.bfloat16
+        and A.is_contiguous()
+        and B.t().is_contiguous()
+        and N >= 16
+        and N % _DEEPGEMM_TMA_ALIGNMENT_BF16 == 0
+        and K % _DEEPGEMM_TMA_ALIGNMENT_BF16 == 0
+    ):
+        import deep_gemm
+
+        out = torch.empty((M, N), device=A.device, dtype=A.dtype)
+        deep_gemm.bf16_gemm_nn(A, B, out)
+        if bias is not None:
+            out += bias
+        return out
 
     out_dtype = A.dtype
     acc_dtype = torch.float32 if fp32_accum else A.dtype
