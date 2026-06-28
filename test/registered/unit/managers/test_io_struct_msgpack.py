@@ -56,6 +56,24 @@ class TestTokenizedGenerateReqInputMsgpack(unittest.TestCase):
         self.assertEqual(decoded.mm_data_mooncake[1].url, "http://x/b.mp4")
         self.assertEqual(decoded.mm_data_mooncake[1].modality, Modality.VIDEO)
 
+    def test_mm_data_mooncake_round_trips_dict_payload(self):
+        # _extract_url_data passes raw dict multimodal items through unchanged
+        # when they carry no "url" key, so the field must survive non-string
+        # payloads over msgpack.
+        items = [
+            MooncakeMMUrlItem(
+                url={"image": "data:base64", "detail": "high"},
+                modality=Modality.IMAGE,
+            ),
+        ]
+
+        decoded = self._round_trip(self._make_request(items))
+
+        self.assertEqual(
+            decoded.mm_data_mooncake[0].url, {"image": "data:base64", "detail": "high"}
+        )
+        self.assertEqual(decoded.mm_data_mooncake[0].modality, Modality.IMAGE)
+
     def test_mm_data_mooncake_round_trips_none(self):
         decoded = self._round_trip(self._make_request(None))
 

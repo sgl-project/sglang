@@ -151,11 +151,16 @@ MultimodalDataInputFormat = Union[
 class MooncakeMMUrlItem(msgspec.Struct, array_like=True):
     """One multimodal item captured at tokenizer dispatch for mooncake encode routing.
 
-    ``url`` is the raw URL string from MMReceiverBase._extract_url_data
-    (ImageData.url when present); ``modality`` tags which encoder pool handles it.
+    ``url`` is the raw payload from MMReceiverBase._extract_url_data: the URL
+    string (ImageData.url, or dict["url"] when present) in the common case, or
+    the original raw multimodal item (e.g. a dict for processor/precomputed
+    formats, or bytes) when no URL is available. Typed as Any because msgspec
+    cannot express a union mixing str and bytes; the field still round-trips
+    over msgpack since every passthrough payload is a native msgpack type.
+    ``modality`` tags which encoder pool handles it.
     """
 
-    url: str
+    url: Any
     modality: Modality
 
 
