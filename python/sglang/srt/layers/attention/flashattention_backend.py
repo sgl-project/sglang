@@ -2285,30 +2285,6 @@ class FlashAttentionBackend(AttentionBackend):
         src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu()
         return src.max().item()
 
-    def _fill_page_table_device(
-        self,
-        metadata: FlashAttentionMetadata,
-        req_pool_indices: torch.Tensor,
-        cache_seqlens: torch.Tensor,
-    ):
-        """Fill metadata.page_table (and swa_page_table for SWA models) in place
-        on-device from cache_seqlens, no D2H. The Triton kernel self-guards per
-        request, so the grid/buffer width use the static max_num_pages bound
-        while writes stay bounded by cache_seqlens.
-        """
-        has_swa = self.use_sliding_window_kv_pool
-        build_trtllm_mha_page_table(
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            cache_seqlens=cache_seqlens,
-            page_table=metadata.page_table,
-            page_size=self.page_size,
-            swa_page_table=metadata.swa_page_table if has_swa else None,
-            full_to_swa=(
-                self.token_to_kv_pool.full_to_swa_index_mapping if has_swa else None
-            ),
-        )
-
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -2522,8 +2498,19 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
-                self._fill_page_table_device(
-                    metadata, req_pool_indices, metadata.cache_seqlens_int32
+                has_swa = self.use_sliding_window_kv_pool
+                build_trtllm_mha_page_table(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    cache_seqlens=metadata.cache_seqlens_int32,
+                    page_table=metadata.page_table,
+                    page_size=self.page_size,
+                    swa_page_table=metadata.swa_page_table if has_swa else None,
+                    full_to_swa=(
+                        self.token_to_kv_pool.full_to_swa_index_mapping
+                        if has_swa
+                        else None
+                    ),
                 )
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
