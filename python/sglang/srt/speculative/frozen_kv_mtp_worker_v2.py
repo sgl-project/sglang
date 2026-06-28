@@ -114,16 +114,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             f"{self.speculative_algorithm.name}."
         )
 
-        # Draft attention uses target req_to_token + KV allocator (read-only).
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
-        target_cfg = target_worker.model_runner.memory_pool_config
-        self.draft_pool_config = MemoryPoolConfig(
-            max_total_num_tokens=64,  # Dummy value
-            max_running_requests=target_cfg.max_running_requests,
-        )
+        # The draft attention backend reads target KV pools, but those pools are
+        # not available until the scheduler finishes target memory profiling.
+        self.req_to_token_pool = None
+        self.token_to_kv_pool_allocator = None
+        self.draft_pool_config = None
 
         self.hot_token_id = None
 
@@ -144,9 +139,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=self.draft_pool_config,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                memory_pool_config=None,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -160,8 +155,6 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             )
 
         self.kv_context: Optional[FrozenKVMTPContext] = None
-        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
-            self._bind_kv_context()
 
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -180,22 +173,25 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        if memory_pool_config is None:
+            raise ValueError("target memory pool config is required")
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.draft_pool_config = MemoryPoolConfig(
+            max_total_num_tokens=64,  # Dummy value; Frozen-KV draft owns no KV.
+            max_running_requests=memory_pool_config.max_running_requests,
+        )
+
         # NOTE: call TpModelWorker explicitly -- EagleDraftWorkerBase precedes it in
         # the MRO and its alloc_memory_pool is a no-op stub.
         TpModelWorker.alloc_memory_pool(
             self,
             memory_pool_config=self.draft_pool_config,
-            req_to_token_pool=(
-                req_to_token_pool
-                if req_to_token_pool is not None
-                else self.req_to_token_pool
-            ),
-            token_to_kv_pool_allocator=(
-                token_to_kv_pool_allocator
-                if token_to_kv_pool_allocator is not None
-                else self.token_to_kv_pool_allocator
-            ),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
+            self._bind_kv_context()
 
     def init_attention_backends(self):
         with (
@@ -676,9 +672,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             server_args.speculative_algorithm
         )
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
         # Match the draft context length to the target (assistant reads target KV).
         server_args.context_length = target_worker.model_runner.model_config.context_len
 

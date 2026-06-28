@@ -866,9 +866,6 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
-        if self.spec_algorithm.is_frozen_kv_mtp():
-            # Frozen-KV MTP draft construction needs the target KV pool.
-            self.init_target_memory_pool()
         self.maybe_init_draft_worker()
 
         # Allocate KV cache pools for all workers.
