@@ -2361,10 +2361,11 @@ class FlashAttentionBackend(AttentionBackend):
                 if self.topk <= 1:
                     # When topk = 1, we use the normal decode metadata
                     metadata = self.decode_cuda_graph_metadata[bs]
-                    # Static upper bound; the device-side page-table build below
-                    # self-guards on cache_seqlens, so no host max is needed.
-                    metadata.max_seq_len_k = self.max_context_len
-
+                    # Page table built on-device below (self-guards on
+                    # cache_seqlens). max_seq_len_k is intentionally left unset:
+                    # the FA3 kernel reads cache_seqlens + page_table only, and
+                    # scheduler_metadata is normal-decode-only, so nothing
+                    # consumes it on this path.
                     normal_decode_set_metadata(
                         metadata.cache_seqlens_int32,
                         metadata.cu_seqlens_k,
@@ -2527,8 +2528,10 @@ class FlashAttentionBackend(AttentionBackend):
                     (seq_lens + self.speculative_num_draft_tokens)
                 )
 
-                # Static upper bound; page table built on-device below.
-                metadata.max_seq_len_k = self.max_context_len
+                # Page table built on-device below (self-guards on cache_seqlens).
+                # max_seq_len_k is intentionally left unset: the FA3 kernel reads
+                # cache_seqlens + page_table only, and scheduler_metadata is
+                # normal-decode-only, so nothing consumes it on this path.
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
                 )
