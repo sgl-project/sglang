@@ -244,9 +244,12 @@ class _StubVisionTower:
 def _bare_model(config):
     """A LocateAnythingForConditionalGeneration with a real projector but a
     stubbed vision tower, bypassing the distributed Qwen2 __init__."""
+    import torch.nn as nn
+
     model = LocateAnythingForConditionalGeneration.__new__(
         LocateAnythingForConditionalGeneration
     )
+    nn.Module.__init__(model)
     model.config = config
     model.multi_modal_projector = LocateAnythingMultiModalProjector(config).eval()
     return model
