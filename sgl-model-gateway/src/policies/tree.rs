@@ -626,8 +626,7 @@ impl Tree {
         (matched_text, result.tenant.to_string())
     }
 
-    #[allow(dead_code)]
-    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+    pub fn prefix_match_tenant_char_count(&self, text: &str, tenant: &str) -> usize {
         // Use slice-based traversal - no Vec<char> allocation
 
         // Intern tenant ID once for efficient lookups
@@ -688,7 +687,12 @@ impl Tree {
                 .insert(Arc::clone(&tenant_id), epoch);
         }
 
-        // Build result from original input using char count
+        matched_chars
+    }
+
+    #[allow(dead_code)]
+    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        let matched_chars = self.prefix_match_tenant_char_count(text, tenant);
         take_chars(text, matched_chars)
     }
 

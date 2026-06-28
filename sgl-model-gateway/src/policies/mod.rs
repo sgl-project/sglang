@@ -14,6 +14,7 @@ mod bucket;
 mod cache_aware;
 mod consistent_hashing;
 mod factory;
+mod lmetric;
 mod manual;
 mod power_of_two;
 mod prefix_hash;
@@ -26,6 +27,7 @@ pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
+pub use lmetric::LMetricPolicy;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
@@ -109,6 +111,22 @@ impl Default for CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 10000,
+        }
+    }
+}
+
+/// Configuration for LMetric policy
+#[derive(Debug, Clone)]
+pub struct LMetricConfig {
+    pub eviction_interval_secs: u64,
+    pub max_tree_size: usize,
+}
+
+impl Default for LMetricConfig {
+    fn default() -> Self {
+        Self {
             eviction_interval_secs: 30,
             max_tree_size: 10000,
         }

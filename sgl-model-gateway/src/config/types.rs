@@ -267,6 +267,19 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
+    /// LMetric multiplication scheduling policy.
+    /// Routes to the worker with minimum:
+    /// `estimated_new_prefill_work * (active_request_load + 1)`.
+    #[serde(rename = "lmetric")]
+    LMetric {
+        /// Interval between LRU eviction cycles for approximate prefix trees.
+        #[serde(default = "default_lmetric_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Maximum nodes per tree before LRU leaf eviction.
+        #[serde(default = "default_lmetric_max_tree_size")]
+        max_tree_size: usize,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
@@ -330,6 +343,14 @@ fn default_load_factor() -> f64 {
     1.25
 }
 
+fn default_lmetric_eviction_interval_secs() -> u64 {
+    30
+}
+
+fn default_lmetric_max_tree_size() -> usize {
+    10000
+}
+
 fn default_manual_eviction_interval_secs() -> u64 {
     60
 }
@@ -344,6 +365,7 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::LMetric { .. } => "lmetric",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
@@ -815,6 +837,12 @@ mod tests {
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
+        let lmetric = PolicyConfig::LMetric {
+            eviction_interval_secs: 300,
+            max_tree_size: 1000,
+        };
+        assert_eq!(lmetric.name(), "lmetric");
+
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
         };
@@ -838,6 +866,15 @@ mod tests {
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
         assert!(json.contains("\"balance_abs_threshold\":10"));
+
+        let lmetric = PolicyConfig::LMetric {
+            eviction_interval_secs: 300,
+            max_tree_size: 1000,
+        };
+        let json = serde_json::to_string(&lmetric).unwrap();
+        assert!(json.contains("\"type\":\"lmetric\""));
+        assert!(json.contains("\"eviction_interval_secs\":300"));
+        assert!(json.contains("\"max_tree_size\":1000"));
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
@@ -888,6 +925,25 @@ mod tests {
                 assert_eq!(load_check_interval_secs, 120);
             }
             _ => panic!("Expected PowerOfTwo"),
+        }
+    }
+
+    #[test]
+    fn test_lmetric_parameters() {
+        let lmetric = PolicyConfig::LMetric {
+            eviction_interval_secs: 120,
+            max_tree_size: 4096,
+        };
+
+        match lmetric {
+            PolicyConfig::LMetric {
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                assert_eq!(eviction_interval_secs, 120);
+                assert_eq!(max_tree_size, 4096);
+            }
+            _ => panic!("Expected LMetric"),
         }
     }
 
