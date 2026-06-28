@@ -110,6 +110,7 @@ class MlxModelRunnerStub(ModelRunner):
 
         self.dtype = self.model_config.dtype
         self.weight_load_mem_usage = 0
+        self.prefill_aware_swa = False
 
     def initialize(self):
         """Lightweight initialize that skips heavy PyTorch setup.
