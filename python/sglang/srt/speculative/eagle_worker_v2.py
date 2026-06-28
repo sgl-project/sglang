@@ -424,15 +424,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
+        graph_supported_backend_types = [
+            TritonAttnBackend,
+            TRTLLMMLABackend,
+            TRTLLMHAAttnBackend,
+            TokenspeedMLABackend,
+            FlashInferAttnBackend,
+        ]
+        if _is_cuda or _is_musa:
+            # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
+            # deep_gemm and the rest of the sparse-attention stack at import time.
+            from sglang.srt.layers.attention.dsa_backend import (
+                DeepseekSparseAttnBackend,
+            )
+
+            graph_supported_backend_types.append(DeepseekSparseAttnBackend)
+
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
-            (
-                TritonAttnBackend,
-                TRTLLMMLABackend,
-                TRTLLMHAAttnBackend,
-                TokenspeedMLABackend,
-                FlashInferAttnBackend,
-            ),
+            tuple(graph_supported_backend_types),
         )
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa

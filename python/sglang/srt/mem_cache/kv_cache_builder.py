@@ -232,6 +232,7 @@ def build_kv_cache(
             server_args=server_args,
             params=params,
             is_hybrid_swa=is_hybrid_swa,
+            full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,
