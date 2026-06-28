@@ -2450,7 +2450,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if self.is_prefill_aware_swa:
                     # Prefill-aware SWA still needs a host max to bound the
                     # per-batch page table built below.
-                    max_len = seq_lens_cpu.max().item()
+                    max_len = self._host_max_seq_len(seq_lens_cpu, seq_lens)
                     metadata.max_seq_len_k = max_len
                     pa_max_len = min(
                         self._pa_swa_max_prefill_len + self.sliding_window_size,
