@@ -10,7 +10,7 @@ from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -247,8 +247,9 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions, forward_batch)
+    ) -> LogitsProcessorOutput:
+        block_hidden = self.model(input_ids, positions, forward_batch)
+        return LogitsProcessorOutput(next_token_logits=None, hidden_states=block_hidden)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=False, is_dspark=True)
