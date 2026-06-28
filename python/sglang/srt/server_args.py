@@ -3566,6 +3566,15 @@ class ServerArgs:
         if not user_set_prefill and not user_set_decode and is_hip():
             self.dsa_prefill_backend = "tilelang"
             self.dsa_decode_backend = "tilelang"
+        elif is_sm120_supported():
+            # SM120 (Blackwell desktop / RTX PRO 6000) lacks tcgen05/TMEM and the
+            # flashinfer / sgl_kernel.flash_mla kernels used by the trtllm and
+            # flashmla_* DSA impls. TileLang sparse MLA runs on SM120 and supports
+            # both bf16 and fp8_e4m3 KV cache. Respect explicit user overrides.
+            if not user_set_prefill:
+                self.dsa_prefill_backend = "tilelang"
+            if not user_set_decode:
+                self.dsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 if not user_set_prefill:
@@ -3665,6 +3674,22 @@ class ServerArgs:
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
+
+                if is_sm120_supported():
+                    # SM120 (Blackwell desktop / RTX PRO 6000) lacks tcgen05/TMEM:
+                    # deep_gemm is unavailable, so route the DSA indexer paged
+                    # (decode) logits through the TileLang fallback and the ragged
+                    # (prefill) logits through the torch reference, and disable the
+                    # DeepGEMM/large-SMEM optimizations.
+                    if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
+                        envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                    envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                    envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                    logger.warning(
+                        "SM120 detected for DSA model: using TileLang indexer "
+                        "logits and disabling DeepGEMM/large-SMEM optimizations."
+                    )
 
                 index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)

@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sm120_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -55,6 +56,9 @@ global _use_multi_stream
 _is_cuda = is_cuda()
 _use_dsa_indexer_fusion = _is_cuda and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
 _is_hip = is_hip()
+# SM120 (Blackwell desktop / RTX PRO 6000): deep_gemm MQA-logits kernels are
+# unavailable (no tcgen05/TMEM), so the indexer uses TileLang/torch fallbacks.
+_is_sm120 = _is_cuda and is_sm120_supported()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -87,6 +91,12 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dsa.paged_mqa_logits import (
+    select_fp8_paged_mqa_logits_fn,
+)
+from sglang.srt.layers.attention.dsa.ragged_mqa_logits import (
+    select_fp8_mqa_logits_fn,
+)
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -373,7 +383,13 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            if _is_sm120:
+                # deep_gemm is disabled on SM120; query the SM count directly.
+                self.sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -842,13 +858,25 @@ class Indexer(MultiPlatformOp):
             and ctx_2d.shape == (B, next_n)
         )
 
+        # Select the paged-MQA-logits backend. On SM120 the deep_gemm kernel is
+        # unavailable, so this returns a TileLang/torch fallback; elsewhere it is
+        # "deep_gemm" and the path below is unchanged.
+        paged_logits_fn, paged_logits_backend = (
+            select_fp8_paged_mqa_logits_fn()
+            if (_is_cuda and not _is_hip)
+            else (None, None)
+        )
+        # Native next_n layout and the deep_gemm schedule metadata only apply to
+        # the deep_gemm kernel.
+        use_dg_native = use_dg_native and paged_logits_backend == "deep_gemm"
+
         if use_dg_native:
             seqlens_32_2d = ctx_2d
         elif seqlens_32.dim() == 2:
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        if _is_cuda and paged_logits_backend == "deep_gemm":
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
@@ -898,7 +926,7 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 clean_logits=False,
             )
-        else:
+        elif paged_logits_backend == "deep_gemm":
             q_fp8 = q_fp8.unsqueeze(1)
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
@@ -906,6 +934,38 @@ class Indexer(MultiPlatformOp):
                 weights[:q_offset],
                 seqlens_32_2d,
                 block_tables,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
+        else:
+            # SM120 fallback (tilelang/torch). These kernels require strict batch
+            # sizing: q rows, seq_lens and page_table all indexed to q_offset.
+            # Only plain decode (one query row per request) is supported for now.
+            if next_n > 1 or forward_batch.forward_mode.is_target_verify():
+                raise NotImplementedError(
+                    "DSA indexer paged logits on SM120 currently support plain "
+                    "decode only; target-verify / MTP (next_n > 1) is not yet "
+                    "supported. Disable speculative decoding on SM120."
+                )
+            q_fp8 = q_fp8.unsqueeze(1)
+            q_arg = q_fp8[:q_offset]
+            bsz = q_arg.shape[0]
+            seq_lens_1d = (
+                seqlens_32_2d[:, 0] if seqlens_32_2d.dim() == 2 else seqlens_32_2d
+            )[:bsz]
+            # tilelang wants 1-D [B] seq lens; the torch fallback wants 2-D [B, 1].
+            seq_lens_arg = (
+                seq_lens_1d
+                if paged_logits_backend == "tilelang"
+                else seq_lens_1d.unsqueeze(-1)
+            )
+            logits = paged_logits_fn(
+                q_arg,
+                kv_cache_fp8,
+                weights[:q_offset],
+                seq_lens_arg,
+                block_tables[:bsz],
                 schedule_metadata,
                 max_seq_len,
                 clean_logits=False,
@@ -992,6 +1052,10 @@ class Indexer(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
+
+        # On SM120 deep_gemm is unavailable; the selector returns the torch
+        # reference. Off SM120 it returns deep_gemm.fp8_mqa_logits (unchanged).
+        mqa_logits_fn, _ = select_fp8_mqa_logits_fn()
 
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
@@ -1086,7 +1150,7 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
                 else:
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = mqa_logits_fn(
                         q_fp8[:q_offset],
                         kv_fp8,
                         weights[:q_offset],
@@ -1138,7 +1202,7 @@ class Indexer(MultiPlatformOp):
                         clean_logits=False,
                     )
                 else:
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = mqa_logits_fn(
                         q_fp8[start:end],
                         kv_fp8,
                         weights[start:end],
@@ -1276,6 +1340,10 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
+        # On SM120 the selector returns the torch reference; off SM120 it returns
+        # deep_gemm.fp8_mqa_logits (unchanged).
+        mqa_logits_fn, _ = select_fp8_mqa_logits_fn()
+
         page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
@@ -1344,7 +1412,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = mqa_logits_fn(
                     q_fp8,
                     kv_fp8,
                     weights,
@@ -1390,7 +1458,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = mqa_logits_fn(
                     q_fp8,
                     kv_fp8,
                     weights,

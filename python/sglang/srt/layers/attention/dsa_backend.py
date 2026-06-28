@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
+    is_sm120_supported,
 )
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
@@ -411,10 +412,31 @@ class DeepseekSparseAttnBackend(
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        self.is_sm120 = is_sm120_supported()
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
+        # SM120 (Blackwell desktop / RTX PRO 6000) cannot run the flashinfer or
+        # sgl_kernel.flash_mla based DSA impls (no tcgen05/TMEM). The auto-selector
+        # picks "tilelang" on SM120; fail loudly if one of the unsupported impls was
+        # forced via --dsa-prefill-backend / --dsa-decode-backend.
+        if self.is_sm120:
+            _sm120_unsupported = {"trtllm", "flashmla_sparse", "flashmla_kv", "fa3"}
+            for _impl, _label in (
+                (self.dsa_prefill_impl, "dsa_prefill_backend"),
+                (self.dsa_decode_impl, "dsa_decode_backend"),
+            ):
+                if _impl in _sm120_unsupported:
+                    raise ValueError(
+                        f"DSA backend '{_impl}' ({_label}) is not supported on SM120 "
+                        f"(no flashinfer / flash_mla kernels). Use 'tilelang' "
+                        f"(or 'triton') instead."
+                    )
+
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        # SM120 never uses the trtllm/flashinfer ragged path, so skip the allocation there.
+        if (
+            self.device_sm_major >= 10 and not self.is_sm120
+        ) or self.dsa_decode_impl == "trtllm":
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -1989,8 +2011,11 @@ class DeepseekSparseAttnBackend(
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
 
-        # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
+        # Determine required padding based on GPU architecture (use cached value).
+        # SM120 uses the 64-pad path (it does not run the SM100 flashmla kernels).
+        required_padding = (
+            128 if (self.device_sm_major >= 10 and not self.is_sm120) else 64
+        )
 
         need_padding = num_heads % required_padding != 0
 
@@ -2111,8 +2136,10 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
-        if self.device_sm_major >= 10:
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+        # SM120 has no flashinfer kernels; it never enters MHA_ONE_SHOT (gated to SM90/SM100
+        # below), so this branch is excluded defensively.
+        if self.device_sm_major >= 10 and not self.is_sm120:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
