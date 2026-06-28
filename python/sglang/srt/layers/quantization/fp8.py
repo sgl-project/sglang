@@ -1768,7 +1768,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            if self.is_deepgemm_moe_runner_backend_enabled():
+            if self.is_fp4_expert and get_moe_a2a_backend().is_megamoe():
+                # MegaMoE falls back to this normal MoE runner when the token
+                # cap is exceeded; FP4 experts need the DeepGEMM-compatible
+                # scale layout prepared by MegaMoE, not Triton's FP8 layout.
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             elif (
                 _is_hip

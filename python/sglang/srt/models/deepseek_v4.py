@@ -155,6 +155,20 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
 
+def _is_megamoe_fp4_fallback_mlp(mlp: nn.Module, hidden_states: torch.Tensor) -> bool:
+    if not get_moe_a2a_backend().is_megamoe():
+        return False
+
+    experts = getattr(mlp, "experts", None)
+    quant_method = getattr(experts, "quant_method", None)
+    if not getattr(quant_method, "is_fp4_expert", False):
+        return False
+
+    from sglang.srt.layers.moe.mega_moe import should_use_mega_moe
+
+    return not should_use_mega_moe(mlp, hidden_states)
+
+
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
     # tensor layout assumptions, so keep it disabled when either dependency is off.
@@ -1580,11 +1594,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_parallel().attn_dp_size > 1
             and get_moe_a2a_backend().is_none()
         )
+        # The hand-scattered path is valid for MegaMOE's native kernel. When
+        # FP4 MegaMOE exceeds its token cap, the fallback runner must keep the
+        # full-token MHC layout to match the surrounding hc_post state.
+        _megamoe_fp4_fallback = _is_megamoe_fp4_fallback_mlp(self.mlp, hidden_states)
         _use_tp_attn_a2a_scatter = (
             not _use_cp
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
+            and not _megamoe_fp4_fallback
         )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
