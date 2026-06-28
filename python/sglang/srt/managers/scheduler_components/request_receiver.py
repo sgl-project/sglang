@@ -124,7 +124,9 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         else:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
+                dp_offset = (
+                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                )
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.ps.pp_rank * self.ps.tp_size + dp_offset,
