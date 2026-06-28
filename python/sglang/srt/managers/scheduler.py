@@ -123,7 +123,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
-    OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
@@ -2011,36 +2010,11 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # Radix-native session: session_id is just a tag; KV bulk-freed on close.
+        # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
-            session_id is not None and self.server_args.enable_session_radix_cache
+            recv_req.session_id is not None
+            and self.server_args.enable_session_radix_cache
         )
-        if radix_native_session:
-            sp = recv_req.session_params
-            if (
-                sp.rid is not None
-                or sp.offset is not None
-                or sp.replace is not None
-                or sp.drop_previous_output is not None
-            ):
-                error_msg = (
-                    "Invalid request: radix-native sessions do not support "
-                    "session_params rid/offset/replace/drop_previous_output; "
-                    "send full context each turn."
-                )
-                req = Req(
-                    recv_req.rid,
-                    recv_req.input_text,
-                    recv_req.input_ids,
-                    recv_req.sampling_params,
-                    vocab_size=self.model_config.vocab_size,
-                    http_worker_ipc=recv_req.http_worker_ipc,
-                )
-                req.tokenizer = self.tokenizer
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
 
         if session_id is None or radix_native_session:
             # Normal non-session request, or a radix-native session request
@@ -2063,6 +2037,7 @@ class Scheduler(
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
+                session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
@@ -2094,8 +2069,6 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
-            if radix_native_session:
-                req.session_id = session_id
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -4082,24 +4055,17 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
-        if self.server_args.enable_session_radix_cache:
-            # Radix-native: open is implicit; explicit open only permits id reuse.
-            session_id = recv_req.session_id
-            self.tree_cache.register_session(session_id)
-            output = OpenSessionReqOutput(
-                session_id=session_id, success=session_id is not None
-            )
-        else:
-            output = self.session_controller.open(recv_req)
+        output = self.session_controller.open(recv_req)
         if self.ps.pp_rank == 0 and self.ps.tp_rank == 0 and self.ps.attn_cp_rank == 0:
             return output
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
         if self.server_args.enable_session_radix_cache:
-            # "Close" just triggers eviction of the session's tagged KV.
-            self.tree_cache.release_session(recv_req.session_id)
-        else:
+            self.tree_cache.release_radix_session(recv_req.session_id)
+        if recv_req.session_id in self.session_controller or not (
+            self.server_args.enable_session_radix_cache
+        ):
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
