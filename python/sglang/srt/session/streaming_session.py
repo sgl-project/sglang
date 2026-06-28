@@ -438,6 +438,9 @@ class StreamingSession(BasePrefixCache):
 
         self._free_slot_mamba(slot)
 
+    def release_radix_session(self, session_id: str) -> None:
+        self.inner.release_radix_session(session_id)
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
 

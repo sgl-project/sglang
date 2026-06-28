@@ -38,6 +38,7 @@ from sglang.jit_kernel.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MambaPool,
+    MHATokenToKOnlyPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
@@ -631,6 +632,316 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
+
+
+class MHATokenToKOnlyPoolHost(HostKVCache):
+    """Host pool for MiniMax sparse index-K buffers (no index V)."""
+
+    device_pool: MHATokenToKOnlyPool
+
+    def __init__(
+        self,
+        device_pool: MHATokenToKOnlyPool,
+        anchor_host: MHATokenToKVPoolHost,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        self.device_pool = device_pool
+        self.page_size = anchor_host.page_size
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
+        self.dtype = device_pool.store_dtype
+        self.start_layer = device_pool.start_layer
+        self.end_layer = device_pool.end_layer
+
+        self.head_num = device_pool.head_num
+        self.head_dim = device_pool.head_dim
+        self.layer_num = device_pool.layer_num
+        self.element_dim = self.head_num * self.head_dim
+        self.token_stride_size = self.element_dim * self.dtype.itemsize
+        self.layout_dim = self.token_stride_size * self.layer_num
+
+        self.size = anchor_host.size
+        self.page_num = anchor_host.page_num
+        self.size_per_token = self.get_size_per_token()
+
+        host_mem = psutil.virtual_memory()
+        requested_bytes = self.size * self.size_per_token
+        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for MiniMax index-K hierarchical cache. "
+                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free."
+            )
+        logger.info(
+            "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",
+            requested_bytes / 1e9,
+            layout,
+        )
+
+        self.init_kv_buffer()
+        self.lock = threading.RLock()
+        self.clear()
+
+        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.token_stride_size
+        )
+        self.k_device_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.device_pool.k_buffer],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        if self.layout == "page_first":
+            transposed = self.k_buffer.transpose(0, 1)
+            self.k_data_refs = [transposed[i] for i in range(self.layer_num)]
+        elif self.layout == "layer_first":
+            self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+        else:
+            self.k_data_refs = []
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def get_size_per_token(self):
+        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token()
+
+    def init_kv_buffer(self):
+        if self.layout == "layer_first":
+            dims = (self.layer_num, self.size, self.head_num, self.head_dim)
+        elif self.layout == "page_first":
+            dims = (self.size, self.layer_num, self.head_num, self.head_dim)
+        elif self.layout == "page_first_direct":
+            dims = (
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        self.k_buffer = alloc_func(
+            dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+
+    def get_hybrid_pool_buffer(self):
+        return [self.k_buffer]
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=device_pool.k_buffer[layer_id],
+                        cache_src=self.k_buffer[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=self.k_buffer[layer_id],
+                        dst=device_pool.k_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        item_size=self.token_stride_size,
+                    )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=device_pool.k_buffer[layer_id],
+                        cache_src=self.k_data_refs[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla_pf_lf(
+                        src=self.k_buffer,
+                        dst=device_pool.k_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[self.k_buffer[layer_id]],
+                    dst_layers=[device_pool.k_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[self.k_buffer],
+                    dst_ptrs=[device_pool.k_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                if self.can_use_jit:
+                    for layer_id in range(self.layer_num):
+                        jit_transfer_hicache_one_layer_mla(
+                            cache_dst=self.k_buffer[layer_id],
+                            cache_src=device_pool.k_buffer[layer_id],
+                            indices_dst=host_indices,
+                            indices_src=device_indices,
+                            element_dim=self.element_dim,
+                        )
+                else:
+                    for layer_id in range(self.layer_num):
+                        transfer_kv_per_layer_mla(
+                            src=device_pool.k_buffer[layer_id],
+                            dst=self.k_buffer[layer_id],
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                        )
+            elif self.layout == "page_first":
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=self.k_data_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=self.k_device_ptrs,
+                        indices_src=device_indices,
+                        cache_dst_stride_bytes=self.layout_dim,
+                        cache_src_stride_bytes=self.token_stride_size,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_mla_lf_pf(
+                        src_layers=self.k_device_ptrs,
+                        dst=self.k_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=device_pool.k_buffer,
+                    dst_layers=self.k_data_refs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=device_pool.k_buffer,
+                    dst_ptrs=[self.k_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        if self.layout == "layer_first":
+            data_page = self.k_buffer[:, index : index + self.page_size, :, :]
+        elif self.layout == "page_first":
+            data_page = self.k_buffer[index : index + self.page_size, :, :, :]
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            data_page = self.k_buffer[real_index : real_index + 1, :, :, :, :]
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        if flat:
+            return data_page.flatten()
+        return data_page
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            (self.layer_num, self.page_size, self.head_num, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        if self.layout == "layer_first":
+            self.k_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
+                self.layer_num, self.page_size, self.head_num, self.head_dim
+            )
+        elif self.layout == "page_first":
+            self.k_buffer[index : index + self.page_size, :, :, :] = data_page.reshape(
+                self.page_size, self.layer_num, self.head_num, self.head_dim
+            )
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            self.k_buffer[real_index : real_index + 1, :, :, :, :] = data_page.reshape(
+                1, self.layer_num, self.page_size, self.head_num, self.head_dim
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def get_page_buffer_meta(self, indices):
+        """Meta data for zero-copy storage I/O."""
+        assert len(indices) % self.page_size == 0
+        if self.layout not in ["page_first", "page_first_direct"]:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+        ptr_list = []
+        k_buffer_data_ptr = self.k_buffer.data_ptr()
+        indices = indices.tolist()
+        for index in range(0, len(indices), self.page_size):
+            k_ptr = (
+                k_buffer_data_ptr
+                + indices[index]
+                * self.layer_num
+                * self.head_num
+                * self.head_dim
+                * self.dtype.itemsize
+            )
+            ptr_list.append(k_ptr)
+        element_size = (
+            self.layer_num
+            * self.dtype.itemsize
+            * self.page_size
+            * self.head_num
+            * self.head_dim
+        )
+        element_size_list = [element_size] * len(ptr_list)
+        return ptr_list, element_size_list
 
 
 class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
