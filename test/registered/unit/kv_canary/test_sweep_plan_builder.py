@@ -20,17 +20,23 @@ import torch
 
 # ---- Patch sys.modules so that sweep_plan_builder's deep import chain succeeds ----
 # Only install mocks for modules not already loaded (avoids clobbering a real import).
+# Track what we installed so tearDownModule can remove the stubs from sys.modules,
+# preventing pollution if a discovery runner collects multiple files in one process.
+_PATCHED_MODULES: list[str] = []
+
 if "sglang.srt.kv_canary.radix_cache_walker" not in sys.modules:
     _rw_stub = types.ModuleType("sglang.srt.kv_canary.radix_cache_walker")
     _rw_stub.walk_radix_cache_for_canary = (
         None  # sentinel; sweep_plan_builder imports this name
     )
     sys.modules["sglang.srt.kv_canary.radix_cache_walker"] = _rw_stub
+    _PATCHED_MODULES.append("sglang.srt.kv_canary.radix_cache_walker")
 
 if "sglang.srt.mem_cache.base_prefix_cache" not in sys.modules:
     _bpc_stub = types.ModuleType("sglang.srt.mem_cache.base_prefix_cache")
     _bpc_stub.BasePrefixCache = None
     sys.modules["sglang.srt.mem_cache.base_prefix_cache"] = _bpc_stub
+    _PATCHED_MODULES.append("sglang.srt.mem_cache.base_prefix_cache")
 
 # Also ensure VerifyPlan exists on the jit_kernel verify module if not already loaded.
 _JIT_VERIFY = "sglang.jit_kernel.kv_canary.verify"
@@ -38,6 +44,13 @@ if _JIT_VERIFY not in sys.modules:
     _jit_mod = types.ModuleType(_JIT_VERIFY)
     _jit_mod.VerifyPlan = None
     sys.modules[_JIT_VERIFY] = _jit_mod
+    _PATCHED_MODULES.append(_JIT_VERIFY)
+
+
+def tearDownModule() -> None:
+    for mod in _PATCHED_MODULES:
+        sys.modules.pop(mod, None)
+
 
 from sglang.srt.kv_canary.sweep_plan_builder import _swa_translate  # noqa: E402
 from sglang.test.test_utils import CustomTestCase
