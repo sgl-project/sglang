@@ -736,7 +736,7 @@ class TestNgramCorpusPrecomputeConsistency(CustomTestCase):
         corpus.synchronize()
         return corpus, prefix
 
-    def test_precomputed_root_hit_tree_matches_fresh_batch_get(self):
+    def test_precomputed_hit_tree_matches_fresh_batch_get(self):
         draft_token_num = 8
         max_trie_depth = 8
         bonus_topk = 3
