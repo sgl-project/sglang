@@ -288,9 +288,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 language_model.model, "layers"
             ):
                 self.layer_model = language_model.model
-                params = list(
-                    inspect.signature(self.layer_model.forward).parameters
-                )
+                params = list(inspect.signature(self.layer_model.forward).parameters)
                 self._input_embeds_arg_idx = (
                     params.index("input_embeds") if "input_embeds" in params else None
                 )
