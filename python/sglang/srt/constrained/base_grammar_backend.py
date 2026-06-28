@@ -27,6 +27,20 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 
+def truncate_grammar_for_log(grammar: Optional[str], limit: int = 256) -> str:
+    """Bound a user-supplied grammar/schema before logging.
+
+    A request's grammar (json_schema/regex/ebnf/structural_tag) has no size cap,
+    so logging it verbatim on a compile failure can dump a large blob per failure.
+    """
+    if grammar is None:
+        return ""
+    grammar_str = str(grammar)
+    if len(grammar_str) <= limit:
+        return grammar_str
+    return f"{grammar_str[:limit]}... ({len(grammar_str)} chars total)"
+
+
 @dataclass
 class GrammarStats:
     compilation_time: Optional[float] = None
@@ -136,7 +150,10 @@ class BaseGrammarBackend:
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
-        logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
+        logger.warning(
+            f"Skip unsupported {key_type=}, "
+            f"key_string={truncate_grammar_for_log(key_string)!r}"
+        )
         return InvalidGrammarObject()
 
     @property
