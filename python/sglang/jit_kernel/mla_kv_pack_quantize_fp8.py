@@ -103,6 +103,7 @@ def _v1_flat_kernel(
     FP8_DTYPE: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    CONTIGUOUS: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -110,35 +111,48 @@ def _v1_flat_kernel(
     pair_idx = pid * BLOCK + tl.arange(0, BLOCK)
     total = s_total * num_heads
     mask = pair_idx < total
+    # k_pe is shared across heads, so it always needs the token index.
     t_idx = pair_idx // num_heads
-    h_idx = pair_idx % num_heads
     nope_idx = tl.arange(0, QK_NOPE)
     rope_idx = tl.arange(0, QK_ROPE)
-    v_idx_ = tl.arange(0, V_HEAD)
-    nope_off = (
-        t_idx[:, None] * k_nope_stride_t
-        + h_idx[:, None] * k_nope_stride_h
-        + nope_idx[None, :]
-    )
+    v_idx = tl.arange(0, V_HEAD)
+
+    if CONTIGUOUS:
+        # Packed layout: each (token, head) pair is one flat row, so index by
+        # `pair_idx` directly (drops `% num_heads` + strided math). Bit-identical.
+        nope_off = pair_idx[:, None] * QK_NOPE + nope_idx[None, :]
+        v_off = pair_idx[:, None] * V_HEAD + v_idx[None, :]
+        k_out_base = pair_idx[:, None] * (QK_NOPE + QK_ROPE)
+        v_out_off = v_off
+    else:
+        h_idx = pair_idx % num_heads
+        nope_off = (
+            t_idx[:, None] * k_nope_stride_t
+            + h_idx[:, None] * k_nope_stride_h
+            + nope_idx[None, :]
+        )
+        v_off = (
+            t_idx[:, None] * v_stride_t + h_idx[:, None] * v_stride_h + v_idx[None, :]
+        )
+        k_out_base = t_idx[:, None] * k_out_stride_t + h_idx[:, None] * k_out_stride_h
+        v_out_off = (
+            t_idx[:, None] * v_out_stride_t
+            + h_idx[:, None] * v_out_stride_h
+            + v_idx[None, :]
+        )
+
     k_nope = tl.load(k_nope_ptr + nope_off, mask=mask[:, None])
     pe_off = t_idx[:, None] * k_pe_stride_t + rope_idx[None, :]
     k_pe = tl.load(k_pe_ptr + pe_off, mask=mask[:, None])
-    v_off = t_idx[:, None] * v_stride_t + h_idx[:, None] * v_stride_h + v_idx_[None, :]
     v = tl.load(v_ptr + v_off, mask=mask[:, None])
     k_nope_fp8 = (k_nope.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     k_pe_fp8 = (k_pe.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     v_fp8 = (v.to(tl.float32) * v_scale_inv).to(FP8_DTYPE)
-    k_out_base = t_idx[:, None] * k_out_stride_t + h_idx[:, None] * k_out_stride_h
     tl.store(k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=mask[:, None])
     tl.store(
         k_out_ptr + k_out_base + QK_NOPE + rope_idx[None, :],
         k_pe_fp8,
         mask=mask[:, None],
-    )
-    v_out_off = (
-        t_idx[:, None] * v_out_stride_t
-        + h_idx[:, None] * v_out_stride_h
-        + v_idx_[None, :]
     )
     tl.store(v_out_ptr + v_out_off, v_fp8, mask=mask[:, None])
     if ENABLE_PDL:
@@ -146,20 +160,25 @@ def _v1_flat_kernel(
 
 
 def _pick_kernel(s: int, num_heads: int) -> Tuple[str, dict]:
-    """Tuned on GB300, DSv3 dims, BF16 -> FP8 e4m3."""
+    """Pick kernel + launch config. Tuned on B200 (sm100), DSv3 dims, BF16 -> FP8 e4m3.
+
+    Memory bound. The flat kernel (1D grid over contiguous (token, head) pairs)
+    wins everywhere except tiny ``s``, where ``v0``'s 2D grid trims launch
+    overhead. For the flat path, ``num_warps`` tracks the total work
+    ``s * num_heads``: 4 warps keep more CTAs resident through the mid range
+    (including L2-resident prefix chunks), 8 warps win once the launch is large
+    enough to saturate HBM.
+    """
     if s <= 2:
-        # Launch-overhead-bound; tighter (BLOCK_S, num_warps) just adds warp
-        # setup cost without paying back in per-CTA work.
+        # Launch-overhead-bound: minimal warps avoid setup cost.
         return "v0", {"BLOCK_S": 1, "num_warps": 1, "num_stages": 2}
     if s <= 16:
         return "v0", {"BLOCK_S": 4, "num_warps": 2, "num_stages": 3}
     if s <= 32:
+        # Still launch-bound: a smaller BLOCK keeps more CTAs in flight.
         return "v1_flat", {"BLOCK": 8, "num_warps": 8, "num_stages": 2}
-    if s <= 192:
-        return "v1_flat", {"BLOCK": 16, "num_warps": 8, "num_stages": 3}
-    if s <= 1536:
-        return "v0", {"BLOCK_S": 16, "num_warps": 4, "num_stages": 3}
-    return "v1_flat", {"BLOCK": 16, "num_warps": 8, "num_stages": 3}
+    num_warps = 8 if s * num_heads >= 200_000 else 4
+    return "v1_flat", {"BLOCK": 16, "num_warps": num_warps, "num_stages": 3}
 
 
 _FP8_DTYPE_MAP = {
@@ -179,11 +198,11 @@ def mla_kv_pack_quantize_fp8(
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fused ``cat(k_nope, broadcast k_pe) + FP8 quantize`` for K and ``FP8 quantize`` for V.
+    """Fused ``cat(k_nope, broadcast k_pe)`` + FP8 quantize for K, FP8 quantize for V.
 
     Shapes: ``k_nope [s, h, qk_nope]``, ``k_pe [s, 1, qk_rope]`` or ``[s, qk_rope]``,
-    ``v [s, h, v_head]``. Returns ``(k_fp8 [s, h, qk_nope + qk_rope], v_fp8 [s, h, v_head])``.
-    Strided views are supported as long as the inner dim is contiguous.
+    ``v [s, h, v_head]`` -> ``(k_fp8 [s, h, qk_nope + qk_rope], v_fp8 [s, h, v_head])``.
+    Strided views are fine if the inner dim is contiguous.
     """
     assert k_nope.dtype in (
         torch.bfloat16,
@@ -261,8 +280,14 @@ def mla_kv_pack_quantize_fp8(
         )
     else:
         block = cfg["BLOCK"]
-        total = s * num_heads
-        grid = (triton.cdiv(total, block),)
+        grid = (triton.cdiv(s * num_heads, block),)
+        # Fast path only when all packed tensors are dense; else strided fallback.
+        flat_contiguous = (
+            k_nope.is_contiguous()
+            and v.is_contiguous()
+            and k_out.is_contiguous()
+            and v_out.is_contiguous()
+        )
         _v1_flat_kernel[grid](
             k_nope,
             k_pe_2d,
@@ -288,6 +313,7 @@ def mla_kv_pack_quantize_fp8(
             FP8_DTYPE=fp8_tl_dtype,
             BLOCK=block,
             ENABLE_PDL=enable_pdl,
+            CONTIGUOUS=flat_contiguous,
             num_warps=cfg["num_warps"],
             num_stages=cfg["num_stages"],
             **extra,
