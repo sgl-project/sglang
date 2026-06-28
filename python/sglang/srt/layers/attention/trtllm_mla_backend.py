@@ -1078,6 +1078,14 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 backend=backend,
             )
 
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+        if self.speculative_num_steps <= 1:
+            return
+        shared_block_kv_indices = self.attn_backends[0].decode_cuda_graph_kv_indices
+        for i in range(1, self.speculative_num_steps - 1):
+            self.attn_backends[i].decode_cuda_graph_kv_indices = shared_block_kv_indices
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
@@ -1093,10 +1101,11 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
             return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+        if self.speculative_num_steps <= 1:
+            return
         inner_fb = build_inner_fb_view(
             forward_batch,
             bs=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
         )
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_out_graph(inner_fb)
+        self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
