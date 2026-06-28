@@ -148,6 +148,17 @@ MultimodalDataInputFormat = Union[
 ]
 
 
+class MooncakeMMUrlItem(msgspec.Struct, array_like=True):
+    """One multimodal item captured at tokenizer dispatch for mooncake encode routing.
+
+    ``url`` is the raw URL string from MMReceiverBase._extract_url_data
+    (ImageData.url when present); ``modality`` tags which encoder pool handles it.
+    """
+
+    url: str
+    modality: Modality
+
+
 @dataclass
 class GenerateReqInput:
     # Request ID(s). If omitted, generated during normalization. For batch
@@ -845,10 +856,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
-    # Pickled Optional[List[{"url": MultimodalDataInputItem, "modality": Modality}]]
-    # from MMReceiverBase._extract_url_data. "url" is ImageData.url,
-    # dict["url"] when present, or the original raw multimodal item.
-    mm_data_mooncake: Optional[PickleWrapper] = None
+    # Multimodal URL snapshot from MMReceiverBase._extract_url_data for mooncake.
+    # Each item carries the raw URL/payload and modality captured at tokenizer dispatch.
+    mm_data_mooncake: Optional[List[MooncakeMMUrlItem]] = None
     # Encoder URL snapshot frozen at tokenizer-side dispatch time so that
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
@@ -863,12 +873,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
-        self.mm_data_mooncake = wrap_as_pickle(self.mm_data_mooncake)
         self.time_stats = wrap_as_pickle(self.time_stats)
 
     def unwrap_pickle_fields(self):
         self.mm_inputs = unwrap_from_pickle(self.mm_inputs)
-        self.mm_data_mooncake = unwrap_from_pickle(self.mm_data_mooncake)
         self.time_stats = unwrap_from_pickle(self.time_stats)
 
 
