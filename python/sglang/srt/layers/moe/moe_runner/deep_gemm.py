@@ -399,6 +399,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
         num_groups, m, k = hidden_states.shape
+        if expected_m <= 0:
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            return torch.empty(
+                (num_groups, m, w2_weight.shape[1]),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
@@ -515,6 +524,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         # GroupGemm-0
         num_groups, m, k = hidden_states.shape
+        if expected_m <= 0:
+            dispose_tensor(hidden_states)
+            return torch.empty(
+                (num_groups, m, w2_weight.shape[1]),
+                device=hidden_states_device,
+                dtype=torch.bfloat16,
+            )
+
         n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
