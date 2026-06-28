@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 import sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits  # noqa: F401
+from sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits import _pick_dsl_expand
 from sglang.srt.layers.attention.dsa.utils import (
     fp8_mqa_logits_ceil_to_ue8m0,
     fp8_mqa_logits_make_fused_kv,
@@ -85,41 +86,6 @@ def _generate_bench_data(
     }
 
 
-def _choose_atom_split(
-    batch: int,
-    ctx: int,
-    next_n: int,
-    num_sms: int = 148,
-    split_kv_tokens: int = 256,
-    tie: str = "max_na",
-    kernel_atoms=(1, 2, 3, 4),
-):
-    """Pick (num_atoms, atom_size) decomposition of next_n minimizing wave count;
-    tie-break configurable via ``tie``:
-      - ``max_na``:  prefer LARGEST num_atoms = smallest atom = most SMs busy per
-                     wave; pays HBM cost of num_atoms× KV re-reads.
-      - ``max_atom``: prefer LARGEST atom = smallest num_atoms = least HBM cost.
-
-    FP8 kernel natively supports ``atom ∈ kernel_atoms`` (default ``(1, 2, 3, 4)``).
-    Returns ``(num_atoms, atom)``.
-    """
-    cands = []
-    for atom in kernel_atoms:
-        if next_n % atom == 0:
-            na = next_n // atom
-            ntask = batch * na * ((ctx + split_kv_tokens - 1) // split_kv_tokens)
-            waves = (ntask + num_sms - 1) // num_sms
-            cands.append((waves, na, atom))
-    if tie == "max_na":
-        cands.sort(key=lambda x: (x[0], -x[1]))
-    elif tie == "max_atom":
-        cands.sort(key=lambda x: (x[0], x[1]))
-    else:
-        raise ValueError(f"unknown tie={tie!r}; expected 'max_na' or 'max_atom'")
-    _, na, atom = cands[0]
-    return na, atom
-
-
 def benchmark(
     batch_sizes: list[int],
     next_ns: list[int],
@@ -129,12 +95,18 @@ def benchmark(
     block_kv: int = 64,
     use_cuda_graph: bool = True,
 ):
-    """Benchmark CuTe DSL vs DeepGEMM FP8 paged MQA logits.
+    """Benchmark CuTe DSL FP8 paged MQA logits vs DeepGEMM.
 
-    The DSL kernel uses 1 atom per batch (real next_n positions per atom);
-    DeepGEMM on SM100 falls back to per-token expansion for next_n in {2, 4+},
-    which is where the DSL kernel pays off. ``use_cuda_graph=True`` matches
-    SGLang's runtime decode path (cuda graph capture is enabled by default).
+    The "DSL" column uses the SAME picker SGLang runs at runtime
+    (``_pick_dsl_expand``), so the table reflects the shipped path. For
+    next_n=6 / num_heads<=42 that picker selects the native single-launch
+    expansion (factor=1, atom=next_n, weights-in-SMEM) once there is enough
+    work to fill the SMs, and a wave-minimizing split otherwise.
+
+    The "native" column force-runs the native expansion (factor=1,
+    atom=next_n) whenever it fits TMEM (``next_n*num_heads <= 256``), so the
+    native path is always visible even on shapes where the picker prefers a
+    split. ``use_cuda_graph=True`` matches SGLang's runtime decode path.
     """
     import deep_gemm
     from flashinfer.testing.utils import bench_gpu_time
@@ -148,25 +120,20 @@ def benchmark(
     backend = "CUPTI + CUDA-Graph" if use_cuda_graph else "CUPTI"
     print(
         f"output_dtype={dtype_str}  mode={mode_str}  block_kv={block_kv}  "
-        f"timing={backend}"
+        f"num_heads={num_heads}  timing={backend}"
     )
     hdr = (
-        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} {'ntask':>6s} | "
-        f"{'maxAtom':>7s} {'DSL(us)':>9s} {'DSLf16(us)':>10s} {'f16/f32':>8s} | "
-        f"{'maxNa':>5s} {'DSL(us)':>9s} {'max_atom/max_na':>15s} | "
-        f"{'DG-nat(us)':>11s} {'nat/DSL_maxA':>13s}"
+        f"{'batch':>5s} {'ctx':>7s} {'next_n':>6s} {'nblk':>7s} | "
+        f"{'pick':>5s} {'DSL(us)':>9s} | "
+        f"{'native':>6s} {'nat(us)':>9s} {'nat/DSL':>8s} | "
+        f"{'DG-nat(us)':>11s} {'DG/DSL':>7s}"
     )
     print(hdr)
-    print(
-        "  nat = DG-native   (q=[B,next_n,H,D])   — TRT-LLM's path; now also SGLang's"
-    )
-    print("  maxAtom = baseline picker (min waves, tie-break largest atom = least HBM)")
-    print(
-        "  DSLf16  = maxAtom DSL with fp16 epilogue (epi_dtype=float16; acc/out unchanged)"
-    )
-    print(
-        "  maxNa   = experimental picker (min waves, tie-break largest num_atoms = more SMs busy)"
-    )
+    print("  DSL    = production picker (_pick_dsl_expand) — exactly what SGLang runs")
+    print("  pick   = chosen factor/atom (1/6 = native single-launch; 2/3 = split)")
+    print("  native = forced native expansion (factor=1, atom=next_n); '-' if N>256")
+    print("  DG-nat = deep_gemm native (q=[B,next_n,H,D]) — TRT-LLM's path")
+    print("  nat/DSL>1 => native beats the picker; DG/DSL>1 => DSL beats deep_gemm")
     print("-" * len(hdr))
 
     # See `cute_dsl_paged_mqa_logits.py` for the SPLIT_KV=256 alignment note:
@@ -179,33 +146,6 @@ def benchmark(
         for context_len in context_lens:
             for batch_size in batch_sizes:
                 nblk = batch_size * ((context_len + block_kv - 1) // block_kv)
-                SPLIT_KV_TOKENS = 256
-                # Pick both atom-split strategies for A/B comparison:
-                #   max_atom (baseline):     min waves, tie-break max atom (least HBM)
-                #   max_na (experimental):   min waves, tie-break max num_atoms (more SMs busy)
-                na_base, atom_base = _choose_atom_split(
-                    batch_size,
-                    context_len,
-                    next_n,
-                    num_sms=num_sms,
-                    split_kv_tokens=SPLIT_KV_TOKENS,
-                    tie="max_atom",
-                    kernel_atoms=(1, 2, 3, 4),
-                )
-                na_exp, atom_exp = _choose_atom_split(
-                    batch_size,
-                    context_len,
-                    next_n,
-                    num_sms=num_sms,
-                    split_kv_tokens=SPLIT_KV_TOKENS,
-                    tie="max_na",
-                    kernel_atoms=(1, 2, 3, 4),
-                )
-                ntask = (
-                    batch_size
-                    * na_base
-                    * ((context_len + SPLIT_KV_TOKENS - 1) // SPLIT_KV_TOKENS)
-                )
 
                 data = _generate_bench_data(
                     batch_size,
@@ -217,18 +157,18 @@ def benchmark(
                     varlen=varlen,
                 )
 
-                # Reshape Q + repeat ctx/block_table per (na, atom). weights
-                # [B*next_n, H] = [B*na*atom, H] needs no reshape because the
-                # row layout is preserved under [B*na, atom, ...] view.
-                def _split(na, atom, data=data, B=batch_size):
-                    if na > 1:
+                # Reshape Q + repeat ctx/block_table per (factor, atom). weights
+                # [B*next_n, H] = [B*factor*atom, H] needs no reshape because the
+                # row layout is preserved under [B*factor, atom, ...] view.
+                def _split(factor, atom, data=data, B=batch_size):
+                    if factor > 1:
                         return {
                             "q": data["q_fp8"].reshape(
-                                B * na, atom, num_heads, head_dim
+                                B * factor, atom, num_heads, head_dim
                             ),
-                            "ctx_lens": data["context_lens"].repeat_interleave(na),
+                            "ctx_lens": data["context_lens"].repeat_interleave(factor),
                             "block_table": data["block_table"].repeat_interleave(
-                                na, dim=0
+                                factor, dim=0
                             ),
                         }
                     return {
@@ -237,25 +177,10 @@ def benchmark(
                         "block_table": data["block_table"],
                     }
 
-                base_t = _split(na_base, atom_base)
-                strats_diverge = (na_base, atom_base) != (na_exp, atom_exp)
-                exp_t = _split(na_exp, atom_exp) if strats_diverge else base_t
-
-                # DSL: schedule input shape (B*na, 1) — picker decides na.
-                dsl_schedule_meta_base = deep_gemm.get_paged_mqa_logits_metadata(
-                    base_t["ctx_lens"].unsqueeze(-1),
-                    DG_METADATA_BLOCK_KV,
-                    num_sms,
-                )
-                dsl_schedule_meta_exp = (
-                    deep_gemm.get_paged_mqa_logits_metadata(
-                        exp_t["ctx_lens"].unsqueeze(-1),
-                        DG_METADATA_BLOCK_KV,
-                        num_sms,
+                def _meta(t):
+                    return deep_gemm.get_paged_mqa_logits_metadata(
+                        t["ctx_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
                     )
-                    if strats_diverge
-                    else dsl_schedule_meta_base
-                )
 
                 def _make_dsl(t, schedule_meta, data=data, epi_dtype=output_dtype):
                     def _dsl(
@@ -279,12 +204,19 @@ def benchmark(
 
                     return _dsl
 
-                _dsl_base = _make_dsl(base_t, dsl_schedule_meta_base)
-                _dsl_exp = _make_dsl(exp_t, dsl_schedule_meta_exp)
-                # fp16-epilogue variant of the maxAtom baseline (epi_dtype only).
-                _dsl_base_f16 = _make_dsl(
-                    base_t, dsl_schedule_meta_base, epi_dtype=torch.float16
+                # Production pick — exactly what SGLang's runtime selects. The op
+                # then auto-tunes the epilogue (incl. max_w_in_reg=8 for native).
+                factor, atom = _pick_dsl_expand(
+                    next_n, batch_size, context_len, num_sms, num_heads=num_heads
                 )
+                prod_t = _split(factor, atom)
+                _dsl_prod = _make_dsl(prod_t, _meta(prod_t))
+
+                # Forced native expansion (factor=1, atom=next_n) when it fits TMEM.
+                native_fits = next_n * num_heads <= 256
+                if native_fits:
+                    nat_t = _split(1, next_n)
+                    _dsl_nat = _make_dsl(nat_t, _meta(nat_t))
 
                 # DG-native: schedule input shape (B, next_n) — wrapper
                 # derives num_next_n_atoms = next_n. q stays [B, next_n, H, D].
@@ -318,32 +250,34 @@ def benchmark(
                 )
 
                 # First DSL call(s) trigger JIT compile; do them outside timing.
-                _dsl_base()
-                _dsl_base_f16()
-                if strats_diverge:
-                    _dsl_exp()
+                _dsl_prod()
+                if native_fits:
+                    _dsl_nat()
                 torch.cuda.synchronize()
 
-                base_ms = np.median(bench_gpu_time(_dsl_base, **bench_kwargs))
-                base_f16_ms = np.median(bench_gpu_time(_dsl_base_f16, **bench_kwargs))
-                exp_ms = (
-                    np.median(bench_gpu_time(_dsl_exp, **bench_kwargs))
-                    if strats_diverge
-                    else base_ms
+                prod_ms = np.median(bench_gpu_time(_dsl_prod, **bench_kwargs))
+                nat_ms = (
+                    np.median(bench_gpu_time(_dsl_nat, **bench_kwargs))
+                    if native_fits
+                    else float("nan")
                 )
                 dg_nat_ms = np.median(bench_gpu_time(_dg_native, **bench_kwargs))
 
-                strat_speedup = base_ms / exp_ms if exp_ms > 0 else float("nan")
-                nat_ratio = dg_nat_ms / base_ms if base_ms > 0 else float("nan")
-                f16_ratio = base_f16_ms / base_ms if base_ms > 0 else float("nan")
-                base_lab = f"{na_base}/{atom_base}"
-                exp_lab = f"{na_exp}/{atom_exp}"
+                pick_lab = f"{factor}/{atom}"
+                nat_over_prod = (
+                    prod_ms / nat_ms if native_fits and nat_ms > 0 else float("nan")
+                )
+                dg_over_prod = dg_nat_ms / prod_ms if prod_ms > 0 else float("nan")
+                native_tag = f"1/{next_n}" if native_fits else "-"
+                nat_us_cell = f"{nat_ms * 1e3:9.2f}" if native_fits else f"{'-':>9s}"
+                nat_ratio_cell = (
+                    f"{nat_over_prod:7.3f}x" if native_fits else f"{'-':>8s}"
+                )
                 print(
-                    f"{batch_size:5d} {context_len:7d} {next_n:6d} {nblk:7d} {ntask:6d} | "
-                    f"{base_lab:>7s} {base_ms * 1e3:9.2f} {base_f16_ms * 1e3:10.2f} "
-                    f"{f16_ratio:7.3f}x | "
-                    f"{exp_lab:>5s} {exp_ms * 1e3:9.2f} {strat_speedup:14.3f}x | "
-                    f"{dg_nat_ms * 1e3:11.2f} {nat_ratio:12.3f}x"
+                    f"{batch_size:5d} {context_len:7d} {next_n:6d} {nblk:7d} | "
+                    f"{pick_lab:>5s} {prod_ms * 1e3:9.2f} | "
+                    f"{native_tag:>6s} {nat_us_cell} {nat_ratio_cell} | "
+                    f"{dg_nat_ms * 1e3:11.2f} {dg_over_prod:6.3f}x"
                 )
 
                 torch.cuda.empty_cache()
