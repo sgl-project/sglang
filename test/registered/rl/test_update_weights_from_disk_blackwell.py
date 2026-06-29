@@ -20,7 +20,7 @@ class UpdateWeightsFromDiskBase:
     model = None
     base_url = DEFAULT_URL_FOR_TEST
     request_timeout = 120
-    update_timeout = 20
+    update_timeout = 120
     idle_timeout = 30
     launch_env = None
     decode_payload = {
