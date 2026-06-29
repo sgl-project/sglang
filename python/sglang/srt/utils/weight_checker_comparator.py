@@ -59,6 +59,8 @@ class Fp8BlockComparable(ComparableWeight):
     def _normalize_scale(w_q: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
         if w_s.dtype == torch.int32:
             w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+            # ue8m0 packing aligns k to a multiple of 4; drop the padding blocks.
+            w_s = w_s[..., : -(-w_q.shape[-1] // 128)]
         return w_s.to(torch.float32)
 
     @staticmethod
