@@ -1159,7 +1159,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         is_new_leaf = False
-        # Create new leaf for remaining suffix
+        # Create new leaf for remaining suffix. A leaf survives on its Full
+        # value alone; auxiliary components (SWA, Mamba) may legitimately hold
+        # only a tombstone for this span (e.g. the whole leaf is outside the SWA
+        # window). Materialize it anyway so the Full KV stays cacheable.
         if len(key):
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True

@@ -1245,14 +1245,19 @@ class UnifiedRadixCacheSuite:
         tree.sanity_check()
 
     def test_swa_insert_keeps_full_leaf_when_entire_span_is_outside_window(self):
+        # A leaf survives on its Full value alone: even when the whole span is
+        # past the SWA window (swa_evicted_seqlen >= total), the Full leaf must
+        # be materialized (and the Full KV kept) so the prefix stays cacheable.
+        # Runs across all SWA configs, including page_size > sliding_window_size
+        # (the dsv4-style edge case).
         if not self.cfg.has_swa or self.cfg.has_mamba:
             self.skipTest("requires SWA without Mamba")
-        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
-            self.skipTest("requires page_size=1, sliding_window_size=4")
         tree, allocator, _ = build_fixture(self.cfg)
 
-        tokens = self._make_seq(1, 4)
+        tokens = self._make_seq(1, 2)
         value = self._alloc(allocator, len(tokens))
+        if value is None:
+            self.skipTest("insufficient pool for this config")
         full_available_before = allocator.full_attn_allocator.available_size()
 
         tree.insert(

@@ -190,16 +190,6 @@ class TreeComponent(ABC):
         portion: value_slice[dup_start:consumed_from]."""
         return prefix_len
 
-    def should_skip_leaf_creation(
-        self, total_prefix_len: int, key_len: int, params: InsertParams
-    ) -> bool:
-        """Legacy hook kept for downstream component compatibility.
-
-        UnifiedRadixCache no longer calls this hook; Full leaves are materialized
-        even when auxiliary components store a tombstone for the same span.
-        """
-        return False
-
     def recover_after_unevict(
         self,
         node: UnifiedTreeNode,
