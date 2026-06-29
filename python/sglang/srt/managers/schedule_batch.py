@@ -500,6 +500,10 @@ class MultimodalInputs:
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
             item.feature = None
+        # Clear Qwen-VL mrope tensors (GPU-resident, survive per-item cleanup)
+        self.mrope_positions = None
+        self.mrope_position_delta = None
+        self.mrope_position_delta_repeated_cache = None
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):
