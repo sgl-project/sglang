@@ -2852,7 +2852,7 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            _prev_fill_len = self.chunked_req.fill_len
+            _prev_fill_len = self.chunked_req.extend_range.end
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -3069,7 +3069,13 @@ class Scheduler(
             if _prev_chunked_req is not None:
                 _prev_chunked_req.inflight_middle_chunks = _prev_is_chunked
                 if _prev_fill_len is not None:
-                    _prev_chunked_req.fill_len = _prev_fill_len
+                    # Restore the stashed fill position (extend_range.end) that
+                    # add_chunked_req may have truncated, so the next iter retries
+                    # from the right offset. (#27611 removed the `fill_len`
+                    # property; `fill_len` == `extend_range.end`.)
+                    _prev_chunked_req.set_extend_range(
+                        _prev_chunked_req.extend_range.start, _prev_fill_len
+                    )
             # Signal back-off for this iter; the next iter will retry.
             self.running_batch.batch_is_full = True
             return None
