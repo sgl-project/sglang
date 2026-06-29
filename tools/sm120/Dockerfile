@@ -40,9 +40,16 @@ RUN if [ -d "${SGLANG_DIR}/.git" ]; then \
         echo "WARNING: ${SGLANG_DIR}/.git not found; using sglang as installed in the base image." ; \
     fi
 
-# --- Validator script ---
+# --- Validator + tilelang patch scripts (from build context) ---
 WORKDIR /workspace
 COPY validate_tilelang_paged_logits.py /workspace/validate_tilelang_paged_logits.py
+COPY patch_tilelang_wait_wgmma.py /workspace/patch_tilelang_wait_wgmma.py
+
+# Patch the installed tilelang gemm_sm120.h with a no-op tl::wait_wgmma so the DSA
+# attention kernels compile on SM120. tilelang JIT-compiles with these headers at
+# runtime, so applying it at build time means the in-container validator (and any
+# kernel compile) sees it. Idempotent.
+RUN python3 /workspace/patch_tilelang_wait_wgmma.py
 
 # tilelang JIT needs a writable cache dir at runtime.
 ENV TILELANG_CACHE_DIR=/tmp/tilelang_cache \
