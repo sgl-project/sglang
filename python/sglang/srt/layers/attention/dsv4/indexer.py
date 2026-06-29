@@ -371,10 +371,9 @@ class C4IndexerBackendMixin:
         c4_indexer: C4Indexer,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: DeepSeekV4TokenToKVPool,
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         q_lora_ready: Optional[torch.cuda.Event] = None,
-    ) -> Tuple[IndexerQuery, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
@@ -393,9 +392,6 @@ class C4IndexerBackendMixin:
             layer_id=c4_indexer.layer_id,
             compressor=c4_indexer.compressor,
         )
-        c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=c4_indexer.layer_id,
-        )
 
         # The weight projection is small and fast; compute it on its own
         # stream, then have the Q stream wait on it before launching the big
@@ -412,7 +408,7 @@ class C4IndexerBackendMixin:
             q, weights = c4_indexer.compute_q(q_lora, positions, weights)
 
         current_stream.wait_stream(stream_q)
-        return q, weights, c4_indexer_kv_cache
+        return q, weights
 
     def _forward_prepare_normal(
         self,
@@ -421,9 +417,8 @@ class C4IndexerBackendMixin:
         c4_indexer: C4Indexer,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: DeepSeekV4TokenToKVPool,
         skip_compressor: bool = False,
-    ) -> Tuple[IndexerQuery, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
@@ -436,10 +431,7 @@ class C4IndexerBackendMixin:
                 layer_id=c4_indexer.layer_id,
                 compressor=c4_indexer.compressor,
             )
-        c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=c4_indexer.layer_id,
-        )
-        return q, weights, c4_indexer_kv_cache
+        return q, weights
 
     def _can_use_nonpaged_indexer(
         self,
@@ -458,8 +450,8 @@ class C4IndexerBackendMixin:
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
             forward_batch.forward_mode != ForwardMode.EXTEND
-            or getattr(forward_batch, "_original_forward_mode", None) is not None
-            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+            or forward_batch._original_forward_mode is not None
+            or forward_batch.tbo_parent_token_range is not None
             or forward_batch.batch_size != 1
             or indexer_metadata.use_prefill_cuda_graph
         ):
@@ -545,17 +537,11 @@ class C4IndexerBackendMixin:
             return None
 
         request_page_table = page_table[:1].contiguous()
-        gather_seq_lens = torch.div(
-            forward_batch.seq_lens[:1].to(torch.int32),
-            4,
-            rounding_mode="floor",
-        ).contiguous()
         ke = c4_seq_lens[:query_rows].reshape(-1).to(torch.int32).contiguous()
+        gather_seq_lens = ke[-1:]
         ks = torch.zeros_like(ke)
         c4_page_size = indexer_metadata.c4_page_size
-        max_seqlen_k = (
-            (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
-        )
+        max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
         plan = NonPagedIndexerPlan(
             page_table=request_page_table,
             gather_seq_lens=gather_seq_lens,
@@ -634,35 +620,27 @@ class C4IndexerBackendMixin:
             positions = positions[:num_queries]
 
         if enable_multi_stream:
-            q_indexer, weights, c4_indexer_kv_cache = (
-                self._forward_prepare_multi_stream(
-                    x=x,
-                    q_lora=q_lora,
-                    c4_indexer=c4_indexer,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    token_to_kv_pool=token_to_kv_pool,
-                    alt_streams=alt_streams,
-                    q_lora_ready=q_lora_ready,
-                )
-            )
-        else:
-            assert q_lora_ready is None
-            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
+            q_indexer, weights = self._forward_prepare_multi_stream(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
                 positions=positions,
                 forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
+                alt_streams=alt_streams,
+                q_lora_ready=q_lora_ready,
+            )
+        else:
+            assert q_lora_ready is None
+            q_indexer, weights = self._forward_prepare_normal(
+                x=x,
+                q_lora=q_lora,
+                c4_indexer=c4_indexer,
+                positions=positions,
+                forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
             )
 
-        assert len(c4_indexer_kv_cache.shape) == 2
-        block_kv = 64
-        num_heads_kv = 1
         use_fp4_indexer = c4_indexer.use_fp4_indexer
-        head_dim_with_sf = 68 if use_fp4_indexer else 132
 
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
@@ -673,9 +651,6 @@ class C4IndexerBackendMixin:
             assert len(q_indexer.shape) == 3
             q = q_indexer.unsqueeze(1)
 
-        c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-            c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         if use_fp4_indexer:
@@ -737,6 +712,14 @@ class C4IndexerBackendMixin:
                 plan=nonpaged_plan,
             )
         else:
+            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=c4_indexer.layer_id,
+            )
+            assert c4_indexer_kv_cache.dim() == 2
+            head_dim_with_sf = 68 if use_fp4_indexer else 132
+            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
+            )
             logits = fn(
                 q,
                 c4_indexer_kv_cache,

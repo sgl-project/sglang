@@ -21,7 +21,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
         forward_batch = SimpleNamespace(
             forward_mode=overrides.get("mode", ForwardMode.EXTEND),
-            _original_forward_mode=None,
+            _original_forward_mode=overrides.get("original_mode"),
             tbo_parent_token_range=overrides.get("tbo"),
             batch_size=overrides.get("batch_size", 1),
         )
@@ -58,6 +58,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         for case in (
             {"enabled": False},
             {"mode": ForwardMode.DECODE},
+            {"original_mode": ForwardMode.DECODE},
             {"batch_size": 2},
             {"tbo": (1, 2)},
             {"prefill_graph": True},
@@ -101,6 +102,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         )
         torch.testing.assert_close(plan.page_table, page_table[:1])
         torch.testing.assert_close(plan.ke, c4_seq_lens)
+        torch.testing.assert_close(plan.gather_seq_lens, c4_seq_lens[-1:])
 
         metadata.nonpaged_plan = None
         batch.extend_seq_lens_cpu = [2, 2]
