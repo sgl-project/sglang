@@ -273,6 +273,13 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
+    if server_args.device == "cpu" and not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap schedule is disabled for speculative decoding on CPU "
+            "(the overlap spec path is not supported on CPU yet)."
+        )
+
     if server_args.disable_overlap_schedule:
         logger.warning(
             "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "
@@ -406,8 +413,11 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("Ngram speculative decoding only supports CUDA device.")
+    if server_args.device == "cpu" and not server_args.disable_overlap_schedule:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap schedule is not implemented for speculative decoding on CPU."
+        )
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48

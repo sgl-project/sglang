@@ -4514,6 +4514,17 @@ class ServerArgs:
             return
 
         self.uses_mamba_radix_cache = True
+
+        if (
+            is_cpu()
+            and self.speculative_eagle_topk is not None
+            and self.speculative_eagle_topk > 1
+        ):
+            # The CPU causal-conv kernel is not tree-aware.
+            raise ValueError(
+                "speculative_eagle_topk > 1 is not supported for hybrid GDN models on CPU"
+            )
+
         if self.mamba_radix_cache_strategy == "auto":
             wants_overlap = not self.disable_overlap_schedule
             wants_paging = self.page_size is not None and self.page_size > 1
@@ -4528,7 +4539,17 @@ class ServerArgs:
         if self.enable_mamba_extra_buffer():
             self._validate_mamba_extra_buffer(model_arch)
         else:
-            self._validate_mamba_no_buffer(model_arch)
+            if is_cpu():
+                # On CPU, extra_buffer is unsupported.
+                # Automatically disable radix cache instead.
+                logger.warning(
+                    f"Speculative decoding for {model_arch} is not compatible "
+                    "with radix cache when using --mamba-scheduler-strategy "
+                    "no_buffer on CPU. Automatically disabling radix cache."
+                )
+                self.disable_radix_cache = True
+            else:
+                self._validate_mamba_no_buffer(model_arch)
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:

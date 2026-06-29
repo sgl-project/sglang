@@ -10,8 +10,23 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+
+
+def _draft_runner_of(worker):
+    """Draft model_runner accessor across worker shapes.
+
+    v2 draft workers (`EagleDraftWorker` and subclasses) expose the draft
+    model_runner as `draft_runner`; fall back to `model_runner` for workers
+    that run the draft model directly.
+    """
+    return (
+        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
+    )
 
 
 @dataclass
@@ -60,18 +75,19 @@ class EagleVerifyInput(SpecInput):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+        device = "cpu" if _is_cpu else "cuda"
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_cum_len=None,
             topk=topk,
