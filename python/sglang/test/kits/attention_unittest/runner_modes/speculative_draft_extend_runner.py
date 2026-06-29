@@ -470,10 +470,6 @@ class _EagleDraftExtendWorkerHarness:
         self.hot_token_id = None
         self.model_runner.model = model_forward
 
-    @property
-    def draft_model_runner(self):
-        return self.model_runner
-
 
 class _EagleDraftExtendV2WorkerHarness:
     def __init__(

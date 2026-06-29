@@ -43,20 +43,6 @@ from sglang.srt.managers.io_struct import (
 logger = logging.getLogger(__name__)
 
 
-def _get_draft_model_runner(draft_worker):
-    # DFlash / FrozenKVMTP workers expose draft_model_runner directly
-    runner = getattr(draft_worker, "draft_model_runner", None)
-    if runner is not None:
-        return runner
-    # EAGLEWorkerV2: _draft_worker.draft_runner
-    inner = getattr(draft_worker, "_draft_worker", None)
-    if inner is not None:
-        runner = getattr(inner, "draft_runner", None)
-        if runner is not None:
-            return runner
-    return None
-
-
 def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     merged_checksums = dict(target["checksums"])
     for name, chk in draft["checksums"].items():
@@ -273,7 +259,7 @@ class SchedulerWeightUpdaterManager:
             )
 
             if self.draft_worker is not None:
-                draft_runner = _get_draft_model_runner(self.draft_worker)
+                draft_runner = self.draft_worker.draft_runner
                 if draft_runner is not None:
                     draft_payload = draft_runner.check_weights(
                         action=recv_req.action,

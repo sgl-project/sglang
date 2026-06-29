@@ -1127,7 +1127,6 @@ class Scheduler(
         draft_token_to_kv_pool, model_config = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
         )
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config

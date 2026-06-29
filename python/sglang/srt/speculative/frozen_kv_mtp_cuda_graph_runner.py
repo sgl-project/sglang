@@ -77,7 +77,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
 
     def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPDraftWorker):
         self.frozen_kv_mtp_worker = frozen_kv_mtp_worker
-        self.model_runner = model_runner = frozen_kv_mtp_worker.draft_model_runner
+        self.model_runner = model_runner = frozen_kv_mtp_worker.draft_runner
 
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)

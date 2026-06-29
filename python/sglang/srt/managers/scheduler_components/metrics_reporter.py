@@ -184,12 +184,8 @@ class SchedulerMetricsReporter:
         timer = self.forward_pass_device_timer
         self.scheduler.tp_worker.model_runner.device_timer = timer
         if self.scheduler.draft_worker is not None:
-            dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
-            if dw is not None:
-                if hasattr(dw, "draft_runner"):
-                    dw.draft_runner.device_timer = timer
-                for r in getattr(dw, "draft_runner_list", []):
-                    r.device_timer = timer
+            for r in self.scheduler.draft_worker.draft_runners:
+                r.device_timer = timer
 
     def _init_fpm(self):
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
