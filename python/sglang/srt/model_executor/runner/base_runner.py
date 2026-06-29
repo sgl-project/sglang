@@ -293,7 +293,13 @@ class BaseRunner(ABC):
             get_fp4_gemm_runner_backend,
         )
 
-        model_uses_fp4 = mr.model_config.quantization in (
+        if hasattr(mr.model_config, "quantization"):
+            model_quantization = mr.model_config.quantization
+        elif getattr(mr, "is_draft_worker", False):
+            model_quantization = mr.server_args.speculative_draft_model_quantization
+        else:
+            model_quantization = mr.server_args.quantization
+        model_uses_fp4 = model_quantization in (
             "modelopt_fp4",
             "modelopt_mixed",
         )
@@ -307,7 +313,7 @@ class BaseRunner(ABC):
         )
         from sglang.srt.utils import is_sm100_supported
 
-        model_uses_modelopt_fp8 = mr.model_config.quantization in (
+        model_uses_modelopt_fp8 = model_quantization in (
             "modelopt",
             "modelopt_fp8",
             "modelopt_mixed",
@@ -317,7 +323,7 @@ class BaseRunner(ABC):
         # exercise correctly -- it triggers an illegal memory access inside the
         # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
         # tuning, so skip autotune for these models.
-        model_uses_mxfp8 = "mxfp8" in (mr.model_config.quantization or "")
+        model_uses_mxfp8 = "mxfp8" in (model_quantization or "")
         fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
             get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
             or (model_uses_modelopt_fp8 and is_sm100_supported())
