@@ -20,7 +20,7 @@ class MooncakeEmbeddingStore(MooncakeBaseStore):
             self.config.local_hostname,
             self.config.metadata_server,
             self.config.global_segment_size,
-            16 * 1024 * 1024,  # Internal local buffer size
+            self.config.local_buffer_size,
             self.config.protocol,
             self.config.device_name,
             self.config.master_server_address,
