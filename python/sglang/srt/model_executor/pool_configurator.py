@@ -21,8 +21,12 @@ import torch
 
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
+    get_minimax_sparse_attention_config,
+    get_minimax_sparse_disable_value_layer_ids,
+    get_minimax_sparse_layer_ids,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_minimax_sparse,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -200,6 +204,44 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
+        elif is_minimax_sparse(model_config.hf_config):
+            # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
+            # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
+            sparse_cfg = get_minimax_sparse_attention_config(model_config.hf_config)
+            dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+            indexer_k_only_layer_ids = set(
+                get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
+            )
+
+            local_dense_layer_ids = [
+                l for l in dense_layer_ids if mr.start_layer <= l < mr.end_layer
+            ]
+            local_sparse_layer_ids = [
+                l for l in sparse_layer_ids if mr.start_layer <= l < mr.end_layer
+            ]
+            num_dense = len(local_dense_layer_ids)
+            num_sparse = len(local_sparse_layer_ids)
+            num_indexer_k_only = sum(
+                1 for l in local_sparse_layer_ids if l in indexer_k_only_layer_ids
+            )
+            num_indexer_kv = num_sparse - num_indexer_k_only
+
+            kv_heads = model_config.get_num_kv_heads(get_attention_tp_size())
+            head_dim = model_config.head_dim
+            indexer_head_dim = sparse_cfg["sparse_index_dim"]
+            indexer_dtype_size = torch._utils._element_size(mr.dtype)
+
+            main_pool_bytes = (
+                (num_dense + num_sparse) * 2 * kv_heads * head_dim * kv_size
+            )
+            indexer_bytes = (
+                (num_indexer_kv * 2 + num_indexer_k_only)
+                * indexer_head_dim
+                * indexer_dtype_size
+            )
+            # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
+            # cell_size is already a sum over heterogeneous sub-pools.
+            return main_pool_bytes + indexer_bytes
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)
