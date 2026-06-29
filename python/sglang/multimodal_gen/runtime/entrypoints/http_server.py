@@ -296,7 +296,7 @@ async def forward_to_scheduler(
             output_file_path = response.output_file_paths[0]
         else:
             output_file_path = sp.output_file_path()
-            save_outputs(
+            output_paths = save_outputs(
                 [response.output[0]],
                 sp.data_type,
                 sp.fps,
@@ -312,6 +312,7 @@ async def forward_to_scheduler(
                 upscaling_model_path=sp.upscaling_model_path,
                 upscaling_scale=sp.upscaling_scale,
             )
+            output_file_path = output_paths[0] if output_paths else output_file_path
 
         if hasattr(response, "model_dump"):
             data = response.model_dump()

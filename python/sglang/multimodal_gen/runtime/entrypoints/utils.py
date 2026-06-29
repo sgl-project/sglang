@@ -43,6 +43,17 @@ from sglang.srt.observability.trace import TraceReqContext
 logger = init_logger(__name__)
 
 
+# Video outputs are written through imageio/ffmpeg as MP4/H.264 and optional
+# audio muxing also targets MP4. Keep the visible path aligned with the
+# container we actually create.
+VIDEO_OUTPUT_EXTENSIONS = frozenset({".mp4"})
+
+# Audio sample-rate bounds used for best-effort validation/inference.
+MIN_AUDIO_SAMPLE_RATE = 8000
+MAX_AUDIO_SAMPLE_RATE = 192000
+DEFAULT_AUDIO_SAMPLE_RATE = 24000
+
+
 @dataclass
 class SetLoraReq:
     lora_nickname: Union[str, List[str]]
@@ -293,8 +304,10 @@ def _pick_audio_sample_rate(
 ) -> int:
     """Pick a plausible sample rate, falling back to inferring from video duration."""
     selected_sr = int(audio_sample_rate) if audio_sample_rate is not None else None
-    if selected_sr is None or not (8000 <= selected_sr <= 192000):
-        selected_sr = 24000
+    if selected_sr is None or not (
+        MIN_AUDIO_SAMPLE_RATE <= selected_sr <= MAX_AUDIO_SAMPLE_RATE
+    ):
+        selected_sr = DEFAULT_AUDIO_SAMPLE_RATE
         try:
             duration_s = float(num_frames) / float(fps) if fps else 0.0
             if duration_s > 0:
@@ -304,11 +317,66 @@ def _pick_audio_sample_rate(
                     else int(audio_np.shape[-1])
                 )
                 inferred_sr = int(round(float(audio_len) / duration_s))
-                if 8000 <= inferred_sr <= 192000:
+                if MIN_AUDIO_SAMPLE_RATE <= inferred_sr <= MAX_AUDIO_SAMPLE_RATE:
                     selected_sr = inferred_sr
         except Exception:
             pass
     return selected_sr
+
+
+def _ensure_parent_dir(file_path: str) -> None:
+    parent_dir = os.path.dirname(file_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+
+def _normalize_video_output_path(
+    save_file_path: Optional[str], data_type: DataType
+) -> Optional[str]:
+    if data_type != DataType.VIDEO or not save_file_path:
+        return save_file_path
+
+    _, ext = os.path.splitext(save_file_path)
+    if ext.lower() in VIDEO_OUTPUT_EXTENSIONS:
+        return save_file_path
+
+    base = save_file_path if not ext else save_file_path[: -len(ext)]
+    corrected_path = f"{base}.mp4"
+    logger.warning(
+        "Video output path %s has non-video extension %s; saving as %s",
+        save_file_path,
+        ext or "<none>",
+        corrected_path,
+    )
+    return corrected_path
+
+
+def _write_video_frames(
+    *,
+    save_file_path: str,
+    frames: list[Any],
+    fps: int,
+    output_compression: Optional[int],
+) -> None:
+    mimsave_kwargs: dict[str, Any] = {
+        "fps": fps,
+        "format": DataType.VIDEO.get_default_extension(),
+        "codec": "libx264",
+    }
+    if output_compression is not None:
+        mimsave_kwargs["quality"] = output_compression / 10
+
+    try:
+        imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
+    except TypeError:
+        if "quality" not in mimsave_kwargs:
+            raise
+        logger.warning(
+            "Video writer rejected the quality option; retrying without it",
+            exc_info=True,
+        )
+        mimsave_kwargs.pop("quality", None)
+        imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
 
 
 def _resolve_ffmpeg_exe() -> str:
@@ -578,23 +646,21 @@ def save_materialized_output(
     save_output: bool = True,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
-) -> None:
+) -> Optional[str]:
     if not save_output:
-        return
+        return save_file_path
     if not save_file_path:
-        logger.info(f"No output path provided, output not saved")
-        return
+        logger.info("No output path provided, output not saved")
+        return save_file_path
 
-    os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+    save_file_path = _normalize_video_output_path(save_file_path, data_type)
+    _ensure_parent_dir(save_file_path)
     if data_type == DataType.VIDEO:
-        quality = output_compression / 10 if output_compression is not None else 5
-        imageio.mimsave(
-            save_file_path,
-            materialized.frames,
+        _write_video_frames(
+            save_file_path=save_file_path,
+            frames=materialized.frames,
             fps=materialized.fps,
-            format=data_type.get_default_extension(),
-            codec="libx264",
-            quality=quality,
+            output_compression=output_compression,
         )
 
         _maybe_mux_audio_into_mp4(
@@ -619,6 +685,7 @@ def save_materialized_output(
                 save_file_path, materialized.frames[0], quality, output_compression
             )
     logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
+    return save_file_path
 
 
 def _save_image_frame(
@@ -660,6 +727,7 @@ def save_outputs(
     output_paths: list[str] = []
     for idx, sample in enumerate(outputs):
         save_file_path = build_output_path(idx)
+        save_file_path = _normalize_video_output_path(save_file_path, data_type)
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
 
@@ -722,7 +790,7 @@ def post_process_sample(
         upscaling_model_path=upscaling_model_path,
         upscaling_scale=upscaling_scale,
     )
-    save_materialized_output(
+    actual_save_file_path = save_materialized_output(
         materialized,
         data_type,
         save_file_path,
@@ -730,4 +798,6 @@ def post_process_sample(
         audio_sample_rate=audio_sample_rate,
         output_compression=output_compression,
     )
+    if actual_save_file_path != save_file_path:
+        logger.debug("Saved output path adjusted to %s", actual_save_file_path)
     return materialized.frames
