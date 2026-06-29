@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -135,14 +136,29 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
         if output is None:
             return None
+        if isinstance(output, (int, float, bool, str, bytes)):
+            return output
         if torch.is_tensor(output):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if dataclasses.is_dataclass(output):
+            return dataclasses.replace(
+                output,
+                **{
+                    field.name: self._slice_output(getattr(output, field.name), num_tokens)
+                    for field in dataclasses.fields(output)
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if isinstance(output, dict):
+            return {
+                key: self._slice_output(value, num_tokens)
+                for key, value in output.items()
+            }
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -155,6 +171,10 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
                 "BCG output structure changed between capture sizes: "
                 f"{type(output)} vs {type(output_buffer)}"
             )
+        if isinstance(output, (int, float, bool, str, bytes)) and isinstance(
+            output_buffer, (int, float, bool, str, bytes)
+        ):
+            return
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
             return
@@ -181,6 +201,28 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if dataclasses.is_dataclass(output) and dataclasses.is_dataclass(output_buffer):
+            if type(output) is not type(output_buffer):
+                raise ValueError(
+                    "BCG output dataclass structure changed between capture sizes: "
+                    f"{type(output)} != {type(output_buffer)}"
+                )
+            for field in dataclasses.fields(output):
+                self._copy_output_to_buffer(
+                    getattr(output, field.name),
+                    getattr(output_buffer, field.name),
+                    num_tokens,
+                )
+            return
+        if isinstance(output, dict) and isinstance(output_buffer, dict):
+            if output.keys() != output_buffer.keys():
+                raise ValueError(
+                    "BCG output dict structure changed between capture sizes: "
+                    f"{output.keys()} != {output_buffer.keys()}"
+                )
+            for key in output:
+                self._copy_output_to_buffer(output[key], output_buffer[key], num_tokens)
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "

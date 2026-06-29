@@ -1735,6 +1735,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
+    @property
+    def enable_flashinfer_cutedsl_sm120_moe(self) -> bool:
+        """Access the global enable_flashinfer_cutedsl_sm120_moe setting."""
+        from sglang.srt.layers.moe import get_moe_runner_backend
+
+        return get_moe_runner_backend().is_flashinfer_cutedsl_sm120()
+
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
     # "v1": cutedsl + deepep low-latency.
@@ -1972,7 +1979,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
-        elif self.enable_flashinfer_cutedsl_moe:
+        elif (
+            self.enable_flashinfer_cutedsl_moe
+            or self.enable_flashinfer_cutedsl_sm120_moe
+        ):
             # CuteDSL standard path uses a single scalar input scale (all experts).
             w13_input_scale = (
                 layer.w13_input_scale.max()
@@ -2243,7 +2253,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
         # The CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
         return self.moe_runner_config.is_gated and (
-            self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
+            self.enable_flashinfer_cutlass_moe
+            or self._is_cutedsl_v2_standard
+            or self.enable_flashinfer_cutedsl_sm120_moe
         )
 
     def create_moe_runner(
@@ -2264,6 +2276,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+        elif moe_runner_backend.is_flashinfer_cutedsl_sm120():
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl_sm120  # noqa: F401 – triggers fused func registration when backend is available
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -2349,6 +2363,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
             )
 
+            return self.runner.run(dispatch_output, quant_info)
+
+        if self.enable_flashinfer_cutedsl_sm120_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl_sm120 import (
+                CuteDslSm120Fp4MoeQuantInfo,
+                ensure_cutedsl_sm120_runtime,
+            )
+
+            ensure_cutedsl_sm120_runtime(layer)
+            w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_sm120_scales
+            quant_info = CuteDslSm120Fp4MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_sf=layer.w13_blockscale_swizzled,
+                w2_weight_sf=layer.w2_blockscale_swizzled,
+                w1_alpha=w1_alpha,
+                w2_alpha=w2_alpha,
+                a1_scale=layer._cutedsl_sm120_input_scale,
+                a2_scale=fc2_input_scale,
+            )
             return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutedsl_moe:

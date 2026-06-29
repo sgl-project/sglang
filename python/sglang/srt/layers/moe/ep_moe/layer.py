@@ -97,7 +97,10 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
-            get_moe_runner_backend().is_flashinfer_cutedsl()
+            (
+                get_moe_runner_backend().is_flashinfer_cutedsl()
+                or get_moe_runner_backend().is_flashinfer_cutedsl_sm120()
+            )
             and quant_config is not None
             and quant_config.get_name() == "modelopt_fp4"
         ):

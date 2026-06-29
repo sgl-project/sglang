@@ -241,6 +241,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_cutedsl_sm120",
     "cutlass",
     "aiter",
     "marlin",
@@ -5340,7 +5341,7 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
-        if self.moe_runner_backend == "flashinfer_cutedsl":
+        if self.moe_runner_backend in ["flashinfer_cutedsl", "flashinfer_cutedsl_sm120"]:
             assert self.quantization in [
                 "modelopt_fp4"
             ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
@@ -5348,14 +5349,23 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-            assert self.moe_a2a_backend in [
-                "none",
-                "deepep",
-                "flashinfer",
-            ], (
-                f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
-                f"got '{self.moe_a2a_backend}'."
-            )
+            if self.moe_runner_backend == "flashinfer_cutedsl":
+                assert self.moe_a2a_backend in [
+                    "none",
+                    "deepep",
+                    "flashinfer",
+                ], (
+                    f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
+                    f"got '{self.moe_a2a_backend}'."
+                )
+            else:
+                assert self.moe_a2a_backend in [
+                    "none",
+                    "flashinfer",
+                ], (
+                    "flashinfer_cutedsl_sm120 supports moe_a2a_backend='none' or "
+                    f"'flashinfer', got '{self.moe_a2a_backend}'."
+                )
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -5572,7 +5582,8 @@ class ServerArgs:
             assert self.moe_runner_backend in [
                 "flashinfer_cutlass",
                 "flashinfer_cutedsl",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass or flashinfer_cutedsl moe runner backend"
+                "flashinfer_cutedsl_sm120",
+            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl, or flashinfer_cutedsl_sm120 moe runner backend"
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size

@@ -122,6 +122,7 @@ def _moe_runner_keeps_global_expert_ids() -> bool:
         return (
             b.is_flashinfer_cutlass()
             or b.is_flashinfer_cutedsl()
+            or b.is_flashinfer_cutedsl_sm120()
             or b.is_experimental_sgl_trtllm()
             or b.is_flashinfer_trtllm_routed()
         )
