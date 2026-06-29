@@ -1,3 +1,8 @@
+---
+title: "GLM-5.2 examples"
+description: "Deploy GLM-5.2 with SGLang on Ascend NPUs, including single-node, multi-node, and Prefill-Decode disaggregation modes."
+---
+
 # GLM-5.2 examples
 
 ## Introduction
@@ -10,14 +15,14 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 - `GLM-5.2`(BF16 version): [Download model weight](https://huggingface.co/collections/zai-org/glm-52).
 - `GLM-5.2-w8a8`(Quantized version without mtp): [Download model weight](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/).
-- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
+- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model naively.
 
 
 ### Installation
 
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
-```{code-block} bash
+```bash
 #Atlas 800 A3
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.0.0-a3-glm5.2-20260615
 #Atlas 800 A2
@@ -240,7 +245,7 @@ do
         --mem-fraction-static 0.8 \
         --port 8000 \
         --served-model-name glm-5 \
-        --cuda-graph-max-bs 32 \
+        --cuda-graph-max-bs-decode 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --speculative-draft-model-quantization unquant \
@@ -250,7 +255,6 @@ do
         break
     fi
 done
-
 ```
 
 ### Prefill-Decode Disaggregation
@@ -348,7 +352,7 @@ do
         --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --ep-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
-        --cuda-graph-max-bs 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --cuda-graph-max-bs-decode 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
         --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
@@ -356,9 +360,6 @@ do
         break
     fi
 done
-
-exit 1
-
 ```
 
 ```shell
@@ -373,4 +374,4 @@ python3 -m sglang_router.launch_router \
 
 ### Using Benchmark
 
-Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.md) for details.
+Refer to [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling) for details.

@@ -24,7 +24,8 @@
 //                      benchmark card + "⚡ Reproduce". NO engine default:
 //                      required whenever benchmarks carry accuracy data
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
-//   dockerImages       optional — per-hw image for `docker run` mode
+//   dockerImages       optional — `docker run` image, keyed by `hw|quant`
+//                      then `hw`; falls back to `lmsysorg/sglang:dev`
 //   github             optional — "Submit verified cell" issue-template overrides
 //   playgroundFeatures optional — consumed by _playground.jsx (see its header)
 //
@@ -500,8 +501,9 @@ export const Deployment = ({ config, benchmarks }) => {
 
     let cmd;
     if (mode === "docker") {
-      // Image picked by hardware; falls back to `:dev` if unmapped.
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped.
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = flags.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const vendorOf = (hwId) => {
