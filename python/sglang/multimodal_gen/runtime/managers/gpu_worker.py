@@ -372,11 +372,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
     ) -> OutputBatch | Req:
-        """
+        """Run a pipeline forward and attach runtime metadata.
+
         Args:
-            forward_fn: the actual forward function for reqs
+            forward_fn: The forward function for the request group.
         """
         output_batch = None
+        pre_forward_reserved_mb = self._get_current_reserved_memory_mb()
         try:
             if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
@@ -384,7 +386,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             start_time = time.monotonic()
             self._realtime_sessions.attach(req)
 
-            # capture memory baseline for each req in grouped forward on rank-0
+            # Capture request memory baselines for grouped forwards on rank 0.
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
@@ -402,13 +404,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     )
                 result = forward_fn()
 
-            # disagg roles return raw Req so callers can keep and transfer intermediate tensors
-            # before converting it to OutputBatch
+            # disagg roles return raw Req so callers can keep and transfer
+            # intermediate tensors before converting it to OutputBatch
             if return_req and isinstance(result, Req):
                 return result
 
             output_batch = self._to_output_batch(result)
-            self._record_output_peak_memory(output_batch)
+            self._record_output_memory_stats(
+                output_batch,
+                pre_forward_reserved_mb=pre_forward_reserved_mb,
+            )
 
             output_metrics = self._iter_output_metrics(output_batch)
             if self.rank == 0 and output_metrics and not current_platform.is_cpu():
@@ -458,13 +463,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 f"Error executing {error_context}: {e}",
                 exc_info=True,
             )
-            if isinstance(e, _oom_exceptions()):
+            is_oom = isinstance(e, _oom_exceptions())
+            if is_oom:
                 logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
-            self._record_output_peak_memory(output_batch)
-            # clean cache if OOM
+            output_batch.is_oom = is_oom
+            self._record_output_memory_stats(
+                output_batch,
+                pre_forward_reserved_mb=pre_forward_reserved_mb,
+            )
+            # Release cached blocks after failures.
             if torch.cuda.is_initialized():
                 torch.cuda.empty_cache()
         return output_batch
@@ -577,11 +587,51 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         return np.asarray(materialized.frames)
 
-    def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
-        if self.rank != 0 or current_platform.is_cpu():
+    @staticmethod
+    def _get_current_reserved_memory_mb() -> float:
+        """Return current allocator-reserved memory in MiB."""
+        return current_platform.get_process_reserved_memory_mb() or 0.0
+
+    def _record_output_memory_stats(
+        self, output_batch: OutputBatch, *, pre_forward_reserved_mb: float
+    ) -> None:
+        """Attach allocator peak stats used by memory-aware admission."""
+        if current_platform.is_cpu():
             return
-        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        should_reduce_peaks = (
+            output_batch.error is None
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        if self.rank != 0 and not should_reduce_peaks:
+            return
+
+        device_module = torch.get_device_module()
+        peak_reserved_mb = float(device_module.max_memory_reserved()) / (1024**2)
+        peak_allocated_mb = float(device_module.max_memory_allocated()) / (1024**2)
+
+        # Avoid collectives on error paths; failed ranks may not reach this point.
+        if should_reduce_peaks:
+            device_type = (
+                "cuda"
+                if current_platform.is_cuda() or current_platform.is_rocm()
+                else current_platform.device_name.lower()
+            )
+            peaks = torch.tensor(
+                [pre_forward_reserved_mb, peak_reserved_mb, peak_allocated_mb],
+                dtype=torch.float32,
+                device=f"{device_type}:{device_module.current_device()}",
+            )
+            torch.distributed.all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
+            pre_forward_reserved_mb = float(peaks[0].item())
+            peak_reserved_mb = float(peaks[1].item())
+            peak_allocated_mb = float(peaks[2].item())
+
+        if self.rank != 0:
+            return
+        output_batch.pre_forward_reserved_memory_mb = pre_forward_reserved_mb
+        output_batch.peak_memory_mb = peak_reserved_mb
+        output_batch.peak_allocated_memory_mb = peak_allocated_mb
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -756,7 +806,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
+        merged.is_oom = merged.is_oom or output_batch.is_oom
+        merged.pre_forward_reserved_memory_mb = max(
+            merged.pre_forward_reserved_memory_mb,
+            output_batch.pre_forward_reserved_memory_mb,
+        )
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        merged.peak_allocated_memory_mb = max(
+            merged.peak_allocated_memory_mb,
+            output_batch.peak_allocated_memory_mb,
+        )
         if (
             merged.trajectory_timesteps is None
             and output_batch.trajectory_timesteps is not None

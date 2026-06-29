@@ -225,13 +225,13 @@ class Req:
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
-        for name, field in self.__class__.__dataclass_fields__.items():
+        for name, field_info in self.__class__.__dataclass_fields__.items():
             if name in kwargs:
                 object.__setattr__(self, name, kwargs.pop(name))
-            elif field.default is not MISSING:
-                object.__setattr__(self, name, field.default)
-            elif field.default_factory is not MISSING:
-                object.__setattr__(self, name, field.default_factory())
+            elif field_info.default is not MISSING:
+                object.__setattr__(self, name, field_info.default)
+            elif field_info.default_factory is not MISSING:
+                object.__setattr__(self, name, field_info.default_factory())
 
         for name, value in kwargs.items():
             setattr(self, name, value)
@@ -427,7 +427,15 @@ class OutputBatch:
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
+
+    # Runtime memory metadata used by dynamic batch admission.
+    pre_forward_reserved_memory_mb: float = 0.0
     peak_memory_mb: float = 0.0
+    peak_allocated_memory_mb: float = 0.0
+    is_oom: bool = False
+    dynamic_batch_size: int = 1
+    dynamic_batch_capacity: int = 1
+    dynamic_batch_stop_reason: str | None = None
 
     def drop_payload_for_warmup(self) -> None:
         self.output = None
