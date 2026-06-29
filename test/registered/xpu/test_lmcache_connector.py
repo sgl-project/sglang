@@ -27,7 +27,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
 os.environ.setdefault(
     "LMCACHE_CONFIG_FILE",
-    os.path.join(os.path.dirname(__file__), "test_xpu_config.yaml"),
+    os.path.join(os.path.dirname(__file__), "test_lmcache_connector_config.yaml"),
 )
 
 try:
