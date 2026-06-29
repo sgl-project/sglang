@@ -107,7 +107,11 @@ def _can_fuse_causal_conv3d_cat_pad(
     cache_x: torch.Tensor | None,
     padding: list[int],
 ) -> bool:
-    if cache_x is None or fused_causal_conv3d_cat_pad is None:
+    if (
+        cache_x is None
+        or fused_causal_conv3d_cat_pad is None
+        or not current_platform.is_cuda()
+    ):
         return False
     if not x.is_cuda or not x.is_contiguous() or not cache_x.is_contiguous():
         return False
