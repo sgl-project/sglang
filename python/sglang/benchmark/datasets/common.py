@@ -1,11 +1,14 @@
+import json
 import random
 from abc import ABC, abstractmethod
 from argparse import Namespace
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
 
 ASSISTANT_SUFFIX = "Assistant:"
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
@@ -16,6 +19,44 @@ MOONCAKE_DATASET_URL = {
     "synthetic": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/synthetic_trace.jsonl",
     "toolagent": "https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces/toolagent_trace.jsonl",
 }
+
+
+def load_sharegpt_conversations(dataset_path: str) -> List[Tuple[str, str]]:
+    """Load ShareGPT dataset and return (prompt, completion) pairs.
+
+    Downloads the dataset if the path is invalid, filters to conversations
+    with ≥2 turns, extracts the first two turns, and shuffles the result.
+    """
+    if not is_file_valid_json(dataset_path):
+        dataset_path = download_and_cache_hf_file(
+            repo_id=SHAREGPT_REPO_ID,
+            filename=SHAREGPT_FILENAME,
+        )
+    with open(dataset_path) as f:
+        dataset = json.load(f)
+    dataset = [
+        data
+        for data in dataset
+        if len(data.get("conversations", data.get("conversation", []))) >= 2
+    ]
+    dataset = [
+        (
+            data.get("conversations", data.get("conversation", []))[0]["value"],
+            data.get("conversations", data.get("conversation", []))[1]["value"],
+        )
+        for data in dataset
+    ]
+    if not dataset:
+        raise ValueError(
+            f"No valid conversations with at least 2 turns found in dataset: {dataset_path}"
+        )
+    random.shuffle(dataset)
+    return dataset
+
+
+def load_sharegpt_prompts(dataset_path: str) -> List[str]:
+    """Load ShareGPT dataset and return first-turn user messages only."""
+    return [prompt for prompt, _ in load_sharegpt_conversations(dataset_path)]
 
 
 @dataclass

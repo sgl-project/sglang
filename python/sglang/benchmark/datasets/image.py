@@ -1,4 +1,5 @@
 import io
+import random
 import warnings
 from argparse import Namespace
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from sglang.benchmark.datasets.common import (
     DatasetRow,
     compute_random_lens,
     gen_mm_prompt,
+    load_sharegpt_prompts,
 )
 from sglang.benchmark.utils import get_processor
 
@@ -30,6 +32,7 @@ class ImageDataset(BaseDataset):
     image_resolution: str
     backend: str
     random_image_count: bool
+    dataset_path: str = ""
 
     @classmethod
     def from_args(cls, args: Namespace) -> "ImageDataset":
@@ -44,6 +47,7 @@ class ImageDataset(BaseDataset):
             image_resolution=args.image_resolution,
             backend=args.backend,
             random_image_count=args.random_image_count,
+            dataset_path=args.dataset_path,
         )
 
     def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
@@ -60,6 +64,7 @@ class ImageDataset(BaseDataset):
             image_resolution=self.image_resolution,
             backend=self.backend,
             random_image_count=self.random_image_count,
+            dataset_path=self.dataset_path,
         )
 
 
@@ -194,6 +199,49 @@ def create_mm_data_row(
     )
 
 
+def _gen_sharegpt_text_prompts(
+    tokenizer,
+    dataset_path: str,
+    input_lens: List[int],
+) -> List[str]:
+    """Generate text prompts from ShareGPT conversations, matching target token lengths.
+
+    Uses the same logic as the random dataset: samples from real ShareGPT conversations,
+    tokenizes, truncates/repeats to match target length, then decodes back to text.
+    If there are not enough conversations to cover all requests, the dataset is
+    reshuffled and reused cyclically.
+    """
+    dataset = load_sharegpt_prompts(dataset_path)
+
+    prompts: List[str] = []
+    data_iter = iter(dataset)
+
+    for target_len in input_lens:
+        # Find a non-empty prompt (cycle through dataset if needed)
+        prompt_token_ids = []
+        while not prompt_token_ids:
+            try:
+                candidate = next(data_iter)
+            except StopIteration:
+                # Re-shuffle and restart
+                random.shuffle(dataset)
+                data_iter = iter(dataset)
+                candidate = next(data_iter)
+            prompt_token_ids = tokenizer.encode(candidate)
+
+        prompt_len = len(prompt_token_ids)
+
+        if prompt_len > target_len:
+            input_ids = prompt_token_ids[:target_len]
+        else:
+            ratio = (target_len + prompt_len - 1) // prompt_len
+            input_ids = (prompt_token_ids * ratio)[:target_len]
+
+        prompts.append(tokenizer.decode(input_ids))
+
+    return prompts
+
+
 def sample_image_requests(
     num_requests: int,
     image_count: int,
@@ -206,6 +254,7 @@ def sample_image_requests(
     image_resolution: str,
     backend: str,
     random_image_count: bool = False,
+    dataset_path: str = "",
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -270,16 +319,32 @@ def sample_image_requests(
 
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
+
+    # Pre-generate text prompts: use ShareGPT if dataset_path is provided, otherwise random tokens
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if dataset_path:
+        print(f"Using ShareGPT dataset for text prompts: {dataset_path}")
+        text_prompts = _gen_sharegpt_text_prompts(tokenizer, dataset_path, input_lens)
+    else:
+        text_prompts = None
+
     for i in range(num_requests):
         # Get the number of images for this request
         request_image_count = int(image_counts[i])
 
         # Generate text prompt
-        text_prompt = gen_mm_prompt(
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor,
-            processor.image_token_id if hasattr(processor, "image_token_id") else None,
-            int(input_lens[i]),
-        )
+        if text_prompts is not None:
+            text_prompt = text_prompts[i]
+        else:
+            text_prompt = gen_mm_prompt(
+                tokenizer,
+                (
+                    processor.image_token_id
+                    if hasattr(processor, "image_token_id")
+                    else None
+                ),
+                int(input_lens[i]),
+            )
 
         # Generate image list
         images, images_base64, images_bytes = zip(

@@ -384,6 +384,26 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
         self.assertTrue(all(row.image_data for row in rows))
 
+    def test_image_sampler_with_sharegpt_dataset(self):
+        dataset_path = self._write_sharegpt_json()
+        rows = sample_image_requests(
+            num_requests=2,
+            image_count=1,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=self.processor,
+            image_content="blank",
+            image_format="png",
+            image_resolution="8x8",
+            backend="sglang",
+            random_image_count=False,
+            dataset_path=dataset_path,
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+        self.assertTrue(all(row.image_data for row in rows))
+
     def test_gen_mm_prompt_excludes_special_tokens(self):
         tokenizer = create_lightweight_tokenizer()
         multimodal_special_tokens = [
