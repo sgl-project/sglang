@@ -77,6 +77,7 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   // Preconditions:
   // 1. blockDim.x >= params.num_experts
   // 2. params.num_experts <= kMaxExperts
+  // Each thread scans one expert: expert_id = tx.
   using namespace device;
   static_assert(kWarpThreads == 32);
 
@@ -108,6 +109,50 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   return result;
 }
 
+[[maybe_unused]]
+SGL_DEVICE CTAWork get_work_two_experts(const SiluMulQuantVarlenParams& params) {
+  // Preconditions:
+  // 1. blockDim.x * 2 >= params.num_experts
+  // 2. params.num_experts <= kMaxExperts
+  // Each thread scans two consecutive experts: expert0 = 2 * tx, expert1 = 2 * tx + 1.
+  using namespace device;
+  static_assert(kWarpThreads == 32);
+
+  static __shared__ uint32_t s_warp_sum[32];
+  static __shared__ CTAWork result;
+
+  result.valid = false;
+
+  const uint32_t tx = threadIdx.x;
+  const uint32_t lane_id = tx % kWarpThreads;
+  const uint32_t warp_id = tx / kWarpThreads;
+
+  const uint32_t expert0 = tx * 2u;
+  const uint32_t expert1 = expert0 + 1u;
+  const uint32_t val0 = expert0 < params.num_experts ? params.masked_m[expert0] : 0u;
+  const uint32_t val1 = expert1 < params.num_experts ? params.masked_m[expert1] : 0u;
+  const uint32_t val = val0 + val1;
+
+  const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
+  const uint32_t warp_exclusive = warp_inclusive - val;
+
+  if (lane_id == kWarpThreads - 1) s_warp_sum[warp_id] = warp_inclusive;
+  __syncthreads();
+  const auto tmp_val = lane_id < warp_id ? s_warp_sum[lane_id] : 0u;
+  const auto prefix_exclusive = warp::reduce_sum(tmp_val) + warp_exclusive;
+  const auto bx = blockIdx.x;
+  if (prefix_exclusive <= bx && bx < prefix_exclusive + val) {
+    const uint32_t local = bx - prefix_exclusive;
+    if (local < val0) {
+      result = {expert0, local, true};
+    } else {
+      result = {expert1, local - val0, true};
+    }
+  }
+  __syncthreads();
+  return result;
+}
+
 template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {
@@ -121,7 +166,8 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   static_assert(8 * kWorkThreads == 128, "Invalid tiling");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
-  const auto [expert_id, token_id, valid] = get_work(params);
+  const auto [expert_id, token_id, valid] =
+      blockDim.x >= params.num_experts ? get_work(params) : get_work_two_experts(params);
 
   if (!valid) return;
 
@@ -130,6 +176,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   const auto offset = expert_id * params.num_tokens + token_id;
   const auto input = params.input + offset * params.hidden_dim * 2;
   const auto output = params.output + offset * params.hidden_dim;
+  const auto compute_threads = static_cast<uint32_t>(params.hidden_dim / 8);
   [[maybe_unused]]
   const auto output_scale = [&] {
     const auto num_groups = params.hidden_dim / kGroupSize;
@@ -157,7 +204,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     up_vec.load(input, threadIdx.x * 2 + 1);
   } else {
     gate_vec.load(input, threadIdx.x);
-    up_vec.load(input, threadIdx.x + blockDim.x);
+    up_vec.load(input, threadIdx.x + compute_threads);
   }
 
   float local_max = 0.0f;
@@ -314,9 +361,10 @@ struct SiluAndMulMaskedPostQuantKernel {
         .num_experts = num_experts,
     };
 
-    const auto num_threads = hidden_dim / 8;
+    const auto num_threads = static_cast<uint32_t>(hidden_dim / 8);
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
-    RuntimeCheck(num_threads >= num_experts);
+    RuntimeCheck(num_threads <= 1024, "hidden_dim too large for single-block-per-row launch");
+    RuntimeCheck(2 * num_threads >= num_experts, "two-expert scan requires 2 * num_threads >= num_experts");
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
     LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
@@ -518,6 +566,8 @@ struct SiluAndMulContigPostQuantKernel {
     }
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    // Early exit for empty batch
+    if (num_tokens == 0) return;
 
     const auto params = SiluMulQuantContigParams{
         .input = static_cast<const bf16_t*>(input.data_ptr()),
