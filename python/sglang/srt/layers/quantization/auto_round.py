@@ -244,9 +244,6 @@ class AutoRoundConfig(QuantizationConfig):
             sym,
         )
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "AutoRound AWQ on CPU requires an x86 CPU with AMX support."
             from sglang.srt.layers.quantization.awq import (
                 AWQCPUConfig,
                 AWQLinearMethod,
@@ -259,6 +256,9 @@ class AutoRoundConfig(QuantizationConfig):
                 zero_point=not sym,
             )
             if isinstance(layer, FusedMoE):
+                assert (
+                    _is_cpu_amx_available
+                ), "AutoRound AWQ MoE on CPU requires an x86 CPU with AMX support."
                 layer.scheme = quant_args.get_moe_scheme(layer)
                 return AWQMoEMethod(quant_args)
             if isinstance(layer, (LinearBase, ParallelLMHead)):
@@ -380,9 +380,6 @@ class AutoRoundConfig(QuantizationConfig):
             return None
 
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "AutoRound GPTQ on CPU requires an x86 CPU with AMX support."
             from sglang.srt.layers.quantization.gptq import CPUGPTQConfig
 
             quant_args = CPUGPTQConfig(
@@ -395,6 +392,9 @@ class AutoRoundConfig(QuantizationConfig):
             quant_args.sym = sym
 
             if isinstance(layer, FusedMoE):
+                assert (
+                    _is_cpu_amx_available
+                ), "AutoRound GPTQ MoE on CPU requires an x86 CPU with AMX support."
                 layer.scheme = quant_args.get_moe_scheme(layer)
                 return GPTQMoEMethod(quant_args)
 
@@ -447,19 +447,17 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             if use_marlin:
-                from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+                return GPTQMarlinMoEMethod(quant_args_marlin)
+            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
-                config = {
-                    "quant_method": "gptq",
-                    "bits": weight_bits,
-                    "group_size": group_size,
-                    "sym": sym,
-                    "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix
-                )
-            return GPTQMarlinMoEMethod(quant_args_marlin)
+            config = {
+                "quant_method": "gptq",
+                "bits": weight_bits,
+                "group_size": group_size,
+                "sym": sym,
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
@@ -471,6 +469,6 @@ class AutoRoundConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if "gptq" in self.packing_format or "gptq" in self.backend:
-            return self.apply_gptq_quant_layer(layer, prefix)
+            return self.apply_gptq_quant_layer(layer, prefix, self.backend)
         if "awq" in self.packing_format or "awq" in self.backend:
-            return self.apply_awq_quant_layer(layer, prefix)
+            return self.apply_awq_quant_layer(layer, prefix, self.backend)
