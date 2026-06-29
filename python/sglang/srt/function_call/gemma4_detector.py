@@ -285,12 +285,11 @@ class Gemma4Detector(BaseFormatDetector):
             if not matches:
                 return StreamingParseResult(normal_text=text)
 
-            tool_indices = self._get_tool_indices(tools)
-            for func_name, args_str in matches:
+            for i, (func_name, args_str) in enumerate(matches):
                 arguments = _parse_gemma4_args(args_str)
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices.get(func_name, -1),
+                        tool_index=i,
                         name=func_name,
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
@@ -377,9 +376,7 @@ class Gemma4Detector(BaseFormatDetector):
 
                                 calls.append(
                                     ToolCallItem(
-                                        tool_index=self._tool_indices.get(
-                                            func_name, -1
-                                        ),
+                                        tool_index=self.current_tool_id,
                                         name=func_name,
                                         parameters="",
                                     )
@@ -408,9 +405,7 @@ class Gemma4Detector(BaseFormatDetector):
 
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self._tool_indices.get(
-                                        self.current_func_name, -1
-                                    ),
+                                    tool_index=self.current_tool_id,
                                     parameters=json.dumps(
                                         arguments, ensure_ascii=False
                                     ),
