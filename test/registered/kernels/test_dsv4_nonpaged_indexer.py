@@ -91,13 +91,21 @@ class TestDeepSeekV4NonPagedIndexer(CustomTestCase):
         )
         page_table = page_order.unsqueeze(0).repeat(query_rows, 1)
 
-        k = torch.randn(
-            num_physical_pages,
-            PAGE_SIZE,
-            1,
-            HEAD_DIM,
-            dtype=torch.bfloat16,
-            device="cuda",
+        # Keep q/k/weights strictly positive so ReLU does not create a large
+        # zero-score tie at the top-k boundary. The production top-k kernel does
+        # not promise a stable ordering for equal scores; this test is about
+        # path parity and page remapping, not tie-breaking policy.
+        k = (
+            torch.rand(
+                num_physical_pages,
+                PAGE_SIZE,
+                1,
+                HEAD_DIM,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            .add_(0.125)
+            .to(torch.bfloat16)
         )
         k_scale = k.abs().float().amax(dim=3, keepdim=True).clamp(1.0e-4) / 448.0
         k_fp8 = (k.float() / k_scale).clamp(-448.0, 448.0).to(FP8_DTYPE)
@@ -114,19 +122,23 @@ class TestDeepSeekV4NonPagedIndexer(CustomTestCase):
             num_physical_pages, PAGE_SIZE, 1, HEAD_DIM + SCALE_BYTES
         )
 
-        q = torch.randn(
-            query_rows,
-            1,
-            num_heads,
-            HEAD_DIM,
-            dtype=torch.bfloat16,
-            device="cuda",
+        q = (
+            torch.rand(
+                query_rows,
+                1,
+                num_heads,
+                HEAD_DIM,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            .add_(0.125)
+            .to(torch.bfloat16)
         )
         q_scale = q.abs().float().amax(dim=3, keepdim=True).clamp(1.0e-4) / 448.0
         q_fp8 = (q.float() / q_scale).clamp(-448.0, 448.0).to(FP8_DTYPE)
-        base_weights = torch.randn(
+        base_weights = torch.rand(
             query_rows, num_heads, dtype=torch.float32, device="cuda"
-        )
+        ).add_(0.125)
         weights = (base_weights[:, None, :, None] * q_scale).view(query_rows, num_heads)
 
         ke = torch.arange(
@@ -203,12 +215,31 @@ class TestDeepSeekV4NonPagedIndexer(CustomTestCase):
             PAGE_SIZE,
             nonpaged_raw_indices,
         )
+        # The CUDA top-k kernel appends winners through atomics, so output order
+        # is intentionally non-stable. Compare the selected sets and validate
+        # each path's raw-to-physical page remapping independently.
+        sorted_paged_raw = paged_raw_indices.sort(dim=1).values
+        sorted_nonpaged_raw = nonpaged_raw_indices.sort(dim=1).values
         torch.testing.assert_close(
-            nonpaged_raw_indices, paged_raw_indices, rtol=0, atol=0
+            sorted_nonpaged_raw, sorted_paged_raw, rtol=0, atol=0
         )
-        torch.testing.assert_close(
-            nonpaged_page_indices, paged_page_indices, rtol=0, atol=0
-        )
+        for raw_indices, page_indices in (
+            (paged_raw_indices, paged_page_indices),
+            (nonpaged_raw_indices, nonpaged_page_indices),
+        ):
+            self.assertTrue(torch.all(raw_indices >= 0).item())
+            self.assertTrue(torch.all(raw_indices < ke.unsqueeze(1)).item())
+            sorted_raw = raw_indices.sort(dim=1).values
+            self.assertTrue(torch.all(sorted_raw[:, 1:] > sorted_raw[:, :-1]).item())
+            logical_page = torch.div(raw_indices, PAGE_SIZE, rounding_mode="floor")
+            offset_in_page = raw_indices % PAGE_SIZE
+            expected_page_indices = (
+                page_table.gather(1, logical_page.to(torch.int64)) * PAGE_SIZE
+                + offset_in_page
+            )
+            torch.testing.assert_close(
+                page_indices, expected_page_indices, rtol=0, atol=0
+            )
 
 
 if __name__ == "__main__":
