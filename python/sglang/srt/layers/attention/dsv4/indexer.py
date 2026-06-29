@@ -24,6 +24,12 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
 from sglang.srt.utils.common import is_sm120_supported
@@ -448,9 +454,12 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
+        # The gather plan is built from eager, child-local ForwardBatch metadata.
+        # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
             forward_batch.forward_mode != ForwardMode.EXTEND
             or getattr(forward_batch, "_original_forward_mode", None) is not None
+            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
             or forward_batch.batch_size != 1
             or indexer_metadata.use_prefill_cuda_graph
         ):
@@ -462,7 +471,12 @@ class C4IndexerBackendMixin:
             or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
             return False
-        if get_attention_cp_size() != 1 or self.hisparse_coordinator is not None:
+        if (
+            get_attention_cp_size() != 1
+            or self.hisparse_coordinator is not None
+            or is_in_tc_piecewise_cuda_graph()
+            or is_in_breakable_cuda_graph()
+        ):
             return False
         return not torch.cuda.is_current_stream_capturing()
 
@@ -530,8 +544,7 @@ class C4IndexerBackendMixin:
         if final_c4_len <= 0:
             return None
 
-        request_row = forward_batch.extend_start_loc[:1].to(torch.int64)
-        request_page_table = page_table.index_select(0, request_row).contiguous()
+        request_page_table = page_table[:1].contiguous()
         gather_seq_lens = torch.div(
             forward_batch.seq_lens[:1].to(torch.int32),
             4,
