@@ -303,7 +303,7 @@ export const Qwen3Deployment = () => {
 
     // Add tool call parser
     if (toolcall === 'enabled') {
-      cmd += ' \\\n  --tool-call-parser qwen25';
+      cmd += ' \\\n  --tool-call-parser qwen';
     }
 
     if (hardware === 'b300') {
