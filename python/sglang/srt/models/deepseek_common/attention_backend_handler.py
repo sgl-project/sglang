@@ -129,8 +129,7 @@ def handle_attention_cutlass_mla(attn, forward_batch):
 
 
 def handle_attention_fa4(attn, forward_batch):
-    # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
-    return AttnForwardMethod.MHA_CHUNKED_KV
+    return _handle_attention_backend(attn, forward_batch, "fa4")
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):

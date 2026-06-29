@@ -694,6 +694,33 @@ class DeepseekMLAForwardMixin:
                         topk_indices=topk_indices,
                     )
                     attn_output = fusion_plan.attn_output_buf
+                elif (
+                    self.current_attention_backend == "fa4"
+                    and forward_batch.forward_mode.is_decode_or_idle()
+                ):
+                    # TODO(Yuzhen): FA4's underlying kvcache kernel does not yet support in-place KV updates,
+                    # so write the MLA KV cache explicitly before invoking FA4 in read-only mode.
+                    get_token_to_kv_pool().set_mla_kv_buffer(
+                        self.attn_mqa,
+                        forward_batch.out_cache_loc,
+                        k_nope.view(-1, 1, self.kv_lora_rank),
+                        k_pe,
+                    )
+                    attn_output = self.attn_mqa(
+                        q_nope_out,
+                        None,
+                        None,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        save_kv_cache=False,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
                 elif forward_batch.forward_mode.is_decode() and dcp_enabled():
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
