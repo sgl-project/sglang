@@ -43,7 +43,7 @@ class TestBasicSanityDFlash(
     gsm8k_accuracy_thres = 0.74
     gsm8k_accept_length_thres = 2.8
 
-    attention_backend = "trtllm_mha"
+    attention_backend = "fa4"
     draft_attention_backend = "triton"
 
     @classmethod
