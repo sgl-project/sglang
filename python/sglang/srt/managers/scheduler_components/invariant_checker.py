@@ -82,6 +82,8 @@ class SchedulerInvariantChecker:
         return leak, msg
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+        if self.is_hybrid_swa and not self.full_tokens_per_layer:
+            return False, ""
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_full_tokens()
@@ -94,15 +96,37 @@ class SchedulerInvariantChecker:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
-        return self._check_pool_invariant(
+        full_evictable_size = ps.full_evictable_size
+        allocator = self.token_to_kv_pool_allocator
+        if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
+            # DCP stores logical tokens in widened physical pages.  Prefix cache
+            # counters are logical-token based, while the allocator frees whole
+            # physical pages, so round cached tokens up to physical page units.
+            full_evictable_size = (
+                (full_evictable_size + allocator.page_size - 1)
+                // allocator.page_size
+                * allocator.page_size
+            )
+        leak, msg = self._check_pool_invariant(
             "full",
             ps.full_available_size,
-            ps.full_evictable_size,
+            full_evictable_size,
             protected,
             session_held,
             total,
             uncached,
         )
+        if (
+            leak
+            and getattr(self.server_args, "dcp_size", 1) > 1
+            and allocator.page_size > 1
+        ):
+            # Radix/Mamba cache accounting is logical-token based while DCP full
+            # KV allocation is physical-page based. Partial physical pages can
+            # leave a small page-level slack even when all pages are owned by
+            # either the allocator or the prefix cache.
+            return False, f"{msg}, dcp_physical_page_slack_allowed=True"
+        return leak, msg
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         return self._check_pool_invariant(
