@@ -1,6 +1,6 @@
 """In-process integration test for the decoupled-spec IPC layer.
 
-Wires the verifier-side DraftProxyThread + drafter-side TokenSyncThread + a
+Wires the verifier-side VerifierIpcThread + drafter-side DrafterIpcThread + a
 DraftTailBuffer over the fake transport, all in one process, and drives them
 deterministically via ``_step()`` (no background threads, no GPU, no sockets).
 This is the test class that the fake transport unblocks: it exercises the whole
@@ -24,9 +24,9 @@ from sglang.srt.speculative.decoupled_spec_transport import (
     FakeTransportMesh,
     build_transport,
 )
-from sglang.srt.speculative.draft_proxy import DraftProxyThread
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
-from sglang.srt.speculative.token_sync_thread import TokenSyncThread
+from sglang.srt.speculative.drafter_ipc_thread import DrafterIpcThread
+from sglang.srt.speculative.verifier_ipc_thread import VerifierIpcThread
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -76,8 +76,10 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
         v_tp.start()
         d_tp.start()
         buf = DraftTailBuffer(verifier_rank=0, required_tail_len=2)
-        proxy = DraftProxyThread(transport=v_tp, verifier_rank=0, draft_tail_buffer=buf)
-        token = TokenSyncThread(transport=d_tp, drafter_rank=0)
+        proxy = VerifierIpcThread(
+            transport=v_tp, verifier_rank=0, draft_tail_buffer=buf
+        )
+        token = DrafterIpcThread(transport=d_tp, drafter_rank=0)
         return mesh, v_tp, d_tp, buf, proxy, token
 
     def test_full_loop_open_stream_commit_close(self):
@@ -227,7 +229,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
         d_tp.start()
         v0_tp.start()
         v1_tp.start()
-        token = TokenSyncThread(transport=d_tp, drafter_rank=0)
+        token = DrafterIpcThread(transport=d_tp, drafter_rank=0)
         try:
             token.submit_draft_results(
                 DraftTailStreamOutputBatch(
@@ -317,7 +319,9 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                 ),
             )
             # _run returns (breaks) instead of propagating, and logs loudly.
-            with self.assertLogs("sglang.srt.speculative.draft_proxy", level="ERROR"):
+            with self.assertLogs(
+                "sglang.srt.speculative.verifier_ipc_thread", level="ERROR"
+            ):
                 proxy._run()
         finally:
             v_tp.close()
@@ -337,7 +341,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                 ),
             )
             with self.assertLogs(
-                "sglang.srt.speculative.token_sync_thread", level="ERROR"
+                "sglang.srt.speculative.drafter_ipc_thread", level="ERROR"
             ):
                 token._run()
         finally:

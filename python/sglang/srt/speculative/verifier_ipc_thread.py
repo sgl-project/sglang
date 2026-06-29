@@ -31,14 +31,14 @@ from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
 
 logger = logging.getLogger(__name__)
 
-# The proxy has no send-side wakeup, so a freshly submitted control waits up to
-# this long before the loop services the send queue. This bounded (<=1ms) control
-# latency is intentional (matches the PR's poll(1ms)).
-DRAFT_PROXY_IDLE_WAIT_TIMEOUT_S = 0.001  # 1ms
+# The verifier IPC thread has no send-side wakeup, so a freshly submitted control
+# waits up to this long before the loop services the send queue. This bounded
+# (<=1ms) control latency is intentional (matches the PR's poll(1ms)).
+VERIFIER_IPC_IDLE_WAIT_TIMEOUT_S = 0.001  # 1ms
 
 
-class DraftProxyThread:
-    """Verifier-side proxy thread for decoupled speculation.
+class VerifierIpcThread:
+    """Verifier-side IPC thread for decoupled speculation.
 
     The injected ``transport`` must be started before the loop runs; ``start()``
     starts it (and the daemon loop) and ``close()`` tears both down (and closes
@@ -59,7 +59,7 @@ class DraftProxyThread:
         self._closed = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
-            name="sglang-draft-proxy",
+            name="sglang-verifier-ipc",
             daemon=True,
         )
 
@@ -74,7 +74,9 @@ class DraftProxyThread:
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
             if self._thread.is_alive():
-                logger.warning("Draft proxy thread did not exit within 1.0s of close()")
+                logger.warning(
+                    "Verifier IPC thread did not exit within 1.0s of close()"
+                )
         self.transport.close()
 
     def submit_control_batch(self, batch: DraftControlBatch) -> None:
@@ -95,14 +97,14 @@ class DraftProxyThread:
         while not self._closed.is_set():
             try:
                 if not self._step():
-                    self.transport.wait_for_input(DRAFT_PROXY_IDLE_WAIT_TIMEOUT_S)
+                    self.transport.wait_for_input(VERIFIER_IPC_IDLE_WAIT_TIMEOUT_S)
             except TransportClosed:
                 break
             except Exception:
                 # Without this, a routing error from _route_* escapes the loop
-                # and silently kills the proxy for all requests. Die loudly;
+                # and silently kills the thread for all requests. Die loudly;
                 # phase 5c will quarantine the offending request instead.
-                logger.exception("Draft proxy thread terminating on unexpected error")
+                logger.exception("Verifier IPC thread terminating on unexpected error")
                 break
 
     def _drain_send_queue(self) -> bool:
@@ -138,12 +140,16 @@ class DraftProxyThread:
         catches that and terminates loudly (5c will quarantine instead).
         """
         if not isinstance(message, DraftMeshMessage):
-            raise RuntimeError(f"Unexpected draft proxy message: {message}")
+            raise RuntimeError(
+                f"Unexpected message on the verifier IPC thread: {message}"
+            )
         if (
             message.message_type != DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
             or message.tail_stream_output_batch is None
         ):
-            raise RuntimeError(f"Unexpected draft proxy message: {message}")
+            raise RuntimeError(
+                f"Unexpected message on the verifier IPC thread: {message}"
+            )
         # TODO whether need to change this to any()
         output_batch = message.tail_stream_output_batch
         mismatched_outputs = [
@@ -153,7 +159,7 @@ class DraftProxyThread:
         ]
         if mismatched_outputs:
             raise RuntimeError(
-                "Draft proxy received a tail stream batch for the wrong verifier: "
+                "Verifier IPC thread received a tail stream batch for the wrong verifier: "
                 f"verifier_rank={self.verifier_rank} "
                 f"dst_verifier_ranks={[int(o.dst_verifier_rank) for o in output_batch.outputs]} "
                 f"request_ids={[o.request_id for o in output_batch.outputs]}"

@@ -34,17 +34,17 @@ logger = logging.getLogger(__name__)
 
 # Idle floor only: the loop wakes immediately via _wakeup when a result is
 # queued; this just bounds the fully-idle sleep before re-polling for controls.
-TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S = 0.0005  # 0.5ms
+DRAFTER_IPC_IDLE_WAIT_TIMEOUT_S = 0.0005  # 0.5ms
 
 
-class TokenSyncThread:
-    """Drafter-side token sync thread for decoupled speculation IPC.
+class DrafterIpcThread:
+    """Drafter-side IPC thread for decoupled speculative decoding.
 
     The injected ``transport`` must be started before the loop runs; ``start()``
     starts it (and the daemon loop) and ``close()`` tears both down.
 
     Plain class (not a dataclass): a thread controller, not a data container;
-    mirrors the sibling ``DraftProxyThread``.
+    mirrors the sibling ``VerifierIpcThread``.
     """
 
     def __init__(
@@ -55,10 +55,10 @@ class TokenSyncThread:
     ) -> None:
         self.transport = transport
         self.drafter_rank = int(drafter_rank)
-        self._pending_control_inbox = DraftControlInbox()
-        # Protects _pending_control_inbox (loop writes, scheduler reads).
-        self._pending_lock = threading.Lock()
-        self._outgoing_results: queue.SimpleQueue[DraftTailStreamOutputBatch] = (
+        self._control_inbox = DraftControlInbox()
+        # Protects _control_inbox (loop writes, scheduler reads).
+        self._inbox_lock = threading.Lock()
+        self._send_queue: queue.SimpleQueue[DraftTailStreamOutputBatch] = (
             queue.SimpleQueue()
         )
         self._closed = threading.Event()
@@ -66,7 +66,7 @@ class TokenSyncThread:
         self._wakeup = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
-            name="sglang-token-sync-thread",
+            name="sglang-drafter-ipc",
             daemon=True,
         )
 
@@ -81,7 +81,7 @@ class TokenSyncThread:
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
             if self._thread.is_alive():
-                logger.warning("Token sync thread did not exit within 1.0s of close()")
+                logger.warning("Drafter IPC thread did not exit within 1.0s of close()")
         self.transport.close()
 
     def collect_ready_draft_controls(
@@ -89,15 +89,15 @@ class TokenSyncThread:
         collector: Callable[[DraftControlInbox], ReadyDraftControls],
     ) -> ReadyDraftControls:
         """Extract ready controls from the live inbox under the inbox lock."""
-        with self._pending_lock:
-            return collector(self._pending_control_inbox)
+        with self._inbox_lock:
+            return collector(self._control_inbox)
 
     def submit_draft_results(self, result_batch: DraftTailStreamOutputBatch) -> None:
         if not result_batch.outputs:
             return
         # Snapshot the outputs so later caller mutations can't race the queued batch.
         queued_batch = DraftTailStreamOutputBatch(outputs=list(result_batch.outputs))
-        self._outgoing_results.put(queued_batch)
+        self._send_queue.put(queued_batch)
         self._wakeup.set()
 
     def _step(self) -> bool:
@@ -105,7 +105,7 @@ class TokenSyncThread:
 
         Returns whether any work was done. Safe to call directly from tests.
         """
-        did_work = self._drain_outgoing_results()
+        did_work = self._drain_send_queue()
         did_work = self._drain_incoming() or did_work
         return did_work
 
@@ -113,7 +113,7 @@ class TokenSyncThread:
         while not self._closed.is_set():
             try:
                 if not self._step():
-                    self._wakeup.wait(timeout=TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S)
+                    self._wakeup.wait(timeout=DRAFTER_IPC_IDLE_WAIT_TIMEOUT_S)
                     self._wakeup.clear()
             except TransportClosed:
                 break
@@ -121,7 +121,7 @@ class TokenSyncThread:
                 # Without this, a routing error from _route_* escapes the loop
                 # and silently kills the thread for all requests. Die loudly;
                 # phase 5c will quarantine the offending request instead.
-                logger.exception("Token sync thread terminating on unexpected error")
+                logger.exception("Drafter IPC thread terminating on unexpected error")
                 break
 
     def _drain_incoming(self) -> bool:
@@ -132,8 +132,8 @@ class TokenSyncThread:
             control_batch = self._route_control_message(message)
             if control_batch is None:
                 continue
-            with self._pending_lock:
-                self._pending_control_inbox.add_control_batch_locked(control_batch)
+            with self._inbox_lock:
+                self._control_inbox.add_control_batch_locked(control_batch)
         return did_work
 
     def _route_control_message(
@@ -157,12 +157,12 @@ class TokenSyncThread:
             return None
         return control_batch
 
-    def _drain_outgoing_results(self) -> bool:
+    def _drain_send_queue(self) -> bool:
         # drafter -> verifier draft tokens
         did_work = False
         while True:
             try:
-                result_batch = self._outgoing_results.get_nowait()
+                result_batch = self._send_queue.get_nowait()
             except queue.Empty:
                 break
             did_work = True

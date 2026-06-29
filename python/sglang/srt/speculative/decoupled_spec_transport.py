@@ -116,7 +116,7 @@ class ZmqTransport(BaseDecoupledSpecTransport):
         self._recv_socket = None
         self._send_sockets: dict[int, object] = {}
         self._started = False
-        self._closed = False
+        self._is_closed = False
 
     def start(self) -> None:
         if self._started:
@@ -134,13 +134,13 @@ class ZmqTransport(BaseDecoupledSpecTransport):
             rank: get_zmq_socket(self._context, zmq.PUSH, endpoint, False)
             for rank, endpoint in enumerate(self._connect_endpoints)
         }
-        self._closed = False
+        self._is_closed = False
         self._started = True
 
     def send(self, dst_rank: int, message: DraftMeshMessage) -> None:
         import zmq
 
-        if self._closed:
+        if self._is_closed:
             raise TransportClosed()
         socket = self._send_sockets.get(int(dst_rank))
         if socket is None:
@@ -156,7 +156,7 @@ class ZmqTransport(BaseDecoupledSpecTransport):
     def try_recv(self) -> Optional[DraftMeshMessage]:
         import zmq
 
-        if self._closed:
+        if self._is_closed:
             raise TransportClosed()
         if self._recv_socket is None:
             return None
@@ -171,7 +171,7 @@ class ZmqTransport(BaseDecoupledSpecTransport):
     def wait_for_input(self, timeout_s: float) -> bool:
         import zmq
 
-        if self._closed:
+        if self._is_closed:
             raise TransportClosed()
         if self._recv_socket is None:
             return False
@@ -188,7 +188,7 @@ class ZmqTransport(BaseDecoupledSpecTransport):
             socket.close(linger=0)
         self._send_sockets = {}
         self._started = False
-        self._closed = True
+        self._is_closed = True
 
 
 class FakeTransportMesh:
