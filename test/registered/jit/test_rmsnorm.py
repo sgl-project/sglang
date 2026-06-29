@@ -47,11 +47,21 @@ SUPPORTED_HIDDEN_SIZE_LIST = get_ci_test_range(
     [64, 128, 256, 512, *range(1024, 8192 + 1, 1024), 2304, 2560, 12288, 16384],
     [256, 1024, 16384],
 )
+RMSNORM_CASES = get_ci_test_range(
+    list(itertools.product(BS_LIST, SUPPORTED_HIDDEN_SIZE_LIST)),
+    [
+        (1, 256),
+        (9, 1024),
+        (38, 6144),
+        (256, 8192),
+        (4109, 1024),
+    ],
+)
 
 
 @pytest.mark.parametrize(
     "batch_size,hidden_size",
-    list(itertools.product(BS_LIST, SUPPORTED_HIDDEN_SIZE_LIST)),
+    RMSNORM_CASES,
 )
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("specify_out", [True, False])

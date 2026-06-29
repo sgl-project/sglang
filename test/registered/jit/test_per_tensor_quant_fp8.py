@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, suite="base-b-kernel-unit-1-gpu-large")
@@ -44,10 +45,13 @@ def torch_scaled_fp8_quant(tensor, inv_scale):
     return qweight
 
 
-@pytest.mark.parametrize(
-    "num_tokens,hidden_dim",
-    list(itertools.product([128, 256, 512], [512, 2048, 4096])),
+PER_TENSOR_QUANT_CASES = get_ci_test_range(
+    list(itertools.product([38, 128, 256, 512], [512, 2048, 4096, 7168])),
+    [(38, 7168), (128, 512), (512, 4096)],
 )
+
+
+@pytest.mark.parametrize("num_tokens,hidden_dim", PER_TENSOR_QUANT_CASES)
 def test_jit_per_tensor_quant_compare_implementations(
     num_tokens: int,
     hidden_dim: int,
