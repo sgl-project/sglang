@@ -1030,9 +1030,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHT_SCALES
         if self.is_fp4_expert:
             fp4_block_k = 32
-            fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
+            fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.uint8
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
+                torch.zeros(
                     num_experts,
                     2 * intermediate_size_per_partition,
                     hidden_size // fp4_block_k,
@@ -1041,7 +1041,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
+                torch.zeros(
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition // fp4_block_k,
@@ -1049,6 +1049,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
+            w13_weight_scale.format_ue8m0 = True
+            w2_weight_scale.format_ue8m0 = True
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         elif self.block_quant:

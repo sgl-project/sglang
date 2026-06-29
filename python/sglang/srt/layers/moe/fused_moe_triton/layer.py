@@ -500,7 +500,23 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
+        loaded_weight = self._maybe_cast_scale_dtype(loaded_weight, expert_data)
         expert_data.copy_(loaded_weight)
+
+    @staticmethod
+    def _maybe_cast_scale_dtype(
+        loaded_weight: torch.Tensor, expert_data: torch.Tensor
+    ) -> torch.Tensor:
+        """Cast scale tensor dtype for copy_ when param storage is uint8."""
+        if expert_data.dtype != torch.uint8:
+            return loaded_weight
+        if loaded_weight.dtype == torch.float8_e8m0fnu:
+            return loaded_weight.view(torch.uint8)
+        if loaded_weight.dtype == torch.float32:
+            return loaded_weight.to(
+                device=expert_data.device, dtype=torch.float8_e8m0fnu
+            ).view(torch.uint8)
+        return loaded_weight
 
     def _load_w2(
         self,
@@ -570,6 +586,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
+        loaded_weight = self._maybe_cast_scale_dtype(loaded_weight, expert_data)
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(
