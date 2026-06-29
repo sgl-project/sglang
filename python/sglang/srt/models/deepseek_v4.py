@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import time
 from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
@@ -1181,121 +1180,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._post_attention_layernorm_weight_bf16 = (
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
-
-    def prewarm_mhc_token_counts(
-        self, token_counts: Tuple[int, ...], device: torch.device
-    ) -> None:
-        paths = (
-            (
-                "attn",
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.input_layernorm,
-            ),
-            (
-                "ffn",
-                self.hc_ffn_fn,
-                self.hc_ffn_scale,
-                self.hc_ffn_base,
-                self.post_attention_layernorm,
-            ),
-        )
-
-        with torch.inference_mode():
-            for num_tokens in token_counts:
-                for path_name, hc_fn, hc_scale, hc_base, norm in paths:
-                    tic = time.perf_counter()
-                    residual = torch.empty(
-                        (num_tokens, self.hc_mult, self.hidden_size),
-                        dtype=torch.bfloat16,
-                        device=device,
-                    )
-                    y, post, comb, _ = self.hc_pre(
-                        residual,
-                        hc_fn,
-                        hc_scale,
-                        hc_base,
-                        norm=norm,
-                    )
-                    del residual, y, post, comb
-                    torch.cuda.synchronize()
-                    logger.info(
-                        "DeepSeek V4 MHC prewarm path=%s num_tokens=%s completed in %.3fs",
-                        path_name,
-                        num_tokens,
-                        time.perf_counter() - tic,
-                    )
-
-            if self.use_fused_mhc_post_pre:
-                for num_tokens in token_counts:
-                    for path_name, hc_fn, hc_scale, hc_base, norm in paths:
-                        tic = time.perf_counter()
-                        # Dummy inputs matching the fused kernel's expected shapes.
-                        x = torch.empty(
-                            (num_tokens, self.hidden_size),
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        residual = torch.empty(
-                            (num_tokens, self.hc_mult, self.hidden_size),
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        post_mix = torch.empty(
-                            (num_tokens, self.hc_mult, 1),
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        comb_mix = torch.empty(
-                            (num_tokens, self.hc_mult, self.hc_mult),
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        norm_weight = norm.weight.data.bfloat16().contiguous()
-                        mhc_fused_post_pre(
-                            x,
-                            residual,
-                            post_mix,
-                            comb_mix,
-                            hc_fn,
-                            hc_scale,
-                            hc_base,
-                            self.rms_norm_eps,
-                            self.hc_eps,
-                            self.hc_eps,
-                            _MHC_POST_MULT_VALUE,
-                            self.hc_sinkhorn_iters,
-                            norm_weight=norm_weight,
-                            norm_eps=norm.variance_epsilon,
-                        )
-                        del x, residual, post_mix, comb_mix, norm_weight
-                        torch.cuda.synchronize()
-                        logger.info(
-                            "DeepSeek V4 MHC fused prewarm path=%s num_tokens=%s completed in %.3fs",
-                            path_name,
-                            num_tokens,
-                            time.perf_counter() - tic,
-                        )
-
-    def prewarm_mhc_token_count_buckets(
-        self, max_num_tokens: int, device: torch.device
-    ) -> Tuple[int, ...]:
-        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
-
-        token_counts = get_mhc_pre_token_count_representatives(
-            max_num_tokens, self.hc_mult * self.hidden_size
-        )
-        if not token_counts:
-            return token_counts
-
-        logger.info(
-            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
-            max_num_tokens,
-            token_counts,
-        )
-        self.prewarm_mhc_token_counts(token_counts, device)
-        return token_counts
 
     def hc_pre(
         self,
