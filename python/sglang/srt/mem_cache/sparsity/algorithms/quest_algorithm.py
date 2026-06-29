@@ -78,10 +78,6 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         tok_start = pg_id * self.page_size
         tok_off = torch.arange(self.page_size, device=device).view(1, 1, -1)
         tok_pos = tok_start.unsqueeze(2) + tok_off
-        tok_mask = (
-            tok_pos
-            < (tok_start + self.page_size).clamp(max=seq_lens.unsqueeze(1)).unsqueeze(2)
-        ) & pg_mask.unsqueeze(2)
 
         phys_tok = req_to_token[
             reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
@@ -89,14 +85,24 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         ].clamp(0, k_buffer.shape[0] - 1)
 
         keys = k_buffer[phys_tok].to(torch.float32)
-        mask = tok_mask.unsqueeze(-1).unsqueeze(-1)
 
-        page_min = torch.where(mask, keys, torch.full_like(keys, float("inf"))).amin(
-            dim=2
-        )
-        page_max = torch.where(mask, keys, torch.full_like(keys, float("-inf"))).amax(
-            dim=2
-        )
+        if bool((end_page * self.page_size <= seq_lens).all().item()):
+            page_min = keys.amin(dim=2)
+            page_max = keys.amax(dim=2)
+        else:
+            tok_mask = (
+                tok_pos
+                < (tok_start + self.page_size)
+                .clamp(max=seq_lens.unsqueeze(1))
+                .unsqueeze(2)
+            ) & pg_mask.unsqueeze(2)
+            mask = tok_mask.unsqueeze(-1).unsqueeze(-1)
+            page_min = torch.where(
+                mask, keys, torch.full_like(keys, float("inf"))
+            ).amin(dim=2)
+            page_max = torch.where(
+                mask, keys, torch.full_like(keys, float("-inf"))
+            ).amax(dim=2)
 
         phys_pg = (
             req_to_token[
