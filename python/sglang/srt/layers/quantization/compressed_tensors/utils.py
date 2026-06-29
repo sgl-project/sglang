@@ -170,6 +170,16 @@ def _is_equal_or_regex_match(
     elif check_contains:
         if target.lower() in value.lower():
             return True
+        # Also match when ``target`` is a path-extension of ``value`` (i.e.,
+        # ``target`` starts with ``value + "."``). compressed-tensors
+        # checkpoints sometimes include a submodule suffix such as ``.linear``
+        # in the ``ignore`` list (e.g., ``...q_proj.linear``) while the runtime
+        # ``layer_name`` is the parent layer without the suffix (e.g., the
+        # unfused shard ``...q_proj`` derived from ``qkv_proj`` via
+        # ``packed_modules_mapping``). The ``.`` path separator prevents
+        # over-matching (e.g., ``q`` does not match ``q_proj.linear``).
+        if target.lower().startswith(value.lower() + "."):
+            return True
     elif target == value:
         return True
     return False
