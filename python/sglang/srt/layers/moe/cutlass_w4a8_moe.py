@@ -334,7 +334,7 @@ def cutlass_w4a8_moe_deepep_normal(
     gateup_input = torch.empty(
         gateup_input_pre_reorder.shape, dtype=torch.float8_e4m3fn, device=device
     )
-    per_tensor_quant_fp8(gateup_input_pre_reorder, gateup_input, a1_scale.float(), True)
+    gateup_input=gateup_input_pre_reorder
     del gateup_input_pre_reorder
     local_topk_ids = topk_ids_
     local_topk_ids = (
