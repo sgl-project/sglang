@@ -1459,8 +1459,15 @@ def fp8_paged_mqa_logits_kernel(
             for j in T.Pipelined(n_iters, num_stages=2):
                 i = i_start + j
                 page = page_table[bx, i]
-                k_smem_u8 = T.alloc_shared((B * D,), UINT8)
-                T.copy(kvcache_u8[page, 0:SCALE_OFFSET], k_smem_u8)
+                # SM120 (Blackwell desktop / RTX PRO 6000): the non-TMA swizzled
+                # copy path reindexes via CheckAndGetBufferRowSize, which requires
+                # a >=2-D shared buffer. Allocate the K tile as (B, D) and fill it
+                # with the same bytes as before (value region = first B*D bytes of
+                # the page, row-major) via an explicit parallel copy (T.view only
+                # accepts a Buffer, not a global slice).
+                k_smem_u8 = T.alloc_shared((B, D), UINT8)
+                for b_, d_ in T.Parallel(B, D):
+                    k_smem_u8[b_, d_] = kvcache_u8[page, b_ * D + d_]
                 k_smem = T.view(k_smem_u8, (B, D), FP8)
                 k_s_smem_u8 = T.alloc_shared((B * 4,), UINT8)
                 T.copy(kvcache_u8[page, SCALE_OFFSET:BLOCK_BYTES], k_s_smem_u8)
