@@ -159,8 +159,8 @@ class EagleDraftInput(SpecInput):
     hidden_states: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # Carried on spec_info, not ForwardBatch: each draft step runs on a copied
-    # ForwardBatch, so a writeback there is dropped (spec_info is shared by ref).
+    # Survives across draft steps: spec_info is shared by reference across the
+    # per-step forwards (each runs on a copied ForwardBatch, dropping writebacks).
     mtp_topk_indices: Optional[torch.Tensor] = None
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
