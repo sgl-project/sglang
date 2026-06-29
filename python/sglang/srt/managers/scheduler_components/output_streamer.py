@@ -441,7 +441,7 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
-                logprob_end = max(len(output_ids_), 1)
+                logprob_end = len(output_ids_)
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
