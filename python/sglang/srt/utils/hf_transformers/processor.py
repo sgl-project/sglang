@@ -135,6 +135,46 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _load_processor_with_optional_attrs_compat(
+    tokenizer_name, *args, trust_remote_code, revision, **kwargs
+):
+    """Compatibility shim for trust_remote_code processors written for transformers v4.
+
+    Transformers v5 changed ProcessorMixin.__init__ to strictly reject any kwarg
+    that is not a modality processor (image_processor, tokenizer, etc.).  Older
+    model repos (e.g. Molmo2) still pass their custom optional_attributes such as
+    `image_use_col_tokens` to super().__init__(), which now raises TypeError.
+
+    This function temporarily patches ProcessorMixin.__init__ to intercept those
+    extra kwargs, strip them before the strict validation runs, and then set them
+    as plain instance attributes after construction — reproducing the v4 behavior.
+    The original __init__ is restored unconditionally via try/finally.
+    """
+    from transformers import ProcessorMixin
+
+    original_init = ProcessorMixin.__init__
+
+    def _permissive_init(self, *a, **kw):
+        # optional_attributes declared by the subclass but not by ProcessorMixin
+        optional = set(getattr(type(self), "optional_attributes", [])) - {"chat_template"}
+        extra = {k: kw.pop(k) for k in list(kw) if k in optional}
+        original_init(self, *a, **kw)
+        for k, v in extra.items():
+            setattr(self, k, v)
+
+    ProcessorMixin.__init__ = _permissive_init
+    try:
+        return AutoProcessor.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+    finally:
+        ProcessorMixin.__init__ = original_init
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -214,6 +254,25 @@ def get_processor(
                     **kwargs,
                 )
 
+    except TypeError as e:
+        if "Unexpected keyword argument" in str(e):
+            # trust_remote_code processor was written for transformers v4 where
+            # ProcessorMixin.__init__ accepted optional_attributes as kwargs.
+            # Retry with a compatibility shim that strips those extra kwargs.
+            logger.info(
+                "Processor for %s passed optional_attributes to ProcessorMixin.__init__ "
+                "(transformers v4 pattern). Retrying with v5 compatibility shim.",
+                tokenizer_name,
+            )
+            processor = _load_processor_with_optional_attrs_compat(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        else:
+            raise
     except ValueError as e:
         error_message = str(e)
         if "does not have a slow version" in error_message:
