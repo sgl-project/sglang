@@ -54,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
+      echo ""
+      echo "Environment:"
+      echo "  ENABLE_CACHE_HOST=1|0"
+      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 0."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -283,13 +287,27 @@ else
   fi
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
+CACHE_HOST=/home/runner/sglang-data
+ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-0}"
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ ! -d "$CACHE_HOST" ]]; then
+      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
+      exit 1
+    fi
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-else
+    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    ;;
+  0|false|no|off|"")
     CACHE_VOLUME=""
-fi
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
@@ -310,6 +328,12 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang mkdir -p \
+  /sgl-data/hf-cache/hub \
+  /sgl-data/pip-cache \
+  /sgl-data/miopen-cache \
+  /sgl-data/aiter-kernels
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
