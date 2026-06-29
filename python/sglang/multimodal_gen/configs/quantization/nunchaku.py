@@ -114,12 +114,22 @@ class NunchakuSVDQuantArgs:
         unsupported: list[str] = []
         for i in range(device_count):
             major, minor = torch.cuda.get_device_capability(i)
-            if major == 9:
-                unsupported.append(f"cuda:{i} (SM{major}{minor}, Hopper)")
+            device = f"cuda:{i} (SM{major}{minor})"
+            if self.quantization_precision == "nvfp4":
+                if major not in (10, 12):
+                    unsupported.append(device)
+            elif major == 9:
+                unsupported.append(f"{device}, Hopper")
             elif major not in (8, 12):
-                unsupported.append(f"cuda:{i} (SM{major}{minor})")
+                unsupported.append(device)
 
         if unsupported:
+            if self.quantization_precision == "nvfp4":
+                raise ValueError(
+                    "Nunchaku SVDQuant FP4 is currently only supported on Blackwell GPUs; "
+                    f"Unsupported devices: {', '.join(unsupported)}. "
+                    "Use INT4 weights on this device, or run FP4 on supported Blackwell hardware."
+                )
             raise ValueError(
                 "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) or SM12x GPUs; "
                 f"Unsupported devices: {', '.join(unsupported)}. "

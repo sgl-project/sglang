@@ -74,6 +74,40 @@ def _parse_extra_container(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _resolve_output_path_for_request(
+    request: ImageGenerationsRequest, server_output_path: str | None
+) -> tuple[str | None, bool]:
+    request_save_output = request.save_output
+    if request_save_output is None:
+        request_save_output = _get_extra_field(request, "save_output")
+    save_output = _coerce_optional_bool(request_save_output)
+    if save_output is None:
+        save_output = True
+
+    request_output_path = request.output_path
+    if request_output_path is None:
+        request_output_path = _get_extra_field(request, "output_path")
+
+    output_path = request_output_path or server_output_path
+    if not save_output:
+        return None, False
+    return output_path, output_path is not None
+
+
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
     """Read and base64-encode each file. Must be called before cloud upload deletes them."""
     result = []
@@ -158,7 +192,11 @@ async def generations(
         else choose_output_image_ext(request.output_format, request.background)
     )
 
-    with temp_dir_if_disabled(server_args.output_path) as output_dir:
+    configured_output_path, is_persistent = _resolve_output_path_for_request(
+        request, server_args.output_path
+    )
+
+    with temp_dir_if_disabled(configured_output_path) as output_dir:
         sampling = build_sampling_params(
             request_id,
             prompt=request.prompt,
@@ -231,9 +269,10 @@ async def generations(
             else None
         )
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        cloud_url = None
+        if is_persistent or resp_format == "url":
+            cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
-        is_persistent = server_args.output_path is not None
         await IMAGE_STORE.upsert(
             request_id,
             {

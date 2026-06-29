@@ -49,6 +49,8 @@ class ImageGenerationsRequest(BaseModel):
     negative_prompt: Optional[str] = None
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
+    save_output: Optional[bool] = None
+    output_path: Optional[str] = None
     enable_teacache: Optional[bool] = False
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
