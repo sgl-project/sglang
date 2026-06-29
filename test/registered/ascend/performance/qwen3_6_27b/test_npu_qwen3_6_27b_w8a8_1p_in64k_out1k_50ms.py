@@ -73,7 +73,7 @@ QWEN3_6_27B_64K_1K_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_6_27B_2P_In64k_Out1k_50ms(TestAscendPerformanceTestCaseBase):
+class TestNPUQwen3_6_27B_2P_In64k_Out1k_50ms(TestNpuPerformanceTestCaseBase):
     """Test NPU performance for Qwen3.6-27B-w8a8 2p in64k out1k 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
