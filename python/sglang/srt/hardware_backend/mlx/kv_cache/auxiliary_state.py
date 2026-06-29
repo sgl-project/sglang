@@ -346,10 +346,11 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         insert_params=None,
     ) -> None:
         if not is_finished:
+            insert_skipped = insert_result is None or insert_result.insert_skipped
             if (
                 insert_params is not None
                 and insert_params.mamba_value is not None
-                and (insert_result is None or insert_result.mamba_exist)
+                and (insert_skipped or insert_result.mamba_exist)
             ):
                 self.cache.req_to_token_pool.auxiliary_state_pool.free(
                     insert_params.mamba_value

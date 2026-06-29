@@ -67,6 +67,13 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    defer_overlap_free: bool = False
+    deferred_overlap_values: list[tuple[int, torch.Tensor]] = dataclasses.field(
+        default_factory=list
+    )
+    created_node_records: list[tuple[int, Any, Any]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -78,6 +85,8 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    insert_skipped: bool = False
+    mamba_inserted_node: Any = None
 
 
 @dataclasses.dataclass

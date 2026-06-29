@@ -111,6 +111,13 @@ class MambaComponent(TreeComponent):
                 req.mamba_pool_idx = dst_index[0]
             req.mamba_cow_src_index = mamba_value
             req.mamba_needs_clear = False
+        elif cow_mamba and req is not None and req.mamba_cow_src_index is not None:
+            # A queued request can keep a COW source from an earlier match. If
+            # this re-match has no donor, that source may point at an evicted
+            # slot; clear it so admission zero-clears instead of copying freed state.
+            req.mamba_cow_src_index = None
+            if req.mamba_pool_idx is not None:
+                req.mamba_needs_clear = True
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure mamba_host_hit_length >= 1 so load_back is triggered.
@@ -136,6 +143,7 @@ class MambaComponent(TreeComponent):
             self.cache.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
             )
+            result.mamba_inserted_node = node
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
@@ -148,6 +156,7 @@ class MambaComponent(TreeComponent):
                 params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
+            result.mamba_inserted_node = node
             return
         self.cache.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
@@ -294,6 +303,19 @@ class MambaComponent(TreeComponent):
             assert slot is not None, "Can not alloc mamba cache"
         return slot
 
+    def _request_mamba_slot(self, req: Req) -> torch.Tensor:
+        if self.enable_mamba_extra_buffer:
+            keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
+            return req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1)
+        return req.mamba_pool_idx.unsqueeze(-1)
+
+    def _copy_mamba_state_to_request(self, req: Req, src: torch.Tensor) -> None:
+        self.cache.req_to_token_pool.mamba_pool.copy_from(
+            src, self._request_mamba_slot(req)
+        )
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -364,8 +386,16 @@ class MambaComponent(TreeComponent):
                     req, mamba_ping_pong_track_buffer_to_keep=keep_idx
                 )
         else:
+            insert_skipped = insert_result is None or insert_result.insert_skipped
+            if insert_skipped and insert_params.mamba_value is not None:
+                self._copy_mamba_state_to_request(req, insert_params.mamba_value)
+            elif insert_result is not None and not self.enable_mamba_extra_buffer:
+                mamba_value = req.last_node.component_data[self.component_type].value
+                if mamba_value is not None:
+                    req.mamba_cow_src_index = mamba_value
+                    req.mamba_needs_clear = False
             if insert_params.mamba_value is not None and (
-                insert_result is None or insert_result.mamba_exist
+                insert_skipped or insert_result.mamba_exist
             ):
                 self.cache.req_to_token_pool.mamba_allocator.free(
                     insert_params.mamba_value
