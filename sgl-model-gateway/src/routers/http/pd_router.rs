@@ -694,16 +694,44 @@ impl PDRouter {
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Send both requests concurrently
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        // For streaming requests without logprob, fire-and-forget prefill to reduce TTFT.
+        // The prefill response body is not needed (only triggers KV cache transfer as side-effect).
+        // If prefill fails, decode will timeout waiting for KV cache and report the error.
+        let (prefill_result, decode_result) = if context.is_stream && !context.return_logprob {
+            let prefill_url = prefill.url().to_string();
+            tokio::spawn(async move {
+                match prefill_request.send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if !status.is_success() {
+                            warn!(
+                                "Prefill returned error (fire-and-forget) prefill_url={} status={}",
+                                prefill_url, status
+                            );
+                        }
+                        // Consume body to allow connection reuse in the pool
+                        let _ = resp.bytes().await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Prefill request failed (fire-and-forget) prefill_url={} error={}",
+                            prefill_url, e
+                        );
+                    }
+                }
+            });
+            (None, decode_request.send().await)
+        } else {
+            let (p, d) = tokio::join!(prefill_request.send(), decode_request.send());
+            (Some(p), d)
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -756,8 +784,8 @@ impl PDRouter {
                     return response;
                 }
 
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
+                // Process prefill response (skipped when fire-and-forget)
+                let prefill_body = if let Some(prefill_result) = prefill_result {
                     match self
                         .process_prefill_response(
                             prefill_result,
@@ -770,14 +798,7 @@ impl PDRouter {
                         Err(error_response) => return error_response,
                     }
                 } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                    None
                 };
 
                 if context.is_stream {
