@@ -26,9 +26,6 @@ from sglang.jit_kernel.dsv4 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.layers.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
@@ -77,6 +74,9 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -2693,6 +2693,18 @@ class DeepseekV4ForCausalLM(nn.Module):
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
+                if (
+                    _FP8_WO_A_GEMM
+                    and name.endswith(".wo_a.weight")
+                    and loaded_weight.dtype != torch.float8_e4m3fn
+                ):
+                    raise ValueError(
+                        f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
+                        f"dtype {loaded_weight.dtype}, expected "
+                        "torch.float8_e4m3fn. This checkpoint does not provide "
+                        "a supported fp8-quantized wo_a; rerun with "
+                        "SGLANG_OPT_FP8_WO_A_GEMM=0."
+                    )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
 
