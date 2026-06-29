@@ -258,7 +258,7 @@ def _parse_shape_values(values: Iterable[str]) -> list[tuple[int, int]]:
     for value in values:
         try:
             N, K = (int(part) for part in value.split(",", 1))
-        except Exception as err:
+        except ValueError as err:
             raise ValueError(f"Expected N,K shape, got {value}") from err
         shapes.append((N, K))
     return shapes
