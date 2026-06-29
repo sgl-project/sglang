@@ -493,6 +493,7 @@ def eagle_sample(
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
+    target_predict = None
     if sampling_info.is_all_greedy or _is_npu or _is_hip:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
@@ -604,16 +605,32 @@ def eagle_sample(
             tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
+        if verify_input.tree_topk != 1:
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently requires "
+                "speculative_eagle_topk=1."
+            )
+
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
+        # For non-greedy requests, use a target-derived terminal token as the
+        # synthetic bonus. Synthetic acceptance is benchmark-only, but keeping
+        # the accepted prefix on a real draft path preserves token/KV coherence.
+        if target_predict is None:
+            target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                bs, verify_input.draft_token_num
+            )
         accept_index = generate_simulated_accept_index(
             accept_index=accept_index,
             predict=predict,  # mutable
             num_correct_drafts=num_correct_drafts,  # mutable
+            candidates=candidates,
+            target_predict=target_predict,
             simulate_acc_len=SIMULATE_ACC_LEN,
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
+            topk=verify_input.tree_topk,
         )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
