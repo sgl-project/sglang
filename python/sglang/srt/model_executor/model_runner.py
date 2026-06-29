@@ -2038,13 +2038,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 weights.append((name, weight))
             for handle in handles:
                 handle.wait()
-            if not _is_npu:
-                self.model.load_weights(weights)
-            else:
-                target_device = torch.device(self.device)
-                DefaultModelLoader.load_weights_and_postprocess(
-                    self.model, weights, target_device
-                )
+
+            self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -2076,13 +2071,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 group=self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
-            if not _is_npu:
-                self.model.load_weights(reconstructed_tensors)
-            else:
-                target_device = torch.device(self.device)
-                DefaultModelLoader.load_weights_and_postprocess(
-                    self.model, reconstructed_tensors, target_device
-                )
+            self.model.load_weights(reconstructed_tensors)
             return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
@@ -2119,23 +2108,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
         elif load_format is None:
-            try:
-                if not _is_npu:
-                    self.model.load_weights(named_tensors)
-                else:
-                    target_device = torch.device(self.device)
-                    DefaultModelLoader.load_weights_and_postprocess(
-                        self.model, named_tensors, target_device
-                    )
-                return True, "Success"
-            except Exception as e:
-                error_msg = (
-                    f"Failed to update parameter online: {e}. "
-                    f"The full weights of the ModelRunner are partially updated. "
-                    f"Please discard the whole weights."
-                )
-                logger.error(error_msg)
-                return False, error_msg
+            self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -2167,23 +2140,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
 
-        try:
-            if not _is_npu:
-                self.model.load_weights(reconstructed_tensors)
-            else:
-                target_device = torch.device(self.device)
-                DefaultModelLoader.load_weights_and_postprocess(
-                    self.model, reconstructed_tensors, target_device
-                )
-            return True, "Success"
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The full weights of the ModelRunner are partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
+        # Load the reconstructed tensors using the standard method
+        self.model.load_weights(reconstructed_tensors)
 
         return True, "Success"
 
