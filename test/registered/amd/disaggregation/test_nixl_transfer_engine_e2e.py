@@ -22,8 +22,8 @@ register_amd_ci(est_time=900, suite="stage-b-test-large-8-gpu-mi35x-disaggregati
 
 class NixlTransferEngineBase(PDDisaggregationServerBase):
     """PD-over-NIXL e2e on ROCm. NIXL (upstream ai-dynamo/nixl + UCX --with-rocm)
-    is an opt-in image stage built with `--build-arg ENABLE_NIXL=1`; when the
-    image was built without it, `import nixl` fails and the test skips rather
+    is enabled by default in the ROCm image; when the image was built with
+    `--build-arg ENABLE_NIXL=0`, `import nixl` fails and the test skips rather
     than failing the suite."""
 
     port_delta = 0
@@ -57,7 +57,8 @@ class NixlTransferEngineBase(PDDisaggregationServerBase):
             import nixl  # noqa: F401
         except Exception as e:
             raise unittest.SkipTest(
-                "nixl not importable; image built without --build-arg ENABLE_NIXL=1 "
+                "nixl not importable; image may have been built with "
+                "--build-arg ENABLE_NIXL=0 "
                 f"({e})."
             )
 
