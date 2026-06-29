@@ -1125,7 +1125,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 gf = req.get_fill_ids()
                 input_len = len(gf) if gf else None
             if input_len is not None and (
-                input_len - sum(len(v) for v in value[:best_value_len])
+                0
+                < input_len - sum(len(v) for v in value[:best_value_len])
                 < MIN_SAFE_GDN_EXTEND
             ):
                 retreat_node, retreat_len = last_node, best_value_len
