@@ -951,19 +951,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
         # Validate input length
         if input_token_num >= self.context_len:
             if self.server_args.allow_auto_truncate:
+                # Leave room for max_new_tokens and reserved tokens so the
+                # request can still produce output after truncation; without
+                # this, truncating to exactly context_len forces max_new_tokens
+                # to 0 in the next check.
+                target_input_len = max(
+                    1,
+                    _max_req_len - (max_new_tokens or 0) - self.num_reserved_tokens,
+                )
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
                     f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
+                    f"Truncating the input to {target_input_len} tokens."
                 )
-                del input_ids[_max_req_len:]
-                input_token_num = len(input_ids)
+                del input_ids[target_input_len:]
+                input_token_num = len(input_ids) + self.num_reserved_tokens
             else:
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
@@ -971,7 +980,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         # Validate total tokens (input + max_new_tokens)
-        max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
