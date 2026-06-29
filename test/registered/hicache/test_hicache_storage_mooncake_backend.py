@@ -30,6 +30,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     # Default port ranges for Mooncake services - can be overridden in subclasses
     mooncake_master_port_base = 50051
     mooncake_metadata_port_base = 8080
+    flush_cache_timeout = 180
 
     @classmethod
     def setUpClass(cls):
@@ -205,7 +206,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             "MC_MS_AUTO_DISC": "0",
             "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
-            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "17179869184",  # 16 GiB, 8 GiB per TP rank
         }
 
         return server_args, env_vars
@@ -314,6 +315,41 @@ class TestMooncakeBackendAccuracy(
         from test_hicache_storage_file_backend import run_eval_accuracy_test
 
         run_eval_accuracy_test(self)
+
+
+class TestMooncakeBackendHybridLinearModel(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Hybrid Model tests for HiCache-Mooncake backend"""
+
+    @classmethod
+    def _get_model_name(cls):
+        """Use hybrid linear model for testing"""
+        return "Qwen/Qwen3.5-27B"
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        """Get additional server arguments specific to configuration - override in subclasses"""
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-mem-layout"] = "page_first_direct"
+        server_args["--hicache-io-backend"] = "direct"
+        server_args["--tp-size"] = 2
+        server_args["--mamba-scheduler-strategy"] = "extra_buffer"
+        server_args["--page-size"] = 64
+
+        return server_args, env_vars
+
+    def test_eval_accuracy(self):
+        """Test eval accuracy with cache persistence across cache flushes"""
+        from test_hicache_storage_file_backend import run_eval_accuracy_test
+
+        run_eval_accuracy_test(
+            self,
+            accuracy_threshold=0.10,
+            max_tokens=2048,
+            num_threads=4,
+            num_examples=50,
+        )
 
 
 if __name__ == "__main__":
