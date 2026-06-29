@@ -2463,9 +2463,7 @@ class DeepseekSparseAttnBackend(
         ):
             cp_meta = forward_batch.attn_cp_metadata
             seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
-            seq_lens = torch.cat(
-                [seq_chunks[i] for i in cp_meta.zigzag_index], dim=0
-            )
+            seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
