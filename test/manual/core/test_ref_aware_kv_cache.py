@@ -67,9 +67,9 @@ class TestTreeNodeRefFields(unittest.TestCase):
         node = TreeNode()
         self.assertEqual(node.low_ref, 0)
 
-    def test_default_tracked_rids_is_empty(self):
+    def test_default_tracked_session_ids_is_empty(self):
         node = TreeNode()
-        self.assertEqual(node.tracked_rids, set())
+        self.assertEqual(node.tracked_session_ids, set())
 
     def test_new_node_classifies_as_unused(self):
         node = TreeNode()
@@ -94,7 +94,7 @@ class TestRefAwareTierAccounting(unittest.TestCase):
         cache.unused_evictable_size_ = 0
         cache.low_ref_evictable_size_ = 0
         cache.high_ref_evictable_size_ = 0
-        cache.rid_to_ref_info = {}
+        cache.session_id_to_ref_info = {}
         cache._evict_scope_stack = []
         return cache
 
@@ -273,7 +273,7 @@ class TestRefAwareRegisterRef(unittest.TestCase):
         cache.unused_evictable_size_ = 0
         cache.low_ref_evictable_size_ = 0
         cache.high_ref_evictable_size_ = 0
-        cache.rid_to_ref_info = {}
+        cache.session_id_to_ref_info = {}
         cache._evict_scope_stack = []
         return cache
 
@@ -291,19 +291,19 @@ class TestRefAwareRegisterRef(unittest.TestCase):
         cache = self._make_cache()
         a = self._append_node(cache.root_node, [1, 2, 3, 4])
 
-        req = SimpleNamespace(rid="r1", priority=1, last_node=a)
+        req = SimpleNamespace(session_id="s1", priority=1, last_node=a)
         cache.register_ref(req)
 
         self.assertEqual(a.high_ref, 1)
         self.assertEqual(a.low_ref, 0)
-        self.assertIn("r1", a.tracked_rids)
+        self.assertIn("s1", a.tracked_session_ids)
 
     def test_register_ref_low_priority_sets_low_ref(self):
         """Low priority (priority < threshold) increments low_ref."""
         cache = self._make_cache()
         a = self._append_node(cache.root_node, [1, 2, 3, 4])
 
-        req = SimpleNamespace(rid="r1", priority=0, last_node=a)
+        req = SimpleNamespace(session_id="s1", priority=0, last_node=a)
         cache.register_ref(req)
 
         self.assertEqual(a.low_ref, 1)
@@ -316,13 +316,13 @@ class TestRefAwareRegisterRef(unittest.TestCase):
         b = self._append_node(a, [5, 6, 7, 8])
         c = self._append_node(b, [9, 10, 11, 12])
 
-        req = SimpleNamespace(rid="r1", priority=1, last_node=c)
+        req = SimpleNamespace(session_id="s1", priority=1, last_node=c)
         cache.register_ref(req)
 
         self.assertEqual(a.high_ref, 1)
         self.assertEqual(b.high_ref, 1)
         self.assertEqual(c.high_ref, 1)
-        self.assertEqual(len(cache.rid_to_ref_info["r1"].nodes), 3)
+        self.assertEqual(len(cache.session_id_to_ref_info["s1"].nodes), 3)
 
         # Extend the chain by one node and call register_ref again
         d = self._append_node(c, [13, 14, 15, 16])
@@ -335,49 +335,49 @@ class TestRefAwareRegisterRef(unittest.TestCase):
         self.assertEqual(c.high_ref, 1)
         # New node should now be tracked
         self.assertEqual(d.high_ref, 1)
-        self.assertEqual(len(cache.rid_to_ref_info["r1"].nodes), 4)
+        self.assertEqual(len(cache.session_id_to_ref_info["s1"].nodes), 4)
 
-    def test_register_ref_tracks_rids_on_nodes(self):
+    def test_register_ref_tracks_session_ids_on_nodes(self):
         cache = self._make_cache()
         a = self._append_node(cache.root_node, [1, 2, 3, 4])
 
-        req = SimpleNamespace(rid="r1", priority=1, last_node=a)
+        req = SimpleNamespace(session_id="s1", priority=1, last_node=a)
         cache.register_ref(req)
 
-        self.assertIn("r1", a.tracked_rids)
-        self.assertIn("r1", cache.rid_to_ref_info)
+        self.assertIn("s1", a.tracked_session_ids)
+        self.assertIn("s1", cache.session_id_to_ref_info)
 
-    def test_register_ref_multiple_rids_on_shared_node(self):
-        """Two different rids that share a node both track it."""
+    def test_register_ref_multiple_session_ids_on_shared_node(self):
+        """Two different session_ids that share a node both track it."""
         cache = self._make_cache()
         a = self._append_node(cache.root_node, [1, 2, 3, 4])
 
-        req1 = SimpleNamespace(rid="r1", priority=1, last_node=a)
-        req2 = SimpleNamespace(rid="r2", priority=1, last_node=a)
+        req1 = SimpleNamespace(session_id="s1", priority=1, last_node=a)
+        req2 = SimpleNamespace(session_id="s2", priority=1, last_node=a)
         cache.register_ref(req1)
         cache.register_ref(req2)
 
         self.assertEqual(a.high_ref, 2)
-        self.assertIn("r1", a.tracked_rids)
-        self.assertIn("r2", a.tracked_rids)
+        self.assertIn("s1", a.tracked_session_ids)
+        self.assertIn("s2", a.tracked_session_ids)
 
 
 class TestReleaseRefIdempotent(unittest.TestCase):
-    """Release unknown rid returns success."""
+    """Release unknown session_id returns success."""
 
     def _make_cache(self):
         cache = RefAwareHiRadixCache.__new__(RefAwareHiRadixCache)
-        cache.rid_to_ref_info = {}
+        cache.session_id_to_ref_info = {}
         return cache
 
-    def test_release_unknown_rid_returns_success(self):
+    def test_release_unknown_session_id_returns_success(self):
         cache = self._make_cache()
         ok, msg = cache.release_ref("never-registered")
         self.assertTrue(ok)
         self.assertIn("not tracked", msg)
 
     def test_release_idempotent_after_first_release(self):
-        """Releasing the same rid twice should succeed both times."""
+        """Releasing the same session_id twice should succeed both times."""
         cache = RefAwareHiRadixCache.__new__(RefAwareHiRadixCache)
         cache.root_node = TreeNode()
         cache.root_node.key = RadixKey([])
@@ -391,7 +391,7 @@ class TestReleaseRefIdempotent(unittest.TestCase):
         cache.unused_evictable_size_ = 0
         cache.low_ref_evictable_size_ = 0
         cache.high_ref_evictable_size_ = 0
-        cache.rid_to_ref_info = {}
+        cache.session_id_to_ref_info = {}
         cache._evict_scope_stack = []
 
         node = TreeNode()
@@ -401,14 +401,14 @@ class TestReleaseRefIdempotent(unittest.TestCase):
         node.children = {}
         cache.root_node.children[1] = node
 
-        req = SimpleNamespace(rid="r1", priority=1, last_node=node)
+        req = SimpleNamespace(session_id="s1", priority=1, last_node=node)
         cache.register_ref(req)
 
-        ok1, _ = cache.release_ref("r1")
+        ok1, _ = cache.release_ref("s1")
         self.assertTrue(ok1)
 
-        # Second release of same rid should also return success (idempotent)
-        ok2, msg2 = cache.release_ref("r1")
+        # Second release of same session_id should also return success (idempotent)
+        ok2, msg2 = cache.release_ref("s1")
         self.assertTrue(ok2)
         self.assertIn("not tracked", msg2)
 
@@ -430,7 +430,7 @@ class TestUpdateRef(unittest.TestCase):
         cache.unused_evictable_size_ = 0
         cache.low_ref_evictable_size_ = 0
         cache.high_ref_evictable_size_ = 0
-        cache.rid_to_ref_info = {}
+        cache.session_id_to_ref_info = {}
         cache._evict_scope_stack = []
         return cache
 
@@ -443,9 +443,9 @@ class TestUpdateRef(unittest.TestCase):
         parent.children[token_ids[0] if token_ids else 0] = node
         return node
 
-    def test_update_ref_unknown_rid_returns_false(self):
+    def test_update_ref_unknown_session_id_returns_false(self):
         cache = self._make_cache()
-        ok, msg = cache.update_ref("unknown-rid", 5)
+        ok, msg = cache.update_ref("unknown-session-id", 5)
         self.assertFalse(ok)
         self.assertIn("not found", msg)
 
@@ -459,13 +459,13 @@ class TestUpdateRef(unittest.TestCase):
             cache._update_ref_aware_leaf_status(n)
 
         # Register as low priority
-        req = SimpleNamespace(rid="r1", priority=0, last_node=b)
+        req = SimpleNamespace(session_id="s1", priority=0, last_node=b)
         cache.register_ref(req)
         self.assertEqual(cache.low_ref_evictable_size_, 8)
         self.assertEqual(cache.high_ref_evictable_size_, 0)
 
         # Promote to high priority
-        ok, _ = cache.update_ref("r1", 5)
+        ok, _ = cache.update_ref("s1", 5)
         self.assertTrue(ok)
         self.assertEqual(cache.low_ref_evictable_size_, 0)
         self.assertEqual(cache.high_ref_evictable_size_, 8)
@@ -484,12 +484,12 @@ class TestUpdateRef(unittest.TestCase):
             cache._update_ref_aware_leaf_status(n)
 
         # Register as high priority
-        req = SimpleNamespace(rid="r1", priority=5, last_node=b)
+        req = SimpleNamespace(session_id="s1", priority=5, last_node=b)
         cache.register_ref(req)
         self.assertEqual(cache.high_ref_evictable_size_, 8)
 
         # Demote to low priority
-        ok, _ = cache.update_ref("r1", 0)
+        ok, _ = cache.update_ref("s1", 0)
         self.assertTrue(ok)
         self.assertEqual(cache.low_ref_evictable_size_, 8)
         self.assertEqual(cache.high_ref_evictable_size_, 0)
@@ -503,12 +503,12 @@ class TestUpdateRef(unittest.TestCase):
             cache._account_new_evictable_node(n)
             cache._update_ref_aware_leaf_status(n)
 
-        req = SimpleNamespace(rid="r1", priority=5, last_node=a)
+        req = SimpleNamespace(session_id="s1", priority=5, last_node=a)
         cache.register_ref(req)
         self.assertEqual(cache.high_ref_evictable_size_, 4)
 
         # Update with another high-priority value (still above threshold)
-        ok, msg = cache.update_ref("r1", 10)
+        ok, msg = cache.update_ref("s1", 10)
         self.assertTrue(ok)
         self.assertIn("unchanged", msg)
         # Size should not have changed
@@ -532,7 +532,7 @@ class TestScopedEvict(unittest.TestCase):
         cache.unused_evictable_size_ = 0
         cache.low_ref_evictable_size_ = 0
         cache.high_ref_evictable_size_ = 0
-        cache.rid_to_ref_info = {}
+        cache.session_id_to_ref_info = {}
         cache._evict_scope_stack = []
         return cache
 
@@ -603,7 +603,7 @@ class TestEndToEndAccounting(unittest.TestCase):
         cache.unused_evictable_size_ = 0
         cache.low_ref_evictable_size_ = 0
         cache.high_ref_evictable_size_ = 0
-        cache.rid_to_ref_info = {}
+        cache.session_id_to_ref_info = {}
         cache._evict_scope_stack = []
         return cache
 
@@ -627,30 +627,30 @@ class TestEndToEndAccounting(unittest.TestCase):
             cache._update_ref_aware_leaf_status(n)
 
         # Register as low priority
-        req = SimpleNamespace(rid="r1", priority=0, last_node=b)
+        req = SimpleNamespace(session_id="s1", priority=0, last_node=b)
         cache.register_ref(req)
         self.assertEqual(cache.unused_evictable_size_, 0)
         self.assertEqual(cache.low_ref_evictable_size_, 8)
         self.assertEqual(cache.high_ref_evictable_size_, 0)
 
         # Promote to high priority
-        ok, _ = cache.update_ref("r1", 5)
+        ok, _ = cache.update_ref("s1", 5)
         self.assertTrue(ok)
         self.assertEqual(cache.low_ref_evictable_size_, 0)
         self.assertEqual(cache.high_ref_evictable_size_, 8)
 
         # Release
-        ok, _ = cache.release_ref("r1")
+        ok, _ = cache.release_ref("s1")
         self.assertTrue(ok)
         self.assertEqual(cache.unused_evictable_size_, 8)
         self.assertEqual(cache.low_ref_evictable_size_, 0)
         self.assertEqual(cache.high_ref_evictable_size_, 0)
-        self.assertNotIn("r1", cache.rid_to_ref_info)
-        self.assertEqual(a.tracked_rids, set())
-        self.assertEqual(b.tracked_rids, set())
+        self.assertNotIn("s1", cache.session_id_to_ref_info)
+        self.assertEqual(a.tracked_session_ids, set())
+        self.assertEqual(b.tracked_session_ids, set())
 
-    def test_register_release_cycle_with_two_rids(self):
-        """Two rids on the same nodes both release cleanly."""
+    def test_register_release_cycle_with_two_session_ids(self):
+        """Two session_ids on the same nodes both release cleanly."""
         cache = self._make_cache()
         a = self._append_node(cache.root_node, [1, 2, 3, 4])
 
@@ -658,20 +658,20 @@ class TestEndToEndAccounting(unittest.TestCase):
             cache._account_new_evictable_node(n)
             cache._update_ref_aware_leaf_status(n)
 
-        req1 = SimpleNamespace(rid="r1", priority=0, last_node=a)
-        req2 = SimpleNamespace(rid="r2", priority=0, last_node=a)
+        req1 = SimpleNamespace(session_id="s1", priority=0, last_node=a)
+        req2 = SimpleNamespace(session_id="s2", priority=0, last_node=a)
         cache.register_ref(req1)
         cache.register_ref(req2)
 
         self.assertEqual(a.low_ref, 2)
         self.assertEqual(cache.low_ref_evictable_size_, 4)
 
-        cache.release_ref("r1")
+        cache.release_ref("s1")
         self.assertEqual(a.low_ref, 1)
         # Still in low_ref tier since r2 still holds it
         self.assertEqual(cache.low_ref_evictable_size_, 4)
 
-        cache.release_ref("r2")
+        cache.release_ref("s2")
         self.assertEqual(a.low_ref, 0)
         # Back to unused
         self.assertEqual(cache.unused_evictable_size_, 4)
@@ -687,18 +687,18 @@ class TestEndToEndAccounting(unittest.TestCase):
             cache._account_new_evictable_node(n)
             cache._update_ref_aware_leaf_status(n)
 
-        req = SimpleNamespace(rid="r1", priority=5, last_node=b)
+        req = SimpleNamespace(session_id="s1", priority=5, last_node=b)
         cache.register_ref(req)
 
         self.assertEqual(cache.high_ref_evictable_size_, 8)
 
-        cache.release_ref("r1")
+        cache.release_ref("s1")
 
         self.assertEqual(cache.unused_evictable_size_, 8)
         self.assertEqual(cache.high_ref_evictable_size_, 0)
-        self.assertNotIn("r1", cache.rid_to_ref_info)
-        self.assertEqual(a.tracked_rids, set())
-        self.assertEqual(b.tracked_rids, set())
+        self.assertNotIn("s1", cache.session_id_to_ref_info)
+        self.assertEqual(a.tracked_session_ids, set())
+        self.assertEqual(b.tracked_session_ids, set())
 
 
 if __name__ == "__main__":
