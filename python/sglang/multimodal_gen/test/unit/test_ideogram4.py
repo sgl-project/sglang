@@ -20,7 +20,11 @@ from sglang.multimodal_gen.configs.sample.ideogram import (
     IDEOGRAM4_PRESETS,
     Ideogram4SamplingParams,
 )
-from sglang.multimodal_gen.registry import _get_config_info, get_model_info
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_model_info,
+    get_non_diffusers_pipeline_name,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType, get_module_role
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -207,16 +211,19 @@ class TestIdeogram4(unittest.TestCase):
 
         with patch(
             "sglang.multimodal_gen.registry.maybe_download_model_index",
-            return_value={
-                "_class_name": "Ideogram4Pipeline",
-                "_diffusers_version": "0.0.0",
-            },
+            side_effect=AssertionError("registered NF4 route should not fetch HF"),
         ):
             info = get_model_info("ideogram-ai/ideogram-4-nf4", backend="sglang")
 
         self.assertEqual(info.pipeline_cls.__name__, "Ideogram4Pipeline")
         self.assertIs(info.pipeline_config_cls, Ideogram4PipelineConfig)
         self.assertIs(info.sampling_param_cls, Ideogram4SamplingParams)
+        self.assertEqual(
+            get_non_diffusers_pipeline_name(
+                "models--ideogram-ai--ideogram-4-nf4/snapshots/mock"
+            ),
+            "Ideogram4Pipeline",
+        )
 
     def test_rowwise_fp8_dequant_uses_output_channel_scale(self):
         weight = torch.tensor(
