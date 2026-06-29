@@ -1346,6 +1346,26 @@ class MultiModalMixin:
         super().__init__(*args, **kwargs)
         self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
+        # Transformers v5 flattened SiglipVisionModel and CLIPVisionModel: the
+        # 'vision_model' sub-module was removed, but checkpoints saved with v4
+        # still have 'vision_tower.vision_model.*' keys. Add a stripping mapper
+        # only when the instantiated model confirms there is no 'vision_model'
+        # child under vision_tower, so models that still have that child
+        # (e.g. CLIPVisionModelWithProjection, PaddleOCRVisionModel, OwlViT)
+        # are not affected.
+        vt = getattr(self.model, "vision_tower", None)
+        if vt is not None and not any(
+            name == "vision_model" for name, _ in vt.named_children()
+        ):
+            self.weight_mapper = (
+                WeightsMapper(
+                    orig_to_new_prefix={
+                        "vision_tower.vision_model.": "model.vision_tower."
+                    }
+                )
+                | self.weight_mapper
+            )
+
     def _uses_mrope_positions(self) -> bool:
         rope_scaling = getattr(self.text_config, "rope_scaling", None)
         if isinstance(rope_scaling, Mapping) and "mrope_section" in rope_scaling:
