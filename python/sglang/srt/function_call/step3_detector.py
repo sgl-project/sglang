@@ -273,40 +273,39 @@ class Step3Detector(BaseFormatDetector):
             if name_match:
                 func_name = name_match.group(1)
 
-                # Validate function name
-                if func_name in self._tool_indices:
-                    self._current_function_name = func_name
-                    self._function_name_sent = True
-
-                    # Initialize tool tracking
-                    if self.current_tool_id == -1:
-                        self.current_tool_id = 0
-
-                    # Ensure tracking arrays are large enough
-                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                        self.prev_tool_call_arr.append({})
-                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                        self.streamed_args_for_tool.append("")
-
-                    # Store tool call info
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
-                        "arguments": {},
-                    }
-
-                    # Send tool name with empty parameters
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
-                    )
-                else:
-                    # Invalid function name
-                    logger.warning(f"Invalid function name: {func_name}")
+                if func_name not in self._tool_indices and self._handle_unknown_tool(
+                    func_name
+                ):
                     self._reset_streaming_state()
                     return StreamingParseResult(calls=calls)
+
+                self._current_function_name = func_name
+                self._function_name_sent = True
+
+                # Initialize tool tracking
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+
+                # Ensure tracking arrays are large enough
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
+                # Store tool call info
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": func_name,
+                    "arguments": {},
+                }
+
+                # Send tool name with empty parameters
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=func_name,
+                        parameters="",
+                    )
+                )
             else:
                 # Function name not complete yet
                 return StreamingParseResult(calls=calls)

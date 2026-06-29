@@ -24,7 +24,6 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -130,11 +129,8 @@ class Lfm2Detector(BaseFormatDetector):
 
         # Validate that the function exists in the tools
         if function_name not in tool_indices:
-            logger.warning(
-                f"Model attempted to call undefined function: {function_name}"
-            )
-            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                return None  # Skip unknown tools (default legacy behavior)
+            if self._handle_unknown_tool(function_name):
+                return None
 
         # Parse arguments
         arguments = {}
