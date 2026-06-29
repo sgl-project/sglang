@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.srt.utils import get_device_name, is_cuda
 
@@ -47,7 +48,7 @@ def _per_token_quant_int8(
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
-    x_q = tl.extra.cuda.libdevice.round(x_q).to(tl.int8)
+    x_q = libdevice.round(x_q).to(tl.int8)
     if CAL_SUM:
         x_sum = tl.sum(x, axis=0)
         tl.store(x_sum_ptr + row_id, x_sum.to(x_sum_ptr.dtype.element_ty))
