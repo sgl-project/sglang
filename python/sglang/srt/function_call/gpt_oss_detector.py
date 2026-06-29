@@ -103,6 +103,7 @@ class GptOssDetector(BaseFormatDetector):
                 # Plain text with no tool markers — emit as normal content
                 out = self._buffer
                 self._buffer = ""
+                self.harmony_parser._buffer = ""
                 return StreamingParseResult(normal_text=out, calls=[])
 
         # Quick check if we might have tool calls
