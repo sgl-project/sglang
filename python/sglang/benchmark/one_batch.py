@@ -294,66 +294,6 @@ class BenchArgs:
         return cls(**result)
 
 
-def _model_uses_mamba_ssu(model_config) -> bool:
-    """Whether the model has Mamba SSM layers (so the selective_state_update
-    dispatch backend must be initialized before any forward).
-
-    Mirrors ``ModelRunner.mambaish_config`` (the isinstance set + the linear-
-    attn registry). KEEP IN SYNC with that property — if a new Mamba/hybrid
-    config is added there, add it here too. Erring toward True is harmless (it
-    only instantiates an unused dispatch global for a non-Mamba model).
-    """
-    from sglang.srt.configs import (
-        BailingHybridConfig,
-        FalconH1Config,
-        GraniteMoeHybridConfig,
-        InternS2PreviewConfig,
-        JetNemotronConfig,
-        JetVLMConfig,
-        KimiLinearConfig,
-        Lfm2Config,
-        Lfm2MoeConfig,
-        Lfm2VlConfig,
-        NemotronH_Nano_VL_V2_Config,
-        NemotronHConfig,
-        Qwen3_5Config,
-        Qwen3_5MoeConfig,
-        Qwen3NextConfig,
-    )
-    from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
-
-    mamba_config_types = (
-        FalconH1Config,
-        NemotronHConfig,
-        Lfm2Config,
-        Lfm2MoeConfig,
-        Lfm2VlConfig,
-        NemotronH_Nano_VL_V2_Config,
-        GraniteMoeHybridConfig,
-        KimiLinearConfig,
-        BailingHybridConfig,
-        Qwen3NextConfig,
-        Qwen3_5Config,
-        Qwen3_5MoeConfig,
-        InternS2PreviewConfig,
-        JetNemotronConfig,
-        JetVLMConfig,
-    )
-    hf_config = model_config.hf_config
-    if isinstance(hf_config, mamba_config_types):
-        return True
-    # Some hybrid configs (e.g. GDN) wrap the text config; check it too.
-    text_config = (
-        hf_config.get_text_config()
-        if hasattr(hf_config, "get_text_config")
-        else hf_config
-    )
-    if isinstance(text_config, mamba_config_types):
-        return True
-    # Registry-based linear-attention hybrids (GDN/KDA/lightning/...).
-    return get_linear_attn_config(hf_config) is not None
-
-
 def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -382,20 +322,6 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
 
         model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
-        # Mamba models need the selective_state_update dispatch backend
-        # initialized before ModelRunner runs any forward — cuda-graph capture
-        # happens inside ModelRunner.__init__, and the captured Mamba SSM step
-        # asserts the backend is set. The serving path does this in
-        # Scheduler.__init__ (init_mamba_backend); this bench builds a
-        # ModelRunner directly with no Scheduler, so we initialize it here.
-        # Gated to Mamba models (bench-only path — serving never calls
-        # load_model — so it cannot affect serving).
-        if _model_uses_mamba_ssu(model_config):
-            from sglang.srt.layers.attention.mamba.ops.ssu_dispatch import (
-                initialize_mamba_selective_state_update_backend,
-            )
-
-            initialize_mamba_selective_state_update_backend(server_args)
         model_runner = ModelRunner(**runner_kwargs)
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
@@ -964,15 +890,8 @@ def latency_test(
     custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
     custom_input_len = len(custom_inputs)
 
-    # Run the sweep. Each result is written to the jsonl AS it completes (and
-    # flushed) so a mid-sweep crash keeps the already-completed data points.
-    # Output is byte-identical on success.
+    # Run the sweep
     result_list = []
-    result_fout = (
-        open(bench_args.result_filename, "a")
-        if (tp_rank == 0 and bench_args.result_filename)
-        else None
-    )
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
@@ -1017,12 +936,12 @@ def latency_test(
         )
         if ret is not None:
             result_list.append(ret)
-            if result_fout is not None:
-                result_fout.write(json.dumps(ret) + "\n")
-                result_fout.flush()
 
-    if result_fout is not None:
-        result_fout.close()
+    # Write results in jsonlines format on rank 0.
+    if tp_rank == 0 and bench_args.result_filename:
+        with open(bench_args.result_filename, "a") as fout:
+            for result in result_list:
+                fout.write(json.dumps(result) + "\n")
 
     if server_args.tp_size > 1:
         destroy_model_parallel()
