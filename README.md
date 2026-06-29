@@ -70,7 +70,45 @@ Its core features include:
 - **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
 
 ## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
+
+### Quick Start
+
+**Installation**
+
+```bash
+pip install sglang
+```
+
+For GPU support with FlashInfer:
+```bash
+pip install sglang[all]
+```
+
+**Launch a Server**
+
+```bash
+python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct
+```
+
+**Send a Request**
+
+```python
+import openai
+
+client = openai.OpenAI(
+    base_url="http://127.0.0.1:30000/v1",
+    api_key="empty"
+)
+
+response = client.chat.completions.create(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    messages=[{"role": "user", "content": "What is the capital of France?"}]
+)
+print(response.choices[0].message.content)
+```
+
+### Learn More
+- [Installation Guide](https://docs.sglang.io/get_started/install.html)
 - [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
 - [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 - [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
