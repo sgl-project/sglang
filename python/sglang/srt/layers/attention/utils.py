@@ -1471,3 +1471,20 @@ def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:
     assert used <= capacity, f"{what}: used {used} > capacity {capacity}" + (
         f" ({', '.join(f'{k}={v}' for k, v in context.items())})" if context else ""
     )
+
+
+def get_model_context_len(model_runner) -> int:
+    """Semantic model context limit."""
+    return int(model_runner.model_config.context_len)
+
+
+def get_req_to_token_capacity_len(model_runner) -> int:
+    """Addressable req_to_token row width, including speculative headroom."""
+    return int(model_runner.req_to_token_pool.req_to_token.shape[1])
+
+
+def get_req_to_token_capacity_pages(model_runner) -> int:
+    """Page-table width needed to cover req_to_token's addressable row."""
+    capacity_len = get_req_to_token_capacity_len(model_runner)
+    page_size = int(model_runner.page_size)
+    return (capacity_len + page_size - 1) // page_size
