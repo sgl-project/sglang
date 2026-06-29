@@ -437,9 +437,14 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-        self._indexer_freqs_cis: Optional[torch.Tensor] = None
         if _use_dsa_indexer_fusion:
-            self._indexer_freqs_cis = _shared_indexer_freqs_cis(self.rotary_emb)
+            self.register_buffer(
+                "_indexer_freqs_cis",
+                _shared_indexer_freqs_cis(self.rotary_emb),
+                persistent=False,
+            )
+        else:
+            self._indexer_freqs_cis: Optional[torch.Tensor] = None
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
