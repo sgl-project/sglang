@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper, tilelang_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,

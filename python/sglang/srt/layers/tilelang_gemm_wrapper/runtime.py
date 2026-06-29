@@ -36,7 +36,7 @@ _AUTOTUNE_BACKENDS = ("event", "cupti", "cudagraph")
 _AUTOTUNE_BACKEND = Literal["event", "cupti", "cudagraph"]
 
 
-def update_tilelang_config(gpu_id: int, server_args: "ServerArgs") -> None:
+def update_tilelang_config(gpu_id: int, server_args: ServerArgs) -> None:
     """Update TileLang runtime config.
 
     The first-rank policy is wired here so warmup/autotune can run before CUDA

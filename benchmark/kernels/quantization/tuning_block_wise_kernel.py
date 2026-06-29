@@ -313,9 +313,7 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
         "num_warps": 4,
         "num_stages": 3,
     }
-    ref = w8a8_block_matmul(
-        A, B, As, Bs, block_size, reference_config, out_dtype
-    )
+    ref = w8a8_block_matmul(A, B, As, Bs, block_size, reference_config, out_dtype)
     torch.get_device_module().synchronize()
 
     best_config = None
@@ -410,8 +408,7 @@ def tune_on_gpu(args_dict):
     search_space = [
         config
         for config in search_space
-        if config["BLOCK_SIZE_K"] >= block_k
-        and config["BLOCK_SIZE_K"] % block_k == 0
+        if config["BLOCK_SIZE_K"] >= block_k and config["BLOCK_SIZE_K"] % block_k == 0
     ]
 
     start = time.perf_counter()

@@ -403,9 +403,7 @@ def generate_candidate_configs(
             for c_scale_local in (False, True):
                 for scale_shm in (False, True):
                     swizzle_options = (
-                        _base_swizzle_options(
-                            M, N, K, base, c_scale_local, scale_shm
-                        )
+                        _base_swizzle_options(M, N, K, base, c_scale_local, scale_shm)
                         if kernel_type == "base"
                         else ((0, "row"),)
                     )
@@ -441,7 +439,7 @@ class SelectedConfigStore:
         nk = (normalized["N"], normalized["K"])
         self.configs_by_nk.setdefault(nk, {})[normalized["M"]] = normalized
 
-    def update(self, other: "SelectedConfigStore") -> None:
+    def update(self, other: SelectedConfigStore) -> None:
         for config in other.as_list():
             self.add(config)
 
@@ -484,7 +482,7 @@ class SelectedConfigStore:
         return configs
 
     @classmethod
-    def from_file(cls, path: str) -> "SelectedConfigStore":
+    def from_file(cls, path: str) -> SelectedConfigStore:
         with open(path) as fin:
             payload = json.load(fin)
 
@@ -513,7 +511,7 @@ class SelectedConfigStore:
         return store
 
     @classmethod
-    def from_path(cls, path: str) -> "SelectedConfigStore":
+    def from_path(cls, path: str) -> SelectedConfigStore:
         if os.path.isdir(path):
             store = cls()
             for filename in sorted(os.listdir(path)):
