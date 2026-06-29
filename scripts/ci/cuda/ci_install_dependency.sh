@@ -56,13 +56,16 @@ configure_environment() {
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
         if [ -n "${GITHUB_ENV:-}" ]; then
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
             touch "$UV_VENV/env.sh"
         fi
         if [ -n "${GITHUB_PATH:-}" ]; then
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
         fi
     else
         echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
@@ -115,6 +118,17 @@ kill_existing_processes() {
         echo "ERROR: killall.py detected uncleanable GPU memory. Aborting CI."
         exit 1
     fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+cleanup_stale_shm() {
+    # Reclaim /dev/shm segments leaked by SIGKILLed processes from earlier
+    # jobs; leaked segments accumulate until the tmpfs fills and scheduler
+    # init dies with SIGBUS. Runs right after killall so every dead creator's
+    # segments are reclaimable. The module is dependency-free and runnable by
+    # path, so this works before sglang is installed.
+    SGLANG_IS_IN_CI=true python3 "${REPO_ROOT}/python/sglang/srt/utils/stale_shm_cleanup.py" || true
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -275,11 +289,18 @@ install_sglang_kernel() {
 
     # Reinstall torch with matching CUDA version if needed
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
-    echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    REINSTALL_TORCH=false
+    if TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')" 2>&1); then
+        echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+    else
+        TORCH_IMPORT_ERROR="${TORCH_CUDA_VER}"
+        TORCH_CUDA_VER=""
+        echo "WARNING: importing torch failed while probing CUDA version; force-reinstalling torch packages."
+        printf '%s\n' "${TORCH_IMPORT_ERROR}"
+        REINSTALL_TORCH=true
+    fi
     TORCHAUDIO_CUDA_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
     TORCHVISION_CUDA_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9][0-9]*\)$/\1/p' || true)
-    REINSTALL_TORCH=false
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
         REINSTALL_TORCH=true
     else
@@ -294,6 +315,11 @@ install_sglang_kernel() {
         TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
         TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+        if [ -z "${TORCH_VER}" ] || [ -z "${TORCHAUDIO_VER}" ] || [ -z "${TORCHVISION_VER}" ]; then
+            echo "ERROR: could not determine installed torch package versions before reinstall."
+            pip show torch torchaudio torchvision || true
+            exit 1
+        fi
         echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
         $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
@@ -335,18 +361,30 @@ download_flashinfer_cache() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-purge_cutlass_libs_base() {
-    # nvidia-cutlass-dsl[cu13] extras are additive on PyPI: requires_dist always
-    # pulls -libs-base AND -libs-cu13 when [cu13] is requested. Both wheels write
-    # to the same site-packages paths with different content, leaving the wrapper
-    # (cutlass.py, cu13 style) mismatched with the binding (_gpu_ops_gen.py, base
-    # style) -> GPUModuleOp signature TypeError. See vllm-project/vllm#40082.
-    # Uninstall -libs-base, then force-reinstall -libs-cu13 so its files win.
-    $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
-    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    if [ -n "$CUTLASS_DSL_VERSION" ]; then
-        $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
+force_reinstall_cutlass_dsl_libs_cu13() {
+    # nvidia-cutlass-dsl[cu13] has additive PyPI extras: installing it pulls in
+    # both -libs-base and -libs-cu13. The two wheels ship intentionally-different
+    # content for the same paths (cutlass/_mlir/dialects/_gpu_ops_gen.py and
+    # cutlass/_mlir/_mlir_libs/_cutlass_ir.cpython-*.so) -- each Python wrapper
+    # is paired with a matching pybind11 .so. If install order leaves the .py
+    # from one wheel and the .so from the other, GPUModuleOp.__init__ raises
+    # TypeError: incompatible function arguments at kernel-compile time.
+    #
+    # Force-reinstall -libs-cu13 LAST so both files come from the same wheel
+    # (BOTH-cu13 state), eliminating the mismatch. The version is parsed from
+    # pyproject.toml so this stays in sync with whatever nvidia-cutlass-dsl
+    # version the project pins.
+    if [ "$CU_MAJOR" != "13" ]; then
+        return
     fi
+
+    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' "${REPO_ROOT}/python/pyproject.toml" || echo "")
+    if [ -z "$CUTLASS_DSL_VERSION" ]; then
+        echo "WARNING: could not detect nvidia-cutlass-dsl version from pyproject.toml; skipping libs-cu13 force-reinstall"
+        return
+    fi
+
+    $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -403,13 +441,17 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
+    MOONCAKE_VERSION="0.3.11.post1"
+    NIXL_VERSION="1.3.0"
     if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+        NIXL_BIN_NAME="nixl-cu13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
+        MOONCAKE_PKG="mooncake-transfer-engine==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
+        NIXL_BIN_NAME="nixl-cu12"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
     # Both variants own the same mooncake/ package files and bin/ scripts
@@ -423,8 +465,18 @@ install_extra_deps() {
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
-    # Best-effort NIXL install for decode-radix disaggregation coverage.
-    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
+    NIXL_INSTALLED=$(pip show nixl 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    NIXL_BIN_INSTALLED=$(pip show "${NIXL_BIN_NAME}" 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    if [ "$NIXL_INSTALLED" = "$NIXL_VERSION" ] && [ "$NIXL_BIN_INSTALLED" = "$NIXL_VERSION" ]; then
+        echo "nixl==${NIXL_VERSION} and ${NIXL_BIN_NAME}==${NIXL_VERSION} already installed, keeping them"
+    else
+        echo "nixl mismatch (meta: ${NIXL_INSTALLED:-none}, ${NIXL_BIN_NAME}: ${NIXL_BIN_INSTALLED:-none}, required: ${NIXL_VERSION}); installing"
+        # Meta stub owns the nixl import path; install only the CUDA binary for
+        # this runner's torch CUDA major. --no-deps avoids pulling the other CUDA
+        # variant; leave any other variant already on the runner image untouched.
+        $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
+            --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -496,6 +548,7 @@ main() {
     configure_environment "$@"
     detect_host
     kill_existing_processes
+    cleanup_stale_shm
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
@@ -504,7 +557,7 @@ main() {
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
-    purge_cutlass_libs_base
+    force_reinstall_cutlass_dsl_libs_cu13
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools

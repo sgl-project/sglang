@@ -10,7 +10,14 @@ Out-of-tree platforms register via setuptools entry_points under the
 "sglang.srt.platforms" group and should subclass SRTPlatform.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Type
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]
@@ -61,8 +68,8 @@ class SRTPlatform(DeviceMixin):
         """Return the MLA KV pool class for this platform."""
         raise NotImplementedError
 
-    def get_nsa_kv_pool_cls(self) -> type:
-        """Return the NSA KV pool class for this platform (DeepSeek V3.2)."""
+    def get_dsa_kv_pool_cls(self) -> type:
+        """Return the DSA KV pool class for this platform (DeepSeek V3.2)."""
         raise NotImplementedError
 
     def get_paged_allocator_cls(self) -> type:
@@ -79,6 +86,14 @@ class SRTPlatform(DeviceMixin):
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
+
+    def get_quantization_config(
+        self, quantization: str
+    ) -> Optional[Type[QuantizationConfig]]:
+        """Return hardware-specific quantization config for the specific
+        quantization scheme, raise an error if not supported or return None
+        to use the default config."""
+        return None
 
     # ------------------------------------------------------------------
     # Capability flags (safe conservative defaults)

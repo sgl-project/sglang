@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
+    ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
@@ -87,6 +88,17 @@ class ModelSlimConfig(QuantizationConfig):
 
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
+        keys = [k for k in quant_config if isinstance(k, str)]
+        is_dsv4 = any(k.startswith("hc_head_") for k in keys)
+        if is_dsv4:
+            from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+            remap = DeepseekV4ForCausalLM.remap_weight_name_to_dpsk_hf_format
+            quant_config = {
+                (remap(k) if isinstance(k, str) else k): v
+                for k, v in quant_config.items()
+            }
+
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
@@ -107,6 +119,9 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
+
+    def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
+        self.packed_modules_mapping.update(mapping)
 
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
@@ -162,6 +177,8 @@ class ModelSlimConfig(QuantizationConfig):
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
+            if layer.scheme is None:
+                return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
@@ -180,6 +197,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
             ("W8A8", ModelSlimW8A8Int8),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
+            ("W8A8_MXFP8", ModelSlimMXFP8Scheme),
         ]
 
         quant_schemes = [self.quant_description.get(prefix + ".weight", "")]

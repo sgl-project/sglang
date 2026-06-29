@@ -26,15 +26,8 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
-from sglang.srt.utils.common import next_power_of_2
 
 # Silence the TRT-LLM cutlass autotune trace embedded inside FlashInfer's
 # cutlass_fused_moe. Its C++ logger reads TLLM_LOG_LEVEL on first kernel launch;
@@ -42,9 +35,6 @@ from sglang.srt.utils.common import next_power_of_2
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
 if is_flashinfer_available():
-    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
-
     try:
         from flashinfer.fused_moe import (
             interleave_moe_scales_for_sm90_mixed_gemm,
@@ -123,6 +113,9 @@ class Mxfp4FlashinferCutlassMoEMethod:
         )
 
     def create_moe_runner(self, layer: Module, moe_runner_config) -> None:
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
         self.moe_runner_config = moe_runner_config
 
         # DSv4 uses standard SwiGLU plus a config-driven activation clamp.
@@ -149,6 +142,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
             self._swiglu_alpha_tensor = None
             self._swiglu_beta_tensor = None
             self._swiglu_limit_tensor = None
+
+        # Register the fused func at runner construction so the FusedOpPool
+        # lookup at `MoeRunner.__init__` finds it.
+        import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+
+        self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
@@ -216,48 +215,32 @@ class Mxfp4FlashinferCutlassMoEMethod:
     def apply(
         self,
         layer: Module,
-        dispatch_output: "DispatchOutput",
-    ) -> "CombineInput":
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            FlashInferCutlassMxfp4MoeQuantInfo,
+        )
+
+        # DSv4 always feeds StandardDispatchOutput; the fused func tolerates
+        # bypassed too but we keep the strict check here as a contract guard.
         topk_output = dispatch_output.topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        x = dispatch_output.hidden_states
-        topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids
-
-        output_dtype = torch.bfloat16
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            out = torch.empty(
-                x.shape[0], x.shape[-1], dtype=output_dtype, device=x.device
-            )
-
-        flashinfer_cutlass_fused_moe(
-            input=x,
-            token_selected_experts=topk_ids.to(torch.int),
-            token_final_scales=topk_weights,
-            fc1_expert_weights=layer.w13_weight,
-            fc2_expert_weights=layer.w2_weight,
-            output_dtype=output_dtype,
-            quant_scales=[
-                layer.w13_weight_scale_inv.view(torch.int32),
-                layer.w2_weight_scale_inv.view(torch.int32),
-            ],
-            fc1_expert_biases=None,  # DSv4 has no MoE expert bias.
-            fc2_expert_biases=None,
+        quant_info = FlashInferCutlassMxfp4MoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_scale=layer.w13_weight_scale_inv,
+            w2_weight_scale=layer.w2_weight_scale_inv,
+            w13_bias=None,  # DSv4 has no MoE expert bias.
+            w2_bias=None,
             swiglu_alpha=self._swiglu_alpha_tensor,  # ones: standard SiLU gate
             swiglu_beta=self._swiglu_beta_tensor,  # zeros: standard up
             swiglu_limit=self._swiglu_limit_tensor,
-            tp_size=layer.moe_tp_size,
-            tp_rank=layer.moe_tp_rank,
-            ep_size=layer.moe_ep_size,
-            ep_rank=layer.moe_ep_rank,
-            use_w4_group_scaling=True,
-            activation_type=ActivationType.Swiglu,
-            tune_max_num_tokens=next_power_of_2(x.shape[0]),
-            output=out,
+            moe_tp_size=layer.moe_tp_size,
+            moe_tp_rank=layer.moe_tp_rank,
+            moe_ep_size=layer.moe_ep_size,
+            moe_ep_rank=layer.moe_ep_rank,
+            padded_hidden=None,  # DSv4 hidden_size is already a multiple of 128.
         )
-
-        return StandardCombineInput(hidden_states=out)
+        return self.runner.run(dispatch_output, quant_info)

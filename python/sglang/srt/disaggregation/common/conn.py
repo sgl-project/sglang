@@ -6,7 +6,6 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -25,7 +24,10 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -44,6 +46,22 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class KVTransferError(Exception):
+    def __init__(
+        self,
+        bootstrap_room: int,
+        failure_reason: str,
+        is_from_another_rank: bool = False,
+    ):
+        super().__init__(failure_reason)
+        self.bootstrap_room = bootstrap_room
+        self.failure_reason = failure_reason
+        self.is_from_another_rank = is_from_another_rank
+
+    def __str__(self):
+        return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 
 
 @dataclasses.dataclass
@@ -125,13 +143,16 @@ class CommonKVManager(BaseKVManager):
         )
 
         # bind zmq socket
-        context = zmq.Context()
+        self._zmq_ctx = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self._socket_cache: Dict[str, zmq.Socket] = {}
+        self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -235,19 +256,11 @@ class CommonKVManager(BaseKVManager):
 
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
-            if self.server_args.enable_hisparse:
-                # HiSparse: decode host pool page_size=1, prefill device pool page_size >= 1.
-                # Transfer will use send_kvcache_hisparse with per-token item_lens.
-                logger.info(
-                    f"HiSparse PD transfer mode: prefill page_size={info.page_size}, "
-                    f"decode host page_size={self.kv_args.page_size}"
-                )
-            else:
-                raise RuntimeError(
-                    f"Page size mismatch: prefill server has page_size={info.page_size}, "
-                    f"but decode server has page_size={self.kv_args.page_size}. "
-                    f"Both servers must use the same --page-size value."
-                )
+            raise RuntimeError(
+                f"Page size mismatch: prefill server has page_size={info.page_size}, "
+                f"but decode server has page_size={self.kv_args.page_size}. "
+                f"Both servers must use the same --page-size value."
+            )
 
         if (
             info.kv_cache_dtype is not None
@@ -381,6 +394,12 @@ class CommonKVManager(BaseKVManager):
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
+            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
+            # and can't be connected to; rewrite it to the same-family loopback,
+            # which the wildcard listener also binds.  (self.local_ip is wrong
+            # here — it can resolve to a different family than the listener,
+            # e.g. IPv6 while the server is bound to 0.0.0.0.)
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
@@ -430,13 +449,44 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
-        if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
+        with self._socket_lock:
+            sock = self._socket_cache.get(endpoint)
+            if sock is not None:
+                monitor = self._monitor_cache.get(endpoint)
+                disconnected = False
+                if monitor is not None:
+                    try:
+                        monitor.recv_multipart(zmq.NOBLOCK)
+                        disconnected = True
+                    except zmq.Again:
+                        pass
+                    except zmq.ZMQError:
+                        disconnected = True
+                if not disconnected:
+                    return sock
+                sock.close(linger=0)
+                if monitor is not None:
+                    monitor.close()
+                self._socket_cache.pop(endpoint, None)
+                self._monitor_cache.pop(endpoint, None)
+
+            sock = self._zmq_ctx.socket(zmq.PUSH)
+            if is_ipv6:
+                sock.setsockopt(zmq.IPV6, 1)
+            sock.setsockopt(zmq.RECONNECT_IVL, -1)
+            sock.setsockopt(zmq.SNDTIMEO, 30000)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+            sock.connect(endpoint)
+            self._socket_cache[endpoint] = sock
+            self._monitor_cache[endpoint] = sock.get_monitor_socket(
+                zmq.EVENT_DISCONNECTED
+            )
+            return sock
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -602,6 +652,104 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    def _start_heartbeat_checker_thread(self):
+        """Start the heartbeat checker thread for Decode worker."""
+
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_info_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+                            self._on_heartbeat_success(bootstrap_addr)
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
+
+        threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    def _on_heartbeat_success(self, bootstrap_addr: str):
+        """Hook called on successful heartbeat. Override for backend-specific cleanup."""
+        pass
+
+    def _handle_node_failure(self, failed_bootstrap_addr: str):
+        """Handle failure of a prefill node."""
+        with self.connection_lock:
+            keys_to_remove = [
+                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+            ]
+            # Collect TCP endpoints from cached bootstrap_infos before deletion
+            stale_endpoints = set()
+            for k in keys_to_remove:
+                for info in self.connection_pool[k]:
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        na = NetworkAddress(ip, int(port))
+                        stale_endpoints.add(na.to_tcp())
+            for k in keys_to_remove:
+                del self.connection_pool[k]
+            self.prefill_info_table.pop(failed_bootstrap_addr, None)
+
+            possible_affected_rooms = self.addr_to_rooms_tracker.get(
+                failed_bootstrap_addr, []
+            )
+            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
+
+        affected_rooms = []
+        for room in possible_affected_rooms:
+            if (
+                room in self.request_status
+                and self.check_status(room) != KVPoll.Success
+            ):
+                self.record_failure(
+                    room,
+                    f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+                )
+                self.update_status(room, KVPoll.Failed)
+                affected_rooms.append(room)
+
+        logger.error(
+            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{len(affected_rooms)} requests affected"
+        )
+
 
 class CommonKVSender(BaseKVSender):
     def __init__(
@@ -622,6 +770,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
+        self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -675,10 +824,10 @@ class CommonKVSender(BaseKVSender):
         )
 
     def pop_decode_prefix_len(self) -> int:
-        return 0
+        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
-        return num_pages > 0
+        return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
@@ -699,12 +848,62 @@ class CommonKVSender(BaseKVSender):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
 
+    def _prepare_send_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+    ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
+        """Common pre-processing for send(): index tracking and CP-rank handling.
+
+        Returns:
+            (kv_indices, index_slice, is_last_chunk, should_skip)
+            If should_skip is True, the caller should return immediately.
+        """
+        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        self.curr_idx += len(kv_indices)
+        is_last_chunk = self.curr_idx == self.num_kv_indices
+
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+                total_pages=self.num_kv_indices,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last_chunk:
+                return kv_indices, index_slice, is_last_chunk, True
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return kv_indices, index_slice, is_last_chunk, True
+
+        return kv_indices, index_slice, is_last_chunk, False
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
         pass
+
+    def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
+        if self.init_time is None:
+            return None
+        elapsed = time.time() - self.init_time
+        if elapsed < self.kv_mgr.bootstrap_timeout:
+            return None
+        logger.warning_once(
+            "Some requests timed out when bootstrapping, "
+            "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
+            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+        )
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"in KVPoll.Bootstrapping",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return KVPoll.Failed
 
     def poll(self) -> KVPoll:
         pass
@@ -745,6 +944,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
+        self.init_time: Optional[float] = None
+        self.abort_notified: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -890,10 +1091,25 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
+                sock.setsockopt(zmq.RECONNECT_IVL, -1)
+                sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+
+    @classmethod
+    def disconnect_endpoint(cls, endpoint: str):
+        with cls._global_lock:
+            sock = cls._socket_cache.pop(endpoint, None)
+            lock = cls._socket_locks.pop(endpoint, None)
+        if sock:
+            if lock:
+                with lock:
+                    sock.close()
+            else:
+                sock.close()
+            logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
@@ -914,6 +1130,31 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         raise NotImplementedError
 
+    def _check_waiting_timeout(self) -> Optional[KVPoll]:
+        if self.init_time is None:
+            return None
+        elapsed = time.time() - self.init_time
+        if elapsed < self.kv_mgr.waiting_timeout:
+            return None
+        logger.warning_once(
+            "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
+            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+        )
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"in KVPoll.WaitingForInput",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
+            self._send_abort_notification()
+            self.abort_notified = True
+        return KVPoll.Failed
+
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
 
@@ -929,6 +1170,36 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
+            self._send_abort_notification()
+            self.abort_notified = True
+
+    def _send_abort_notification(self):
+        for bootstrap_info in self.bootstrap_infos:
+            # Best-effort notification to prefill side that this request was aborted.
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"ABORT",
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                        ]
+                    )
+                logger.debug(
+                    f"Sent abort notification for room {self.bootstrap_room} "
+                    f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
+                )
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):

@@ -861,6 +861,37 @@ class TestReasoningParser(CustomTestCase):
         self.assertEqual(reasoning, "Let me think")
         self.assertEqual(normal, "The answer is 42.")
 
+    def test_parse_non_stream_preserves_payload_whitespace(self):
+        """Non-streaming parsing must not rewrite text inside or after reasoning."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_non_stream(
+            "<think>\nLet me think\n</think>\n\nThe answer is 42.\n"
+        )
+        self.assertEqual(reasoning, "\nLet me think\n")
+        self.assertEqual(normal, "\n\nThe answer is 42.\n")
+
+    def test_parse_non_stream_strips_repeated_leading_start_tokens(self):
+        """Repeated leading start tokens are markers, not reasoning payload."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_non_stream(
+            "<think><think>Let me think</think>The answer is 42."
+        )
+        self.assertEqual(reasoning, "Let me think")
+        self.assertEqual(normal, "The answer is 42.")
+
+    def test_parse_stream_chunk_preserves_payload_whitespace(self):
+        """Streaming parsing preserves the same generated payload whitespace."""
+        parser = ReasoningParser("qwen3")
+        reasoning, normal = parser.parse_stream_chunk("<think>")
+        self.assertEqual(reasoning, "")
+        self.assertEqual(normal, "")
+
+        reasoning, normal = parser.parse_stream_chunk(
+            "\nLet me think\n</think>\n\nThe answer is 42.\n"
+        )
+        self.assertEqual(reasoning, "\nLet me think\n")
+        self.assertEqual(normal, "\n\nThe answer is 42.\n")
+
     def test_parse_stream_chunk(self):
         """Test streaming chunk parsing."""
         parser = ReasoningParser("qwen3")

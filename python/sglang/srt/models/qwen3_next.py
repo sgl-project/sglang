@@ -6,16 +6,16 @@ import torch
 import triton
 from torch import nn
 
+from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -35,13 +35,19 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -49,6 +55,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -56,10 +63,8 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
-from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -68,6 +73,9 @@ _is_amx_available = cpu_has_amx_support()
 if _is_npu:
     from sgl_kernel_npu.fla.utils import (
         fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
+    )
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+        split_qkvgate_gemma_rmsnorm_rope,
     )
 
     fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
@@ -84,8 +92,8 @@ class Qwen3GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.hidden_size = config.hidden_size
         self.num_v_heads = (
             config.linear_num_value_heads
@@ -193,7 +201,7 @@ class Qwen3GatedDeltaNet(nn.Module):
                     else {}
                 ),
             )
-            if not get_global_server_args().disable_piecewise_cuda_graph
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             else FusedRMSNormGated(
                 self.head_v_dim,
                 eps=self.layer_norm_epsilon,
@@ -369,7 +377,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         if (
             _is_cpu
             or _is_npu
-            or not get_global_server_args().disable_piecewise_cuda_graph
+            or check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
         ):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
@@ -536,6 +544,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
+                support_shared_expert_fusion=True,
+                enable_cuda_shared_expert_fusion=True,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -600,8 +610,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.attn_tp_rank = get_attention_tp_rank()
-        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
@@ -703,6 +713,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
+                support_shared_expert_fusion=True,
+                enable_cuda_shared_expert_fusion=True,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -751,14 +763,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def self_attention(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -770,16 +776,67 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
 
         q, k = self._apply_qk_norm(q, k)
-
         q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
+        qkv, _ = self.qkv_proj(hidden_states)
+        # Calculate first full attention layer ID based on config
+        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+            self.rotary_emb.get_cos_sin_with_position(positions)
+
+        q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            int(self.head_dim * self.partial_rotary_factor),
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+        )
+        return q, k, v, gate
+
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Full attention forward pass."""
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or not self.attn_output_gate
+        ):
+            q, k, v, gate = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            q, k, v, gate = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if _is_hip:
+                from sglang.jit_kernel.triton.sigmoid_gate_mul import (
+                    sigmoid_gate_mul,
+                )
+
+                attn_output = sigmoid_gate_mul(attn_output, gate)
+            else:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -977,6 +1034,15 @@ class Qwen3NextForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        if self.num_fused_shared_experts > 1:
+            raise ValueError(
+                "Qwen3-Next shared expert fusion currently supports exactly one "
+                "shared expert because checkpoint weight remapping maps it into "
+                "a single fused MoE expert slot."
+            )
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
@@ -988,6 +1054,14 @@ class Qwen3NextForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def _get_num_fused_shared_experts(self) -> int:
+        if not hasattr(self.model, "layers"):
+            return 0
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+                return layer.mlp.num_fused_shared_experts
+        return 0
 
     @torch.no_grad()
     def forward(
@@ -1062,7 +1136,11 @@ class Qwen3NextForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=(
+                self.config.num_experts
+                if not self.enable_shared_expert_fusion
+                else self.config.num_experts + self.num_fused_shared_experts
+            ),
         )
 
         params_dict = dict(self.named_parameters())
@@ -1091,6 +1169,12 @@ class Qwen3NextForCausalLM(nn.Module):
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
+            if self.enable_shared_expert_fusion and "mlp.shared_expert." in name:
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{self.config.num_experts}.",
+                )
 
             # Remap modelopt FP8 KV cache scale names:
             # checkpoint: k_proj.k_scale / v_proj.v_scale

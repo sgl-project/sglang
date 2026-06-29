@@ -1,10 +1,10 @@
 /*
- * Fused metadata copy kernel for NSA backend CUDA graph replay.
+ * Fused metadata copy kernel for DSA backend CUDA graph replay.
  * JIT-compiled version for python/sglang/jit_kernel.
  *
  * OVERVIEW:
  * This kernel fuses multiple tensor copy operations (cache_seqlens, cu_seqlens_k,
- * page_table, nsa metadata, and optional FlashMLA metadata) into single kernel
+ * page_table, dsa metadata, and optional FlashMLA metadata) into single kernel
  * launches, significantly reducing kernel launch overhead and improving CUDA
  * graph replay performance during inference.
  *
@@ -35,9 +35,13 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>  // for std::min
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#else
+#include <hip/hip_runtime.h>
+#endif
 
-// Forward mode enum (must match Python ForwardMode in sglang/srt/layers/attention/nsa_backend.py)
+// Forward mode enum (must match Python ForwardMode in sglang/srt/layers/attention/dsa_backend.py)
 enum ForwardModeEnum { DECODE = 0, TARGET_VERIFY = 1, DRAFT_EXTEND = 2 };
 
 /**
@@ -49,9 +53,9 @@ struct SourcePointers {
   const int32_t* __restrict__ cache_seqlens;        // [bs] sequence lengths in cache
   const int32_t* __restrict__ cu_seqlens_k;         // [bs+1] cumulative sequence lengths
   const int32_t* __restrict__ page_indices;         // page table indices
-  const int32_t* __restrict__ nsa_cache_seqlens;    // NSA-specific cache lengths
+  const int32_t* __restrict__ dsa_cache_seqlens;    // DSA-specific cache lengths
   const int32_t* __restrict__ seqlens_expanded;     // expanded sequence lengths (TARGET_VERIFY/DRAFT_EXTEND only)
-  const int32_t* __restrict__ nsa_cu_seqlens_k;     // NSA cumulative sequence lengths
+  const int32_t* __restrict__ dsa_cu_seqlens_k;     // DSA cumulative sequence lengths
   const int32_t* __restrict__ real_page_table;      // optional real page table
   const int32_t* __restrict__ flashmla_num_splits;  // optional FlashMLA split counts
   const int32_t* __restrict__ flashmla_metadata;    // optional FlashMLA metadata
@@ -66,9 +70,9 @@ struct DestinationPointers {
   int32_t* __restrict__ cache_seqlens;        // [bs] sequence lengths in cache
   int32_t* __restrict__ cu_seqlens_k;         // [bs+1] cumulative sequence lengths
   int32_t* __restrict__ page_table_1;         // page table (note: different name from source)
-  int32_t* __restrict__ nsa_cache_seqlens;    // NSA-specific cache lengths
+  int32_t* __restrict__ dsa_cache_seqlens;    // DSA-specific cache lengths
   int32_t* __restrict__ seqlens_expanded;     // expanded sequence lengths (TARGET_VERIFY/DRAFT_EXTEND only)
-  int32_t* __restrict__ nsa_cu_seqlens_k;     // NSA cumulative sequence lengths
+  int32_t* __restrict__ dsa_cu_seqlens_k;     // DSA cumulative sequence lengths
   int32_t* __restrict__ real_page_table;      // optional real page table
   int32_t* __restrict__ flashmla_num_splits;  // optional FlashMLA split counts
   int32_t* __restrict__ flashmla_metadata;    // optional FlashMLA metadata
@@ -189,26 +193,26 @@ __global__ void fused_metadata_copy_kernel(const FusedMetadataCopyParams __grid_
     }
   }
 
-  // Branch 3: NSA metadata copy (different loop sizes per mode)
+  // Branch 3: DSA metadata copy (different loop sizes per mode)
   if (forward_mode == 0) {  // DECODE
 #pragma unroll 8
     for (int i = tid; i < bs; i += total_threads) {
-      dst.nsa_cache_seqlens[i] = src.nsa_cache_seqlens[i];
+      dst.dsa_cache_seqlens[i] = src.dsa_cache_seqlens[i];
     }
 
 #pragma unroll 8
     for (int i = tid; i < bs; i += total_threads) {
-      dst.nsa_cu_seqlens_k[i + 1] = src.nsa_cu_seqlens_k[i + 1];
+      dst.dsa_cu_seqlens_k[i + 1] = src.dsa_cu_seqlens_k[i + 1];
     }
   } else {  // TARGET_VERIFY or DRAFT_EXTEND
 #pragma unroll 4
     for (int i = tid; i < seqlens_expanded_size; i += total_threads) {
-      dst.nsa_cache_seqlens[i] = src.nsa_cache_seqlens[i];
+      dst.dsa_cache_seqlens[i] = src.dsa_cache_seqlens[i];
     }
 
 #pragma unroll 4
     for (int i = tid; i < seqlens_expanded_size; i += total_threads) {
-      dst.nsa_cu_seqlens_k[i + 1] = src.nsa_cu_seqlens_k[i + 1];
+      dst.dsa_cu_seqlens_k[i + 1] = src.dsa_cu_seqlens_k[i + 1];
     }
   }
 
@@ -309,22 +313,22 @@ __global__ void fused_metadata_copy_multi_kernel(const FusedMetadataCopyMultiPar
     dst2.page_table_1[row * page_table_1_stride + col] = val;
   }
 
-  // Copy nsa_cache_seqlens to all 3 backends
+  // Copy dsa_cache_seqlens to all 3 backends
 #pragma unroll 8
   for (int i = tid; i < bs; i += total_threads) {
-    int32_t val = src.nsa_cache_seqlens[i];
-    dst0.nsa_cache_seqlens[i] = val;
-    dst1.nsa_cache_seqlens[i] = val;
-    dst2.nsa_cache_seqlens[i] = val;
+    int32_t val = src.dsa_cache_seqlens[i];
+    dst0.dsa_cache_seqlens[i] = val;
+    dst1.dsa_cache_seqlens[i] = val;
+    dst2.dsa_cache_seqlens[i] = val;
   }
 
-  // Copy NSA cu_seqlens to all 3 backends
+  // Copy DSA cu_seqlens to all 3 backends
 #pragma unroll 8
   for (int i = tid; i < bs; i += total_threads) {
-    int32_t val = src.nsa_cu_seqlens_k[i + 1];
-    dst0.nsa_cu_seqlens_k[i + 1] = val;
-    dst1.nsa_cu_seqlens_k[i + 1] = val;
-    dst2.nsa_cu_seqlens_k[i + 1] = val;
+    int32_t val = src.dsa_cu_seqlens_k[i + 1];
+    dst0.dsa_cu_seqlens_k[i + 1] = val;
+    dst1.dsa_cu_seqlens_k[i + 1] = val;
+    dst2.dsa_cu_seqlens_k[i + 1] = val;
   }
 
   // Copy real page table to all 3 backends
@@ -493,18 +497,18 @@ struct FusedMetadataCopyKernel {
   run(const tvm::ffi::TensorView cache_seqlens_src,
       const tvm::ffi::TensorView cu_seqlens_k_src,
       const tvm::ffi::TensorView page_indices_src,
-      const tvm::ffi::TensorView nsa_cache_seqlens_src,
+      const tvm::ffi::TensorView dsa_cache_seqlens_src,
       const tvm::ffi::Optional<tvm::ffi::TensorView> seqlens_expanded_src,
-      const tvm::ffi::TensorView nsa_cu_seqlens_k_src,
+      const tvm::ffi::TensorView dsa_cu_seqlens_k_src,
       const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_src,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_src,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_src,
       const tvm::ffi::TensorView cache_seqlens_dst,
       const tvm::ffi::TensorView cu_seqlens_k_dst,
       const tvm::ffi::TensorView page_table_1_dst,
-      const tvm::ffi::TensorView nsa_cache_seqlens_dst,
+      const tvm::ffi::TensorView dsa_cache_seqlens_dst,
       const tvm::ffi::Optional<tvm::ffi::TensorView> seqlens_expanded_dst,
-      const tvm::ffi::TensorView nsa_cu_seqlens_k_dst,
+      const tvm::ffi::TensorView dsa_cu_seqlens_k_dst,
       const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst,
@@ -522,9 +526,9 @@ struct FusedMetadataCopyKernel {
                 .cache_seqlens = unwrap_data_ptr<int32_t>(cache_seqlens_src, "cache_seqlens_src"),
                 .cu_seqlens_k = unwrap_data_ptr<int32_t>(cu_seqlens_k_src, "cu_seqlens_k_src"),
                 .page_indices = unwrap_data_ptr<int32_t>(page_indices_src, "page_indices_src"),
-                .nsa_cache_seqlens = unwrap_data_ptr<int32_t>(nsa_cache_seqlens_src, "nsa_cache_seqlens_src"),
+                .dsa_cache_seqlens = unwrap_data_ptr<int32_t>(dsa_cache_seqlens_src, "dsa_cache_seqlens_src"),
                 .seqlens_expanded = unwrap_optional_data_ptr<int32_t>(seqlens_expanded_src, "seqlens_expanded_src"),
-                .nsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src"),
+                .dsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(dsa_cu_seqlens_k_src, "dsa_cu_seqlens_k_src"),
                 .real_page_table = unwrap_optional_data_ptr<int32_t>(real_page_table_src, "real_page_table_src"),
                 .flashmla_num_splits =
                     unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
@@ -535,9 +539,9 @@ struct FusedMetadataCopyKernel {
                 .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst, "cache_seqlens_dst"),
                 .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst, "cu_seqlens_k_dst"),
                 .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst, "page_table_1_dst"),
-                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst, "nsa_cache_seqlens_dst"),
+                .dsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(dsa_cache_seqlens_dst, "dsa_cache_seqlens_dst"),
                 .seqlens_expanded = unwrap_optional_data_ptr_mut<int32_t>(seqlens_expanded_dst, "seqlens_expanded_dst"),
-                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst, "nsa_cu_seqlens_k_dst"),
+                .dsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(dsa_cu_seqlens_k_dst, "dsa_cu_seqlens_k_dst"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst, "real_page_table_dst"),
                 .flashmla_num_splits =
                     unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst, "flashmla_num_splits_dst"),
@@ -605,32 +609,32 @@ struct FusedMetadataCopyMultiKernel {
   run(const tvm::ffi::TensorView cache_seqlens_src,
       const tvm::ffi::TensorView cu_seqlens_k_src,
       const tvm::ffi::TensorView page_indices_src,
-      const tvm::ffi::TensorView nsa_cache_seqlens_src,
-      const tvm::ffi::TensorView nsa_cu_seqlens_k_src,
+      const tvm::ffi::TensorView dsa_cache_seqlens_src,
+      const tvm::ffi::TensorView dsa_cu_seqlens_k_src,
       const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_src,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_src,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_src,
       const tvm::ffi::TensorView cache_seqlens_dst0,
       const tvm::ffi::TensorView cu_seqlens_k_dst0,
       const tvm::ffi::TensorView page_table_1_dst0,
-      const tvm::ffi::TensorView nsa_cache_seqlens_dst0,
-      const tvm::ffi::TensorView nsa_cu_seqlens_k_dst0,
+      const tvm::ffi::TensorView dsa_cache_seqlens_dst0,
+      const tvm::ffi::TensorView dsa_cu_seqlens_k_dst0,
       const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst0,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst0,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst0,
       const tvm::ffi::TensorView cache_seqlens_dst1,
       const tvm::ffi::TensorView cu_seqlens_k_dst1,
       const tvm::ffi::TensorView page_table_1_dst1,
-      const tvm::ffi::TensorView nsa_cache_seqlens_dst1,
-      const tvm::ffi::TensorView nsa_cu_seqlens_k_dst1,
+      const tvm::ffi::TensorView dsa_cache_seqlens_dst1,
+      const tvm::ffi::TensorView dsa_cu_seqlens_k_dst1,
       const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst1,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst1,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst1,
       const tvm::ffi::TensorView cache_seqlens_dst2,
       const tvm::ffi::TensorView cu_seqlens_k_dst2,
       const tvm::ffi::TensorView page_table_1_dst2,
-      const tvm::ffi::TensorView nsa_cache_seqlens_dst2,
-      const tvm::ffi::TensorView nsa_cu_seqlens_k_dst2,
+      const tvm::ffi::TensorView dsa_cache_seqlens_dst2,
+      const tvm::ffi::TensorView dsa_cu_seqlens_k_dst2,
       const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst2,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst2,
       const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst2,
@@ -647,9 +651,9 @@ struct FusedMetadataCopyMultiKernel {
                 .cache_seqlens = unwrap_data_ptr<int32_t>(cache_seqlens_src, "cache_seqlens_src"),
                 .cu_seqlens_k = unwrap_data_ptr<int32_t>(cu_seqlens_k_src, "cu_seqlens_k_src"),
                 .page_indices = unwrap_data_ptr<int32_t>(page_indices_src, "page_indices_src"),
-                .nsa_cache_seqlens = unwrap_data_ptr<int32_t>(nsa_cache_seqlens_src, "nsa_cache_seqlens_src"),
+                .dsa_cache_seqlens = unwrap_data_ptr<int32_t>(dsa_cache_seqlens_src, "dsa_cache_seqlens_src"),
                 .seqlens_expanded = nullptr,  // Not used in multi-backend DECODE mode
-                .nsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src"),
+                .dsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(dsa_cu_seqlens_k_src, "dsa_cu_seqlens_k_src"),
                 .real_page_table = unwrap_optional_data_ptr<int32_t>(real_page_table_src, "real_page_table_src"),
                 .flashmla_num_splits =
                     unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
@@ -660,9 +664,9 @@ struct FusedMetadataCopyMultiKernel {
                 .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst0, "cache_seqlens_dst0"),
                 .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst0, "cu_seqlens_k_dst0"),
                 .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst0, "page_table_1_dst0"),
-                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst0, "nsa_cache_seqlens_dst0"),
+                .dsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(dsa_cache_seqlens_dst0, "dsa_cache_seqlens_dst0"),
                 .seqlens_expanded = nullptr,
-                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst0, "nsa_cu_seqlens_k_dst0"),
+                .dsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(dsa_cu_seqlens_k_dst0, "dsa_cu_seqlens_k_dst0"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst0, "real_page_table_dst0"),
                 .flashmla_num_splits =
                     unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst0, "flashmla_num_splits_dst0"),
@@ -674,9 +678,9 @@ struct FusedMetadataCopyMultiKernel {
                 .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst1, "cache_seqlens_dst1"),
                 .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst1, "cu_seqlens_k_dst1"),
                 .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst1, "page_table_1_dst1"),
-                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst1, "nsa_cache_seqlens_dst1"),
+                .dsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(dsa_cache_seqlens_dst1, "dsa_cache_seqlens_dst1"),
                 .seqlens_expanded = nullptr,
-                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst1, "nsa_cu_seqlens_k_dst1"),
+                .dsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(dsa_cu_seqlens_k_dst1, "dsa_cu_seqlens_k_dst1"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst1, "real_page_table_dst1"),
                 .flashmla_num_splits =
                     unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst1, "flashmla_num_splits_dst1"),
@@ -688,9 +692,9 @@ struct FusedMetadataCopyMultiKernel {
                 .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst2, "cache_seqlens_dst2"),
                 .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst2, "cu_seqlens_k_dst2"),
                 .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst2, "page_table_1_dst2"),
-                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst2, "nsa_cache_seqlens_dst2"),
+                .dsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(dsa_cache_seqlens_dst2, "dsa_cache_seqlens_dst2"),
                 .seqlens_expanded = nullptr,
-                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst2, "nsa_cu_seqlens_k_dst2"),
+                .dsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(dsa_cu_seqlens_k_dst2, "dsa_cu_seqlens_k_dst2"),
                 .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst2, "real_page_table_dst2"),
                 .flashmla_num_splits =
                     unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst2, "flashmla_num_splits_dst2"),

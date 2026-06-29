@@ -34,7 +34,7 @@ WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
 
 
 def _extract_whitelisted_headers(
-    request: Optional["fastapi.Request"],
+    request: Optional[fastapi.Request],
 ) -> Optional[Dict[str, str]]:
     if request is None:
         return None
@@ -87,9 +87,9 @@ class RequestLogger:
 
     def log_received_request(
         self,
-        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenizer: Any = None,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -131,7 +131,7 @@ class RequestLogger:
     def log_openai_received_request(
         self,
         obj: Any,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         """Log the raw OpenAI request payload before request adaptation/tokenization."""
         max_length, _, _ = self.metadata
@@ -158,9 +158,9 @@ class RequestLogger:
 
     def log_finished_request(
         self,
-        obj: Union["GenerateReqInput", "EmbeddingReqInput"],
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
         out: Any,
-        request: Optional["fastapi.Request"] = None,
+        request: Optional[fastapi.Request] = None,
     ) -> None:
         if not self.log_requests:
             return
@@ -206,6 +206,7 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "video_data",
+                    "mm_data_mooncake",
                     "lora_path",
                     "sampling_params",
                 }
@@ -219,6 +220,7 @@ class RequestLogger:
                     "image_data",
                     "audio_data",
                     "video_data",
+                    "mm_data_mooncake",
                     "lora_path",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}

@@ -24,11 +24,17 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     ConcatParams,
     UnsharderPlan,
 )
-from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
+from sglang.srt.debug_utils.comparator.dims_spec import (
+    ParallelAxis,
+    TokenLayout,
+    apply_dim_names,
+    without_dim_names,
+)
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-c-test-cpu")
 
 
 class TestExecuteSubPlans:
@@ -57,8 +63,8 @@ class TestExecuteSubPlans:
         assert r.snapshots == []
 
     def test_with_unsharder_plan(self) -> None:
-        t0: torch.Tensor = torch.tensor([[1.0, 2.0]]).refine_names("b", "h")
-        t1: torch.Tensor = torch.tensor([[3.0, 4.0]]).refine_names("b", "h")
+        t0: torch.Tensor = apply_dim_names(torch.tensor([[1.0, 2.0]]), ["b", "h"])
+        t1: torch.Tensor = apply_dim_names(torch.tensor([[3.0, 4.0]]), ["b", "h"])
 
         plan = UnsharderPlan(
             axis=ParallelAxis.TP,
@@ -70,7 +76,7 @@ class TestExecuteSubPlans:
 
         assert r.tensor is not None
         expected: torch.Tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        assert torch.equal(r.tensor.rename(None), expected)
+        assert torch.equal(without_dim_names(r.tensor), expected)
         assert r.checks == []
         assert len(r.snapshots) == 1
 
@@ -226,8 +232,8 @@ class TestExecuteAlignerPlanWithTokenDim:
         torch.manual_seed(42)
 
         # shape [3, 4, 8]: dim0=a, dim1=token(4 tokens), dim2=hidden
-        tensor_x: torch.Tensor = torch.randn(3, 4, 8).refine_names("a", "t", "h")
-        tensor_y: torch.Tensor = torch.randn(3, 4, 8).refine_names("a", "t", "h")
+        tensor_x: torch.Tensor = apply_dim_names(torch.randn(3, 4, 8), ["a", "t", "h"])
+        tensor_y: torch.Tensor = apply_dim_names(torch.randn(3, 4, 8), ["a", "t", "h"])
 
         locator_x = TokenLocator(
             steps=[0, 0, 0],
@@ -262,8 +268,8 @@ class TestExecuteAlignerPlanWithTokenDim:
         assert result.tensors.x.shape == (3, 3, 8)
         assert result.tensors.y.shape == (3, 3, 8)
 
-        plain_x: torch.Tensor = tensor_x.rename(None)
-        plain_y: torch.Tensor = tensor_y.rename(None)
+        plain_x: torch.Tensor = without_dim_names(tensor_x)
+        plain_y: torch.Tensor = without_dim_names(tensor_y)
         for i in range(3):
             assert torch.equal(
                 result.tensors.x.select(dim=1, index=i),
@@ -279,11 +285,11 @@ class TestExecuteAlignerPlanWithTokenDim:
         torch.manual_seed(42)
 
         # x side: THD layout, shape [6, 8] (6 tokens, hidden=8), pre-named
-        tensor_x: torch.Tensor = torch.randn(6, 8).refine_names("t", "h")
+        tensor_x: torch.Tensor = apply_dim_names(torch.randn(6, 8), ["t", "h"])
 
         # y side: BSHD layout, shape [2, 3, 8] (B=2, S=3, H=8), pre-named
-        tensor_y: torch.Tensor = torch.randn(2, 3, 8).refine_names("b", "s", "h")
-        flat_y: torch.Tensor = tensor_y.rename(None).reshape(6, 8)
+        tensor_y: torch.Tensor = apply_dim_names(torch.randn(2, 3, 8), ["b", "s", "h"])
+        flat_y: torch.Tensor = tensor_y.reshape(6, 8)
 
         locator = TokenLocator(
             steps=[0, 0, 0],
@@ -314,7 +320,7 @@ class TestExecuteAlignerPlanWithTokenDim:
         assert result.tensors.x.shape == (3, 8)
         assert result.tensors.y.shape == (3, 8)
 
-        plain_x: torch.Tensor = tensor_x.rename(None)
+        plain_x: torch.Tensor = without_dim_names(tensor_x)
         assert torch.equal(result.tensors.x[0], plain_x[0])
         assert torch.equal(result.tensors.x[1], plain_x[2])
         assert torch.equal(result.tensors.x[2], plain_x[5])

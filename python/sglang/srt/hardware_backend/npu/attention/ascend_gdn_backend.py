@@ -47,6 +47,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
 
+    def _prepare_mamba_track_metadata(self, forward_batch: ForwardBatch):
+        if self.forward_metadata.has_mamba_track_mask:
+            mamba_track_mask_indices = forward_batch.mamba_track_mask.nonzero(
+                as_tuple=True
+            )[0]
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[mamba_track_mask_indices]
+            )
+
     def prepare_gdn_inputs(
         self,
         bs: int,
@@ -72,8 +81,24 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         else:
             self.ssm_state_indices = cache_indices
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            return
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        self.prepare_gdn_inputs(
+            forward_batch.batch_size,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+        )
+        self._prepare_mamba_track_metadata(forward_batch)
+        self.graph_mode = True
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if forward_batch.forward_mode.is_draft_extend(True):
+        if forward_batch.forward_mode.is_draft_extend_v2():
             return
         super().init_forward_metadata(forward_batch)
         self.prepare_gdn_inputs(
@@ -81,57 +106,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             forward_batch.forward_mode,
             forward_batch.spec_info,
         )
+        self._prepare_mamba_track_metadata(forward_batch)
         self.graph_mode = False
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        if forward_mode.is_draft_extend(True):
-            return
-        super().init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
-        self.prepare_gdn_inputs(bs, forward_mode, spec_info)
-        self.graph_mode = True
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        if forward_mode.is_draft_extend(True):
-            return
-        super().init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
-        )
-        self.prepare_gdn_inputs(bs, forward_mode, spec_info)
-        self.graph_mode = True
 
     def forward_decode(
         self,
@@ -256,16 +232,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
+            if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states.transpose(1, 2)[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states.transpose(1, 2)[
+                    forward_metadata.conv_states_mask_indices
+                ] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
             conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
             conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
@@ -350,14 +323,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     ssm_states.dtype, copy=False
                 )
                 ssm_states[cache_indices] = last_recurrent_state
-            if not forward_batch.spec_algorithm.is_none():
-                last_recurrent_state = last_recurrent_state.transpose(-1, -2).to(
-                    ssm_states.dtype, copy=False
-                )
-            else:
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
             if h is not None:
                 self._track_mamba_state_extend(

@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.lfm2 import Lfm2Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -40,10 +40,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -124,13 +126,13 @@ class Lfm2Attention(nn.Module):
         if rope_parameters is not None and "rope_theta" in rope_parameters:
             rope_theta = rope_parameters["rope_theta"]
         else:
-            rope_theta = config.rope_parameters["rope_theta"]
+            rope_theta = getattr(config, "rope_theta", 1000000.0)
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=getattr(config, "max_position_embeddings", 8192),
-            rope_scaling=config.rope_parameters,
+            rope_scaling=rope_parameters or getattr(config, "rope_scaling", None),
             base=rope_theta,
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
@@ -222,7 +224,7 @@ class Lfm2ShortConv(nn.Module):
         self.use_bias = bool(config.conv_bias)
         self.hidden_size = config.hidden_size
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.hidden_size_per_partition = self.hidden_size // tp_size
 
         # Use MergedColumnParallelLinear so each output (B, C, x) is sharded separately
@@ -263,12 +265,10 @@ class Lfm2ShortConv(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
+        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
-        mamba_indices = forward_batch.req_to_token_pool.get_mamba_indices(
-            req_pool_indices
-        )
+        mamba_indices = get_req_to_token_pool().get_mamba_indices(req_pool_indices)
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj, _ = self.in_proj(hidden_states)

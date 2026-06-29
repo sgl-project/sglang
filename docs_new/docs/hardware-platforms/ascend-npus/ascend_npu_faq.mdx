@@ -138,7 +138,7 @@ The `alloc_extend_kernel` operator appears to have a memory allocation issue. Pe
 
 Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the affected branch and use the else branch instead.
 
-```text highlight=15-36
+```python highlight=15-36
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -175,11 +175,11 @@ Modify `sglang/srt/hardware_backend/npu/allocator_npu.py` to comment out the aff
         #     )
 
         # else:
-            out_indices = torch.empty(
-                (extend_num_tokens,),
-                dtype=torch.int32,
-                device=self.device,
-            )
+        out_indices = torch.empty(
+            (extend_num_tokens,),
+            dtype=torch.int32,
+            device=self.device,
+        )
         ...
 ```
 
@@ -206,7 +206,7 @@ If the NPUs are not occupied, you can use `--tp` to deploy across multiple devic
 ## 5. How to update sgl-kernel-npu
 
 ### Solution
-```
+```shell
 git clone https://github.com/sgl-project/sgl-kernel-npu.git
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -221,3 +221,81 @@ python -c "import sgl_kernel_npu; print(sgl_kernel_npu.__path__)"
 
 rm -rf sgl-kernel-npu
 ```
+
+## 6. `[Errno 101] Network is unreachable` when downloading HuggingFace datasets
+
+### Error message
+
+```text highlight=1-2
+'[Errno 101] Network is unreachable' thrown while requesting HEAD https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+Retrying in 1s [Retry 1/5].
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/bench_serving.py", line 2353, in <module>
+    run_benchmark(args)
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/bench_serving.py", line 1848, in run_benchmark
+    input_requests = get_dataset(args, tokenizer, model_id)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/benchmark/datasets/__init__.py", line 44, in get_dataset
+    return dataset.load(tokenizer=tokenizer, model_id=model_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/benchmark/datasets/random.py", line 45, in load
+    return sample_random_requests(
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/benchmark/datasets/random.py", line 89, in sample_random_requests
+    dataset_path = download_and_cache_hf_file(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.14/lib/python3.11/site-packages/sglang/benchmark/utils.py", line 98, in download_and_cache_hf_file
+    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  ...
+RuntimeError: Cannot send a request, as the client has been closed.
+[ERROR] 2026-05-18-11:58:31 (PID:215, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
+```
+
+### Cause
+
+The machine cannot directly access the HuggingFace server due to network restrictions (firewall, proxy, or regional access limitations).
+
+### Solution
+
+- **Use an HF mirror site** — set the `HF_ENDPOINT` environment variable to a mirror (e.g., hf-mirror.com):
+
+  ```bash
+  export HF_ENDPOINT=https://hf-mirror.com
+  ```
+
+- **Use a proxy** — if you have an HTTP proxy available:
+
+  ```bash
+  export http_proxy=http://your-proxy:port
+  export https_proxy=http://your-proxy:port
+  ```
+
+- **Download the dataset manually** — use a machine with network access to download the file, then transfer it to the target machine. Use `--dataset-path` to specify the local file path:
+
+  ```bash
+  python -m sglang.bench_serving \
+    --dataset-name random \
+    --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
+    ...
+  ```
+## 7. Unexpected type fp8
+
+### Cause
+FP8 model is not supported
+
+### Solution
+Replace model weights, e.g., switch Qwen/Qwen3.5-27B-FP8 to Eco-Tech/Qwen3.5-27B-w8a8-mtp.
+
+## 8. Docker image versions: stable release vs. daily build
+
+Docker images for Ascend NPU are available in two types:
+
+- **Stable release** — validated version with a specific tag, e.g., `quay.io/ascend/sglang:v0.5.13.post1-cann9.0.0-a3`.
+  Recommended for production deployments.
+- **Daily build** — includes the latest development changes, e.g., `quay.io/ascend/sglang:main-cann8.5.0-a3`. Use this
+  if you need the latest features or bug fixes that have not yet been included in a stable release.
+
+If you encounter issues with a stable release, try switching to a daily build to see if the issue has been resolved in the latest development version.
