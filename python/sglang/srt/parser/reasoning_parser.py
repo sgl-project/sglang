@@ -461,10 +461,10 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         if not self.is_first_chunk:
             self.is_first_chunk = True
             new_text = self.think_start_token + new_text
-        return StreamingParseResult(normal_text=new_text)
+        return super().parse_streaming_increment(new_text)
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
-        return StreamingParseResult(normal_text=self.think_start_token + text)
+        return super().detect_and_parse(self.think_start_token + text)
 
 
 class Nemotron3Detector(BaseReasoningFormatDetector):
