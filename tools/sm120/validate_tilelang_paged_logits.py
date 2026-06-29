@@ -83,19 +83,29 @@ def fp8_paged_mqa_logits_torch_ref(
 
 def build_inputs(device="cuda"):
     torch.manual_seed(0)
-    # Use *valid* fp8 values (quantized from floats), not random bytes: random
-    # uint8 includes fp8-e4m3 NaN patterns (0x7F/0xFF) and huge magnitudes, which
-    # would make both the kernel and the reference produce NaN/garbage.
+    # Valid fp8 values (quantized from floats), and a VALUE-MAJOR page layout:
+    # per page the bytes are [ all B*D fp8 values | all B fp32 scales ], which is
+    # exactly how both the kernel and the reference read the cache. (A plain
+    # contiguous (BLOCK,1,HEAD_DIM+4) tensor would be token-major and mis-feed the
+    # value-major readers.)
     q = (torch.randn(BATCH, 1, NUM_HEADS, HEAD_DIM, device=device) * 0.5).to(FP8)
     weight = torch.randn(BATCH, NUM_HEADS, device=device, dtype=torch.float32)
-    head_dim_sf = HEAD_DIM + 4
-    kv = torch.zeros(NUM_PAGES, BLOCK, 1, head_dim_sf, device=device, dtype=torch.uint8)
-    kv_vals_fp8 = (
-        torch.randn(NUM_PAGES, BLOCK, 1, HEAD_DIM, device=device) * 0.5
-    ).to(FP8)
-    kv[..., :HEAD_DIM] = kv_vals_fp8.view(torch.uint8)
-    scales = (torch.rand(NUM_PAGES, BLOCK, 1, 1, device=device) + 0.1).to(torch.float32)
-    kv[..., HEAD_DIM:] = scales.view(torch.uint8)
+
+    block_bytes = BLOCK * (HEAD_DIM + 4)   # 8448
+    scale_offset = BLOCK * HEAD_DIM        # 8192
+    flat = torch.zeros(NUM_PAGES, block_bytes, device=device, dtype=torch.uint8)
+
+    # value region [0:B*D] = (BLOCK, HEAD_DIM) fp8, row-major
+    kv_vals_fp8 = (torch.randn(NUM_PAGES, BLOCK, HEAD_DIM, device=device) * 0.5).to(FP8)
+    flat[:, :scale_offset] = kv_vals_fp8.reshape(NUM_PAGES, scale_offset).view(torch.uint8)
+
+    # scale region [B*D:] = (BLOCK,) fp32 per page
+    scales = (torch.rand(NUM_PAGES, BLOCK, device=device) + 0.1).to(torch.float32)
+    flat[:, scale_offset:] = scales.view(torch.uint8).reshape(NUM_PAGES, BLOCK * 4)
+
+    # present in the (pages, BLOCK, 1, HEAD_DIM+4) shape the wrapper asserts; it
+    # immediately flattens back to (pages, block_bytes), preserving value-major.
+    kv = flat.view(NUM_PAGES, BLOCK, 1, HEAD_DIM + 4)
     seq_lens = torch.full((BATCH,), MAX_SEQ - 7, device=device, dtype=torch.int32)
     max_pages = (MAX_SEQ + BLOCK - 1) // BLOCK
     page_table = (
