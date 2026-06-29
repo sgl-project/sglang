@@ -29,7 +29,7 @@ The subclass overrides only:
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
@@ -378,6 +378,73 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             enable_memory_saver,
             kernel_page_size=self.page_size,
         )
+
+    # PD-disaggregation buffer descriptors. NPU buffers are 4D PA_ND
+    # (num_pages, page_size, 1, dim); buf.nbytes / buf[0].nbytes stay per-page-correct.
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        # No full-token contiguous space on NPU; everything ships per-pool via
+        # get_dsv4_state_components(), so the contiguous path is empty.
+        return [], [], []
+
+    def get_dsv4_state_components(
+        self,
+    ) -> List[Tuple[str, List[int], List[int], List[int]]]:
+        """Ordered ``(DSV4_* name, data_ptrs, data_lens, item_lens)`` per pool, in a
+        fixed order so prefill and decode register identically (empty pools skipped)."""
+        components: List[Tuple[str, List[int], List[int], List[int]]] = []
+
+        def kv_entry(bufs):
+            return (
+                [b.data_ptr() for b in bufs],
+                [b.nbytes for b in bufs],
+                [b[0].nbytes for b in bufs],
+            )
+
+        def state_entry(want_ratio: int, include_indexer: bool):
+            ptrs: List[int] = []
+            lens: List[int] = []
+            ilens: List[int] = []
+
+            def add(pool):
+                t = pool.kv_score_buffer.kv_score
+                ptrs.append(t.data_ptr())
+                lens.append(t.nbytes)
+                ilens.append(t[0].nbytes * pool.page_size)
+
+            for ratio, pool in zip(self.compression_ratios, self.compress_state_pools):
+                if pool is not None and ratio == want_ratio:
+                    add(pool)
+            if include_indexer:
+                # indexer compress-state pools are all ratio 4 and share the
+                # c4_state slot space.
+                for pool in self.indexer_compress_state_pools:
+                    if pool is not None:
+                        add(pool)
+            return ptrs, lens, ilens
+
+        # KV pools (4D PA_ND).
+        if self.swa_kv_pool is not None:
+            components.append(("DSV4_SWA", *kv_entry(self.swa_kv_pool.kv_buffer)))
+        if self.c4_kv_pool is not None:
+            components.append(("DSV4_C4", *kv_entry(self.c4_kv_pool.kv_buffer)))
+        if self.c128_kv_pool is not None:
+            components.append(("DSV4_C128", *kv_entry(self.c128_kv_pool.kv_buffer)))
+        if self.c4_indexer_kv_pool is not None:
+            idx_bufs = list(self.c4_indexer_kv_pool.index_k_buffer) + list(
+                self.c4_indexer_kv_pool.index_scale_buffer
+            )
+            components.append(("DSV4_INDEXER", *kv_entry(idx_bufs)))
+
+        # Compress-state pools (paged, flat 2D). c4_state bundles attn-c4-state +
+        # indexer-c4-state (same req_to_token_c4_state slot space).
+        components.append(("DSV4_C4_STATE", *state_entry(4, include_indexer=True)))
+        components.append(
+            ("DSV4_C128_STATE", *state_entry(128, include_indexer=False))
+        )
+
+        # Drop empty components (e.g. a ratio with no layers) so every shipped
+        # component has non-zero item_lens; the set is identical on both sides.
+        return [c for c in components if c[1]]
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """fp32 ``[block_num, page_size, 2*coff*D]`` view of this layer's

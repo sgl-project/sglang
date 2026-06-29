@@ -111,6 +111,101 @@ def maybe_write_dsv4_extend(
         )
 
 
+def dsv4_state_payloads(req_to_token_pool, req_pool_idx, seq_len, page_size, window_size):
+    """Per-StateType PD-payload builders for DSV4-on-NPU, keyed by ``StateType``.
+
+    Returns ``{}`` for non-DSV4 pools so PD code can ``dict.update`` it
+    unconditionally. prefill (src) and decode (dst) share this builder so their
+    page-index lists line up positionally (a mismatch silently corrupts KV).
+    """
+    if not hasattr(req_to_token_pool, "req_to_token_c4"):
+        return {}
+
+    import numpy as np
+
+    from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.mem_cache.common import kv_to_page_indices
+
+    def pages(table, lo, hi):
+        if hi <= lo:
+            return np.empty((0,), dtype=np.int32)
+        slots = table[req_pool_idx, lo:hi].cpu().numpy()
+        return kv_to_page_indices(slots, page_size).astype(np.int32)
+
+    def state_pages(table):
+        # Whole prompt span, mirroring the kernel state_block_table
+        # (state_table[req, ::page_size]//page_size); non-tail = skip sentinel page 0.
+        n_pages = (seq_len + page_size - 1) // page_size
+        return pages(table, 0, n_pages * page_size)
+
+    window_start = (max(0, seq_len - window_size) // page_size) * page_size
+
+    # DSV4_INDEXER shares the c4 slot space (written at the c4 loc).
+    return {
+        AscendStateType.DSV4_SWA: lambda: pages(
+            req_to_token_pool.req_to_token_swa, window_start, seq_len
+        ),
+        AscendStateType.DSV4_C4: lambda: pages(
+            req_to_token_pool.req_to_token_c4, 0, seq_len // 4
+        ),
+        AscendStateType.DSV4_C128: lambda: pages(
+            req_to_token_pool.req_to_token_c128, 0, seq_len // 128
+        ),
+        AscendStateType.DSV4_INDEXER: lambda: pages(
+            req_to_token_pool.req_to_token_c4, 0, seq_len // 4
+        ),
+        AscendStateType.DSV4_C4_STATE: lambda: state_pages(
+            req_to_token_pool.req_to_token_c4_state
+        ),
+        AscendStateType.DSV4_C128_STATE: lambda: state_pages(
+            req_to_token_pool.req_to_token_c128_state
+        ),
+    }
+
+
+def write_dsv4_prealloc_tables(
+    req_to_token_pool,
+    req: Req,
+    prefix_len: int,
+    fill_len: int,
+    bundle,
+) -> None:
+    """Write the five DSV4 per-req tables for one request on the disagg-decode
+    prealloc path (no ScheduleBatch); no-op without bundle / DSV4 tables."""
+    if bundle is None or not hasattr(req_to_token_pool, "write_c4"):
+        return
+    rp = torch.tensor([req.req_pool_idx])
+    pl = torch.tensor([prefix_len])
+    sl = torch.tensor([fill_len])
+
+    _write_per_req_slice(req_to_token_pool.write_swa, rp, pl, sl, bundle.out_swa_loc, ratio=1)
+    _write_per_req_slice(req_to_token_pool.write_c4, rp, pl, sl, bundle.out_c4_loc, ratio=4)
+    _write_per_req_slice(
+        req_to_token_pool.write_c128, rp, pl, sl, bundle.out_c128_loc, ratio=128
+    )
+
+    if bundle.out_c4_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c4_state"
+    ):
+        _write_state_tail_per_req(
+            req_to_token_pool.write_c4_state,
+            rp,
+            [getattr(req, "c4_state_alloc_offset", 0)],
+            sl,
+            bundle.out_c4_state_loc,
+        )
+    if bundle.out_c128_state_loc is not None and hasattr(
+        req_to_token_pool, "write_c128_state"
+    ):
+        _write_state_tail_per_req(
+            req_to_token_pool.write_c128_state,
+            rp,
+            [getattr(req, "c128_state_alloc_offset", 0)],
+            sl,
+            bundle.out_c128_state_loc,
+        )
+
+
 def maybe_write_dsv4_decode(
     batch: ScheduleBatch,
     seq_lens_cpu: torch.Tensor,

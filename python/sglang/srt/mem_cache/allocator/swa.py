@@ -270,9 +270,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_full_indices[-swa_tail_len:], alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[
-                alloc_full_indices[:-swa_tail_len].to(torch.int64)
-            ] = 0
+            zero_indices = alloc_full_indices[:-swa_tail_len]
+            if _is_npu:
+                # aclnnIndexPut rejects a scalar/int32 value against the int64
+                # mapping; mirror alloc_decode and scatter an int64 zero tensor.
+                torch_npu.npu_scatter_nd_update_(
+                    self.full_to_swa_index_mapping,
+                    zero_indices.to(torch.int64).unsqueeze(-1),
+                    torch.zeros(
+                        zero_indices.numel(),
+                        dtype=self.full_to_swa_index_mapping.dtype,
+                        device=self.full_to_swa_index_mapping.device,
+                    ),
+                )
+            else:
+                self.full_to_swa_index_mapping[zero_indices] = 0
         return alloc_full_indices
 
     def alloc_decode(
