@@ -54,7 +54,8 @@ def cutlass_w4a8_moe_mm(
     a_strides: torch.tensor,
     b_strides: torch.tensor,
     d_strides: torch.tensor,
-    s_strides: torch.tensor,
+    sa_strides: torch.tensor,
+    sb_strides: torch.tensor,
     chunk_size: int = 128,
     topk: int = 8,
 ):
@@ -81,7 +82,8 @@ def cutlass_w4a8_moe_mm(
         a_strides: Strides information for A matrices
         b_strides: Strides information for B matrices
         d_strides: Strides information for D matrices
-        s_strides: Strides information for b_scales matrices
+        sa_strides: Strides information for a_scales matrices
+        sb_strides: Strides information for b_scales matrices
         chunk_size: Number of elements each scale value applies to (K//512), default to 128
 
     Requirements:
@@ -106,7 +108,8 @@ def cutlass_w4a8_moe_mm(
         a_strides,
         b_strides,
         d_strides,
-        s_strides,
+        sa_strides,
+        sb_strides,
         chunk_size,
         topk,
     )
