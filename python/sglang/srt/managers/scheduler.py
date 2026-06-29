@@ -4031,7 +4031,7 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_prealloc_queue is not None
         ):
-            self.disagg_decode_prealloc_queue.release_held_rebootstrap()
+            self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
     def load_lora_adapter(

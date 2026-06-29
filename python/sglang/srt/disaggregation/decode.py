@@ -575,12 +575,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         here would leave the preallocation queue non-empty, which makes the
         scheduler non-idle so ``update_weights``' post-update cache flush
         asserts and crashes the decode worker. Instead we hold the request and
-        enqueue it from ``release_held_rebootstrap`` on resume, so its prefix KV
+        enqueue it from ``enqueue_held_rebootstrap`` on resume, so its prefix KV
         is recomputed by the prefill worker under the updated weights.
         """
         self.held_rebootstrap_reqs.append(req)
 
-    def release_held_rebootstrap(self) -> None:
+    def enqueue_held_rebootstrap(self) -> None:
         """Enqueue all staged rebootstrap requests when generation resumes."""
         held = self.held_rebootstrap_reqs
         self.held_rebootstrap_reqs = []
@@ -596,54 +596,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
         if getattr(req, "pd_rebootstrap_in_progress", False):
+            # Rebootstrap recomputes the full committed sequence (prompt + every
+            # emitted token, including the forced boundary token), so allocate
+            # len(origin)+len(output) with no -1, unlike normal decode where the
+            # last token's KV has not been written yet.
             return len(req.origin_input_ids) + len(req.output_ids)
         return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-
-    @staticmethod
-    def _sampling_params_for_rebootstrap(req: Req) -> dict:
-        sp = req.sampling_params
-        return {
-            "max_new_tokens": 1,
-            "temperature": sp.temperature,
-            "top_p": sp.top_p,
-            "top_k": sp.top_k,
-            "min_p": sp.min_p,
-            "frequency_penalty": sp.frequency_penalty,
-            "presence_penalty": sp.presence_penalty,
-            "repetition_penalty": sp.repetition_penalty,
-            "ignore_eos": sp.ignore_eos,
-            "skip_special_tokens": sp.skip_special_tokens,
-            "spaces_between_special_tokens": sp.spaces_between_special_tokens,
-            "no_stop_trim": sp.no_stop_trim,
-        }
-
-    def _build_rebootstrap_payload(self, req: Req) -> dict:
-        """Build the ``/generate`` payload sent to the original prefill worker to
-        recompute a retracted request's prefix KV under the current weights.
-
-        The dispatch itself (shared executor + HTTP session + failure handling)
-        lives on the kv manager; here we only assemble the request body so the
-        sampling-param allow-list stays next to the scheduler. ``input_ids`` are
-        coerced to plain ``int`` so the payload is always JSON-serializable even
-        when ``origin_input_ids``/``output_ids`` hold numpy scalars.
-        """
-        return {
-            "input_ids": [int(x) for x in req.origin_input_ids]
-            + [int(x) for x in req.output_ids],
-            "sampling_params": self._sampling_params_for_rebootstrap(req),
-            "return_logprob": False,
-            "stream": False,
-            "rid": req.rid,
-            "bootstrap_host": req.bootstrap_host,
-            "bootstrap_port": req.bootstrap_port,
-            "bootstrap_room": req.bootstrap_room,
-            "pd_rebootstrap_prefill_url": req.pd_rebootstrap_prefill_url,
-            "pd_rebootstrap_forced_output_id": req.pd_rebootstrap_forced_output_id,
-            "priority": req.priority,
-            "extra_key": req.extra_key,
-            "routing_key": req.routing_key,
-            "disagg_prefill_dp_rank": req.disagg_prefill_dp_rank,
-        }
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         input_len = self._rebootstrap_prefill_len(req)
@@ -1172,8 +1130,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_prefix_len=total_prefix_len,
             )
             if decode_req.is_rebootstrap:
-                decode_req.kv_receiver.dispatch_prefill_recompute(
-                    self._build_rebootstrap_payload(decode_req.req)
+                self.kv_manager.submit_prefill_recompute(
+                    decode_req.kv_receiver,
+                    decode_req.req.build_rebootstrap_payload(),
                 )
             if (
                 self.transfer_queue.enable_staging

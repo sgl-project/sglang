@@ -287,8 +287,8 @@ class CommonKVManager(BaseKVManager):
         surfaced through the standard ``KVPoll.Failed`` path via
         ``kv_receiver.abort()`` so the scheduler's existing transfer-failure
         handling streams the aborted request back to the client. ``payload`` is
-        prebuilt by the decode scheduler (input ids + sampling params + bootstrap
-        routing) so HTTP/sampling concerns stay out of the receiver.
+        prebuilt by the decode scheduler (``Req.build_rebootstrap_payload``) so
+        HTTP/sampling concerns stay on the kv manager.
         """
         prefill_url = payload.get("pd_rebootstrap_prefill_url")
         if not prefill_url:
@@ -296,7 +296,7 @@ class CommonKVManager(BaseKVManager):
                 "PD retract rebootstrap requires pd_rebootstrap_prefill_url from "
                 "the router (rid=%s bootstrap_room=%s).",
                 payload.get("rid"),
-                kv_receiver.bootstrap_room,
+                payload.get("bootstrap_room"),
             )
             self._fail_prefill_recompute(
                 kv_receiver,
@@ -1245,20 +1245,6 @@ class CommonKVReceiver(BaseKVReceiver):
         state_indices: Optional[List[int]] = None,
     ):
         raise NotImplementedError
-
-    def dispatch_prefill_recompute(self, payload: dict) -> None:
-        """Ask the original prefill worker to recompute this request's prefix KV
-        under the current weights (PD true-retraction rebootstrap) and transfer
-        it back over the already-bootstrapped channel.
-
-        Thin wrapper around the kv manager's shared executor; the decode
-        scheduler builds ``payload``. Must be called only after ``init`` and
-        ``send_metadata`` so the bootstrap handshake is complete and the
-        destination KV pages are registered before the prefill recomputes. A
-        failure is surfaced via ``KVPoll.Failed`` (see
-        ``CommonKVManager.submit_prefill_recompute``).
-        """
-        self.kv_mgr.submit_prefill_recompute(self, payload)
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:

@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -247,10 +247,11 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         )
 
     def test_build_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
-        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         req = self._new_req()
 
-        payload = prealloc_queue._build_rebootstrap_payload(req)
+        # build_rebootstrap_payload lives on Req; exercise it unbound with a
+        # namespace that carries the attributes it reads.
+        payload = Req.build_rebootstrap_payload(req)
 
         # origin_input_ids + output_ids, coerced to plain python ints.
         self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
@@ -350,29 +351,6 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         session.post.assert_called_once()
         receiver.abort.assert_not_called()
         self.assertEqual(mgr.failure_records, {})
-
-    def test_receiver_dispatch_delegates_to_manager(self):
-        from sglang.srt.disaggregation.common.conn import CommonKVReceiver
-
-        # CommonKVReceiver is abstract (abstract poll()); exercise the method
-        # unbound with a fake self that only carries kv_mgr.
-        fake_self = SimpleNamespace(kv_mgr=MagicMock())
-        payload = self._payload()
-
-        CommonKVReceiver.dispatch_prefill_recompute(fake_self, payload)
-
-        fake_self.kv_mgr.submit_prefill_recompute.assert_called_once_with(
-            fake_self, payload
-        )
-
-    def test_base_receiver_dispatch_falls_back_to_abort(self):
-        # Backends that do not subclass CommonKVReceiver (e.g. fake transfer)
-        # must fail a rebootstrap gracefully via abort(), not raise.
-        from sglang.srt.disaggregation.base.conn import BaseKVReceiver
-
-        fake_self = MagicMock()
-        BaseKVReceiver.dispatch_prefill_recompute(fake_self, self._payload())
-        fake_self.abort.assert_called_once_with()
 
 
 class TestDecodePrebuiltPriority(unittest.TestCase):

@@ -174,7 +174,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
             ContinueGenerationReqInput(torch_empty_cache=False)
         )
 
-        scheduler.disagg_decode_prealloc_queue.release_held_rebootstrap.assert_called_once_with()
+        scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
 
     def test_abort_drains_overlap_queue(self):
