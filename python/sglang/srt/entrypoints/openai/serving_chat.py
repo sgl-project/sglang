@@ -516,6 +516,24 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        # response_format with json_schema or json_object applies a grammar
+        # constraint that forces the model to produce the specified JSON shape.
+        # This is mutually exclusive with active tool calling: the constraint
+        # prevents the model from emitting tool-call tokens, so tool_calls will
+        # silently always be null.  OpenAI's own API rejects this combination.
+        if (
+            request.response_format
+            and getattr(request.response_format, "type", None)
+            in ("json_schema", "json_object")
+            and request.tools
+            and request.tool_choice != "none"
+        ):
+            return (
+                "response_format with type 'json_schema' or 'json_object' is not "
+                "compatible with tool calling. Either remove response_format, or "
+                "set tool_choice to 'none'."
+            )
+
         return None
 
     def _convert_to_internal_request(
