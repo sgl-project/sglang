@@ -534,6 +534,57 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.custom_logit_processor, ["processor1", "processor2"])
 
+    def test_bootstrap_params_with_parallel_sampling(self):
+        """Test bootstrap metadata normalization with parallel sampling."""
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            sampling_params={"n": 3},
+            bootstrap_host=["host1", "host2"],
+            bootstrap_port=[1001, 1002],
+            bootstrap_room=[10, 20],
+            bootstrap_pair_key=["key1", "key2"],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.bootstrap_host, ["host1", "host2"] * 3)
+        self.assertEqual(req.bootstrap_port, [1001, 1002] * 3)
+        self.assertEqual(req.bootstrap_pair_key, ["key1", "key2"] * 3)
+        self.assertEqual(req.bootstrap_room, [10, 20, 12, 22, 14, 24])
+
+    def test_bootstrap_params_already_expanded_with_parallel_sampling(self):
+        """Test bootstrap metadata that is already expanded by the router."""
+        req = GenerateReqInput(
+            text="Prompt",
+            sampling_params={"n": 3},
+            bootstrap_host=["host1", "host1", "host1"],
+            bootstrap_port=[1001, 1001, 1001],
+            bootstrap_room=[10, 11, 12],
+            bootstrap_pair_key=["key1", "key2", "key3"],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.bootstrap_host, ["host1", "host1", "host1"])
+        self.assertEqual(req.bootstrap_port, [1001, 1001, 1001])
+        self.assertEqual(req.bootstrap_room, [10, 11, 12])
+        self.assertEqual(req.bootstrap_pair_key, ["key1", "key2", "key3"])
+
+    def test_bootstrap_room_scalar_with_parallel_sampling(self):
+        """Test scalar bootstrap room expansion keeps rooms unique."""
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            sampling_params={"n": 2},
+            bootstrap_host="host",
+            bootstrap_port=1001,
+            bootstrap_room=10,
+            bootstrap_pair_key="key",
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.bootstrap_host, ["host"] * 4)
+        self.assertEqual(req.bootstrap_port, [1001] * 4)
+        self.assertEqual(req.bootstrap_pair_key, ["key"] * 4)
+        self.assertEqual(req.bootstrap_room, [10, 11, 12, 13])
+
     def test_session_params_handling(self):
         """Test handling of session_params."""
         # Test with dict
