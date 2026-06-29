@@ -133,6 +133,43 @@ RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
     python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
 fi
 
+# ============== DOCA / MLNX_OFED userspace upgrade (opt-in) ==============
+# Ubuntu 24.04's distro rdma-core (50.0-2ubuntu0.2) ships a libmlx5 that
+# does NOT export mlx5dv_reg_dmabuf_mr. NCCL >= 2.27 needs that symbol for
+# the dmabuf MR-registration path used by alltoall / scatter / sendrecv
+# and any CUMEM/VMM-backed buffer sent across NICs. Without it NCCL
+# silently falls back via dlvsym, then later fails with
+# IBV_WC_LOC_PROT_ERR (vendor_err=81) on cross-rack traffic on Mellanox HCAs.
+#
+# DOCA 3.2.2 LTS ships rdma-core 25.10 which exports MLX5_1.25.
+# Disabled by default; enable on Mellanox-HCA hosts (Nebius GB300, DGX,
+# etc.) with:  --build-arg ENABLE_DOCA_RDMA=1
+# To pin a different DOCA release, override DOCA_REPO_URL_BASE.
+ARG ENABLE_DOCA_RDMA=0
+ARG DOCA_REPO_URL_BASE=https://linux.mellanox.com/public/repo/doca/3.2.2/ubuntu24.04
+ARG DOCA_REPO_KEY_URL=https://linux.mellanox.com/public/repo/doca/GPG-KEY-Mellanox.pub
+RUN if [ "${ENABLE_DOCA_RDMA}" = "1" ]; then set -eux; \
+      arch=$(uname -m); \
+      case "$arch" in \
+        aarch64) doca_arch=arm64-sbsa ;; \
+        x86_64)  doca_arch=x86_64 ;; \
+        *) echo "ENABLE_DOCA_RDMA: unsupported arch $arch" && exit 1 ;; \
+      esac; \
+      apt-get update -qq; \
+      apt-get install -y --no-install-recommends curl ca-certificates gnupg; \
+      curl -fsSL "${DOCA_REPO_KEY_URL}" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/mellanox.gpg; \
+      echo "deb [signed-by=/etc/apt/trusted.gpg.d/mellanox.gpg] ${DOCA_REPO_URL_BASE}/${doca_arch} ./" \
+        > /etc/apt/sources.list.d/doca.list; \
+      apt-get update; \
+      apt-get install -y --allow-change-held-packages \
+          rdma-core libibverbs1 libibverbs-dev ibverbs-providers \
+          libibumad3 libibmad5 libibnetdisc5 infiniband-diags; \
+      nm -D "/usr/lib/${arch}-linux-gnu/libmlx5.so.1" | grep -q mlx5dv_reg_dmabuf_mr; \
+      echo "OK: libmlx5 exports mlx5dv_reg_dmabuf_mr @ MLX5_1.25"; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
     && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
@@ -782,6 +819,35 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && python3 -m pip config set global.break-system-packages true \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# ============== DOCA / MLNX_OFED userspace upgrade (opt-in) ==============
+# Mirrors the block in the `base` stage. The `runtime` stage has its own
+# apt install of rdma-core / libibverbs1 / libmlx5 above, so the upgrade
+# must be reapplied here. See `base` stage for the rationale.
+ARG ENABLE_DOCA_RDMA=0
+ARG DOCA_REPO_URL_BASE=https://linux.mellanox.com/public/repo/doca/3.2.2/ubuntu24.04
+ARG DOCA_REPO_KEY_URL=https://linux.mellanox.com/public/repo/doca/GPG-KEY-Mellanox.pub
+RUN if [ "${ENABLE_DOCA_RDMA}" = "1" ]; then set -eux; \
+      arch=$(uname -m); \
+      case "$arch" in \
+        aarch64) doca_arch=arm64-sbsa ;; \
+        x86_64)  doca_arch=x86_64 ;; \
+        *) echo "ENABLE_DOCA_RDMA: unsupported arch $arch" && exit 1 ;; \
+      esac; \
+      apt-get update -qq; \
+      apt-get install -y --no-install-recommends curl ca-certificates gnupg; \
+      curl -fsSL "${DOCA_REPO_KEY_URL}" \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/mellanox.gpg; \
+      echo "deb [signed-by=/etc/apt/trusted.gpg.d/mellanox.gpg] ${DOCA_REPO_URL_BASE}/${doca_arch} ./" \
+        > /etc/apt/sources.list.d/doca.list; \
+      apt-get update; \
+      apt-get install -y --allow-change-held-packages \
+          rdma-core libibverbs1 ibverbs-providers \
+          libibumad3 infiniband-diags; \
+      nm -D "/usr/lib/${arch}-linux-gnu/libmlx5.so.1" | grep -q mlx5dv_reg_dmabuf_mr; \
+      echo "OK: libmlx5 exports mlx5dv_reg_dmabuf_mr @ MLX5_1.25"; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Set up locale
 RUN apt-get update && apt-get install -y --no-install-recommends locales \
