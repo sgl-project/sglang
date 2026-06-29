@@ -65,6 +65,9 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+# SM120 (Blackwell desktop / RTX PRO 6000): module-level so all SM120 guards work
+# regardless of __init__ ordering / partial patch application.
+_IS_SM120 = is_sm120_supported()
 
 if is_cuda():
     import deep_gemm
@@ -412,14 +415,14 @@ class DeepseekSparseAttnBackend(
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
-        self.is_sm120 = is_sm120_supported()
+        self.is_sm120 = _IS_SM120
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # SM120 (Blackwell desktop / RTX PRO 6000) cannot run the flashinfer or
         # sgl_kernel.flash_mla based DSA impls (no tcgen05/TMEM). The auto-selector
         # picks "tilelang" on SM120; fail loudly if one of the unsupported impls was
         # forced via --dsa-prefill-backend / --dsa-decode-backend.
-        if self.is_sm120:
+        if _IS_SM120:
             _sm120_unsupported = {"trtllm", "flashmla_sparse", "flashmla_kv", "fa3"}
             for _impl, _label in (
                 (self.dsa_prefill_impl, "dsa_prefill_backend"),
@@ -435,7 +438,7 @@ class DeepseekSparseAttnBackend(
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         # SM120 never uses the trtllm/flashinfer ragged path, so skip the allocation there.
         if (
-            self.device_sm_major >= 10 and not self.is_sm120
+            self.device_sm_major >= 10 and not _IS_SM120
         ) or self.dsa_decode_impl == "trtllm":
             global global_workspace_buffer
             if global_workspace_buffer is None:
@@ -906,7 +909,7 @@ class DeepseekSparseAttnBackend(
             # ignores this schedule metadata, so skip the (crashing) call there.
             paged_mqa_schedule_metadata = (
                 None
-                if self.is_sm120
+                if _IS_SM120
                 else deep_gemm.get_paged_mqa_logits_metadata(
                     paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1189,7 +1192,7 @@ class DeepseekSparseAttnBackend(
             # ignores this schedule metadata, so skip the (crashing) call there.
             paged_mqa_schedule_metadata = (
                 None
-                if self.is_sm120
+                if _IS_SM120
                 else deep_gemm.get_paged_mqa_logits_metadata(
                     paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1364,7 +1367,7 @@ class DeepseekSparseAttnBackend(
             )
             new_schedule = (
                 None
-                if self.is_sm120
+                if _IS_SM120
                 else deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -1568,7 +1571,7 @@ class DeepseekSparseAttnBackend(
                 )
             new_schedule = (
                 None
-                if self.is_sm120
+                if _IS_SM120
                 else deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
@@ -2034,7 +2037,7 @@ class DeepseekSparseAttnBackend(
         # Determine required padding based on GPU architecture (use cached value).
         # SM120 uses the 64-pad path (it does not run the SM100 flashmla kernels).
         required_padding = (
-            128 if (self.device_sm_major >= 10 and not self.is_sm120) else 64
+            128 if (self.device_sm_major >= 10 and not _IS_SM120) else 64
         )
 
         need_padding = num_heads % required_padding != 0
@@ -2159,7 +2162,7 @@ class DeepseekSparseAttnBackend(
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
         # SM120 has no flashinfer kernels; it never enters MHA_ONE_SHOT (gated to SM90/SM100
         # below), so this branch is excluded defensively.
-        if self.device_sm_major >= 10 and not self.is_sm120:
+        if self.device_sm_major >= 10 and not _IS_SM120:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32

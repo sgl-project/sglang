@@ -3676,19 +3676,21 @@ class ServerArgs:
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
                 if is_sm120_supported():
-                    # SM120 (Blackwell desktop / RTX PRO 6000) lacks tcgen05/TMEM:
-                    # deep_gemm is unavailable, so route the DSA indexer paged
-                    # (decode) logits through the TileLang fallback and the ragged
-                    # (prefill) logits through the torch reference, and disable the
-                    # DeepGEMM/large-SMEM optimizations.
-                    if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
-                        envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                    # SM120 (Blackwell desktop / RTX PRO 6000) lacks tcgen05/TMEM,
+                    # so deep_gemm is unavailable. The TileLang paged-logits kernel
+                    # also fails to lower on current SM120 tilelang builds
+                    # (k_smem_u8 shape assert), so default the DSA indexer paged
+                    # (decode) logits to the pure-torch SM120 fallback. The ragged
+                    # (prefill) logits already use the torch reference. Honor an
+                    # explicit --enable... tilelang opt-in if the user set it.
+                    if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                        envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                     envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                     envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                     logger.warning(
-                        "SM120 detected for DSA model: using TileLang indexer "
-                        "logits and disabling DeepGEMM/large-SMEM optimizations."
+                        "SM120 detected for DSA model: using torch paged-logits "
+                        "fallback and disabling DeepGEMM/large-SMEM optimizations."
                     )
 
                 index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
