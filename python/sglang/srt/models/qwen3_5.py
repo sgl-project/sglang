@@ -1253,6 +1253,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     @property
     def start_layer(self) -> int:
         return self._start_layer
@@ -1683,6 +1688,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.set_eagle3_layers_to_capture(
+                [2, num_layers // 2, num_layers - 3]
+            )
+        else:
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1841,6 +1859,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         else:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.set_eagle3_layers_to_capture(
+                [2, num_layers // 2, num_layers - 3]
+            )
+        else:
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
