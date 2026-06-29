@@ -2216,7 +2216,11 @@ def _to_msgpack_state(obj: object) -> object:
         return {"__np_dtype__": obj.str}
     if isinstance(obj, dict):
         return {key: _to_msgpack_state(value) for key, value in obj.items()}
-    if isinstance(obj, (list, tuple, torch.Size)):
+    if isinstance(obj, torch.Size):
+        return {"__torch_size__": list(obj)}
+    if isinstance(obj, tuple):
+        return {"__tuple__": [_to_msgpack_state(value) for value in obj]}
+    if isinstance(obj, list):
         return [_to_msgpack_state(value) for value in obj]
     return obj
 
@@ -2229,6 +2233,10 @@ def _from_msgpack_state(obj: object) -> object:
             return torch.device(obj["__torch_device__"])
         if "__np_dtype__" in obj:
             return np.dtype(obj["__np_dtype__"])
+        if "__torch_size__" in obj:
+            return torch.Size(obj["__torch_size__"])
+        if "__tuple__" in obj:
+            return tuple(_from_msgpack_state(value) for value in obj["__tuple__"])
         return {key: _from_msgpack_state(value) for key, value in obj.items()}
     if isinstance(obj, list):
         return [_from_msgpack_state(value) for value in obj]

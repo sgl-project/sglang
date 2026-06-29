@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -148,6 +149,54 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         self.assertEqual(item.feature.device.type, "cuda")
         self.assertEqual(item.model_specific_data["image_grid_thw"].device.type, "cuda")
         self.assertEqual(decoded.mm_inputs.mrope_positions.device.type, "cuda")
+
+    def test_cuda_ipc_proxy_state_round_trip_preserves_tuple_types(self):
+        proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+        proxy.proxy_state = {
+            "ipc_extra": {
+                "shape": torch.Size([2, 3]),
+                "stride": (3, 1),
+                "dtype": torch.float16,
+                "nested": [(1, 2), torch.Size([4])],
+            },
+            "tensor_data": None,
+        }
+        proxy.reconstruct_tensor = None
+        proxy.sync_data_meta = {
+            "handle": "dummy",
+            "shape": torch.Size([1]),
+            "dtype": np.dtype("float32"),
+        }
+        proxy.sync_buffer = None
+
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].model_specific_data["ipc_proxy"] = proxy
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_proxy = decoded.mm_inputs.mm_items[0].model_specific_data["ipc_proxy"]
+        ipc_extra = decoded_proxy.proxy_state["ipc_extra"]
+        self.assertIsInstance(ipc_extra["shape"], torch.Size)
+        self.assertEqual(ipc_extra["shape"], torch.Size([2, 3]))
+        self.assertIsInstance(ipc_extra["stride"], tuple)
+        self.assertEqual(ipc_extra["stride"], (3, 1))
+        self.assertIsInstance(ipc_extra["nested"][0], tuple)
+        self.assertIsInstance(ipc_extra["nested"][1], torch.Size)
+        self.assertIsInstance(decoded_proxy.sync_data_meta["shape"], torch.Size)
+        self.assertIsInstance(decoded_proxy.sync_data_meta["dtype"], np.dtype)
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
