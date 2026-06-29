@@ -550,11 +550,17 @@ class DeepseekV4AttnBackend(
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
-    def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
+    def init_forward_metadata_indexer(
+        self,
+        core_attn_metadata: DSV4AttnMetadata,
+        *,
+        use_prefill_cuda_graph: bool = False,
+    ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
     def init_forward_metadata_decode(
@@ -637,7 +643,10 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
         )
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+            )
             if need_compress
             else None
         )

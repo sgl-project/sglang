@@ -17,10 +17,15 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
-from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.dsv4.metadata import (
+    NonPagedIndexerPlan,
+    PagedIndexerMetadata,
+)
+from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_hip
+from sglang.srt.utils import add_prefix, is_cuda, is_hip
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -430,6 +435,157 @@ class C4IndexerBackendMixin:
         )
         return q, weights, c4_indexer_kv_cache
 
+    def _can_use_nonpaged_indexer(
+        self,
+        *,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        indexer_metadata: PagedIndexerMetadata,
+    ) -> bool:
+        if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
+            return False
+        # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
+        # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
+        if not is_cuda() or is_hip():
+            return False
+        if (
+            forward_batch.forward_mode != ForwardMode.EXTEND
+            or getattr(forward_batch, "_original_forward_mode", None) is not None
+            or forward_batch.batch_size != 1
+            or indexer_metadata.use_prefill_cuda_graph
+        ):
+            return False
+        if (
+            c4_indexer.use_fp4_indexer
+            or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        ):
+            return False
+        if get_attention_cp_size() != 1 or self.hisparse_coordinator is not None:
+            return False
+        return not torch.cuda.is_current_stream_capturing()
+
+    def _get_nonpaged_indexer_plan(
+        self,
+        *,
+        c4_indexer: C4Indexer,
+        forward_batch: ForwardBatch,
+        indexer_metadata: PagedIndexerMetadata,
+        page_table: torch.Tensor,
+        c4_seq_lens: torch.Tensor,
+        query_rows: int,
+    ) -> Optional[NonPagedIndexerPlan]:
+        if not self._can_use_nonpaged_indexer(
+            c4_indexer=c4_indexer,
+            forward_batch=forward_batch,
+            indexer_metadata=indexer_metadata,
+        ):
+            return None
+        if indexer_metadata.nonpaged_plan is not None:
+            return indexer_metadata.nonpaged_plan
+
+        if (
+            forward_batch.seq_lens is None
+            or forward_batch.seq_lens_cpu is None
+            or forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.extend_seq_lens is None
+            or forward_batch.extend_start_loc is None
+            or forward_batch.extend_num_tokens is None
+        ):
+            return None
+
+        def to_cpu_int_list(values) -> Optional[List[int]]:
+            if isinstance(values, torch.Tensor):
+                if values.device.type != "cpu":
+                    return None
+                values = values.tolist()
+            return [int(value) for value in values]
+
+        extend_lens_cpu = to_cpu_int_list(forward_batch.extend_seq_lens_cpu)
+        seq_lens_cpu = to_cpu_int_list(forward_batch.seq_lens_cpu)
+        if (
+            extend_lens_cpu is None
+            or seq_lens_cpu is None
+            or len(extend_lens_cpu) != 1
+            or len(seq_lens_cpu) != 1
+            or extend_lens_cpu[0] <= 0
+        ):
+            return None
+
+        actual_queries = extend_lens_cpu[0]
+        if (
+            actual_queries != query_rows
+            or int(forward_batch.extend_num_tokens) != query_rows
+            or forward_batch.seq_lens.numel() != 1
+            or forward_batch.extend_seq_lens.numel() != 1
+            or forward_batch.extend_start_loc.numel() != 1
+            or page_table.dim() != 2
+            or page_table.shape[0] < query_rows
+            or c4_seq_lens.numel() < query_rows
+        ):
+            return None
+
+        final_c4_len = seq_lens_cpu[0] // 4
+        if final_c4_len <= 0:
+            return None
+
+        request_row = forward_batch.extend_start_loc[:1].to(torch.int64)
+        request_page_table = page_table.index_select(0, request_row).contiguous()
+        gather_seq_lens = torch.div(
+            forward_batch.seq_lens[:1].to(torch.int32),
+            4,
+            rounding_mode="floor",
+        ).contiguous()
+        ke = c4_seq_lens[:query_rows].reshape(-1).to(torch.int32).contiguous()
+        ks = torch.zeros_like(ke)
+        c4_page_size = indexer_metadata.c4_page_size
+        max_seqlen_k = (
+            (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
+        )
+        plan = NonPagedIndexerPlan(
+            page_table=request_page_table,
+            gather_seq_lens=gather_seq_lens,
+            ks=ks,
+            ke=ke,
+            seq_len_sum=final_c4_len,
+            max_seq_len=final_c4_len,
+            max_seqlen_k=max_seqlen_k,
+            query_rows=query_rows,
+        )
+        indexer_metadata.nonpaged_plan = plan
+        return plan
+
+    @staticmethod
+    def _forward_nonpaged_indexer(
+        *,
+        q_indexer: torch.Tensor,
+        weights: torch.Tensor,
+        c4_indexer: C4Indexer,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        plan: NonPagedIndexerPlan,
+    ) -> torch.Tensor:
+        import deep_gemm
+
+        k_u8, scale_u8 = token_to_kv_pool.get_index_k_scale_buffer(
+            layer_id=c4_indexer.layer_id,
+            seq_len_tensor=plan.gather_seq_lens,
+            page_indices=plan.page_table,
+            seq_len_sum=plan.seq_len_sum,
+            max_seq_len=plan.max_seq_len,
+        )
+        k_fp8 = k_u8.view(FP8_DTYPE)
+        k_scale = scale_u8.view(torch.float32).squeeze(-1)
+        return deep_gemm.fp8_mqa_logits(
+            q_indexer[: plan.query_rows],
+            (k_fp8, k_scale),
+            weights[: plan.query_rows],
+            plan.ks,
+            plan.ke,
+            clean_logits=False,
+            max_seqlen_k=plan.max_seqlen_k,
+        )
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -550,16 +706,34 @@ class C4IndexerBackendMixin:
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
-        logits = fn(
-            q,
-            c4_indexer_kv_cache,
-            weights,
-            _c4sl,
-            page_table,
-            indexer_metadata.deep_gemm_metadata,
-            indexer_metadata.max_c4_seq_len,
-            False,
+        nonpaged_plan = self._get_nonpaged_indexer_plan(
+            c4_indexer=c4_indexer,
+            forward_batch=forward_batch,
+            indexer_metadata=indexer_metadata,
+            page_table=page_table,
+            c4_seq_lens=c4_seq_lens,
+            query_rows=query_rows,
         )
+        if nonpaged_plan is not None:
+            assert isinstance(q_indexer, torch.Tensor)
+            logits = self._forward_nonpaged_indexer(
+                q_indexer=q_indexer,
+                weights=weights,
+                c4_indexer=c4_indexer,
+                token_to_kv_pool=token_to_kv_pool,
+                plan=nonpaged_plan,
+            )
+        else:
+            logits = fn(
+                q,
+                c4_indexer_kv_cache,
+                weights,
+                _c4sl,
+                page_table,
+                indexer_metadata.deep_gemm_metadata,
+                indexer_metadata.max_c4_seq_len,
+                False,
+            )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
