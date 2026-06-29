@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -859,6 +860,26 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
 
+        # FastHunyuan no longer pins a 150GB bar; it falls back to the global
+        # video default while keeping its VAE-only resident set.
+        fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
+        self.assertIsNone(
+            fast_hunyuan_deployment.auto_disable_component_offload_min_available_memory_gb
+        )
+        self.assertEqual(
+            fast_hunyuan_deployment.auto_disable_component_offload_components, ("vae",)
+        )
+
+        # The default resident set covers the auxiliary components (incl. VAE)
+        # but NOT the DiT, whose placement is owned by the FSDP / layerwise policy.
+        self.assertEqual(
+            qwen_deployment.auto_disable_component_offload_components,
+            ("text_encoder", "image_encoder", "vae"),
+        )
+        self.assertIsNone(
+            qwen_deployment.auto_disable_component_offload_min_available_memory_gb
+        )
+
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
             SanaWMPipelineConfig(),
@@ -948,7 +969,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIsNone(args.image_encoder_cpu_offload)
         self.assertFalse(args.enable_cfg_parallel)
 
-    def test_default_auto_replaces_text_encoder_cpu_offload_with_layerwise(self):
+    def test_default_auto_keeps_image_aux_resident_when_memory_allows(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={"model_path": "Qwen/Qwen-Image"},
@@ -956,10 +977,27 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.performance_mode, "auto")
         self.assertFalse(args.use_fsdp_inference)
+        # 80GB clears the image keep-resident threshold (45GB): the auxiliary
+        # components (incl. VAE) stay resident, so there is no layerwise offload.
+        # DiT placement is owned by the offload/FSDP policy and is unchanged.
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload_components)
+        self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_auto_image_offloads_aux_below_resident_threshold(self):
+        # Below the image keep-resident threshold (45GB) the auxiliary
+        # components -- including the VAE -- are still layerwise-offloaded to
+        # save VRAM on small GPUs, exactly as before this policy.
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            memory_gb=40,
+            kwargs={"model_path": "Qwen/Qwen-Image"},
+        )
+
+        self.assertEqual(args.performance_mode, "auto")
+        self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
@@ -1296,7 +1334,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(args.ltx2_two_stage_device_mode, "resident")
         self.assertEqual(args.layerwise_offload_components, ["text_encoder"])
 
-    def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_cfg(self):
+    def test_auto_multi_gpu_qwen_keeps_aux_resident_with_cfg(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
@@ -1308,14 +1346,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+        # 80GB/GPU clears the image keep-resident threshold (45GB): aux
+        # components (incl. VAE) stay resident, no layerwise offload; CFG
+        # parallel is still enabled and DiT placement is unchanged.
         self.assertTrue(args.dit_cpu_offload)
-        self.assertTrue(args.layerwise_offload_components)
+        self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
-        )
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_zimage_base_prefers_fsdp(self):
         args = self._from_dict_with_pipeline_config(
@@ -1359,9 +1397,14 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        # Explicit use_fsdp_inference=False marks an explicit memory policy, so
+        # the post-offload residency pass is skipped. The VAE is still kept
+        # resident by the layerwise filter (it never enters the offload list);
+        # only the text encoder remains offloaded layerwise.
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["text_encoder"],
         )
 
     def test_auto_multi_gpu_qwen_skips_fsdp_when_available_memory_is_low(self):
@@ -1377,13 +1420,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+        # 50GB still clears the image keep-resident threshold (45GB), so aux
+        # components (incl. VAE) stay resident with no layerwise offload; FSDP
+        # is still skipped because Qwen-Image does not opt into auto FSDP.
         self.assertTrue(args.dit_cpu_offload)
+        self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
-        )
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
         args = self._from_dict_with_pipeline_config(
@@ -1400,7 +1444,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_auto_multi_gpu_qwen_replaces_text_encoder_offload_with_headroom(self):
+    def test_auto_multi_gpu_qwen_keeps_aux_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             available_memory_gb={1: 72, 2: 80},
@@ -1414,13 +1458,14 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+        # min available across selected GPUs is 72GB, which clears the image
+        # keep-resident threshold (45GB): aux components (incl. VAE) stay
+        # resident with no layerwise offload.
         self.assertTrue(args.dit_cpu_offload)
+        self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
-        )
+        self.assertFalse(args.vae_cpu_offload)
 
     def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(
