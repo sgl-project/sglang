@@ -209,6 +209,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
+        self.supports_untrimmed_swa_spec_dec_tree = bool(
+            getattr(
+                flashinfer.decode,
+                "trtllm_gen_supports_untrimmed_swa_spec_dec_tree",
+                False,
+            )
+        )
 
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
@@ -237,11 +244,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # backends through these attributes.
         self.draft_branch_page_tables: Optional[torch.Tensor] = None
         self.draft_branch_page_table_buf: Optional[torch.Tensor] = None
-        # SWA hybrid + topk > 1: tree verify on SWA layers folds the sliding
-        # window into the packed custom mask (the trtllm custom-mask
-        # cubins have no SlidingWindow+Custom mask type), presenting only the
-        # in-window KV via a page-trimmed SWA table so the mask region stays
-        # ~window-sized. See _swa_verify_views.
+        # Older FlashInfer versions fold the sliding window into the packed
+        # custom mask and need a page-trimmed SWA table. Newer versions own
+        # native-versus-folded selection and consume the full SWA metadata.
         self.sliding_window_size = model_runner.sliding_window_size
 
         # Forward metadata
@@ -420,7 +425,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ) // self.page_size + 1
 
     def _fill_swa_verify_views(self, metadata: TRTLLMMHAMetadata):
-        """Fill the trimmed (page_table, seqlens) for tree verify on SWA layers.
+        """Fill fallback trimmed metadata for tree verify on SWA layers.
 
         The window is folded into flashinfer's packed custom mask, whose
         region covers the whole presented KV range, so present only the pages
@@ -430,7 +435,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         and leave the gather out of the captured graph, replaying stale
         capture-time trims.
         """
-        if self._swa_kv_pool is None or self.topk <= 1:
+        if (
+            self.supports_untrimmed_swa_spec_dec_tree
+            or self._swa_kv_pool is None
+            or self.topk <= 1
+        ):
             return
         window = self.sliding_window_size
         nv = metadata.max_seq_len_q
@@ -537,7 +546,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
-            if self._swa_kv_pool is not None and self.topk > 1:
+            if (
+                not self.supports_untrimmed_swa_spec_dec_tree
+                and self._swa_kv_pool is not None
+                and self.topk > 1
+            ):
                 # Trimmed SWA verify views; refilled before each replay in
                 # the apply path (see _fill_swa_verify_views).
                 self.target_verify_metadata["swa_verify_page_table"] = torch.zeros(
@@ -1232,13 +1245,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and self.forward_metadata.tree_mask is not None
                 and self._layer_is_swa(layer)
+                and not self.supports_untrimmed_swa_spec_dec_tree
             ):
-                # Tree verify on a SWA layer: flashinfer folds the window
-                # into the packed custom mask (no SlidingWindow+Custom cubin;
-                # proper kernel support is a planned follow-up), and the mask
-                # region covers all presented KV, so present only the
-                # in-window pages (filled by _fill_swa_verify_views in the
-                # metadata init/apply paths).
+                # Compatibility path for FlashInfer versions that fold the
+                # window into the packed custom mask: present only in-window
+                # pages filled by _fill_swa_verify_views.
                 page_table = self.forward_metadata.swa_verify_page_table
                 seq_lens_arg = self.forward_metadata.swa_verify_seqlens
                 max_seq_len_arg = self._swa_verify_max_pages() * self.page_size
