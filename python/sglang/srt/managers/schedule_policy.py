@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
 CLIP_MAX_NEW_TOKENS = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "16384")
 )
 
 # Threshold for in-batch prefix cache.
