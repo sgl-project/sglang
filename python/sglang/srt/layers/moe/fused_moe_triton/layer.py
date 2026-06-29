@@ -1119,13 +1119,7 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # Conditionally pre-allocate output in symmetric memory pool when
-        # symmetric memory optimization is enabled. This allows the downstream
-        # all-reduce to use NCCL symmetric memory for better performance.
-        # When disabled, we fall back to the original path without overhead.
-        _symm_required = is_allocation_symmetric()
-
-        if _symm_required:
+        if is_allocation_symmetric():
             with use_symmetric_memory(get_tp_group()):
                 symm_output = torch.empty(
                     hidden_states.shape[0],
@@ -1143,29 +1137,6 @@ class FusedMoE(torch.nn.Module):
                 final_hidden_states = self.dispatcher.combine(
                     combine_input=combine_input
                 )
-
-            # The upstream hidden_states (e.g. from hc_pre in DeepSeek-V4) may not
-            # reside in the symmetric memory pool, so the MoE compute pipeline
-            # (dispatch → experts → combine) produces a final_hidden_states
-            # outside the pool.  Additionally, some quant methods / runners
-            # (e.g. FP8 flashinfer_trtllm, MxFP4FlashinferTrtllmMoEMethod,
-            # Triton, DeepGemm) ignore the buffer passed via
-            # moe_output_buffer_ctx and allocate their own output.  If the
-            # combine result is not the pre-allocated symmetric buffer, copy
-            # it in so that the downstream allreduce can use the low-latency
-            # NCCL symmetric memory path.  The copy overhead is negligible
-            # (a single small memcpy on decode-scale batch sizes) compared
-            # to the latency saving from symmetric-memory allreduce.
-            if (
-                final_hidden_states.untyped_storage().data_ptr()
-                != symm_output.untyped_storage().data_ptr()
-            ):
-                symm_output[
-                    : final_hidden_states.shape[0], : final_hidden_states.shape[1]
-                ].copy_(final_hidden_states)
-                final_hidden_states = symm_output[
-                    : final_hidden_states.shape[0], : final_hidden_states.shape[1]
-                ]
         else:
             combine_input = self.run_moe_core(dispatch_output=dispatch_output)
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)

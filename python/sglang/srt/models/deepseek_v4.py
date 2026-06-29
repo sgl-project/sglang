@@ -32,6 +32,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -61,6 +64,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
@@ -1387,8 +1391,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
+        # y is the post-norm activation fed into the MoE. Allocate it in the
+        # symmetric memory pool so the downstream all-reduce uses the low-latency
+        # NCCL symmetric path: the Triton inplace MoE runner writes the expert
+        # output back into this buffer, so a symmetric input yields a symmetric
+        # all-reduce input. Gated by is_allocation_symmetric() (mirrors the
+        # TileLang path in _mhc_pre_impl / mhc_fused_post_pre).
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1).to(dtype)
+        return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
         self,
