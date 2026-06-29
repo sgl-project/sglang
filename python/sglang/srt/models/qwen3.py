@@ -14,7 +14,7 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -78,6 +78,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        attn_type: Optional[AttentionType] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -147,12 +148,16 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        # Default to DECODER attention type if not specified
+        if attn_type is None:
+            attn_type = AttentionType.DECODER
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            attn_type=attn_type,
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
@@ -335,6 +340,9 @@ class Qwen3DecoderLayer(nn.Module):
             rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
+        # Determine attention type from config (for bidirectional/encoder-only models)
+        is_causal = getattr(config, "is_causal", True)
+        attn_type = AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
         self.self_attn = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -350,6 +358,7 @@ class Qwen3DecoderLayer(nn.Module):
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            attn_type=attn_type,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
