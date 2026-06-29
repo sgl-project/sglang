@@ -1,6 +1,8 @@
 import unittest
+from pathlib import Path
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
+from sglang.test.aime25_hard_subset import build_aime25_hard_subset
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
@@ -84,11 +86,31 @@ HIGH_THROUGHPUT_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
 }
 
+AIME25_ENV = {
+    "SGLANG_DEFAULT_THINKING": "1",
+    "SGLANG_DSV4_REASONING_EFFORT": "max",
+}
+
+AIME25_HARD_SUBSET_PATH = Path("/tmp/deepseek_v4_pro_aime25_hard_subset.jsonl")
+
 PERFORMANCE_BATCH_SIZES = {
     "low-latency": [1, 4, 16],
     "balanced": [64],
     "high-throughput": [128],
 }
+
+PERFORMANCE_EXTRA_BENCH_ARGS = {
+    "high-throughput": ["--request-timeout", "3600"],
+}
+
+
+def text_model_launch_settings(*args, **kwargs):
+    kwargs["env"] = {**AIME25_ENV, **(kwargs.get("env") or {})}
+    settings = ModelLaunchSettings(*args, **kwargs)
+    settings.extra_args = [
+        arg for arg in settings.extra_args if arg != "--enable-multimodal"
+    ]
+    return settings
 
 
 class TestDeepSeekV4ProFp4(unittest.TestCase):
@@ -96,14 +118,14 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
 
     def test_deepseek_v4_pro_fp4(self):
         variants = [
-            ModelLaunchSettings(
+            text_model_launch_settings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=LOW_LATENCY_ARGS,
                 variant="low-latency",
                 launch_timeout=SERVER_LAUNCH_TIMEOUT,
             ),
-            ModelLaunchSettings(
+            text_model_launch_settings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=BALANCED_ARGS,
@@ -111,7 +133,7 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
                 variant="balanced",
                 launch_timeout=SERVER_LAUNCH_TIMEOUT,
             ),
-            ModelLaunchSettings(
+            text_model_launch_settings(
                 MODEL_PATH,
                 tp_size=4,
                 extra_args=HIGH_THROUGHPUT_ARGS,
@@ -122,9 +144,13 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
         ]
 
         failures = []
+        aime25_data_path = build_aime25_hard_subset(AIME25_HARD_SUBSET_PATH)
         accuracy_params = AccuracyTestParams(
-            dataset="gsm8k",
-            baseline_accuracy=0.935,
+            dataset="aime25",
+            baseline_accuracy=0.70,
+            aime25_data_path=str(aime25_data_path),
+            max_tokens=400000,
+            num_threads=16,
             temperature=1.0,
             top_p=1.0,
         )
@@ -137,6 +163,9 @@ class TestDeepSeekV4ProFp4(unittest.TestCase):
                     performance_params=PerformanceTestParams(
                         batch_sizes=PERFORMANCE_BATCH_SIZES[variant.variant],
                         profile_dir="performance_profiles_gb300",
+                        extra_bench_args=PERFORMANCE_EXTRA_BENCH_ARGS.get(
+                            variant.variant, []
+                        ),
                     ),
                 )
             except AssertionError as e:

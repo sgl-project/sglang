@@ -168,7 +168,11 @@ def run_eval(args):
     elif args.eval_name == "aime25":
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
-        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+        eval_obj = AIME25Eval(
+            args.num_examples,
+            args.num_threads,
+            data_path=getattr(args, "aime25_data_path", None),
+        )
     elif args.eval_name == "gsm8k":
         from sglang.test.simple_eval_gsm8k import GSM8KEval
 
@@ -377,6 +381,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to GSM8K data file (e.g., test.jsonl)",
+    )
+    parser.add_argument(
+        "--aime25-data-path",
+        type=str,
+        default=None,
+        help="Path to AIME25 JSONL data file for eval_name=aime25",
     )
     parser.add_argument(
         "--mixed-prefix-gsm8k-secondary-pool-size",
