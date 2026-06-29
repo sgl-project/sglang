@@ -18,6 +18,7 @@ def test_mhc_fused_post_pre_matches_unfused(
         pytest.skip("CUDA is required for TileLang mHC kernels")
 
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_round_robin_split", lambda: False)
+    monkeypatch.setattr(mhc, "_mhc_pre_warmed", True)
     torch.manual_seed(0)
     device = torch.device("cuda")
     hc_mult = 4

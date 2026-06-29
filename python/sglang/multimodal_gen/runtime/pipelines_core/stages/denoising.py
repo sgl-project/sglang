@@ -114,6 +114,13 @@ from sglang.srt.utils.common import get_compiler_backend
 logger = init_logger(__name__)
 
 
+def _ensure_tensor_model_output(model_output):
+    sample = getattr(model_output, "sample", None)
+    if isinstance(sample, torch.Tensor):
+        return sample
+    return model_output
+
+
 @dataclass(slots=True)
 class DenoisingContext:
     """Loop-scoped state shared across the denoising skeleton and its hooks."""
@@ -321,8 +328,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
+                dit_config,
+                "torch_compile_mode",
+                "max-autotune-no-cudagraphs",
             )
             compile_kwargs["mode"] = mode
             logger.info(f"Compiling transformer with mode: {mode}")
@@ -1807,12 +1817,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
-        return current_model(
+        model_output = current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
             **guidance_kwargs,
             **kwargs,
         )
+        return _ensure_tensor_model_output(model_output)
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

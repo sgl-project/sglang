@@ -191,11 +191,11 @@ Use the preset categories this way:
 
 | Preset | Model | Nightly | Notes |
 | --- | --- | --- | --- |
-| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, `--dit-layerwise-offload false`; no explicit steps/guidance override |
-| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, `--dit-layerwise-offload false`; no explicit steps/guidance override |
-| `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Prompt, 1024x1024, seed 42; no explicit steps/guidance override |
-| `qwen-edit` | `Qwen/Qwen-Image-Edit-2511` | Yes: `qwen_image_edit_2511` | Uses the nightly cat image and edit prompt |
-| `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Prompt, 1024x1024, seed 42; no explicit steps/guidance override |
+| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
+| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2, `--dit-layerwise-offload false`; no explicit steps/guidance override |
+| `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
+| `qwen-edit` | `Qwen/Qwen-Image-Edit-2511` | Yes: `qwen_image_edit_2511` | Uses the nightly cat image and edit prompt, 2 GPUs, TP size 2 |
+| `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Prompt, 1024x1024, seed 42, 2 GPUs, TP size 2; no explicit steps/guidance override |
 | `wan-t2v` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Yes: `wan22_t2v_a14b_720p` | 1280x720, 81 frames, 4 GPUs, CFG parallel, Ulysses degree 2, text encoder CPU offload and pinned CPU memory |
 | `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Nightly cat image and motion prompt, 1280x720, 81 frames, seed 42 |
 | `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | `LTX2TwoStagePipeline`, 2 GPUs, CFG parallel, 768x512, 121 frames, seed 42 |
@@ -213,7 +213,7 @@ Use the preset categories this way:
 | `glm-image` | `zai-org/GLM-Image` | No | Current-source extra for GLM-Image |
 | `sana-1.5-1.6b` | `Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers` | No | Current-source extra for a SANA native image path |
 | `fastwan22-ti2v-5b` | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | No | Current-source extra matching the FastWan2.2 TI2V registered path |
-| `ltx23-hq-two-stage` | `Lightricks/LTX-2.3` | No | Current-source extra for `LTX2TwoStageHQPipeline` with `snapshot` device mode; high-resolution and VRAM-heavy |
+| `ltx23-hq-two-stage` | `Lightricks/LTX-2.3` | No | Current-source extra for `LTX2TwoStageHQPipeline` with `--ltx2-two-stage-device-mode=original`; high-resolution and VRAM-heavy |
 | `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `ltx23-two-stage-cfg-parallel` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution CFG-parallel stress preset matching `ltx23-two-stage` plus `--cfg-parallel-size 2` |

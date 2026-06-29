@@ -4,24 +4,17 @@
 from __future__ import annotations
 
 import logging
-from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
@@ -41,9 +34,11 @@ from sglang.srt.layers.quantization.fp4_utils import (
     fp4_quantize,
     get_fp4_gemm_runner_backend,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_linear_bmm_flashinfer,
     cutlass_fp8_supported,
     is_blackwell_supported,
 )
@@ -66,8 +61,9 @@ from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
+    is_flashinfer_available,
+    is_sm100_supported,
     is_sm120_supported,
-    next_power_of_2,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -99,20 +95,6 @@ if is_cuda():
         cutlass_fp4_gemm = None
 else:
     cutlass_fp4_gemm = None
-
-try:
-    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
-except ImportError:
-    flashinfer_cutlass_fused_moe = None
-
-    # Define a minimal ActivationType enum if flashinfer is not available
-    class ActivationType(IntEnum):
-        Swiglu = 3
-        Geglu = 4
-        Relu2 = 6
-        Identity = 7
-
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -510,6 +492,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         super().__init__()
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
 
     def create_weights(
         self,
@@ -571,8 +554,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             layer.weight, layer.weight_scale, layer.logical_widths
         )
         layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
-        # cutlass sgl-kernel only supports per-channel scale
-        if self.cutlass_fp8_supported:
+        if self.cutlass_fp8_supported and not self.enable_flashinfer_bmm:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
@@ -584,6 +566,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        if self.enable_flashinfer_bmm and layer.input_scale is not None:
+            return apply_fp8_linear_bmm_flashinfer(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
@@ -1019,7 +1009,15 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_flashinfer_cutlass():
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTLASS, moe_runner_config
+            )
+        else:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
         self,
@@ -1028,7 +1026,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     ) -> CombineInput:
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
@@ -1040,14 +1037,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp8MoeQuantInfo,
                 fused_experts_none_to_flashinfer_trtllm_fp8,
-            )
-            from sglang.srt.layers.moe.utils import RoutingMethodType
-
-            topk_config = topk_output.topk_config
-
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 get_activation_type,
             )
+            from sglang.srt.layers.moe.utils import RoutingMethodType
 
             _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
             assert self.moe_runner_config.activation in _SUPPORTED_FP8_ACTIVATIONS, (
@@ -1084,75 +1076,33 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         if get_moe_runner_backend().is_flashinfer_cutlass():
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                get_activation_type,
-            )
-
             activation_str = self.moe_runner_config.activation
             assert activation_str in _SUPPORTED_ACT_STRS, (
                 f"Activation {activation_str!r} is not supported for "
                 f"flashinfer cutlass fp8 moe (supported: {_SUPPORTED_ACT_STRS})."
             )
-            activation = ActivationType(
-                get_activation_type(
-                    activation_str, is_gated=self.moe_runner_config.is_gated
-                )
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassMoeQuantInfo,
             )
-            # FlashInfer CUTLASS MoE supports gated Swiglu/Geglu and non-gated
-            # Relu2/Identity. Non-gated Silu/Gelu are not implemented.
-            _CUTLASS_SUPPORTED = {
-                ActivationType.Swiglu,
-                ActivationType.Geglu,
-                ActivationType.Relu2,
-                ActivationType.Identity,
-            }
-            assert activation in _CUTLASS_SUPPORTED, (
-                f"Activation {activation_str!r} (is_gated="
-                f"{self.moe_runner_config.is_gated}) maps to {activation.name}, "
-                "which is not supported by flashinfer cutlass fp8 moe."
-            )
-            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-            x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
-            output_dtype = x.dtype
-            original_col = x.shape[1]
-            x_sf = None
 
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                symm_output = torch.empty(
-                    x.shape[0], original_col, dtype=output_dtype, device=x.device
-                )
-            output = flashinfer_cutlass_fused_moe(
-                output=symm_output,
-                input=x_fp8,
-                token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
-                fc1_expert_weights=layer.w13_weight,
-                fc2_expert_weights=layer.w2_weight,
-                output_dtype=output_dtype,
-                input_sf=x_sf,
+            quant_info = FlashInferCutlassMoeQuantInfo(
+                quant_type="fp8",
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
                 quant_scales=[
                     layer.fc1_dequant,
                     layer.fc2_quant,
                     layer.fc2_dequant,
                     layer.fc1_input_dequant,
                 ],
-                ep_size=layer.moe_ep_size,
-                ep_rank=layer.moe_ep_rank,
-                tp_size=layer.moe_tp_size,
-                tp_rank=layer.moe_tp_rank,
-                tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=activation,
-            )[0]
-
-            if (
-                not layer.should_fuse_routed_scaling_factor_in_topk
-                and self.moe_runner_config.routed_scaling_factor is not None
-            ):
-                output.mul_(self.moe_runner_config.routed_scaling_factor)
-
-            return StandardCombineInput(hidden_states=output)
+                output_dtype=x.dtype,
+                moe_ep_size=layer.moe_ep_size,
+                moe_ep_rank=layer.moe_ep_rank,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                apply_routed_scaling_factor=not layer.should_fuse_routed_scaling_factor_in_topk,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
@@ -1308,9 +1258,9 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     "Expected either flat format (config.json) or nested format (hf_quant_config.json)."
                 )
 
-        if not quant_method in ["FP8", "NVFP4"]:
+        if quant_method not in ["FP8", "NVFP4"]:
             raise ValueError(
-                f"ModelOpt currently only supports: FP8, NVFP4"
+                "ModelOpt currently only supports: FP8, NVFP4"
                 " quantizations in sglang. Please check the "
                 "quantization config for your model's configuration."
             )
@@ -1341,6 +1291,45 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             Linear=ModelOptFp4LinearMethod,
             Moe=ModelOptNvFp4FusedMoEMethod,
         )
+
+
+class HybridFp8NvFp4Config(Fp8Config):
+    """FP8 (linear/attention/MTP MoE) + NVFP4 (FusedMoE) hybrid quantization.
+
+    For checkpoints like nvidia/DeepSeek-V4-Pro-NVFP4 where
+    config.json:quantization_config declares quant_method=fp8 and
+    moe_quant_algo=NVFP4. FusedMoE layers route through
+    ModelOptNvFp4FusedMoEMethod; linear / attention layers
+    delegate to the inherited Fp8Config dispatch.
+    """
+
+    def __init__(self, fp8_config: Fp8Config, nvfp4_config: ModelOptFp4Config):
+        # Inherit all of fp8_config's state without re-running its
+        # validation / logging (already happened at fp8_config build time).
+        self.__dict__.update(fp8_config.__dict__)
+        self.nvfp4_config = nvfp4_config
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            if not self.nvfp4_config.is_layer_excluded(prefix):
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            # Fall back to MXFP4 for MTP MoE layers
+            if self.is_fp4_experts:
+                from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+                from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                    Mxfp4FlashinferTrtllmMoEMethod,
+                )
+
+                return Mxfp4FlashinferTrtllmMoEMethod(Fp8MoEMethod(self), prefix=prefix)
+        return super().get_quant_method(layer, prefix)
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
+        super().apply_weight_name_mapper(hf_to_sglang_mapper)
+        self.nvfp4_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
@@ -2042,6 +2031,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
+        swiglu_limit = layer.moe_runner_config.swiglu_limit
+        if (
+            swiglu_limit is not None
+            and layer.moe_runner_config.is_gated
+            and self.enable_flashinfer_trtllm_moe
+        ):
+            copy_or_rebind_param(
+                layer,
+                "gemm1_clamp_limit",
+                (swiglu_limit / layer.g1_alphas).to(torch.float32),
+            )
+
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
             {
@@ -2264,8 +2265,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
-        if not moe_runner_backend.is_flashinfer_cutlass():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        if moe_runner_backend.is_flashinfer_cutlass():
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,
@@ -2327,6 +2330,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer, "routing_method_type", RoutingMethodType.Default
             )
 
+            gemm1_clamp = getattr(layer, "gemm1_clamp_limit", None)
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight.data,
                 w2_weight=layer.w2_weight.data,
@@ -2342,6 +2346,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
                 use_per_token_activation=self.quant_config.use_per_token_activation,
+                gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
             )
 
             return self.runner.run(dispatch_output, quant_info)
@@ -2393,85 +2398,33 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutlass_moe:
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                get_activation_type,
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassMoeQuantInfo,
             )
-            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
             assert (
                 not moe_runner_config.apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
-            # Resolve the FlashInfer ActivationType honoring the gated flag,
-            # then verify the CUTLASS FP4 kernel supports it.
-            fi_activation = ActivationType(
-                get_activation_type(activation, is_gated=moe_runner_config.is_gated)
-            )
-            _CUTLASS_FP4_SUPPORTED = {
-                ActivationType.Swiglu,
-                ActivationType.Geglu,
-                ActivationType.Relu2,
-                ActivationType.Identity,
-            }
-            assert fi_activation in _CUTLASS_FP4_SUPPORTED, (
-                f"Activation {activation!r} (is_gated={moe_runner_config.is_gated}) "
-                f"maps to {fi_activation.name}, which is not supported by the "
-                "flashinfer cutlass fp4 moe kernel."
-            )
-            # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
-            # and fp4 quantized weights loaded from the checkpoint
-            x = dispatch_output.hidden_states
-            x_sf = dispatch_output.hidden_states_scale
-            topk_output = dispatch_output.topk_output
-            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-
-            output_dtype = torch.bfloat16
-
-            if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
-                symm_output = dispatch_output.moe_output
-            else:
-                # If x_sf is not None, x is FP4 packed (half size), so we need * 2
-                # If x_sf is None, x is not packed, so output_col = x.shape[1]
-                output_col = x.shape[1]
-                if x_sf is not None and layer.moe_runner_config.is_gated:
-                    output_col *= 2
-                with use_symmetric_memory(
-                    get_tp_group(), disabled=not is_allocation_symmetric()
-                ):
-                    symm_output = torch.empty(
-                        x.shape[0],
-                        output_col,
-                        dtype=output_dtype,
-                        device=x.device,
-                    )
-
-            output = flashinfer_cutlass_fused_moe(
-                output=symm_output,
-                input=x,
-                token_selected_experts=topk_ids.to(torch.int),
-                token_final_scales=topk_weights,
-                fc1_expert_weights=layer.w13_weight.view(torch.long),
-                fc2_expert_weights=layer.w2_weight.view(torch.long),
-                output_dtype=output_dtype,
-                input_sf=x_sf,
-                # swizzled_input_sf intentionally omitted; not used for this path.
+            quant_info = FlashInferCutlassMoeQuantInfo(
+                quant_type="fp4",
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                output_dtype=torch.bfloat16,
                 quant_scales=[
                     layer.w13_input_scale_quant,
-                    layer.w13_blockscale_swizzled.view(torch.int32),
+                    layer.w13_blockscale_swizzled,
                     layer.g1_alphas,
                     layer.w2_input_scale_quant,
-                    layer.w2_blockscale_swizzled.view(torch.int32),
+                    layer.w2_blockscale_swizzled,
                     layer.g2_alphas,
                 ],
-                ep_size=layer.moe_ep_size,
-                ep_rank=layer.moe_ep_rank,
-                tp_size=layer.moe_tp_size,
-                tp_rank=layer.moe_tp_rank,
-                tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=fi_activation,
-                enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
-            )[0]
-
-            return StandardCombineInput(hidden_states=output)
+                moe_ep_size=layer.moe_ep_size,
+                moe_ep_rank=layer.moe_ep_rank,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                apply_routed_scaling_factor=False,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
