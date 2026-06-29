@@ -5889,6 +5889,9 @@ class ServerArgs:
                 )
                 self.load_format = "auto"
 
+        if self.load_format in ["auto", "mistral"] and is_in_ci():
+            self.weight_loader_prefetch_checkpoints = True
+
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
