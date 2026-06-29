@@ -97,10 +97,10 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmaxPac
 
   static_assert(ELTS_PER_WARP % ELTS_PER_ROW == 0, "The elts per row must cleanly divide the total elt per warp");
 
-  const int cta_base_row = blockIdx.x * ROWS_PER_CTA;
-  const int warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
+  const int64_t cta_base_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_CTA;
+  const int64_t warp_base_row = cta_base_row + static_cast<int64_t>(threadIdx.y) * ROWS_PER_WARP;
   const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
-  const int thread_row = warp_base_row + thread_row_in_warp;
+  const int64_t thread_row = warp_base_row + thread_row_in_warp;
   if (thread_row >= num_rows) {
     return;
   }

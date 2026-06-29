@@ -2,6 +2,8 @@
 #include <ATen/cuda/CUDADataType.h>
 #include <cuda_runtime.h>
 
+#include <limits>
+
 #include "pytorch_extension_utils.h"
 #include "utils.cuh"
 
@@ -17,15 +19,15 @@ __global__ void concat_mla_k_kernel(
     nv_bfloat16* __restrict__ k,
     const nv_bfloat16* __restrict__ k_nope,
     const nv_bfloat16* __restrict__ k_rope,
-    const int num_tokens,
+    const int64_t num_tokens,
     const int64_t k_stride_0,
     const int k_stride_1,
     const int64_t k_nope_stride_0,
     const int k_nope_stride_1,
     const int64_t k_rope_stride_0) {
-  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-  const int token_id = flat_warp_id / NUM_HEAD_CHUNKS;
-  const int head_chunk_id = flat_warp_id % NUM_HEAD_CHUNKS;
+  const int64_t flat_warp_id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  const int64_t token_id = flat_warp_id / NUM_HEAD_CHUNKS;
+  const int head_chunk_id = static_cast<int>(flat_warp_id % NUM_HEAD_CHUNKS);
   const int lane_id = get_lane_id();
   if (token_id >= num_tokens) return;
 
@@ -85,7 +87,7 @@ inline void check_tensor(const at::Tensor& t, int64_t shape0, int64_t shape1, in
 }
 
 void concat_mla_k(at::Tensor k, at::Tensor k_nope, at::Tensor k_rope) {
-  const int num_tokens = k.size(0);
+  const int64_t num_tokens = k.size(0);
 
   check_tensor(k, num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, at::kBFloat16);
   check_tensor(k_nope, num_tokens, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, at::kBFloat16);
@@ -97,10 +99,12 @@ void concat_mla_k(at::Tensor k, at::Tensor k_nope, at::Tensor k_rope) {
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   constexpr int num_warps_per_block = 32;
-  const int grid_size = ceil_div(num_tokens * NUM_HEAD_CHUNKS, num_warps_per_block);
+  const int64_t grid_size = (num_tokens * NUM_HEAD_CHUNKS + num_warps_per_block - 1) / num_warps_per_block;
+  TORCH_CHECK(grid_size <= std::numeric_limits<uint32_t>::max(), "concat_mla_k grid size exceeds uint32_t");
+  const dim3 grid_dim(static_cast<uint32_t>(grid_size));
   const int block_size = num_warps_per_block * 32;
 
-  concat_mla_k_kernel<<<grid_size, block_size, 0, stream>>>(
+  concat_mla_k_kernel<<<grid_dim, block_size, 0, stream>>>(
       reinterpret_cast<nv_bfloat16*>(k.data_ptr()),
       reinterpret_cast<nv_bfloat16*>(k_nope.data_ptr()),
       reinterpret_cast<nv_bfloat16*>(k_rope.data_ptr()),
@@ -124,19 +128,19 @@ __global__ void concat_mla_absorb_q_kernel(
     nv_bfloat16* a,
     nv_bfloat16* b,
     nv_bfloat16* out,
-    const int num_items,
-    const int dim_1,
+    const int64_t num_items,
+    const int64_t dim_1,
     const int64_t a_stride_0,
     const int a_stride_1,
     const int64_t b_stride_0,
     const int b_stride_1,
     const int64_t out_stride_0,
     const int out_stride_1) {
-  const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int64_t flat_warp_id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
   const int lane_id = get_lane_id();
 
-  const int idx_0 = flat_warp_id / dim_1;
-  const int idx_1 = flat_warp_id % dim_1;
+  const int64_t idx_0 = flat_warp_id / dim_1;
+  const int64_t idx_1 = flat_warp_id % dim_1;
 
   if (flat_warp_id >= num_items) {
     return;
@@ -194,13 +198,15 @@ void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out) {
 
   TORCH_CHECK_EQ(a.size(0) * a.size(1), b.size(0) * b.size(1));
   TORCH_CHECK_EQ(a.size(1), b.size(1));
-  const int num_items = a.size(0) * a.size(1);
+  const int64_t num_items = a.size(0) * a.size(1);
 
   constexpr int num_warps_per_block = 32;
-  const int grid_size = ceil_div(num_items, num_warps_per_block);
+  const int64_t grid_size = (num_items + num_warps_per_block - 1) / num_warps_per_block;
+  TORCH_CHECK(grid_size <= std::numeric_limits<uint32_t>::max(), "concat_mla_absorb_q grid size exceeds uint32_t");
+  const dim3 grid_dim(static_cast<uint32_t>(grid_size));
   const int block_size = num_warps_per_block * 32;
 
-  concat_mla_absorb_q_kernel<<<grid_size, block_size, 0, stream>>>(
+  concat_mla_absorb_q_kernel<<<grid_dim, block_size, 0, stream>>>(
       reinterpret_cast<nv_bfloat16*>(a.data_ptr()),
       reinterpret_cast<nv_bfloat16*>(b.data_ptr()),
       reinterpret_cast<nv_bfloat16*>(out.data_ptr()),

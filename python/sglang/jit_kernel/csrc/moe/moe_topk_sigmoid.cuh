@@ -213,10 +213,10 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSigmoid(
 
   static_assert(ELTS_PER_WARP % ELTS_PER_ROW == 0, "");
 
-  const int cta_base_row = blockIdx.x * ROWS_PER_CTA;
-  const int warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
+  const int64_t cta_base_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_CTA;
+  const int64_t warp_base_row = cta_base_row + static_cast<int64_t>(threadIdx.y) * ROWS_PER_WARP;
   const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
-  const int thread_row = warp_base_row + thread_row_in_warp;
+  const int64_t thread_row = warp_base_row + thread_row_in_warp;
   const int topk = k + num_fused_shared_experts;
 
   if (thread_row >= num_rows) {

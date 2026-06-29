@@ -20,6 +20,8 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+#include <cstdint>
+
 #ifndef USE_ROCM
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
@@ -380,15 +382,15 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topkGatingSoftmax(
 
   // Compute CTA and warp rows. We pack multiple rows into a single warp, and a block contains WARPS_PER_CTA warps.
   // This, each block processes a chunk of rows. We start by computing the start row for each block.
-  const int cta_base_row = blockIdx.x * ROWS_PER_CTA;
+  const int64_t cta_base_row = static_cast<int64_t>(blockIdx.x) * ROWS_PER_CTA;
 
   // Now, using the base row per thread block, we compute the base row per warp.
-  const int warp_base_row = cta_base_row + threadIdx.y * ROWS_PER_WARP;
+  const int64_t warp_base_row = cta_base_row + static_cast<int64_t>(threadIdx.y) * ROWS_PER_WARP;
 
   // The threads in a warp are split into sub-groups that will work on a row.
   // We compute row offset for each thread sub-group
   const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
-  const int thread_row = warp_base_row + thread_row_in_warp;
+  const int64_t thread_row = warp_base_row + thread_row_in_warp;
 
   // Threads with indices out of bounds should early exit here.
   if (thread_row >= num_rows) {
