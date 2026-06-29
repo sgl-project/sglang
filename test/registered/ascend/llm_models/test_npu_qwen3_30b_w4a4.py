@@ -15,7 +15,7 @@ class TestQwen330Bw4a4(GSM8KAscendMixin, CustomTestCase):
     [Test Target] Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS
     """
 
-    model = QWEN3_30B_MODELSLIM_INT4_WEIGHTS_PATH
+    model = QWEN3_30B_W4A4_MODELSLIM_WEIGHTS_PATH
     accuracy = 0.85
     other_args = [
         "--trust-remote-code",
