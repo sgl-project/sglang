@@ -73,6 +73,16 @@ class TestSamplingParamsInit(CustomTestCase):
         sp = SamplingParams(stop_token_ids=[])
         self.assertIsNone(sp.stop_token_ids)
 
+    def test_stop_token_ids_filters_none_and_casts_to_int(self):
+        """Nullable stop token IDs are filtered before integer normalization."""
+        sp = SamplingParams(stop_token_ids=["1", None, 2, "2"])
+        self.assertEqual(sp.stop_token_ids, {1, 2})
+
+    def test_stop_token_ids_all_none_becomes_none(self):
+        """A list without usable stop IDs is normalized to None."""
+        sp = SamplingParams(stop_token_ids=[None, None])
+        self.assertIsNone(sp.stop_token_ids)
+
 
 class TestSamplingParamsVerify(CustomTestCase):
 
@@ -364,6 +374,12 @@ class TestSamplingParamsNormalize(CustomTestCase):
         tokenizer = self._mock_tokenizer()
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_regex_max_len, 3)
+
+    def test_stop_regex_list_uses_longest_pattern(self):
+        """Regex buffering uses the longest pattern in a stop_regex list."""
+        sp = SamplingParams(stop_regex=[r"ok", r"(foo|quux)\d{2}"])
+        sp.normalize(tokenizer=None)
+        self.assertEqual(sp.stop_regex_max_len, 6)
 
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
