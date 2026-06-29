@@ -1,4 +1,4 @@
-"""Generate a Markdown dashboard for diffusion cross-framework comparisons.
+"""Generate a Markdown dashboard for SGLang-Diffusion nightly benchmarks.
 
 Reads current comparison results + historical data from sgl-project/ci-data repo
 and produces a Markdown report with tables and trend charts saved as PNG files.
@@ -252,7 +252,7 @@ def generate_dashboard(
     Returns the markdown string.
     """
     lines: list[str] = []
-    lines.append("# Diffusion Cross-Framework Performance Dashboard\n")
+    lines.append("# SGLang-Diffusion Nightly Performance Dashboard\n")
     ts = current.get("timestamp", datetime.now(timezone.utc).isoformat())
     sha = current.get("commit_sha", "unknown")
     lines.append(f"*Generated: {_short_date(ts)} | Commit: `{_short_sha(sha)}`*\n")
@@ -297,8 +297,8 @@ def generate_dashboard(
         all_frameworks.insert(0, "sglang")
     other_frameworks = [fw for fw in all_frameworks if fw != "sglang"]
 
-    # ---- Section 1: Cross-Framework Comparison (current run) ----
-    lines.append("## Cross-Framework Performance Comparison\n")
+    # ---- Section 1: SGLang-Diffusion performance (current run) ----
+    lines.append("## SGLang-Diffusion Performance\n")
 
     # Compute risk assessments for all cases
     risk_map: dict[str, tuple[str, str]] = {}
@@ -345,7 +345,7 @@ def generate_dashboard(
             row += f" {_fmt_speedup(sg_lat, case_fws.get(ofw))} |"
         lines.append(row)
 
-    # ---- Section 2: Cross-Framework Speedup Trend (only if multiple frameworks) ----
+    # ---- Section 2: Speedup-over-time vs. other frameworks (rendered only when present) ----
     if history and other_frameworks:
         lines.append("\n## SGLang vs vLLM-Omni Speedup Over Time\n")
 
@@ -750,7 +750,7 @@ def _create_alert_issue(alert_reasons: list[str]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate diffusion cross-framework comparison dashboard"
+        description="Generate SGLang-Diffusion nightly benchmark dashboard"
     )
     parser.add_argument(
         "--results",
