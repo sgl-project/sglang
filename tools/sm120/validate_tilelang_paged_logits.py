@@ -2,17 +2,25 @@
 """
 Validate the SM120 fix for tilelang_fp8_paged_mqa_logits.
 
-Run this ON THE RTX PRO 6000 box (needs CUDA + the patched tilelang + sglang).
+Run this ON the RTX PRO 6000 box (needs CUDA + the patched tilelang + sglang).
 It compiles the tilelang paged-MQA-logits kernel and compares its output against
-the pure-torch reference (fp8_paged_mqa_logits_torch_sm120), which is the ground
-truth. If they match within fp8 tolerance, the tilelang fix is correct.
+an inlined pure-torch reference (identical to sglang's
+fp8_paged_mqa_logits_torch_sm120). If they match within fp8 tolerance, the
+tilelang fix is correct.
+
+The reference is inlined on purpose: importing it from
+sglang.srt.layers.attention.dsv4.indexer drags in deepseek_v2 -> flashinfer.comm,
+which can fail at import time in some images (libcudart stub symbol errors). We
+only need the tilelang kernel under test from sglang; the reference is standalone.
 
     python validate_tilelang_paged_logits.py
 
 Exit code 0 = PASS, 1 = FAIL/compile-error.
 """
 import sys
+
 import torch
+import torch.nn.functional as F
 
 FP8 = torch.float8_e4m3fn
 
@@ -25,11 +33,58 @@ MAX_SEQ = 4096     # > index_topk so the kernel path is exercised
 NUM_PAGES = BATCH * (MAX_SEQ // BLOCK) + 8
 
 
+def fp8_paged_mqa_logits_torch_ref(
+    q_fp8, kvcache_fp8, weight, seq_lens, page_table, max_seq_len
+):
+    """Standalone copy of sglang's fp8_paged_mqa_logits_torch_sm120
+    (clean_logits=False semantics). Ground-truth reference."""
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+    device = q_fp8.device
+    assert head_dim == 128 and block_size == 64
+    if seq_lens.dim() > 1:
+        seq_lens = seq_lens.squeeze(-1)
+
+    max_pages = (max_seq_len + block_size - 1) // block_size
+    max_padded_seq = max_pages * block_size
+    kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+    scale_offset = block_size * head_dim
+
+    page_ids = page_table[:, :max_pages]
+    gathered = kvcache_flat[page_ids]
+    kv_value = (
+        gathered[..., :scale_offset]
+        .contiguous()
+        .view(dtype=FP8)
+        .to(torch.float32)
+        .view(batch_size, max_padded_seq, head_dim)
+    )
+    kv_scale = (
+        gathered[..., scale_offset:]
+        .contiguous()
+        .view(dtype=torch.float32)
+        .view(batch_size, max_padded_seq)
+    )
+
+    q = q_fp8[:, 0].to(torch.float32)               # [B, H, D]
+    score = torch.bmm(kv_value, q.transpose(1, 2))  # [B, S, H]
+    score = F.relu(score)
+    score = score * weight.unsqueeze(1)
+    score = score.sum(dim=2)                         # [B, S]
+    score = score * kv_scale
+
+    out_width = min(max_padded_seq, max_seq_len)
+    logits = score.new_full((batch_size, max_seq_len), float("-inf"))
+    logits[:, :out_width] = score[:, :out_width]
+    positions = torch.arange(max_seq_len, device=device)
+    logits.masked_fill_(positions.unsqueeze(0) >= seq_lens.unsqueeze(1), float("-inf"))
+    return logits
+
+
 def build_inputs(device="cuda"):
     torch.manual_seed(0)
     q = torch.randn(BATCH, 1, NUM_HEADS, HEAD_DIM, device=device).to(FP8)
     weight = torch.randn(BATCH, NUM_HEADS, device=device, dtype=torch.float32)
-    # KV cache: [num_pages, BLOCK, 1, HEAD_DIM + 4]  (128 fp8 vals + 1 fp32 scale)
     head_dim_sf = HEAD_DIM + 4
     kv = torch.zeros(NUM_PAGES, BLOCK, 1, head_dim_sf, device=device, dtype=torch.uint8)
     kv[..., :HEAD_DIM] = torch.randint(
@@ -39,9 +94,10 @@ def build_inputs(device="cuda"):
     kv[..., HEAD_DIM:] = scales.view(torch.uint8)
     seq_lens = torch.full((BATCH,), MAX_SEQ - 7, device=device, dtype=torch.int32)
     max_pages = (MAX_SEQ + BLOCK - 1) // BLOCK
-    page_table = torch.arange(
-        BATCH * max_pages, device=device, dtype=torch.int32
-    ).view(BATCH, max_pages) % NUM_PAGES
+    page_table = (
+        torch.arange(BATCH * max_pages, device=device, dtype=torch.int32)
+        .view(BATCH, max_pages) % NUM_PAGES
+    )
     return q, kv, weight, seq_lens, page_table
 
 
@@ -51,21 +107,16 @@ def main():
     major, minor = torch.cuda.get_device_capability()
     print(f"Device cc: sm_{major}{minor}  ({torch.cuda.get_device_name()})")
 
+    # Only the kernel under test is imported from sglang. This import is safe; it
+    # does NOT pull in the flashinfer.comm chain (which can fail in some images).
     from sglang.srt.layers.attention.dsa.tilelang_kernel import (
         tilelang_fp8_paged_mqa_logits,
-    )
-    from sglang.srt.layers.attention.dsv4.indexer import (
-        fp8_paged_mqa_logits_torch_sm120,
     )
 
     q, kv, weight, seq_lens, page_table = build_inputs()
 
-    # Reference (ground truth) — pure torch.
-    ref = fp8_paged_mqa_logits_torch_sm120(
-        q, kv, weight, seq_lens, page_table, None, MAX_SEQ, clean_logits=False
-    )
+    ref = fp8_paged_mqa_logits_torch_ref(q, kv, weight, seq_lens, page_table, MAX_SEQ)
 
-    # Tilelang kernel under test — this is what must compile + match on SM120.
     try:
         out = tilelang_fp8_paged_mqa_logits(
             q, kv, weight, seq_lens, page_table, None, MAX_SEQ, clean_logits=False
@@ -75,16 +126,13 @@ def main():
         print(repr(e))
         return 1
 
-    # Compare only the valid (unmasked) region per row: [0, seq_len).
     ok = True
     max_abs = 0.0
     for b in range(BATCH):
         n = int(seq_lens[b].item())
         a = out[b, :n].float()
         r = ref[b, :n].float()
-        d = (a - r).abs().max().item()
-        max_abs = max(max_abs, d)
-        # fp8 inputs => loose tolerance; structure/scale must match.
+        max_abs = max(max_abs, (a - r).abs().max().item())
         if not torch.allclose(a, r, atol=1e-2, rtol=1e-2):
             ok = False
     print(f"max abs diff (valid region) = {max_abs:.4g}")
