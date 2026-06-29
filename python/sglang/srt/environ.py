@@ -656,6 +656,7 @@ class Envs:
 
     # Flash Attention
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+    SGLANG_FA3_DETERMINISTIC_NUM_SPLITS = EnvInt(4)
 
     # Kernels
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
