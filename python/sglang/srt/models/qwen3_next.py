@@ -368,8 +368,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
         value = value.reshape(value.size(0), -1, self.head_v_dim)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b = b.reshape(b.size(0), self.num_v_heads // self.attn_tp_size)
-        a = a.reshape(a.size(0), self.num_v_heads // self.attn_tp_size)
+        b = b.reshape(b.size(0), self.num_v_heads // self.attn_tp_size).contiguous()
+        a = a.reshape(a.size(0), self.num_v_heads // self.attn_tp_size).contiguous()
 
         return query, key, value, z, b, a
 
