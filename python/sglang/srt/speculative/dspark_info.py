@@ -61,8 +61,10 @@ class DSparkVerifyInput(SpecInput):
         batch.capture_hidden_mode = self.capture_hidden_mode
         verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
 
+        server_args = get_global_server_args()
         can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
+            not server_args.enable_dp_attention
+            and target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )
