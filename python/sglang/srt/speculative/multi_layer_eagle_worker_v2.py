@@ -53,6 +53,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    get_draft_recurrent_hidden_state_spec,
 )
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -155,8 +156,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
-        # Match `EagleDraftWorker.draft_runner` so `_draft_runner_of(self)` works
-        # for the EagleDraftInput shape classmethods.
+        # Match `EagleDraftWorker.draft_runner` for generic draft-runner access.
         self.draft_runner: ModelRunner = self.draft_runner_list[0]
 
         # Chain-style MTP: each step propagates its own output hidden states to the
@@ -186,15 +186,17 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
     def init_attention_backends(self):
-        with self.draft_tp_context(
-            self.draft_runner_list[0].tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_attention_backends()
 
     def init_cuda_graphs(self):
-        with self.draft_tp_context(
-            self.draft_runner_list[0].tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            speculative_moe_backend_context(),
+        ):
             super().init_cuda_graphs()
 
     def mtp_model_runner(self, step: int):
@@ -736,10 +738,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     if self.speculative_algorithm.is_standalone()
                     else CaptureHiddenMode.LAST
                 )
+                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                    self.draft_worker.draft_runner
+                )
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
-                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                    hidden_size=hidden_size,
+                    dtype=hidden_dtype,
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=capture_mode,
                 )

@@ -234,7 +234,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
@@ -993,14 +995,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
-            # Snapshot built -- publish a read-done event for the WAR barrier.
-            # Only plain DECODE: the captured decode graph reads only its static
-            # snapshot, so the forward is done reading the shared pool here. Spec
-            # verify (target_verify/dllm_extend) replays on this runner too, but
-            # those are NOT the step's last shared-buffer-reading phase (eagle
-            # publishes from draft_extend; ngram/dflash must not publish here),
-            # and some verify graphs may read beyond the snapshot in replay.
-            if forward_batch.forward_mode.is_decode():
+            # Publish a read-done event for the WAR barrier: a cuda-graph forward
+            # finishes its shared req_to_token / SWA reads at this pre-replay
+            # snapshot, so plain DECODE and DFLASH TARGET_VERIFY both qualify.
+            if forward_batch.forward_mode.is_decode() or (
+                forward_batch.forward_mode.is_target_verify()
+                and self.model_runner.spec_algorithm.is_dflash()
+            ):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
