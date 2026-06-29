@@ -496,9 +496,11 @@ class MoEGate(nn.Module):
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
+            # NOTE(b8zhong): this threshold has been empirically verified
+            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
                 _is_cuda
-                and hidden_states.shape[0] <= 16
+                and hidden_states.shape[0] <= max_router_gemm_tokens
                 and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
