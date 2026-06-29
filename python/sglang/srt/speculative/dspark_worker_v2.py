@@ -272,18 +272,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
         )
         out_tokens[:, 0] = bonus_tokens.view(-1).to(torch.int64)
-        markov_embeds = []
+        markov_embeds = None
         with torch.inference_mode():
             base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
             for i in range(block_size):
                 prev_embed = markov_head.get_prev_embeddings(out_tokens[:, i])
+                if markov_embeds is None:
+                    markov_embeds = prev_embed.new_empty(
+                        (bs, block_size, prev_embed.shape[-1])
+                    )
+                markov_embeds[:, i].copy_(prev_embed)
                 bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
                 refined = base_logits[:, i] + bias
                 out_tokens[:, i + 1] = torch.argmax(refined, dim=-1)
-                markov_embeds.append(prev_embed)
 
-            stacked_embed = torch.stack(markov_embeds, dim=1)
-            confidence = confidence_head(block_hidden, stacked_embed)
+            confidence = confidence_head(block_hidden, markov_embeds)
 
         candidates = out_tokens[:, :block_size].contiguous()
         return candidates, confidence
