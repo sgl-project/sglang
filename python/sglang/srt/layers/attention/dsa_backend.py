@@ -120,10 +120,6 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 _USE_FUSED_METADATA_GENERATION = (
     envs.SGLANG_DSA_USE_FUSED_METADATA_GENERATION.get() and not _is_hip
 )
-_warned_deepgemm_schedule_out_failure = False
-_deep_gemm_schedule_metadata_out = (
-    getattr(deep_gemm, "get_paged_mqa_logits_metadata_out", None) if is_cuda() else None
-)
 
 
 @dataclass(frozen=True)
@@ -600,48 +596,6 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        global _warned_deepgemm_schedule_out_failure
-
-        schedule_metadata_out = _deep_gemm_schedule_metadata_out
-        if (
-            metadata.paged_mqa_schedule_metadata is not None
-            and schedule_metadata_out is not None
-        ):
-            try:
-                schedule_metadata_out(
-                    seqlens_32_2d,
-                    metadata.paged_mqa_schedule_metadata,
-                    64,
-                    deep_gemm.get_num_sms(),
-                )
-                return
-            except AttributeError as e:
-                if not _warned_deepgemm_schedule_out_failure:
-                    logger.warning(
-                        "DeepGEMM paged MQA schedule out API is unavailable; "
-                        "falling back to allocation-plus-copy refresh. Error: %s",
-                        e,
-                    )
-                    _warned_deepgemm_schedule_out_failure = True
-            except RuntimeError as e:
-                msg = str(e)
-                compatibility_failure = (
-                    "get_paged_mqa_logits_metadata_out" in msg
-                    or "num_sms" in msg
-                    or "size" in msg
-                    or "shape" in msg
-                )
-                if not compatibility_failure:
-                    raise
-                if not _warned_deepgemm_schedule_out_failure:
-                    logger.warning(
-                        "DeepGEMM paged MQA schedule out API rejected the existing "
-                        "buffer; falling back to allocation-plus-copy refresh. "
-                        "Error: %s",
-                        e,
-                    )
-                    _warned_deepgemm_schedule_out_failure = True
-
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
