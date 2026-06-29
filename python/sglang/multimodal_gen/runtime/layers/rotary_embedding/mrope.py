@@ -253,6 +253,10 @@ class OneDRotaryEmbedding(torch.nn.Module):
         This method converts the input tensor to a hashable representation
         and calls a cached helper method to perform the computation.
         """
+        if torch.compiler.is_compiling():
+            # Skip lru_cache path under torch.compile to avoid graph break
+            # from Tensor.tolist() on non-integer tensor
+            return self.build_freqs_outer(pos, pos.device)
         pos_tuple = tuple(pos.tolist())
         device_str = str(pos.device)
         return self._forward_cached(pos_tuple, device_str)
