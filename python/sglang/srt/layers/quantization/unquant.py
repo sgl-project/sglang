@@ -399,6 +399,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if get_moe_runner_backend().is_torch_native():
+            self.runner = MoeRunner(MoeRunnerBackend.TORCH_NATIVE, moe_runner_config)
+            self._aiter_runner = None
+            return
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -587,15 +591,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return StandardCombineInput(hidden_states=output)
         else:
-            from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+            if get_moe_runner_backend().is_torch_native():
+                from sglang.srt.layers.moe.moe_runner.torch_native import (
+                    TorchNativeMoeQuantInfo,
+                )
 
-            output = moe_forward_native(
-                layer,
-                x,
-                topk_output,
-                moe_runner_config,
-            )
-            return StandardCombineInput(hidden_states=output)
+                quant_info = TorchNativeMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    w13_bias=getattr(layer, "w13_weight_bias", None),
+                    w2_bias=getattr(layer, "w2_weight_bias", None),
+                )
+                return self.runner.run(dispatch_output, quant_info)
+            else:
+                from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
+
+                output = moe_forward_native(
+                    layer,
+                    x,
+                    topk_output,
+                    moe_runner_config,
+                )
+                return StandardCombineInput(hidden_states=output)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(

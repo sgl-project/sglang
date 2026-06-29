@@ -65,6 +65,10 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer CUTLASS only supports fused path
         elif runner_backend.is_flashinfer_mxfp4():
             self.runner_core = None  # FlashInfer MXFP4 only supports fused path
+        elif runner_backend.is_torch_native():
+            import sglang.srt.layers.moe.moe_runner.torch_native  # noqa: F401
+
+            self.runner_core = None  # Torch native only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
