@@ -2,7 +2,7 @@ import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
-    ECO_TECH_QWEN3_30B_A3B_W4A4_LAOS_WEIGHTS_PATH
+    ECO_TECH_QWEN3_30B_A3B_W4A4_LAOS_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
