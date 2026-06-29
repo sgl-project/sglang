@@ -53,6 +53,10 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
+  Speed numbers are measured with `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc`. Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 1-1-2 = 2); high-throughput has no spec.
+</Note>
+
+<Note>
   **NVFP4 (B300 / GB300)** deploys on the dev image **`lmsysorg/sglang:dev-glm52-nvfp4`** — the command panel's **Docker** toggle selects it automatically. The FP8 / BF16 recipes use the release **`lmsysorg/sglang:latest`** (the `docker pull` in Install above).
 </Note>
 

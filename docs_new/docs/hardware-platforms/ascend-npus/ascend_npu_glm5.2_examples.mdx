@@ -245,7 +245,7 @@ do
         --mem-fraction-static 0.8 \
         --port 8000 \
         --served-model-name glm-5 \
-        --cuda-graph-max-bs 32 \
+        --cuda-graph-max-bs-decode 32 \
         --moe-a2a-backend deepep \
         --deepep-mode auto \
         --speculative-draft-model-quantization unquant \
@@ -352,7 +352,7 @@ do
         --port 8003 --trust-remote-code --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --ep-size 16 \
         --mem-fraction-static 0.8 --max-running-requests 128 --attention-backend ascend --device npu --quantization modelslim \
         --served-model-name glm-5 --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency \
-        --cuda-graph-max-bs 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
+        --cuda-graph-max-bs-decode 4 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 180000 \
         --tokenizer-worker-num 4 --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16  --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
