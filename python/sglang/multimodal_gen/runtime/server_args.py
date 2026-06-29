@@ -1666,7 +1666,7 @@ class ServerArgs(DisaggServerArgsMixin):
         Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
         """
         scheduler_host = self.host
-        if scheduler_host is None or scheduler_host == "localhost":
+        if scheduler_host is None or scheduler_host == "localhost" or is_valid_ipv6_address(scheduler_host):
             scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
