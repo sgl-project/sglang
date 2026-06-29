@@ -57,11 +57,13 @@ if _IS_SM120 and hasattr(tilelang.PassConfigKey, "TL_DISABLE_WGMMA"):
     _SM120_WGMMA_OFF[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
     pass_configs[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
 
-# SM120 (RTX PRO 6000) caps dynamic shared memory at ~100 KB, vs 228 KB on
-# Hopper/SM100 that the DSA attention kernel was tuned for (block_I=64 needs
-# ~166 KB). Use a smaller K block on SM120 so the kernel fits; env-overridable
-# for tuning (must divide topk and keep topk/block_I even).
-_SM120_DSA_BLOCK_I = int(os.environ.get("SGLANG_SM120_DSA_BLOCK_I", "32"))
+# NOTE: the v2 DSA attention kernel hardwires its load offsets to block_I=64
+# (~166 KB smem), which exceeds SM120's ~100 KB cap. block_I<64 compiles but
+# reads past the smaller K buffers (illegal memory access), so it is NOT safely
+# tunable -- the v2 tilelang kernel cannot run on SM120 bf16. SM120 should use
+# the triton sparse-MLA path (fp8 KV) instead. Kept as an env knob (default 64)
+# only for experimentation.
+_SM120_DSA_BLOCK_I = int(os.environ.get("SGLANG_SM120_DSA_BLOCK_I", "64"))
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()

@@ -223,6 +223,35 @@ def check_sparse_attention():
     return bool(finite)
 
 
+def check_triton_sparse_attention():
+    """The triton sparse-MLA kernel (fp8 KV). This is the SM120-viable attention
+    path -- it sizes smem to the target and has no wgmma/TMA. Needs fp8 q/kv."""
+    print("\n=== [3/3] DSA sparse-attention via TRITON (triton_sparse_mla_fwd, fp8) ===")
+    from sglang.srt.layers.attention.dsa.triton_sparse_mla import triton_sparse_mla_fwd
+
+    dev = "cuda"
+    dim = SA_D_V + SA_TAIL
+    q_nope = (torch.randn(SA_TOKENS, SA_HEADS, SA_D_V, device=dev) * 0.5).to(FP8)
+    q_rope = (torch.randn(SA_TOKENS, SA_HEADS, SA_TAIL, device=dev) * 0.5).to(FP8)
+    kv = (torch.randn(SA_NUM_KV, 1, dim, device=dev) * 0.5).to(FP8)
+    indices = torch.randint(
+        0, SA_NUM_KV, (SA_TOKENS, 1, SA_TOPK), device=dev, dtype=torch.int32
+    )
+    sm_scale = 1.0 / (dim ** 0.5)
+
+    try:
+        out = triton_sparse_mla_fwd(q_nope, q_rope, kv, indices, sm_scale, d_v=SA_D_V)
+    except Exception as e:  # noqa: BLE001
+        print("TRITON COMPILE/RUN FAILED:")
+        print(repr(e))
+        return False
+
+    finite = torch.isfinite(out).all().item()
+    print(f"out shape={tuple(out.shape)} dtype={out.dtype} all_finite={finite}")
+    print("triton sparse-attention: PASS" if finite else "triton sparse-attention: FAIL")
+    return bool(finite)
+
+
 def main():
     if not torch.cuda.is_available():
         print("CUDA required"); return 1
@@ -231,13 +260,17 @@ def main():
 
     ok_logits = check_paged_logits()
     ok_attn = check_sparse_attention()
+    ok_triton = check_triton_sparse_attention()
 
     print("\n==================== SUMMARY ====================")
-    print(f"  paged-logits kernel:    {'PASS' if ok_logits else 'FAIL'}")
-    print(f"  sparse-attention kernel:{'PASS' if ok_attn else 'FAIL'}")
-    all_ok = ok_logits and ok_attn
-    print("OVERALL:", "PASS" if all_ok else "FAIL")
-    return 0 if all_ok else 1
+    print(f"  paged-logits kernel:           {'PASS' if ok_logits else 'FAIL'}")
+    print(f"  tilelang sparse-attn (bf16):   {'PASS' if ok_attn else 'FAIL (expected on SM120: smem)'}")
+    print(f"  triton sparse-attn (fp8):      {'PASS' if ok_triton else 'FAIL'}")
+    # On SM120 the viable serving path is paged-logits + triton attention (fp8 KV).
+    sm120_path_ok = ok_logits and ok_triton
+    print("SM120 serving path (paged-logits + triton attn):",
+          "PASS" if sm120_path_ok else "FAIL")
+    return 0 if sm120_path_ok else 1
 
 
 if __name__ == "__main__":
