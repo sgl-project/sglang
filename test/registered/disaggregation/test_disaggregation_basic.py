@@ -303,6 +303,21 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
         requests that are already in running_batch."""
         asyncio.run(self._run_pause_on_decode_running_batch("retract"))
 
+    def test_retract_weight_update_decode_running_batch(self):
+        """Retract pause + weight update on a disagg decode node.
+
+        This guards the core reason retract mode exists: while paused, the
+        running_batch AND the rebootstrap preallocation queue are empty, so the
+        scheduler is fully idle and the post-update cache flush succeeds (a
+        regression here trips ``assert ..., "Cache flush failed after updating
+        weights"`` and crashes the decode worker). On continue, the retracted
+        requests rebootstrap-recompute their prefix KV under the updated weights
+        and resume to completion.
+        """
+        asyncio.run(
+            self._run_pause_on_decode_running_batch("retract", weight_update=True)
+        )
+
     async def _get_decode_num_running_reqs(self, session):
         """Query current decode running_batch size from /v1/loads."""
         async with session.get(
@@ -322,7 +337,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
 
         self.fail("Timed out waiting for decode running_batch to become non-empty")
 
-    async def _run_pause_on_decode_running_batch(self, mode):
+    async def _run_pause_on_decode_running_batch(self, mode, weight_update=False):
         num_requests = 2
         max_new_tokens = 512
         prompt = "Write a detailed numbered explanation of distributed inference. " * 12
@@ -374,6 +389,25 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
                 )
                 decode_paused = True
                 await asyncio.sleep(1)
+
+                if weight_update:
+                    # Reload the same weights from disk while retract-paused. The
+                    # update mechanism (disk/tensor/distributed/ipc) is irrelevant
+                    # here: they all share flush_cache_after_weight_update, whose
+                    # flush asserts the scheduler is fully idle. This must not
+                    # crash, proving retracted reqs are not stuck in the prealloc
+                    # queue.
+                    wu = await _post(
+                        session,
+                        self.decode_url + "/update_weights_from_disk",
+                        {"model_path": self.model},
+                        timeout=180,
+                    )
+                    self.assertTrue(
+                        wu.get("success", False),
+                        f"update_weights_from_disk failed during retract pause: {wu}",
+                    )
+
                 await _post(session, self.decode_url + "/continue_generation", {})
                 decode_paused = False
 
