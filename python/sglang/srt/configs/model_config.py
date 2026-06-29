@@ -1693,6 +1693,7 @@ multimodal_model_archs = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
+    "LocateAnythingForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
@@ -1707,6 +1708,7 @@ multimodal_model_archs = [
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
+    "UnlimitedOCRForCausalLM",
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
@@ -1863,6 +1865,7 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
@@ -1949,6 +1952,9 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
+    elif "UnlimitedOCRForCausalLM" in model_architectures:
+        swa_attention_layer_ids = list(range(num_hidden_layers))
+        full_attention_layer_ids = []
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern
