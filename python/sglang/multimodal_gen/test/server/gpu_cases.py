@@ -378,6 +378,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         SANA_WM_TI2V_CI_sampling_params,
         run_perf_check=False,
+        run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,

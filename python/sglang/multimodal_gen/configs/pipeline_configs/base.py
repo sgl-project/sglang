@@ -982,7 +982,7 @@ class PipelineConfig:
                 explicit_config_classes = get_pipeline_config_classes(
                     pipeline_class_name
                 )
-                if explicit_config_classes is not None:
+                if explicit_config_classes:
                     explicit_config_cls = explicit_config_classes[0]
                     if (
                         isinstance(explicit_config_cls, type)
