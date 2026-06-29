@@ -428,10 +428,12 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        # TODO: support DP
+        # Plain DP would race for the same per-tp_rank port. With dp_attention
+        # there is one global TP world, so distinct tp_ranks pick distinct
+        # ports (ports_list[self.tp_rank]) and the protocol is well-formed.
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for init_weights_send_group_for_remote_instance"
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
         )[0]
@@ -443,10 +445,10 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        # TODO: support DP
+        # See init_weights_send_group_for_remote_instance for the rationale.
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for send_weights_to_remote_instance"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
 
