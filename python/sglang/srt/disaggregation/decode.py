@@ -1352,9 +1352,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     swa_num_tokens=swa_num_to_evict,
                 )
             else:
-                params = EvictParams(
-                    num_tokens=num_to_evict
-                )
+                params = EvictParams(num_tokens=num_to_evict)
             result = self.tree_cache.evict(params)
             if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
                 logger.warning(
