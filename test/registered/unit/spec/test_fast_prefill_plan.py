@@ -27,7 +27,7 @@ try:
 except ImportError:
     _HAS_FLASHINFER = False
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 # Draft-extend layout: constant qo (num_tokens_per_req per req), page_size 1.
 # Non-uniform seq_lens make cumsum non-trivial, so a wrong per-row kv split is

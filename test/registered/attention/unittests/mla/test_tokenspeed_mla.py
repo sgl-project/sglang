@@ -59,8 +59,8 @@ MLA_SHAPE_KWARGS = dict(
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not _SUPPORTED, _SKIP_REASON)

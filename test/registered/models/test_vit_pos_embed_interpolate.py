@@ -23,8 +23,8 @@ import torch.nn as nn
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-register_cuda_ci(est_time=20, stage="base-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cuda_ci(est_time=10, stage="base-a", runner_config="1-gpu-small")
 
 NUM_POS = 2304  # Qwen3-VL num_position_embeddings -> 48x48 grid
 HIDDEN = 64  # small hidden dim keeps the unit test fast

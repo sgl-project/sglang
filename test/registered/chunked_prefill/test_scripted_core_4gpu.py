@@ -11,7 +11,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until_finished,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=115, stage="extra-b", runner_config="4-gpu-h100")
 
 
 _CHUNK_SIZE = 64

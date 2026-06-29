@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=12, suite="base-c-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners

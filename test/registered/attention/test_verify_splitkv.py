@@ -30,7 +30,7 @@ from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 # Split-KV accumulates the prefix in parallel splits and merges via log-sum-exp;
