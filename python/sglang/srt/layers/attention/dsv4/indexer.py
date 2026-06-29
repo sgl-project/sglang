@@ -36,10 +36,8 @@ if TYPE_CHECKING:
 
 if is_fp8_fnuz():
     FP8_DTYPE = torch.float8_e4m3fnuz
-    FP8_MAX = torch.finfo(FP8_DTYPE).max
 else:
     FP8_DTYPE = torch.float8_e4m3fn
-    FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
