@@ -6910,6 +6910,17 @@ class ServerArgs:
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
+        if self.tokenizer_worker_num > 1:
+            # The API-key auth middleware is only installed in single-tokenizer
+            # mode (see launch_server). In multi-tokenizer mode a configured
+            # api_key / admin_api_key would not be enforced, silently leaving
+            # admin-tagged management routes reachable without credentials.
+            # Reject the unsupported combination at startup instead.
+            assert self.api_key is None and self.admin_api_key is None, (
+                "API key authentication (--api-key / --admin-api-key) is not "
+                "supported in multi-tokenizer mode (tokenizer_worker_num > 1). "
+                "Set tokenizer_worker_num=1 to enable API key authentication."
+            )
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
