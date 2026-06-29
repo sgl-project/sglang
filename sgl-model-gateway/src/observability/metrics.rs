@@ -425,6 +425,7 @@ pub mod metrics_labels {
     pub const REGISTRATION_FAILED: &str = "failed";
     pub const REGISTRATION_DUPLICATE: &str = "duplicate";
     pub const DEREGISTRATION_POD_DELETED: &str = "pod_deleted";
+    pub const DEREGISTRATION_SELECTOR_MISMATCH: &str = "selector_mismatch";
 
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
