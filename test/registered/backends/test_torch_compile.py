@@ -32,7 +32,7 @@ class TestTorchCompile(CustomTestCase, MMLUMixin):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--enable-torch-compile", "--cuda-graph-max-bs", "4"],
+            other_args=["--enable-torch-compile", "--cuda-graph-max-bs-decode", "4"],
         )
 
     @classmethod

@@ -147,6 +147,12 @@ class TritonAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
+        # Pass-through to the Triton attention wrappers so they can extract the
+        # KV view strides and specialize on the PAGE_SIZE constexpr. At
+        # page_size=1 the kernel path matches the slot-based envelope addresses.
+        # `model_runner.page_size` defaults to 1 when `server_args.page_size` is
+        # None, avoiding the Optional case here.
+        self.page_size = getattr(model_runner, "page_size", 1) or 1
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -543,7 +549,7 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped by eagle_info_v2).
+        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped on the draft-extend path).
         # Triton extend kernel receives extend K/V as separate tensors, so
         # kv_indptr/kv_indices must cover only the prefix portion.
         # extend_seq_lens_tensor is only attached to spec_info at real
@@ -1306,6 +1312,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
+            page_size=self.page_size,
         )
         return o
 
@@ -1575,6 +1582,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_start_pos=window_start_pos,
             xai_temperature_len=layer.xai_temperature_len,
+            page_size=self.page_size,
         )
 
         return o
@@ -1710,6 +1718,7 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
             has_mla=self.use_mla,
             use_pdl=self.use_pdl,
+            page_size=self.page_size,
         )
         return o
 

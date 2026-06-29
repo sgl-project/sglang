@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -429,8 +430,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
+    # Gate for reusing the first MTP draft step's indexer topk across steps;
+    # the carried topk lives on spec_info (see EagleDraftInput.mtp_topk_indices).
     reuse_mtp_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
@@ -502,6 +503,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
+
+    # For decode context parallel
+    attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
     # Decode context parallel KV write mask.
     dcp_kv_mask: Optional[torch.Tensor] = None
@@ -860,7 +864,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        if getattr(model_runner, "dcp_size", 1) > 1 and ret.out_cache_loc is not None:
+        if (
+            getattr(model_runner, "dcp_size", 1) > 1
+            and ret.out_cache_loc is not None
+            and is_hip()
+        ):
             ret.dcp_kv_mask = (
                 ret.positions % model_runner.dcp_size == model_runner.dcp_rank
             )
