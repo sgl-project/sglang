@@ -53,15 +53,21 @@ from sglang.srt.layers.deepseek_v4_rope import (
 )
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
+    _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
+    dp_reduce_scatterv_async,
     dp_scatter,
     get_dp_global_num_tokens,
+    get_dp_tbo_comm_stream,
     get_global_dp_buffer,
+    get_global_dp_buffer_len,
     get_local_dp_buffer,
+    get_local_dp_buffer_len,
+    get_tbo_persistent_buffer,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
@@ -1842,6 +1848,99 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         return output
 
+    # ------------------------------------------------------------------
+    # Non-EP (DP TP-MoE) TBO ops. Overlap the DP all_gatherv (pre-MoE gather)
+    # + reduce_scatterv (post-MoE combine) with the OTHER ubatch's attn+MoE
+    # compute. Used when moe_a2a_backend is "none" (DP-attention, TP-MoE) —
+    # the path ATOM uses for DSV4 (+~7.7% prefill). Replaces the EP mori
+    # op_dispatch/op_combine. op_mhc_* and op_attn are reused (local hidden).
+    # ------------------------------------------------------------------
+    def op_gather_a(self, state):
+        # Launch the all_gatherv (local hidden -> global buffer) + the input_ids
+        # replicate-gather on the shared comm stream; record an event.
+        fb = state.forward_batch
+        local = state.pop("hidden_states_mlp_input")  # LOCAL [M_local, hidden]
+        # Shared-expert-local: compute on LOCAL hidden before the gather; added
+        # back after the combine (same as the non-fused forward). Skipped in the
+        # global MoE via skip_shared_experts.
+        do_shared_local = (
+            _SHARED_EXPERT_LOCAL
+            and getattr(self.mlp, "shared_experts", None) is not None
+            and getattr(self.mlp, "_shared_expert_tp1", False)
+        )
+        state.do_shared_local = do_shared_local
+        state.shared_local = (
+            self.mlp._forward_shared_experts(local)
+            if (do_shared_local and local.shape[0] > 0)
+            else None
+        )
+        # Persistent grow-only scratch (keyed per ubatch) instead of a fresh
+        # torch.empty each layer -> stops the allocator's `reserved` from
+        # ballooning at large prefill chunks. input_ids_global is gathered ONCE
+        # per ubatch in _forward_layers_tbo (cached on fb), not here.
+        sub = state.tbo_subbatch_index
+        global_rows = get_global_dp_buffer_len()
+        global_hidden = get_tbo_persistent_buffer(
+            ("gh", sub), global_rows, local.shape[1], local.dtype, local.device
+        )
+        comm = get_dp_tbo_comm_stream()
+        compute = torch.cuda.current_stream()
+        local.record_stream(comm)
+        global_hidden.record_stream(comm)
+        with torch.cuda.stream(comm):
+            comm.wait_stream(compute)
+            dp_gather_partial(global_hidden, local, fb)
+            state.gather_event = _tbo_event(("gather", sub))
+            state.gather_event.record(comm)
+        state.global_hidden = global_hidden
+
+    def op_gather_b(self, state):
+        torch.cuda.current_stream().wait_event(state.pop("gather_event"))
+
+    def op_moe(self, state):
+        # MoE (gate/topk/experts) on the GLOBAL gathered buffer. use_reduce_scatter
+        # skips the MoE-internal all_reduce (we reduce_scatterv in op_combine).
+        fb = state.forward_batch
+        global_hidden = state.pop("global_hidden")
+        global_ids = fb._tbo_global_input_ids
+        state.global_expert_out = self.mlp(
+            global_hidden,
+            fb,
+            use_reduce_scatter=True,
+            input_ids=global_ids,
+            input_ids_global=global_ids,
+            skip_shared_experts=state.do_shared_local,
+        )
+
+    def op_combine_a(self, state):
+        # Launch reduce_scatterv (global partial expert sums -> per-rank local) on
+        # the comm stream; record an event. Symmetric inverse of the all_gatherv.
+        global_out = state.pop("global_expert_out")
+        local_out = get_tbo_persistent_buffer(
+            ("lo", state.tbo_subbatch_index),
+            get_local_dp_buffer_len(),
+            global_out.shape[1],
+            global_out.dtype,
+            global_out.device,
+        )
+        state.combine_event = dp_reduce_scatterv_async(
+            local_out,
+            global_out,
+            get_dp_global_num_tokens(),
+            event_key=("combine", state.tbo_subbatch_index),
+        )
+        state.local_out = local_out
+
+    def op_combine_b(self, state):
+        torch.cuda.current_stream().wait_event(state.pop("combine_event"))
+        hidden = state.pop("local_out")
+        shared_local = state.pop("shared_local")
+        state.pop("do_shared_local")
+        if shared_local is not None:
+            n = hidden.shape[0]
+            hidden = hidden + shared_local[:n]
+        state.hidden_states_mlp_output = hidden
+
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1988,6 +2087,53 @@ class DeepseekV4Model(nn.Module):
             )
             for idx, child in enumerate(forward_batch.tbo_children)
         ]
+
+        # Non-EP DP TP-MoE: the per-ubatch DP gather/combine (op_gather/op_combine)
+        # needs each ubatch's per-rank token counts, but tbo_padded_len is computed
+        # per-rank locally (not synced). All-gather both ubatches' padded lengths
+        # once across DP ranks, then populate each child's global_num_tokens +
+        # global_dp_buffer_len so the gatherv/reduce_scatterv buffers size correctly.
+        if get_moe_a2a_backend().is_none() and get_parallel().attn_dp_size > 1:
+            tp_group = get_tp_group()
+            world = tp_group.world_size
+            children = forward_batch.tbo_children
+            local_lens = torch.tensor(
+                [int(c.tbo_padded_len) for c in children],
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            gathered = torch.empty(
+                (world, local_lens.shape[0]),
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            tp_group.all_gather_into_tensor(gathered, local_lens)
+            gathered_cpu = gathered.tolist()
+            rank = tp_group.rank_in_group
+            for idx, child in enumerate(children):
+                sizes = [gathered_cpu[r][idx] for r in range(world)]
+                child.global_num_tokens_cpu = sizes
+                child.global_num_tokens_gpu = gathered[:, idx].contiguous()
+                child.global_dp_buffer_len = sum(sizes)
+                # Gather the ubatch's input_ids -> global ONCE here (cached on the
+                # child) instead of per-layer in op_gather_a. The hash MoE reads
+                # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
+                # VARYING size (-> RCCL registers a new internal buffer per size ->
+                # HSA_STATUS_ERROR_OUT_OF_RESOURCES) collapses to 1 per ubatch.
+                local_ids = child.input_ids
+                rows = sizes[rank]
+                if local_ids.shape[0] < rows:
+                    padded_ids = local_ids.new_zeros((rows,))
+                    padded_ids[: local_ids.shape[0]] = local_ids
+                elif local_ids.shape[0] > rows:
+                    padded_ids = local_ids[:rows]
+                else:
+                    padded_ids = local_ids
+                gids = torch.empty(
+                    (sum(sizes),), dtype=local_ids.dtype, device=local_ids.device
+                )
+                tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
+                child._tbo_global_input_ids = gids
 
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,

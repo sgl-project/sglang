@@ -6967,9 +6967,14 @@ class ServerArgs:
             )
 
         # Check two batch overlap
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
+        if (
+            self.enable_two_batch_overlap
+            and self.moe_a2a_backend == "none"
+            and not envs.SGLANG_ENABLE_DP_TBO.get()
+        ):
             raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+                "When enabling two batch overlap, moe_a2a_backend cannot be 'none' "
+                "(set SGLANG_ENABLE_DP_TBO=1 for the DeepSeek-V4 non-EP DP TBO path)."
             )
 
         # Check communications compression

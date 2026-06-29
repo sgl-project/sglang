@@ -609,6 +609,11 @@ class Envs:
     # hit HSA_STATUS_ERROR_OUT_OF_RESOURCES under TBO + cuda-graph (observed on
     # DeepSeek-V4 + mori EP on MI355X). Mirrors ATOM's fixed graph_bs//N bucketing.
     SGLANG_TBO_PAD_BUCKET = EnvBool(False)
+    # Allow two-batch-overlap on the non-EP (DP TP-MoE) path, where TBO overlaps
+    # the DP all_gatherv (pre-MoE gather) + reduce_scatterv (post-MoE combine)
+    # with the other ubatch's compute (instead of an EP a2a dispatcher). Only
+    # DeepSeek-V4 implements the non-EP TBO ops; default OFF, opt-in.
+    SGLANG_ENABLE_DP_TBO = EnvBool(False)
 
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)

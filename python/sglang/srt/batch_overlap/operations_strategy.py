@@ -182,10 +182,27 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
 
 
 def _compute_moe_deepseek_v4_prefill(layer):
-    return OperationsStrategy(
-        deep_gemm_num_sms=None,
-        tbo_delta_stages=0,
-        operations=[
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+
+    if get_moe_a2a_backend().is_none():
+        # Non-EP DP TP-MoE: overlap the DP all_gatherv (gather) + reduce_scatterv
+        # (combine) with the other ubatch's attn+MoE compute (ATOM's DSV4 path).
+        ops = [
+            layer.op_mhc_prepare_attn,
+            layer.self_attn.op_attn,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.op_gather_a,
+            operations.YieldOperation(),
+            layer.op_gather_b,
+            layer.op_moe,
+            layer.op_combine_a,
+            operations.YieldOperation(),
+            layer.op_combine_b,
+            layer.op_mhc_postprocess,
+        ]
+    else:
+        # EP / mori a2a: reuse DeepseekV2MoE's deepep dispatch/combine ops.
+        ops = [
             layer.op_mhc_prepare_attn,
             layer.self_attn.op_attn,
             layer.op_mhc_post_attn_pre_mlp,
@@ -201,7 +218,11 @@ def _compute_moe_deepseek_v4_prefill(layer):
             layer.mlp.op_combine_b,
             layer.mlp.op_output,
             layer.op_mhc_postprocess,
-        ],
+        ]
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=0,
+        operations=ops,
     )
 
 
