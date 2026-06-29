@@ -1059,23 +1059,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _register_to_engine_info_bootstrap(self):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
-        The bootstrap server runs on node_rank==0. For multi-node setups, the
-        host is derived from dist_init_addr. For single-node, use 127.0.0.1.
+        The bootstrap server runs on node_rank==0. For multi-node setups the
+        host is derived from dist_init_addr. For single-node we reuse
+        engine_info_bootstrap_url so the loopback respects the bind family
+        (`::` -> `::1`, `0.0.0.0` -> `127.0.0.1`); hardcoding 127.0.0.1 breaks
+        IPv6-only pods where the bootstrap server only accepts IPv6 connections.
         """
         import requests as http_requests
 
         if self.server_args.dist_init_addr:
-            # Multi-node: bootstrap server is on the head node (node_rank==0).
-            # Derive host from dist_init_addr (shared across all nodes).
             bootstrap_host = (
                 NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
             )
+            bootstrap_port = self.server_args.engine_info_bootstrap_port
+            bootstrap_url = NetworkAddress(bootstrap_host, bootstrap_port).to_url()
         else:
-            bootstrap_host = "127.0.0.1"
+            bootstrap_url = self.server_args.engine_info_bootstrap_url
 
-        bootstrap_port = self.server_args.engine_info_bootstrap_port
-        bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
-        url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
+        url = f"{bootstrap_url}/register_transfer_engine_info"
 
         payload = {
             "tp_rank": self.tp_rank,
@@ -1090,7 +1091,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if resp.status_code == 200:
                 logger.info(
                     f"Registered transfer engine info for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_na}"
+                    f"with bootstrap server at {bootstrap_url}"
                 )
             else:
                 logger.error(
