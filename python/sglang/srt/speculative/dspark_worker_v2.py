@@ -249,6 +249,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            lora_ids=[None] * bs,
         )
         if self.server_args.enable_dp_attention and batch.global_num_tokens is not None:
             draft_global_num_tokens = [
