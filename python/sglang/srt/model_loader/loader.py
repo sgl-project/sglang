@@ -798,7 +798,8 @@ class DefaultModelLoader(BaseModelLoader):
                 torch.cuda.empty_cache()
         else:
             model.load_weights(weights)
-
+        if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
+            return
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             memory_end = get_available_gpu_memory(
