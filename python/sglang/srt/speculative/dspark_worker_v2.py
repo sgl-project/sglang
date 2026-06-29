@@ -513,8 +513,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark spec-v2 expected DSparkDraftInputV2 state on the running batch."
             )
 
-        if model_worker_batch.forward_mode.is_idle():
+        participates_in_dp_decode = (
+            self.server_args.enable_dp_attention
+            and model_worker_batch.forward_mode.is_idle()
+            and model_worker_batch.global_num_tokens is not None
+            and any(int(x) > 0 for x in model_worker_batch.global_num_tokens)
+        )
+        if model_worker_batch.forward_mode.is_idle() and not participates_in_dp_decode:
             return self._forward_idle(on_publish)
+        if participates_in_dp_decode:
+            self._debug_hang(
+                "idle_rank_join_dp_decode",
+                model_worker_batch,
+                global_num_tokens=model_worker_batch.global_num_tokens,
+            )
 
         model_worker_batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -583,6 +595,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         model_worker_batch.out_cache_loc = verify_out_cache_loc
         self._debug_hang("prepare_verify_begin", model_worker_batch, bs=bs)
+        if participates_in_dp_decode:
+            model_worker_batch.forward_mode = ForwardMode.DECODE
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
