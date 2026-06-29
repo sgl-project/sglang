@@ -333,10 +333,15 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
-        try:
-            graph = torch.cuda.CUDAGraph(keep_graph=True)
-            self._current_graph_needs_instantiate = True
-        except TypeError:
+        # keep_graph retains the raw graph for dedup; skip it on the plain path.
+        if self.cuda_graph._deduped_cuda_graph is not None:
+            try:
+                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                self._current_graph_needs_instantiate = True
+            except TypeError:
+                graph = torch.cuda.CUDAGraph()
+                self._current_graph_needs_instantiate = False
+        else:
             graph = torch.cuda.CUDAGraph()
             self._current_graph_needs_instantiate = False
         graph.capture_begin(
