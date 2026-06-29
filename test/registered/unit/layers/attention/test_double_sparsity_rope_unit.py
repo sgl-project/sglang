@@ -27,8 +27,8 @@ import torch
 
 from sglang.srt.layers.attention.double_sparsity import validate_double_sparsity
 from sglang.srt.layers.attention.double_sparsity.config import (
-    DoubleSparsityConfig,
     _ALLOWED_FIELDS,
+    DoubleSparsityConfig,
     parse_double_sparsity_config,
 )
 from sglang.test.ci.ci_register import register_cuda_ci

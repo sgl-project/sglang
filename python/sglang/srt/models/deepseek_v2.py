@@ -21,9 +21,7 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import nullcontext
-from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -2121,47 +2119,6 @@ class DeepseekV2AttentionMLA(
             tp_size=max(attn_tp_size, 1),
         )
 
-        # sensitivity gate: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1
-        # replaces the calibrated channel selection with a deterministically
-        # random one drawn uniformly from [0, head_dim). Used to verify the
-        # NIAH @ 64K negative sensitivity assertion (recall must drop > 20 pp).
-        # Weights and dtype/device are preserved so only the selection
-        # changes. Logged once per (process, layer) so an operator cannot
-        # leave it on by accident.
-        if os.getenv("SGLANG_DS_FAULT_INJECT_CORRUPT_MASK") == "1":
-            from dataclasses import replace as _replace
-
-            sel = local_mask.channel_selection
-            # Deterministic per-layer seed: layer_id keeps each layer
-            # consistent across restarts but lets layers diverge.
-            gen = torch.Generator(device=sel.device).manual_seed(self.layer_id)
-            head_dim = int(local_mask.head_dim)
-            label_dim = int(sel.shape[-1])
-            if label_dim <= head_dim:
-                # Sample without replacement per (layer, head) row.
-                L, H, _ = sel.shape
-                rows = []
-                for _ in range(L * H):
-                    perm = torch.randperm(head_dim, generator=gen, device=sel.device)
-                    rows.append(perm[:label_dim])
-                corrupted = torch.stack(rows, dim=0).view(L, H, label_dim).to(sel.dtype)
-            else:
-                corrupted = torch.randint(
-                    low=0,
-                    high=head_dim,
-                    size=sel.shape,
-                    generator=gen,
-                    device=sel.device,
-                    dtype=sel.dtype,
-                )
-            local_mask = _replace(local_mask, channel_selection=corrupted)
-            logger.warning(
-                "double_sparsity: SGLANG_DS_FAULT_INJECT_CORRUPT_MASK=1 — "
-                "channel_selection for layer %d was randomly permuted; "
-                "NIAH @ 64K is expected to drop > 20 pp.",
-                self.layer_id,
-            )
-
         # Publish the channel selection + no-PE head width on server_args. The
         # selector's KV-write hook marks slots through _ds_channel_selection, and
         # the DSA backend derives the absorbed scratch label_dim from it (without
@@ -2257,58 +2214,6 @@ class DeepseekV2AttentionMLA(
         assert_tp_configured(
             self.double_sparsity_selector, tp_world_size=max(attn_tp_size, 1)
         )
-
-    def _publish_ds_request_summary(
-        self,
-        *,
-        forward_batch: ForwardBatch,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        layer_id: int,
-    ) -> None:
-        """Publish per-row DS stats onto ``forward_batch.ds_per_request_summary``.
-
-        The scheduler reads this side-channel into ``Req.per_request_summary``
-        so the tokenizer surfaces a single dict per request in
-        ``meta_info["double_sparsity"]``. Stores the latest layer's
-        snapshot (last layer's stats win the per-request summary).
-        """
-        from sglang.srt.layers.attention.double_sparsity.metrics import (
-            meta_info_for_request,
-        )
-
-        seq_lens = getattr(forward_batch, "seq_lens", None)
-        if seq_lens is None:
-            return
-        bs = int(valid_lengths.shape[0])
-        # CPU copy: this side-channel is a host-side scalar publication,
-        # not a hot-path tensor; one .tolist() per layer per batch.
-        vl_cpu = valid_lengths.detach().to("cpu").tolist()
-        sl_cpu = seq_lens.detach().to("cpu").tolist()
-
-        # After the token-level rotation the selector emits TOKEN
-        # positions, not pages — so the sparsity denominator is the
-        # sequence length in tokens, not (seq_len + page_size - 1) // page_size.
-        records: List[Optional[Dict[str, Any]]] = []
-        for b in range(bs):
-            selected_tokens = int(vl_cpu[b])
-            total_tokens = max(1, int(sl_cpu[b]))
-            stats = SimpleNamespace(
-                sparsity_rate=float(1.0 - selected_tokens / total_tokens),
-                selected_tokens=selected_tokens,
-                total_tokens=total_tokens,
-                dense_fallback=0,
-            )
-            records.append(meta_info_for_request(stats))
-
-        # Stash on forward_batch; the scheduler reads this when assembling
-        # BatchTokenIDOutput. We overwrite per layer; the last layer to
-        # publish wins (consistent with "latest snapshot per request").
-        summary = getattr(forward_batch, "ds_per_request_summary", None)
-        if summary is None:
-            summary = {}
-            setattr(forward_batch, "ds_per_request_summary", summary)
-        summary["double_sparsity"] = records
 
     def _select_topk_indices(
         self,
@@ -2464,25 +2369,11 @@ class DeepseekV2AttentionMLA(
                 _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
                 if _ds_graph_state is None and _dsa_metadata is not None:
                     _ds_graph_state = getattr(_dsa_metadata, "ds_graph_state", None)
-                # All non-learned selector variants ride the graph-safe path —
-                # head_agg (mean) in the absorbed score kernel and anchor_mode
-                # (recency/global/strided) as a tensorized post-topK force-include
-                # in retrieve_topk_graph_safe — so ds_scorer_is_graph_safe() is
-                # True and nothing here forces eager. The SGLANG_DS_FORCE_EAGER_SELECT
-                # env escape hatch is retained for debugging. Config-borne flags
-                # reach the TP workers.
-                from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-                    ds_scorer_is_graph_safe as _ds_scorer_is_graph_safe,
-                )
-
-                # Selection always rides the production graph-safe path unless a
-                # non-graph-safe scorer variant or the explicit env override forces
-                # eager.
-                _force_eager_select = os.environ.get(
-                    "SGLANG_DS_FORCE_EAGER_SELECT", "0"
-                ) == "1" or not _ds_scorer_is_graph_safe(
-                    getattr(_selector, "config", None)
-                )
+                # Selection always rides the production graph-safe path: every
+                # served scorer variant is graph-safe (validate_double_sparsity
+                # rejects non-graph-safe configs at startup), so the only reason
+                # to fail closed here is a missing precondition.
+                #
                 # Graph-safe selection requires BOTH the bind-time absorbed
                 # projection AND the preallocated absorbed scratch (v_h /
                 # weighted-query / int64 mask / fp32 query cast) — without them the
@@ -2498,8 +2389,7 @@ class DeepseekV2AttentionMLA(
                     and _ds_graph_state.scratch_absorbed_q is not None
                 )
                 _use_graph_safe = (
-                    not _force_eager_select
-                    and _ds_graph_state is not None
+                    _ds_graph_state is not None
                     and _ds_graph_state.scratch_scores is not None
                     and _has_selector_state
                     and _selector.channel_mask is not None
@@ -2738,25 +2628,6 @@ class DeepseekV2AttentionMLA(
                         "the eager retrieve_topk fallback is not wired for "
                         "production selection."
                     )
-                # Selection-capture mirrors (config-borne diagnostic): copy this
-                # layer's selection into the per-layer capture buffers. A device
-                # copy, so CUDA-graph capture records it and replay keeps the
-                # mirrors current; eager decode runs it directly. The model
-                # runner reads the mirrors after the forward returns.
-                _cap_idx = (
-                    getattr(_ds_graph_state, "capture_indices", None)
-                    if _ds_graph_state is not None
-                    else None
-                )
-                if _cap_idx is not None and layer_id < _cap_idx.shape[0]:
-                    _cap_bs = selected_indices.shape[0]
-                    _cap_k = min(selected_indices.shape[1], _cap_idx.shape[2])
-                    _cap_idx[layer_id, :_cap_bs, :_cap_k].copy_(
-                        selected_indices[:, :_cap_k]
-                    )
-                    _ds_graph_state.capture_lengths[layer_id, :_cap_bs].copy_(
-                        valid_lengths
-                    )
                 # prefer the NSA-metadata-owned buffer, allocated
                 # once per batch in init_forward_metadata (also for
                 # capture/replay). Resolve from the same real production
@@ -2818,20 +2689,6 @@ class DeepseekV2AttentionMLA(
                     ds_out[:, :mtk].copy_(selected_indices)
                     if mtk < ds_out.shape[1]:
                         ds_out[:, mtk:].fill_(-1)
-                # Skip the per-request CPU-side summary while CUDA capture
-                # is recording the stream; the host syncs (.to('cpu') and
-                # .item()) inside _publish_ds_request_summary are illegal
-                # during capture and not needed for the captured replay.
-                if not (
-                    torch.cuda.is_available()
-                    and torch.cuda.is_current_stream_capturing()
-                ):
-                    self._publish_ds_request_summary(
-                        forward_batch=forward_batch,
-                        selected_indices=selected_indices,
-                        valid_lengths=valid_lengths,
-                        layer_id=layer_id,
-                    )
                 return ds_out
 
             # DS selection runs directly: a selector/mask/TP failure surfaces

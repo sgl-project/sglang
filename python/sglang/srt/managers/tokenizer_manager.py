@@ -1932,19 +1932,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             state.customized_info_accumulated[k] = []
                         state.customized_info_accumulated[k].extend(v[i])
                         meta_info[k] = state.customized_info_accumulated[k]
-                # Per-request summary channel: v is a list of length bs, one dict
-                # per request. Unpacks to a single dict per request in meta_info
-                # (NOT a list of per-output-token dicts). Used by Double Sparsity.
-                # Skip None entries so requests without a summary do not get the
-                # key set to None — the key is absent for non-DS requests.
-                if getattr(recv_obj, "per_request_summary", None):
-                    for k, v in recv_obj.per_request_summary.items():
-                        if v is None or i >= len(v):
-                            continue
-                        entry = v[i]
-                        if entry is None:
-                            continue
-                        meta_info[k] = entry
 
                 # Add multimodal prompt token counts only for requests that
                 # actually consumed them, so plain-text meta_info stays unchanged.

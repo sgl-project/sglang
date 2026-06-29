@@ -61,9 +61,11 @@ python -m sglang.launch_server \
 ```
 
 CUDA graphs and radix cache are **on** (radix needs no fixture artifact or
-override — DS + radix just works). To confirm DS is genuinely active, a decode
-response carries `meta_info["double_sparsity"]` with `selected_tokens > 0`,
-`total_tokens > selected_tokens`, and `dense_fallback == 0`.
+override — DS + radix just works). To confirm DS is genuinely active, check the
+startup log: it loads the channel mask (`Loaded channel mask file ...
+content_sha256=...`) and selects the DSA attention backend, and the decode
+throughput tracks the selector-width graph ladder (§3) rather than the dense
+~18.8 TPS floor.
 
 > This branch is off latest `origin/main`, which requires `sglang-kernel >=
 > 0.4.4` (its flash-attention path uses the 0.4.4 `only_qv` kernel). Install it

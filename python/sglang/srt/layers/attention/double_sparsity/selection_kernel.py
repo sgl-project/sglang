@@ -14,100 +14,16 @@ both capture-safe (no host syncs, no dynamic shapes):
    (logical token position order) with ``-1`` padding, per the selector ABI
    contract. The top-K step uses ``torch.topk`` + ``torch.sort`` (both
    CUDA-graph capture-safe with static shapes).
-
-``project_query_onto_channels`` projects a query onto each head's channel
-mask; it is the canonical projection the absorbed-latent build mirrors.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
-
-# Dev-only score capture (SGLANG_DS_SCORE_CAPTURE_DIR, registered in environ.py so it
-# reaches TP workers; None default → production inert). When set AND the selector runs
-# eager (NOT under CUDA-graph capture — host dumps are not capture-safe), the graph-safe
-# selector dumps the per-rank pre-reduce, post-reduce, and authoritative (post-mask)
-# score rows + the emitted selection, so an offline validator can prove the cross-TP
-# selected-index contract on the REAL served call. When unset this is a single field
-# read with no clone / sync / alloc — production unchanged.
-_ds_capture_counter = 0
-
-
-def _ds_score_capture_dir() -> Optional[str]:
-    from sglang.srt.environ import envs
-
-    return envs.SGLANG_DS_SCORE_CAPTURE_DIR.get()
-
-
-def _ds_score_capture_active(device: torch.device) -> bool:
-    if device.type != "cuda":
-        return False
-    if not _ds_score_capture_dir():
-        return False
-    return not torch.cuda.is_current_stream_capturing()
-
-
-def _dump_ds_score_capture(
-    *,
-    pre_reduce,
-    post_reduce,
-    authoritative,
-    out_indices,
-    out_lengths,
-    req_pool_indices,
-    req_to_token,
-    seq_lens,
-    layer_id,
-    process_group,
-):
-    """Write one capture record per (tp_rank, layer, call). Eager-only (the caller
-    gates on _ds_score_capture_active). Carries the per-request emitted selection + the
-    score rows it was computed from, on CPU, for the offline cross-rank validator."""
-    global _ds_capture_counter
-    from sglang.srt.environ import envs
-
-    cap_dir = envs.SGLANG_DS_SCORE_CAPTURE_DIR.get()
-    if not cap_dir:
-        return
-    if _ds_capture_counter >= int(envs.SGLANG_DS_SCORE_CAPTURE_MAX.get()):
-        return
-    os.makedirs(cap_dir, exist_ok=True)
-    tp_rank = (
-        torch.distributed.get_rank(process_group)
-        if (process_group is not None and torch.distributed.is_initialized())
-        else 0
-    )
-    bs = out_indices.shape[0]
-    phys = []
-    for b in range(bs):
-        rp = int(req_pool_indices[b])
-        sel = out_indices[b].long().clamp_min(0)
-        phys.append(req_to_token[rp].long()[sel].cpu())
-    record = {
-        "tp_rank": tp_rank,
-        "layer_id": int(layer_id),
-        "req_pool_indices": req_pool_indices.detach().cpu(),
-        "seq_lens": seq_lens.detach().cpu(),
-        "pre_reduce": pre_reduce.detach().float().cpu(),
-        "post_reduce": post_reduce.detach().float().cpu(),
-        "authoritative": authoritative.detach().float().cpu(),
-        "selected_indices": out_indices.detach().cpu(),
-        "valid_lengths": out_lengths.detach().cpu(),
-        "phys_slots": torch.stack(phys, 0) if phys else torch.empty(0),
-        "score_dtype": str(authoritative.dtype),
-    }
-    fname = os.path.join(
-        cap_dir, f"cap_rank{tp_rank}_layer{int(layer_id)}_{_ds_capture_counter}.pt"
-    )
-    _ds_capture_counter += 1
-    torch.save(record, fname)
-
 
 SELECTED_PAD_VALUE = -1
 _TRITON_AVAILABLE = False
@@ -118,36 +34,6 @@ try:
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
-
-
-def project_query_onto_channels(
-    queries: torch.Tensor,
-    channel_selection: torch.Tensor,
-    channel_weights: torch.Tensor,
-) -> torch.Tensor:
-    """Project ``queries[bs, H, head_dim]`` onto each head's channel mask.
-
-    Returns ``query_projected[bs, H, label_dim]``.
-    """
-
-    if queries.dim() != 3:
-        raise ValueError(
-            f"queries must be 3-D [bs, H, head_dim], got shape {tuple(queries.shape)}."
-        )
-    if channel_selection.dim() != 2 or channel_weights.dim() != 2:
-        raise ValueError(
-            "channel_selection/channel_weights must be 2-D [H, label_dim]."
-        )
-    bs, num_heads, head_dim = queries.shape
-    if channel_selection.shape[0] != num_heads:
-        raise ValueError(
-            f"channel_selection head dim {int(channel_selection.shape[0])} does not match "
-            f"queries num_heads {num_heads}."
-        )
-
-    selection_idx = channel_selection.long().unsqueeze(0).expand(bs, -1, -1)
-    gathered = torch.gather(queries, dim=-1, index=selection_idx)
-    return gathered * channel_weights.unsqueeze(0)
 
 
 def assert_rope_selection_supported(
@@ -395,17 +281,6 @@ def reduce_token_scores(
     return token_scores
 
 
-def all_reduce_token_scores(
-    token_scores: torch.Tensor,
-    *,
-    process_group=None,
-) -> torch.Tensor:
-    """Original in-place fp32 SUM reduce (compat wrapper over
-    :func:`reduce_token_scores`)."""
-
-    return reduce_token_scores(token_scores, process_group=process_group)
-
-
 def _topk_by_score_then_pos(
     vals: torch.Tensor,
     pos: torch.Tensor,
@@ -455,7 +330,7 @@ def select_topk_sequence_order(
     # ASCENDING). token_scores columns are already in position order, so the shared
     # helper's stable score-descending argsort breaks score ties toward the lower
     # position -- the single ordering all DS top-k selectors honor (see
-    # _topk_by_score_then_pos / blocked_topk_sequence_order).
+    # _topk_by_score_then_pos).
     positions = (
         torch.arange(max_tokens, device=device, dtype=torch.int64)
         .unsqueeze(0)
@@ -494,105 +369,6 @@ def select_topk_sequence_order(
         selected[:, :effective_top_k] = real_slice
 
     return selected, valid_lengths.to(torch.int32)
-
-
-def blocked_topk_sequence_order(
-    token_scores: torch.Tensor,
-    max_top_k: int,
-    block_width: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Exact blocked top-K — identical output to :func:`select_topk_sequence_order`.
-
-    Partitions the ``max_tokens`` score axis into fixed ``block_width`` blocks,
-    keeps each block's top ``min(max_top_k, block_width)`` candidates, then merges
-    them and takes the global top-K. The result (ascending logical positions,
-    ``-1`` padded, + valid_lengths) is identical to the monolithic selection.
-
-    Exactness: a token in the global top-K has within-block rank <= its global
-    rank <= K, so it is in its block's top-min(K, block_width); the union of the
-    per-block candidates therefore contains the global top-K, and merging them under
-    the SHARED deterministic tie-break (score descending, then logical position
-    ascending) reproduces ``select_topk_sequence_order`` EXACTLY -- including on
-    finite ties (equal scores resolve to the lower position in both). This is the
-    exactness ORACLE and the
-    eager fallback for the graph-safe blocked top-k, whose value is that it can
-    SKIP blocks entirely past each request's ``seq_len`` (every such block is all
-    ``-inf`` and contributes no candidate), shrinking the per-decode-step work
-    versus a monolithic ``torch.topk`` over the full KV-index width.
-
-    token_scores: [bs, max_tokens] fp32 (unwritten/out-of-range tokens = -inf).
-    Returns: selected_indices int32 [bs, max_top_k] ascending -1-padded; valid_lengths int32 [bs].
-    """
-    if token_scores.dim() != 2:
-        raise ValueError(f"token_scores must be 2-D, got {tuple(token_scores.shape)}.")
-    if max_top_k <= 0:
-        raise ValueError(f"max_top_k must be positive, got {max_top_k}.")
-    if block_width <= 0:
-        raise ValueError(f"block_width must be positive, got {block_width}.")
-    bs, max_tokens = token_scores.shape
-    device = token_scores.device
-    K = min(max_top_k, max_tokens)
-    bw = block_width
-    nb = (max_tokens + bw - 1) // bw
-    pad = nb * bw - max_tokens
-    if pad:
-        sc = token_scores.new_full((bs, nb * bw), float("-inf"))
-        sc[:, :max_tokens] = token_scores
-    else:
-        sc = token_scores
-    blk = sc.view(bs, nb, bw)
-    kb = min(K, bw)
-    # per-block top-kb candidate LOCAL positions by (score desc, local-pos asc) -- the
-    # argsort indices ARE the local positions; stable keeps ascending pos on ties.
-    blk_order = torch.argsort(blk, dim=-1, descending=True, stable=True)[:, :, :kb]
-    block_base = (torch.arange(nb, device=device, dtype=torch.int64) * bw).view(
-        1, nb, 1
-    )
-    cand_pos = (block_base + blk_order).reshape(bs, nb * kb)
-    cand_vals = torch.gather(blk, 2, blk_order).reshape(bs, nb * kb)
-    # global top-K over the union, by the SHARED (score desc, position asc) contract
-    # -- identical to select_topk_sequence_order, including on finite ties.
-    eff = min(K, nb * kb)
-    sel_pos, merge_vals = _topk_by_score_then_pos(cand_vals, cand_pos, eff)
-    invalid = torch.isneginf(merge_vals)
-    sel_pos = torch.where(invalid, torch.full_like(sel_pos, max_tokens), sel_pos)
-    sorted_pos, _ = torch.sort(sel_pos, dim=-1)
-    selected = torch.full(
-        (bs, max_top_k), SELECTED_PAD_VALUE, dtype=torch.int32, device=device
-    )
-    valid_lengths = (sorted_pos < max_tokens).to(torch.int32).sum(dim=-1)
-    grid = torch.arange(eff, device=device)
-    keep = grid.unsqueeze(0) < valid_lengths.unsqueeze(1)
-    real = torch.where(
-        keep,
-        sorted_pos.to(torch.int32),
-        torch.full_like(sorted_pos, SELECTED_PAD_VALUE, dtype=torch.int32),
-    )
-    selected[:, :eff] = real
-    return selected, valid_lengths.to(torch.int32)
-
-
-def _anchor_positions(n: int, budget: int, mode: str) -> list:
-    """Deterministic anchor logical positions in ``[0, n)`` for one request.
-
-    - ``recency``: the ``budget`` most-recent positions ``[n-budget, n)``.
-    - ``global``: the ``budget`` earliest stable positions ``[0, budget)``.
-    - ``strided``: ``budget`` distinct evenly-spaced positions over ``[0, n)``.
-    Clamps ``budget`` to ``n``; returns ``[]`` for ``off`` / empty.
-    """
-    if budget <= 0 or n <= 0 or mode == "off":
-        return []
-    b = min(budget, n)
-    if mode == "recency":
-        return list(range(n - b, n))
-    if mode == "global":
-        return list(range(0, b))
-    if mode == "strided":
-        if b == 1:
-            return [0]
-        step = (n - 1) / (b - 1)
-        return sorted({int(round(i * step)) for i in range(b)})
-    return []
 
 
 def _anchor_positions_tensor(
@@ -1149,8 +925,6 @@ def retrieve_topk_graph_safe(
     # kernel-name matching. Host-side annotations: they mark eager decode and
     # the capture-time launches; CUDA-graph replay does not re-emit them.
     scores_view = scratch_scores[:bs, :max_seq_len]
-    _do_capture = _ds_score_capture_active(device)
-    _cap_pre = _cap_post = _cap_auth = None
     # Dead positions (past seq_len) only need -inf when a full-width consumer
     # reads them: the legacy torch.topk pipeline scans the whole scratch, the
     # recall oracle ranks the full score row, and the anchor force-include is
@@ -1243,8 +1017,6 @@ def retrieve_topk_graph_safe(
         radix_topk_scratch is not None and bf16_used and anchor_mode == "off"
     )
     topk_scores = scores_view
-    if _do_capture:
-        _cap_pre = scores_view.detach().float().clone()  # per-rank, pre-reduce
     if (
         process_group is not None
         and torch.distributed.is_available()
@@ -1263,8 +1035,6 @@ def retrieve_topk_graph_safe(
             topk_scores = reduced
         torch.cuda.nvtx.range_pop()
 
-    if _do_capture:
-        _cap_post = topk_scores.detach().float().clone()  # post-reduce, pre-mask
     if per_request_valid is not None:
         assert (
             scratch_pv_mask is not None
@@ -1304,11 +1074,6 @@ def retrieve_topk_graph_safe(
             req_pool_indices=req_pool_indices,
             req_to_token=req_to_token,
         )
-
-    if _do_capture:
-        _cap_auth = (
-            topk_scores.detach().float().clone()
-        )  # post-mask+include, topk input
 
     torch.cuda.nvtx.range_push("ds_topk_select")
     if radix_topk_scratch is not None:
@@ -1400,19 +1165,5 @@ def retrieve_topk_graph_safe(
         )
         out_indices[:bs, :max_top_k].copy_(a_idx)
         out_lengths[:bs].copy_(a_len)
-
-    if _do_capture:
-        _dump_ds_score_capture(
-            pre_reduce=_cap_pre,
-            post_reduce=_cap_post,
-            authoritative=_cap_auth,
-            out_indices=out_indices[:bs],
-            out_lengths=out_lengths[:bs],
-            req_pool_indices=req_pool_indices[:bs],
-            req_to_token=req_to_token,
-            seq_lens=seq_lens[:bs],
-            layer_id=layer_id,
-            process_group=process_group,
-        )
 
     return out_indices, out_lengths

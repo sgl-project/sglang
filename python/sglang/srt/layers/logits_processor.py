@@ -124,11 +124,6 @@ class LogitsProcessorOutput:
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
-    # Per-request summary (one dict per request per key; the scheduler
-    # collects the latest snapshot into Req.per_request_summary so the
-    # tokenizer's `meta_info[key]` is a single dict, not a list of
-    # per-output-token dicts).
-    per_request_summary: Optional[Dict[str, List[Any]]] = None
 
     mm_input_embeds: Optional[torch.Tensor] = None
 

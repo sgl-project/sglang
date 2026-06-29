@@ -196,8 +196,8 @@ def load_channel_mask(path: str, *, map_location: str = "cpu") -> ChannelMask:
         )
 
     # channel_selection holds vocab indices into a head_dim-wide channel
-    # axis; out-of-range values blow up later in project_query_onto_channels
-    # with an opaque gather error, so reject up front.
+    # axis; out-of-range values blow up later during the channel gather
+    # with an opaque error, so reject up front.
     if channel_selection.numel() > 0:
         cs_int = channel_selection.to(torch.int64)
         cs_min = int(cs_int.min().item())

@@ -147,15 +147,7 @@ def validate_double_sparsity(server_args: ServerArgs) -> None:
                 "Double Sparsity 'rope_aware_score' is validated only on the CUDA MLA "
                 f"path; got --device={device!r}. Set rope_aware_score=false."
             )
-        from sglang.srt.environ import envs
-
-        if (
-            getattr(server_args, "disable_cuda_graph", False)
-            and not envs.SGLANG_DS_SCORE_CAPTURE_DIR.get()
-        ):
-            # The one legal eager+rope path is the dev score-capture run (host dumps are
-            # not CUDA-graph-safe, so the captured-selection validator serves eager with
-            # SGLANG_DS_SCORE_CAPTURE_DIR set). Production graphs-off still fails closed.
+        if getattr(server_args, "disable_cuda_graph", False):
             raise ValueError(
                 "Double Sparsity 'rope_aware_score' is validated only with CUDA graphs "
                 "ON; it is not supported with "

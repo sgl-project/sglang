@@ -175,112 +175,6 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
-    def _maybe_abort_on_ds_error(
-        self,
-        i: int,
-        req: Req,
-        logits_output: LogitsProcessorOutput,
-    ) -> bool:
-        """Early-abort hook for DS per-request row errors.
-
-        Returns True iff `logits_output.per_request_summary["double_sparsity"][i]`
-        carries an `error_class` (i.e., the DS adapter sanitized this row).
-        On True, this also:
-          - clears `req.customized_info["double_sparsity"]`,
-          - stores the failure summary on `req.per_request_summary`,
-          - calls `req.set_finish_with_abort(...)`,
-          - immediately calls `req.update_finish_state()` so `finished_reason`
-            is materialised on the current scheduler step.
-
-        Callers must run this BEFORE token append, logprob/grammar/
-        hidden-state bookkeeping. The returned True signals the caller
-        to skip normal output processing for this request.
-        """
-        if logits_output is None:
-            return False
-        summary = getattr(logits_output, "per_request_summary", None)
-        if summary is None:
-            return False
-        ds_list = summary.get("double_sparsity")
-        if ds_list is None or i >= len(ds_list):
-            return False
-        entry = ds_list[i]
-        if not (isinstance(entry, dict) and entry.get("error_class")):
-            return False
-
-        # Capture the failure record on the request, then trigger abort.
-        if req.per_request_summary is None:
-            req.per_request_summary = {}
-        req.per_request_summary["double_sparsity"] = entry
-        if req.customized_info is not None:
-            req.customized_info.pop("double_sparsity", None)
-
-        error_class = entry.get("error_class", "DSAdapterError")
-        error_message = entry.get("error_message", "")
-        if getattr(req, "to_finish", None) is None:
-            req.set_finish_with_abort(f"Double Sparsity {error_class}: {error_message}")
-        # Materialise finished_reason on the current step.
-        req.update_finish_state()
-        return True
-
-    def _maybe_collect_per_request_summary(
-        self,
-        i: int,
-        req: Req,
-        logits_output: LogitsProcessorOutput,
-    ):
-        """Collect the latest per-request summary snapshot for req `i`.
-
-        Unlike customized_info (which appends per-output-token), this
-        overwrites: each model step replaces the prior snapshot. The
-        tokenizer surfaces the final value as a single dict per request.
-
-        Additionally: when the snapshot for the Double Sparsity namespace
-        carries an `error_class` (set by `_publish_ds_request_summary`
-        when the DS adapter sanitized this row), clear the partial
-        per-output-token `customized_info["double_sparsity"]` for this
-        request so a degraded request does not surface stale stats from
-        prior steps. Per-request abort plumbing through the scheduler
-        boundary remains queued; this method ensures the partial state
-        is at least consistent.
-        """
-        if logits_output is None:
-            return
-        summary = getattr(logits_output, "per_request_summary", None)
-        if summary is None:
-            return
-        if req.per_request_summary is None:
-            req.per_request_summary = {}
-        for k, v in summary.items():
-            if v is None or i >= len(v):
-                continue
-            entry = v[i]
-            if entry is None:
-                continue
-            req.per_request_summary[k] = entry
-
-            # If the DS row was sanitized, abort that single request via
-            # the existing scheduler error-finish path. Siblings in the
-            # same batch continue; the failed request returns a non-2xx
-            # response with the typed error class as the reason. Clear
-            # the partial per-token DS accumulator so the abort response
-            # does not surface stale pre-failure stats.
-            if (
-                k == "double_sparsity"
-                and isinstance(entry, dict)
-                and entry.get("error_class")
-            ):
-                if req.customized_info is not None:
-                    req.customized_info.pop("double_sparsity", None)
-                error_class = entry.get("error_class", "DSAdapterError")
-                error_message = entry.get("error_message", "")
-                # Avoid double-aborting if some other path already marked
-                # the request finished with an error.
-                if getattr(req, "to_finish", None) is None:
-                    req.set_finish_with_abort(
-                        f"Double Sparsity {error_class}: {error_message}"
-                    )
-
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -330,42 +224,6 @@ class SchedulerBatchResultProcessor:
                     # drain its accounting without streaming it.
                     continue
 
-                # DS early-abort: capture batch-wide cursor spans for this row
-                # BEFORE `_maybe_abort_on_ds_error` may mutate `req`
-                # (`set_finish_with_abort` rewrites `req.origin_input_ids = [0]`).
-                # Using the captured values to advance keeps siblings' flattened
-                # slices correctly aligned.
-                _abort_num_input_logprobs = 0
-                _abort_hidden_state_span = 0
-                if (
-                    batch.return_logprob
-                    and extend_logprob_start_len_per_req is not None
-                    and extend_input_len_per_req is not None
-                ):
-                    _abort_num_input_logprobs = (
-                        self.logprob_result_processor.calculate_num_input_logprobs(
-                            req,
-                            extend_input_len_per_req[i],
-                            extend_logprob_start_len_per_req[i],
-                        )
-                    )
-                if (
-                    getattr(req, "return_hidden_states", False)
-                    and logits_output is not None
-                    and logits_output.hidden_states is not None
-                ):
-                    _abort_hidden_state_span = len(req.origin_input_ids)
-
-                if self._maybe_abort_on_ds_error(i, req, logits_output):
-                    release_kv_cache(req, self.tree_cache)
-                    req.time_stats.set_completion_time()
-                    # Advance batch-wide cursors using the pre-abort spans
-                    # captured above. Token append, grammar, and request logprob
-                    # bookkeeping are intentionally skipped for the failed request.
-                    logprob_pt += _abort_num_input_logprobs
-                    hidden_state_offset += _abort_hidden_state_span
-                    continue
-
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
@@ -386,7 +244,6 @@ class SchedulerBatchResultProcessor:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self._maybe_collect_customized_info(i, req, logits_output)
-                    self._maybe_collect_per_request_summary(i, req, logits_output)
 
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
@@ -818,16 +675,6 @@ class SchedulerBatchResultProcessor:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-            # DS early-abort: a row-error surfaced in per_request_summary aborts
-            # this request (set_finish_with_abort + update_finish_state already
-            # ran inside the hook) before the successful token append; finalize
-            # the finished request on the current scheduler step.
-            if self._maybe_abort_on_ds_error(i, req, logits_output):
-                self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
-                )
-                continue
-
             # next_token_id is a per-req list: 1 token for non-spec, the verified
             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
             next_token_id = next_token_ids[i]
@@ -1009,7 +856,6 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_completion_time()
 
         self._maybe_collect_customized_info(i, req, logits_output)
-        self._maybe_collect_per_request_summary(i, req, logits_output)
 
     def _maybe_update_reasoning_tokens(
         self,

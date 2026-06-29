@@ -20,7 +20,7 @@ claim.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -38,47 +38,6 @@ def _next_pow2(n: int) -> int:
     while p < n:
         p <<= 1
     return p
-
-
-def quantize_latent_fp8(
-    c_kv: torch.Tensor, *, block_size: int = 128
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-128-channel-block fp8 quantization of the MLA nope latent.
-
-    Matches the pool's ``quantize_k_cache_separate`` scheme: per block
-    ``s = max|tile| / FP8_MAX; q = clamp(tile / s, ±FP8_MAX).to(fp8)``.
-
-    Args:
-        c_kv: ``[T, lora]`` fp32/bf16 latent. ``lora % block_size == 0``.
-
-    Returns:
-        ``(fp8 [T, lora] float8_e4m3fn, scales [T, lora//block_size] fp32)`` —
-        the two tensors ``get_mla_kv_buffer`` exposes after unpacking the
-        ``[512 fp8 | 4 fp32 scales]`` pool bytes.
-    """
-    T, lora = c_kv.shape
-    assert lora % block_size == 0, f"lora {lora} not a multiple of block {block_size}"
-    nblk = lora // block_size
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    src = c_kv.to(torch.float32)
-    tiles = src.view(T, nblk, block_size)
-    scales = tiles.abs().amax(dim=2) / fp8_max  # [T, nblk]
-    safe = scales.clamp_min(torch.finfo(torch.float32).tiny)
-    q = torch.clamp(tiles / safe.unsqueeze(2), -fp8_max, fp8_max).to(
-        torch.float8_e4m3fn
-    )
-    return q.view(T, lora).contiguous(), scales.contiguous()
-
-
-def dequantize_latent_fp8(
-    fp8: torch.Tensor, scales: torch.Tensor, *, block_size: int = 128
-) -> torch.Tensor:
-    """Inverse of :func:`quantize_latent_fp8` — the value-for-value latent the
-    kernel scores against; feed this to the CPU reference as the oracle's input."""
-    T, lora = fp8.shape
-    nblk = lora // block_size
-    deq = fp8.to(torch.float32).view(T, nblk, block_size) * scales.unsqueeze(2)
-    return deq.view(T, lora)
 
 
 if _HAS_TRITON:

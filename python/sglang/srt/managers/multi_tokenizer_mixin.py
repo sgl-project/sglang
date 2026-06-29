@@ -149,32 +149,6 @@ def _extract_field_by_index(
     return wrap_as_pickle(new_field) if should_wrap_result else new_field
 
 
-def _extract_per_request_summary_by_index(
-    output: Any, index: int
-) -> Optional[Dict[str, list]]:
-    """Extract `per_request_summary` for one child output.
-
-    The producer stores `per_request_summary` as `{key: [per_req_value, ...]}`
-    (the outer dict has one key per summary namespace, the inner list is
-    one entry per request in the parent batch). Splitting for a child
-    tokenizer must preserve the *list-of-one* shape so the downstream
-    tokenizer unpack (which does `v[i]` on each value) still works.
-
-    Returns `{key: [per_req_value_at_index]}` for non-None entries.
-    Returns `None` when the field is absent on the parent output.
-    """
-    field = getattr(output, "per_request_summary", None)
-    if field is None or not isinstance(field, dict):
-        return None
-    new_field: Dict[str, list] = {}
-    for k, v in field.items():
-        if v is None or len(v) <= index:
-            new_field[k] = [None]
-        else:
-            new_field[k] = [v[index]]
-    return new_field
-
-
 def _handle_output_by_index(output, i):
     """NOTE: A maintainable method is better here."""
     if isinstance(output, BatchTokenIDOutput):
@@ -267,7 +241,6 @@ def _handle_output_by_index(output, i):
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
-            per_request_summary=_extract_per_request_summary_by_index(output, i),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
         )
     elif isinstance(output, BatchEmbeddingOutput):
@@ -355,7 +328,6 @@ def _handle_output_by_index(output, i):
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
-            per_request_summary=_extract_per_request_summary_by_index(output, i),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

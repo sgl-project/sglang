@@ -35,7 +35,7 @@ Algorithm (keys are the standard order-preserving uint32 mapping of fp32 —
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -67,15 +67,15 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _radix_hist_kernel(
-        scores_ptr,      # fp32/bf16 [bs, width] (loads upcast to fp32)
-        seq_lens_ptr,    # int32 [bs]
-        prefix_ptr,      # int64 [bs] accumulated high key bits (<< shift aligned)
-        hist_ptr,        # int32 [bs, NUM_BINS] (pre-zeroed)
+        scores_ptr,  # fp32/bf16 [bs, width] (loads upcast to fp32)
+        seq_lens_ptr,  # int32 [bs]
+        prefix_ptr,  # int64 [bs] accumulated high key bits (<< shift aligned)
+        hist_ptr,  # int32 [bs, NUM_BINS] (pre-zeroed)
         width: tl.constexpr,
         scores_stride_b: tl.constexpr,
-        SHIFT: tl.constexpr,         # bits below the digit being counted
+        SHIFT: tl.constexpr,  # bits below the digit being counted
         PREFIX_SHIFT: tl.constexpr,  # SHIFT + radix bits (start of the fixed prefix)
-        PREFIX_BITS: tl.constexpr,   # number of key bits already fixed (0 on the first radix pass)
+        PREFIX_BITS: tl.constexpr,  # number of key bits already fixed (0 on the first radix pass)
         NBINS: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
@@ -90,7 +90,9 @@ if _TRITON_AVAILABLE:
         in_win = offs < n
         s = tl.load(
             scores_ptr + row * scores_stride_b + offs, mask=in_win, other=float("-inf")
-        ).to(tl.float32)  # exact upcast: bf16 input compares as its fp32 value
+        ).to(
+            tl.float32
+        )  # exact upcast: bf16 input compares as its fp32 value
         finite = in_win & (s == s) & (s != float("-inf"))
         key = _key_of(s)
         if PREFIX_BITS > 0:
@@ -107,9 +109,9 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _radix_scan_kernel(
-        hist_ptr,       # int32 [bs, NUM_BINS]
-        prefix_ptr,     # int64 [bs] in/out
-        quota_ptr,      # int32 [bs] in/out (k_target in, tie quota state out)
+        hist_ptr,  # int32 [bs, NUM_BINS]
+        prefix_ptr,  # int64 [bs] in/out
+        quota_ptr,  # int32 [bs] in/out (k_target in, tie quota state out)
         lengths_out_ptr,  # int32 [bs] valid_lengths (written in the first round)
         max_top_k: tl.constexpr,
         SHIFT: tl.constexpr,
@@ -126,7 +128,7 @@ if _TRITON_AVAILABLE:
         else:
             k64 = tl.load(quota_ptr + row).to(tl.int64)
         # above_excl[b] = count of keys with digit > b among candidates.
-        incl = tl.cumsum(h, axis=0)            # inclusive ascending
+        incl = tl.cumsum(h, axis=0)  # inclusive ascending
         above_excl = total - incl
         # The threshold digit b*: above_excl[b] < k <= above_excl[b] + h[b].
         is_thr = (above_excl < k64) & ((above_excl + h) >= k64) & (h > 0)
@@ -141,9 +143,9 @@ if _TRITON_AVAILABLE:
     def _block_count_kernel(
         scores_ptr,
         seq_lens_ptr,
-        thr_ptr,         # int64 [bs] full threshold key T
-        above_ptr,       # int32 [bs, nblocks]
-        tie_ptr,         # int32 [bs, nblocks]
+        thr_ptr,  # int64 [bs] full threshold key T
+        above_ptr,  # int32 [bs, nblocks]
+        tie_ptr,  # int32 [bs, nblocks]
         width: tl.constexpr,
         scores_stride_b: tl.constexpr,
         nblocks: tl.constexpr,
@@ -162,7 +164,9 @@ if _TRITON_AVAILABLE:
         in_win = offs < n
         s = tl.load(
             scores_ptr + row * scores_stride_b + offs, mask=in_win, other=float("-inf")
-        ).to(tl.float32)  # exact upcast: bf16 input compares as its fp32 value
+        ).to(
+            tl.float32
+        )  # exact upcast: bf16 input compares as its fp32 value
         finite = in_win & (s == s) & (s != float("-inf"))
         key = _key_of(s)
         t = tl.load(thr_ptr + row)
@@ -173,9 +177,9 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _block_prefix_kernel(
-        above_ptr,        # int32 [bs, nblocks] in: counts, out untouched
+        above_ptr,  # int32 [bs, nblocks] in: counts, out untouched
         tie_ptr,
-        above_pref_ptr,   # int32 [bs, nblocks] out: exclusive prefixes
+        above_pref_ptr,  # int32 [bs, nblocks] out: exclusive prefixes
         tie_pref_ptr,
         nblocks: tl.constexpr,
         NBLOCK_POW2: tl.constexpr,
@@ -194,11 +198,11 @@ if _TRITON_AVAILABLE:
     def _emit_kernel(
         scores_ptr,
         seq_lens_ptr,
-        thr_ptr,          # int64 [bs]
-        quota_ptr,        # int32 [bs] tie quota r
-        above_pref_ptr,   # int32 [bs, nblocks] exclusive prefix of strictly-above
-        tie_pref_ptr,     # int32 [bs, nblocks] exclusive prefix of ties
-        out_ptr,          # int32 [bs, out_width] (pre-filled with -1)
+        thr_ptr,  # int64 [bs]
+        quota_ptr,  # int32 [bs] tie quota r
+        above_pref_ptr,  # int32 [bs, nblocks] exclusive prefix of strictly-above
+        tie_pref_ptr,  # int32 [bs, nblocks] exclusive prefix of ties
+        out_ptr,  # int32 [bs, out_width] (pre-filled with -1)
         width: tl.constexpr,
         scores_stride_b: tl.constexpr,
         out_stride_b: tl.constexpr,
@@ -216,7 +220,9 @@ if _TRITON_AVAILABLE:
         in_win = offs < n
         s = tl.load(
             scores_ptr + row * scores_stride_b + offs, mask=in_win, other=float("-inf")
-        ).to(tl.float32)  # exact upcast: bf16 input compares as its fp32 value
+        ).to(
+            tl.float32
+        )  # exact upcast: bf16 input compares as its fp32 value
         finite = in_win & (s == s) & (s != float("-inf"))
         key = _key_of(s)
         t = tl.load(thr_ptr + row)
@@ -243,19 +249,19 @@ if _TRITON_AVAILABLE:
 
 
 def select_topk_sequence_order_triton(
-    token_scores: torch.Tensor,   # fp32 or bf16 [bs, width] (kernels upcast in-register)
-    seq_lens: torch.Tensor,       # int32 [bs]
+    token_scores: torch.Tensor,  # fp32 or bf16 [bs, width] (kernels upcast in-register)
+    seq_lens: torch.Tensor,  # int32 [bs]
     max_top_k: int,
     *,
-    out_indices: torch.Tensor,    # int32 [bs_buf >= bs, >= max_top_k]
-    out_lengths: torch.Tensor,    # int32 [bs_buf >= bs]
-    scratch_hist: torch.Tensor,        # int32 [bs_buf, NUM_BINS]
+    out_indices: torch.Tensor,  # int32 [bs_buf >= bs, >= max_top_k]
+    out_lengths: torch.Tensor,  # int32 [bs_buf >= bs]
+    scratch_hist: torch.Tensor,  # int32 [bs_buf, NUM_BINS]
     scratch_key_prefix: torch.Tensor,  # int64 [bs_buf]
-    scratch_quota: torch.Tensor,       # int32 [bs_buf]
+    scratch_quota: torch.Tensor,  # int32 [bs_buf]
     scratch_block_above: torch.Tensor,  # int32 [bs_buf, nblocks]
-    scratch_block_tie: torch.Tensor,    # int32 [bs_buf, nblocks]
-    scratch_above_pref: torch.Tensor,   # int32 [bs_buf, nblocks]
-    scratch_tie_pref: torch.Tensor,     # int32 [bs_buf, nblocks]
+    scratch_block_tie: torch.Tensor,  # int32 [bs_buf, nblocks]
+    scratch_above_pref: torch.Tensor,  # int32 [bs_buf, nblocks]
+    scratch_tie_pref: torch.Tensor,  # int32 [bs_buf, nblocks]
     block: int = 1024,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run the sequence-aware deterministic top-K over caller-owned buffers.
@@ -281,7 +287,10 @@ def select_topk_sequence_order_triton(
         shift = 32 - RADIX_BITS * (rnd + 1)
         hist.zero_()
         _radix_hist_kernel[grid_wide](
-            token_scores, seq_lens, key_prefix, hist,
+            token_scores,
+            seq_lens,
+            key_prefix,
+            hist,
             width=width,
             scores_stride_b=token_scores.stride(0),
             SHIFT=shift,
@@ -291,7 +300,10 @@ def select_topk_sequence_order_triton(
             BLOCK=block,
         )
         _radix_scan_kernel[(bs,)](
-            hist, key_prefix, quota, out_lengths,
+            hist,
+            key_prefix,
+            quota,
+            out_lengths,
             max_top_k=max_top_k,
             SHIFT=shift,
             FIRST_ROUND=(rnd == 0),
@@ -299,8 +311,11 @@ def select_topk_sequence_order_triton(
         )
 
     _block_count_kernel[grid_wide](
-        token_scores, seq_lens, key_prefix,
-        scratch_block_above, scratch_block_tie,
+        token_scores,
+        seq_lens,
+        key_prefix,
+        scratch_block_above,
+        scratch_block_tie,
         width=width,
         scores_stride_b=token_scores.stride(0),
         nblocks=scratch_block_above.shape[1],
@@ -310,14 +325,20 @@ def select_topk_sequence_order_triton(
     while nb_pow2 < nblocks:
         nb_pow2 *= 2
     _block_prefix_kernel[(bs,)](
-        scratch_block_above, scratch_block_tie,
-        scratch_above_pref, scratch_tie_pref,
+        scratch_block_above,
+        scratch_block_tie,
+        scratch_above_pref,
+        scratch_tie_pref,
         nblocks=scratch_block_above.shape[1],
         NBLOCK_POW2=nb_pow2,
     )
     _emit_kernel[grid_wide](
-        token_scores, seq_lens, key_prefix, quota,
-        scratch_above_pref, scratch_tie_pref,
+        token_scores,
+        seq_lens,
+        key_prefix,
+        quota,
+        scratch_above_pref,
+        scratch_tie_pref,
         out_indices,
         width=width,
         scores_stride_b=token_scores.stride(0),
@@ -326,25 +347,3 @@ def select_topk_sequence_order_triton(
         BLOCK=block,
     )
     return out_indices, out_lengths
-
-
-def allocate_topk_scratch(
-    *,
-    max_bs: int,
-    width: int,
-    block: int = 1024,
-    device: Optional[torch.device] = None,
-) -> dict:
-    """Scratch bundle for :func:`select_topk_sequence_order_triton`."""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    nblocks = (width + block - 1) // block
-    return {
-        "scratch_hist": torch.zeros(max_bs, NUM_BINS, dtype=torch.int32, device=device),
-        "scratch_key_prefix": torch.zeros(max_bs, dtype=torch.int64, device=device),
-        "scratch_quota": torch.zeros(max_bs, dtype=torch.int32, device=device),
-        "scratch_block_above": torch.zeros(max_bs, nblocks, dtype=torch.int32, device=device),
-        "scratch_block_tie": torch.zeros(max_bs, nblocks, dtype=torch.int32, device=device),
-        "scratch_above_pref": torch.zeros(max_bs, nblocks, dtype=torch.int32, device=device),
-        "scratch_tie_pref": torch.zeros(max_bs, nblocks, dtype=torch.int32, device=device),
-    }

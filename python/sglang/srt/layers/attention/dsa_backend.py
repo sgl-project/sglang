@@ -507,6 +507,7 @@ class DeepseekSparseAttnBackend(
             if self._ds_key_norm_enabled:
                 from sglang.srt.layers.attention.double_sparsity.absorbed_latent import (
                     assert_resident_fp8_layout,
+                    validate_cosine_projections,
                 )
 
                 wsel_map = (
@@ -523,7 +524,7 @@ class DeepseekSparseAttnBackend(
                 # published at bind with the exact expected shape. Validate FULL
                 # coverage here (at init), never accept a partial map and fail later
                 # inside the KV-write populate.
-                self._ds_w_flat_by_layer = self._prepare_cosine_projections(
+                self._ds_w_flat_by_layer = validate_cosine_projections(
                     wsel_map,
                     n_layers=int(self._ds_channel_selection.shape[0]),
                     exp_shape=(_kn_H, self._knorm_label_dim, self._knorm_lora),
@@ -564,7 +565,10 @@ class DeepseekSparseAttnBackend(
                 _max_app = max(
                     256,
                     int(getattr(model_runner.server_args, "cuda_graph_max_bs", 0) or 0),
-                    int(getattr(model_runner.server_args, "chunked_prefill_size", 0) or 0),
+                    int(
+                        getattr(model_runner.server_args, "chunked_prefill_size", 0)
+                        or 0
+                    ),
                 )
                 self._knorm_max_app = _max_app
                 _lora = self._knorm_lora
@@ -1910,44 +1914,6 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
-    @staticmethod
-    def _prepare_cosine_projections(wsel_map, *, n_layers, exp_shape, device):
-        """Validate the bind-published absorbed_w_sel map (fail closed at init):
-        every DS layer ``0..n_layers-1`` must be present with shape ``exp_shape``
-        ([H, label_dim, lora]); reject missing/out-of-range layer ids and shape
-        mismatches. Returns ``{layer_id: w_flat [H*label_dim, lora] fp32}`` on
-        ``device`` (the per-layer matmul rhs for the populate).
-        """
-        wsel_map = wsel_map or {}
-        expected = range(n_layers)
-        missing = [lid for lid in expected if lid not in wsel_map]
-        if missing:
-            raise RuntimeError(
-                f"Double Sparsity scorer_norm='cosine' requires absorbed_w_sel for "
-                f"every DS layer (0..{n_layers - 1}); bind published {sorted(wsel_map)} "
-                f"— layers {missing[:8]} missing."
-            )
-        extra = [lid for lid in wsel_map if lid not in expected]
-        if extra:
-            raise RuntimeError(
-                f"Double Sparsity cosine: unexpected absorbed_w_sel layer ids {extra} "
-                f"(expected 0..{n_layers - 1})."
-            )
-        H, label_dim, lora = exp_shape
-        for lid in expected:
-            if tuple(wsel_map[lid].shape) != tuple(exp_shape):
-                raise RuntimeError(
-                    f"Double Sparsity cosine: absorbed_w_sel[{lid}] shape "
-                    f"{tuple(wsel_map[lid].shape)} != expected {tuple(exp_shape)}."
-                )
-        return {
-            lid: wsel_map[lid]
-            .to(device=device, dtype=torch.float32)
-            .reshape(H * label_dim, lora)
-            .contiguous()
-            for lid in expected
-        }
-
     def _populate_key_norm_cache(self, layer_id: int, cache_loc: torch.Tensor) -> None:
         """Store the cosine key norm for the just-written slots, read from the
         RESIDENT fp8-dequantized latent (the bytes the score kernel reads — NOT the
@@ -1957,9 +1923,7 @@ class DeepseekSparseAttnBackend(
         """
         cache = self._ds_key_norm_cache
         w_flat = (
-            self._ds_w_flat_by_layer.get(layer_id)
-            if self._ds_w_flat_by_layer
-            else None
+            self._ds_w_flat_by_layer.get(layer_id) if self._ds_w_flat_by_layer else None
         )
         if cache is None or w_flat is None:
             # Fail closed: cosine is enabled but bind did not publish this layer's
@@ -1970,7 +1934,9 @@ class DeepseekSparseAttnBackend(
                 f"{layer_id} (cosine enabled but the bind publish is missing)."
             )
         pool = self.token_to_kv_pool
-        buf = pool.kv_buffer[layer_id - getattr(pool, "start_layer", 0)]  # [slots, 1, D]
+        buf = pool.kv_buffer[
+            layer_id - getattr(pool, "start_layer", 0)
+        ]  # [slots, 1, D]
         lora = self._knorm_lora
         nblk = self._knorm_nblk
         H = self.num_q_heads
@@ -2298,60 +2264,6 @@ class DeepseekSparseAttnBackend(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
             )
 
-    def maybe_publish_ds_request_summary(self, forward_batch: ForwardBatch) -> None:
-        """Publish per-request DS selected-vs-total token counts onto
-        ``forward_batch.ds_per_request_summary["double_sparsity"]`` so the
-        scheduler/tokenizer surface ``meta_info["double_sparsity"]`` (the
-        per-request selected-vs-total token counts that prove sparse selection).
-
-        The DeepseekV2 model-side publisher only fires on its own attention; GLM
-        (``Glm4MoeAttention``) and any other model on this ``dsa`` backend never
-        reach it, so the per-request DS summary was absent for them. It cannot be
-        published from ``forward_decode`` either: decode runs under CUDA-graph
-        replay, where that Python never executes, and a per-step device→host read
-        of the selected page table would serialize the graph.
-
-        Instead derive it host-side, no GPU sync: the table-free selector's
-        contract is to keep ``min(top_k, valid_tokens)`` token positions, and for
-        decode ``valid_tokens`` is the sequence length, so
-        ``selected = min(ds_max_top_k, seq_len)`` exactly. ``total = seq_len``,
-        ``dense_fallback = 0`` (a sanitized row is aborted via the error-containment
-        seam, not surfaced as a completed-request stat). Called from the model
-        runner's post-forward transport, which runs every step for eager AND graph
-        decode. Decode-only; native-DSA / non-DS paths never reach this (DS gate),
-        and an existing model-side summary is not overwritten.
-        """
-        if not self.enable_double_sparsity:
-            return
-        if not forward_batch.forward_mode.is_decode_or_idle():
-            return
-        if getattr(forward_batch, "ds_per_request_summary", None) is not None:
-            return
-        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-        if seq_lens_cpu is None:
-            return
-        from sglang.srt.layers.attention.double_sparsity.metrics import (
-            DoubleSparsityRequestStats,
-            meta_info_for_request,
-        )
-
-        top_k = int(self.ds_max_top_k)
-        records = []
-        for sl in seq_lens_cpu.tolist():
-            total = max(1, int(sl))
-            selected = min(top_k, total)
-            records.append(
-                meta_info_for_request(
-                    DoubleSparsityRequestStats(
-                        sparsity_rate=float(1.0 - selected / total),
-                        selected_tokens=selected,
-                        total_tokens=total,
-                        dense_fallback=0,
-                    )
-                )
-            )
-        forward_batch.ds_per_request_summary = {"double_sparsity": records}
-
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -2576,7 +2488,7 @@ class DeepseekSparseAttnBackend(
                 f"TP size may be too large for this model."
             )
 
-            # Pad q to required size.
+            # Pad q to required size
             q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
             q_padded[:, :num_heads, :] = q_all
             q_input = q_padded

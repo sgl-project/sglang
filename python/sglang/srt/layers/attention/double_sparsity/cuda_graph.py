@@ -23,15 +23,10 @@ This module exposes:
 * :func:`capture_decode_step` — convenience wrapper that captures one
   decode-step call to ``selector.retrieve_topk`` and returns a replayable
   closure.
-* :func:`assert_no_alloc_in_region` — context manager used by the
-  CUDA-graph allocation regression probe: any ``torch.empty(...)`` /
-  ``torch.zeros(...)`` call inside the region raises, proving the rule
-  is enforced rather than just declared.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
@@ -605,32 +600,3 @@ def capture_decode_step(
         return state.selected_indices, state.valid_lengths
 
     return _replay
-
-
-@contextlib.contextmanager
-def assert_no_alloc_in_region(label: str = "DS decode capture"):
-    """Context manager that fails if any tensor is allocated in the body.
-
-    Used by the CUDA-graph allocation regression probe: wrap the captured region; if any
-    ``torch.empty(...)`` / ``torch.zeros(...)`` / ``torch.tensor(...)``
-    is called, raise ``RuntimeError`` so the test detects the rule
-    violation. Implementation: snapshot the CUDA caching-allocator counter
-    via ``torch.cuda.memory_stats`` before / after; growth indicates new
-    allocations. On non-CUDA devices, this is a no-op.
-    """
-
-    if not torch.cuda.is_available():
-        yield
-        return
-    before = torch.cuda.memory_stats(device=None).get("allocation.all.allocated", 0)
-    try:
-        yield
-    finally:
-        after = torch.cuda.memory_stats(device=None).get("allocation.all.allocated", 0)
-        delta = after - before
-        if delta > 0:
-            raise RuntimeError(
-                f"{label}: new CUDA allocation detected inside the captured region "
-                f"({delta} new allocations). CUDA-graph capture requires all "
-                "scratch to be preallocated and all branching to be device-side."
-            )

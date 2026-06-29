@@ -22,9 +22,9 @@ latent directly (``scorer_norm="off"``).
 This module owns the production absorbed-latent scoring math: the bind-time
 ``build_absorbed_projection`` and the per-step query-side ``absorbed_latent_v``
 build (the raw-dot ``scorer_norm="off"`` numerator), plus the resident-latent key
-norm (``key_norms_from_latent`` / ``key_norms_from_resident_fp8``) and the cosine
-reference (``absorbed_latent_cosine_logical`` / ``_fp8``, ``scorer_norm="cosine"``)
-— and the CPU reference scorers used as the exact oracle for the Triton kernel.
+norm (``key_norms_from_latent``) and the cosine reference
+(``absorbed_latent_cosine_logical``, ``scorer_norm="cosine"``) — and the CPU
+reference scorers used as the exact oracle for the Triton kernel.
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ def absorbed_latent_v(
 
     Args:
         queries: ``[bs, H, qk_nope_head_dim]`` — no-PE query, BEFORE channel
-            projection (same input as ``project_query_onto_channels``).
+            projection/weighting.
         w_sel: ``[H, label_dim, kv_lora_rank]`` — the bind-time-selected ``W_UK``
             rows from :func:`build_absorbed_projection`.
         channel_selection: ``[H, label_dim]`` int — the query channels ``S_h``.
@@ -163,34 +163,6 @@ def absorbed_latent_v_into(
     v_hbl = out_v.transpose(0, 1)  # [H, bs, lora] (view of out_v)
     torch.bmm(q_hbd, w_sel_f, out=v_hbl)
     return out_v
-
-
-def absorbed_latent_score(
-    queries: torch.Tensor,
-    c_kv: torch.Tensor,
-    w_sel: torch.Tensor,
-    channel_selection: torch.Tensor,
-    channel_weights: torch.Tensor,
-    head_agg: str = "max",
-) -> torch.Tensor:
-    """Per-(query, token) selection score from the latent, no table.
-
-    ``score[b, t] = agg_h ( v_h[b] · c_kv[t] )`` for ``scorer_norm="off"``.
-
-    Args:
-        queries: ``[bs, H, qk_nope_head_dim]``.
-        c_kv: ``[T, kv_lora_rank]`` — the resident MLA KV latent (dequantized).
-        w_sel, channel_selection, channel_weights: see :func:`absorbed_latent_v`.
-        head_agg: ``"max"`` (default) or ``"mean"``.
-
-    Returns:
-        ``[bs, T]`` fp32 scores.
-    """
-    v = absorbed_latent_v(queries, w_sel, channel_selection, channel_weights)
-    dots = torch.einsum("bhl,tl->bht", v, c_kv.to(torch.float32))  # [bs, H, T]
-    if head_agg == "mean":
-        return dots.mean(dim=1)
-    return dots.amax(dim=1)
 
 
 def absorbed_latent_score_logical(
@@ -320,22 +292,10 @@ def key_norms_from_latent(
     """
     w = w_sel.to(torch.float32)  # [H, label_dim, lora]
     # K_label[t, h, d] = sum_l w[h, d, l] * c_kv[t, l]
-    k_label = torch.einsum("hdl,tl->thd", w, c_kv.to(torch.float32))  # [T, H, label_dim]
+    k_label = torch.einsum(
+        "hdl,tl->thd", w, c_kv.to(torch.float32)
+    )  # [T, H, label_dim]
     return k_label.norm(dim=-1)  # [T, H]
-
-
-def key_norms_from_resident_fp8(
-    w_sel: torch.Tensor,
-    latent_fp8: torch.Tensor,
-    latent_scales: torch.Tensor,
-) -> torch.Tensor:
-    """:func:`key_norms_from_latent` over the fp8-dequantized resident latent (the
-    FP8 KV path). The BF16-path analogue is :func:`key_norms_from_latent` called
-    with the bf16 ``k_nope`` (as fp32) directly.
-    """
-    return key_norms_from_latent(
-        w_sel, dequantize_resident_latent(latent_fp8, latent_scales)
-    )
 
 
 def absorbed_latent_cosine_logical(
@@ -410,41 +370,39 @@ def absorbed_latent_cosine_logical(
     return scores.masked_fill(~seq_len_mask, float("-inf"))
 
 
-def absorbed_latent_cosine_logical_fp8(
-    queries: torch.Tensor,
-    latent_fp8: torch.Tensor,
-    latent_scales: torch.Tensor,
-    w_sel: torch.Tensor,
-    channel_selection: torch.Tensor,
-    channel_weights: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_seq_len: int,
-    written: torch.Tensor = None,
-    head_agg: str = "max",
-    eps: float = 1e-6,
-    normalize: bool = True,
-) -> torch.Tensor:
-    """:func:`absorbed_latent_cosine_logical` over the fp8-dequantized resident
-    latent (the FP8 KV path): dequantizes ``latent_fp8`` / ``latent_scales`` to
-    ``c_kv`` via :func:`dequantize_resident_latent`, then scores. The BF16-path
-    analogue is :func:`absorbed_latent_cosine_logical` called with the bf16
-    ``k_nope`` (as fp32) directly.
+def validate_cosine_projections(wsel_map, *, n_layers, exp_shape, device):
+    """Validate the bind-published absorbed_w_sel map (fail closed at init):
+    every DS layer ``0..n_layers-1`` must be present with shape ``exp_shape``
+    ([H, label_dim, lora]); reject missing/out-of-range layer ids and shape
+    mismatches. Returns ``{layer_id: w_flat [H*label_dim, lora] fp32}`` on
+    ``device`` (the per-layer matmul rhs for the cosine key-norm populate).
     """
-    c_kv = dequantize_resident_latent(latent_fp8, latent_scales)
-    return absorbed_latent_cosine_logical(
-        queries,
-        c_kv,
-        w_sel,
-        channel_selection,
-        channel_weights,
-        req_pool_indices,
-        req_to_token,
-        seq_lens,
-        max_seq_len,
-        written=written,
-        head_agg=head_agg,
-        eps=eps,
-        normalize=normalize,
-    )
+    wsel_map = wsel_map or {}
+    expected = range(n_layers)
+    missing = [lid for lid in expected if lid not in wsel_map]
+    if missing:
+        raise RuntimeError(
+            f"Double Sparsity scorer_norm='cosine' requires absorbed_w_sel for "
+            f"every DS layer (0..{n_layers - 1}); bind published {sorted(wsel_map)} "
+            f"— layers {missing[:8]} missing."
+        )
+    extra = [lid for lid in wsel_map if lid not in expected]
+    if extra:
+        raise RuntimeError(
+            f"Double Sparsity cosine: unexpected absorbed_w_sel layer ids {extra} "
+            f"(expected 0..{n_layers - 1})."
+        )
+    H, label_dim, lora = exp_shape
+    for lid in expected:
+        if tuple(wsel_map[lid].shape) != tuple(exp_shape):
+            raise RuntimeError(
+                f"Double Sparsity cosine: absorbed_w_sel[{lid}] shape "
+                f"{tuple(wsel_map[lid].shape)} != expected {tuple(exp_shape)}."
+            )
+    return {
+        lid: wsel_map[lid]
+        .to(device=device, dtype=torch.float32)
+        .reshape(H * label_dim, lora)
+        .contiguous()
+        for lid in expected
+    }

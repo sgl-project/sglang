@@ -171,9 +171,7 @@ class CustomAllReduceV2:
     ) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
         algo = (
-            override_algo
-            if override_algo is not None
-            else self._determine_algo(input)
+            override_algo if override_algo is not None else self._determine_algo(input)
         )
         return torch.from_dlpack(self.obj.all_reduce(input, algo))
 

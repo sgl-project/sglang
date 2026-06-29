@@ -64,7 +64,9 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_DTYPES = ("fp8_e4m3", "bfloat16")
 
 
-def _niah_synthetic_prompts(num_samples: int, ctx_len: int, *, seed: int = 0) -> List[str]:
+def _niah_synthetic_prompts(
+    num_samples: int, ctx_len: int, *, seed: int = 0
+) -> List[str]:
     """Generate NIAH-shaped synthetic prompts.
 
     Each prompt is a deterministic "haystack" of repeated filler tokens with
@@ -135,7 +137,9 @@ def _extract_mla_nope_prefix(
     ``[-1, H, nope_dim + suffix_dim]``, then slice ``[..., :nope_dim]``.
     """
     flat = tensor.reshape(-1, tensor.shape[-1])
-    return flat.reshape(-1, num_heads, nope_dim + suffix_dim)[..., :nope_dim].contiguous()
+    return flat.reshape(-1, num_heads, nope_dim + suffix_dim)[
+        ..., :nope_dim
+    ].contiguous()
 
 
 def _build_pile_val_token_blocks(
@@ -194,8 +198,8 @@ def _summarize_param_placement(model) -> Dict[str, Any]:
     """Collect a dtype + device histogram across the model's parameters."""
     from collections import Counter
 
-    dtype_counts: "Counter[str]" = Counter()
-    device_counts: "Counter[str]" = Counter()
+    dtype_counts: Counter[str] = Counter()
+    device_counts: Counter[str] = Counter()
     total = 0
     for _name, p in model.named_parameters():
         dtype_counts[str(p.dtype)] += 1
@@ -542,7 +546,9 @@ def _collect_channel_importance(
     handles = []
     # Expected flat output widths for MLA projections.
     full_mla_k_width = num_heads * (k_head_dim + v_head_dim) if v_head_dim > 0 else None
-    full_mla_q_width = num_heads * (k_head_dim + qk_rope_head_dim) if qk_rope_head_dim > 0 else None
+    full_mla_q_width = (
+        num_heads * (k_head_dim + qk_rope_head_dim) if qk_rope_head_dim > 0 else None
+    )
     # Standard-attention path: no per-head suffix, full output = noPE width.
     std_k_width = num_heads * k_head_dim
 
@@ -604,7 +610,9 @@ def _collect_channel_importance(
                 if is_mla:
                     if full_w is not None and t.shape[-1] == full_w:
                         # Reshape per-head first, then slice K_nope prefix.
-                        k_nope = _extract_mla_nope_prefix(t, num_heads, k_head_dim, v_head_dim)
+                        k_nope = _extract_mla_nope_prefix(
+                            t, num_heads, k_head_dim, v_head_dim
+                        )
                     elif t.shape[-1] == std_w:
                         # kv_b_proj already outputs noPE-only (e.g. model variant).
                         k_nope = t.reshape(-1, num_heads, k_head_dim)
@@ -612,7 +620,10 @@ def _collect_channel_importance(
                         logger.warning(
                             "kv_b_proj output last-dim=%d does not match expected "
                             "[K|V] total=%s or K-only=%d; skipping layer %d K hook.",
-                            t.shape[-1], full_w, std_w, idx,
+                            t.shape[-1],
+                            full_w,
+                            std_w,
+                            idx,
                         )
                         return
                 else:
@@ -638,7 +649,9 @@ def _collect_channel_importance(
                 t = tensor.detach().to(torch.float32)
                 if is_mla and full_w is not None and t.shape[-1] == full_w:
                     # Reshape per-head first, then slice Q_nope prefix.
-                    q_nope = _extract_mla_nope_prefix(t, num_heads, k_head_dim, qk_rope_head_dim)
+                    q_nope = _extract_mla_nope_prefix(
+                        t, num_heads, k_head_dim, qk_rope_head_dim
+                    )
                 elif t.shape[-1] == std_w:
                     # Standard attention or already-noPE-only output.
                     q_nope = t.reshape(-1, num_heads, k_head_dim)
@@ -646,7 +659,10 @@ def _collect_channel_importance(
                     logger.warning(
                         "q projection output last-dim=%d does not match expected "
                         "[Q_noPE|Q_RoPE] total=%s or Q-only=%d; skipping layer %d Q hook.",
-                        t.shape[-1], full_w, std_w, idx,
+                        t.shape[-1],
+                        full_w,
+                        std_w,
+                        idx,
                     )
                     return
                 _q_buf[idx] = q_nope
@@ -663,7 +679,9 @@ def _collect_channel_importance(
         _bsz = block_size or 512
         logger.info(
             "Building Pile-val token blocks: %d blocks × %d tokens (seed=%d).",
-            len(prompts), _bsz, pile_val_seed,
+            len(prompts),
+            _bsz,
+            pile_val_seed,
         )
         token_blocks = _build_pile_val_token_blocks(
             tokenizer, len(prompts), _bsz, pile_val_seed
@@ -780,7 +798,9 @@ def calibrate(args: argparse.Namespace) -> str:
         # Production path: Pile validation, seed=42, exactly num_samples × block_size tokens.
         # Block construction happens inside _collect_channel_importance after the tokenizer
         # is loaded so token IDs are concatenated correctly across document boundaries.
-        prompts = [""] * args.num_samples  # length-hint only; content ignored when use_pile_val=True
+        prompts = [
+            ""
+        ] * args.num_samples  # length-hint only; content ignored when use_pile_val=True
         dataset_source = "mit-han-lab/pile-val-backup"
         use_pile_val = True
 
@@ -893,19 +913,28 @@ def _make_parser() -> argparse.ArgumentParser:
     p.add_argument("--label-dim", type=int, default=16)
     p.add_argument("--page-size", type=int, default=64)
     p.add_argument(
-        "--num-samples", type=int, default=256,
+        "--num-samples",
+        type=int,
+        default=256,
         help="Number of calibration prompts/blocks (Pile-val default: 256).",
     )
     p.add_argument(
-        "--block-size", type=int, default=512,
+        "--block-size",
+        type=int,
+        default=512,
         help="Token count per block when using Pile-val (default: 512).",
     )
     p.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="Random seed for Pile-val shuffle (default: 42).",
     )
     p.add_argument(
-        "--ctx-len", type=int, default=4096, help="Approx token length per prompt (NIAH synthetic only)."
+        "--ctx-len",
+        type=int,
+        default=4096,
+        help="Approx token length per prompt (NIAH synthetic only).",
     )
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument(

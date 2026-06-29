@@ -284,7 +284,6 @@ class _GenerationStreamAccumulator:
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
-    per_request_summary: dict = field(default_factory=dict)
     time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
@@ -506,28 +505,6 @@ class _GenerationStreamAccumulator:
                     self.customized_info[k] = []
                 self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
-        # Per-request summary (one dict per request; the latest
-        # value the model emitted for this request wins).
-        #
-        # Invariant: for every emitted request emit_index `j`, every
-        # key in `per_request_summary` must have a value at index `j`
-        # (possibly None). When a new key first appears at req j,
-        # backfill `None` for all prior emitted reqs so the
-        # tokenizer's `v[i]` indexing never raises.
-        _pos = len(self.rids) - 1  # index of the just-appended req
-        if req.per_request_summary is not None:
-            new_keys = set(req.per_request_summary.keys())
-            existing_keys = set(self.per_request_summary.keys())
-            for k in new_keys - existing_keys:
-                self.per_request_summary[k] = [None] * _pos
-            for k in existing_keys - new_keys:
-                self.per_request_summary[k].append(None)
-            for k in new_keys:
-                self.per_request_summary[k].append(req.per_request_summary[k])
-        else:
-            for k in self.per_request_summary:
-                self.per_request_summary[k].append(None)
-
     def to_payload(
         self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
@@ -576,7 +553,6 @@ class _GenerationStreamAccumulator:
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
             ),
-            per_request_summary=self.per_request_summary or None,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,

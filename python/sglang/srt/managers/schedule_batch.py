@@ -930,13 +930,8 @@ class Req(ReqDllmMixin):
         self.indexer_topk: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
         )
-        # Customized info (per-output-token accumulator)
+        # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
-        # Per-request summary (one dict per request; overwritten by the
-        # model output path each step so the latest snapshot wins).
-        # Used by Double Sparsity to publish sparsity_rate/selected_pages/
-        # dense_fallback into meta_info as a single dict per request.
-        self.per_request_summary: Optional[Dict[str, Any]] = None
 
         # Embedding (return values)
         self.embedding = None

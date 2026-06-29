@@ -35,10 +35,6 @@ except ImportError:
     _TRITON_AVAILABLE = False
 
 
-class DSAdapterError(Exception):
-    """Base class for Double Sparsity adapter errors."""
-
-
 if _TRITON_AVAILABLE:
 
     @triton.jit

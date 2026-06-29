@@ -3005,31 +3005,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
-        # Let a Double Sparsity attention backend publish the per-request DS
-        # summary host-side for models whose attention does not write it on the
-        # model path (e.g. GLM on the dsa backend) — runs every step for eager and
-        # graph decode; a no-op when DS is off or a model-side summary already exists.
-        _ds_publish = getattr(
-            self.attn_backend, "maybe_publish_ds_request_summary", None
-        )
-        if _ds_publish is not None:
-            _ds_publish(forward_batch)
-
-        # Copy Double Sparsity per-request summary side-channel from
-        # forward_batch onto the logits output so the scheduler's
-        # maybe_collect_per_request_summary picks it up. The DS attention
-        # path writes to forward_batch.ds_per_request_summary during
-        # _select_topk_indices.
-        ds_summary = getattr(forward_batch, "ds_per_request_summary", None)
-        if ds_summary is not None:
-            logits_out = getattr(output, "logits_output", None) or output
-            existing = getattr(logits_out, "per_request_summary", None)
-            if existing is None:
-                if hasattr(logits_out, "per_request_summary"):
-                    logits_out.per_request_summary = dict(ds_summary)
-            else:
-                existing.update(ds_summary)
-
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
