@@ -523,8 +523,8 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        load_guards: Vec<WorkerLoadGuard>,
     ) -> Response {
         let status = res.status();
 
@@ -567,8 +567,8 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
+                load_guards,
             )
         } else {
             // Handle non-streaming error response
@@ -652,12 +652,10 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        let load_guards = vec![
+            WorkerLoadGuard::new(prefill.clone(), headers),
+            WorkerLoadGuard::new(decode.clone(), headers),
+        ];
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -750,7 +748,7 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode, load_guards)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -801,8 +799,8 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
+                        load_guards,
                     )
                 } else {
                     // Non-streaming response
@@ -1041,8 +1039,8 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        load_guards: Vec<WorkerLoadGuard>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1131,11 +1129,6 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
-
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
@@ -1143,7 +1136,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        AttachedBody::wrap_response(response, load_guards)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1923,14 +1916,22 @@ mod tests {
         let stream = UnboundedReceiverStream::new(rx);
 
         {
+            let guards = vec![
+                WorkerLoadGuard::new(prefill_ref.clone(), None),
+                WorkerLoadGuard::new(decode_ref.clone(), None),
+            ];
+
+            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(decode_ref.load(), 1);
+
             let response = router.create_streaming_response(
                 stream.map(Ok),
                 StatusCode::OK,
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
+                guards,
             );
 
             // Guards are now attached to response body, so load should be 1
