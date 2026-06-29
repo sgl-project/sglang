@@ -7,7 +7,8 @@ resolution code.
 The resolution rule for ``timeout_keep_alive`` is:
     CLI flag (``--timeout-keep-alive``) overrides the env var
     (``SGLANG_TIMEOUT_KEEP_ALIVE``); the env var falls back to its
-    default (65s, see environ.py for the rationale).
+    default (5s; raise to ~65s for long-pool clients — see environ.py
+    for the rationale).
 
 The tuning kwargs are passed through to uvicorn/Granian only when the
 operator set them, so SGLang doesn't pin the underlying server's
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 
 
 def resolved_keep_alive_timeout(server_args: ServerArgs) -> int:
-    """CLI flag wins; env var is the fallback (and its default is 65)."""
+    """CLI flag wins; env var is the fallback (and its default is 5)."""
     if server_args.timeout_keep_alive is not None:
         return server_args.timeout_keep_alive
     return envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()

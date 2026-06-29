@@ -548,7 +548,7 @@ class ServerArgs:
     # behind the embedded server defaults. None means "use server default".
     timeout_keep_alive: A[
         Optional[int],
-        "Override SGLANG_TIMEOUT_KEEP_ALIVE for the public HTTP listener (seconds). Default is the env var (65s).",
+        "Override SGLANG_TIMEOUT_KEEP_ALIVE for the public HTTP listener (seconds). Defaults to the env var (5s); raise to ~65s when fronting clients with long-idle pool keep-alive (Go, reqwest, Node) to avoid pool-reuse races.",
     ] = None
     http_backlog: A[
         int,
