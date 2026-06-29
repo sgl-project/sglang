@@ -71,6 +71,112 @@ class TestPrepareServerArgs(CustomTestCase):
             os.unlink(config_file)
 
 
+class TestLoRASpeculativeArgs(unittest.TestCase):
+    def test_single_lora_allows_eagle_speculative_decoding(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_lora=True,
+            lora_paths=["adapter=/tmp/adapter"],
+            max_loras_per_batch=1,
+            speculative_algorithm="EAGLE",
+        )
+
+        server_args.check_lora_server_args()
+
+        self.assertEqual(len(server_args.lora_paths), 1)
+        self.assertEqual(server_args.lora_paths[0].lora_name, "adapter")
+
+    def test_single_lora_allows_nextn_before_normalization(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_lora=True,
+            lora_paths=["adapter=/tmp/adapter"],
+            max_loras_per_batch=1,
+            speculative_algorithm="NEXTN",
+        )
+
+        server_args.check_lora_server_args()
+
+        self.assertEqual(len(server_args.lora_paths), 1)
+
+    def test_multi_lora_rejects_eagle_speculative_decoding(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_lora=True,
+            lora_paths=["a=/tmp/a", "b=/tmp/b"],
+            max_loras_per_batch=2,
+            speculative_algorithm="EAGLE",
+        )
+
+        with self.assertRaisesRegex(ValueError, "fixed single-adapter mode"):
+            server_args.check_lora_server_args()
+
+    def test_lora_still_allows_ngram_speculative_decoding(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_lora=True,
+            lora_paths=["a=/tmp/a", "b=/tmp/b"],
+            max_loras_per_batch=2,
+            speculative_algorithm="NGRAM",
+        )
+
+        server_args.check_lora_server_args()
+
+        self.assertEqual(len(server_args.lora_paths), 2)
+
+    def test_lora_rejects_multi_layer_eagle_speculative_decoding(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_lora=True,
+            lora_paths=["adapter=/tmp/adapter"],
+            max_loras_per_batch=1,
+            speculative_algorithm="EAGLE",
+            enable_multi_layer_eagle=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "fixed single-adapter mode"):
+            server_args.check_lora_server_args()
+
+    def test_lora_rejects_adaptive_speculative_decoding(self):
+        # The draft worker is built from a static ServerArgs snapshot, so adaptive
+        # runtime updates would desync target/draft -> reject up front.
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_lora=True,
+            lora_paths=["adapter=/tmp/adapter"],
+            max_loras_per_batch=1,
+            speculative_algorithm="EAGLE",
+            speculative_adaptive=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
+            server_args.check_lora_server_args()
+
+    def test_make_draft_server_args_strips_lora_without_mutating_original(self):
+        from sglang.srt.speculative.draft_utils import make_draft_server_args
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_lora=True,
+            enable_lora_overlap_loading=False,
+            lora_paths=["adapter=/tmp/adapter"],
+            max_loras_per_batch=1,
+            speculative_algorithm="EAGLE",
+        )
+        server_args.check_lora_server_args()
+
+        draft = make_draft_server_args(server_args)
+
+        # Draft worker must not carry any LoRA configuration.
+        self.assertFalse(draft.enable_lora)
+        self.assertFalse(draft.enable_lora_overlap_loading)
+        self.assertEqual(draft.lora_paths, [])
+
+        # The original (target) ServerArgs must be untouched.
+        self.assertTrue(server_args.enable_lora)
+        self.assertEqual(len(server_args.lora_paths), 1)
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")

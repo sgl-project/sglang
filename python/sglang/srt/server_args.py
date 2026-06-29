@@ -7037,12 +7037,6 @@ class ServerArgs:
                     f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
                 )
 
-            # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
-                raise ValueError(
-                    "Currently LoRA is only compatible with NGRAM speculative decoding."
-                )
-
             # Parse lora_paths
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
@@ -7100,6 +7094,8 @@ class ServerArgs:
                     "Expected a list or a dictionary."
                 )
 
+            self._check_lora_speculative_compatibility()
+
             # Normalize target modules to a set; keep {"all"} as a sentinel
             # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
@@ -7137,6 +7133,55 @@ class ServerArgs:
             assert (
                 self.lora_drain_wait_threshold >= 0.0
             ), "--lora-drain-wait-threshold must be non-negative."
+
+    def _check_lora_speculative_compatibility(self):
+        """Validate LoRA + speculative decoding combinations.
+
+        LoRA is fully compatible with NGRAM speculative decoding. For NEXTN/EAGLE
+        (e.g. a model's built-in MTP head) LoRA is supported only in a fixed
+        single-adapter configuration: the adapter applies to the target model
+        while the draft worker runs unadapted (see make_draft_server_args).
+        """
+        if self.speculative_algorithm in ["NGRAM", None]:
+            return
+
+        if self.speculative_algorithm not in ["EAGLE", "NEXTN"]:
+            raise ValueError(
+                "Currently LoRA is only compatible with NGRAM speculative decoding, "
+                "or fixed single-adapter LoRA with NEXTN/EAGLE speculative decoding."
+            )
+
+        # Adaptive speculative decoding mutates speculative_num_steps (and related
+        # fields) at runtime. The draft worker is built from a static snapshot of
+        # ServerArgs (see make_draft_server_args), so adaptive updates would not be
+        # reflected in the draft -- desynchronizing target and draft. This combo is
+        # unvalidated, so reject it explicitly rather than silently diverge.
+        if self.speculative_adaptive:
+            raise ValueError(
+                "LoRA with NEXTN/EAGLE speculative decoding does not support "
+                "--speculative-adaptive (the draft worker uses a static ServerArgs "
+                "snapshot, which adaptive runtime updates would desynchronize)."
+            )
+
+        if (
+            len(self.lora_paths) == 1
+            and self.max_loras_per_batch == 1
+            and not self.enable_lora_overlap_loading
+            and not self.enable_multi_layer_eagle
+        ):
+            logger.warning(
+                "LoRA with NEXTN/EAGLE speculative decoding is enabled in "
+                "fixed single-adapter mode. This path is experimental and does "
+                "not support multi-LoRA batching."
+            )
+            return
+
+        raise ValueError(
+            "LoRA with NEXTN/EAGLE speculative decoding currently requires "
+            "fixed single-adapter mode: provide exactly one --lora-paths entry, "
+            "set --max-loras-per-batch=1, disable --enable-lora-overlap-loading, "
+            "and do not enable multi-layer EAGLE."
+        )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:

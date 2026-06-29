@@ -52,7 +52,10 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_utils import (
+    DraftBackendFactory,
+    make_draft_server_args,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -167,6 +170,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
+        # LoRA applies to the target model; the draft worker runs unadapted.
+        draft_server_args = make_draft_server_args(server_args)
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
@@ -175,7 +180,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.draft_worker = TpModelWorker(
-                server_args=server_args,
+                server_args=draft_server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 pp_rank=0,  # spec workers don't support pipeline parallelism

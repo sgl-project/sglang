@@ -1,9 +1,29 @@
 import logging
+from copy import copy
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.common import is_blackwell, is_hip, is_musa, is_npu
 
 logger = logging.getLogger(__name__)
+
+
+def make_draft_server_args(server_args: ServerArgs) -> ServerArgs:
+    """Build the ServerArgs used to initialize a speculative draft worker.
+
+    LoRA adapters apply to the target model only. Draft/MTP weights are loaded
+    from their own checkpoint and must not initialize a second (target) LoRA
+    manager, so LoRA is stripped from the draft worker's server args.
+
+    Note: this is a static snapshot (shallow copy). It is correct for static
+    speculative configs; LoRA + adaptive speculative decoding is rejected up
+    front in ServerArgs._check_lora_speculative_compatibility() precisely
+    because adaptive runtime updates to the target args would not propagate here.
+    """
+    draft_server_args = copy(server_args)
+    draft_server_args.enable_lora = False
+    draft_server_args.enable_lora_overlap_loading = False
+    draft_server_args.lora_paths = []
+    return draft_server_args
 
 
 class DraftBackendFactory:
