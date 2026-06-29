@@ -100,10 +100,13 @@ class VBenchDataset(BaseDataset):
         if isinstance(enum_name, str):
             return enum_to_task_name.get(enum_name, task_name)
 
-        # Handle enum string repr, e.g., "ModelTaskType.T2I"
-        if isinstance(task_name, str) and "." in task_name:
-            suffix = task_name.split(".")[-1]
-            return enum_to_task_name.get(suffix, task_name)
+        # Handle direct string inputs or enum string repr
+        if isinstance(task_name, str):
+            if task_name in enum_to_task_name:
+                return enum_to_task_name[task_name]
+            if "." in task_name:
+                suffix = task_name.split(".")[-1]
+                return enum_to_task_name.get(suffix, task_name)
 
         return task_name
 
@@ -307,6 +310,7 @@ class VBenchDataset(BaseDataset):
             height=self.args.height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
+            num_inference_steps=self.args.num_inference_steps,
             image_paths=[item["image_path"]] if "image_path" in item else None,
         )
 
