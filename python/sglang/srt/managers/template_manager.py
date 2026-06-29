@@ -152,6 +152,9 @@ class TemplateManager:
             if self._chat_template_name is None:
                 # Try HuggingFace template first
                 hf_template = self._resolve_hf_chat_template(tokenizer_manager)
+                hf_template = self._maybe_apply_glm51_tool_result_fix(
+                    hf_template, model_path
+                )
                 if hf_template:
                     # override the chat template
                     if tokenizer_manager.tokenizer:
@@ -276,6 +279,40 @@ class TemplateManager:
         logger.info(
             f"Detected user specified Jinja chat template with content format: {self._jinja_template_content_format}"
         )
+
+    def _should_apply_glm51_tool_result_fix(self, model_path: str) -> bool:
+        override = os.getenv("SGLANG_GLM51_TOOL_RESULT_TEMPLATE_FIX", "").lower()
+        if override in {"0", "false", "no", "off"}:
+            return False
+        if override in {"1", "true", "yes", "on"}:
+            return True
+        normalized = model_path.lower()
+        return "glm-5.1" in normalized or "glm5.1" in normalized
+
+    def _maybe_apply_glm51_tool_result_fix(
+        self, chat_template: Optional[str], model_path: str
+    ) -> Optional[str]:
+        if chat_template is None or not self._should_apply_glm51_tool_result_fix(
+            model_path
+        ):
+            return chat_template
+
+        template_path = os.path.join(
+            os.path.dirname(__file__),
+            "templates",
+            "glm5_1_tool_result_as_user.jinja",
+        )
+        if not os.path.exists(template_path):
+            logger.warning(
+                "GLM5.1 tool-result template override file is missing: %s",
+                template_path,
+            )
+            return chat_template
+
+        with open(template_path, "r", encoding="utf-8") as f:
+            fixed_template = f.read().strip("\n")
+        logger.info("Applying GLM5.1 tool-result template override")
+        return fixed_template
 
     def _load_json_chat_template(self, template_path: str) -> None:
         """Load a JSON chat template file."""
