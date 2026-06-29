@@ -430,8 +430,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
+    # Gate for reusing the first MTP draft step's indexer topk across steps;
+    # the carried topk lives on spec_info (see EagleDraftInput.mtp_topk_indices).
     reuse_mtp_topk_indices: Optional[bool] = False
 
     # MiniMax-M3 sparse-attention layers whose K/V cache was written by a fused
