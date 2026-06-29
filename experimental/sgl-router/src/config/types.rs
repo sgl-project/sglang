@@ -174,6 +174,17 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
+    /// Cache-hit load guard (absolute). After a cache hit selects the
+    /// lowest-load worker *within the matched set*, divert to the globally
+    /// least-loaded worker when the hit worker is backed up by more than
+    /// this many in-flight requests AND the relative guard also fires.
+    /// Default 0. Only armed when `hit_load_rel_threshold` is finite.
+    pub hit_load_abs_threshold: usize,
+    /// Cache-hit load guard (relative). The hit worker must also exceed
+    /// `min_load * hit_load_rel_threshold` to be diverted. Default
+    /// `f32::INFINITY` = guard OFF (behaviour identical to plain
+    /// cache-aware). A finite value arms the guard; must be `>= 1.0`.
+    pub hit_load_rel_threshold: f32,
 }
 
 impl Default for CacheAwareConfig {
@@ -182,6 +193,8 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
+            hit_load_abs_threshold: default_hit_load_abs(),
+            hit_load_rel_threshold: default_hit_load_rel(),
         }
     }
 }
@@ -194,6 +207,12 @@ fn default_balance_abs() -> usize {
 }
 fn default_balance_rel() -> f32 {
     1.1
+}
+fn default_hit_load_abs() -> usize {
+    0
+}
+fn default_hit_load_rel() -> f32 {
+    f32::INFINITY
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix
