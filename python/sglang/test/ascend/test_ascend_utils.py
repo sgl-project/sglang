@@ -338,6 +338,7 @@ BGE_RERANKER_V2_M3_WEIGHTS_PATH = os.path.join(
 INTERNLM2_7B_REWARD_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Shanghai_AI_Laboratory/internlm2-7b-reward"
 )
+QWEN3_5_27B_MODEL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.5-27B")
 QWEN2_5_1_5B_APEACH_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Howeee/Qwen2.5-1.5B-apeach"
 )
