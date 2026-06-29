@@ -838,12 +838,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(zimage_deployment.fsdp_auto_requires_cfg)
         self.assertFalse(zimage_deployment.auto_dit_layerwise_offload)
 
-        self.assertEqual(
-            ltx_deployment.auto_disable_component_offload_min_available_memory_gb, 70
-        )
-        self.assertEqual(
-            ltx_deployment.auto_disable_component_offload_components, ("dit",)
-        )
+        self.assertEqual(ltx_deployment.keep_resident_min_available_gb, 70)
+        self.assertEqual(ltx_deployment.keep_resident_components, ("dit",))
         self.assertEqual(
             ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1), (8, 1))
         )
@@ -860,25 +856,17 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
 
-        # FastHunyuan no longer pins a 150GB bar; it falls back to the global
-        # video default while keeping its VAE-only resident set.
+        # fasthunyuan no longer pins 150gb -- falls back to the global video default
         fast_hunyuan_deployment = FastHunyuanConfig().get_model_deployment_config()
-        self.assertIsNone(
-            fast_hunyuan_deployment.auto_disable_component_offload_min_available_memory_gb
-        )
-        self.assertEqual(
-            fast_hunyuan_deployment.auto_disable_component_offload_components, ("vae",)
-        )
+        self.assertIsNone(fast_hunyuan_deployment.keep_resident_min_available_gb)
+        self.assertEqual(fast_hunyuan_deployment.keep_resident_components, ("vae",))
 
-        # The default resident set covers the auxiliary components (incl. VAE)
-        # but NOT the DiT, whose placement is owned by the FSDP / layerwise policy.
+        # default set keeps aux resident but not dit (owned by FSDP/layerwise)
         self.assertEqual(
-            qwen_deployment.auto_disable_component_offload_components,
+            qwen_deployment.keep_resident_components,
             ("text_encoder", "image_encoder", "vae"),
         )
-        self.assertIsNone(
-            qwen_deployment.auto_disable_component_offload_min_available_memory_gb
-        )
+        self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
@@ -977,9 +965,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertEqual(args.performance_mode, "auto")
         self.assertFalse(args.use_fsdp_inference)
-        # 80GB clears the image keep-resident threshold (45GB): the auxiliary
-        # components (incl. VAE) stay resident, so there is no layerwise offload.
-        # DiT placement is owned by the offload/FSDP policy and is unchanged.
+        # 80gb > image threshold (45gb): aux resident, no layerwise; dit unchanged
         self.assertTrue(args.dit_cpu_offload)
         self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
@@ -987,9 +973,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_image_offloads_aux_below_resident_threshold(self):
-        # Below the image keep-resident threshold (45GB) the auxiliary
-        # components -- including the VAE -- are still layerwise-offloaded to
-        # save VRAM on small GPUs, exactly as before this policy.
+        # 40gb < image threshold (45gb): aux incl. vae still offloaded to save vram
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             memory_gb=40,
@@ -1346,9 +1330,7 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # 80GB/GPU clears the image keep-resident threshold (45GB): aux
-        # components (incl. VAE) stay resident, no layerwise offload; CFG
-        # parallel is still enabled and DiT placement is unchanged.
+        # 80gb > image threshold (45gb): aux resident, no layerwise; cfg/dit unchanged
         self.assertTrue(args.dit_cpu_offload)
         self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
@@ -1398,10 +1380,9 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
-        # Explicit use_fsdp_inference=False marks an explicit memory policy, so
-        # the post-offload residency pass is skipped. The VAE is still kept
-        # resident by the layerwise filter (it never enters the offload list);
-        # only the text encoder remains offloaded layerwise.
+        # explicit use_fsdp_inference marks an explicit memory policy -> residency
+        # pass is skipped, but the layerwise filter still keeps vae resident,
+        # leaving only the text encoder offloaded
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder"],
@@ -1420,9 +1401,8 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # 50GB still clears the image keep-resident threshold (45GB), so aux
-        # components (incl. VAE) stay resident with no layerwise offload; FSDP
-        # is still skipped because Qwen-Image does not opt into auto FSDP.
+        # 50gb still > image threshold (45gb): aux resident; fsdp skipped (qwen
+        # does not opt into auto fsdp)
         self.assertTrue(args.dit_cpu_offload)
         self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
@@ -1458,9 +1438,8 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        # min available across selected GPUs is 72GB, which clears the image
-        # keep-resident threshold (45GB): aux components (incl. VAE) stay
-        # resident with no layerwise offload.
+        # min available across selected gpus is 72gb > image threshold (45gb):
+        # aux resident, no layerwise offload
         self.assertTrue(args.dit_cpu_offload)
         self.assertIsNone(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)

@@ -14,16 +14,10 @@ class ModelDeploymentConfig:
     auto_dit_layerwise_offload: bool = False
     # if the available memory is bigger than this value, keep dit resident instead of apply layerwise-offload
     auto_dit_layerwise_offload_high_memory_disable_gb: float | None = None
-    auto_disable_component_offload_min_available_memory_gb: float | None = None
-    # AUXILIARY components kept resident on GPU (offload disabled) once available
-    # memory clears auto_disable_component_offload_min_available_memory_gb. The DiT
-    # is intentionally excluded: its placement is owned by the FSDP / dit-layerwise
-    # policies (forcing it resident here would suppress FSDP sharding). VAE is
-    # included so the fast decode path stays resident whenever memory allows -- it
-    # is tiny (<1GB) and reloading it from CPU per request dominates decode latency.
-    # The large text/image encoders are listed too, but they only stay resident on
-    # GPUs that clear the (modality-specific) threshold, since they can OOM.
-    auto_disable_component_offload_components: tuple[OffloadComponentName, ...] = (
+    keep_resident_min_available_gb: float | None = None
+    # dit is intentionally absent -- its placement is owned by the FSDP /
+    # dit-layerwise policy, listing it here would suppress FSDP sharding
+    keep_resident_components: tuple[OffloadComponentName, ...] = (
         "text_encoder",
         "image_encoder",
         "vae",

@@ -32,17 +32,9 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
     (LAYERWISE_OFFLOAD_VAE_GROUP, "vae_cpu_offload"),
 )
 
-# Available-memory (GiB) thresholds above which `auto` performance mode keeps a
-# model's auxiliary components (text/image encoders, VAE) resident on GPU instead
-# of layerwise-offloading them. Used as the default when a model's
-# ModelDeploymentConfig does not pin an explicit
-# auto_disable_component_offload_min_available_memory_gb.
-#
-# Image models carry tiny VAEs (<1GB) and modest text encoders (<=~20GB), so the
-# whole auxiliary set fits resident on any datacenter-class GPU -- keeping it
-# resident avoids paying a CPU->GPU reload on every (typically bsz=1, <=4K) decode.
-# Video models carry much larger VAEs/encoders, so they only stay resident on
-# very-high-memory GPUs and otherwise keep offloading to save VRAM.
+# task-type defaults for keep_resident_min_available_gb when a model does not pin
+# one: image aux (encoders + tiny vae) fits resident on any datacenter gpu, video
+# aux is much larger so it only stays resident on very-high-memory gpus
 IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
 
@@ -60,18 +52,11 @@ class ServerArgsAutoTuner:
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
 
-    def _resolve_auto_disable_component_offload_threshold_gb(
+    def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
     ) -> float | None:
-        """Available-memory threshold (GiB) above which auto policy keeps a model's
-        auxiliary components resident instead of layerwise-offloading them.
-
-        Priority: explicit per-model deployment config > task-type default >
-        global default. Returns None only if a model explicitly opts out.
-        """
-        explicit = (
-            deployment_config.auto_disable_component_offload_min_available_memory_gb
-        )
+        # explicit per-model > task-type default > global default
+        explicit = deployment_config.keep_resident_min_available_gb
         if explicit is not None:
             return explicit
         if self.server_args.pipeline_config.task_type.is_image_gen():
@@ -128,7 +113,7 @@ class ServerArgsAutoTuner:
 
         min_available_gb = self._get_min_available_device_memory_gb()
         deployment_config = self._deployment_config()
-        disable_threshold_gb = self._resolve_auto_disable_component_offload_threshold_gb(
+        disable_threshold_gb = self._resolve_keep_resident_min_available_gb(
             deployment_config
         )
         if (
@@ -137,7 +122,7 @@ class ServerArgsAutoTuner:
             and min_available_gb >= disable_threshold_gb
         ):
             changed = []
-            components = deployment_config.auto_disable_component_offload_components
+            components = deployment_config.keep_resident_components
             if (
                 args.layerwise_offload_components is not None
                 and not args.is_arg_explicitly_set("layerwise_offload_components")
@@ -432,9 +417,7 @@ class ServerArgsAutoTuner:
             return components
 
         deployment_config = self._deployment_config()
-        threshold_gb = self._resolve_auto_disable_component_offload_threshold_gb(
-            deployment_config
-        )
+        threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
         if threshold_gb is None:
             return components
 
@@ -442,9 +425,7 @@ class ServerArgsAutoTuner:
         if min_available_gb is None or min_available_gb < threshold_gb:
             return components
 
-        resident_components = set(
-            deployment_config.auto_disable_component_offload_components
-        )
+        resident_components = set(deployment_config.keep_resident_components)
         filtered_components = [
             component
             for component in components
