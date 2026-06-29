@@ -912,6 +912,70 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertIsNone(args.decode_attention_backend)
 
 
+class TestAMDSpecificArgs(unittest.TestCase):
+    def _make_minimax_args(
+        self,
+        *,
+        model_path: str = "MiniMaxAI/MiniMax-M2.7",
+        arch: str = "MiniMaxM2ForCausalLM",
+        tp_size: int = 4,
+    ) -> ServerArgs:
+        args = ServerArgs.__new__(ServerArgs)
+        args.model_path = model_path
+        args.tp_size = tp_size
+        args.disable_custom_all_reduce = False
+        args.triton_attention_num_kv_splits = 8
+
+        hf_config = SimpleNamespace(architectures=[arch], _name_or_path=model_path)
+        args.get_model_config = lambda: SimpleNamespace(hf_config=hf_config)
+        return args
+
+    @patch("sglang.srt.server_args.is_gfx942_supported", return_value=True)
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_minimax_m27_gfx942_disables_custom_all_reduce(
+        self, _mock_is_hip, _mock_is_gfx942_supported
+    ):
+        args = self._make_minimax_args()
+
+        args._handle_amd_specifics()
+
+        self.assertEqual(args.triton_attention_num_kv_splits, 16)
+        self.assertTrue(args.disable_custom_all_reduce)
+
+    @patch("sglang.srt.server_args.is_gfx942_supported", return_value=True)
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_minimax_m27_gfx942_keeps_tp1_custom_all_reduce_setting(
+        self, _mock_is_hip, _mock_is_gfx942_supported
+    ):
+        args = self._make_minimax_args(tp_size=1)
+
+        args._handle_amd_specifics()
+
+        self.assertFalse(args.disable_custom_all_reduce)
+
+    @patch("sglang.srt.server_args.is_gfx942_supported", return_value=False)
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_minimax_m27_non_gfx942_keeps_custom_all_reduce_setting(
+        self, _mock_is_hip, _mock_is_gfx942_supported
+    ):
+        args = self._make_minimax_args()
+
+        args._handle_amd_specifics()
+
+        self.assertFalse(args.disable_custom_all_reduce)
+
+    @patch("sglang.srt.server_args.is_gfx942_supported", return_value=True)
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_minimax_m25_gfx942_keeps_custom_all_reduce_setting(
+        self, _mock_is_hip, _mock_is_gfx942_supported
+    ):
+        args = self._make_minimax_args(model_path="MiniMaxAI/MiniMax-M2.5")
+
+        args._handle_amd_specifics()
+
+        self.assertFalse(args.disable_custom_all_reduce)
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def test_prepare_server_args_parses_external_sam_args(self):
         server_args = prepare_server_args(

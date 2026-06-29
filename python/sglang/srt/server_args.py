@@ -76,6 +76,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx942_supported,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
@@ -112,6 +113,13 @@ MIMO_V2_MODEL_ARCHS = (
 LLAMA4_MODEL_ARCHS = (
     "Llama4ForConditionalGeneration",
     "Llama4ForCausalLM",
+)
+MINIMAX_M2_MODEL_ARCHS = ("MiniMaxM2ForCausalLM",)
+MINIMAX_M27_MODEL_MARKERS = (
+    "minimax-m2.7",
+    "minimax_m2.7",
+    "minimax-m27",
+    "minimax_m27",
 )
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
@@ -4969,6 +4977,40 @@ class ServerArgs:
     def _handle_amd_specifics(self):
         if is_hip():
             self.triton_attention_num_kv_splits = 16
+            self._handle_minimax_m27_gfx942_custom_all_reduce()
+
+    def _handle_minimax_m27_gfx942_custom_all_reduce(self):
+        if (
+            self.disable_custom_all_reduce
+            or self.tp_size <= 1
+            or not is_gfx942_supported()
+        ):
+            return
+
+        hf_config = self.get_model_config().hf_config
+        model_archs = getattr(hf_config, "architectures", None) or []
+        if not model_archs or model_archs[0] not in MINIMAX_M2_MODEL_ARCHS:
+            return
+
+        model_identifiers = [
+            self.model_path,
+            getattr(hf_config, "_name_or_path", None),
+            getattr(hf_config, "name_or_path", None),
+        ]
+        if not any(
+            marker in str(identifier).lower()
+            for identifier in model_identifiers
+            if identifier is not None
+            for marker in MINIMAX_M27_MODEL_MARKERS
+        ):
+            return
+
+        self.disable_custom_all_reduce = True
+        logger.warning(
+            "Disabling custom all-reduce for MiniMax-M2.7 on AMD gfx942 "
+            "(MI300X/MI325X). This avoids the unsafe decode-time ROCm custom "
+            "all-reduce path reported in sgl-project/sglang#22714."
+        )
 
     def _handle_nccl_pre_warm(self):
         # pre_warm_nccl is only used with CUDA or HIP hardware
