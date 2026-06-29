@@ -293,7 +293,7 @@ class ModelConfig:
                         "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
                         self.is_fp4_experts,
                     )
-            if envs.SGLANG_DSV4_FP4_DEQUANT.is_set():
+            if envs.SGLANG_DSV4_FP4_DEQUANT.get():
                 envs.SGLANG_DSV4_FP4_DEQUANT.set(self.is_fp4_experts is not None)
 
             # HF config.json inherits topk_group=4 from the V3 template, but

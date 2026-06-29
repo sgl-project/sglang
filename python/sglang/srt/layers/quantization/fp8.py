@@ -350,7 +350,9 @@ class Fp8Config(QuantizationConfig):
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert not get_moe_runner_backend().is_marlin()
+                assert (
+                    get_moe_runner_backend().is_auto()
+                ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 return fp8_method
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
