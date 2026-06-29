@@ -371,22 +371,22 @@ class RefAwareCacheMixin:
     # Explicit ref management for multi-turn requests
     # ------------------------------------------------------------------
 
-    def ref_id_for_req(self, req: Req) -> Optional[str]:
+    def session_id_for_req(self, req: Req) -> Optional[str]:
         session_id = getattr(req, "session_id", None)
         if session_id is None:
             session_id = getattr(getattr(req, "session", None), "session_id", None)
         return session_id
 
     def register_ref(self, req: Req):
-        ref_id = self.ref_id_for_req(req)
-        if ref_id is None:
+        session_id = self.session_id_for_req(req)
+        if session_id is None:
             return
         is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
 
-        if ref_id not in self.session_id_to_ref_info:
-            self.session_id_to_ref_info[ref_id] = RefInfo(is_high=is_high)
+        if session_id not in self.session_id_to_ref_info:
+            self.session_id_to_ref_info[session_id] = RefInfo(is_high=is_high)
 
-        ref_info = self.session_id_to_ref_info[ref_id]
+        ref_info = self.session_id_to_ref_info[session_id]
 
         last_node = getattr(req, "last_node", None)
         if last_node not in (None, self.root_node):
@@ -410,7 +410,7 @@ class RefAwareCacheMixin:
         for node in new_nodes:
             self._inc_priority_ref_single(node, is_high)
             ref_info.nodes.add(node)
-            node.tracked_session_ids.add(ref_id)
+            node.tracked_session_ids.add(session_id)
 
         ref_info.cached_tokens = sum(len(n.key) for n in ref_info.nodes)
 
