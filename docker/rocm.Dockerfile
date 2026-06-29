@@ -15,9 +15,10 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + NIXL docker image, for prefill/decode disaggregation):
-# Builds UCX (--with-rocm) and upstream ai-dynamo/nixl from source; enable with ENABLE_NIXL=1.
+# Builds UCX (--with-rocm) and upstream ai-dynamo/nixl from source by default.
+# Set ENABLE_NIXL=0 to skip NIXL.
 # At runtime use --disaggregation-transfer-backend nixl (env is wired via /etc/bash.bashrc).
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_NIXL=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
@@ -112,9 +113,9 @@ ARG MORI_REPO="https://github.com/ROCm/mori.git"
 ARG MORI_COMMIT="bf99bdf18fc69887a346913ca01c315c2aa9bd4c"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
-# Built from source for ROCm; needs UCX built --with-rocm (built here from openucx). Disabled
-# by default; enable with --build-arg ENABLE_NIXL=1.
-ARG ENABLE_NIXL=0
+# Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
+# Enabled by default; disable with --build-arg ENABLE_NIXL=0.
+ARG ENABLE_NIXL=1
 ARG UCX_REPO="https://github.com/openucx/ucx.git"
 ARG UCX_BRANCH="v1.19.x"
 ARG NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
@@ -503,8 +504,8 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[MORI] Done."'
 
 # -----------------------
-# NIXL (optional) — upstream ai-dynamo/nixl KV transfer backend for PD disaggregation on ROCm.
-# Builds UCX (--with-rocm) + nixl from source; enable with --build-arg ENABLE_NIXL=1.
+# NIXL — upstream ai-dynamo/nixl KV transfer backend for PD disaggregation on ROCm.
+# Builds UCX (--with-rocm) + nixl from source by default; skip with ENABLE_NIXL=0.
 # --no-build-isolation reuses the image's ROCm torch (nixl pins torch==2.11.* as a build dep,
 # which would otherwise pull a multi-GB CUDA torch); --no-deps keeps CUDA runtime deps out.
 # wheel_variant=rocm names the pkg nixl_rocm, so symlink `nixl` since SGLang imports plain nixl.
