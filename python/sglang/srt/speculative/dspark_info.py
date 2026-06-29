@@ -71,10 +71,9 @@ class DSparkVerifyInput(SpecInput):
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
-        elif not batch.forward_mode.is_idle():
-            target_worker.model_runner.attn_backend.init_forward_metadata(
-                verify_forward_batch
-            )
+            verify_forward_batch.mark_forward_metadata_ready()
+        # Non-cuda-graph: defer metadata init to the forward path so DP attention
+        # padding in prepare_mlp_sync_batch is reflected in the backend plan.
 
         return verify_forward_batch, can_run_cuda_graph
 

@@ -643,7 +643,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
         )
         self._debug_hang("target_verify_end", model_worker_batch, bs=bs)
         logits_output = target_out.logits_output
