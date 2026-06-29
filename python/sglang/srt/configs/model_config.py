@@ -293,6 +293,8 @@ class ModelConfig:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
             if (
