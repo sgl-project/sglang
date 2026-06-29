@@ -340,23 +340,36 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_hidden = raw if isinstance(raw, torch.Tensor) else raw.hidden_states
         if block_hidden is None:
             raise RuntimeError("DSpark draft model returned no block hidden states.")
-        block_hidden = block_hidden[: bs * int(self.block_size)]
-        return block_hidden.reshape(bs, int(self.block_size), block_hidden.shape[-1])
+        reshape_bs = bs
+        keep_tokens = bs * int(self.block_size)
+        if bs == 0 and dp_decode_global_num_tokens is not None:
+            reshape_bs = 1
+            keep_tokens = int(self.block_size)
+            if block_hidden.numel() == 0:
+                block_hidden = block_hidden.new_zeros(
+                    int(self.block_size), self._draft_inner.hidden_size
+                )
+        block_hidden = block_hidden[:keep_tokens]
+        return block_hidden.reshape(
+            reshape_bs, int(self.block_size), block_hidden.shape[-1]
+        )
 
     def _refine_block_markov(
         self,
         *,
         block_hidden: torch.Tensor,
         bonus_tokens: torch.Tensor,
+        output_bs: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bs = int(block_hidden.shape[0])
+        output_bs = bs if output_bs is None else int(output_bs)
         block_size = int(self.block_size)
         if bs == 0:
             empty_tokens = torch.empty(
-                (0, block_size), dtype=torch.int64, device=block_hidden.device
+                (output_bs, block_size), dtype=torch.int64, device=block_hidden.device
             )
             empty_confidence = torch.empty(
-                (0, block_size), dtype=torch.float32, device=block_hidden.device
+                (output_bs, block_size), dtype=torch.float32, device=block_hidden.device
             )
             return empty_tokens, empty_confidence
 
@@ -377,7 +390,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         out_tokens = torch.empty(
             (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
         )
-        out_tokens[:, 0] = bonus_tokens.view(-1).to(torch.int64)
+        if bonus_tokens.numel() == bs:
+            first_tokens = bonus_tokens.view(-1).to(torch.int64)
+        else:
+            first_tokens = torch.full(
+                (bs,), self.noise_token_id, dtype=torch.int64, device=block_hidden.device
+            )
+        out_tokens[:, 0] = first_tokens
         markov_embeds = None
         with torch.inference_mode():
             base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
@@ -395,7 +414,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             confidence = confidence_head(block_hidden, markov_embeds)
 
         candidates = out_tokens[:, :block_size].contiguous()
-        return candidates, confidence
+        return candidates[:output_bs], confidence[:output_bs]
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
         keep = torch.sigmoid(confidence) >= self.confidence_threshold
@@ -604,6 +623,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             candidates, confidence = self._refine_block_markov(
                 block_hidden=block_hidden,
                 bonus_tokens=draft_input.bonus_tokens,
+                output_bs=bs,
             )
             self._debug_hang("refine_end", model_worker_batch, bs=bs)
 
