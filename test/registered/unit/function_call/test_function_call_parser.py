@@ -2495,6 +2495,41 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertIsInstance(params["dry_run"], bool)
         self.assertEqual(params["dry_run"], True)
 
+    def test_boolean_union_type_parameter_conversion(self):
+        """
+        Test JSON-Schema union type conversion for boolean parameters.
+
+        Scenario: Tool schema uses ["boolean", "null"] and the model emits
+        JSON-style lowercase false.
+        Purpose: Verify false is parsed as bool False, not a truthy string.
+        """
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="sql_interpreter",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "dry_run": {"type": ["boolean", "null"]},
+                        },
+                    },
+                ),
+            )
+        ]
+        text = """<tool_call>
+<function=sql_interpreter>
+<parameter=query>SELECT 1</parameter>
+<parameter=dry_run>false</parameter>
+</function>
+</tool_call>"""
+        result = self.detector.detect_and_parse(text, tools)
+
+        params = json.loads(result.calls[0].parameters)
+        self.assertIsInstance(params["dry_run"], bool)
+        self.assertIs(params["dry_run"], False)
+
     def test_complex_array_parameter(self):
         """
         Test parsing of complex array parameters.
