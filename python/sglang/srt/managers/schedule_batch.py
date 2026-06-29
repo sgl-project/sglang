@@ -986,7 +986,10 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
-        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        self.skip_radix_cache_insert = (
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            or positional_embed_overrides is not None
+        )
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank

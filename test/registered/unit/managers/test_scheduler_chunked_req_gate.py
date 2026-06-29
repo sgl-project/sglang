@@ -166,5 +166,24 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertIsNone(s.chunked_req)
 
 
+class TestPositionalEmbedOverridesSkipRadixInsert(CustomTestCase):
+    def test_positional_embed_overrides_do_not_populate_radix_cache(self):
+        from sglang.srt.managers.embed_types import PositionalEmbeds
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        req = Req(
+            rid="override-req",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3]),
+            sampling_params=SamplingParams(),
+            positional_embed_overrides=PositionalEmbeds(
+                embeds=torch.ones((1, 4)),
+                positions=[0],
+            ),
+        )
+
+        self.assertTrue(req.skip_radix_cache_insert)
+
+
 if __name__ == "__main__":
     unittest.main()
