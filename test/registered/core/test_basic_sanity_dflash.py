@@ -32,7 +32,7 @@ class TestBasicSanityDFlash(
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_DFLASH
-    fwd_occupancy_threshold = 95
+    fwd_occupancy_threshold = 97.5
     fwd_occupancy_max_new_tokens = 2048
     # DFLASH accepts a full block per verify, so its acc length runs well above
     # EAGLE3's; keep a safe lower bound here.
