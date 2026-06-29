@@ -10,7 +10,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -82,13 +81,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_worker.model_runner.model_config.context_len
         )
         saved_server_args = get_global_server_args()
-        draft_init_tp_context = (
-            draft_tp_context(get_attention_tp_group())
-            if server_args.enable_dp_attention
-            else empty_context()
-        )
         with (
-            draft_init_tp_context,
+            empty_context(),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
