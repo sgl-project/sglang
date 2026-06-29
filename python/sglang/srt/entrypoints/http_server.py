@@ -705,9 +705,10 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     # server_args.model_config is not serializable but should be excluded by asdict.
+    # Secret fields (API/admin keys, SSL key password) are masked by to_dict_redacted.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **server_args.to_dict_redacted(),
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
