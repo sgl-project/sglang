@@ -42,6 +42,11 @@ _DEBUG_HANG = os.getenv("SGLANG_DSPARK_DEBUG_HANG", "0").lower() in (
     "true",
     "yes",
 )
+_DEBUG_ACCEPT = os.getenv("SGLANG_DSPARK_DEBUG_ACCEPT", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -160,6 +165,38 @@ class DSparkWorkerV2(BaseSpecWorker):
             mode,
             global_tokens,
             kwargs,
+        )
+
+    def _debug_accept(
+        self,
+        candidates: torch.Tensor,
+        target_predict: torch.Tensor,
+        confidence: torch.Tensor,
+        correct_len: torch.Tensor,
+    ):
+        if not _DEBUG_ACCEPT or candidates.numel() == 0:
+            return
+
+        torch.get_device_module(self.device).synchronize()
+        first_match = (candidates[:, 0] == target_predict[:, 0]).to(torch.float32)
+        full_match = (candidates == target_predict).to(torch.float32).mean(dim=0)
+        sample_n = min(4, candidates.shape[0])
+        logger.warning(
+            "[DSPARK_DEBUG_ACCEPT] tp_rank=%s dp_rank=%s bs=%s "
+            "first_match=%.4f per_pos_match=%s correct_len=%s "
+            "cand0=%s tgt0=%s conf0=%s",
+            self.tp_rank,
+            self.dp_rank,
+            candidates.shape[0],
+            float(first_match.mean().item()),
+            [round(float(x), 4) for x in full_match.detach().cpu().tolist()],
+            correct_len[:sample_n].detach().cpu().tolist(),
+            candidates[:sample_n].detach().cpu().tolist(),
+            target_predict[:sample_n].detach().cpu().tolist(),
+            [
+                [round(float(v), 4) for v in row]
+                for row in confidence[:sample_n].detach().float().cpu().tolist()
+            ],
         )
 
     def _get_dp_decode_global_num_tokens(
@@ -687,6 +724,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 candidates=candidates,
                 target_predict=target_predict,
             )
+            self._debug_accept(candidates, target_predict, confidence, correct_len)
             confident_prefix = self._confident_prefix(confidence)
             correct_len = torch.minimum(
                 correct_len.to(torch.int64), confident_prefix.to(torch.int64)
