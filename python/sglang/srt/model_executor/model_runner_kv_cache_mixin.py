@@ -1033,8 +1033,8 @@ class ModelRunnerKVCacheMixin:
     ) -> int:
         """Cap per-rank decode concurrency for the DeepEP low_latency path.
 
-        The all-to-all buffer is collective, so after bounding each rank by
-        FINISHED_SUM_TAG we take the EP-group MIN: the result is uniform and <=
+        The all-to-all buffer is collective, so after bounding each rank by the
+        buffer's num_max we take the EP-group MIN: the result is uniform and <=
         every rank's concurrency, so the buffer fits and no rank overruns it.
         """
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -1051,14 +1051,20 @@ class ModelRunnerKVCacheMixin:
             or self.server_args.speculative_num_draft_tokens
             or 1
         )
-        capped = min(
-            max_num_reqs, DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req
-        )
-        # Also honor the num_max the auto mem_fraction reserved for, else the decode
-        # batch could dispatch past the buffer and OOM at capture.
+        # Bound concurrency by the num_max the buffer is actually sized for, else the
+        # decode batch dispatches past it and trips the deep_ep assert. That num_max is
+        # the reserved ceiling when the auto mem_fraction set one and the env isn't
+        # overridden, else the env value (a user setting, or the static default when no
+        # reservation ran — e.g. the kill-switch is off, where it would otherwise stay
+        # at the loose FINISHED_SUM_TAG bound while the buffer is the small default).
+        env = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
         hard = getattr(self.server_args, "_deepep_reserved_num_max", None)
-        if hard is not None:
-            capped = min(capped, max(1, hard // tokens_per_req))
+        buffer_num_max = hard if (hard is not None and not env.is_set()) else env.get()
+        capped = min(
+            max_num_reqs,
+            DEEPEP_LOW_LATENCY_MAX_DISPATCH_TOKENS // tokens_per_req,
+            max(1, buffer_num_max // tokens_per_req),
+        )
         ep_group = get_moe_ep_group()
         if ep_group.world_size > 1:
             tensor = torch.tensor(capped, dtype=torch.int64)

@@ -5,12 +5,15 @@ All CPU-only and fully mocked:
     lazily (honoring a value auto-tuned after construction) and caches it.
   - ModelRunner._maybe_auto_tune_deepep_num_max_dispatch_tokens sizes the cap to
     the scheduler's decode concurrency (request-pool size, capped at 1024), only
-    for the "deepep" backend low_latency path, and never overrides a user env.
+    for the "deepep" backend low_latency path, never overrides a user env, and only
+    raises num_max when the auto mem_fraction reserved a ceiling (without one it
+    stays at the static default, since the larger buffer was never reserved).
     The spec multiplier uses max_speculative_num_draft_tokens (the adaptive-spec
     upper bound), not just the startup value.
   - _clamp_deepep_low_latency_concurrency caps per-rank decode concurrency to the
-    FINISHED_SUM_TAG bound and takes the EP-group minimum so the collective
-    dispatch buffer is uniform and no rank overruns it.
+    buffer's num_max (reserved ceiling, or the env/default when no reservation ran)
+    and takes the EP-group minimum so the collective dispatch buffer is uniform and
+    no rank overruns it.
 """
 
 from __future__ import annotations
@@ -172,15 +175,25 @@ class TestDeepEPAutoTune(unittest.TestCase):
             self.assertFalse(_ENV.is_set())
 
     def test_raises_to_decode_concurrency(self):
+        # With a non-binding reservation, num_max tracks decode concurrency.
         with _env_unset():
-            self._run(self._runner(pool_size=512))
+            self._run(self._runner(pool_size=512, reserved_num_max=1024))
             self.assertEqual(_ENV.get(), 512)
 
     def test_caps_at_finished_sum_tag(self):
         # req pool above the 1024 FINISHED_SUM_TAG ceiling clamps to 1024.
         with _env_unset():
-            self._run(self._runner(pool_size=4096))
+            self._run(self._runner(pool_size=4096, reserved_num_max=1024))
             self.assertEqual(_ENV.get(), 1024)
+
+    def test_no_reservation_keeps_default(self):
+        # No reserved ceiling (kill-switch off / user-set mem_fraction / unreadable
+        # config): the buffer for a larger num_max was never reserved, so auto-tune
+        # must NOT raise it — stay at the static default instead of OOMing at capture.
+        with _env_unset():
+            self._run(self._runner(pool_size=4096, reserved_num_max=None))
+            self.assertFalse(_ENV.is_set())
+            self.assertEqual(_ENV.get(), 128)
 
     def test_mooncake_backend_not_tuned(self):
         # B2: only the "deepep" backend allocates the nvshmem low_latency buffer and
@@ -191,7 +204,7 @@ class TestDeepEPAutoTune(unittest.TestCase):
             self.assertFalse(_ENV.is_set())
 
     def test_low_concurrency_keeps_default(self):
-        # need <= default(128): never written, env stays unset.
+        # No reservation: env stays at the static default (never written).
         with _env_unset():
             self._run(self._runner(pool_size=64))
             self.assertFalse(_ENV.is_set())
@@ -218,10 +231,14 @@ class TestDeepEPAutoTune(unittest.TestCase):
         # Spec verify dispatches num_draft_tokens per request, so num_max tracks
         # concurrency * num_draft_tokens, still clamped to the 1024 ceiling.
         with _env_unset():
-            self._run(self._runner(pool_size=100, num_draft_tokens=4))
+            self._run(
+                self._runner(pool_size=100, num_draft_tokens=4, reserved_num_max=1024)
+            )
             self.assertEqual(_ENV.get(), 400)
         with _env_unset():
-            self._run(self._runner(pool_size=512, num_draft_tokens=4))
+            self._run(
+                self._runner(pool_size=512, num_draft_tokens=4, reserved_num_max=1024)
+            )
             self.assertEqual(_ENV.get(), 1024)
 
     def test_adaptive_spec_uses_max_draft_tokens(self):
@@ -230,7 +247,12 @@ class TestDeepEPAutoTune(unittest.TestCase):
         # 100 * 8 = 800.
         with _env_unset():
             self._run(
-                self._runner(pool_size=100, num_draft_tokens=2, max_draft_tokens=8)
+                self._runner(
+                    pool_size=100,
+                    num_draft_tokens=2,
+                    max_draft_tokens=8,
+                    reserved_num_max=1024,
+                )
             )
             self.assertEqual(_ENV.get(), 800)
 
@@ -250,19 +272,36 @@ class TestDeepEPConcurrencyClamp(unittest.TestCase):
     def test_passthrough_for_normal_mode(self):
         self.assertEqual(self._clamp(_deepep_runner(mode="normal"), 2048), 2048)
 
-    def test_caps_to_finished_sum_tag_single_rank(self):
-        with patch(
+    def test_caps_to_reserved_ceiling_single_rank(self):
+        # With a reservation at the 1024 ceiling, concurrency caps to it.
+        with _env_unset(), patch(
             f"{_MIXIN_MODULE}.get_moe_ep_group",
             return_value=SimpleNamespace(world_size=1, cpu_group=None),
         ):
-            self.assertEqual(self._clamp(_deepep_runner(), 2048), 1024)
+            self.assertEqual(
+                self._clamp(_deepep_runner(reserved_num_max=1024), 2048), 1024
+            )
+
+    def test_no_reservation_caps_to_default_buffer(self):
+        # No reservation (kill-switch off / user mem_fraction): the buffer is the
+        # static default, so concurrency caps to it — NOT the loose FINISHED_SUM_TAG
+        # bound, which would let the decode batch overrun the small default buffer.
+        with _env_unset(), patch(
+            f"{_MIXIN_MODULE}.get_moe_ep_group",
+            return_value=SimpleNamespace(world_size=1, cpu_group=None),
+        ):
+            self.assertEqual(
+                self._clamp(_deepep_runner(reserved_num_max=None), 2048), 128
+            )
 
     def test_below_cap_unchanged_single_rank(self):
-        with patch(
+        with _env_unset(), patch(
             f"{_MIXIN_MODULE}.get_moe_ep_group",
             return_value=SimpleNamespace(world_size=1, cpu_group=None),
         ):
-            self.assertEqual(self._clamp(_deepep_runner(), 512), 512)
+            self.assertEqual(
+                self._clamp(_deepep_runner(reserved_num_max=1024), 512), 512
+            )
 
     def test_mooncake_backend_not_capped(self):
         # B2: the concurrency clamp is deepep-only; mooncake passes through.
@@ -275,24 +314,32 @@ class TestDeepEPConcurrencyClamp(unittest.TestCase):
             )
 
     def test_spec_divides_cap_by_draft_tokens(self):
-        # num_draft_tokens=4 means batch * 4 tokens dispatched, so the concurrency
-        # ceiling is FINISHED_SUM_TAG // 4 = 256.
-        with patch(
-            f"{_MIXIN_MODULE}.get_moe_ep_group",
-            return_value=SimpleNamespace(world_size=1, cpu_group=None),
-        ):
-            self.assertEqual(self._clamp(_deepep_runner(num_draft_tokens=4), 2048), 256)
-
-    def test_adaptive_spec_divides_cap_by_max_draft_tokens(self):
-        # B1: the clamp divides by the adaptive max (8), not the startup value (2):
-        # 1024 // 8 = 128.
-        with patch(
+        # num_draft_tokens=4 means batch * 4 tokens dispatched, so the ceiling
+        # (reserved 1024) is divided: 1024 // 4 = 256.
+        with _env_unset(), patch(
             f"{_MIXIN_MODULE}.get_moe_ep_group",
             return_value=SimpleNamespace(world_size=1, cpu_group=None),
         ):
             self.assertEqual(
                 self._clamp(
-                    _deepep_runner(num_draft_tokens=2, max_draft_tokens=8), 2048
+                    _deepep_runner(num_draft_tokens=4, reserved_num_max=1024), 2048
+                ),
+                256,
+            )
+
+    def test_adaptive_spec_divides_cap_by_max_draft_tokens(self):
+        # B1: the clamp divides by the adaptive max (8), not the startup value (2):
+        # 1024 // 8 = 128.
+        with _env_unset(), patch(
+            f"{_MIXIN_MODULE}.get_moe_ep_group",
+            return_value=SimpleNamespace(world_size=1, cpu_group=None),
+        ):
+            self.assertEqual(
+                self._clamp(
+                    _deepep_runner(
+                        num_draft_tokens=2, max_draft_tokens=8, reserved_num_max=1024
+                    ),
+                    2048,
                 ),
                 128,
             )
@@ -303,11 +350,13 @@ class TestDeepEPConcurrencyClamp(unittest.TestCase):
         def fake_all_reduce(tensor, op=None, group=None):
             tensor.fill_(600)
 
-        with patch(
+        with _env_unset(), patch(
             f"{_MIXIN_MODULE}.get_moe_ep_group",
             return_value=SimpleNamespace(world_size=2, cpu_group=object()),
         ), patch("torch.distributed.all_reduce", side_effect=fake_all_reduce):
-            self.assertEqual(self._clamp(_deepep_runner(), 800), 600)
+            self.assertEqual(
+                self._clamp(_deepep_runner(reserved_num_max=1024), 800), 600
+            )
 
 
 if __name__ == "__main__":

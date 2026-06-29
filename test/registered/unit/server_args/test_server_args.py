@@ -1498,6 +1498,29 @@ class TestDeepEPMemReserveTiering(unittest.TestCase):
         )
         self.assertEqual(ns._deepep_reserved_num_max, 256)
 
+    def test_unreadable_config_falls_back_conservative(self):
+        # An unreadable model config must not silently skip: that leaves no reserved
+        # ceiling and re-arms the unbounded num_max auto-tune. Pin the conservative
+        # default (128) and leave mem_fraction untouched.
+        def _raise():
+            raise RuntimeError("no config")
+
+        ns = SimpleNamespace(
+            _auto_mem_fraction_gpu_mib=139.8 * 1024,
+            moe_a2a_backend="deepep",
+            deepep_mode="auto",
+            max_speculative_num_draft_tokens=None,
+            speculative_num_draft_tokens=None,
+            max_running_requests=None,
+            dp_size=8,
+            _auto_mem_chunked_slack_mib=10.5 * 1024,
+            mem_fraction_static=0.858,
+            get_model_config=_raise,
+        )
+        ServerArgs._adjust_mem_fraction_for_deepep_capture(ns)
+        self.assertEqual(ns._deepep_reserved_num_max, 128)
+        self.assertEqual(ns.mem_fraction_static, 0.858)
+
 
 if __name__ == "__main__":
     unittest.main()

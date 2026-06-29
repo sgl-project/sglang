@@ -3487,6 +3487,11 @@ class ServerArgs:
         if self.moe_a2a_backend != "deepep" or self.deepep_mode == "normal":
             return
 
+        # Conservative ceiling for the fallbacks below: main's static num_max, which
+        # fits without an explicit reservation.
+        conservative_num_max = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.default
+        )
         try:
             model_config = self.get_model_config()
             hidden = model_config.hidden_size
@@ -3502,9 +3507,25 @@ class ServerArgs:
                 if value:
                     num_experts = int(value)
                     break
-        except Exception:
+        except Exception as e:
+            # Don't swallow this: with no reserved ceiling the num_max auto-tune runs
+            # unbounded and OOMs at capture. Pin the conservative default and warn.
+            logger.warning(
+                "DeepEP auto mem reserve: could not read model config (%s); pinning "
+                "num_max=%d and skipping the mem_fraction reservation. Set "
+                "--mem-fraction-static if capture OOMs.",
+                e,
+                conservative_num_max,
+            )
+            self._deepep_reserved_num_max = conservative_num_max
             return
         if not hidden or not num_experts:
+            logger.warning(
+                "DeepEP auto mem reserve: model config missing hidden_size/num_experts;"
+                " pinning num_max=%d and skipping the mem_fraction reservation.",
+                conservative_num_max,
+            )
+            self._deepep_reserved_num_max = conservative_num_max
             return
 
         from sglang.srt.layers.moe.token_dispatcher.deepep import (
