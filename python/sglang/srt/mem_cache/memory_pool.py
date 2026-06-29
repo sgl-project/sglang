@@ -1143,17 +1143,21 @@ class KVWriteLoc:
     """Write target(s) for ``KVCache.set_kv_buffer``.
 
     All location info lives here (in the attention metadata), NOT in the pool:
-    - ``loc``: the full-pool write location (VIRTUAL under the shared KV pool).
-    - ``swa_loc``: the pre-translated full->SWA-physical location for hybrid SWA
-      pools (``None`` otherwise).
-    - ``full_loc``: the pre-translated full-PHYSICAL location for the shared KV
-      pool (``None`` otherwise), computed once per forward in attention metadata
-      (``ForwardBatch.out_cache_loc_full_physical``). The shared full pool writes
-      it directly; the pool never translates (replacing the former per-layer v2p
-      gather / ``set_full_loc`` pin).
+    - ``loc``: the generic per-token write location (the allocated
+      ``out_cache_loc``). VIRTUAL under the shared KV pool (it indexes the
+      virtual slot space); already physical for a non-shared pool.
+    - ``swa_loc``: the pre-translated SWA-sub-pool PHYSICAL location for hybrid
+      SWA pools (``None`` otherwise).
+    - ``full_loc``: the pre-translated full-attention-sub-pool PHYSICAL location
+      for the shared KV pool (``None`` otherwise), computed once per forward in
+      attention metadata (``ForwardBatch.out_cache_loc_full_physical``). The
+      shared full pool writes it directly; the pool never translates (replacing
+      the former per-layer v2p gather / ``set_full_loc`` pin).
 
-    Bundling them lets a backend issue one ``set_kv_buffer`` call regardless of
-    pool type.
+    ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
+    PHYSICAL loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
+    ``loc`` is the generic, possibly-virtual fallback. Bundling them lets a
+    backend issue one ``set_kv_buffer`` call regardless of pool type.
     """
 
     loc: torch.Tensor
