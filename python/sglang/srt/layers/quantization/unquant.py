@@ -337,6 +337,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
+        if _is_npu:
+            for weight_name in ["w13_weight", "w2_weight"]:
+                weight = getattr(layer, weight_name)
+                new_weight = origin_weight.contiguous()
+                weight.data = npu_format_cast(new_weight)
 
         return
 
