@@ -54,6 +54,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
 
+        self.current_streaming_param_name: Optional[str] = None
+        self.current_streaming_param_prefix_sent: bool = False
+        self.current_streaming_param_seen_value: bool = False
+        self.current_streaming_param_pending: str = ""
+
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
@@ -169,6 +174,137 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
 
+    def _get_param_type(self, param_name: str, param_config: dict) -> str:
+        if param_name not in param_config:
+            return "string"
+
+        config = param_config[param_name]
+        if isinstance(config, dict) and "type" in config:
+            param_type = config["type"]
+            if isinstance(param_type, list):
+                if "string" in param_type:
+                    return "string"
+                if param_type:
+                    param_type = param_type[0]
+                else:
+                    return "string"
+            return str(param_type).strip().lower()
+
+        return "string"
+
+    def _is_streamable_string_param(self, param_name: str, param_config: dict) -> bool:
+        param_type = self._get_param_type(param_name, param_config)
+        return param_type in ["string", "str", "text", "varchar", "char", "enum"]
+
+    def _json_string_fragment(self, value: str) -> str:
+        return json.dumps(value, ensure_ascii=False)[1:-1]
+
+    def _ensure_streaming_param_prefix(self, calls: list[ToolCallItem]) -> None:
+        if not self.json_started:
+            calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="{"))
+            self.json_started = True
+
+        if self.current_streaming_param_prefix_sent:
+            return
+
+        param_name = self.current_streaming_param_name
+        json_key = json.dumps(param_name, ensure_ascii=False)
+        prefix = f'{json_key}: "'
+        if self.current_tool_param_count > 0:
+            prefix = ", " + prefix
+
+        calls.append(
+            ToolCallItem(
+                tool_index=self.current_tool_id,
+                parameters=prefix,
+            )
+        )
+        self.current_streaming_param_prefix_sent = True
+
+    def _find_streaming_param_terminator(self, text: str) -> Optional[tuple[int, int]]:
+        candidates = []
+        for token, token_len in [
+            (self.parameter_end_token, len(self.parameter_end_token)),
+            (self.parameter_prefix, 0),
+            (self.function_end_token, 0),
+        ]:
+            idx = text.find(token)
+            if idx != -1:
+                candidates.append((idx, token_len))
+
+        if not candidates:
+            return None
+        return min(candidates, key=lambda x: x[0])
+
+    def _held_streaming_param_suffix_len(self, text: str) -> int:
+        held = 1 if text else 0
+        for token in [
+            self.parameter_end_token,
+            self.parameter_prefix,
+            self.function_end_token,
+        ]:
+            max_len = min(len(token) - 1, len(text))
+            for suffix_len in range(max_len, 0, -1):
+                if token.startswith(text[-suffix_len:]):
+                    held = max(held, min(len(text), suffix_len + 1))
+                    break
+        return held
+
+    def _reset_streaming_param_state(self) -> None:
+        self.current_streaming_param_name = None
+        self.current_streaming_param_prefix_sent = False
+        self.current_streaming_param_seen_value = False
+        self.current_streaming_param_pending = ""
+
+    def _emit_streaming_param_value(
+        self, current_slice: str, calls: list[ToolCallItem]
+    ) -> int:
+        text = self.current_streaming_param_pending + current_slice
+        self.current_streaming_param_pending = ""
+
+        if not self.current_streaming_param_seen_value and text.startswith("\n"):
+            text = text[1:]
+
+        terminator = self._find_streaming_param_terminator(text)
+        if terminator is not None:
+            end_pos, end_token_len = terminator
+            value = text[:end_pos]
+            if value.endswith("\n"):
+                value = value[:-1]
+
+            self._ensure_streaming_param_prefix(calls)
+            if value:
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        parameters=self._json_string_fragment(value),
+                    )
+                )
+                self.current_streaming_param_seen_value = True
+
+            calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters='"'))
+            self.current_tool_param_count += 1
+            self._reset_streaming_param_state()
+            return len(current_slice) - (len(text) - end_pos - end_token_len)
+
+        held_len = self._held_streaming_param_suffix_len(text)
+        emit_len = max(0, len(text) - held_len)
+        if emit_len == 0:
+            self.current_streaming_param_pending = text
+            return len(current_slice)
+
+        value = text[:emit_len]
+        self.current_streaming_param_pending = text[emit_len:]
+        self._ensure_streaming_param_prefix(calls)
+        calls.append(
+            ToolCallItem(
+                tool_index=self.current_tool_id,
+                parameters=self._json_string_fragment(value),
+            )
+        )
+        self.current_streaming_param_seen_value = True
+        return len(current_slice)
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
         if self.tool_call_start_token not in text:
@@ -260,6 +396,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if not current_slice:
                 break
 
+            if self.current_streaming_param_name is not None:
+                consumed_len = self._emit_streaming_param_value(current_slice, calls)
+                self.parsed_pos += consumed_len
+                continue
+
             # -------------------------------------------------------
             # 1. Priority detection: check if it's the start of Tool Call
             # -------------------------------------------------------
@@ -302,6 +443,18 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if current_slice.startswith(self.parameter_prefix):
                 name_end = current_slice.find(">")
                 if name_end != -1:
+                    param_name = current_slice[len(self.parameter_prefix) : name_end]
+                    param_config = self._get_arguments_config(
+                        self.current_func_name, tools
+                    )
+                    if self._is_streamable_string_param(param_name, param_config):
+                        self.current_streaming_param_name = param_name
+                        self.current_streaming_param_prefix_sent = False
+                        self.current_streaming_param_seen_value = False
+                        self.current_streaming_param_pending = ""
+                        self.parsed_pos += name_end + 1
+                        continue
+
                     value_start_idx = name_end + 1
                     rest_of_slice = current_slice[value_start_idx:]
 
@@ -329,9 +482,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         end_pos = best_cand[0]
                         end_token_len = best_cand[1]
 
-                        param_name = current_slice[
-                            len(self.parameter_prefix) : name_end
-                        ]
                         raw_value = rest_of_slice[:end_pos]
 
                         # Cleanup value
@@ -349,9 +499,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             )
                             self.json_started = True
 
-                        param_config = self._get_arguments_config(
-                            self.current_func_name, tools
-                        )
                         converted_val = self._convert_param_value(
                             raw_value, param_name, param_config, self.current_func_name
                         )
@@ -395,6 +542,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
                 self.parsed_pos += len(self.function_end_token)
                 self.current_func_name = None
+                self._reset_streaming_param_state()
                 continue
 
             # -------------------------------------------------------
