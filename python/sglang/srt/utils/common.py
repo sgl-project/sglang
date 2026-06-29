@@ -1375,6 +1375,35 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
+class _ColoredFormatter(logging.Formatter):
+    """A logging formatter that adds color to ERROR and WARNING levels.
+
+    Only applies color when the output stream is a terminal (isatty).
+    Adapted from sglang.multimodal_gen.runtime.utils.logging_utils.ColoredFormatter.
+    """
+
+    _RED = "\033[91m"
+    _YELLOW = "\033[93m"
+    _RESET = "\033[0;0m"
+
+    LEVEL_COLORS = {
+        logging.ERROR: _RED,
+        logging.WARNING: _YELLOW,
+    }
+
+    def __init__(self, *args, stream=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_color = hasattr(stream, "isatty") and stream.isatty()
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        if self._use_color:
+            color = self.LEVEL_COLORS.get(record.levelno)
+            if color:
+                formatted = f"{color}{formatted}{self._RESET}"
+        return formatted
+
+
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1387,11 +1416,16 @@ def configure_logger(server_args, prefix: str = ""):
         logging.config.dictConfig(custom_config)
         return
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
-    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+    fmt = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    level = getattr(logging, server_args.log_level.upper())
+
+    # Use colored formatter for terminal output
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_ColoredFormatter(fmt, datefmt=datefmt, stream=sys.stderr))
     logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
+        level=level,
+        handlers=[handler],
         force=True,
     )
 

@@ -2148,7 +2148,15 @@ def _wait_and_warmup(
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     # The server is ready for requests
-    logger.info("The server is fired up and ready to roll!")
+    scheme = "https" if server_args.ssl_certfile else "http"
+    logger.info(
+        f"\n----------------------------------------------\n"
+        f"  SGLang Server Ready!\n"
+        f"  Model:    {server_args.served_model_name}\n"
+        f"  API:      {scheme}://{server_args.host}:{server_args.port}\n"
+        f"  TP: {server_args.tp_size}, DP: {server_args.dp_size}\n"
+        f"----------------------------------------------"
+    )
 
     if server_args.delete_ckpt_after_loading:
         delete_directory(server_args.model_path)
