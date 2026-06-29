@@ -48,6 +48,7 @@ class DSparkMarkovHead(nn.Module):
             markov_rank,
             quant_config=quant_config,
             prefix=add_prefix("markov_w2", prefix),
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:

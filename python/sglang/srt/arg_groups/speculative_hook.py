@@ -248,6 +248,14 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "Currently DSpark speculative decoding only supports pp_size == 1."
         )
 
+    if server_args.enable_dp_attention and not server_args.enable_dp_lm_head:
+        server_args.enable_dp_lm_head = True
+        logger.warning(
+            "Enable DP LM head for DSpark with DP attention. DSpark refinement "
+            "computes local draft logits, so vocab heads must not be sharded across "
+            "different DP requests."
+        )
+
     if server_args.speculative_draft_model_path is None:
         server_args.speculative_draft_model_path = server_args.model_path
         server_args.speculative_draft_model_revision = server_args.revision

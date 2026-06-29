@@ -429,6 +429,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         vocab_size = int(self._draft_inner.vocab_size)
 
         def _gather_full_vocab(logits_shard: torch.Tensor) -> torch.Tensor:
+            if logits_shard.shape[-1] >= vocab_size:
+                return logits_shard[..., :vocab_size]
             if tp_size == 1:
                 return logits_shard
             return tensor_model_parallel_all_gather(logits_shard, dim=-1)[
