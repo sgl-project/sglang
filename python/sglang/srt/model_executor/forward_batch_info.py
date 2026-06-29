@@ -1315,15 +1315,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if self.mrope_positions is not None:
-            self.mrope_positions = torch.cat(
-                [
-                    self.mrope_positions,
-                    self.mrope_positions.new_zeros(
-                        3, num_tokens - self.mrope_positions.shape[1]
-                    ),
-                ],
-                dim=1,
-            )
+            # Only pad if needed, never shrink (mrope_positions is already correctly sized)
+            if num_tokens > self.mrope_positions.shape[1]:
+                self.mrope_positions = torch.cat(
+                    [
+                        self.mrope_positions,
+                        self.mrope_positions.new_zeros(
+                            3, num_tokens - self.mrope_positions.shape[1]
+                        ),
+                    ],
+                    dim=1,
+                )
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:

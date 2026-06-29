@@ -26,6 +26,9 @@ from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
 
+# TBO
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+
 # Configs
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -41,7 +44,11 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -570,6 +577,94 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def op_prepare(self, state):
+        hidden_states: torch.Tensor = state.pop("hidden_states_after_comm_pre_attn")
+        forward_batch = state.forward_batch
+
+        if forward_batch.forward_mode.is_idle():
+            state.attn_intermediate_state = hidden_states, None
+            return
+
+        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+            hidden_states
+        )
+
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                projected_states_qkvz,
+                projected_states_ba,
+                triton.cdiv(self.num_k_heads, self.attn_tp_size),
+                triton.cdiv(self.num_v_heads, self.attn_tp_size),
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        elif _is_cpu and _is_amx_available:
+            mixed_qkv, z, b, a = (
+                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    self.num_k_heads // self.attn_tp_size,
+                    self.num_v_heads // self.attn_tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+            )
+        else:
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                projected_states_qkvz, projected_states_ba
+            )
+            query, key, value = map(
+                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+            )
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+
+        kwargs = {
+            "mixed_qkv": mixed_qkv,
+            "a": a,
+            "b": b,
+            "z": z,
+        }
+
+        state.attn_intermediate_state = None, kwargs
+
+    def op_core(self, state):
+        hidden_state, kwargs = state.pop("attn_intermediate_state")
+        forward_batch = state.forward_batch
+        if forward_batch.forward_mode.is_idle():
+            state.hidden_states_after_attn = hidden_state
+            return
+
+        core_attn_out = self.attn(
+            forward_batch,
+            mixed_qkv=kwargs["mixed_qkv"],
+            a=kwargs["a"],
+            b=kwargs["b"],
+        )
+
+        z = kwargs.get("z")
+        z_shape_og = z.shape
+        # reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+
+        # Add padding for DP-Attn
+        if core_attn_out.shape != z.shape:
+            core_attn_out_pad = torch.zeros_like(z)
+            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+            core_attn_out = core_attn_out_pad
+
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        if core_attn_out.numel() == 0:
+            state.hidden_states_after_attn = hidden_state
+            return
+
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+
+        output, _ = self.out_proj(core_attn_out)
+
+        state.hidden_states_after_attn = output
+
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
@@ -628,6 +723,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse = False
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
+
+        self.is_layer_sparse = is_layer_sparse
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -707,6 +804,104 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
 
         return hidden_states, residual
+
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state_update = dict(
+            forward_batch=forward_batch,
+            positions=positions,
+            tbo_subbatch_index=tbo_subbatch_index,
+        )
+        if input_deepstack_embeds is not None:
+            state_update["input_deepstack_embeds"] = input_deepstack_embeds
+        state.update(state_update)
+
+    def op_attn_prepare(self, state):
+        self.linear_attn.op_prepare(state)
+
+    def op_attn_core(self, state):
+        self.linear_attn.op_core(state)
+
+    def op_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+
+    def op_mlp(self, state):
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            state.forward_batch
+        )
+        hidden_states = state.pop("hidden_states_mlp_input")
+        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            state.hidden_states_mlp_output = self.mlp(
+                hidden_states, state.forward_batch, use_reduce_scatter
+            )
+        else:
+            state.hidden_states_mlp_output = self.mlp(
+                hidden_states, use_reduce_scatter=use_reduce_scatter
+            )
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        # Add deepstack embeddings for the first few layers
+        input_deepstack_embeds = state.get("input_deepstack_embeds")
+        if (
+            input_deepstack_embeds is not None
+            and input_deepstack_embeds.numel() > 0
+            and self.layer_id < 3
+        ):
+            sep = self.config.hidden_size * self.layer_id
+            hidden_states.add_(
+                input_deepstack_embeds[:, sep : sep + self.config.hidden_size]
+            )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        if input_deepstack_embeds is not None:
+            output["input_deepstack_embeds"] = input_deepstack_embeds
+
+        state.clear(
+            expect_keys=(
+                {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                    "input_deepstack_embeds",
+                }
+                if input_deepstack_embeds is not None
+                else {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                }
+            )
+        )
+        return output
 
 
 class Qwen3_5AttentionDecoderLayer(nn.Module):
@@ -833,6 +1028,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse = True
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
+
+        self.is_layer_sparse = is_layer_sparse
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -1093,6 +1290,145 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state_update = dict(
+            forward_batch=forward_batch,
+            positions=positions,
+            tbo_subbatch_index=tbo_subbatch_index,
+        )
+        if input_deepstack_embeds is not None:
+            state_update["input_deepstack_embeds"] = input_deepstack_embeds
+        state.update(state_update)
+
+    def op_attn_prepare(self, state):
+        hidden_states = state.pop("hidden_states_after_comm_pre_attn")
+        forward_batch = state.forward_batch
+        if forward_batch.forward_mode.is_idle():
+            state.attn_intermediate_state = hidden_states, None
+            return
+
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+            orig_shape = q_gate.shape[:-1]
+            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*orig_shape, -1)
+            gate = gate.reshape(*orig_shape, -1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            gate = None
+
+        q, k = self._apply_qk_norm(q, k)
+
+        q, k = self.rotary_emb(state.positions, q, k)
+
+        state.attn_intermediate_state = None, (q, k, v, gate)
+
+    def op_attn_core(self, state):
+        hidden_states, inner_state = state.pop("attn_intermediate_state")
+
+        if inner_state is None:
+            state.hidden_states_after_attn = hidden_states
+            return
+
+        q, k, v, gate = inner_state
+
+        attn_output = self.attn(q, k, v, state.forward_batch)
+
+        if self.attn_output_gate:
+            gate = torch.sigmoid(gate)
+            attn_output = attn_output * gate
+
+        output, _ = self.o_proj(attn_output)
+
+        state.hidden_states_after_attn = output
+
+    def op_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+
+    def op_mlp(self, state):
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            state.forward_batch
+        )
+        hidden_states = state.pop("hidden_states_mlp_input")
+        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+            state.hidden_states_mlp_output = self.mlp(
+                hidden_states, state.forward_batch, use_reduce_scatter
+            )
+        else:
+            state.hidden_states_mlp_output = self.mlp(
+                hidden_states, use_reduce_scatter=use_reduce_scatter
+            )
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        # Add deepstack embeddings for the first few layers
+        input_deepstack_embeds = state.get("input_deepstack_embeds")
+        if (
+            input_deepstack_embeds is not None
+            and input_deepstack_embeds.numel() > 0
+            and self.layer_id < 3
+        ):
+            sep = self.config.hidden_size * self.layer_id
+            hidden_states.add_(
+                input_deepstack_embeds[:, sep : sep + self.config.hidden_size]
+            )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        if input_deepstack_embeds is not None:
+            output["input_deepstack_embeds"] = input_deepstack_embeds
+
+        state.clear(
+            expect_keys=(
+                {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                    "input_deepstack_embeds",
+                }
+                if input_deepstack_embeds is not None
+                else {
+                    "positions",
+                    "forward_batch",
+                    "tbo_subbatch_index",
+                }
+            )
+        )
+        return output
+
 
 ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3_5AttentionDecoderLayer,
@@ -1285,33 +1621,45 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         aux_hidden_states = []
         # Pass through decoder layers
-        for layer_idx in range(self.start_layer, self.end_layer):
-            layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
-                )
+        if forward_batch.can_run_tbo:
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers,
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+                input_deepstack_embeds=input_deepstack_embeds,
+            )
+        else:
+            for layer_idx in range(self.start_layer, self.end_layer):
+                layer = self.layers[layer_idx]
+                with get_global_expert_distribution_recorder().with_current_layer(
+                    layer_idx
+                ):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
 
-            # Process deepstack embeddings if provided
-            if (
-                input_deepstack_embeds is not None
-                and input_deepstack_embeds.numel() > 0
-                and layer_idx < 3
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+                # Process deepstack embeddings if provided
+                if (
+                    input_deepstack_embeds is not None
+                    and input_deepstack_embeds.numel() > 0
+                    and layer_idx < 3
+                ):
+                    sep = self.hidden_size * layer_idx
+                    hidden_states.add_(
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    )
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
