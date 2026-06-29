@@ -22,13 +22,17 @@ if current_platform.is_cuda():
         can_use_fused_causal_conv3d_cat_pad_cuda,
         fused_causal_conv3d_cat_pad_cuda,
     )
-    from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
-        fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
-    )
 else:
     can_use_fused_causal_conv3d_cat_pad_cuda = None
     fused_causal_conv3d_cat_pad_cuda = None
-    fused_causal_conv3d_cat_pad_triton = None
+
+# The Triton fusion is platform-agnostic (pure triton.jit) and serves as the
+# fallback when the CUDA fused kernel is unavailable — so import it on all
+# platforms, not just CUDA. Without this, ROCm hits `fused_causal_conv3d_cat_pad_triton is None`
+# and raises "causal Conv3D cat/pad fusion is only available on CUDA".
+from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
+    fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
+)
 
 
 _causal_conv3d_cat_pad_cuda_failed = False
