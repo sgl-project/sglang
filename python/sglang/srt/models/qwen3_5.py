@@ -2066,6 +2066,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             )
                         elif self.enable_shared_expert_fusion:
                             # shared experts should be loaded to experts.w13_weight and experts.w2_weight
+                            if name_mapped not in params_dict:
+                                continue
                             param = params_dict[name_mapped]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
