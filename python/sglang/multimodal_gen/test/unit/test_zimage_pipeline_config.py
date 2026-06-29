@@ -8,6 +8,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 
 
 class TestZImagePipelineConfig(unittest.TestCase):
+    def test_zimage_prepares_explicit_sigmas(self) -> None:
+        """Z-Image uses the native explicit flow sigmas schedule."""
+        config = ZImagePipelineConfig()
+
+        self.assertEqual(
+            config.prepare_sigmas(None, 4).tolist(),
+            [1.0, 0.75, 0.5, 0.25],
+        )
+
     @patch("sglang.multimodal_gen.configs.pipeline_configs.zimage.get_sp_world_size")
     def test_zimage_negative_prompt_rotary_embeddings_use_negative_prompt_len(
         self, mock_get_sp_world_size
