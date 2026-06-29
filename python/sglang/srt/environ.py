@@ -902,6 +902,8 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+    # Fused AG-GEMM and MoE reduce-scatter via torch symmetric memory.
+    SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL = EnvBool(False)
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)

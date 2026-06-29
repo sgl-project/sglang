@@ -149,6 +149,7 @@ def inplace_fused_experts(
         a2_scale,
         block_shape,
         False,
+        False,
         routed_scaling_factor,
         gemm1_alpha,
         gemm1_limit,
@@ -183,6 +184,7 @@ def outplace_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    no_topk_reduce: bool = False,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
@@ -215,6 +217,7 @@ def outplace_fused_experts(
         a2_scale,
         block_shape,
         no_combine=no_combine,
+        no_topk_reduce=no_topk_reduce,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
@@ -250,6 +253,40 @@ def fused_experts(
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    from sglang.srt.distributed import get_tp_group
+    comm = get_tp_group().torch_symm_mem_comm
+    fused_topk_reduce_rs = comm is not None and comm.use_cp
+    if fused_topk_reduce_rs:
+        return outplace_fused_experts(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            b1,
+            b2,
+            moe_runner_config.activation,
+            moe_runner_config.is_gated,
+            moe_runner_config.apply_router_weight_on_input,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            per_channel_quant,
+            w1_scale,
+            w2_scale,
+            w1_zp,
+            w2_zp,
+            a1_scale,
+            a2_scale,
+            block_shape,
+            no_topk_reduce=True,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            filter_expert=filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+        )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
@@ -447,6 +484,7 @@ def _fused_moe_kernel_sequence(
     activation: str,
     is_gated: bool,
     no_combine: bool,
+    no_topk_reduce: bool,
     inplace: bool,
     apply_router_weight_on_input: bool,
     routed_scaling_factor: Optional[float],
@@ -475,7 +513,7 @@ def _fused_moe_kernel_sequence(
     )
     total_tokens = num_tokens * topk + padded_tokens
 
-    if no_combine:
+    if no_combine or no_topk_reduce:
         assert not inplace
         out_hidden_states = torch.empty(
             (num_tokens, topk, w2.shape[1]),
@@ -683,9 +721,10 @@ def _fused_moe_kernel_sequence(
         dtype=hidden_states.dtype,
     )
 
-    # LoRA hooks force the second kernel to write to intermediate_cache3 so
-    # hooks.after_down can inspect/modify it before reduction.
-    _use_intermediate = not no_combine and (topk != 1 or hooks)
+    # LoRA hooks and no_topk_reduce both need intermediate_cache3.
+    _use_intermediate = not no_combine and not no_topk_reduce and (
+        topk != 1 or hooks 
+    )
 
     out_slice = None
     if use_fused_moe_sum_all_reduce:
@@ -740,7 +779,7 @@ def _fused_moe_kernel_sequence(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
-    if no_combine:
+    if no_combine or no_topk_reduce:
         pass
     elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
@@ -839,6 +878,7 @@ def fused_experts_impl(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
+    no_topk_reduce: bool = False,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
@@ -912,6 +952,7 @@ def fused_experts_impl(
         activation=activation,
         is_gated=is_gated,
         no_combine=no_combine,
+        no_topk_reduce=no_topk_reduce,
         inplace=inplace,
         apply_router_weight_on_input=apply_router_weight_on_input,
         routed_scaling_factor=routed_scaling_factor,

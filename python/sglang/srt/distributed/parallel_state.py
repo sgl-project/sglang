@@ -431,7 +431,10 @@ class GroupCoordinator:
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
-        if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
+        if (
+            self.use_torch_symm_mem_all_reduce
+            or envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get()
+        ) and self.world_size > 1:
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -643,7 +646,7 @@ class GroupCoordinator:
             outplace_all_reduce_method = "pymscclpp"
         elif (
             self.torch_symm_mem_comm is not None
-            and not self.torch_symm_mem_comm.disabled
+            and not self.torch_symm_mem_comm.allreduce_disabled
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
@@ -751,7 +754,7 @@ class GroupCoordinator:
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
-            assert not torch_symm_mem_comm.disabled
+            assert not torch_symm_mem_comm.allreduce_disabled
             out = torch_symm_mem_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
@@ -769,7 +772,7 @@ class GroupCoordinator:
             pynccl_comm.all_reduce(input_)
         elif (
             torch_symm_mem_comm is not None
-            and not torch_symm_mem_comm.disabled
+            and not torch_symm_mem_comm.allreduce_disabled
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             torch_symm_mem_comm.all_reduce(input_, out=input_)

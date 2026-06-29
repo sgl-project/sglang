@@ -216,6 +216,9 @@ def _freqs_cis_to_cos_sin(
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
 
+def _cp_fused_symm_mem_enabled() -> bool:
+    """True when CP AG/RS should be handled by torch_symm_mem fused kernels."""
+    return envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get() and not get_is_capture_mode()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -1633,7 +1636,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
-                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+                if not _cp_fused_symm_mem_enabled() or not self.mlp.experts.moe_runner_config.inplace:
+                    hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert get_moe_a2a_backend().is_deepep(), (
                     "CP requires DeepEP (moe_a2a_backend == deepep). "
@@ -1666,7 +1670,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             skip_shared_experts=_do_shared_local,
         )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            if not _cp_fused_symm_mem_enabled():
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
@@ -1844,6 +1849,9 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         if dsa_use_prefill_cp(forward_batch):
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is not None and _cp_fused_symm_mem_enabled():
+                _comm.set_use_cp(True)
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -1882,6 +1890,9 @@ class DeepseekV4Model(nn.Module):
                 hidden_states, prev_residual, prev_post, prev_comb
             )
 
+        _comm = get_tp_group().torch_symm_mem_comm
+        if _comm is not None:
+            _comm.set_use_cp(False)
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
