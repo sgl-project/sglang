@@ -443,6 +443,9 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             events = [e for e in events if e.medium == medium]
         return events
 
+    def _event_hashes(self, events):
+        return [block_hash for event in events for block_hash in event.block_hashes]
+
     def _leaf_for(self, tree, tokens):
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertIsNot(match.last_device_node, tree.root_node)
@@ -512,7 +515,8 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         result = tree.evict(EvictParams(num_tokens=len(seq)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
         removed = self._removed_events(tree, StorageMedium.GPU)
-        self.assertCountEqual([e.block_hashes[0] for e in removed], stored_hashes)
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0].block_hashes, stored_hashes)
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -554,7 +558,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         tree.evict(EvictParams(num_tokens=len(seq)))
         removed_gpu = self._removed_events(tree, StorageMedium.GPU)
-        self.assertCountEqual([e.block_hashes[0] for e in removed_gpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(removed_gpu), stored_hashes)
 
         self._load_back_node(tree, node)
         restored_gpu = self._stored_events(tree, StorageMedium.GPU)
@@ -564,7 +568,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._removed_events(tree, StorageMedium.GPU)
         tree.evict_host(len(seq))
         removed_cpu = self._removed_events(tree, StorageMedium.CPU)
-        self.assertCountEqual([e.block_hashes[0] for e in removed_cpu], stored_hashes)
+        self.assertCountEqual(self._event_hashes(removed_cpu), stored_hashes)
 
     def test_hicache_split_pending_write_through_publishes_fragments(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -898,7 +902,9 @@ class UnifiedRadixCacheSuite:
         req.swa_uuid_for_lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids + output_ids)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 
@@ -922,8 +928,10 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", prompt_ids)
         req.output_ids = array("q", output_ids)
         req.full_untruncated_fill_ids = array("q", prompt_ids + output_ids)
-        req.fill_len = len(req.full_untruncated_fill_ids)
-        kv_len = req.fill_len
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
+        kv_len = req.extend_range.end
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
@@ -977,7 +985,9 @@ class UnifiedRadixCacheSuite:
         req.swa_uuid_for_lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
 
         avail_before = allocator.available_size()
         tree.cache_finished_req(req, is_insert=False)
@@ -995,7 +1005,9 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = array("q", tokens)
         req.output_ids = array("q")
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         kv_len = len(tokens)
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
@@ -1130,7 +1142,9 @@ class UnifiedRadixCacheSuite:
         req.swa_uuid_for_lock = None
         req.extra_key = None
         req.full_untruncated_fill_ids = array("q", input_ids)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(
+            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+        )
         if self.cfg.has_mamba:
             req.mamba_last_track_seqlen = kv_len
 
@@ -1805,7 +1819,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv_committed_len = pre_len
@@ -1857,7 +1871,7 @@ class UnifiedRadixCacheSuite:
         req.origin_input_ids = tokens
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens)
-        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(0, len(req.full_untruncated_fill_ids))
         kv_indices = self._alloc(allocator, pre_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, pre_len)), kv_indices)
         req.kv_committed_len = pre_len

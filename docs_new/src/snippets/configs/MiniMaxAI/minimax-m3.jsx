@@ -97,11 +97,11 @@ sgl-eval run mmmu_pro \\
     gb200: "lmsysorg/sglang:dev-cu13-minimax-m3",
     gb300: "lmsysorg/sglang:dev-cu13-minimax-m3",
     h200: "lmsysorg/sglang:dev-cu12-minimax-m3",
-    // AMD ROCm images — pin the exact tag from the validated build (see Configuration Tips).
-    mi300x: "lmsysorg/sglang:<rocm-tag>-rocm700-mi30x",
-    mi325x: "lmsysorg/sglang:<rocm-tag>-rocm700-mi30x",
-    mi350x: "lmsysorg/sglang:<rocm-tag>-rocm720-mi35x",
-    mi355x: "lmsysorg/sglang:<rocm-tag>-rocm720-mi35x",
+    // AMD ROCm images — published M3 builds, by arch (gfx942 -> mi30x, gfx950 -> mi35x).
+    mi300x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
+    mi325x: "aigmkt/minimax-m3-sglang-rocm700-mi30x",
+    mi350x: "aigmkt/minimax-m3-sglang-rocm720-mi35x",
+    mi355x: "aigmkt/minimax-m3-sglang-rocm720-mi35x",
   },
 
   github: {
@@ -211,7 +211,6 @@ sgl-eval run mmmu_pro \\
         "--tool-call-parser auto",
         "--tp 8",
         "--attention-backend fa4",
-        "--page-size 128",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.65",
@@ -230,7 +229,6 @@ sgl-eval run mmmu_pro \\
         "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
-        "--page-size 128",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.75",
@@ -250,7 +248,6 @@ sgl-eval run mmmu_pro \\
         "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
-        "--page-size 128",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.75",
@@ -269,7 +266,6 @@ sgl-eval run mmmu_pro \\
         "--tool-call-parser auto",
         "--tp 4",
         "--attention-backend fa4",
-        "--page-size 128",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
         "--mem-fraction-static 0.75",

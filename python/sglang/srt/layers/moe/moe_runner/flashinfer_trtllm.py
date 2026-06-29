@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, cast
+from typing import TYPE_CHECKING, Generator, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -321,6 +321,11 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
 
     assert w13_scale.dtype == torch.uint8
     assert w2_scale.dtype == torch.uint8
+
+    if not is_gated:
+        intermediate = w2_weight.shape[2]
+        w13_weight = w13_weight[:, :intermediate, :].contiguous()
+        w13_scale = w13_scale[:, :intermediate, :].contiguous()
 
     # Pad for kernel alignment (non-gated needs 128, gated needs 16)
     min_alignment = 16 if is_gated else 128
@@ -675,7 +680,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert quant_info.weight_block_k == 32
             from flashinfer import mxfp8_quantize
 
-            a_q, a_sf = mxfp8_quantize(hidden_states, False)
+            a_q, a_sf = mxfp8_quantize(hidden_states, False, backend="cute-dsl")
             # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
             # [num_tokens, hidden_size // 32] (no transpose).
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
@@ -857,6 +862,8 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     routing_method_type: int
     use_per_token_activation: bool = False
 
+    gemm1_clamp_limit: Optional[torch.Tensor] = None
+
 
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
@@ -953,18 +960,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         runner_config.activation, is_gated=runner_config.is_gated
     )
 
-    # Build per-expert clamp-limit tensor from the per-layer scalar.
-    _clamp_val = runner_config.gemm1_clamp_limit
-    if _clamp_val is not None:
-        gemm1_clamp_limit = torch.full(
-            (quant_info.local_num_experts,),
-            _clamp_val,
-            dtype=torch.float32,
-            device=hs_fp4.device,
-        )
-    else:
-        gemm1_clamp_limit = None
-
     # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
     if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
         use_routed_topk = True
@@ -1020,7 +1015,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
@@ -1060,7 +1055,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
-            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,

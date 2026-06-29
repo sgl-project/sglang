@@ -16,6 +16,11 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
@@ -1227,7 +1232,7 @@ def tensor_hash(tensor_list) -> int:
         # CPU path: hash each tensor incrementally without concat
         hasher = hashlib.sha256()
         for t in tensors:
-            t = t.detach().contiguous()
+            t = t.detach().cpu().contiguous()
             hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -1235,7 +1240,7 @@ def tensor_hash(tensor_list) -> int:
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().contiguous()
+    tensor = tensor.detach().cpu().contiguous()
     hasher = hashlib.sha256()
     hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
@@ -1733,17 +1738,14 @@ def wrap_shm_features(obj):
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
 
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            item_hash = getattr(item, "hash", None)
-            if hasattr(item, "feature") and item.feature is not None:
+            item_hash = item.hash
+            if item.feature is not None:
                 item.feature = _wrap_tensor_or_list(
                     item.feature, precomputed_hash=item_hash
                 )
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings, precomputed_hash=item_hash
                 )
@@ -1762,14 +1764,17 @@ def _feature_has_shm(feat) -> bool:
 def has_shm_features(recv_reqs):
     """Return True if any request in the list contains ShmPointerMMData."""
     for req in recv_reqs:
-        if hasattr(req, "batch"):
+        if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
                 return True
-        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+        elif (
+            isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+            and req.mm_inputs
+        ):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
-                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                if _feature_has_shm(item.precomputed_embeddings):
                     return True
     return False
 
@@ -1794,19 +1799,19 @@ def unwrap_shm_features(obj):
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
     # Handle batch requests
-    if hasattr(obj, "batch"):
+    if isinstance(obj, BaseBatchReq):
         for sub_obj in obj.batch:
             unwrap_shm_features(sub_obj)
         return obj
     # Handle single requests
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if (
+        isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+        and obj.mm_inputs
+    ):
         for item in obj.mm_inputs.mm_items:
-            if hasattr(item, "feature") and item.feature is not None:
+            if item.feature is not None:
                 item.feature = _unwrap_tensor_or_list(item.feature)
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
