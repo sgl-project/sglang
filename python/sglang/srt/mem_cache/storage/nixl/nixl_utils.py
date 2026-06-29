@@ -195,7 +195,7 @@ class NixlBackendSelection:
 
         except Exception as e:
             logger.error(
-                f"Failed to create NIXL backend: {e}, backend_name {self.backend_name}, supported plugins {plugin_list} initparams {initparams}"
+                f"Failed to create NIXL backend: {e}, backend_name {self.backend_name}, supported plugins {locals().get('plugin_list', 'N/A')} initparams {locals().get('initparams', 'N/A')}"
             )
             return False
 
