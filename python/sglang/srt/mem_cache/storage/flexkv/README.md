@@ -19,8 +19,10 @@ exercised. Adjust paths / model / GPU as needed.
 
 * `lmsysorg/sglang:dev` (or any sglang container with CUDA 12.x + torch 2.10+).
 * This sglang fork (branch `feat/flexkv-main-connector`) and FlexKV
-  (branch `feat/layerwise_rebase`) checked out somewhere reachable
-  from the container — e.g. `/raid/fly/sglang-connector-dir/{sglang,FlexKV}`.
+  (branch `main`) checked out somewhere reachable from the container
+  — e.g. `/raid/fly/sglang-connector-dir/{sglang,FlexKV}`. Verified
+  against FlexKV main at `aa74e39` (PR #184); older commits down to
+  the layerwise integration also work.
 
 ### 2. Start a container with both repos mounted
 
@@ -50,8 +52,9 @@ docker exec flexkv-sglang bash -c '
   cd /raid/fly/sglang-connector-dir/sglang
   pip install --no-deps -e python
 
-  # FlexKV: needs git submodule (xxHash) and a debug C++ build
+  # FlexKV: pin to main, init the xxHash submodule, debug C++ build.
   cd /raid/fly/sglang-connector-dir/FlexKV
+  git checkout main && git pull --ff-only
   git submodule update --init third_party/xxHash
   pip install -q cython ninja pybind11
   FLEXKV_ENABLE_METRICS=0 bash build.sh --debug
