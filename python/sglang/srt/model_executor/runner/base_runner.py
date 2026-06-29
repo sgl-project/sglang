@@ -251,19 +251,10 @@ class BaseRunner(ABC):
             dtype=mr.dtype,
         )
 
-    def _should_run_flashinfer_autotune(self) -> bool:
+    def _should_run_flashinfer_autotune(
+        self, *, for_speculative_draft: bool = False
+    ) -> bool:
         """Check if flashinfer autotune should be run."""
-        mr = self.model_runner
-        if not self._flashinfer_autotune_is_applicable():
-            return False
-
-        if mr.spec_algorithm.is_speculative():
-            return not mr.is_draft_worker
-
-        return True
-
-    def _flashinfer_autotune_is_applicable(self) -> bool:
-        """Return whether this runner uses FlashInfer kernels worth autotuning."""
         mr = self.model_runner
         if str(mr.device).split(":")[0] != "cuda":
             return False
@@ -327,9 +318,20 @@ class BaseRunner(ABC):
             or (model_uses_modelopt_fp8 and is_sm100_supported())
         )
 
-        return (
+        if not (
             moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
-        ) and torch.cuda.get_device_capability()[0] >= 9
+        ):
+            return False
+
+        if torch.cuda.get_device_capability()[0] < 9:
+            return False
+
+        if mr.spec_algorithm.is_speculative():
+            return (
+                mr.is_draft_worker if for_speculative_draft else not mr.is_draft_worker
+            )
+
+        return True
 
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
@@ -414,7 +416,7 @@ class BaseRunner(ABC):
         if (
             not mr.spec_algorithm.is_speculative()
             or not mr.is_draft_worker
-            or not self._flashinfer_autotune_is_applicable()
+            or not self._should_run_flashinfer_autotune(for_speculative_draft=True)
         ):
             return
 
