@@ -32,6 +32,12 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
     (LAYERWISE_OFFLOAD_VAE_GROUP, "vae_cpu_offload"),
 )
 
+# task-type defaults for keep_resident_min_available_gb when a model does not pin
+# one: image vae is tiny so any datacenter gpu keeps it resident, video vae is
+# larger so it only stays resident on very-high-memory gpus
+IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
+DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
+
 
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
@@ -45,6 +51,17 @@ class ServerArgsAutoTuner:
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
+
+    def _resolve_keep_resident_min_available_gb(
+        self, deployment_config: ModelDeploymentConfig
+    ) -> float | None:
+        # explicit per-model > task-type default > global default
+        explicit = deployment_config.keep_resident_min_available_gb
+        if explicit is not None:
+            return explicit
+        if self.server_args.pipeline_config.task_type.is_image_gen():
+            return IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB
+        return DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
 
     def adjust_based_on_performance_mode(self) -> None:
         """Adjust the server args based on the performance mode"""
@@ -96,8 +113,8 @@ class ServerArgsAutoTuner:
 
         min_available_gb = self._get_min_available_device_memory_gb()
         deployment_config = self._deployment_config()
-        disable_threshold_gb = (
-            deployment_config.auto_disable_component_offload_min_available_memory_gb
+        disable_threshold_gb = self._resolve_keep_resident_min_available_gb(
+            deployment_config
         )
         if (
             min_available_gb is not None
@@ -105,7 +122,7 @@ class ServerArgsAutoTuner:
             and min_available_gb >= disable_threshold_gb
         ):
             changed = []
-            components = deployment_config.auto_disable_component_offload_components
+            components = deployment_config.keep_resident_components
             if (
                 args.layerwise_offload_components is not None
                 and not args.is_arg_explicitly_set("layerwise_offload_components")
@@ -400,9 +417,7 @@ class ServerArgsAutoTuner:
             return components
 
         deployment_config = self._deployment_config()
-        threshold_gb = (
-            deployment_config.auto_disable_component_offload_min_available_memory_gb
-        )
+        threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
         if threshold_gb is None:
             return components
 
@@ -410,9 +425,7 @@ class ServerArgsAutoTuner:
         if min_available_gb is None or min_available_gb < threshold_gb:
             return components
 
-        resident_components = set(
-            deployment_config.auto_disable_component_offload_components
-        )
+        resident_components = set(deployment_config.keep_resident_components)
         filtered_components = [
             component
             for component in components

@@ -20,7 +20,7 @@ class TestBenchOneBatch1GPU(CustomTestCase):
 
     def test_bs1_small(self):
         _, output_throughput, _ = run_bench_one_batch(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["--cuda-graph-max-bs", "2"]
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["--cuda-graph-max-bs-decode", "2"]
         )
         self.assertGreater(output_throughput, 50)
 
@@ -42,7 +42,7 @@ class TestBenchOneBatch1GPU(CustomTestCase):
             "1024",
             "--model-path",
             DEFAULT_MODEL_NAME_FOR_TEST,
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "2",
         ]
 

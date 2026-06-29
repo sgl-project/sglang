@@ -201,11 +201,10 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from sgl_kernel import dsv3_fused_a_gemm
-
     from sglang.jit_kernel.dsv3_router_gemm import (
         dsv3_router_gemm as _jit_dsv3_router_gemm,
     )
+    from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -497,9 +496,11 @@ class MoEGate(nn.Module):
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
+            # NOTE(b8zhong): this threshold has been empirically verified
+            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
                 _is_cuda
-                and hidden_states.shape[0] <= 16
+                and hidden_states.shape[0] <= max_router_gemm_tokens
                 and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
@@ -925,6 +926,11 @@ class DeepseekV2MoE(nn.Module):
         *,
         use_flashinfer_trtllm_bypass: bool = False,
     ) -> torch.Tensor:
+        # Note(kpham-sgl): launch the shared expert BEFORE the routed call.
+        # The routed deep_gemm pre-permute calls `dispose_tensor` which
+        # `set_()`s `hidden_states` to empty (host-side); any later kernel
+        # launch consuming `hidden_states` then captures `data_ptr() == 0`
+        # into the decode CUDA graph and replays from null.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         server_args = get_global_server_args()
@@ -933,6 +939,10 @@ class DeepseekV2MoE(nn.Module):
             if server_args.enable_eplb
             else None
         )
+        with torch.cuda.stream(self.alt_stream):
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
         if use_flashinfer_trtllm_bypass:
@@ -953,11 +963,8 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
-        has_shared_output = (
-            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
-        )
         deferred_finalize = (
-            has_shared_output
+            shared_output is not None
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
@@ -977,11 +984,6 @@ class DeepseekV2MoE(nn.Module):
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
-
-        with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
-            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -1771,11 +1773,12 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and not self.is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 256 == 0
             and _is_cuda
-            and 90 <= _device_sm < 120
+            and _device_sm >= 90
         )
+        self.fused_a_gemm_backend = "auto"
 
         self.init_mha_forward()
         self.init_mla_forward()
@@ -1989,7 +1992,9 @@ class DeepseekV2AttentionMLA(
             and not lora_active
         ):
             qkv_latent = dsv3_fused_a_gemm(
-                hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight.T,
+                backend=self.fused_a_gemm_backend,
             )
         else:
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
