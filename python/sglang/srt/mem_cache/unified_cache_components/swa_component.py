@@ -604,8 +604,8 @@ class SWAComponent(TreeComponent):
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
-        # No host SWA pool (unified_kv device-only ring).
-        if self._swa_kv_pool_host is None:
+        # unified_kv keeps SWA as a device-only ring.
+        if self._swa_kv_pool_host is None and self.cache.cache_controller is not None:
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
