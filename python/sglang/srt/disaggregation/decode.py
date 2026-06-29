@@ -1339,6 +1339,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # internal SWA tombstones (the majority of swa_evictable) are left
             # untouched — Full.drive_eviction only cascades SWA on leaves.
             allocator = self.token_to_kv_pool_allocator
+            num_to_evict = required_alloc_tokens - allocator.available_size()
             if isinstance(allocator, SWATokenToKVPoolAllocator):
                 full_num_to_evict = max(
                     0, required_alloc_tokens - allocator.full_available_size()
@@ -1352,7 +1353,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             else:
                 params = EvictParams(
-                    num_tokens=required_alloc_tokens - allocator.available_size()
+                    num_tokens=num_to_evict
                 )
             result = self.tree_cache.evict(params)
             if self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens:
