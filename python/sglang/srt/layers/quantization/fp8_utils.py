@@ -70,6 +70,18 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
+class _MXFP4QuantizedData(MXFP4QuantizeUtil):
+    def __init__(
+        self,
+        original_shape: torch.Size,
+        original_dtype: torch.dtype,
+        quantized_data: torch.Tensor,
+    ):
+        self.original_shape = original_shape
+        self.original_dtype = original_dtype
+        self.quantized_data = quantized_data
+
+
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
 # projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
 # Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
@@ -1279,9 +1291,10 @@ def quantize_block_fp8_weight_to_mxfp4(
         weight_block_size,
         torch.bfloat16,
     )
-    fp4_weight, fp4_scale = MXFP4QuantizeUtil.quantize(
+    fp4_weight, fp4_scale = _MXFP4QuantizedData.quantize(
         fp8_weight_dequant, block_size=mxfp4_block_size
     )
+    fp4_weight = fp4_weight.quantized_data
     fp4_weight = fp4_weight.contiguous().view(torch.int8)
     fp4_scale = fp4_scale.view(
         *fp8_weight_dequant.shape[:-1],
