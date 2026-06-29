@@ -77,11 +77,11 @@ def resolve_decode_backend(
             raise ValueError(
                 f"XPU only supports cuda_graph_config decode backend 'full', got '{backend_name}'"
             )
-        from sglang.srt.hardware_backend.xpu.graph_runner.xpu_cudagraph_backend import (
-            XpuCudaGraphBackend,
+        from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+            FullXPUGraphBackend,
         )
 
-        return XpuCudaGraphBackend(
+        return FullXPUGraphBackend(
             cuda_graph_runner, enable_memory_saver=enable_memory_saver
         )
 

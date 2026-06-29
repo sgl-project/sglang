@@ -1,4 +1,4 @@
-"""XpuCudaGraphBackend — Intel XPU full-graph capture (torch.xpu.XPUGraph).
+"""FullXPUGraphBackend — Intel XPU full-graph capture (torch.xpu.XPUGraph).
 
 Mirrors FullCudaGraphBackend with XPU-specific differences:
   - Captures via torch.xpu.graph(xpu_graph=...) into torch.xpu.XPUGraph.
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     )
 
 
-class XpuCudaGraphBackend(BaseCudaGraphBackend):
+class FullXPUGraphBackend(BaseCudaGraphBackend):
     """One torch.xpu.XPUGraph per shape for Intel XPU devices."""
 
     def __init__(

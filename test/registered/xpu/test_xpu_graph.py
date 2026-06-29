@@ -57,7 +57,11 @@ class TestXPUGraph(CustomTestCase):
         prefill_latency, decode_throughput, _ = run_bench_one_batch(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN, args
         )
-        self.assertIsNotNone(prefill_latency, "prefill latency should be reported")
+        self.assertGreater(
+            prefill_latency,
+            0,
+            "prefill latency must be > 0 with tc_piecewise XPU graph",
+        )
         self.assertGreater(
             decode_throughput, 0, "decode throughput must be > 0 with full XPU graph"
         )

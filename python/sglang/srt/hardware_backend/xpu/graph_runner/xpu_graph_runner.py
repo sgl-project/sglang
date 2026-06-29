@@ -134,9 +134,6 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         ), "XPUGraphRunner does not support Torch Memory Saver yet."
 
         assert (
-            not self.model_runner.server_args.enable_lora
-        ), "XPUGraphRunner does not support LoRA yet."
-        assert (
             not self.enable_two_batch_overlap
         ), "XPUGraphRunner does not support two batch overlap yet."
         assert (
@@ -151,8 +148,6 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         assert (
             model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
         ), "XPUGraphRunner does not support speculative inference yet."
-        assert self.dp_size == 1, "XPUGraphRunner does not support DP yet."
-        assert self.pp_size == 1, "XPUGraphRunner does not support PP yet."
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(
