@@ -2304,7 +2304,7 @@ class Scheduler(
                         last_hash,
                         prefix_keys,
                     )
-                    if l3_storage_hit_length <= 0:
+                    if l3_storage_hit_length < self.tree_cache.prefetch_threshold:
                         return
                     new_input_tokens = new_input_tokens[:l3_storage_hit_length]
 
