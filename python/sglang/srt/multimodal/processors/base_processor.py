@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import (
@@ -550,8 +550,8 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except ValueError as e:
-            # Bad input (e.g. invalid base64) -> 400, not 500.
+        except (ValueError, UnidentifiedImageError) as e:
+            # Bad input (e.g. invalid base64, unreadable image) -> 400, not 500.
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
@@ -917,6 +917,11 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
+            except ValueError as e:
+                # Bad input (unreadable/invalid media) -> 400, not 500.
+                raise ValueError(
+                    f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
+                ) from e
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",
@@ -1058,6 +1063,11 @@ class BaseMultimodalProcessor(ABC):
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
+            except ValueError as e:
+                # Bad input (unreadable/invalid media) -> 400, not 500.
+                raise ValueError(
+                    f"An exception occurred while loading multimodal data: {e}"
+                ) from e
             except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
