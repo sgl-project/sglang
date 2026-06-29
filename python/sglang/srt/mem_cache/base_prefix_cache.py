@@ -361,6 +361,23 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
 
+    def release_aborted_request(self, rid: str):
+        """Clean up any state associated with an aborted request.
+
+        Subclasses with prefetch or other async state (e.g., HiRadixCache)
+        should override this to terminate in-flight operations.
+
+        TEMPORARY FIX: This no-op exists to prevent an AttributeError crash
+        in disagg decode mode, where the cache is ChunkCache but
+        enable_hicache_storage is True (because --hicache-storage-backend is
+        set for decode offload). DecodeKVCacheOffloadManager is not a prefix
+        cache subclass, so abort cleanup can't be routed through this
+        interface — a separate code path in the scheduler abort logic is
+        needed. A no-op here may silently leak host memory in mooncake store.
+        See: https://github.com/sgl-project/sglang/pull/20790
+        """
+        pass
+
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
