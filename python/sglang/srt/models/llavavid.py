@@ -146,9 +146,7 @@ class LlavaVidForCausalLM(nn.Module):
                     ]
                 )
                 image_offsets = [
-                    flatten_nested_list(
-                        [item.offsets for item in image_inputs[i].mm_items]
-                    )
+                    flatten_nested_list([image_inputs[i].image_offsets])
                     for i in range(bs)
                     if need_vision[i]
                 ]

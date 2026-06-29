@@ -908,6 +908,85 @@ class VideoData:
     preprocess_kwargs: Optional[Dict] = None
 
 
+def decode_video_base64(video_base64):
+    from PIL import Image
+
+    # Decode the base64 string
+    video_bytes = pybase64.b64decode(video_base64, validate=True)
+
+    # Placeholder for the start indices of each PNG image
+    img_starts = []
+
+    frame_format = "PNG"  # str(os.getenv('FRAME_FORMAT', "JPEG"))
+
+    assert frame_format in [
+        "PNG",
+        "JPEG",
+    ], "FRAME_FORMAT must be either 'PNG' or 'JPEG'"
+
+    if frame_format == "PNG":
+        # Find each PNG start signature to isolate images
+        i = 0
+        while i < len(video_bytes) - 7:  # Adjusted for the length of the PNG signature
+            # Check if we found the start of a PNG file
+            if (
+                video_bytes[i] == 0x89
+                and video_bytes[i + 1] == 0x50
+                and video_bytes[i + 2] == 0x4E
+                and video_bytes[i + 3] == 0x47
+                and video_bytes[i + 4] == 0x0D
+                and video_bytes[i + 5] == 0x0A
+                and video_bytes[i + 6] == 0x1A
+                and video_bytes[i + 7] == 0x0A
+            ):
+                img_starts.append(i)
+                i += 8  # Skip the PNG signature
+            else:
+                i += 1
+    else:
+        # Find each JPEG start (0xFFD8) to isolate images
+        i = 0
+        while (
+            i < len(video_bytes) - 1
+        ):  # Adjusted for the length of the JPEG SOI signature
+            # Check if we found the start of a JPEG file
+            if video_bytes[i] == 0xFF and video_bytes[i + 1] == 0xD8:
+                img_starts.append(i)
+                # Move to the next byte to continue searching for the next image start
+                i += 2
+            else:
+                i += 1
+
+    frames = []
+    for start_idx in img_starts:
+        # Assuming each image is back-to-back, the end of one image is the start of another
+        # The last image goes until the end of the byte string
+        end_idx = (
+            img_starts[img_starts.index(start_idx) + 1]
+            if img_starts.index(start_idx) + 1 < len(img_starts)
+            else len(video_bytes)
+        )
+        img_bytes = video_bytes[start_idx:end_idx]
+
+        # Convert bytes to a PIL Image
+        img = Image.open(BytesIO(img_bytes))
+
+        # Convert PIL Image to a NumPy array
+        frame = np.array(img)
+
+        # Append the frame to the list of frames
+        frames.append(frame)
+
+    # Ensure there's at least one frame to avoid errors with np.stack
+    if frames:
+        return np.stack(frames, axis=0), img.size
+    else:
+        return np.array([]), (
+            0,
+            0,
+        )  # Return an empty array and size tuple if no frames were found
+
+
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 
@@ -980,6 +1059,9 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("data:"):
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("video:"):
+        image_file = image_file.replace("video:", "")
+        image, image_size = decode_video_base64(image_file)
     elif isinstance(
         image_file, str
     ):  # Other formats, try to decode as base64 by default
