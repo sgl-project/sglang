@@ -919,21 +919,19 @@ class SelfBenchmark:
         }
 
     def _rank_output_path(self, base_path: str) -> str:
+        # The consumer addresses rank files by DP rank only: dp_rank 0 writes the
+        # caller-assigned base path, dp_rank N writes the "_dpN" sibling. We keep
+        # the filename to exactly that contract and carry the full
+        # role/rank/run identity inside the file (see _build_output_identity), so
+        # a consumer validates provenance from contents rather than parsing a
+        # brittle path suffix. Co-located workers (e.g. disagg prefill/decode)
+        # are kept distinct by the caller assigning a unique base path per
+        # worker, not by namespacing the filename here.
+        dp_rank = self._rank_value("dp_rank", default=0)
+        if dp_rank == 0:
+            return base_path
         stem, ext = os.path.splitext(base_path)
-        return f"{stem}_{self._output_path_suffix()}{ext}"
-
-    def _output_path_suffix(self) -> str:
-        parts = [
-            ("role", self._role_name()),
-            ("node", getattr(self.scheduler.server_args, "node_rank", 0)),
-            ("dp", self._rank_value("dp_rank", default=0)),
-            ("tp", self._rank_value("tp_rank", default=0)),
-            ("atp", self._rank_value("attn_tp_rank", default=0)),
-            ("acp", self._rank_value("attn_cp_rank", default=0)),
-        ]
-        return "_".join(
-            f"{name}-{self._sanitize_path_part(value)}" for name, value in parts
-        )
+        return f"{stem}_dp{dp_rank}{ext}"
 
     def _role_name(self) -> str:
         role = getattr(self.scheduler, "disaggregation_mode", DisaggregationMode.NULL)
@@ -942,9 +940,3 @@ class SelfBenchmark:
     def _rank_value(self, name: str, *, default: int) -> int:
         value = getattr(self.scheduler.ps, name, default)
         return default if value is None else value
-
-    @staticmethod
-    def _sanitize_path_part(value) -> str:
-        return "".join(
-            ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value)
-        )
