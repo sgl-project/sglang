@@ -838,9 +838,17 @@ impl PDRouter {
                 }
             }
             Err(e) => {
+                let mut error_chain = Vec::new();
+                let mut source = std::error::Error::source(&e);
+                while let Some(err) = source {
+                    error_chain.push(err.to_string());
+                    source = err.source();
+                }
+                let error_chain = error_chain.join(" | caused by: ");
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
+                    error_chain = %error_chain,
                     "Decode request failed"
                 );
                 // Decode failed at TCP/transport level. No tracked
@@ -1203,10 +1211,18 @@ impl PDRouter {
         let prefill_response = match prefill_result {
             Ok(response) => response,
             Err(e) => {
+                let mut error_chain = Vec::new();
+                let mut source = std::error::Error::source(&e);
+                while let Some(err) = source {
+                    error_chain.push(err.to_string());
+                    source = err.source();
+                }
+                let error_chain = error_chain.join(" | caused by: ");
                 error!(
-                    "Prefill server failed (CRITICAL) prefill_url={} error={}. Decode will timeout without prefill KV cache.",
-                    prefill_url,
-                    e
+                    prefill_url = %prefill_url,
+                    error = %e,
+                    error_chain = %error_chain,
+                    "Prefill server failed (CRITICAL). Decode will timeout without prefill KV cache."
                 );
 
                 // Return error immediately - don't wait for decode to timeout
