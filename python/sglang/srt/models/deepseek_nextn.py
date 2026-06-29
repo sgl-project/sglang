@@ -24,6 +24,7 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.fused_eh_norm import fused_eh_norm
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
@@ -196,19 +197,27 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = input_embeds
 
             if hidden_states.shape[0] > 0:
-                eh_input = torch.cat(
-                    (
-                        self.enorm(hidden_states),
-                        self.hnorm(
-                            forward_batch.spec_info.hidden_states
-                            if self.rot_weight is None
-                            else torch.matmul(
-                                forward_batch.spec_info.hidden_states, self.rot_weight
-                            )
+                previous_hidden_states = forward_batch.spec_info.hidden_states
+                if self.rot_weight is not None:
+                    previous_hidden_states = torch.matmul(
+                        previous_hidden_states, self.rot_weight
+                    )
+                if _is_cuda:
+                    eh_input = fused_eh_norm(
+                        hidden_states,
+                        previous_hidden_states,
+                        self.enorm.weight,
+                        self.hnorm.weight,
+                        self.enorm.variance_epsilon,
+                    )
+                else:
+                    eh_input = torch.cat(
+                        (
+                            self.enorm(hidden_states),
+                            self.hnorm(previous_hidden_states),
                         ),
-                    ),
-                    dim=-1,
-                )
+                        dim=-1,
+                    )
                 if isinstance(self.eh_proj, ReplicatedLinear):
                     hidden_states, _ = self.eh_proj(eh_input)
                 else:
