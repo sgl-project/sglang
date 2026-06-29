@@ -142,24 +142,37 @@ def sdpa_attention(
     """
     # Unified format legal check
     assert q.dim() == k.dim() == v.dim() == 3, "q, k, v must have 3 dims"
+
+    # Fast path for a single packed segment.
+    if q_cu_seqlens is None or len(q_cu_seqlens) <= 2:
+        q_ = q.transpose(0, 1).unsqueeze(0)
+        k_ = k.transpose(0, 1).unsqueeze(0)
+        v_ = v.transpose(0, 1).unsqueeze(0)
+        attn_output = F.scaled_dot_product_attention(q_, k_, v_, dropout_p=0.0)
+        return attn_output.squeeze(0).transpose(0, 1).reshape(q.shape[0], -1)
+
     assert q_cu_seqlens[-1] == q.shape[0], "q_cu_seqlens must sum to q.shape[0]"
-    seq_length = q.shape[0]
-    attention_mask = torch.zeros(
-        [1, seq_length, seq_length], device=q.device, dtype=torch.bool
-    )
+    assert (
+        k_cu_seqlens is not None and k_cu_seqlens[-1] == k.shape[0]
+    ), "k_cu_seqlens must sum to k.shape[0]"
+    assert len(q_cu_seqlens) == len(
+        k_cu_seqlens
+    ), "q_cu_seqlens and k_cu_seqlens must have the same batch size"
+
+    # Memory-safe path: compute SDPA segment-by-segment. Building a single
+    # (sum(L_i), sum(L_i)) block mask can trigger OOM when multiple images
+    # are packed together because memory scales with total_length^2.
+    outputs = []
     for i in range(1, len(q_cu_seqlens)):
-        attention_mask[
-            ...,
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-        ] = True
-    q = q.transpose(0, 1)
-    k = k.transpose(0, 1)
-    v = v.transpose(0, 1)
-    attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
-    attn_output = attn_output.transpose(0, 1)
-    attn_output = attn_output.reshape(seq_length, -1)
-    return attn_output
+        q_start, q_end = q_cu_seqlens[i - 1].item(), q_cu_seqlens[i].item()
+        k_start, k_end = k_cu_seqlens[i - 1].item(), k_cu_seqlens[i].item()
+        q_i = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+        k_i = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        v_i = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        out_i = F.scaled_dot_product_attention(q_i, k_i, v_i, dropout_p=0.0)
+        outputs.append(out_i.squeeze(0).transpose(0, 1))
+
+    return torch.cat(outputs, dim=0).reshape(q.shape[0], -1)
 
 
 VL_VISION_ATTENTION_FUNCTIONS = {
