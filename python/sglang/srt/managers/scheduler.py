@@ -3253,7 +3253,8 @@ class Scheduler(
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
                                 batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob, return_hidden_states=batch.return_hidden_states,
+                                    return_logprob=batch.return_logprob,
+                                    return_hidden_states=batch.return_hidden_states,
                                 )
                             else:
                                 # Result D2H on copy_stream overlaps the next forward
