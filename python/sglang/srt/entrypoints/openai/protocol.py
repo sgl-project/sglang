@@ -1018,9 +1018,10 @@ class DeltaMessage(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        if self.hidden_states is None:
-            data.pop("hidden_states", None)
-        return data
+        # Exclude None fields from delta messages to comply with the OpenAI
+        # streaming spec.  Without this, reasoning-content chunks would emit
+        # "role": null, "content": null which breaks OpenAI-compatible clients.
+        return {k: v for k, v in data.items() if v is not None}
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
