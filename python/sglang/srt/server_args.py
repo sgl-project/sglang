@@ -1947,6 +1947,27 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # FlexKV
+    # -------------------------------------------------------------------------
+    enable_flexkv: A[
+        bool,
+        (
+            "Route the default RadixCache through FlexKV's KVManager for "
+            "host-tier (CPU / SSD / Remote) KV cache offload. Equivalent "
+            "to --radix-cache-backend=flexkv but also participates in the "
+            "auto-selection chain alongside --enable-lmcache."
+        ),
+    ] = False
+    flexkv_config_file: A[
+        Optional[str],
+        (
+            "Path to the FlexKV YAML / JSON configuration file. "
+            "Equivalent to setting the FLEXKV_CONFIG_PATH environment "
+            "variable."
+        ),
+    ] = None
+
+    # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
     # -------------------------------------------------------------------------
     kt_weight_path: A[
@@ -6305,6 +6326,11 @@ class ServerArgs:
                     "LMCache is disabled because of using diffusion LLM inference"
                 )
                 self.enable_lmcache = False
+            if self.enable_flexkv:
+                logger.warning(
+                    "FlexKV is disabled because of using diffusion LLM inference"
+                )
+                self.enable_flexkv = False
 
         if self.pp_size > 1:
             logger.warning(
@@ -6686,6 +6712,7 @@ class ServerArgs:
             help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
             "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
+
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
