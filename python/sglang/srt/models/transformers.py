@@ -71,6 +71,33 @@ from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
 
+# Newer Transformers dropped the 'default' key from ROPE_INIT_FUNCTIONS but some
+# trust_remote_code model implementations still reference it.  Inject a standard
+# no-scaling implementation so those models can initialize without a KeyError.
+try:
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE_FUNCS
+
+    if "default" not in _ROPE_FUNCS:
+        import torch as _torch
+
+        def _default_rope_init(config=None, device=None, **kwargs):
+            head_dim = getattr(config, "head_dim", None) or (
+                config.hidden_size // config.num_attention_heads
+            )
+            base = getattr(config, "rope_theta", 10000.0)
+            inv_freq = 1.0 / (
+                base
+                ** (
+                    _torch.arange(0, head_dim, 2, dtype=_torch.float32, device=device)
+                    / head_dim
+                )
+            )
+            return inv_freq, 1.0
+
+        _ROPE_FUNCS["default"] = _default_rope_init
+except Exception:
+    pass
+
 
 def can_enable_torch_compile(config: PretrainedConfig) -> bool:
     """Check whether the model config is compatible with torch.compile.
@@ -610,15 +637,47 @@ class TransformersBase(nn.Module):
             else True
         )
 
+        # Some model configs (e.g. OuroConfig, Step3TextConfig) omit pad_token_id
+        # entirely — their remote __init__ accesses it directly and raises
+        # AttributeError.  Fall back to bos_token_id (Transformers convention).
+        for _cfg in (self.config, self.text_config):
+            if not hasattr(_cfg, "pad_token_id"):
+                _cfg.pad_token_id = getattr(_cfg, "bos_token_id", None)
+
         # Initialize on meta device to avoid premature GPU allocation
         self.text_config._attn_implementation = "sglang"
         if supports_backend:
             with _init_on_device_without_buffers(torch.device("meta")):
-                self.model: PreTrainedModel = AutoModel.from_config(
-                    self.config,
-                    torch_dtype=torch.get_default_dtype(),
-                    trust_remote_code=True,
-                )
+                try:
+                    self.model: PreTrainedModel = AutoModel.from_config(
+                        self.config,
+                        torch_dtype=torch.get_default_dtype(),
+                        trust_remote_code=True,
+                    )
+                except ValueError as _e:
+                    if "Unrecognized configuration class" not in str(_e):
+                        raise
+                    # Some VLM configs (e.g. Molmo2Config) are only registered
+                    # under a task-specific auto class ("AutoModelForImageTextToText")
+                    # rather than the base AutoModel.  Try the first matching class.
+                    _auto_map = getattr(self.config, "auto_map", {})
+                    _auto_cls_name = next(
+                        (k for k in _auto_map if k.startswith("AutoModelFor")), None
+                    )
+                    if _auto_cls_name is None:
+                        raise
+                    import importlib as _imp
+
+                    _auto_cls = getattr(
+                        _imp.import_module("transformers"), _auto_cls_name, None
+                    )
+                    if _auto_cls is None:
+                        raise
+                    self.model = _auto_cls.from_config(
+                        self.config,
+                        torch_dtype=torch.get_default_dtype(),
+                        trust_remote_code=True,
+                    )
         else:
             raise ValueError(
                 f"Model {model_cls} does not support custom attention backends "
@@ -626,11 +685,18 @@ class TransformersBase(nn.Module):
                 "requires custom attention support."
             )
 
-        self.vocab_size = getattr(
-            self.text_config,
-            "vocab_size",
-            self.model.get_input_embeddings().num_embeddings,
-        )
+        # Lazy vocab_size: avoid calling .num_embeddings directly since some VLMs
+        # (e.g. Molmo2) use custom embedding classes without that attribute.
+        _tc_vocab = getattr(self.text_config, "vocab_size", None)
+        if _tc_vocab is not None:
+            self.vocab_size = _tc_vocab
+        else:
+            _embed = self.model.get_input_embeddings()
+            self.vocab_size = (
+                getattr(_embed, "num_embeddings", None)
+                or getattr(getattr(_embed, "new_embedding", None), "num_embeddings", None)
+                or getattr(self.config, "vocab_size", None)
+            )
         self.unpadded_vocab_size = self.vocab_size
 
         # Embedding scale (e.g. Whisper)
