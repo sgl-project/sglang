@@ -7,6 +7,8 @@ prefill regime (n_groups=1): the attention tile is tiny (M=16 heads = one
 coordination overhead of the 256-thread TileLang block.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -33,6 +35,23 @@ _AUTOTUNE_CONFIGS = [
     for w in (1, 2, 4)
     for ns in (1, 2)
 ]
+
+# SM120: the 18-config autotune sweep (nvcc compile + benchmark of every config,
+# on every DP rank at once) overruns the 300s scheduler watchdog on the first
+# prefill. A *single* config means triton skips benchmarking and compiles once.
+# Env-tunable if you want to try other tiles. Off-SM120 keeps the full sweep.
+try:
+    from sglang.srt.utils import is_sm120_supported as _is_sm120_supported
+
+    if _is_sm120_supported():
+        _bn = int(os.environ.get("SGLANG_SM120_DSA_ATTN_BLOCK_N", "64"))
+        _w = int(os.environ.get("SGLANG_SM120_DSA_ATTN_WARPS", "4"))
+        _ns = int(os.environ.get("SGLANG_SM120_DSA_ATTN_STAGES", "2"))
+        _AUTOTUNE_CONFIGS = [
+            triton.Config({"BLOCK_N": _bn}, num_warps=_w, num_stages=_ns)
+        ]
+except Exception:  # noqa: BLE001
+    pass
 
 
 @triton.autotune(
