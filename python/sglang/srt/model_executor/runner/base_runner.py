@@ -302,13 +302,7 @@ class BaseRunner(ABC):
             "modelopt_fp8",
             "modelopt_mixed",
         )
-        # Online MXFP8 (microscaling) linears dispatch to flashinfer's
-        # ``mm_mxfp8``, which the flashinfer fp8 autotune dummy run does not
-        # exercise correctly -- it triggers an illegal memory access inside the
-        # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
-        # tuning, so skip autotune for these models.
-        model_uses_mxfp8 = "mxfp8" in (mr.model_config.quantization or "")
-        fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
+        fp8_gemm_needs_autotune = (
             get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
             or (model_uses_modelopt_fp8 and is_sm100_supported())
         )
@@ -363,7 +357,8 @@ class BaseRunner(ABC):
         with torch.get_device_module(mr.device).stream(mr.forward_stream):
             with (
                 torch.inference_mode(),
-                autotune(True, cache=str(autotune_cache)),
+                # Autotuning mxfp8_gemm hits an IMA; skip it.
+                autotune(True, cache=str(autotune_cache), skip_ops={"mxfp8_gemm"}),
                 autotune_dummy_run_mode(),
             ):
                 self._dummy_run(batch_size=batch_size, buffers=buffers)
