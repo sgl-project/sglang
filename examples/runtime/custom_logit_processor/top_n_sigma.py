@@ -62,7 +62,8 @@ class TopNSigmaLogitProcessor(CustomLogitProcessor):
             if not params:
                 continue
             n = params.get("top_n_sigma")
-            if n is None or not isinstance(n, (int, float)) or n <= 0:
+            # bool is an int subclass; reject it so top_n_sigma=True isn't read as 1.0.
+            if isinstance(n, bool) or not isinstance(n, (int, float)) or n <= 0:
                 continue
             n_sigmas[i] = n
             process_mask[i] = True
@@ -71,11 +72,13 @@ class TopNSigmaLogitProcessor(CustomLogitProcessor):
             return logits
 
         n_sigmas_t = torch.tensor(n_sigmas, device=logits.device, dtype=logits.dtype)
-        process_mask_t = torch.tensor(process_mask, device=logits.device, dtype=torch.bool)
+        process_mask_t = torch.tensor(
+            process_mask, device=logits.device, dtype=torch.bool
+        )
 
         # Compute std and max once over the full tensor (no row copies).
         std_all = logits.std(dim=-1, keepdim=True)
-        max_logits = logits.max(dim=-1, keepdim=True).values
+        max_logits = logits.amax(dim=-1, keepdim=True)
 
         # Build a combined mask: only rows that are (a) in the process list,
         # (b) have all-finite logits, and (c) have non-zero std.
@@ -84,9 +87,7 @@ class TopNSigmaLogitProcessor(CustomLogitProcessor):
         guard_mask = process_mask_t.unsqueeze(-1) & finite_mask & nonzero_std_mask
 
         thresholds = max_logits - n_sigmas_t.unsqueeze(-1) * std_all
-        logits.masked_fill_(
-            (logits < thresholds) & guard_mask, float("-inf")
-        )
+        logits.masked_fill_((logits < thresholds) & guard_mask, float("-inf"))
         return logits
 
 
@@ -109,13 +110,15 @@ def run_generate():
 
 
 def run_openai():
-    """OpenAI-compatible chat completions endpoint."""
+    """OpenAI-compatible chat completions, with and without top-nσ."""
     import openai
 
     client = openai.OpenAI(base_url=url + "/v1", api_key="None")
-    response = client.chat.completions.create(
+    messages = [{"role": "user", "content": "List 3 countries and their capitals."}]
+
+    filtered = client.chat.completions.create(
         model="default",
-        messages=[{"role": "user", "content": "List 3 countries and their capitals."}],
+        messages=messages,
         temperature=0.8,
         max_tokens=32,
         extra_body={
@@ -124,7 +127,17 @@ def run_openai():
         },
     )
     print("\n=== OpenAI chat with top_n_sigma=2.0 ===")
-    print(response.choices[0].message.content)
+    print(filtered.choices[0].message.content)
+
+    # Omit the processor to fall back to standard sampling.
+    plain = client.chat.completions.create(
+        model="default",
+        messages=messages,
+        temperature=0.8,
+        max_tokens=32,
+    )
+    print("\n=== OpenAI chat without top-nσ (baseline) ===")
+    print(plain.choices[0].message.content)
 
 
 if __name__ == "__main__":
