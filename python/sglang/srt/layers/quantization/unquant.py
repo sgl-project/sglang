@@ -340,8 +340,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
-                new_weight = origin_weight.contiguous()
-                weight.data = npu_format_cast(new_weight)
+                weight.data = npu_format_cast(weight)
 
         return
 
