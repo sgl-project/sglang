@@ -27,6 +27,8 @@
 #include <torch/cuda.h>
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 #define CHECK_TYPE(x, st) \
   TORCH_CHECK(x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
@@ -127,14 +129,14 @@ __global__ void fusedQKNormRopeKernel(
   int const laneId = threadIdx.x % 32;
 
   // Calculate global warp index to determine which head/token this warp processes
-  int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+  int64_t const globalWarpIdx = static_cast<int64_t>(blockIdx.x) * warpsPerBlock + warpId;
 
   // Total number of attention heads (Q and K)
   int const total_qk_heads = num_heads_q + num_heads_k;
 
   // Determine which token and head type (Q or K) this warp processes
-  int const tokenIdx = globalWarpIdx / total_qk_heads;
-  int const localHeadIdx = globalWarpIdx % total_qk_heads;
+  int64_t const tokenIdx = globalWarpIdx / total_qk_heads;
+  int const localHeadIdx = static_cast<int>(globalWarpIdx % total_qk_heads);
 
   // Skip if this warp is assigned beyond the number of tokens
   if (tokenIdx >= num_tokens) return;
@@ -153,15 +155,16 @@ __global__ void fusedQKNormRopeKernel(
   constexpr int vecSize = elemSizeBytes / 4;  // Use packed_as<uint, vecSize> to perform loading/saving.
   using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
 
-  int offsetWarp;  // Offset for the warp
+  int64_t offsetWarp;  // Offset for the warp
   if (isQ) {
     // Q segment: token offset + head offset within Q segment
-    offsetWarp = tokenIdx * num_heads * head_dim + headIdx * head_dim;
+    offsetWarp = tokenIdx * num_heads * head_dim + static_cast<int64_t>(headIdx) * head_dim;
   } else {
     // K segment: token offset + entire Q segment + head offset within K segment
-    offsetWarp = tokenIdx * num_heads * head_dim + num_heads_q * head_dim + headIdx * head_dim;
+    offsetWarp = tokenIdx * num_heads * head_dim + static_cast<int64_t>(num_heads_q) * head_dim +
+                 static_cast<int64_t>(headIdx) * head_dim;
   }
-  int offsetThread = offsetWarp + laneId * numElemsPerThread;
+  int64_t offsetThread = offsetWarp + laneId * numElemsPerThread;
 
   // Sum of squares for RMSNorm
   float sumOfSquares = 0.0f;
@@ -283,9 +286,10 @@ void launchFusedQKNormRope(
   constexpr int blockSize = 256;
   int const warpsPerBlock = blockSize / 32;
   int const totalQKHeads = num_heads_q + num_heads_k;
-  int const totalWarps = num_tokens * totalQKHeads;
-  int const gridSize = common::divUp(totalWarps, warpsPerBlock);
-  dim3 gridDim(gridSize);
+  int64_t const totalWarps = static_cast<int64_t>(num_tokens) * totalQKHeads;
+  int64_t const gridSize = common::divUp(totalWarps, static_cast<int64_t>(warpsPerBlock));
+  TORCH_CHECK(gridSize <= std::numeric_limits<uint32_t>::max(), "fused_qk_norm_rope grid size exceeds uint32_t");
+  dim3 gridDim(static_cast<uint32_t>(gridSize));
   dim3 blockDim(blockSize);
   // Head dimensions should be a multiple of 64
   // Add more cases as needed
