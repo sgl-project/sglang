@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -220,6 +221,7 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
             residual = None
+            index_topk_share = IndexTopKShareState.from_forward_batch(forward_batch)
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states, residual, topk_indices = self.decoder(
                     positions,
@@ -227,14 +229,9 @@ class DeepseekModelNextN(nn.Module):
                     forward_batch,
                     residual,
                     zero_allocator,
-                    prev_topk_indices=(
-                        forward_batch.topk_indices
-                        if forward_batch.reuse_mtp_topk_indices
-                        else None
-                    ),
+                    prev_topk_indices=index_topk_share.prev_topk_indices(),
                 )
-                if forward_batch.reuse_mtp_topk_indices:
-                    forward_batch.topk_indices = topk_indices
+                index_topk_share.store_topk_indices(topk_indices)
 
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:

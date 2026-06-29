@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -610,86 +611,93 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
-        if self.index_share_for_mtp_iteration:
-            forward_batch.reuse_mtp_topk_indices = True
-            forward_batch.topk_indices = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+        # enable_mtp_iteration guarantees reuse_mtp_topk_indices / topk_indices
+        # are cleared on the way out even if a draft step raises.
+        index_topk_share_cm = (
+            IndexTopKShareState.enable_mtp_iteration(forward_batch)
+            if self.index_share_for_mtp_iteration
+            else contextlib.nullcontext()
+        )
+        with index_topk_share_cm:
+            for i in range(self.speculative_num_steps):
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
+                # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+                if i == self.speculative_num_steps - 1:
+                    break
 
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-            # argument must be contiguous.
-            if (
-                self.draft_runner.model_config.hf_config.architectures[0]
-                == "Qwen3MoeForCausalLMMTP"
-            ):
-                out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            spec_info.hidden_states = hidden_states
+                # Set inputs
+                forward_batch.input_ids = input_ids
+                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
+                # argument must be contiguous.
+                if (
+                    self.draft_runner.model_config.hf_config.architectures[0]
+                    == "Qwen3MoeForCausalLMMTP"
+                ):
+                    out_cache_loc = out_cache_loc.contiguous()
+                forward_batch.out_cache_loc = out_cache_loc[i]
+                spec_info.hidden_states = hidden_states
 
-            # Run forward under a per-step ForwardContext so the model layer
-            # reads attn_backends[i] for the i-th draft step, plus a canary
-            # index context so canary tracks which draft step is active.
-            canary_index_ctx = (
-                c.with_active_single_forward_manager(i)
-                if (c := self.draft_runner.canary_manager) is not None
-                else contextlib.nullcontext()
-            )
-            with (
-                forward_context(
-                    ForwardContext(
-                        attn_backend=self.draft_attn_backend.attn_backends[i]
+                # Run forward under a per-step ForwardContext so the model layer
+                # reads attn_backends[i] for the i-th draft step, plus a canary
+                # index context so canary tracks which draft step is active.
+                canary_index_ctx = (
+                    c.with_active_single_forward_manager(i)
+                    if (c := self.draft_runner.canary_manager) is not None
+                    else contextlib.nullcontext()
+                )
+                with (
+                    forward_context(
+                        ForwardContext(
+                            attn_backend=self.draft_attn_backend.attn_backends[i]
+                        )
+                    ),
+                    canary_index_ctx,
+                ):
+                    logits_output = self.draft_runner.forward(
+                        forward_batch
+                    ).logits_output
+                maybe_detect_nan(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                maybe_detect_inf(
+                    logits_output.next_token_logits, f"draft_forward step {i}"
+                )
+                if self.server_args.speculative_use_rejection_sampling:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        self.server_args.speculative_use_rejection_sampling,
                     )
-                ),
-                canary_index_ctx,
-            ):
-                logits_output = self.draft_runner.forward(forward_batch).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            maybe_detect_inf(logits_output.next_token_logits, f"draft_forward step {i}")
-            if self.server_args.speculative_use_rejection_sampling:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
+                    topk_p, topk_index = fast_sample(probs, num_samples=1)
+                    draft_probs_list.append(probs)
+                elif self.topk == 1 and not _is_hip:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                else:
+                    probs = renorm_draft_probs(
+                        logits_output.next_token_logits,
+                        forward_batch.sampling_info,
+                        self.server_args.speculative_use_rejection_sampling,
+                    )
+                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
                 )
-                topk_p, topk_index = fast_sample(probs, num_samples=1)
-                draft_probs_list.append(probs)
-            elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
-                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-            else:
-                probs = renorm_draft_probs(
-                    logits_output.next_token_logits,
-                    forward_batch.sampling_info,
-                    self.server_args.speculative_use_rejection_sampling,
-                )
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
-            forward_batch.positions.add_(1)
-
-        if self.index_share_for_mtp_iteration:
-            forward_batch.topk_indices = None
-            forward_batch.reuse_mtp_topk_indices = False
+                if self.hot_token_id is not None:
+                    topk_index = self.hot_token_id[topk_index]
+                hidden_states = logits_output.hidden_states
+                forward_batch.positions.add_(1)
 
         # Organize the results
         if (
