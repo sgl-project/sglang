@@ -52,6 +52,29 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+def _causal_depthwise_conv1d(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Deterministic causal depthwise conv1d without cuDNN.
+
+    Args:
+        x: [B, D, L] input tensor (fp32)
+        weight: [D, 1, K] depthwise conv kernel
+        bias: optional [D] bias
+
+    Returns: [B, D, L] convolution output
+    """
+    K = weight.shape[2]
+    x_padded = F.pad(x, (K - 1, 0))
+    L = x.shape[2]
+    out = x_padded[:, :, 0:L] * weight[:, 0, 0].view(1, -1, 1)
+    for k in range(1, K):
+        out = out + x_padded[:, :, k : k + L] * weight[:, 0, k].view(1, -1, 1)
+    if bias is not None:
+        out = out + bias.view(1, -1, 1)
+    return out
+
+
 def torch_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,
@@ -526,16 +549,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             if is_batch_invariant_mode_enabled():
                 dim, total_len = mixed_qkv.shape
-                width = layer.conv_weights.shape[1]
-                padding = width - 1
-                x = mixed_qkv.unsqueeze(0).float()
-                conv_out = F.conv1d(
-                    input=x,
-                    weight=layer.conv_weights.unsqueeze(1).float(),
-                    bias=layer.bias.float() if layer.bias is not None else None,
-                    padding=padding,
-                    groups=dim,
-                )
+                x = mixed_qkv.unsqueeze(0).float().contiguous()
+                weight = layer.conv_weights.unsqueeze(1).float()
+                bias = layer.bias.float() if layer.bias is not None else None
+                conv_out = _causal_depthwise_conv1d(x, weight, bias)
                 mixed_qkv = F.silu(conv_out[..., :total_len]).to(mixed_qkv.dtype).squeeze(0).transpose(0, 1)[:seq_len]
             else:
                 mixed_qkv = causal_conv1d_fn(
