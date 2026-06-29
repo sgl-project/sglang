@@ -15,8 +15,20 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 NUM_VIDEO_FRAMES = 8
+
+
+def _to_numpy_frame(frame: Any) -> Any:
+    """Convert a single video frame to numpy if it is a legacy decord frame.
+
+    Decord frames expose a callable ``asnumpy()``; numpy / PIL frames do not and are
+    returned unchanged. ``getattr`` + ``callable`` avoids mistaking a non-callable
+    ``asnumpy`` attribute for a converter and evaluates the attribute only once.
+    """
+    converter = getattr(frame, "asnumpy", None)
+    return converter() if callable(converter) else frame
 
 
 class NVILAMultimodalProcessor(BaseMultimodalProcessor):
@@ -63,7 +75,18 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
         )
 
         for i, video in enumerate(base_output.videos):  # type: ignore
-            base_output.videos[i] = [x.asnumpy() for x in video]  # type: ignore
+            # `load_video` yields a VideoDecoderWrapper (decoded file/URL/bytes) or a
+            # caller-supplied list/tuple of frames; materialize only those to numpy frames.
+            # Legacy decord frames expose a callable `.asnumpy()`; numpy frames pass through
+            # `_to_numpy_frame` unchanged. The old `[x.asnumpy() for x in video]` assumed
+            # decord and raised AttributeError on the wrapper's numpy frames. The positive
+            # check leaves everything else untouched -- a whole-clip ndarray/torch.Tensor, a
+            # preprocessed dict, or a `None` placeholder -- since iterating those would slice
+            # an array into rows, reduce a dict to its keys, or raise on `None`.
+            if isinstance(video, (VideoDecoderWrapper, list, tuple)):
+                base_output.videos[i] = [  # type: ignore
+                    _to_numpy_frame(frame) for frame in video
+                ]
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output,
