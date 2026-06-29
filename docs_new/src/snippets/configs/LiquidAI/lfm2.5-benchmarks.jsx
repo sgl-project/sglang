@@ -49,6 +49,16 @@ export const benchmarks = [
     ],
   },
   {
+    match: { hw: "h100", variant: "230m", quant: "bf16", strategy: "default", nodes: "single" },
+    sglang_version: "0.0.0.dev1+g631db6c75",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 10 },
+        ttft_ms: 23.74, tpot_ms: 1.77, tokens_per_sec_per_gpu: 546.07 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100, num_prompts: 1000 },
+        ttft_ms: 1128.14, tpot_ms: 4.54, tokens_per_sec_per_gpu: 14280.32 },
+    ],
+  },
+  {
     match: { hw: "h100", variant: "jp", quant: "bf16", strategy: "default", nodes: "single" },
     sglang_version: "0.0.0.dev1+g631db6c75",
     speed: [
@@ -122,6 +132,16 @@ export const benchmarks = [
     ],
   },
   {
+    match: { hw: "h200", variant: "230m", quant: "bf16", strategy: "default", nodes: "single" },
+    sglang_version: "0.0.0.dev1+g631db6c75",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 10 },
+        ttft_ms: 18.74, tpot_ms: 1.74, tokens_per_sec_per_gpu: 561.43 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100, num_prompts: 1000 },
+        ttft_ms: 458.07, tpot_ms: 4.47, tokens_per_sec_per_gpu: 17892.27 },
+    ],
+  },
+  {
     match: { hw: "h200", variant: "jp", quant: "bf16", strategy: "default", nodes: "single" },
     sglang_version: "0.0.0.dev1+g631db6c75",
     speed: [
@@ -192,6 +212,16 @@ export const benchmarks = [
         ttft_ms: 12.18, tpot_ms: 0.91, tokens_per_sec_per_gpu: 1065.73 },
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100, num_prompts: 1000 },
         ttft_ms: 1177.6, tpot_ms: 1.92, tokens_per_sec_per_gpu: 22636.7 },
+    ],
+  },
+  {
+    match: { hw: "b200", variant: "230m", quant: "bf16", strategy: "default", nodes: "single" },
+    sglang_version: "0.0.0.dev1+g631db6c75",
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 10 },
+        ttft_ms: 12.28, tpot_ms: 0.84, tokens_per_sec_per_gpu: 1158.08 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100, num_prompts: 1000 },
+        ttft_ms: 1550.61, tpot_ms: 1.93, tokens_per_sec_per_gpu: 19205.62 },
     ],
   },
   {
