@@ -312,6 +312,11 @@ class QuarkConfig(QuantizationConfig):
         if weight_quant is None or input_quant is None:
             return False
 
+        # Quark quantization config uses a multi-stage (list) spec,
+        # so bail out here instead of calling dict methods on a list in the next check.
+        if not isinstance(weight_quant, dict) or not isinstance(input_quant, dict):
+            return False
+
         # Confirm weight scheme is supported
         is_fp8_dtype = (
             weight_quant.get("dtype") == "fp8_e4m3"
@@ -344,6 +349,13 @@ class QuarkConfig(QuantizationConfig):
             logger.debug(
                 "Quark model is not in MX-FP4 format: "
                 "weight_quant or input_quant not set"
+            )
+            return False
+
+        if not isinstance(weight_quant, dict) or not isinstance(input_quant, dict):
+            logger.debug(
+                "Quark model is not in MX-FP4 format: "
+                "weight_quant or input_quant is a multi-stage (list) spec"
             )
             return False
 
@@ -499,7 +511,11 @@ class QuarkConfig(QuantizationConfig):
         elif self._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoE(weight_config, input_config)
         else:
-            raise RuntimeError("Unsupported FusedMoe scheme")
+            raise RuntimeError(
+                "Unsupported Quark FusedMoE scheme. "
+                f"Weight config: {weight_config}, "
+                f"Input config: {input_config}"
+            )
 
     def get_scaled_act_names(self) -> List[str]:
         return []
