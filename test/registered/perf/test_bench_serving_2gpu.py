@@ -17,6 +17,15 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=721, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=1450, suite="stage-b-test-2-gpu-large-amd")
 
+AMD_WATCHDOG_TIMEOUT = "1200"
+
+
+def _amd_watchdog_args():
+    if not is_in_amd_ci():
+        return []
+    # MI300 CI hit the hard watchdog during ROCm compile/capture.
+    return ["--watchdog-timeout", AMD_WATCHDOG_TIMEOUT]
+
 
 class TestBenchServing2GPU(CustomTestCase):
     def test_moe_offline_throughput_default(self):
@@ -24,7 +33,7 @@ class TestBenchServing2GPU(CustomTestCase):
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
             num_prompts=300,
             request_rate=float("inf"),
-            other_server_args=["--tp", "2"],
+            other_server_args=["--tp", "2"] + _amd_watchdog_args(),
         )
 
         if is_in_ci():
@@ -42,7 +51,12 @@ class TestBenchServing2GPU(CustomTestCase):
             model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
             num_prompts=300,
             request_rate=float("inf"),
-            other_server_args=["--tp", "2", "--disable-radix-cache"],
+            other_server_args=[
+                "--tp",
+                "2",
+                "--disable-radix-cache",
+            ]
+            + _amd_watchdog_args(),
         )
 
         if is_in_ci():
@@ -62,7 +76,7 @@ class TestBenchServing2GPU(CustomTestCase):
             request_rate=float("inf"),
             random_input_len=1,
             random_output_len=1024,
-            other_server_args=["--pp-size", "2"],
+            other_server_args=["--pp-size", "2"] + _amd_watchdog_args(),
             need_warmup=True,
             seed=42,
         )
@@ -88,6 +102,7 @@ class TestBenchServing2GPU(CustomTestCase):
                 "--pp-size",
                 "2",
             ]
+            + _amd_watchdog_args()
             + (["--mem-fraction-static", "0.7"] if is_in_amd_ci() else []),
             need_warmup=False,
             seed=42,
