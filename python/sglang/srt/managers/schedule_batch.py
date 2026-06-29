@@ -1575,7 +1575,18 @@ def set_mamba_track_indices_from_reqs(batch):
     ]  # (bs, ping_pong_size), int64, on device
     idx = (
         torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
+            [
+                # A request that finished during a speculative TARGET_VERIFY step
+                # can still be present here after its mamba resources were
+                # released (mamba_next_track_idx is reset to None on free). Its
+                # track index is unused, so guard the None to avoid
+                # "TypeError: 'NoneType' object cannot be interpreted as an
+                # integer" when building the int64 tensor. Reliably triggered by
+                # structured-output (grammar) requests, which finish
+                # deterministically at grammar completion. See #28407.
+                req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
+                for req in batch.reqs
+            ],
             dtype=torch.int64,
             pin_memory=True,
         )
