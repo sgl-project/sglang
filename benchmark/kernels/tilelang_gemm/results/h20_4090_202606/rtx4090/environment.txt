@@ -1,0 +1,11 @@
+{
+  "python": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+  "platform": "Linux-5.15.0-60-generic-x86_64-with-glibc2.39",
+  "cuda_visible_devices": null,
+  "torch": "2.11.0+cu130",
+  "triton": "3.6.0",
+  "tilelang": "0.1.11",
+  "sglang": "0.5.13",
+  "safetensors": "0.8.0",
+  "nvidia_smi": "0, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB\n1, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB\n2, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB\n3, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB\n4, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB\n5, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB\n6, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB\n7, NVIDIA GeForce RTX 4090, 580.65.06, 24564 MiB"
+}

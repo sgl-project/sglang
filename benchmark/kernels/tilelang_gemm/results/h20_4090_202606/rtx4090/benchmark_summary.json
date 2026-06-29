@@ -1,0 +1,18 @@
+{
+  "rows": 575,
+  "shapes": 25,
+  "m_values": 23,
+  "tilelang_allclose_failures": 0,
+  "deepgemm_allclose_failures": 0,
+  "tilelang_ms_median": 0.008743477386917695,
+  "triton_ms_median": 0.03214164757954209,
+  "deepgemm_ms_median": NaN,
+  "tilelang_faster_than_triton": 489,
+  "tilelang_slower_than_triton": 86,
+  "tilelang_faster_than_deepgemm": 0,
+  "tilelang_slower_than_deepgemm": 0,
+  "speedup_vs_triton_median": 2.9487691317334774,
+  "speedup_vs_deepgemm_median": NaN,
+  "tilelang_over_triton_max": 1.7220322150881278,
+  "tilelang_over_deepgemm_max": NaN
+}

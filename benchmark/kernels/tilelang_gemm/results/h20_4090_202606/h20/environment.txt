@@ -1,0 +1,11 @@
+{
+  "python": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+  "platform": "Linux-5.4.0-204-generic-x86_64-with-glibc2.39",
+  "cuda_visible_devices": null,
+  "torch": "2.11.0+cu130",
+  "triton": "3.6.0",
+  "tilelang": "0.1.11",
+  "sglang": "0.5.13",
+  "safetensors": "0.8.0",
+  "nvidia_smi": "0, NVIDIA H20, 535.183.01, 97871 MiB\n1, NVIDIA H20, 535.183.01, 97871 MiB\n2, NVIDIA H20, 535.183.01, 97871 MiB\n3, NVIDIA H20, 535.183.01, 97871 MiB\n4, NVIDIA H20, 535.183.01, 97871 MiB\n5, NVIDIA H20, 535.183.01, 97871 MiB\n6, NVIDIA H20, 535.183.01, 97871 MiB\n7, NVIDIA H20, 535.183.01, 97871 MiB"
+}

@@ -1,0 +1,17 @@
+run_id=cu130_4090_10_no_deepgemm_20260629_061522
+repo_dir=/sgl-workspace/sglang
+out_dir=/workspace/model/experiments/tilelang_fp8_gemm_repro/tilelang_fp8_gemm_repro_outputs/cu130_4090_10_no_deepgemm_20260629_061522
+shape_source=static_default
+m_values=1 2 3 4 5 6 7 8 12 14 16 24 32 48 64 96 128 256 512 1024 2048 4096 8192
+gpus=0,1,2,3,4,5,6,7
+autotune_backend=cudagraph
+autotune_policy=fast_sm90
+autotune_warmup=25
+autotune_rep=100
+bench_backend=cudagraph
+bench_rep=100
+compare_deepgemm=0
+skip_tune=1
+skip_bench=0
+git_commit=1a6b70949961ce6e79078b35daf2869c18381321
+git_branch=tilelang-fp8-gemm-modernization

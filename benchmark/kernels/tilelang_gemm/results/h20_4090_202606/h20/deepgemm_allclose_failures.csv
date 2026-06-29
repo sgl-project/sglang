@@ -1,0 +1,2 @@
+M,N,K,tilelang_ms,tilelang_tflops,kernel_type,baseline_ms,baseline_tflops,speedup,allclose,max_diff,deepgemm_ms,deepgemm_tflops,tilelang_deepgemm_speedup,deepgemm_allclose,deepgemm_max_diff,tilelang_over_triton,tilelang_over_deepgemm
+1,512,2048,0.003350818622358537,0.6258625835509651,splitK_swapAB,0.0065851336588356995,0.31846764373356573,1.9652313064324052,False,0.5,0.004500430117371262,0.4659892377631149,1.343083772825504,False,0.5,0.5088459545331364,0.7445551947189833
