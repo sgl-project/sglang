@@ -486,9 +486,7 @@ class DFlashLagunaAttention(DFlashAttention):
     """Laguna DFlash attention with the trained Laguna softplus gate."""
 
     def __init__(self, config, layer_id: int, quant_config=None) -> None:
-        super().__init__(
-            config=config, layer_id=layer_id, quant_config=quant_config
-        )
+        super().__init__(config=config, layer_id=layer_id, quant_config=quant_config)
         hidden_size = int(config.hidden_size)
         total_num_heads = int(config.num_attention_heads)
         gating = getattr(config, "gating", True)
@@ -584,5 +582,6 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
             normed[:, i, :] = norm(slices[:, i, :])
         fused = normed.reshape(target_hidden.shape[0], -1)
         return self.hidden_norm(self.fc(fused))
+
 
 EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]
