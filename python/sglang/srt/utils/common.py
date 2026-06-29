@@ -308,7 +308,10 @@ is_sm90_supported = lru_cache(maxsize=1)(
 
 
 try:
-    import sgl_kernel  # noqa: F401
+    try:
+        import sgl_kernel_cpu as sgl_kernel
+    except:
+        import sgl_kernel  # noqa: F401
 
     is_intel_amx_backend_available = hasattr(
         torch.ops.sgl_kernel, "convert_weight_packed"
