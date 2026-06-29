@@ -564,8 +564,9 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
-        if is_finished:
-            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        # Unfinished requests can already have an SWA-evicted prefix; preserve
+        # that boundary so insertion creates a tombstone instead of live SWA KV.
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
 
     def free_out_of_window_slots(
