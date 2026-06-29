@@ -14,8 +14,8 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
-use serde::de::IgnoredAny;
-use serde::Deserialize;
+use serde::de::{self, IgnoredAny};
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -62,7 +62,7 @@ pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
 /// full request schema.
 #[derive(Debug, Deserialize)]
 struct RequestProbe {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
@@ -907,6 +907,29 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     Ok(probe)
 }
 
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        String(String),
+    }
+
+    match Option::<BoolOrString>::deserialize(deserializer)? {
+        Some(BoolOrString::Bool(value)) => Ok(Some(value)),
+        Some(BoolOrString::String(value)) if value.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(BoolOrString::String(value)) if value.eq_ignore_ascii_case("false") => Ok(Some(false)),
+        Some(BoolOrString::String(value)) => Err(de::Error::invalid_value(
+            de::Unexpected::Str(&value),
+            &"a boolean or a string boolean",
+        )),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,6 +1188,14 @@ mod tests {
         let b = Bytes::from_static(br#"{"stream": true, "model": "tiny"}"#);
         assert_eq!(parse_probe(&b).unwrap().stream, Some(true));
         let b = Bytes::from_static(br#"{"stream": false, "model": "tiny"}"#);
+        assert_eq!(parse_probe(&b).unwrap().stream, Some(false));
+    }
+
+    #[test]
+    fn parse_probe_reads_stream_string_bool_from_object() {
+        let b = Bytes::from_static(br#"{"stream": "True", "model": "tiny"}"#);
+        assert_eq!(parse_probe(&b).unwrap().stream, Some(true));
+        let b = Bytes::from_static(br#"{"stream": "FALSE", "model": "tiny"}"#);
         assert_eq!(parse_probe(&b).unwrap().stream, Some(false));
     }
 
