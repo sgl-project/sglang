@@ -35,7 +35,6 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
-import zmq
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
@@ -1588,9 +1587,7 @@ class Scheduler(
                 # `_flush` finds `event.query()` True and compacts freely.
                 # Sync-free; best-effort.
                 allocator = self.token_to_kv_pool_allocator
-                if allocator is not None and hasattr(
-                    allocator, "flush_opportunistic"
-                ):
+                if allocator is not None and hasattr(allocator, "flush_opportunistic"):
                     try:
                         allocator.flush_opportunistic()
                     except Exception:
@@ -2838,7 +2835,9 @@ class Scheduler(
         # the req is tracked via self.chunked_req (never the waiting queue).
         _prev_chunked_req = self.chunked_req
         _prev_is_chunked = (
-            self.chunked_req.inflight_middle_chunks if self.chunked_req is not None else None
+            self.chunked_req.inflight_middle_chunks
+            if self.chunked_req is not None
+            else None
         )
         # `add_chunked_req` (below) is the ONLY writer of `fill_len` here; it
         # advances it to `len(prefix_indices) + extend_input_len`. Snapshot the
@@ -3198,25 +3197,6 @@ class Scheduler(
                         len(r.output_ids) for r in retracted_reqs
                     ),
                 )
-            # Guard against an admission deadlock on the EMPTY-batch path.
-            # `estimate_new_token_ratio_after_retract([])` returns 0.0 (its
-            # arithmetic is `0 / (0 + 1)`), and `retract_decode` empties the
-            # batch when it aborts the last/only request — one that cannot fit
-            # even alone (a genuinely ~pool-sized request at a tight
-            # mem-fraction). Neither that estimator nor `retract_decode` floors
-            # the result, so applied raw `current = 0.0` freezes admission and
-            # the server hangs with no progress. Floor at the tracker's `min`
-            # (the same floor `decay_step` enforces) so admission always
-            # resumes; the oversized request is aborted with a 500 below and the
-            # scheduler keeps draining the queue.
-            #
-            # NOTE: one trigger was the shared pool's optimistic
-            # `available_size` OVER-admitting a too-big request — now fixed by
-            # the Mamba joint-budget reservation. This floor is KEPT as the
-            # GENERAL safety for the empty-batch ratio-0 case, which is
-            # independent of that fix (and which upstream's unfloored estimator
-            # shares).
-            new_token_ratio = max(new_token_ratio, self.new_token_ratio_tracker.min)
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
@@ -3417,7 +3397,6 @@ class Scheduler(
                                 forward_done,
                                 batch.out_cache_loc,
                             )
-                        batch_result.forward_done = forward_done
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:

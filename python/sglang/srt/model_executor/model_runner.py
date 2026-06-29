@@ -422,7 +422,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.enable_hisparse = server_args.enable_hisparse
         self.enable_shared_kv_pool = server_args.enable_shared_kv_pool
 
-
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None

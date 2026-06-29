@@ -28,7 +28,6 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
-import os
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -888,9 +887,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             full = getattr(alloc, "full_attn_allocator", None)
             if full is not None:
                 ps = full.page_size
-                v_pages = (
-                    ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
-                )
+                v_pages = ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
                 raw_v2p = full.virtual_to_physical[v_pages]
                 bad_mask = raw_v2p < 0
                 if bool(bad_mask.any().item()):
@@ -911,9 +908,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             swa = getattr(alloc, "swa_attn_allocator", None)
             if swa is not None:
                 ps = swa.page_size
-                v_pages = (
-                    ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
-                )
+                v_pages = ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
                 raw_v2p_swa = swa.virtual_to_physical[v_pages]
                 # Tombstone on swa side: -1 = freed/never-bound. Don't fail
                 # on 0 (sentinel page) because under SWARadixCache the swa

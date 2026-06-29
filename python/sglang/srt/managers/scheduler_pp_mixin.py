@@ -677,7 +677,6 @@ class SchedulerPPMixin:
                         "planner refused the batch (out of mamba slots "
                         "or shared-pool byte budget)."
                     )
-                model_worker_batch = batch.get_model_worker_batch()
 
                 # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
                 if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:

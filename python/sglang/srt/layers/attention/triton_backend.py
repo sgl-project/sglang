@@ -1112,7 +1112,6 @@ class TritonAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
 
-
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         """Shared-pool read-path v2p translate, recorded as cuda-graph node(s)
         at the FRONT of the captured decode graph.
@@ -1136,9 +1135,7 @@ class TritonAttnBackend(AttentionBackend):
             return  # non-shared → translate-free graph (Invariant 2)
         # Full-attention read path: cuda_graph_kv_indices[0:kv_indptr[bs]].
         # Translate VIRTUAL -> PHYSICAL in place at replay (reads the LIVE v2p).
-        self._translate_kv_loc_bounded(
-            self.cuda_graph_kv_indices, self.kv_indptr, bs
-        )
+        self._translate_kv_loc_bounded(self.cuda_graph_kv_indices, self.kv_indptr, bs)
         # SWA window read path (Phase 2c): window_kv_indices[0:window_kv_indptr[bs]],
         # virtual full-token -> swa-physical, in place, against the swa sub-pool's
         # v2p. Only for hybrid-SWA shared pools (the bounded swa variant exists).
