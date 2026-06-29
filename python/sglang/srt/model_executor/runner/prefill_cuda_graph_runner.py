@@ -261,11 +261,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 }
 
         # Static hidden_states buffer giving the captured graph a stable
-        # address; load_batch refreshes it from live spec_info at replay.
-        # Draft consumes the aux-concatenated hidden states from the target
-        # (e.g. EAGLE3 stacks 3 target layers), so read the dim from the
-        # draft model's input fc when available; fall back to the per-layer
-        # dim for arches without an fc projection.
+        # address; load_batch refreshes it from live spec_info at replay. The
+        # buffer width must match the target-hidden slice the draft consumes:
+        #   - EAGLE3 feeds the aux-stacked target hidden straight into fc, so
+        #     that width == fc.in_features (e.g. 3 stacked target layers).
+        #   - EAGLE-v1's fc instead consumes cat([embed(H), target_hidden(H)]),
+        #     so fc.in_features overcounts the target-hidden slice by H.
+        # get_draft_hidden_dim returns the correct width for both algorithms;
+        # only prefer fc.in_features for EAGLE3, where it is the ground truth
+        # even when target/draft hidden sizes differ.
         if (
             isinstance(self.backend, BreakableCudaGraphBackend)
             and model_runner.is_draft_worker
@@ -275,11 +279,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
             inner = getattr(model_runner.model, "model", model_runner.model)
             fc = getattr(inner, "fc", None)
-            hidden_dim = (
-                fc.in_features
-                if fc is not None and hasattr(fc, "in_features")
-                else get_draft_hidden_dim(model_runner)
-            )
+            if (
+                model_runner.spec_algorithm.is_eagle3()
+                and fc is not None
+                and hasattr(fc, "in_features")
+            ):
+                hidden_dim = fc.in_features
+            else:
+                hidden_dim = get_draft_hidden_dim(model_runner)
             with torch.device(self.device):
                 self.static_draft_hidden_states = torch.zeros(
                     (self.max_num_tokens, hidden_dim),
