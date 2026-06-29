@@ -291,6 +291,10 @@ class TestDSV4NonPagedIndexer(unittest.TestCase):
         for use_nonpaged in (False, True):
             with self.subTest(use_nonpaged=use_nonpaged):
                 plan = MagicMock(spec=NonPagedIndexerPlan) if use_nonpaged else None
+                if plan is not None:
+                    plan.query_rows = query_rows
+                    plan.max_seq_len = 65
+                    plan.max_seqlen_k = 128
                 backend = SimpleNamespace(
                     token_to_kv_pool=MagicMock(),
                     forward_metadata=SimpleNamespace(
