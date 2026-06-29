@@ -193,7 +193,7 @@ if _is_cuda or _is_hip or _is_xpu:
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
-        from aiter.fused_moe import fused_topk as aiter_fused_topk
+        from aiter.ops.topk import topk_gating as aiter_topk_gating
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 if _is_musa:
@@ -767,15 +767,29 @@ def fused_topk(
     if scoring_func == "softmax":
         if _use_aiter:
 
-            # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
-            topk_weights, topk_ids = aiter_fused_topk(
-                hidden_states,
+            # Fused topk gating softmax: a single aiter kernel fuses the gating
+            # softmax (topkGatingSoftmax) with the top-k selection/sorting
+            # (opus_moe_sorting_entry), writing topk_weights/topk_ids in one
+            # launch instead of the separate softmax + topk of aiter_fused_topk.
+            #
+            # NOTE: topk_gating forces need_renorm=False for score_func="softmax"
+            # (it assumes the full softmax is already normalized). That is only
+            # true *before* top-k selection -- after selecting the top-k experts
+            # the selected weights no longer sum to 1, so we must renormalize
+            # them here when renormalize=True. Skipping this corrupts MoE routing
+            # (correct expert ids but wrong, sub-unity weights) and collapses
+            # accuracy. The renorm runs on the tiny (M x topk) weight tensor and
+            # does not negate the kernel-fusion benefit of the gating launch.
+            aiter_topk_gating(
+                topk_weights,
+                topk_ids,
                 gating_output,
-                topk,
-                renormalize,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
+                correction_bias=None,
+                need_renorm=renormalize,
+                score_func="softmax",
             )
+            if renormalize:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         # ===== TO BE REFACTORED ====
         elif packed_out is not None:
             # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
