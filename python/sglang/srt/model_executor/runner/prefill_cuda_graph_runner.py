@@ -27,6 +27,7 @@ Backend selection comes from cuda_graph_config.prefill:
 
 from __future__ import annotations
 
+import inspect
 import logging
 import warnings
 from typing import TYPE_CHECKING, Dict, Optional, Union
@@ -191,13 +192,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             embed_dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
-            # Register the multimodal input_embeds slot for every prefill
-            # backend (default True). The slot is only added when is_multimodal,
-            # so text-only models are unaffected. Both tc_piecewise (outer MM
-            # wrapper passes composed input_embeds as an argument) and breakable
-            # (captures the input_embeds path; general_mm_embed_routine fills the
-            # slot) need it, otherwise the captured graph re-embeds input_ids and
-            # drops the scattered vision embeddings.
             source=self.buffers,
         )
 
@@ -294,6 +288,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 language_model.model, "layers"
             ):
                 self.layer_model = language_model.model
+                params = list(inspect.signature(self.layer_model.forward).parameters)
+                self._input_embeds_arg_idx = (
+                    params.index("input_embeds") if "input_embeds" in params else None
+                )
             else:
                 raise RuntimeError(
                     f"BCG could not resolve inner layer_model on "
@@ -880,6 +878,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 shape_key = ShapeKey(size=self._static_num_tokens)
                 static_n = self._static_num_tokens
 
+                ie_idx = self._input_embeds_arg_idx
+
                 def replay_layer_forward(*args, **layer_kwargs):
                     # The captured BCG graph reads activations from the static
                     # input_embeds slot. The outer model.forward (run eagerly)
@@ -891,8 +891,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     # current request's embeddings (mirrors main's BCG closure).
                     if self.buffer_registry.has_slot("input_embeds"):
                         ie = layer_kwargs.get("input_embeds")
-                        if ie is None and len(args) > 3:
-                            ie = args[3]
+                        if ie is None and ie_idx is not None and len(args) > ie_idx:
+                            ie = args[ie_idx]
                         if ie is not None:
                             self.buffer_registry.get_slot("input_embeds").slice_for(
                                 1, static_n

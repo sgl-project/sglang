@@ -42,7 +42,7 @@ class TestDeepseekV3CPInSeqSplit(CustomTestCase):
             "fa3",
             "--mem-frac",
             "0.7",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "32",
             "--max-running-requests",
             "32",
