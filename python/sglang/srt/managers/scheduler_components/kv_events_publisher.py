@@ -69,7 +69,8 @@ class SchedulerKvEventsPublisher:
 
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.ps.attn_dp_rank
+                kv_events_config,
+                self.ps.dp_rank if self.ps.dp_rank is not None else 0,
             )
 
     def emit_kv_metrics(self):
