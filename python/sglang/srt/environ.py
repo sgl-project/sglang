@@ -851,6 +851,14 @@ class Envs:
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # SM120 long-context speedup: shard the paged-MQA logits scan across
+    # (batch, num_splits) CTAs. The base kernel is latency-bound on per-row scan
+    # depth (flat vs batch up to the SM count), off by default.
+    SGLANG_SM120_INDEXER_SPLIT = EnvBool(False)
+    # KV-splits per row. More = shallower per-CTA scan
+    SGLANG_SM120_INDEXER_SPLIT_COUNT = EnvInt(256)
+    # Upper batch bound for the split: the captured-graph batch ceiling.
+    SGLANG_SM120_INDEXER_SPLIT_MAX_BS = EnvInt(128)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
 

@@ -355,6 +355,16 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+def is_deepseek_v4_kernel_available() -> bool:
+    """Whether the custom SM120 deepseek_v4_kernel is installed.
+
+    Provides the SM120 sparse decode + prefill kernels
+    (``deepseek_v4_kernel.ops.{sparse_decode_fwd, sparse_prefill_fwd}``), drop-ins
+    for FlashMLA. Optional; when absent the in-tree Triton/torch paths are used.
+    """
+    return importlib.util.find_spec("deepseek_v4_kernel") is not None
+
+
 @lru_cache(maxsize=1)
 def is_tokenspeed_mla_available():
     """

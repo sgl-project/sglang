@@ -118,6 +118,21 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 
+def _has_flashinfer_sm120_mxfp4_moe() -> bool:
+    """True when FlashInfer exposes the SM120 MXFP4 fused-MoE path.
+
+    Probes FlashInfer's public capability API rather than a version string;
+    returns False (dormant) on builds that predate SM120 MXFP4 MoE support.
+    """
+    try:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+            sm120_moe_supported_quant_modes,
+        )
+    except Exception:
+        return False
+    return "mxfp4" in sm120_moe_supported_quant_modes()
+
+
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
@@ -281,6 +296,20 @@ class Fp8Config(QuantizationConfig):
                 )
 
             fp8_method = Fp8MoEMethod(self)
+
+            # SM120 (RTX PRO 6000 / 5090): MXFP4 x MXFP4 fused MoE. Load the
+            # MXFP4 experts as-is and run FlashInfer's fused CuTe-DSL kernels.
+            # Feature-probed; NVFP4/Marlin paths are untouched.
+            if (
+                self.is_fp4_experts
+                and is_sm120_supported()
+                and _has_flashinfer_sm120_mxfp4_moe()
+            ):
+                from sglang.srt.layers.quantization.mxfp4_w4a4_moe import (
+                    Mxfp4W4A4MoEMethod,
+                )
+
+                return Mxfp4W4A4MoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (

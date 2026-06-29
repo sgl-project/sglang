@@ -1473,8 +1473,6 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
@@ -1545,15 +1543,34 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            attn_sink=attn_sink,
-            topk_length=combined_lens,
-        )
+        if _is_sm120:
+            # Stock flash_mla_sparse_fwd is SM90a/SM100f-only and raises on SM120;
+            # route through the SM120 selector (SGLANG_SM120_SPARSE_PREFILL).
+            from sglang.srt.layers.attention.flash_mla_sparse_prefill_sm120 import (
+                flash_mla_sparse_fwd_sm120,
+            )
+
+            o, _, _ = flash_mla_sparse_fwd_sm120(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
+        else:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
         return o
 
     def expand_prefill_casually(
