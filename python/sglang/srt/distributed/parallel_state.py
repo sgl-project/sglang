@@ -2449,7 +2449,10 @@ def get_dcp_rank():
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
-    return get_tp_group().rank_in_group
+    try:
+        return get_tp_group().rank_in_group
+    except (AssertionError, AttributeError):
+        return 0
 
 
 # ATTN_TP
