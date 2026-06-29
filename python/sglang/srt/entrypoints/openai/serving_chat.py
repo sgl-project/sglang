@@ -516,6 +516,40 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        # Any output constraint (response_format, regex, ebnf) forces the model
+        # to produce a specific shape and prevents it from emitting tool-call
+        # tokens.  tool_calls will be silently null unless we reject early.
+        # OpenAI's own API rejects response_format + active tool calling.
+        _active_tool_calling = request.tools and request.tool_choice != "none"
+        if _active_tool_calling:
+            rf_type = (
+                getattr(request.response_format, "type", None)
+                if request.response_format
+                else None
+            )
+            if rf_type in ("json_schema", "json_object"):
+                return (
+                    "response_format with type 'json_schema' or 'json_object' is "
+                    "not compatible with tool calling. Either remove "
+                    "response_format, or set tool_choice to 'none'."
+                )
+            if rf_type == "structural_tag":
+                return (
+                    "response_format with type 'structural_tag' is not compatible "
+                    "with tool calling. Either remove response_format, or set "
+                    "tool_choice to 'none'."
+                )
+            if request.regex:
+                return (
+                    "The 'regex' parameter is not compatible with tool calling. "
+                    "Either remove regex, or set tool_choice to 'none'."
+                )
+            if request.ebnf:
+                return (
+                    "The 'ebnf' parameter is not compatible with tool calling. "
+                    "Either remove ebnf, or set tool_choice to 'none'."
+                )
+
         return None
 
     def _convert_to_internal_request(

@@ -940,7 +940,14 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            logger.warning("Constrained decoding is not compatible with tool calls.")
+            logger.warning(
+                "Constrained decoding (regex/ebnf/json_schema/structural_tag) "
+                "is not compatible with tool calls. The tool_call_constraint "
+                "will be ignored and only the output constraint will be applied. "
+                "Tool calls will not be generated. To avoid this, send the "
+                "request through the /v1/chat/completions endpoint which "
+                "rejects this combination with a 400 error."
+            )
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
