@@ -48,6 +48,8 @@ def _triton_baseline(kv_buffer, loc, cache_k_nope, cache_k_rope):
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        DCP_RANK=0,
+        DCP_WORLD_SIZE=1,
         **pdl_kwargs,
     )
 

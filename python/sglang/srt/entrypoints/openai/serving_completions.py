@@ -125,11 +125,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
+            session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
         )
 
         return adapted_request, request
