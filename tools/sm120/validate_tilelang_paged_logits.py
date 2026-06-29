@@ -247,9 +247,36 @@ def check_triton_sparse_attention():
         return False
 
     finite = torch.isfinite(out).all().item()
-    print(f"out shape={tuple(out.shape)} dtype={out.dtype} all_finite={finite}")
-    print("triton sparse-attention: PASS" if finite else "triton sparse-attention: FAIL")
-    return bool(finite)
+    if not finite:
+        print("triton sparse-attention: FAIL (non-finite)")
+        return False
+
+    # Numerical reference: clean fp32 softmax over the selected topk KV.
+    # (The kernel additionally fp8-quantizes the probabilities, so we compare by
+    # cosine similarity -- robust to that per-element magnitude noise but still
+    # catches wrong indexing / scale / V.)
+    qm, qt = q_nope.float(), q_rope.float()                 # [S,H,Dv], [S,H,Dt]
+    km_all, kt_all = kv[:, 0, :SA_D_V].float(), kv[:, 0, SA_D_V:].float()
+    idx = indices.squeeze(1)                                # [S, topk]
+    ref = torch.zeros(SA_TOKENS, SA_HEADS, SA_D_V, device=out.device)
+    for s in range(SA_TOKENS):
+        km, kt = km_all[idx[s]], kt_all[idx[s]]            # [topk, Dv], [topk, Dt]
+        qk = (qm[s] @ km.T + qt[s] @ kt.T) * sm_scale      # [H, topk]
+        p = torch.softmax(qk, dim=-1)
+        ref[s] = p @ km                                     # V == k_main
+
+    a = out[0].float().reshape(-1, SA_D_V)
+    r = ref.reshape(-1, SA_D_V)
+    cos = torch.nn.functional.cosine_similarity(a, r, dim=-1)
+    cos_mean = cos.mean().item()
+    cos_min = cos.min().item()
+    max_abs = (a - r).abs().max().item()
+    ok = cos_mean > 0.99 and cos_min > 0.95
+    print(f"out shape={tuple(out.shape)} dtype={out.dtype} all_finite=True")
+    print(f"vs torch ref: cos_sim mean={cos_mean:.4f} min={cos_min:.4f} "
+          f"max_abs={max_abs:.4g}")
+    print("triton sparse-attention: PASS" if ok else "triton sparse-attention: FAIL (numeric)")
+    return bool(ok)
 
 
 def check_sm120_routing():
