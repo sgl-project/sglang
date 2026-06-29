@@ -2,6 +2,9 @@
 
 TP=4 wedges the Level Zero driver during the first prefill batch on Arc/BMG;
 TP=2 runs cleanly with the same model and serves at ~18 tok/s.
+
+Scored by ``simple_eval_gsm8k.GSM8KEval`` (the same evaluator AMD and
+NVIDIA nightlies use); threshold mirrors theirs.
 """
 
 import unittest
@@ -10,7 +13,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.xpu.gsm8k_xpu_mixin import GSM8KXPUMixin
+from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
 register_xpu_ci(est_time=1200, suite="nightly-xpu-2-gpu", nightly=True)
 
@@ -19,12 +22,12 @@ register_xpu_ci(est_time=1200, suite="nightly-xpu-2-gpu", nightly=True)
     torch.xpu.is_available(),
     "Intel XPU not available (torch.xpu.is_available() returned False)",
 )
-class TestLlama31_8BInstructXPU(GSM8KXPUMixin, CustomTestCase):
+class TestLlama31_8BInstructXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "meta-llama/Llama-3.1-8B-Instruct"
     tp_size = 2
-    accuracy = 0.75
+    accuracy = 0.80
 
-    other_args = GSM8KXPUMixin.other_args + [
+    other_args = SimpleEvalGSM8KXPUMixin.other_args + [
         "--max-total-tokens",
         "65536",
         "--mem-fraction-static",
