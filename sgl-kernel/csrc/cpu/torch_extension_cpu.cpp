@@ -224,8 +224,6 @@ at::Tensor fused_linear_sigmoid_mul(
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
-#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
-
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
@@ -246,6 +244,8 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation);
+
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
@@ -327,25 +327,10 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
 // multidimensional rope
 std::tuple<at::Tensor, at::Tensor>
 apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
-#else
-// fused moe
-at::Tensor fused_experts_cpu(
-    at::Tensor& hidden_states,
-    at::Tensor& w1,
-    at::Tensor& w2,
-    at::Tensor& topk_weights,
-    at::Tensor& topk_ids,
-    bool inplace,
-    int64_t moe_comp_method,
-    const std::optional<at::Tensor>& w1_scale,
-    const std::optional<at::Tensor>& w2_scale,
-    const std::optional<at::Tensor>& w1_zero,
-    const std::optional<at::Tensor>& w2_zero,
-    const std::optional<std::vector<int64_t>> block_size,
-    bool is_vnni);
 #endif
 
 // conv3d fast path for patch embedding
@@ -597,7 +582,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
-#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
@@ -605,6 +589,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
       "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+
+#if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // weight absorption
   m.def(
       "qkv_proj_with_rope(Tensor hidden_states, Tensor q_a_proj_weight, Tensor q_b_proj_weight, Tensor "
@@ -649,13 +635,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "apply_multidimensional_rope_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> (Tensor(a!), "
       "Tensor(b!))");
   m.impl("apply_multidimensional_rope_cpu", torch::kCPU, &apply_multidimensional_rope_cpu);
-#else
-  // moe
-  m.def(
-      "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
-      "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
-  m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 #endif
 
   // conv3d fast path for patch embedding
