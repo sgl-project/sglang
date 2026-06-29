@@ -47,7 +47,7 @@ ACCURACY_TOLERANCE = 0.99
 
 # Dataset total question counts and allowed fluctuation (in questions)
 DATASET_QUESTION_COUNTS = {
-    "aime25": 15,
+    "aime25": 30,
     "aime26": 30,
     "gpqa_diamond": 198,
 }
