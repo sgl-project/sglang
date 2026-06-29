@@ -537,8 +537,16 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         """Trigger post-processing hooks for weights after loading."""
         self.auto_create_handle_loop()
-        async with self.model_update_lock.writer_lock:
-            results = await self.post_process_weights_communicator(obj)
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            if is_paused:
+                results = await self.post_process_weights_communicator(obj)
+
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.post_process_weights_communicator(obj)
+
         return FanOutCommunicator.merge_results(results)
 
     async def _unload_lora_adapter_locked(

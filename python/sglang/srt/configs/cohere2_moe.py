@@ -2,6 +2,7 @@
 """Cohere2Moe text config used by the Cohere Command-A Plus checkpoints."""
 
 from dataclasses import dataclass
+
 from transformers.configuration_utils import PreTrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
