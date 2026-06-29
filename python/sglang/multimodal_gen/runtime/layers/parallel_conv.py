@@ -34,7 +34,6 @@ from sglang.jit_kernel.diffusion.triton.causal_conv3d_pad import (
     fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
 )
 
-
 _causal_conv3d_cat_pad_cuda_failed = False
 
 
