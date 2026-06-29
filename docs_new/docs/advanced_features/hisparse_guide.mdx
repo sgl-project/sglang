@@ -108,10 +108,15 @@ Pass as a JSON string via `--hisparse-config`:
       <td>int</td>
       <td>Ratio of logical pool size to device pool size, determining host memory capacity</td>
     </tr>
+    <tr>
+      <td><code>swap_in_block_size</code></td>
+      <td>int / 960</td>
+      <td>CUDA thread-block size for the HiSparse swap-in kernel</td>
+    </tr>
   </tbody>
 </table>
 
-Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10}'`
+Example: `--hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'`
 
 #### Shared-index prefetch (automatic)
 
@@ -153,7 +158,7 @@ python3 -m sglang.launch_server \
     --dist-init-addr 127.0.0.1:5757 \
     --nnodes 1 --node-rank 0 \
     --enable-hisparse \
-    --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10}'
+    --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10, "swap_in_block_size": 960}'
 ```
 
 > **Note**: For DSA models, `--kv-cache-dtype` defaults to `auto`, which resolves to `fp8_e4m3` on SM100+ (Blackwell) and `bfloat16` on older architectures. The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`). DSA backend flags apply only to DSA models; DeepSeek V4 uses its own `dsv4` attention backend.
