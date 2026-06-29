@@ -708,6 +708,7 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        session_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -723,13 +724,14 @@ class Req(ReqDllmMixin):
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
         # Full untruncated sequence: origin + output (+ DLLM mask block).
-        # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
-        # never mutates this array's length.
+        # Kept in sync by _refresh_fill_ids; admission only updates
+        # extend_range, never mutates this array's length.
         self.full_untruncated_fill_ids = array("q")
         self.extend_range: Optional[Range] = None
         self.dllm_initialized: bool = False
 
         self.session = session
+        self.session_id = session_id
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices

@@ -93,6 +93,14 @@ DEFAULT_PSNR_THRESHOLD_VIDEO = 24.0
 DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
 _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
+# Case keys whose remote GT has been positively confirmed present. Cached so a
+# case that probes GT existence more than once in a single run — e.g. a
+# consistency check followed by the LoRA basic-API check, which re-validates
+# after merge/set_lora — does not re-hit the remote store. A single transient
+# miss on a *later* probe must not turn an already-confirmed GT into a spurious
+# "GT not found". Only positive (exists) results are cached; misses are not, so
+# a genuinely-absent GT is still reported.
+_gt_exists_remote_cache: set[str] = set()
 
 
 def _load_clip_processor_with_roberta_processing_compat(
@@ -1000,7 +1008,11 @@ def _is_ascend_consistency_case(case_id: str) -> bool:
 
 
 def _remote_file_exists(url: str) -> bool | None:
-    for _ in range(3):
+    """Probe whether a remote GT file exists, robust to transient failures."""
+    attempts = 5
+    backoff = 1.0
+    saw_absent = False  # observed a clean (non-rate-limit) 4xx at least once
+    for attempt in range(attempts):
         for method in ("head", "get"):
             try:
                 if method == "head":
@@ -1016,18 +1028,26 @@ def _remote_file_exists(url: str) -> bool | None:
                 try:
                     if resp.status_code in (200, 206):
                         return True
-                    if resp.status_code == 404:
-                        return False
-                    if (
+                    if resp.status_code == 404 or (
                         resp.status_code not in (403, 405, 429)
                         and resp.status_code < 500
                     ):
-                        return False
+                        # Clean 4xx -> "absent", but don't trust it yet: a
+                        # freshly-pinned commit can briefly 404 on the CDN.
+                        # Keep retrying and let a later 200 win
+                        saw_absent = True
+                    # 403/405/429/5xx -> transient; keep retrying.
                 finally:
                     resp.close()
             except requests.RequestException:
                 pass
-    return None
+        if attempt < attempts - 1:
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 16.0)
+    # Never saw a 200/206 across all attempts.
+    if saw_absent:
+        return False  # consistently absent -> genuinely missing
+    return None  # only transient failures -> uncertain (caller assumes present)
 
 
 def _load_remote_gt_image(url: str) -> np.ndarray:
@@ -1197,9 +1217,17 @@ def gt_exists(
             return all((gt_dir / c).exists() for c in candidates)
         return any((gt_dir / c).exists() for c in candidates)
 
-    return bool(
+    cache_key = _get_consistency_gt_cache_key(
+        case_id, num_gpus, is_video, output_format
+    )
+    if cache_key in _gt_exists_remote_cache:
+        return True
+    found = bool(
         _find_remote_consistency_gt_files(case_id, num_gpus, is_video, output_format)
     )
+    if found:
+        _gt_exists_remote_cache.add(cache_key)
+    return found
 
 
 def extract_key_frames_from_video(
