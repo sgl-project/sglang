@@ -25,8 +25,10 @@ ROUTER_GEMM_CASES = get_ci_test_range(
     ),
     [
         (256, 1024, 1, torch.bfloat16),
+        (256, 7168, 6, torch.bfloat16),
         (256, 6144, 4, torch.float32),
         (384, 7168, 8, torch.bfloat16),
+        (256, 7168, 16, torch.float32),
         (384, 5120, 16, torch.float32),
     ],
 )

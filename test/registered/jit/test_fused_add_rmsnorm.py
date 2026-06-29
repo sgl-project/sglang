@@ -46,11 +46,19 @@ def forward_native_hf_reference(
 
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
-BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
 HIDDEN_SIZE_LIST = [512, 1024, 1536, 2048, 3072, 4096, 5120, 6144, 7168, 8192]
 FUSED_ADD_RMSNORM_CASES = get_ci_test_range(
     list(itertools.product(BS_LIST, HIDDEN_SIZE_LIST)),
-    [(1, 512), (9, 2048), (38, 6144), (256, 8192), (4109, 2048)],
+    [
+        (1, 512),
+        (18, 4096),
+        (38, 4096),
+        (39, 4096),
+        (39, 5120),
+        (39, 8192),
+        (44, 8192),
+        (89, 4096),
+    ],
 )
 DEVICE = "cuda"
 DTYPE = torch.bfloat16

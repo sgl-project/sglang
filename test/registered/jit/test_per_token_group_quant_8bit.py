@@ -4,106 +4,124 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
-
-from sgl_kernel.test_utils import (
-    assert_all_close_or_tiny_diff,
-    create_per_token_group_quant_test_data,
-)
-
 from sglang.jit_kernel.per_token_group_quant_8bit import (
     per_token_group_quant_8bit as sglang_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import (
-    create_per_token_group_quant_fp8_output_scale,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
-)
+from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=16, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
-configs = list(
-    itertools.product(
-        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
-        [16, 32, 64, 128],  # group_size
-        [None],  # num_ranks
-        [fp8_type_],  # dtype
-        [
-            dict(
-                column_major_scales=False,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-        ],
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
+
+from sgl_kernel.test_utils import (  # noqa: E402
+    assert_all_close_or_tiny_diff,
+    create_per_token_group_quant_test_data,
+)
+
+from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+    create_per_token_group_quant_fp8_output_scale,
+)
+from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
+    per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
+)
+
+_is_hip = is_hip()
+fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+
+BASE_FLAGS = [
+    dict(
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+]
+FUSED_FLAGS = [
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode="balanced",
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode="imbalanced",
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=True,
+        masked_layout_mode="extreme",
+    ),
+]
+
+configs = get_ci_test_range(
+    list(
+        itertools.product(
+            [1, 4, 16, 17, 38, 51, 64, 127, 128, 512, 1024, 4096, 8192],
+            [128, 256, 384, 512, 768, 1024, 1536, 1664, 2048, 4096, 7168, 16384],
+            [16, 32, 64, 128],
+            [None],
+            [fp8_type_],
+            BASE_FLAGS,
+        )
     )
-) + list(
-    itertools.product(
-        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-        [2048],
-        [128],
-        [8, 16, 32, 48],
-        [fp8_type_],
-        [
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                masked_layout_mode="balanced",
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                masked_layout_mode="imbalanced",
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                masked_layout_mode="extreme",
-            ),
-        ],
-    )
+    + list(
+        itertools.product(
+            [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+            [2048],
+            [128],
+            [8, 16, 32, 48],
+            [fp8_type_],
+            FUSED_FLAGS,
+        )
+    ),
+    [
+        (1, 128, 128, None, fp8_type_, BASE_FLAGS[0]),
+        (17, 1536, 128, None, fp8_type_, BASE_FLAGS[2]),
+        (38, 4096, 128, None, fp8_type_, BASE_FLAGS[2]),
+        (51, 4096, 128, None, fp8_type_, BASE_FLAGS[2]),
+        (512, 2048, 128, 8, fp8_type_, FUSED_FLAGS[0]),
+        (2048, 2048, 128, 16, fp8_type_, FUSED_FLAGS[1]),
+    ],
 )
 
 

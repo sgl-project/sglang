@@ -96,6 +96,57 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
+PRODUCTION_LIKE_NORM_CASES = [
+    (38, 4096, torch.bfloat16),
+    (1240, 1536, torch.bfloat16),
+    (7807, 128, torch.bfloat16),
+]
+
+
+@pytest.mark.parametrize("batch_size,hidden_size,dtype", PRODUCTION_LIKE_NORM_CASES)
+def test_norm_production_like_shapes(batch_size, hidden_size, dtype):
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    w = torch.randn(hidden_size, dtype=dtype, device="cuda")
+
+    y_ref = llama_rms_norm(x, w)
+    enable_pdl = is_arch_support_pdl()
+    y = sgl_kernel.rmsnorm(x, w, enable_pdl=enable_pdl)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+PRODUCTION_LIKE_FUSED_ADD_RMSNORM_CASES = [
+    (39, 4096, torch.bfloat16),
+    (39, 8192, torch.bfloat16),
+    (89, 4096, torch.bfloat16),
+]
+
+
+@pytest.mark.parametrize(
+    "batch_size,hidden_size,dtype", PRODUCTION_LIKE_FUSED_ADD_RMSNORM_CASES
+)
+def test_fused_add_rmsnorm_production_like_shapes(batch_size, hidden_size, dtype):
+    eps = 1e-6
+
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    enable_pdl = is_arch_support_pdl()
+    sgl_kernel.fused_add_rmsnorm(
+        x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
+    )
+
+    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])

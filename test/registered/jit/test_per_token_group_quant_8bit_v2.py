@@ -60,7 +60,9 @@ V2_QUANT_CASES = get_ci_test_range(
     ),
     [
         (torch.bfloat16, 1, 128, False, False),
+        (torch.bfloat16, 17, 1536, False, False),
         (torch.bfloat16, 38, 7168, False, True),
+        (torch.bfloat16, 38, 4096, False, True),
         (torch.bfloat16, 64, 4096, True, True),
         (torch.float16, 333, 2048, True, False),
     ],
@@ -121,7 +123,9 @@ ROW_MAJOR_UE8M0_CASES = get_ci_test_range(
     ),
     [
         (torch.bfloat16, 1, 128),
+        (torch.bfloat16, 17, 1536),
         (torch.bfloat16, 33, 7168),
+        (torch.bfloat16, 38, 4096),
         (torch.float16, 128, 4096),
     ],
 )

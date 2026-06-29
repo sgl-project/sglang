@@ -46,8 +46,13 @@ def torch_scaled_fp8_quant(tensor, inv_scale):
 
 
 PER_TENSOR_QUANT_CASES = get_ci_test_range(
-    list(itertools.product([38, 128, 256, 512], [512, 2048, 4096, 7168])),
-    [(38, 7168), (128, 512), (512, 4096)],
+    list(
+        itertools.product(
+            [38, 39, 128, 256, 512, 1392],
+            [512, 1536, 2048, 4096, 7168],
+        )
+    ),
+    [(38, 7168), (39, 1536), (128, 512), (512, 4096), (1392, 1536)],
 )
 
 
