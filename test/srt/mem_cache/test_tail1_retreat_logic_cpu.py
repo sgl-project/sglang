@@ -40,7 +40,8 @@ def retreat(value, last_node, best_value_len, req, root, cow_mamba=True):
             gf = req.get_fill_ids()
             input_len = len(gf) if gf else None
         if input_len is not None and (
-            input_len - sum(len(v) for v in value[:best_value_len])
+            0
+            < input_len - sum(len(v) for v in value[:best_value_len])
             < MIN_SAFE_GDN_EXTEND
         ):
             rn, rl = last_node, best_value_len
@@ -108,6 +109,13 @@ if __name__ == "__main__":
             "tail=64 (L=192) no retreat",
             n_chunks=2,
             input_len=192,
+            expect_retreat_to_len=2,
+        ),
+        # tail=0 -> perfect cache hit -> NO retreat (bvl unchanged)
+        case(
+            "tail=0 (L=128) no retreat",
+            n_chunks=2,
+            input_len=128,
             expect_retreat_to_len=2,
         ),
         # single checkpoint + tail=1 -> no earlier ckpt -> fresh fallback (bvl=0)

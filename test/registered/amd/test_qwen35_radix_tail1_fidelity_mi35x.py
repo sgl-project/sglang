@@ -167,6 +167,20 @@ class TestQwen35RadixTail1FidelityMI35x(CustomTestCase):
             "tail=2 extend should stay 2 (no spurious retreat)",
         )
 
+    def test_tail0_control_perfect_hit_not_retreated(self):
+        # Control: token_len % 64 == 0 -> tail=0 (perfect cache hit, nothing to recompute, no M=1 forward).
+        # Assert the fix does NOT over-trigger on perfect hits: the extend stays 0 (no spurious retreat that
+        # would force recomputing up to a full chunk). Guards the tail==0 regression.
+        prompt, ptok = _build_prompt_of_len_mod(self.base_url, target_mod=0)
+        requests.get(self.base_url + "/flush_cache", timeout=60)
+        _first_token(self.base_url, prompt)  # warm
+        _tok, hit_ptok, hit_cached = _first_token(self.base_url, prompt)  # hit
+        self.assertEqual(
+            hit_ptok - hit_cached,
+            0,
+            "tail=0 perfect cache hit should have 0 extend (must not retreat)",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
