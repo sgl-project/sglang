@@ -42,6 +42,10 @@ uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.a
 
 ## Method 2: From source
 
+<Note>
+Building from source requires the Protocol Buffers compiler (`protoc`) for Rust gRPC components. On macOS, install it with `brew install protobuf`. On Linux, install it with `apt install protobuf-compiler`.
+</Note>
+
 ```bash Command
 # Use the last release branch
 git clone -b v0.5.12 https://github.com/sgl-project/sglang.git
