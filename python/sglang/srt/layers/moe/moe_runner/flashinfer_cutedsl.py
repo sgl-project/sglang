@@ -293,6 +293,23 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     layer._cutedsl_input_scale = used_input_scale
 
 
+def invalidate_cutedsl_cache(layer: torch.nn.Module) -> None:
+    """Refresh cached CuteDSL scalar scales after a weight reload.
+
+    Called from process_weights_after_loading to refresh the wrapper's cached
+    scales after a weight reload.  This is a no-op when the wrapper is not yet
+    created, which happens during the first forward. In that case, the wrapper
+    is created lazily on first forward.
+    """
+    if getattr(layer, "_cutedsl_wrapper", None) is None:
+        return
+    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+        resolve_cutedsl_standard_scales(layer)
+    )
+    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+    layer._cutedsl_input_scale = used_input_scale
+
+
 # ---------------------------------------------------------------------------
 # Dataclass + fused function for moe_runner dispatch
 # ---------------------------------------------------------------------------
