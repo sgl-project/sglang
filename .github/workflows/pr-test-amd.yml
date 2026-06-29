@@ -1138,7 +1138,7 @@ jobs:
       - name: Verify NIXL in Container
         run: |
           docker exec ci_sglang bash -lc '
-            set -euxo pipefail
+            set -eux
             export LD_LIBRARY_PATH=/opt/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
             python -c "import nixl; print(\"nixl OK:\", nixl.__file__)"
             test -d /opt/ucx/lib
