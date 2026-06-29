@@ -528,15 +528,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dim, total_len = mixed_qkv.shape
                 width = layer.conv_weights.shape[1]
                 padding = width - 1
-                x = mixed_qkv.unsqueeze(0)
+                x = mixed_qkv.unsqueeze(0).float()
                 conv_out = F.conv1d(
                     input=x,
-                    weight=layer.conv_weights.unsqueeze(1),
-                    bias=layer.bias,
+                    weight=layer.conv_weights.unsqueeze(1).float(),
+                    bias=layer.bias.float() if layer.bias is not None else None,
                     padding=padding,
                     groups=dim,
                 )
-                mixed_qkv = F.silu(conv_out[..., :total_len]).squeeze(0).transpose(0, 1)[:seq_len]
+                mixed_qkv = F.silu(conv_out[..., :total_len]).to(mixed_qkv.dtype).squeeze(0).transpose(0, 1)[:seq_len]
             else:
                 mixed_qkv = causal_conv1d_fn(
                     mixed_qkv,
