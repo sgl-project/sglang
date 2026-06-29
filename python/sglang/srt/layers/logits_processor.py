@@ -83,6 +83,20 @@ def autotune_dummy_run_mode():
         _in_autotune_dummy_run = False
 
 
+def _get_chunk_logprob_indices(
+    input_logprob_indices: torch.Tensor, start_idx: int, end_idx: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select sorted logprob indices for a chunk without materializing a bool mask."""
+    chunk_start = torch.searchsorted(input_logprob_indices, start_idx)
+    chunk_end = torch.searchsorted(input_logprob_indices, end_idx)
+    mask_indices = torch.arange(
+        chunk_start, chunk_end, device=input_logprob_indices.device
+    )
+    global_indices = input_logprob_indices[mask_indices]
+    chunk_indices = global_indices - start_idx
+    return mask_indices, global_indices, chunk_indices
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -727,14 +741,15 @@ class LogitsProcessor(nn.Module):
                 lm_head.set_lm_head_pass(i)
 
             # Get indices for this chunk
-            chunk_mask = (input_logprob_indices >= start_idx) & (
-                input_logprob_indices < end_idx
+            (
+                mask_indices,
+                global_indices,
+                chunk_indices,
+            ) = _get_chunk_logprob_indices(
+                input_logprob_indices,
+                start_idx,
+                end_idx,
             )
-            global_indices = input_logprob_indices[chunk_mask]
-            chunk_indices = global_indices - start_idx
-            # Get the positions in the original array where chunk_mask is True
-            # This is needed to correctly index into extend_input_logprob_token_ids_gpu
-            mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
 
             # Get the logits for this chunk
             chunk_states = pruned_states[start_idx:end_idx]
