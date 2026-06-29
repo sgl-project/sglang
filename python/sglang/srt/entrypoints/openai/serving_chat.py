@@ -465,6 +465,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        # Reject multimodal content when multimodal is not enabled
+        if not self.tokenizer_manager.model_config.is_multimodal:
+            multimodal_type = self._detect_multimodal_content(request)
+            if multimodal_type:
+                return (
+                    f"Multimodal input ({multimodal_type}) is not supported. "
+                    "Please start the server with --enable-multimodal to enable "
+                    "multimodal functionality."
+                )
+
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
@@ -516,6 +526,26 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        return None
+
+    @staticmethod
+    def _detect_multimodal_content(
+        request: ChatCompletionRequest,
+    ) -> Optional[str]:
+        """Check if the request contains multimodal content parts.
+
+        Returns the type of multimodal content found (e.g. "image_url"),
+        or None if the request is text-only.
+        """
+        multimodal_types = {"image_url", "video_url", "audio_url"}
+        for message in request.messages:
+            content = getattr(message, "content", None)
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                part_type = getattr(part, "type", None)
+                if part_type in multimodal_types:
+                    return part_type
         return None
 
     def _convert_to_internal_request(
