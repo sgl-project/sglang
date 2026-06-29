@@ -241,13 +241,16 @@ class FlashAttentionBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_capacity_len = int(self.req_to_token.shape[1])
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
-        # Static page-table width (upper bound). The device-side page-table build
-        # sizes to this constant, so no runtime host max is needed.
+        # Static page-table width (upper bound). Speculative decoding can
+        # over-allocate KV beyond the model context length, and req_to_token is
+        # sized with that headroom. Metadata that indexes req_to_token must use
+        # the addressable row width, not the semantic model context length.
         self.max_num_pages = (
-            self.max_context_len + self.page_size - 1
+            self.req_to_token_capacity_len + self.page_size - 1
         ) // self.page_size
         # Opt out of the seq_lens_cpu D2H only for dflash (the worker adapted to
         # the GPU-only relay); EAGLE/MTP/standalone/non-spec keep the CPU mirror.
@@ -1768,7 +1771,7 @@ class FlashAttentionBackend(AttentionBackend):
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        max_num_pages = self.max_num_pages
 
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
@@ -1786,7 +1789,10 @@ class FlashAttentionBackend(AttentionBackend):
                 device=self.device,
             ),
             "strided_indices": torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
+                0,
+                self.req_to_token_capacity_len,
+                self.page_size,
+                device=self.device,
             ),
         }
         # Pre-allocate scheduler_metadata buffer for CUDA graph
@@ -1859,7 +1865,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -1928,7 +1934,10 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
                 "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
+                    0,
+                    self.req_to_token_capacity_len,
+                    self.page_size,
+                    device=self.device,
                 ),
             }
 
@@ -1951,7 +1960,10 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 ),
                 "strided_indices": torch.arange(
-                    0, self.max_context_len, self.page_size, device=self.device
+                    0,
+                    self.req_to_token_capacity_len,
+                    self.page_size,
+                    device=self.device,
                 ),
             }
 
@@ -1986,7 +1998,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    self.max_context_len,
+                    max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
@@ -2037,7 +2049,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     "page_table": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
-                        self.max_context_len,
+                        max_num_pages,
                         dtype=torch.int32,
                         device=self.device,
                     ),
