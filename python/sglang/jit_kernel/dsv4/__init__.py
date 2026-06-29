@@ -12,6 +12,7 @@ from .compress import (
 from .compress_old import fused_norm_rope_inplace
 from .elementwise import (
     fused_k_norm_rope_flashmla,
+    fused_q_indexer_rope_first_quant,
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
@@ -38,6 +39,7 @@ __all__ = [
     "fused_store_cache",
     "fused_rope_inplace",
     "fused_q_norm_rope",
+    "fused_q_indexer_rope_first_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
