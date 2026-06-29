@@ -1287,11 +1287,6 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         for idx, ret_item in enumerate(ret):
-            # Process logprobs
-            choice_logprobs = None
-            if request.logprobs:
-                choice_logprobs = self._process_response_logprobs(ret_item)
-
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
@@ -1323,6 +1318,19 @@ class OpenAIServingChat(OpenAIServingBase):
                         err_type="InternalServerError",
                         status_code=500,
                     )
+
+            # Process logprobs after reasoning parsing so logprobs.content describes
+            # the same visible text as message.content, not the raw reasoning stream.
+            choice_logprobs = None
+            if request.logprobs:
+                choice_logprobs = self._process_response_logprobs(
+                    ret_item,
+                    parsed_content=(
+                        text
+                        if reasoning_parser and request.separate_reasoning
+                        else None
+                    ),
+                )
 
             # Handle tool calls
             tool_calls = None
@@ -1451,11 +1459,127 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return token_logprobs
 
-    def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
-        """Process logprobs for non-streaming response"""
+    def _slice_response_logprobs_to_content(
+        self,
+        output_token_logprobs: List[Any],
+        output_top_logprobs: Optional[List[Any]],
+        content: Optional[str],
+    ) -> tuple[List[Any], Optional[List[Any]]]:
+        """Slice non-streaming logprobs so joining tokens equals message.content."""
+        if content is None:
+            return output_token_logprobs, output_top_logprobs
+        if not content:
+            return [], [] if output_top_logprobs is not None else None
+
+        token_texts = [token_logprob[2] for token_logprob in output_token_logprobs]
+        raw_text = "".join(token_texts)
+
+        token_offsets = [0]
+        boundaries = {0: 0}
+        offset = 0
+        for token_index, token_text in enumerate(token_texts, start=1):
+            offset += len(token_text)
+            token_offsets.append(offset)
+            boundaries[offset] = token_index
+
+        content_start = raw_text.rfind(content)
+        while content_start != -1:
+            content_end = content_start + len(content)
+            start_index = boundaries.get(content_start)
+            end_index = boundaries.get(content_end)
+            if start_index is not None and end_index is not None:
+                sliced_top_logprobs = (
+                    output_top_logprobs[start_index:end_index]
+                    if output_top_logprobs is not None
+                    else None
+                )
+                return (
+                    output_token_logprobs[start_index:end_index],
+                    sliced_top_logprobs,
+                )
+
+            # The reasoning parser trims the final text. If that trim cuts into a
+            # decoded token, keep the token logprob but trim only whitespace from
+            # the displayed token text so the public invariant still holds:
+            # "".join(t.token for t in logprobs.content) == message.content.
+            start_index = 0
+            while (
+                start_index + 1 < len(token_offsets)
+                and token_offsets[start_index + 1] <= content_start
+            ):
+                start_index += 1
+            end_index = start_index + 1
+            while (
+                end_index < len(token_offsets)
+                and token_offsets[end_index] < content_end
+            ):
+                end_index += 1
+
+            prefix = raw_text[token_offsets[start_index] : content_start]
+            suffix = raw_text[content_end : token_offsets[end_index]]
+            if not prefix.strip() and not suffix.strip():
+                sliced_token_logprobs = list(
+                    output_token_logprobs[start_index:end_index]
+                )
+                if start_index == end_index - 1:
+                    sliced_token_logprobs[0] = self._replace_token_logprob_text(
+                        sliced_token_logprobs[0],
+                        content,
+                    )
+                else:
+                    first_token_text = token_texts[start_index][
+                        content_start - token_offsets[start_index] :
+                    ]
+                    last_token_text = token_texts[end_index - 1][
+                        : content_end - token_offsets[end_index - 1]
+                    ]
+                    sliced_token_logprobs[0] = self._replace_token_logprob_text(
+                        sliced_token_logprobs[0],
+                        first_token_text,
+                    )
+                    sliced_token_logprobs[-1] = self._replace_token_logprob_text(
+                        sliced_token_logprobs[-1],
+                        last_token_text,
+                    )
+
+                sliced_top_logprobs = (
+                    output_top_logprobs[start_index:end_index]
+                    if output_top_logprobs is not None
+                    else None
+                )
+                return sliced_token_logprobs, sliced_top_logprobs
+            content_start = raw_text.rfind(content, 0, content_start)
+
+        logger.warning(
+            "Failed to align chat completion logprobs with parsed message content; "
+            "returning unsliced logprobs."
+        )
+        return output_token_logprobs, output_top_logprobs
+
+    @staticmethod
+    def _replace_token_logprob_text(token_logprob: Any, token_text: str) -> Any:
+        values = list(token_logprob)
+        values[2] = token_text
+        return tuple(values) if isinstance(token_logprob, tuple) else values
+
+    def _process_response_logprobs(
+        self,
+        ret_item: Dict[str, Any],
+        parsed_content: Optional[str] = None,
+    ) -> ChoiceLogprobs:
+        """Process logprobs for non-streaming response."""
+        output_token_logprobs = ret_item["meta_info"]["output_token_logprobs"]
+        output_top_logprobs = ret_item["meta_info"].get("output_top_logprobs", None)
+        output_token_logprobs, output_top_logprobs = (
+            self._slice_response_logprobs_to_content(
+                output_token_logprobs,
+                output_top_logprobs,
+                parsed_content,
+            )
+        )
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
-            output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
+            output_token_logprobs=output_token_logprobs,
+            output_top_logprobs=output_top_logprobs,
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
