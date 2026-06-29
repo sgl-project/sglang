@@ -18,6 +18,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
+from sglang.srt.models.qwen2_5_omni import (
+    Qwen2_5OmniForConditionalGeneration,
+    Qwen2_5OmniModel,
+)
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.models.qwen3_5 import (
@@ -262,6 +266,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
+        Qwen2_5OmniForConditionalGeneration,
+        Qwen2_5OmniModel,
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
         Qwen3_5ForConditionalGeneration,
@@ -273,8 +279,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
-        if hf_config.model_type == "qwen3_omni_moe":
+        if hf_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
             hf_config = hf_config.thinker_config
+
+        if self.model_type == "qwen2_5_omni":
+            hf_config.image_token_id = getattr(
+                hf_config, "image_token_id", hf_config.image_token_index
+            )
+            hf_config.video_token_id = getattr(
+                hf_config, "video_token_id", hf_config.video_token_index
+            )
+            hf_config.audio_token_id = getattr(
+                hf_config, "audio_token_id", hf_config.audio_token_index
+            )
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
@@ -289,16 +306,42 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
         self.audio_token_id = getattr(hf_config, "audio_token_id", None)
 
-        self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<|vision_start|><|image_pad|><|vision_end|>",
-            image_token_id=hf_config.image_token_id,
-            # The regex that matches expanded image tokens.
-            image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-            ),
-            video_token_id=self.VIDEO_TOKEN_ID,
-            audio_token_id=self.audio_token_id,
-        ).build(_processor)
+        if self.model_type == "qwen2_5_omni":
+            vision_bos = getattr(_processor, "vision_bos_token", "<|vision_bos|>")
+            vision_eos = getattr(_processor, "vision_eos_token", "<|vision_eos|>")
+            audio_bos = getattr(_processor, "audio_bos_token", "<|audio_bos|>")
+            audio_eos = getattr(_processor, "audio_eos_token", "<|audio_eos|>")
+            image_token = getattr(_processor, "image_token", "<|IMAGE|>")
+            video_token = getattr(_processor, "video_token", "<|VIDEO|>")
+            audio_token = getattr(_processor, "audio_token", "<|AUDIO|>")
+            self.mm_tokens = MultimodalSpecialTokens(
+                image_token=f"{vision_bos}{image_token}{vision_eos}",
+                image_token_id=hf_config.image_token_id,
+                image_token_regex=re.compile(
+                    rf"{re.escape(vision_bos)}(?:{re.escape(image_token)})+{re.escape(vision_eos)}"
+                ),
+                video_token=f"{vision_bos}{video_token}{vision_eos}",
+                video_token_id=self.VIDEO_TOKEN_ID,
+                video_token_regex=re.compile(
+                    rf"{re.escape(vision_bos)}(?:{re.escape(video_token)})+{re.escape(vision_eos)}"
+                ),
+                audio_token=f"{audio_bos}{audio_token}{audio_eos}",
+                audio_token_id=self.audio_token_id,
+                audio_token_regex=re.compile(
+                    rf"{re.escape(audio_bos)}(?:{re.escape(audio_token)})+{re.escape(audio_eos)}"
+                ),
+            ).build(_processor)
+        else:
+            self.mm_tokens = MultimodalSpecialTokens(
+                image_token="<|vision_start|><|image_pad|><|vision_end|>",
+                image_token_id=hf_config.image_token_id,
+                # The regex that matches expanded image tokens.
+                image_token_regex=re.compile(
+                    r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+                ),
+                video_token_id=self.VIDEO_TOKEN_ID,
+                audio_token_id=self.audio_token_id,
+            ).build(_processor)
 
     def build_input_ids_with_timestamps(
         self, prompt, embeddings, img_grid_thw, video_grid_thw, video_timestamps
@@ -626,7 +669,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             second_per_grid_ts=second_per_grid_ts,
             use_audio_in_video=False,
             audio_seqlens=(
-                audio_feature_lens if self.model_type == "qwen3_omni_moe" else None
+                audio_feature_lens
+                if self.model_type in ("qwen2_5_omni", "qwen3_omni_moe")
+                else None
             ),
             audio_token_id=getattr(self.hf_config, "audio_token_id", None),
             audio_start_token_id=self.audio_start_token_id,
@@ -719,11 +764,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         audio_feature_lengths = None
 
-        if self.model_type == "qwen3_omni_moe":
-            audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
-            if audio_item:
-                audio_feature_lengths = torch.sum(
-                    audio_item.feature_attention_mask, dim=1
+        if self.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+            audio_items = [mm for mm in mm_items if mm.is_audio()]
+            if audio_items:
+                audio_feature_lengths = torch.cat(
+                    [
+                        torch.sum(audio_item.feature_attention_mask, dim=1)
+                        for audio_item in audio_items
+                    ],
+                    dim=0,
                 )
 
         second_per_grid_ts = self._get_processor_output_value(ret, "second_per_grid_ts")

@@ -1684,6 +1684,8 @@ multimodal_model_archs = [
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
+    "Qwen2_5OmniForConditionalGeneration",
+    "Qwen2_5OmniModel",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
