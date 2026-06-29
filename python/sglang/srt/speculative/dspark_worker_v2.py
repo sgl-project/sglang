@@ -1,5 +1,4 @@
 import logging
-import math
 from copy import deepcopy
 from typing import Optional, Tuple
 
@@ -7,7 +6,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -261,34 +259,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         lm_head = self.draft_model.lm_head
 
         tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
         vocab_size = int(self._draft_inner.vocab_size)
-        shard_start = int(
-            getattr(
-                getattr(lm_head, "shard_indices", None),
-                "padded_org_vocab_start_index",
-                tp_rank * lm_head.weight.shape[0],
-            )
-        )
 
-        def _argmax_sharded_vocab(logits_shard: torch.Tensor) -> torch.Tensor:
+        def _gather_full_vocab(logits_shard: torch.Tensor) -> torch.Tensor:
             if tp_size == 1:
-                return torch.argmax(logits_shard[..., :vocab_size], dim=-1)
-
-            local_values, local_indices = torch.max(logits_shard, dim=-1)
-            global_indices = local_indices.to(torch.int64) + shard_start
-            invalid = global_indices >= vocab_size
-            if invalid.any():
-                local_values = local_values.masked_fill(invalid, float("-inf"))
-
-            gathered_values = tensor_model_parallel_all_gather(
-                local_values.unsqueeze(-1), dim=-1
-            )
-            gathered_indices = tensor_model_parallel_all_gather(
-                global_indices.unsqueeze(-1), dim=-1
-            )
-            best_rank = torch.argmax(gathered_values, dim=-1, keepdim=True)
-            return gathered_indices.gather(1, best_rank).squeeze(1)
+                return logits_shard
+            return tensor_model_parallel_all_gather(logits_shard, dim=-1)[
+                ..., :vocab_size
+            ]
 
         out_tokens = torch.empty(
             (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
@@ -296,7 +274,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         out_tokens[:, 0] = bonus_tokens.view(-1).to(torch.int64)
         markov_embeds = None
         with torch.inference_mode():
-            base_logits = F.linear(block_hidden, lm_head.weight)
+            base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
             for i in range(block_size):
                 prev_embed = markov_head.get_prev_embeddings(out_tokens[:, i])
                 if markov_embeds is None:
@@ -304,10 +282,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                         (bs, block_size, prev_embed.shape[-1])
                     )
                 markov_embeds[:, i].copy_(prev_embed)
-                bias = markov_head.project_bias(prev_embed)
-                out_tokens[:, i + 1] = _argmax_sharded_vocab(
-                    base_logits[:, i] + bias
-                )
+                bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
+                refined = base_logits[:, i] + bias
+                out_tokens[:, i + 1] = torch.argmax(refined, dim=-1)
 
             confidence = confidence_head(block_hidden, markov_embeds)
 
@@ -315,20 +292,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         return candidates, confidence
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
-        if self.confidence_threshold <= 0.0:
-            return torch.full(
-                (confidence.shape[0],),
-                confidence.shape[1],
-                dtype=torch.int64,
-                device=confidence.device,
-            )
-        if self.confidence_threshold >= 1.0:
-            logit_threshold = float("inf")
-        else:
-            logit_threshold = math.log(
-                self.confidence_threshold / (1.0 - self.confidence_threshold)
-            )
-        keep = confidence >= logit_threshold
+        keep = torch.sigmoid(confidence) >= self.confidence_threshold
         return keep.to(torch.int32).cumprod(dim=1).sum(dim=1)
 
     def _make_next_draft_input_prefill(
