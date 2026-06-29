@@ -169,10 +169,16 @@ def build_tree_kernel_efficient(
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
-    # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
-    retrieve_buf = torch.full(
-        (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
-    )
+    # On CUDA/HIP/MUSA, retrieve buffers are initialized to -1 inside the kernel.
+    # On NPU, the kernel does not initialize them, so we use torch.full.
+    if _is_npu:
+        retrieve_buf = torch.full(
+            (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
+        )
+    else:
+        retrieve_buf = torch.empty(
+            (3, bs, num_verify_tokens), device=device, dtype=torch.long
+        )
     retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve_buf
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
