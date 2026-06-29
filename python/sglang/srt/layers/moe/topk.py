@@ -1319,9 +1319,7 @@ def _mask_topk_ids_padded_region(
         # workloads; `torch.where` avoids that nonzero scan.
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         mask = (indices >= num_token_non_padded).unsqueeze(-1)
-        topk_ids = torch.where(mask, torch.full_like(topk_ids, -1), topk_ids)
-    elif _can_fuse_padded_region(topk_ids):
-        _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
+        topk_ids.masked_fill_(mask, fill_value)
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
