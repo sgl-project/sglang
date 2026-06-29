@@ -530,6 +530,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
 
+        stage_layer_num = len(stage_ratios)
         c4_layer_num = sum(1 for r in stage_ratios if r == 4)
         c128_layer_num = sum(1 for r in stage_ratios if r == 128)
         c4_page_size = page_size // 4
@@ -572,35 +573,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 size=swa_size,
                 page_size=swa_page_size,
                 dtype=dtype,
-                layer_num=layer_num,
+                layer_num=stage_layer_num,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
             )
 
-        c4_kv_pool_type = DeepSeekV4SingleKVPool
-        if enable_hisparse:
-            c4_kv_pool_type = HiSparseC4DevicePool
-        self.c4_kv_pool = self._make_kv_pool(
-            size=c4_size,
-            page_size=c4_page_size,
-            dtype=dtype,
-            layer_num=c4_layer_num,
-            device=device,
-            enable_memory_saver=enable_memory_saver,
-            global_page_size=page_size,
-            cls=c4_kv_pool_type,
-        )
+            c4_kv_pool_type = DeepSeekV4SingleKVPool
+            if enable_hisparse:
+                c4_kv_pool_type = HiSparseC4DevicePool
+            self.c4_kv_pool = self._make_kv_pool(
+                size=c4_size,
+                page_size=c4_page_size,
+                dtype=dtype,
+                layer_num=c4_layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=page_size,
+                cls=c4_kv_pool_type,
+            )
 
-        self.c128_kv_pool = self._make_kv_pool(
-            size=c128_size,
-            page_size=c128_page_size,
-            dtype=dtype,
-            layer_num=c128_layer_num,
-            device=device,
-            enable_memory_saver=enable_memory_saver,
-            global_page_size=page_size,
-        )
+            self.c128_kv_pool = self._make_kv_pool(
+                size=c128_size,
+                page_size=c128_page_size,
+                dtype=dtype,
+                layer_num=c128_layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=page_size,
+            )
 
         indexer_size = (
             self.c4_logical_size
@@ -924,6 +925,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def _swa_local_layer_id(self, layer_id: int) -> int:
         """Convert absolute model layer_id to SWA-pool-local (PP-stage-local) index."""
         return layer_id - self._stage_start
+
+    def get_swa_raw_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)

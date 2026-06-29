@@ -21,13 +21,13 @@ This module deliberately does **not** own torch.compile-specific state
 
 from __future__ import annotations
 
-import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
-logger = logging.getLogger(__name__)
-
+from sglang.srt.model_executor.runner_backend_utils import (
+    PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -45,21 +45,11 @@ def is_in_tc_piecewise_cuda_graph() -> bool:
 def enable_tc_piecewise_cuda_graph():
     """Mark the enclosed scope as "we are inside a piecewise CUDA graph
     capture/replay". Sets _in_tc_piecewise_cuda_graph true for the duration.
-
-    Errors during capture surface a hint that lets users disable the
-    feature while filing a bug.
     """
     global _in_tc_piecewise_cuda_graph
     _in_tc_piecewise_cuda_graph = True
     try:
         yield
-    except Exception as e:
-        logger.error(
-            "Piecewise CUDA Graph failed with error: %s\n%s",
-            e,
-            TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG,
-        )
-        raise
     finally:
         _in_tc_piecewise_cuda_graph = False
 
@@ -112,7 +102,5 @@ def set_tc_piecewise_forward_context(
 
 
 TC_PIECEWISE_CUDA_GRAPH_CAPTURE_FAILED_MSG = (
-    "Piecewise CUDA Graph capture failed.\n"
-    "To work around this error, add --cuda-graph-backend-prefill=disabled to your launch command.\n"
-    "Please report this issue at https://github.com/sgl-project/sglang/issues/new/choose"
+    "Piecewise CUDA graph failed.\n" + PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG
 )

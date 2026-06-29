@@ -283,6 +283,14 @@ class BaseSpecWorker(ABC):
         pass
 
     @property
+    def war_fastpath_runner(self):
+        # The runner that runs the step's LAST shared-buffer-reading phase --
+        # it owns the read-done event the scheduler's WAR barrier waits on.
+        # Default is the target runner; override if the last phase runs
+        # elsewhere (eagle's draft_extend runs on the draft runner).
+        return self.target_worker.model_runner
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
         """Attn backends touched by spec_v2 forward; OR-ed by decide_needs_cpu_seq_lens.
         Default returns target only; subclasses extend with draft backends."""
