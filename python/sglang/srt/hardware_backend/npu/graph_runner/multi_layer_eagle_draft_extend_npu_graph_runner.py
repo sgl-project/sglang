@@ -17,7 +17,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleDraftExtendCudaGraphRunner,
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -36,10 +38,19 @@ class MultiLayerEagleDraftExtendNpuGraphRunner(
         seq_lens = self.buffers.seq_lens_cpu[: self.raw_bs].tolist() + [0] * (
             self.bs - self.raw_bs
         )
+        use_fia_v2 = (
+            self.model_runner.model_config.attention_arch == AttentionArch.MLA
+            and get_global_server_args().kv_cache_dtype == "fp8_e4m3"
+        )
+        attr_name = (
+            "actual_seq_kvlen"
+            if use_fia_v2
+            else "actual_seq_lengths_kv"
+        )
         return self.backend.replay_with_input_update(
             shape_key,
             seq_lens=seq_lens,
-            attr_name="actual_seq_kvlen",
+            attr_name=attr_name,
             attr_type=[],
         )
 

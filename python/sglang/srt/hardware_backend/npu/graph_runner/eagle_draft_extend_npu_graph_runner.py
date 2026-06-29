@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
@@ -29,6 +30,10 @@ if TYPE_CHECKING:
 
 class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
     def __init__(self, eagle_worker: EagleDraftWorker):
+        self.use_fia_v2 = (
+            eagle_worker.draft_runner.model_config.attention_arch == AttentionArch.MLA
+            and get_global_server_args().kv_cache_dtype == "fp8_e4m3"
+        )
         super().__init__(eagle_worker)
 
     def _cache_loc_dtype(self):
@@ -42,7 +47,11 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             return self.backend.replay_with_input_update(
                 shape_key,
                 seq_lens=seq_lens,
-                attr_name="actual_seq_lengths_kv",
+                attr_name=(
+                    "actual_seq_kvlen"
+                    if self.use_fia_v2
+                    else "actual_seq_lengths_kv"
+                ),
                 attr_type=[],
             )
         else:
