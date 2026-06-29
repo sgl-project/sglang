@@ -237,6 +237,7 @@ class MMEncoder:
         schedule_path=None,
         dist_init_method=None,
         rank: int = 0,
+        shm_resources=None,
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
@@ -303,7 +304,9 @@ class MMEncoder:
         )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
-        self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
+        self.mm_cache = MultiModalStaticCache(
+            embedding_cache_size * 1024 * 1024, shm_resources=shm_resources
+        )
         self.mm_cache_lock = asyncio.Lock()
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
@@ -1981,10 +1984,82 @@ class MMEncoder:
             hashes=req.get("hashes"),
         )
 
+    async def _encode_missing_with_cache(
+        self,
+        mm_feature,
+        mm_inputs: dict,
+        grid_dim: List,
+        total: int,
+        modality: Modality,
+        get_feat,
+    ) -> List[torch.Tensor]:
+        """Like running _encode_missing over the whole batch, but consults the
+        mm_cache per file first and only runs ViT on cache misses.
+
+        The cache key is the hash of a single file's *preprocessed* feature
+        (via _calculate_hashes_from_features), identical to the scheme _encode
+        uses, so a file is shared across DP workers (shm_resources) and across
+        the two encode paths under the same key.
+
+        TP-collective safety: when tp_size > 1, get_feat runs a collective ViT
+        across ranks, so every rank must agree on which items to encode. Each
+        rank's cache applies the same deterministic get/set/eviction to the
+        same ordered items, so missing_indices is identical on all ranks and
+        the collective stays aligned. This is the same invariant _encode relies
+        on (it also skips a hit without broadcasting a mask).
+        """
+        if not self.server_args.enable_prefix_mm_cache:
+            return self._encode_missing(
+                mm_feature, mm_inputs, list(range(total)), modality, get_feat
+            )
+
+        hashes = self._calculate_hashes_from_features(mm_feature, grid_dim, modality)
+        final_slices: List[Optional[torch.Tensor]] = [None] * total
+        missing_indices: List[int] = []
+
+        _t0 = time.perf_counter()
+        async with self.mm_cache_lock:
+            for i, h in enumerate(hashes):
+                hit = self.mm_cache.get_single(h)
+                if hit is not None:
+                    final_slices[i] = hit.embedding
+                else:
+                    missing_indices.append(i)
+        read_ms = (time.perf_counter() - _t0) * 1e3
+        logger.info(
+            f"[mm_cache] batch read modality={modality.name} total={total} "
+            f"hits={total - len(missing_indices)} misses={len(missing_indices)} "
+            f"read_ms={read_ms:.2f} cache_entries={len(self.mm_cache)}"
+        )
+
+        if missing_indices:
+            new_slices = self._encode_missing(
+                mm_feature, mm_inputs, missing_indices, modality, get_feat
+            )
+            _t0 = time.perf_counter()
+            inserted = 0
+            async with self.mm_cache_lock:
+                for idx, emb in zip(missing_indices, new_slices):
+                    final_slices[idx] = emb
+                    if self.mm_cache.set(hashes[idx], EmbeddingResult(embedding=emb)):
+                        inserted += 1
+            store_ms = (time.perf_counter() - _t0) * 1e3
+            logger.info(
+                f"[mm_cache] batch store modality={modality.name} "
+                f"inserted={inserted}/{len(missing_indices)} store_ms={store_ms:.2f}"
+            )
+
+        return final_slices
+
     async def batch_encode(
         self, requests: List[dict], modality: Modality
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
-        """Cross-request encoder fusion (image/audio). No cache path."""
+        """Cross-request encoder fusion (image/audio). Consults the per-file
+        mm_cache (content-hash keyed) when enable_prefix_mm_cache is set and
+        only runs ViT on cache misses; otherwise runs ViT on the whole batch.
+
+        With SGLANG_MM_CACHE_SHM the cache is shared across DP encoder workers,
+        so a file encoded by one worker is reused by the others."""
         # items_per_req counts grid entries (post-expansion) so per-request
         # slicing of grid_dim/final_slices stays aligned for processors that
         # expand one leaf into multiple grids (e.g. Kimi-VL/K25 dict-of-images).
@@ -2023,12 +2098,8 @@ class MMEncoder:
                     ),
                 )
 
-            final_slices = self._encode_missing(
-                mm_feature,
-                mm_inputs,
-                list(range(total)),
-                modality,
-                get_feat,
+            final_slices = await self._encode_missing_with_cache(
+                mm_feature, mm_inputs, grid_dim, total, modality, get_feat
             )
 
             if self.profiler is not None:
@@ -3076,6 +3147,7 @@ async def run_dp_worker(
     gpu_id: int,
     dispatch_path: str,
     result_path: str,
+    shm_resources=None,
 ):
     logger.info(
         f"DP worker {dp_rank} starting on gpu_id={gpu_id} "
@@ -3088,7 +3160,12 @@ async def run_dp_worker(
     args = copy.deepcopy(server_args)
     args.base_gpu_id = gpu_id
     args.tp_size = 1
-    enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
+    enc = MMEncoder(
+        args,
+        dist_init_method=f"tcp://127.0.0.1:{get_free_port()}",
+        rank=0,
+        shm_resources=shm_resources,
+    )
     sched = EncoderScheduler(
         encoder=enc, send_sockets=[], max_batch_size=ENCODER_MAX_BATCH_SIZE
     )
@@ -3165,11 +3242,14 @@ def launch_dp_worker(
     gpu_id: int,
     dispatch_path: str,
     result_path: str,
+    shm_resources=None,
 ):
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
-            run_dp_worker(server_args, dp_rank, gpu_id, dispatch_path, result_path)
+            run_dp_worker(
+                server_args, dp_rank, gpu_id, dispatch_path, result_path, shm_resources
+            )
         )
     except KeyboardInterrupt:
         logger.info(f"DP worker {dp_rank} exiting")
@@ -3405,6 +3485,17 @@ def _launch_server_dp(server_args: ServerArgs):
         for r in range(dp_size)
     ]
 
+    shm_resources = None
+    if server_args.enable_prefix_mm_cache and envs.SGLANG_MM_CACHE_SHM.get():
+        mgr = ctx.Manager()
+        shm_resources = {
+            "index": mgr.dict(),
+            "lru": mgr.list(),
+            "size": mgr.Value("l", 0),
+            "lock": ctx.Lock(),
+        }
+        logger.info(f"Shared mm_cache enabled across {dp_size} DP workers")
+
     # Register atexit BEFORE spawn loop so partial spawns get reaped on
     # exception (atexit holds the list ref and reads it at exit time).
     import atexit
@@ -3417,6 +3508,21 @@ def _launch_server_dp(server_args: ServerArgs):
                 p.kill()
         for p in worker_processes:
             p.join(timeout=5)
+        if shm_resources is not None:
+            from multiprocessing.shared_memory import SharedMemory
+
+            for meta in list(shm_resources["index"].values()):
+                names = [meta.get("shm_name")]
+                names += [seg.get("shm_name") for seg in meta.get("aux_segments", [])]
+                for name in names:
+                    if not name:
+                        continue
+                    try:
+                        shm = SharedMemory(name=name, create=False)
+                        shm.close()
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
 
     atexit.register(_kill_workers)
 
@@ -3436,6 +3542,7 @@ def _launch_server_dp(server_args: ServerArgs):
                     gpu_id,
                     f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
                     result_path,
+                    shm_resources,
                 ),
                 daemon=False,
             )
