@@ -1000,13 +1000,21 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
-            # TODO: max_running_requests_under_SLO has no setter — sglang:utilization stuck at 0 (regressed #22713).
+            # Prefer the SLO-aware capacity if it has been populated (non-OSS
+            # or future OSS paths). Fall back to max_running_requests so that
+            # sglang:utilization reflects real load in the OSS codepath.
+            # See: https://github.com/sgl-project/sglang/issues/22713
             max_under_slo = getattr(
                 self.scheduler, "max_running_requests_under_SLO", None
             )
-            if max_under_slo is not None and max_under_slo > 0:
+            capacity = (
+                max_under_slo
+                if (max_under_slo is not None and max_under_slo > 0)
+                else getattr(self.scheduler, "max_running_requests", None)
+            )
+            if capacity is not None and capacity > 0:
                 self.stats.utilization = max(
-                    self.stats.num_running_reqs.total / max_under_slo,
+                    self.stats.num_running_reqs.total / capacity,
                     self.stats.token_usage / 0.9,
                 )
 
