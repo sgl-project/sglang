@@ -28,6 +28,19 @@ class SchedulerLoader(ComponentLoader):
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
+        override = getattr(
+            server_args.pipeline_config, "scheduler_class_override", None
+        )
+        if override is not None and override != class_name:
+            # Use the flow-native scheduler the model was sampled with.
+            logger.info(
+                "Overriding scheduler %s -> %s for %s",
+                class_name,
+                override,
+                type(server_args.pipeline_config).__name__,
+            )
+            class_name = override
+
         scheduler_cls, _ = ModelRegistry.resolve_model_cls(class_name)
 
         scheduler = scheduler_cls(**config)

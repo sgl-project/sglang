@@ -431,12 +431,16 @@ class DiffGenerator:
             and output_index < len(output_batch.metrics_list)
         ):
             metrics = output_batch.metrics_list[output_index]
+        action = output_batch.action
+        if action is not None and output_index is not None and len(action) > output_index:
+            action = action[output_index]
         return dict(
             prompt=req.prompt,
             size=(req.height, req.width, req.num_frames),
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
+            action=action,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=output_batch.rollout_trajectory_data,

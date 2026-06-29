@@ -40,8 +40,11 @@ class Cosmos3Config(PipelineConfig):
     vae_tiling: bool = False
     vae_sp: bool = False
 
-    # Sourced from scheduler_config.json in the checkpoint.
+    # Unset so the per-mode default (T2V 10, I2V 5, T2I 3) applies.
     flow_shift: float | None = None
+
+    # The model uses the flow-native FlowUniPC schedule.
+    scheduler_class_override: str = "FlowUniPCMultistepScheduler"
 
     precision: str = "bf16"
     vae_precision: str = "bf16"
@@ -49,6 +52,7 @@ class Cosmos3Config(PipelineConfig):
     # Pipeline-level (not sampling) knobs.
     max_sequence_length: int = 512
     use_duration_template: bool = True
+    use_resolution_template: bool = True
     use_system_prompt: bool = False
 
     def __post_init__(self):

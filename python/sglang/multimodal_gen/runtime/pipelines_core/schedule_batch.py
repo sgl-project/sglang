@@ -414,6 +414,7 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    action: torch.Tensor | None = None
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
@@ -432,6 +433,7 @@ class OutputBatch:
     def drop_payload_for_warmup(self) -> None:
         self.output = None
         self.audio = None
+        self.action = None
         self.trajectory_timesteps = None
         self.trajectory_latents = None
         self.rollout_trajectory_data = None

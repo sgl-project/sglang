@@ -13,7 +13,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
@@ -23,6 +22,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.domain_aware_linear import (
+    DomainAwareLinear,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm,
@@ -912,10 +914,42 @@ class Cosmos3OmniTransformer(CachableDiT):
         # Output norm
         self.norm_moe_gen = RMSNorm(self.hidden_size, eps=arch.rms_norm_eps)
 
+        self.sound_gen = arch.sound_gen
+        self.action_gen = arch.action_gen
+        self.sound_dim = arch.sound_dim
+        self.action_dim = arch.action_dim
+        self.sound_latent_fps = arch.sound_latent_fps
+        self.temporal_compression_factor_sound = arch.temporal_compression_factor_sound
+        if self.sound_gen:
+            self.audio_proj_in = ReplicatedLinear(
+                arch.sound_dim,
+                self.hidden_size,
+                bias=True,
+                quant_config=quant_config,
+                prefix="audio_proj_in",
+            )
+            self.audio_proj_out = ReplicatedLinear(
+                self.hidden_size,
+                arch.sound_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix="audio_proj_out",
+            )
+            self.audio_modality_embed = nn.Parameter(torch.empty(self.hidden_size))
+        if self.action_gen:
+            self.action_proj_in = DomainAwareLinear(
+                arch.action_dim, self.hidden_size, arch.num_embodiment_domains
+            )
+            self.action_proj_out = DomainAwareLinear(
+                self.hidden_size, arch.action_dim, arch.num_embodiment_domains
+            )
+            self.action_modality_embed = nn.Parameter(torch.empty(self.hidden_size))
+
         # Cached K/V from UND pathway - dict keyed by cache_key for CFG support
         # This allows maintaining separate caches for conditional and unconditional
         # prompts, avoiding recomputation on every denoising step
         self.cached_kv: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        # One rope cache covers the packed GEN sequence (vision + sound + action).
         self.cached_gen_rope_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         self.__post_init__()
@@ -1006,6 +1040,64 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         return text_pos_ids, vis_pos_ids
 
+    def _compute_sound_position_ids(
+        self,
+        text_mask: torch.Tensor,
+        t_sound: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """mRoPE position ids [3, B, T_sound] for the sound segment.
+
+        Sound shares the vision temporal-axis start (text length + the modality
+        margin) on a 1x1 spatial grid with its own fps, so the vision
+        position-id helper produces the right ids at grid_h=grid_w=1.
+        """
+        text_lengths = text_mask.sum(dim=1).long()
+        pos_list = []
+        for b in range(text_mask.shape[0]):
+            offset = int(text_lengths[b].item()) + self.temporal_margin
+            s_pos, _ = compute_mrope_position_ids_vision(
+                t_sound,
+                1,
+                1,
+                temporal_offset=offset,
+                device=device,
+                fps=float(self.sound_latent_fps),
+                base_fps=self.base_fps,
+                temporal_compression_factor=self.temporal_compression_factor_sound,
+            )
+            pos_list.append(s_pos)
+        return torch.stack(pos_list, dim=1).to(device)
+
+    def _compute_action_position_ids(
+        self,
+        text_mask: torch.Tensor,
+        t_action: int,
+        device: torch.device,
+        fps: float | None,
+    ) -> torch.Tensor:
+        """mRoPE position ids [3, B, T_action] for the action segment.
+
+        Action runs at the pixel-frame rate, so positions advance by
+        ``base_fps / (fps * temporal_compression_factor)`` per step (offset 1 aligns
+        action[0] with vision frame 1), keeping action and vision aligned across
+        the whole chunk, not just the first step.
+        """
+        text_lengths = text_mask.sum(dim=1).long()
+        start_frame_offset = 1
+        if fps is not None and fps > 0:
+            step = self.base_fps / (fps * self.temporal_compression_factor)
+        else:
+            step = 1.0
+        frame_indices = torch.arange(t_action, device=device, dtype=torch.float32)
+        pos_list = []
+        for b in range(text_mask.shape[0]):
+            offset = float(int(text_lengths[b].item()) + self.temporal_margin)
+            t_index = (frame_indices + start_frame_offset) * step + offset
+            zeros = torch.zeros_like(t_index)
+            pos_list.append(torch.stack([t_index, zeros, zeros], dim=0))
+        return torch.stack(pos_list, dim=1).to(device)
+
     def reset_cache(self, cache_key: str | None = None):
         """Reset cached K/V from UND pathway.
 
@@ -1044,8 +1136,12 @@ class Cosmos3OmniTransformer(CachableDiT):
         cache_key: str = "default",
         noisy_frame_mask: torch.Tensor | None = None,
         max_text_seq_len: int | None = None,
+        sound_latent: torch.Tensor | None = None,
+        action_latent: torch.Tensor | None = None,
+        action_domain_id: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
 
         Args:
@@ -1070,6 +1166,11 @@ class Cosmos3OmniTransformer(CachableDiT):
         """
         if text_ids is None or text_mask is None:
             raise ValueError("Cosmos3 requires text_ids and text_mask to be passed")
+        if sound_latent is not None and self.sp_size > 1:
+            raise NotImplementedError(
+                "Cosmos3 sound generation is not yet supported with sequence "
+                "parallelism. Run sound generation on a single GPU."
+            )
 
         batch_size, C, T, H, W = hidden_states.shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
@@ -1160,13 +1261,60 @@ class Cosmos3OmniTransformer(CachableDiT):
                 vis_pos_ids = vis_pos_ids.view(
                     3, batch_size, self.sp_size, local_seq_len
                 )[:, :, self.sp_rank, :]
+            # Append sound/action positions in the same order they are packed
+            # into hidden_gen below, so one rope cache covers the whole sequence.
+            packed_pos_ids = vis_pos_ids
+            if sound_latent is not None:
+                packed_pos_ids = torch.cat(
+                    [
+                        packed_pos_ids,
+                        self._compute_sound_position_ids(
+                            text_mask, sound_latent.shape[-1], hidden_states.device
+                        ),
+                    ],
+                    dim=2,
+                )
+            if action_latent is not None:
+                packed_pos_ids = torch.cat(
+                    [
+                        packed_pos_ids,
+                        self._compute_action_position_ids(
+                            text_mask, action_latent.shape[1], hidden_states.device, fps
+                        ),
+                    ],
+                    dim=2,
+                )
             self.cached_gen_rope_inputs[cache_key] = (
                 self.language_model.rotary_emb.build_rope_cache_inputs(
-                    vis_pos_ids, cache_dtype=hidden_gen.dtype
+                    packed_pos_ids, cache_dtype=hidden_gen.dtype
                 )
             )
 
         cos_sin_gen, gen_rope_cache_positions = self.cached_gen_rope_inputs[cache_key]
+
+        # Append sound after vision in the GEN sequence (all sound frames noisy).
+        sound_seq_len = 0
+        if sound_latent is not None:
+            hidden_sound_in, _ = self.audio_proj_in(sound_latent.transpose(1, 2))
+            hidden_sound_in = hidden_sound_in + self.audio_modality_embed
+            hidden_sound_in = hidden_sound_in + time_embed.unsqueeze(1)
+            sound_seq_len = hidden_sound_in.shape[1]
+            hidden_gen = torch.cat([hidden_gen, hidden_sound_in], dim=1)
+
+        # Action packs after sound with temporal-only mRoPE. Only noisy action
+        # tokens are time-embedded (a clean forward-dynamics action gets none).
+        action_seq_len = 0
+        if action_latent is not None:
+            hidden_action_in = self.action_proj_in(action_latent, action_domain_id)
+            hidden_action_in = hidden_action_in + self.action_modality_embed
+            if action_noisy_mask is not None:
+                hidden_action_in = (
+                    hidden_action_in + time_embed.unsqueeze(1) * action_noisy_mask
+                )
+            else:
+                hidden_action_in = hidden_action_in + time_embed.unsqueeze(1)
+            action_seq_len = hidden_action_in.shape[1]
+            hidden_gen = torch.cat([hidden_gen, hidden_action_in], dim=1)
 
         # Run GEN layers. `residual` is threaded so each layer's
         # input_layernorm and post_attention_layernorm can use the
@@ -1193,6 +1341,18 @@ class Cosmos3OmniTransformer(CachableDiT):
         # this cuts the post-loop SP collective bandwidth ~21x.
         hidden_gen = hidden_gen + residual
         hidden_gen = self.norm_moe_gen(hidden_gen)
+
+        # Slice trailing modalities back off in reverse packing order
+        # (vision | sound | action), action last.
+        hidden_action = None
+        if action_seq_len > 0:
+            hidden_action = hidden_gen[:, -action_seq_len:]
+            hidden_gen = hidden_gen[:, :-action_seq_len]
+        hidden_sound = None
+        if sound_seq_len > 0:
+            hidden_sound = hidden_gen[:, -sound_seq_len:]
+            hidden_gen = hidden_gen[:, :-sound_seq_len]
+
         output, _ = self.proj_out(hidden_gen)
 
         if sequence_shard_enabled:
@@ -1200,7 +1360,16 @@ class Cosmos3OmniTransformer(CachableDiT):
             if seq_shard_pad > 0:
                 output = output[:, :seq_len_orig, :]
 
-        return self.unpatchify(output, T, H, W)
+        video_velocity = self.unpatchify(output, T, H, W)
+        extras: list[torch.Tensor] = []
+        if hidden_sound is not None:
+            sound_velocity, _ = self.audio_proj_out(hidden_sound)
+            extras.append(sound_velocity.transpose(1, 2))
+        if hidden_action is not None:
+            extras.append(self.action_proj_out(hidden_action, action_domain_id))
+        if extras:
+            return (video_velocity, *extras)
+        return video_velocity
 
     def preprocess_loaded_state_dict(
         self, iterator: Iterable[tuple[str, torch.Tensor]]
@@ -1349,10 +1518,36 @@ class Cosmos3OmniTransformer(CachableDiT):
             if not _is_quantized(module):
                 _cast_direct(module, target_dtype)
 
+        omni_heads = []
+        if self.sound_gen:
+            omni_heads += [self.audio_proj_in, self.audio_proj_out]
+        if self.action_gen:
+            omni_heads += [self.action_proj_in, self.action_proj_out]
+        for head in omni_heads:
+            for module in head.modules():
+                if not _is_quantized(module):
+                    _cast_direct(module, target_dtype)
+        if self.sound_gen:
+            self.audio_modality_embed = torch.nn.Parameter(
+                self.audio_modality_embed.data.to(target_dtype), requires_grad=False
+            )
+        if self.action_gen:
+            self.action_modality_embed = torch.nn.Parameter(
+                self.action_modality_embed.data.to(target_dtype), requires_grad=False
+            )
+
         # Convert RMSNorm layers to target dtype
         for module in self.modules():
             if isinstance(module, RMSNorm):
                 module.to(target_dtype)
+
+        if self.sound_gen or self.action_gen:
+            stats = []
+            for name in ("audio_modality_embed", "action_modality_embed"):
+                p = getattr(self, name, None)
+                if p is not None:
+                    stats.append(f"{name} absmean={p.float().abs().mean().item():.3e}")
+            logger.info("Cosmos3 omni heads loaded: %s", ", ".join(stats))
 
 
 EntryClass = Cosmos3OmniTransformer

@@ -117,6 +117,7 @@ class GenerationResult:
     samples: Any = None
     frames: Any = None
     audio: Any = None
+    action: Any = None
     prompt: str | None = None
     size: tuple | None = None  # (height, width, num_frames)
     generation_time: float = 0.0

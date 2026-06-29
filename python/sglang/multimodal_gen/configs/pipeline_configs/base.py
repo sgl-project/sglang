@@ -217,6 +217,9 @@ class PipelineConfig:
     cfg_policy: CFGPolicy = field(default_factory=CFGPolicy)
     generator_device: str | None = None
     flow_shift: float | None = None
+    # Force a scheduler class instead of the checkpoint scheduler_config.json
+    # _class_name (Cosmos3 uses the flow-native FlowUniPC schedule).
+    scheduler_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
