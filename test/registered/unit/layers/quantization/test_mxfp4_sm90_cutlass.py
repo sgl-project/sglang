@@ -290,20 +290,6 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
     assert torch.equal(layer.w13_weight_bias.data, ref_w13_b)
     assert torch.equal(layer.w2_weight_bias.data, ref_w2_b)
 
-    # SwiGLU per-expert scalars seeded with GPT-OSS defaults.
-    assert torch.allclose(
-        layer.swiglu_alpha,
-        torch.full((num_experts,), 1.702, dtype=torch.float32, device="cuda"),
-    )
-    assert torch.allclose(
-        layer.swiglu_beta,
-        torch.full((num_experts,), 1.0, dtype=torch.float32, device="cuda"),
-    )
-    assert torch.allclose(
-        layer.swiglu_limit,
-        torch.full((num_experts,), 7.0, dtype=torch.float32, device="cuda"),
-    )
-
 
 @pytest.mark.parametrize(
     "tokens,num_experts,hidden,inter,top_k",
@@ -351,6 +337,17 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     )
     method = _build_method(num_experts, hidden, inter)
     method._process_weights_for_sm90_cutlass(layer)
+
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+    _cfg = MoeRunnerConfig(
+        num_experts=num_experts, layer_id=0, gemm1_alpha=1.702, gemm1_clamp_limit=7.0
+    )
+    (
+        layer.swiglu_alpha,
+        layer.swiglu_beta,
+        layer.swiglu_limit,
+    ) = method._init_flashinfer_swiglu_scalars(layer, _cfg)
 
     out_sglang = method._apply_sm90_cutlass(
         layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
@@ -575,6 +572,66 @@ class _MockDispatchOutput:
             topk_ids=topk_ids,
             router_logits=router_logits,
         )
+
+
+def test_swiglu_scalars_plumbed_from_config():
+    """The exact bug shape: per-expert SwiGLU scalars must come from
+    moe_runner_config, NOT the hardcoded GPT-OSS 1.702/7.0. We pass
+    deliberately non-GPT-OSS values and require them to flow through."""
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+    num_experts, hidden, inter = 4, 256, 256
+    w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
+    layer = _build_mock_layer(
+        num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
+    )
+    method = _build_method(num_experts, hidden, inter)
+
+    # NON-GPT-OSS values: a model whose true scalars differ from 1.702/7.0.
+    cfg = MoeRunnerConfig(
+        num_experts=num_experts,
+        layer_id=0,
+        gemm1_alpha=1.0,  # != 1.702
+        gemm1_clamp_limit=10.0,  # != 7.0
+    )
+    alpha, beta, limit = method._init_flashinfer_swiglu_scalars(layer, cfg)
+
+    assert torch.allclose(
+        alpha, torch.full((num_experts,), 1.0, dtype=torch.float32, device="cuda")
+    ), "alpha must come from moe_runner_config.gemm1_alpha, not hardcoded 1.702"
+    assert torch.allclose(
+        limit, torch.full((num_experts,), 10.0, dtype=torch.float32, device="cuda")
+    ), "limit must come from moe_runner_config.gemm1_clamp_limit, not hardcoded 7.0"
+    # beta has no config field -> constant 1.0 by design.
+    assert torch.allclose(
+        beta, torch.full((num_experts,), 1.0, dtype=torch.float32, device="cuda")
+    )
+    assert alpha.dtype == torch.float32 and alpha.device.type == "cuda"
+
+
+def test_swiglu_scalars_fail_loud_when_config_missing():
+    """Fail loud: if the model did not plumb the scalars (None on the
+    config), raise instead of silently using GPT-OSS defaults."""
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+    num_experts, hidden, inter = 4, 256, 256
+    w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
+    layer = _build_mock_layer(
+        num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
+    )
+    method = _build_method(num_experts, hidden, inter)
+
+    cfg_missing_alpha = MoeRunnerConfig(
+        num_experts=num_experts, layer_id=3, gemm1_alpha=None, gemm1_clamp_limit=7.0
+    )
+    with pytest.raises(ValueError, match="gemm1_alpha"):
+        method._init_flashinfer_swiglu_scalars(layer, cfg_missing_alpha)
+
+    cfg_missing_limit = MoeRunnerConfig(
+        num_experts=num_experts, layer_id=3, gemm1_alpha=1.702, gemm1_clamp_limit=None
+    )
+    with pytest.raises(ValueError, match="gemm1_clamp_limit"):
+        method._init_flashinfer_swiglu_scalars(layer, cfg_missing_limit)
 
 
 if __name__ == "__main__":
