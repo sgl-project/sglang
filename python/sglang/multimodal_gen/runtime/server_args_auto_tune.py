@@ -33,8 +33,8 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
 )
 
 # task-type defaults for keep_resident_min_available_gb when a model does not pin
-# one: image aux (encoders + tiny vae) fits resident on any datacenter gpu, video
-# aux is much larger so it only stays resident on very-high-memory gpus
+# one: image vae is tiny so any datacenter gpu keeps it resident, video vae is
+# larger so it only stays resident on very-high-memory gpus
 IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
 
