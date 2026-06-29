@@ -617,23 +617,32 @@ def refresh_context_on_dual_transformer(
     num_low_noise_steps: int,
     scm_preset: str | None = None,
     verbose: bool = False,
+    steps_computation_mask: Optional[List[int]] = None,
+    steps_computation_mask_2: Optional[List[int]] = None,
+    steps_computation_policy: str | None = None,
 ) -> None:
     """Refresh cache-dit context for dual transformers."""
-    high_noise_steps_computation_mask = None
-    low_noise_steps_computation_mask = None
-    if scm_preset is not None:
+    high_noise_steps_computation_mask = steps_computation_mask
+    low_noise_steps_computation_mask = steps_computation_mask_2
+    if high_noise_steps_computation_mask is None and scm_preset is not None:
         high_noise_steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_high_noise_steps
         )
+    if low_noise_steps_computation_mask is None and scm_preset is not None:
         low_noise_steps_computation_mask = cache_dit.steps_mask(
             mask_policy=scm_preset, total_steps=num_low_noise_steps
         )
+    policy = (
+        steps_computation_policy
+        if steps_computation_policy is not None
+        else scm_preset
+    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_high_noise_steps,
             steps_computation_mask=high_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )
@@ -642,7 +651,7 @@ def refresh_context_on_dual_transformer(
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_low_noise_steps,
             steps_computation_mask=low_noise_steps_computation_mask,
-            steps_computation_policy=scm_preset,
+            steps_computation_policy=policy,
         ),
         verbose=verbose,
     )

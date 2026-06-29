@@ -410,20 +410,20 @@ class Ideogram4DenoisingStage(DenoisingStage):
             return
 
         cache_dit_steps = self._cache_dit_num_steps(num_inference_steps)
-        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-        scm_preset = None if scm_preset == "none" else scm_preset
+        config = self._build_ideogram_cache_dit_config(cache_dit_steps)
         if self._cache_dit_enabled:
             refresh_context_on_dual_transformer(
                 self.transformer,
                 self.unconditional_transformer,
                 cache_dit_steps,
                 cache_dit_steps,
-                scm_preset=scm_preset,
+                steps_computation_mask=config.steps_computation_mask,
+                steps_computation_mask_2=config.steps_computation_mask,
+                steps_computation_policy=config.steps_computation_policy,
             )
             return
 
         sp_group, tp_group = self._cache_dit_parallel_groups()
-        config = self._build_ideogram_cache_dit_config(cache_dit_steps)
         (
             self.transformer,
             self.unconditional_transformer,
