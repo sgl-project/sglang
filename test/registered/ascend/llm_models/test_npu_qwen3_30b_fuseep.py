@@ -34,7 +34,7 @@ class TestQwen330Bw8a8FuseEP(GSM8KAscendMixin, CustomTestCase):
         "--moe-a2a-backend",
         "ascend_fuseep",
         "--fuseep-mode",
-        2
+        2,
     ]
 
 
