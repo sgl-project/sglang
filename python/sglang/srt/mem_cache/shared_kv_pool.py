@@ -27,10 +27,14 @@ from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
+import triton
 from torch.profiler import record_function
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.layout.page_major import (
+    build_page_major_mamba_views,
+    build_page_major_mha_views,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MambaPool,
@@ -39,12 +43,6 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-import triton
-
-from sglang.srt.mem_cache.layout.page_major import (
-    build_page_major_mamba_views,
-    build_page_major_mha_views,
-)
 from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d_kernel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -80,9 +78,10 @@ class SubPoolSpec(ABC):
     grow_direction: str  # "up" or "down"
 
     def __post_init__(self):
-        assert self.grow_direction in ("up", "down"), (
-            f"grow_direction must be 'up' or 'down'; got {self.grow_direction!r}"
-        )
+        assert self.grow_direction in (
+            "up",
+            "down",
+        ), f"grow_direction must be 'up' or 'down'; got {self.grow_direction!r}"
         assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
 
     @abstractmethod
@@ -121,7 +120,9 @@ class MHASubPoolSpec(SubPoolSpec):
         assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
         if self.v_head_dim is None:
             object.__setattr__(self, "v_head_dim", self.head_dim)
-        assert self.v_head_dim > 0, f"v_head_dim must be positive; got {self.v_head_dim}"
+        assert (
+            self.v_head_dim > 0
+        ), f"v_head_dim must be positive; got {self.v_head_dim}"
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -159,7 +160,10 @@ class MHASubPoolSpec(SubPoolSpec):
     def layer_v_offset_in_page(self, layer_id: int, page_size: int) -> int:
         """Byte offset (within one page) of layer ``layer_id``'s V block.
         Immediately after that layer's K block."""
-        return self.layer_k_offset_in_page(layer_id, page_size) + page_size * self.k_row_bytes()
+        return (
+            self.layer_k_offset_in_page(layer_id, page_size)
+            + page_size * self.k_row_bytes()
+        )
 
     def get_dtype(self) -> torch.dtype:
         """Storage dtype of the MHA K/V buffers — single dtype shared by
@@ -245,7 +249,9 @@ class SharedKVPool:
         self.total_bytes = total_bytes
         self.sub_pool_specs = sub_pool_specs
         self._page_size = page_size  # feeds _build_mha_views stride math
-        self._specs_by_name: Dict[str, SubPoolSpec] = {s.name: s for s in sub_pool_specs}
+        self._specs_by_name: Dict[str, SubPoolSpec] = {
+            s.name: s for s in sub_pool_specs
+        }
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -282,7 +288,10 @@ class SharedKVPool:
             self._min_slot_index[spec.name] = min_slot_index
             if isinstance(spec, MHASubPoolSpec):
                 self._mha_views[spec.name] = self._build_mha_views(
-                    spec, anchor, max_slots, page_size=page_size,
+                    spec,
+                    anchor,
+                    max_slots,
+                    page_size=page_size,
                 )
             elif isinstance(spec, MambaSubPoolSpec):
                 self._mamba_views[spec.name] = self._build_mamba_views(
@@ -319,16 +328,16 @@ class SharedKVPool:
 
     def mha_spec(self, name: str) -> MHASubPoolSpec:
         s = self._specs_by_name[name]
-        assert isinstance(s, MHASubPoolSpec), (
-            f"sub-pool {name!r} is {type(s).__name__}, expected MHASubPoolSpec"
-        )
+        assert isinstance(
+            s, MHASubPoolSpec
+        ), f"sub-pool {name!r} is {type(s).__name__}, expected MHASubPoolSpec"
         return s
 
     def mamba_spec(self, name: str) -> MambaSubPoolSpec:
         s = self._specs_by_name[name]
-        assert isinstance(s, MambaSubPoolSpec), (
-            f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
-        )
+        assert isinstance(
+            s, MambaSubPoolSpec
+        ), f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
         return s
 
     def max_slots(self, name: str) -> int:
@@ -469,10 +478,14 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         # data_ptrs / data_strides are populated for any external code that
         # inspects them; we force the native move path so they are not consumed.
         self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_buffer], dtype=torch.uint64, device=self.device,
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
         )
         self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_buffer], dtype=torch.uint64, device=self.device,
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         self.data_strides = torch.tensor(
@@ -494,7 +507,10 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         # operating on layer-major views.
         with record_function("SharedMHA.move_kv_cache"):
             move_kv_cache_native(
-                self.k_buffer, self.v_buffer, tgt_loc, src_loc,
+                self.k_buffer,
+                self.v_buffer,
+                tgt_loc,
+                src_loc,
                 page_size=self._page_size,
             )
 
@@ -543,7 +559,17 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         v_scale=None,
         layer_id_override: Optional[int] = None,
         already_physical: bool = False,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
+        # `dcp_kv_mask` is forwarded unconditionally by the parent
+        # `HybridLinearKVPool.set_kv_buffer` (default None). Decode context
+        # parallelism is not supported under the shared KV pool yet, so fail
+        # loud rather than silently ignore a real mask (which would write
+        # tokens this rank does not own).
+        assert dcp_kv_mask is None, (
+            "SharedMHATokenToKVPool.set_kv_buffer: decode context parallel "
+            "(dcp_kv_mask) is not supported with --enable-shared-kv-pool."
+        )
         # Collapsed wrapper chain: this method does all the work in ONE
         # frame and calls `store_cache_4d_kernel` directly, bypassing the
         # Python launcher for the hot path. The standalone `store_cache_4d`
@@ -716,13 +742,22 @@ class SharedMambaPool(MambaPool):
         self.num_mamba_layers = spec.layer_num
         # Note: layer_transfer_counter is owned by HybridReqToTokenPool / MHA pools,
         # NOT MambaPool — don't add it here.
+        # GDN/KDA ReplaySSM is not supported under the shared KV pool. Replicate
+        # the parent `MambaPool`'s disabled-state attributes so inherited code
+        # paths that read them unconditionally (e.g. `HybridReqToTokenPool.alloc`
+        # and `MambaRadixCache`, both guarded by `replayssm_write_pos is not
+        # None`) see a well-defined "disabled" pool instead of an AttributeError.
+        self.enable_linear_replayssm = False
+        self.linear_replayssm_cache_len = 16
+        self.replayssm_write_pos = None
+        self.replayssm_is_kda = False
 
-        assert conv_views[0].shape[0] == self.num_mamba_layers, (
-            f"conv_views layers={conv_views[0].shape[0]} vs expected {self.num_mamba_layers}"
-        )
-        assert conv_views[0].shape[1] == self._max_size + 1, (
-            f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
-        )
+        assert (
+            conv_views[0].shape[0] == self.num_mamba_layers
+        ), f"conv_views layers={conv_views[0].shape[0]} vs expected {self.num_mamba_layers}"
+        assert (
+            conv_views[0].shape[1] == self._max_size + 1
+        ), f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
 
         # Optional per-draft-token intermediate buffers — different outer size
         # (spec_state_size+1), so NOT in the shared byte buffer; allocate locally.
@@ -909,7 +944,9 @@ class SharedMambaSlotAllocator:
             slot = next(self._alloc_iter, None)
             if slot is not None:
                 return slot
-        return self._multi_ended_allocator.alloc(need_size)  # VIRTUAL ids; clearing deferred
+        return self._multi_ended_allocator.alloc(
+            need_size
+        )  # VIRTUAL ids; clearing deferred
 
     def free(self, free_index: torch.Tensor):
         return self._multi_ended_allocator.free(free_index)
@@ -1003,8 +1040,12 @@ class SharedHybridReqToTokenPool(HybridReqToTokenPool):
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         mamba_envelope_layout: bool = False,
+        enable_linear_replayssm: bool = False,
+        linear_replayssm_cache_len: int = 16,
     ):
-        # `mamba_envelope_layout` and `speculative_eagle_topk` are accepted to
+        # `mamba_envelope_layout`, `speculative_eagle_topk`,
+        # `enable_linear_replayssm`, and `linear_replayssm_cache_len` are
+        # accepted to
         # match the parent `HybridReqToTokenPool._init_mamba_pool` signature but
         # NOT forwarded to `SharedMambaPool`. The shared pool's Mamba conv/
         # temporal state are always envelope-strided VIEWS into the shared
@@ -1145,9 +1186,7 @@ def init_shared_mamba_pools(
         SharedMambaTokenToKVPoolAllocator,
     )
 
-    assert not use_mla_backend, (
-        "shared KV pool does not support MLA-hybrid-Mamba yet"
-    )
+    assert not use_mla_backend, "shared KV pool does not support MLA-hybrid-Mamba yet"
     # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
     # the mamba sub-pool stays page=1 because the Mamba state is per-request,
     # orthogonal to per-token paging.
@@ -1470,9 +1509,7 @@ class SharedSWAKVPool(SWAKVPool):
         )
         ps = self._swa_allocator.page_size
         if ps == 1:
-            return self._swa_allocator.virtual_to_physical[kv_indices].to(
-                torch.int32
-            )
+            return self._swa_allocator.virtual_to_physical[kv_indices].to(torch.int32)
         virt_pages = kv_indices // ps
         offsets = kv_indices % ps
         swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
@@ -1659,9 +1696,7 @@ class SharedSWAKVPool(SWAKVPool):
         self.full_kv_pool.load_cpu_copy(kv_cache_cpu["full"], full_phys)
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
-            swa_phys = self._virt_tokens_to_phys_tokens(
-                indices, self._swa_allocator
-            )
+            swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
             self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
 
 
@@ -1712,12 +1747,12 @@ def init_shared_swa_pools(
     # `SharedSWATokenToKVPoolAllocator.alloc_extend` preserves the upstream
     # tail-page-reuse contract across both sub-pools.
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
-    assert len(full_attention_layer_ids) > 0, (
-        "SWA-hybrid with zero full-attention layers is degenerate"
-    )
-    assert len(swa_attention_layer_ids) > 0, (
-        "SWA-hybrid with zero SWA-attention layers is degenerate"
-    )
+    assert (
+        len(full_attention_layer_ids) > 0
+    ), "SWA-hybrid with zero full-attention layers is degenerate"
+    assert (
+        len(swa_attention_layer_ids) > 0
+    ), "SWA-hybrid with zero SWA-attention layers is degenerate"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # Layout convention (mirrors the mamba builder): full-attn KV at the

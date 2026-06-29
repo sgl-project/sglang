@@ -43,7 +43,6 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -157,6 +156,12 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # Expose the captured mamba-track registry slot (already filled with the
+        # runtime VIRTUAL ids by `buffer_registry.fill_from` above) so the
+        # backend's `init_forward_metadata_out_graph` can translate it
+        # virtual->physical IN PLACE on the cg_on replay path (the shared-KV-pool
+        # OPEN-6 fix). None when mamba-track is disabled; the backend guards on it.
+        mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
     )
 
