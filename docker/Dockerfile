@@ -562,7 +562,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     matplotlib \
     tabulate \
     termplotlib \
-    "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+    "runai-model-streamer[s3,gcs,azure]>=0.15.7" \
+    && DYNAMO_VERSION="$(curl -fsSL https://pypi.nvidia.com/ai-dynamo/ | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.dev[0-9]{8}' | sort -u | tail -1)" \
+    && python3 -m pip install --extra-index-url https://pypi.nvidia.com "ai-dynamo==${DYNAMO_VERSION}"
 
 # Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
@@ -673,7 +675,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
 COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    python3 -m pip install --force-reinstall --no-deps /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory
