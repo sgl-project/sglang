@@ -162,6 +162,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             kwargs,
         )
 
+    def _get_dp_decode_global_num_tokens(
+        self, batch: ScheduleBatch
+    ) -> Optional[list[int]]:
+        if not self.server_args.enable_dp_attention or batch.global_num_tokens is None:
+            return None
+
+        global_num_tokens = [int(x) for x in batch.global_num_tokens]
+        if any(x > 0 for x in global_num_tokens):
+            return [max(1, x) for x in global_num_tokens]
+        return global_num_tokens
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -255,6 +266,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         verify_out_cache_loc: torch.Tensor,
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        dp_decode_global_num_tokens: Optional[list[int]] = None,
     ) -> torch.Tensor:
         device = self.device
         seq_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
@@ -280,9 +292,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             lora_ids=[None] * bs,
         )
-        if self.server_args.enable_dp_attention and batch.global_num_tokens is not None:
+        if dp_decode_global_num_tokens is None:
+            dp_decode_global_num_tokens = batch.global_num_tokens
+        if (
+            self.server_args.enable_dp_attention
+            and dp_decode_global_num_tokens is not None
+        ):
             draft_global_num_tokens = [
-                int(x) * int(self.block_size) for x in batch.global_num_tokens
+                int(x) * int(self.block_size) for x in dp_decode_global_num_tokens
             ]
             draft_forward_batch.original_global_num_tokens_cpu = (
                 batch.global_num_tokens
@@ -527,6 +544,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 model_worker_batch,
                 global_num_tokens=model_worker_batch.global_num_tokens,
             )
+        dp_decode_global_num_tokens = self._get_dp_decode_global_num_tokens(
+            model_worker_batch
+        )
 
         model_worker_batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
@@ -577,6 +597,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc=verify_out_cache_loc,
                 prefix_lens=prefix_lens,
                 req_pool_indices=req_pool_indices,
+                dp_decode_global_num_tokens=dp_decode_global_num_tokens,
             )
 
             self._debug_hang("refine_begin", model_worker_batch, bs=bs)
@@ -597,9 +618,25 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._debug_hang("prepare_verify_begin", model_worker_batch, bs=bs)
         if participates_in_dp_decode:
             model_worker_batch.forward_mode = ForwardMode.DECODE
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            model_worker_batch, self.target_worker
+        original_global_num_tokens = model_worker_batch.global_num_tokens
+        original_global_num_tokens_for_logprob = (
+            model_worker_batch.global_num_tokens_for_logprob
         )
+        if dp_decode_global_num_tokens is not None:
+            model_worker_batch.global_num_tokens = dp_decode_global_num_tokens
+            if original_global_num_tokens_for_logprob is not None:
+                model_worker_batch.global_num_tokens_for_logprob = (
+                    dp_decode_global_num_tokens
+                )
+        try:
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                model_worker_batch, self.target_worker
+            )
+        finally:
+            model_worker_batch.global_num_tokens = original_global_num_tokens
+            model_worker_batch.global_num_tokens_for_logprob = (
+                original_global_num_tokens_for_logprob
+            )
         self._debug_hang("prepare_verify_end", model_worker_batch, bs=bs)
         self._debug_hang("target_verify_begin", model_worker_batch, bs=bs)
         target_out = self.target_worker.forward_batch_generation(
