@@ -91,8 +91,8 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         server_args.dp_size == 1
     ), "For round-robin split mode, dp attention is not supported."
     assert (
-        server_args.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+        server_args.nnodes == 1
+    ), "Context parallel only supports single-machine runs. Cross-machine CP has precision issues."
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
