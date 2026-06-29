@@ -12,6 +12,7 @@ import torch
 import triton
 from common_utils import (
     BenchmarkConfig,
+    filter_configs_by_shared_memory,
     get_config_filename,
     get_configs_compute_bound,
     get_default_batch_sizes,
@@ -427,6 +428,14 @@ def main(args: argparse.Namespace):
                 for config in search_space
                 if block_k % config["BLOCK_SIZE_K"] == 0
             ]
+        search_space = filter_configs_by_shared_memory(
+            search_space,
+            dtype,
+            use_fp8_w8a8,
+            use_int8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+        )
 
         filename = get_config_filename(
             E,

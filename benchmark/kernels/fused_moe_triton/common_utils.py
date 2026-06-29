@@ -1,8 +1,9 @@
 import json
 from types import SimpleNamespace
-from typing import Dict, List, TypedDict
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 import torch
+from search_space import filter_configs_by_smem
 
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -249,6 +250,68 @@ def get_configs_compute_bound() -> List[Dict[str, int]]:
                                     }
                                 )
     return configs
+
+
+def get_device_shared_memory_per_block() -> Optional[int]:
+    try:
+        device_module = torch.get_device_module()
+        if not device_module.is_available():
+            return None
+        props = device_module.get_device_properties(device_module.current_device())
+    except (AttributeError, AssertionError, RuntimeError):
+        return None
+    return getattr(props, "shared_memory_per_block_optin", None) or getattr(
+        props, "shared_memory_per_block", None
+    )
+
+
+def get_moe_tuning_operand_bytes(
+    dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+) -> Optional[Tuple[int, int]]:
+    if use_int4_w4a16:
+        return None
+    if use_int8_w8a16:
+        return 2, 1
+    if use_fp8_w8a8 or use_int8_w8a8:
+        return 1, 1
+    dtype_bytes = torch.empty((), dtype=dtype).element_size()
+    return dtype_bytes, dtype_bytes
+
+
+def filter_configs_by_shared_memory(
+    configs: List[BenchmarkConfig],
+    dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+) -> List[BenchmarkConfig]:
+    if is_hip():
+        return configs
+
+    operand_bytes = get_moe_tuning_operand_bytes(
+        dtype,
+        use_fp8_w8a8,
+        use_int8_w8a8,
+        use_int8_w8a16,
+        use_int4_w4a16,
+    )
+    smem_limit = get_device_shared_memory_per_block()
+    if operand_bytes is None or smem_limit is None:
+        return configs
+
+    filtered_configs = filter_configs_by_smem(configs, smem_limit, *operand_bytes)
+    num_removed = len(configs) - len(filtered_configs)
+    if num_removed > 0:
+        print(
+            f"Filtered {num_removed}/{len(configs)} configurations whose estimated "
+            f"shared memory exceeds {smem_limit} bytes."
+        )
+    return filtered_configs
 
 
 def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
