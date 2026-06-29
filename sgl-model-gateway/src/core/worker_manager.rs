@@ -218,10 +218,15 @@ impl WorkerManager {
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
+                    .get("loads")
+                    .and_then(|l| l.as_array())
+                    .and_then(|loads| {
+                        let mut parsed = loads.iter().filter_map(|load| {
+                            load.get("num_total_tokens").and_then(|v| v.as_i64())
+                        });
+                        let first = parsed.next()?;
+                        Some((first + parsed.sum::<i64>()) as isize)
+                    })
                     .unwrap_or(-1),
                 _ => -1,
             },
@@ -358,22 +363,25 @@ impl LoadMonitor {
 
             let mut loads = HashMap::new();
             for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
+                if load_info.load >= 0 {
+                    loads.insert(load_info.worker, load_info.load);
+                }
             }
 
-            if !loads.is_empty() {
+            if loads.is_empty() {
+                warn!("No valid loads fetched from workers");
+            } else {
                 debug!(
                     "Fetched loads from {} workers, updating {} PowerOfTwo policies",
                     loads.len(),
                     power_of_two_policies.len()
                 );
-                for policy in &power_of_two_policies {
-                    policy.update_loads(&loads);
-                }
-                let _ = tx.send(loads);
-            } else {
-                warn!("No loads fetched from workers");
             }
+
+            for policy in &power_of_two_policies {
+                policy.update_loads(&loads);
+            }
+            let _ = tx.send(loads);
         }
     }
 
