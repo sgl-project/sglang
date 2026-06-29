@@ -57,13 +57,14 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
     get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
-    requant_weight_ue8m0_inplace,
+    requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -535,37 +536,19 @@ class Fp8LinearMethod(LinearMethodBase):
             self._process_mxfp8_linear_weight_scale(layer)
             return
         else:
-            # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
-            from sglang.srt.layers.quantization.fp8_utils import (
-                deepgemm_w8a8_block_fp8_linear_with_fallback,
+            # Requantize block scales to UE8M0 when DeepGEMM is the active runner.
+            use_deepgemm_runner = (
+                self.w8a8_block_fp8_linear
+                is deepgemm_w8a8_block_fp8_linear_with_fallback
             )
-            from sglang.srt.model_loader.utils import (
-                should_deepgemm_weight_requant_ue8m0,
+            requant_block_scale_ue8m0_for_deepgemm(
+                layer.weight,
+                layer.weight_scale_inv,
+                getattr(self.quant_config, "weight_block_size", None),
+                use_deepgemm_runner=use_deepgemm_runner,
+                output_dtype=getattr(layer, "orig_dtype", None),
+                weight_shape=layer.weight.shape,
             )
-
-            # Only requantize to UE8M0 if DeepGEMM can actually run
-            # this layer. If the dtype or shape is unsupported, the GEMM
-            # falls back to triton at runtime, which needs float32 scales.
-            if (
-                should_deepgemm_weight_requant_ue8m0(
-                    weight_block_size=getattr(
-                        self.quant_config, "weight_block_size", None
-                    ),
-                    output_dtype=getattr(layer, "orig_dtype", None),
-                    weight_shape=layer.weight.shape,
-                )
-                and (
-                    self.w8a8_block_fp8_linear
-                    is deepgemm_w8a8_block_fp8_linear_with_fallback
-                )
-                and (not layer.weight_scale_inv.format_ue8m0)
-            ):
-                requant_weight_ue8m0_inplace(
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    self.quant_config.weight_block_size,
-                )
-                layer.weight_scale_inv.format_ue8m0 = True
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
         layer.weight.data = weight.data
@@ -587,7 +570,8 @@ class Fp8LinearMethod(LinearMethodBase):
         if not self.use_mxfp8:
             return
 
-        if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+        backend = get_fp8_gemm_runner_backend()
+        if backend.is_flashinfer_trtllm():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
             weight = layer.weight.data
@@ -628,7 +612,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 .reshape_as(scale_u8)
                 .contiguous(),
             )
-        elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+        elif backend.is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
@@ -791,9 +775,10 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+            backend = get_fp8_gemm_runner_backend()
+            if backend.is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
-            elif get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            elif backend.is_flashinfer_trtllm():
                 weight_scale = layer.weight_scale_inv_shuffled
             else:
                 weight_scale = layer.weight_scale_inv
@@ -1332,9 +1317,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers import deep_gemm_wrapper
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-            from sglang.srt.model_loader.utils import (
-                should_deepgemm_weight_requant_ue8m0,
-            )
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
@@ -1381,32 +1363,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 from sglang.srt.layers.moe.mega_moe_sm90 import (
                     build_sm90_mega_moe_experts_weights,
                 )
+
                 assert not self.is_fp4_expert
                 build_sm90_mega_moe_experts_weights(layer)
                 return
 
-            if (
-                not self.is_fp4_expert
-                and should_deepgemm_weight_requant_ue8m0(
-                    weight_block_size=getattr(
-                        self.quant_config, "weight_block_size", None
-                    ),
-                )
-                and will_use_deepgemm
-                and not layer.w13_weight_scale_inv.format_ue8m0
-            ):
-                assert isinstance(
-                    layer, DeepEPMoE
-                ), "DeepGemm MoE is only supported with DeepEPMoE"
+            if not self.is_fp4_expert:
                 weight_block_size = self.quant_config.weight_block_size
-                requant_weight_ue8m0_inplace(
-                    layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
-                )
-                requant_weight_ue8m0_inplace(
-                    layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
-                )
-                layer.w13_weight_scale_inv.format_ue8m0 = True
-                layer.w2_weight_scale_inv.format_ue8m0 = True
+                if requant_block_scale_ue8m0_for_deepgemm(
+                    layer.w13_weight,
+                    layer.w13_weight_scale_inv,
+                    weight_block_size,
+                    use_deepgemm_runner=will_use_deepgemm,
+                ):
+                    assert isinstance(
+                        layer, DeepEPMoE
+                    ), "DeepGemm MoE is only supported with DeepEPMoE"
+                    requant_block_scale_ue8m0_for_deepgemm(
+                        layer.w2_weight,
+                        layer.w2_weight_scale_inv,
+                        weight_block_size,
+                        use_deepgemm_runner=True,
+                    )
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
