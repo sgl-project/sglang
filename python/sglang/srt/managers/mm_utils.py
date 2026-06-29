@@ -24,7 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.evs import EVSEmbeddingResult, VideoEVSDataItem
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
@@ -656,7 +656,12 @@ def _get_chunked_prefill_embedding(
         # Use per-image path when all items have exactly one offset (already
         # split per-image) — this avoids encoding images not in this chunk.
         # Fall back to combined path for non-split items or EVS.
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
+        # EVS items must use the full path because evs_video() returns
+        # EVSEmbeddingResult (not a plain tensor) and needs redistribute_pruned_frames_placeholders.
+        is_per_image = all(
+            len(item.offsets) == 1 and not isinstance(item, VideoEVSDataItem)
+            for item in embedding_items_per_req
+        )
 
         if is_per_image:
             chunk_embedding = _get_chunked_embedding_by_item(
