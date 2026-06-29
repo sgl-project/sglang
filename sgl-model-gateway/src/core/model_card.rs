@@ -38,6 +38,12 @@ pub enum ProviderType {
     /// Google Gemini - special logprobs handling
     #[serde(alias = "gemini", alias = "google")]
     Gemini,
+    /// Evolink (`direct.evolink.ai`) - OpenAI-compatible aggregation
+    /// platform. Selected explicitly via `provider: evolink`; it is not
+    /// inferred from the model name because Evolink serves OpenAI-style
+    /// model ids (e.g. `gpt-*`) that would collide with [`Self::OpenAI`].
+    #[serde(alias = "evolink")]
+    Evolink,
     /// Custom provider with string identifier
     #[serde(untagged)]
     Custom(String),
@@ -51,6 +57,7 @@ impl ProviderType {
             Self::XAI => "xai",
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
+            Self::Evolink => "evolink",
             Self::Custom(s) => s.as_str(),
         }
     }
