@@ -29,10 +29,11 @@ _mock_device.start()
 class TestHttpTuningConfig(unittest.TestCase):
     # Defaults, CLI parsing, and CLI-vs-env resolution for the new tunables.
 
-    def test_env_keep_alive_default_is_65s(self):
-        # 65s aligns with Go net/http (90s), reqwest (90s), Node (60s)
-        # client pool defaults. Old 5s default tripped pool-reuse races.
-        self.assertEqual(envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(), 65)
+    def test_env_keep_alive_default_is_5s(self):
+        # 5s is conservative for backward compat. Operators with longer
+        # client pools override via SGLANG_TIMEOUT_KEEP_ALIVE,
+        # --timeout-keep-alive, or the Engine constructor.
+        self.assertEqual(envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(), 5)
 
     def test_dataclass_defaults_are_unset(self):
         # None == "use server default" for everything except backlog (2048
@@ -123,10 +124,10 @@ class TestUvicornWiring(unittest.TestCase):
         self._run_setup(args, mock)
         self.assertTrue(mock.called)
         kwargs = mock.call_args.kwargs
-        # keep-alive comes from env (65 by default), backlog from the
+        # keep-alive comes from env (5 by default), backlog from the
         # dataclass default (2048), no limit_concurrency or
         # timeout_graceful_shutdown unless the operator set them.
-        self.assertEqual(kwargs["timeout_keep_alive"], 65)
+        self.assertEqual(kwargs["timeout_keep_alive"], 5)
         self.assertEqual(kwargs["backlog"], 2048)
         self.assertNotIn("limit_concurrency", kwargs)
         self.assertNotIn("timeout_graceful_shutdown", kwargs)
