@@ -120,7 +120,8 @@ def choose_output_image_ext(
         return "jpg" if fmt == "jpeg" else fmt
     if (background or "auto").lower() == "transparent":
         return "png"
-    return "jpg"
+    # the default format should be png, same logical with DataType.get_default_extension
+    return "png"
 
 
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
