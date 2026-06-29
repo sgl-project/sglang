@@ -99,7 +99,7 @@ class RefAwareCacheMixin:
         self.unused_evictable_size_: int = 0
         self.low_ref_evictable_size_: int = 0
         self.high_ref_evictable_size_: int = 0
-        self.rid_to_ref_info: Dict[str, RefInfo] = {}
+        self.session_id_to_ref_info: Dict[str, RefInfo] = {}
         self._evict_scope_stack: list[tuple[bool, bool]] = []
 
     def _reset_ref_aware_state(self):
@@ -113,7 +113,7 @@ class RefAwareCacheMixin:
         self.unused_evictable_size_ = 0
         self.low_ref_evictable_size_ = 0
         self.high_ref_evictable_size_ = 0
-        self.rid_to_ref_info.clear()
+        self.session_id_to_ref_info.clear()
         self._evict_scope_stack.clear()
 
     # ------------------------------------------------------------------
@@ -244,18 +244,18 @@ class RefAwareCacheMixin:
         return DecLockRefResult(delta=delta)
 
     # ------------------------------------------------------------------
-    # _delete_leaf — tier cleanup + tracked_rids cleanup
+    # _delete_leaf — tier cleanup + tracked_session_ids cleanup
     # ------------------------------------------------------------------
 
     def _delete_leaf(self, node):
         tier = _classify_node_tier(node)
         self._tier_leaf_set(tier).discard(node)
         self._add_tier_size(tier, -len(node.key))
-        for rid in node.tracked_rids:
-            ref_info = self.rid_to_ref_info.get(rid)
+        for session_id in node.tracked_session_ids:
+            ref_info = self.session_id_to_ref_info.get(session_id)
             if ref_info is not None:
                 ref_info.nodes.discard(node)
-        node.tracked_rids.clear()
+        node.tracked_session_ids.clear()
         super()._delete_leaf(node)
 
     # ------------------------------------------------------------------
@@ -375,9 +375,7 @@ class RefAwareCacheMixin:
         session_id = getattr(req, "session_id", None)
         if session_id is None:
             session_id = getattr(getattr(req, "session", None), "session_id", None)
-        if session_id is not None:
-            return session_id
-        return getattr(req, "rid", None)
+        return session_id
 
     def register_ref(self, req: Req):
         ref_id = self.ref_id_for_req(req)
@@ -385,10 +383,10 @@ class RefAwareCacheMixin:
             return
         is_high = self.is_high_priority(getattr(req, "priority", 0) or 0)
 
-        if ref_id not in self.rid_to_ref_info:
-            self.rid_to_ref_info[ref_id] = RefInfo(is_high=is_high)
+        if ref_id not in self.session_id_to_ref_info:
+            self.session_id_to_ref_info[ref_id] = RefInfo(is_high=is_high)
 
-        ref_info = self.rid_to_ref_info[ref_id]
+        ref_info = self.session_id_to_ref_info[ref_id]
 
         last_node = getattr(req, "last_node", None)
         if last_node not in (None, self.root_node):
@@ -412,7 +410,7 @@ class RefAwareCacheMixin:
         for node in new_nodes:
             self._inc_priority_ref_single(node, is_high)
             ref_info.nodes.add(node)
-            node.tracked_rids.add(ref_id)
+            node.tracked_session_ids.add(ref_id)
 
         ref_info.cached_tokens = sum(len(n.key) for n in ref_info.nodes)
 
@@ -466,21 +464,25 @@ class RefAwareCacheMixin:
         if not node.evicted and node.lock_ref == 0 and old_tier != new_tier:
             self._move_node_tier(node, old_tier, new_tier)
 
-    def release_ref(self, rid: str) -> Tuple[bool, str]:
-        ref_info = self.rid_to_ref_info.pop(rid, None)
+    def release_ref(self, session_id: str) -> Tuple[bool, str]:
+        if session_id is None:
+            return False, "session_id is None"
+        ref_info = self.session_id_to_ref_info.pop(session_id, None)
         if ref_info is None:
-            return True, f"rid {rid} not tracked"
+            return True, f"session_id {session_id} not tracked"
 
         for node in ref_info.nodes:
             self._dec_priority_ref_single(node, ref_info.is_high)
-            node.tracked_rids.discard(rid)
+            node.tracked_session_ids.discard(session_id)
 
-        return True, f"released {len(ref_info.nodes)} nodes for rid {rid}"
+        return True, f"released {len(ref_info.nodes)} nodes for session_id {session_id}"
 
-    def update_ref(self, rid: str, new_priority: int) -> Tuple[bool, str]:
-        ref_info = self.rid_to_ref_info.get(rid)
+    def update_ref(self, session_id: str, new_priority: int) -> Tuple[bool, str]:
+        if session_id is None:
+            return False, "session_id is None"
+        ref_info = self.session_id_to_ref_info.get(session_id)
         if ref_info is None:
-            return False, f"rid {rid} not found in ref tracking"
+            return False, f"session_id {session_id} not found in ref tracking"
 
         new_is_high = self.is_high_priority(new_priority)
 
@@ -491,7 +493,7 @@ class RefAwareCacheMixin:
             self._dec_priority_ref_single(node, ref_info.is_high)
             self._inc_priority_ref_single(node, new_is_high)
         ref_info.is_high = new_is_high
-        return True, f"updated {len(ref_info.nodes)} nodes for rid {rid}"
+        return True, f"updated {len(ref_info.nodes)} nodes for session_id {session_id}"
 
     # ------------------------------------------------------------------
     # Split node override to propagate high_ref / low_ref
@@ -501,10 +503,10 @@ class RefAwareCacheMixin:
         new_node = super()._split_node(key, child, split_len)
         new_node.high_ref = child.high_ref
         new_node.low_ref = child.low_ref
-        new_node.tracked_rids = set(child.tracked_rids)
-        # Update rid_to_ref_info: add new_node to each tracking rid's node set
-        for rid in new_node.tracked_rids:
-            ref_info = self.rid_to_ref_info.get(rid)
+        new_node.tracked_session_ids = set(child.tracked_session_ids)
+        # Update session_id_to_ref_info: add new_node to each tracking session_id's node set
+        for session_id in new_node.tracked_session_ids:
+            ref_info = self.session_id_to_ref_info.get(session_id)
             if ref_info is not None:
                 ref_info.nodes.add(new_node)
         self._update_ref_aware_leaf_status(new_node)

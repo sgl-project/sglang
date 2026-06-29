@@ -1395,7 +1395,7 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
 
 @dataclass
 class ReleaseRefReqInput(BaseReq):
-    rid: str = ""
+    session_id: str = ""
 
 
 @dataclass
@@ -1406,7 +1406,7 @@ class ReleaseRefReqOutput(BaseReq):
 
 @dataclass
 class UpdateRefReqInput(BaseReq):
-    rid: str = ""
+    session_id: str = ""
     new_priority: int = 0
 
 

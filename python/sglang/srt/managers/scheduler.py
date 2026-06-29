@@ -690,12 +690,19 @@ class Scheduler(
     def handle_get_loads_req(self, req: GetLoadsReqInput):
         return self.load_inquirer.get_loads(req)
 
+    def session_id_for_req(self, req: Req) -> Optional[str]:
+        session_id = getattr(req, "session_id", None)
+        if session_id is None:
+            session_id = getattr(getattr(req, "session", None), "session_id", None)
+        return session_id
+
     def handle_release_ref(self, recv_req: ReleaseRefReqInput):
         if self.enable_ref_aware_kv_buffer:
             from sglang.srt.mem_cache.ref_aware_cache_mixin import RefAwareCacheMixin
 
             if isinstance(self.tree_cache, RefAwareCacheMixin):
-                success, msg = self.tree_cache.release_ref(recv_req.rid)
+                session_id = self.session_id_for_req(recv_req)
+                success, msg = self.tree_cache.release_ref(session_id)
                 return ReleaseRefReqOutput(success=success, message=msg)
         return ReleaseRefReqOutput(
             success=False, message="ref-aware KV buffer not enabled"
@@ -713,19 +720,20 @@ class Scheduler(
                 success=False, message="ref-aware KV buffer not enabled"
             )
 
-        rid = recv_req.rid
+        session_id = self.session_id_for_req(recv_req)
         new_priority = recv_req.new_priority
-        for req in getattr(self.running_batch, "reqs", []) or []:
-            if req.rid == rid:
-                req.priority = new_priority
-        for req in self.waiting_queue or []:
-            if req.rid == rid:
-                req.priority = new_priority
-        chunked = getattr(self, "chunked_req", None)
-        if chunked is not None and chunked.rid == rid:
-            chunked.priority = new_priority
+        if session_id is not None:
+            for req in getattr(self.running_batch, "reqs", []) or []:
+                if self.session_id_for_req(req) == session_id:
+                    req.priority = new_priority
+            for req in self.waiting_queue or []:
+                if self.session_id_for_req(req) == session_id:
+                    req.priority = new_priority
+            chunked = getattr(self, "chunked_req", None)
+            if chunked is not None and self.session_id_for_req(chunked) == session_id:
+                chunked.priority = new_priority
 
-        success, msg = self.tree_cache.update_ref(rid, new_priority)
+        success, msg = self.tree_cache.update_ref(session_id, new_priority)
         return UpdateRefReqOutput(success=success, message=msg)
 
     def init_tokenizer(self):

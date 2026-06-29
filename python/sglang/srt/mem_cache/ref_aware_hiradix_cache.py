@@ -205,11 +205,11 @@ class RefAwareHiRadixCache(RefAwareCacheMixin, HiRadixCache):
             assert v == x, f"parent does not have child key, {key}"
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
-            for rid in x.tracked_rids:
-                ref_info = self.rid_to_ref_info.get(rid)
+            for session_id in x.tracked_session_ids:
+                ref_info = self.session_id_to_ref_info.get(session_id)
                 if ref_info is not None:
                     ref_info.nodes.discard(x)
-            x.tracked_rids.clear()
+            x.tracked_session_ids.clear()
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
