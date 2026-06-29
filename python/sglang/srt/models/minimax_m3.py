@@ -258,6 +258,16 @@ class MiniMaxM3MLP(nn.Module):
         up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
         return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
+    @staticmethod
+    def _swigluoai_fused(
+        x: torch.Tensor, alpha: float, limit: float
+    ) -> torch.Tensor:
+        """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
+        from sglang.srt.layers.triton_ops.npu_swiglu_oai_quant import swiglu_oai_quant
+
+        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
+        return out
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -295,7 +305,7 @@ class MiniMaxM3MLP(nn.Module):
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
             if _is_npu:
-                self.act_fn = lambda x: self._swigluoai_torch(
+                self.act_fn = lambda x: self._swigluoai_fused(
                     x, config.swiglu_alpha, config.swiglu_limit
                 )
             else:
