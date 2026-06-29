@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
@@ -29,6 +30,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
 )
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -42,12 +44,12 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, "ScriptedTokenizerRecvProxy"]
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    ps: "ParallelState"
+    ps: ParallelState
     tp_group: Any
     tp_cpu_group: Any
     attn_tp_group: Any
@@ -55,18 +57,19 @@ class SchedulerRequestReceiver:
     attn_cp_group: Any
     attn_cp_cpu_group: Any
     world_group: Any
-    server_args: "ServerArgs"
-    model_config: "ModelConfig"
+    server_args: ServerArgs
+    model_config: ModelConfig
     max_recv_per_poll: int
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
-    scripted_scheduler_hook: Optional["ScriptedSchedulerHook"] = None
+    scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    @scheduler_nvtx_method("scheduler.recv_requests")
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -86,6 +89,9 @@ class SchedulerRequestReceiver:
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 
+        if self.ps.pp_rank == 0:
+            self.unwrap_pickle_wrapper(recv_reqs)
+
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
         self._finalize_shm_features(recv_reqs)
@@ -101,7 +107,7 @@ class SchedulerRequestReceiver:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -110,7 +116,7 @@ class SchedulerRequestReceiver:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
@@ -191,6 +197,19 @@ class SchedulerRequestReceiver:
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
+
+    def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:
+        if not recv_reqs:
+            return
+
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                req.unwrap_pickle_fields()
+            elif isinstance(
+                req, (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput)
+            ):
+                for sub_req in req:
+                    sub_req.unwrap_pickle_fields()
 
     def _apply_mm_receiver(self, recv_reqs: List) -> List:
         # Process MM requests under EPD-disaggregation mode

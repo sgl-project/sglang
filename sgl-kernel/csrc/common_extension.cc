@@ -38,15 +38,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
-  m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
-  m.def(
-      "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
-      "int nranks_per_node, int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
-  m.impl("mscclpp_init_context", torch::kCUDA, &mscclpp_init_context);
-
-  m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
-  m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
-
   /*
    * From csrc/attention
    */
@@ -143,9 +134,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
-
-  m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  m.impl("dsv3_router_gemm", torch::kCUDA, &dsv3_router_gemm);
 
   /*
    * From csrc/gemm/gptq

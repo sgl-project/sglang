@@ -25,6 +25,13 @@ from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    can_install_spatial_shard_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
+    enable_diffusers_decoder_spatial_parallel,
+    spatial_parallel_diffusers_decode,
+)
 
 
 class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
@@ -127,6 +134,15 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
 
         self.use_slicing = False
         self.use_tiling = False
+        self.use_parallel_decode = config.use_parallel_decode
+        self.parallel_decode_mode = config.parallel_decode_mode
+        self._spatial_parallel_decode_enabled = False
+        self._spatial_parallel_upsample_count = 0
+        if can_install_spatial_shard_parallel_decode(self.config):
+            self._spatial_parallel_upsample_count = (
+                enable_diffusers_decoder_spatial_parallel(self.decoder)
+            )
+            self._spatial_parallel_decode_enabled = True
 
         # only relevant if vae tiling is enabled
         self.tile_sample_min_size = sample_size
@@ -311,7 +327,12 @@ class AutoencoderKL(nn.Module, LayerwiseOffloadableModuleMixin):
         if self.post_quant_conv is not None:
             z = self.post_quant_conv(z)
 
-        dec = self.decoder(z)
+        if self._spatial_parallel_decode_enabled:
+            dec = spatial_parallel_diffusers_decode(
+                self.decoder, z, self._spatial_parallel_upsample_count
+            )
+        else:
+            dec = self.decoder(z)
 
         if not return_dict:
             return (dec,)
