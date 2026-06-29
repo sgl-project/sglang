@@ -169,9 +169,15 @@ harness = false
 path = "benches/manual_policy_benchmark.rs"
 
 [[bench]]
+name = "sse_event_type_alloc"
+harness = false
+path = "benches/sse_event_type_alloc.rs"
+
+[[bench]]
 name = "streaming_utils_bench"
 harness = false
 path = "benches/streaming_utils_bench.rs"
+
 
 [profile.release]
 opt-level = "z"     # Optimize for size
