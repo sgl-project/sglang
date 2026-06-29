@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import threading
@@ -203,6 +204,16 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+            # PD true-retraction rebootstrap: a shared executor + per-thread HTTP
+            # sessions used to drive the original prefill worker's ``/generate``
+            # endpoint so it recomputes a retracted request's prefix KV under the
+            # current weights. Created lazily on first use so deployments that
+            # never retract pay nothing.
+            self._prefill_recompute_executor: Optional[
+                concurrent.futures.ThreadPoolExecutor
+            ] = None
+            self._prefill_recompute_executor_lock = threading.Lock()
+            self._prefill_recompute_sessions = threading.local()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -231,6 +242,115 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def _ensure_prefill_recompute_executor(
+        self,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        """Lazily create the shared executor that drives PD-retract rebootstrap
+        ``/generate`` calls. One executor per (decode) kv manager, shared across
+        all receivers."""
+        executor = self._prefill_recompute_executor
+        if executor is not None:
+            return executor
+        with self._prefill_recompute_executor_lock:
+            if self._prefill_recompute_executor is None:
+                workers = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
+                if workers is None:
+                    workers = 4
+                self._prefill_recompute_executor = (
+                    concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max(1, workers),
+                        thread_name_prefix="pd-rebootstrap-prefill",
+                    )
+                )
+            return self._prefill_recompute_executor
+
+    def _get_prefill_recompute_session(self) -> requests.Session:
+        """Per-thread ``requests.Session`` for the rebootstrap executor threads
+        (``requests.Session`` is not safe for concurrent cross-thread use)."""
+        session = getattr(self._prefill_recompute_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._prefill_recompute_sessions.session = session
+        return session
+
+    def submit_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, payload: dict
+    ) -> None:
+        """Dispatch a PD true-retraction rebootstrap ``/generate`` to the
+        original prefill worker so it recomputes the retracted request's prefix
+        KV under the current weights and transfers it back over the
+        already-bootstrapped channel.
+
+        Non-blocking from the scheduler's perspective: the HTTP POST runs on the
+        shared executor. Any failure (missing URL, HTTP error, exception) is
+        surfaced through the standard ``KVPoll.Failed`` path via
+        ``kv_receiver.abort()`` so the scheduler's existing transfer-failure
+        handling streams the aborted request back to the client. ``payload`` is
+        prebuilt by the decode scheduler (input ids + sampling params + bootstrap
+        routing) so HTTP/sampling concerns stay out of the receiver.
+        """
+        prefill_url = payload.get("pd_rebootstrap_prefill_url")
+        if not prefill_url:
+            logger.error(
+                "PD retract rebootstrap requires pd_rebootstrap_prefill_url from "
+                "the router (rid=%s bootstrap_room=%s).",
+                payload.get("rid"),
+                kv_receiver.bootstrap_room,
+            )
+            self._fail_prefill_recompute(
+                kv_receiver,
+                "PD retract rebootstrap requires pd_rebootstrap_prefill_url from "
+                "the router.",
+            )
+            return
+        self._ensure_prefill_recompute_executor().submit(
+            self._run_prefill_recompute, kv_receiver, prefill_url, payload
+        )
+
+    def _fail_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, reason: str
+    ) -> None:
+        """Fail a rebootstrap request via the standard ``KVPoll.Failed`` path.
+
+        ``abort()`` transitions the receiver to Failed and notifies the prefill
+        worker to release its orphaned bootstrap entry, but records a generic
+        reason; we overwrite it with a descriptive one so the eventual
+        ``failure_exception`` (and the client-facing abort message) explains that
+        the rebootstrap ``/generate`` failed rather than reporting a spurious
+        ``AbortReq``.
+        """
+        kv_receiver.abort()
+        self.record_failure(kv_receiver.bootstrap_room, reason)
+
+    def _run_prefill_recompute(
+        self, kv_receiver: CommonKVReceiver, prefill_url: str, payload: dict
+    ) -> None:
+        rid = payload.get("rid")
+        try:
+            response = self._get_prefill_recompute_session().post(
+                prefill_url.rstrip("/") + "/generate",
+                json=payload,
+                timeout=self.waiting_timeout,
+            )
+            if response.status_code >= 400:
+                logger.error(
+                    "PD rebootstrap prefill failed for rid=%s status=%s body=%s",
+                    rid,
+                    response.status_code,
+                    response.text[:512],
+                )
+                self._fail_prefill_recompute(
+                    kv_receiver,
+                    f"PD retract rebootstrap /generate failed for rid={rid} "
+                    f"(status={response.status_code}).",
+                )
+        except Exception:
+            logger.exception("PD rebootstrap prefill request failed for rid=%s", rid)
+            self._fail_prefill_recompute(
+                kv_receiver,
+                f"PD retract rebootstrap /generate request errored for rid={rid}.",
+            )
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
@@ -1126,6 +1246,20 @@ class CommonKVReceiver(BaseKVReceiver):
         state_indices: Optional[List[int]] = None,
     ):
         raise NotImplementedError
+
+    def dispatch_prefill_recompute(self, payload: dict) -> None:
+        """Ask the original prefill worker to recompute this request's prefix KV
+        under the current weights (PD true-retraction rebootstrap) and transfer
+        it back over the already-bootstrapped channel.
+
+        Thin wrapper around the kv manager's shared executor; the decode
+        scheduler builds ``payload``. Must be called only after ``init`` and
+        ``send_metadata`` so the bootstrap handshake is complete and the
+        destination KV pages are registered before the prefill recomputes. A
+        failure is surfaced via ``KVPoll.Failed`` (see
+        ``CommonKVManager.submit_prefill_recompute``).
+        """
+        self.kv_mgr.submit_prefill_recompute(self, payload)
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:

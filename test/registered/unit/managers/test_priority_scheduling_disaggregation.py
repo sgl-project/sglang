@@ -1,5 +1,6 @@
-import queue
+import json
 import sys
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -208,7 +209,11 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         )
 
 
-class TestDecodePreallocQueueRebootstrap(unittest.TestCase):
+class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
+    """The decode scheduler builds the rebootstrap ``/generate`` payload; the
+    dispatch itself now lives on the kv manager (see
+    ``TestCommonKVManagerPrefillRecompute``)."""
+
     def _sampling_params(self):
         return SimpleNamespace(
             temperature=0.0,
@@ -224,23 +229,12 @@ class TestDecodePreallocQueueRebootstrap(unittest.TestCase):
             no_stop_trim=False,
         )
 
-    def _new_rebootstrap_queue(self, session):
-        rebootstrap_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        rebootstrap_queue.scheduler = MagicMock()
-        rebootstrap_queue._rebootstrap_prefill_executor = MagicMock()
-        rebootstrap_queue._rebootstrap_prefill_sessions = SimpleNamespace(
-            session=session
-        )
-        rebootstrap_queue._failed_rebootstrap_prefill_reqs = queue.SimpleQueue()
-        return rebootstrap_queue
-
-    def _new_decode_req(self):
-        req = SimpleNamespace(
+    def _new_req(self):
+        return SimpleNamespace(
             rid="rid-0",
             origin_input_ids=np.array([1, 2], dtype=np.int32),
-            output_ids=[3, 4],
+            output_ids=[np.int32(3), np.int32(4)],
             sampling_params=self._sampling_params(),
-            return_logprob=False,
             bootstrap_host="127.0.0.1",
             bootstrap_port=30000,
             bootstrap_room=7,
@@ -250,48 +244,135 @@ class TestDecodePreallocQueueRebootstrap(unittest.TestCase):
             extra_key=None,
             routing_key=None,
             disagg_prefill_dp_rank=None,
-            finished_output=False,
         )
-        return SimpleNamespace(req=req, kv_receiver=MagicMock())
 
-    def test_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
+    def test_build_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
+        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        req = self._new_req()
+
+        payload = prealloc_queue._build_rebootstrap_payload(req)
+
+        # origin_input_ids + output_ids, coerced to plain python ints.
+        self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
+        self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
+        self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
+        self.assertEqual(payload["pd_rebootstrap_prefill_url"], "http://prefill")
+        self.assertEqual(payload["pd_rebootstrap_forced_output_id"], 5)
+        self.assertEqual(payload["bootstrap_room"], 7)
+        # Must be JSON-serializable (numpy scalars would raise here).
+        json.dumps(payload)
+
+
+class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
+    """The kv manager owns the shared executor + HTTP session and routes any
+    rebootstrap ``/generate`` failure through ``kv_receiver.abort()`` ->
+    ``KVPoll.Failed`` so the scheduler's normal transfer-failure streaming runs.
+    """
+
+    def _new_manager(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr._prefill_recompute_executor = None
+        mgr._prefill_recompute_executor_lock = threading.Lock()
+        mgr._prefill_recompute_sessions = threading.local()
+        mgr.waiting_timeout = 300
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        return mgr
+
+    def _payload(self, url="http://prefill"):
+        return {
+            "input_ids": [1, 2, 3, 4],
+            "rid": "rid-0",
+            "pd_rebootstrap_prefill_url": url,
+        }
+
+    def test_submit_dispatches_run_to_shared_executor(self):
+        mgr = self._new_manager()
+        mgr._prefill_recompute_executor = MagicMock()
+        receiver = MagicMock(bootstrap_room=7)
+
+        mgr.submit_prefill_recompute(receiver, self._payload())
+
+        mgr._prefill_recompute_executor.submit.assert_called_once()
+        args = mgr._prefill_recompute_executor.submit.call_args[0]
+        self.assertEqual(args[0], mgr._run_prefill_recompute)
+        self.assertIs(args[1], receiver)
+        self.assertEqual(args[2], "http://prefill")
+        receiver.abort.assert_not_called()
+
+    def test_submit_missing_url_fails_via_abort(self):
+        mgr = self._new_manager()
+        mgr._prefill_recompute_executor = MagicMock()
+        receiver = MagicMock(bootstrap_room=7)
+
+        mgr.submit_prefill_recompute(receiver, self._payload(url=None))
+
+        receiver.abort.assert_called_once()
+        mgr._prefill_recompute_executor.submit.assert_not_called()
+        self.assertIn(7, mgr.failure_records)
+
+    def test_run_aborts_on_http_error(self):
+        mgr = self._new_manager()
         session = MagicMock()
-        session.post.return_value = SimpleNamespace(status_code=200, text="")
-        rebootstrap_queue = self._new_rebootstrap_queue(session)
-        decode_req = self._new_decode_req()
+        session.post.return_value = SimpleNamespace(status_code=500, text="boom")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
 
-        rebootstrap_queue.submit_rebootstrap_prefill(decode_req)
-
-        rebootstrap_queue._rebootstrap_prefill_executor.submit.assert_called_once()
-        submitted = rebootstrap_queue._rebootstrap_prefill_executor.submit.call_args[0][
-            0
-        ]
-        submitted()
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
 
         session.post.assert_called_once()
-        payload = session.post.call_args.kwargs["json"]
-        self.assertEqual(payload["input_ids"], [1, 2, 3, 4])
+        receiver.abort.assert_called_once()
+        self.assertIn(7, mgr.failure_records)
 
-    def test_rebootstrap_failure_is_drained_to_stream_output(self):
+    def test_run_aborts_on_exception(self):
+        mgr = self._new_manager()
         session = MagicMock()
-        session.post.return_value = SimpleNamespace(status_code=500, text="failed")
-        rebootstrap_queue = self._new_rebootstrap_queue(session)
-        decode_req = self._new_decode_req()
+        session.post.side_effect = RuntimeError("network down")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
 
-        rebootstrap_queue.submit_rebootstrap_prefill(decode_req)
-        submitted = rebootstrap_queue._rebootstrap_prefill_executor.submit.call_args[0][
-            0
-        ]
-        submitted()
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
 
-        decode_req.kv_receiver.abort.assert_called_once()
-        rebootstrap_queue.scheduler.output_streamer.stream_output.assert_not_called()
+        receiver.abort.assert_called_once()
+        self.assertIn(7, mgr.failure_records)
 
-        rebootstrap_queue.drain_rebootstrap_prefill_failures()
+    def test_run_success_does_not_abort(self):
+        mgr = self._new_manager()
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=200, text="")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
 
-        rebootstrap_queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [decode_req.req], decode_req.req.return_logprob
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
+
+        session.post.assert_called_once()
+        receiver.abort.assert_not_called()
+        self.assertEqual(mgr.failure_records, {})
+
+    def test_receiver_dispatch_delegates_to_manager(self):
+        from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+
+        # CommonKVReceiver is abstract (abstract poll()); exercise the method
+        # unbound with a fake self that only carries kv_mgr.
+        fake_self = SimpleNamespace(kv_mgr=MagicMock())
+        payload = self._payload()
+
+        CommonKVReceiver.dispatch_prefill_recompute(fake_self, payload)
+
+        fake_self.kv_mgr.submit_prefill_recompute.assert_called_once_with(
+            fake_self, payload
         )
+
+    def test_base_receiver_dispatch_falls_back_to_abort(self):
+        # Backends that do not subclass CommonKVReceiver (e.g. fake transfer)
+        # must fail a rebootstrap gracefully via abort(), not raise.
+        from sglang.srt.disaggregation.base.conn import BaseKVReceiver
+
+        fake_self = MagicMock()
+        BaseKVReceiver.dispatch_prefill_recompute(fake_self, self._payload())
+        fake_self.abort.assert_called_once_with()
 
 
 class TestDecodePrebuiltPriority(unittest.TestCase):

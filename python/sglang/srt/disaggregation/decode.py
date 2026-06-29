@@ -20,10 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
-import queue
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -31,7 +28,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import requests
 import torch
 from torch.distributed import ProcessGroup
 
@@ -329,17 +325,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
-        rebootstrap_prefill_workers = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
-        if rebootstrap_prefill_workers is None:
-            rebootstrap_prefill_workers = 4
-        self._rebootstrap_prefill_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, rebootstrap_prefill_workers),
-            thread_name_prefix="pd-rebootstrap-prefill",
-        )
-        self._rebootstrap_prefill_sessions = threading.local()
-        self._failed_rebootstrap_prefill_reqs: queue.SimpleQueue[Req] = (
-            queue.SimpleQueue()
-        )
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -486,8 +471,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
         return kv_manager
 
-    def add(self, req: Req, is_retracted: bool = False) -> None:
-        """Add a request to the pending queue."""
+    def add(
+        self, req: Req, is_retracted: bool = False, is_rebootstrap: bool = False
+    ) -> None:
+        """Add a request to the pending queue.
+
+        ``is_rebootstrap`` marks a PD true-retraction request whose prefix KV
+        must be recomputed by the original prefill worker under the current
+        weights (rather than resumed from stale CPU KV). It otherwise follows the
+        same bootstrap-handshake path as a fresh request; the ``/generate``
+        dispatch happens later, after preallocation and ``send_metadata`` (see
+        ``pop_preallocated``).
+        """
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -495,7 +490,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
-            decode_req = self._create_receiver_and_enqueue(req)
+            decode_req = self._create_receiver_and_enqueue(
+                req, is_rebootstrap=is_rebootstrap
+            )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
@@ -588,30 +585,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         held = self.held_rebootstrap_reqs
         self.held_rebootstrap_reqs = []
         for req in held:
-            self.add_rebootstrap(req)
-
-    def add_rebootstrap(self, req: Req) -> None:
-        """Queue a pause-generation rebootstrap request.
-
-        Unlike OOM retraction, this path must not resume stale CPU KV. Decode
-        preallocates fresh destination pages, then asks the original prefill
-        worker to recompute the prefix KV under the current weights.
-        """
-        if self._check_if_req_exceed_kv_capacity(req):
-            return
-
-        decode_req = self._create_receiver_and_enqueue(req, is_rebootstrap=True)
-        if _is_fake_transfer(req, self.scheduler.server_args):
-            decode_req.kv_receiver.init(0)
-            return
-
-        prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-        logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
-        if prefill_dp_rank is not None:
-            decode_req.kv_receiver.init(prefill_dp_rank)
-            return
-
-        self.pending_reqs.append(decode_req)
+            self.add(req, is_rebootstrap=True)
 
     @staticmethod
     def _rebootstrap_prefill_len(req: Req) -> int:
@@ -643,52 +617,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             "no_stop_trim": sp.no_stop_trim,
         }
 
-    def _abort_rebootstrap_prefill(
-        self,
-        decode_req: DecodeRequest,
-        error_message: str,
-        status_code: HTTPStatus,
-        *,
-        stream_output: bool,
-    ) -> None:
-        req = decode_req.req
-        prepare_abort(req, error_message, status_code=status_code)
-        decode_req.kv_receiver.abort()
-        if stream_output:
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
-        else:
-            self._failed_rebootstrap_prefill_reqs.put(req)
+    def _build_rebootstrap_payload(self, req: Req) -> dict:
+        """Build the ``/generate`` payload sent to the original prefill worker to
+        recompute a retracted request's prefix KV under the current weights.
 
-    def drain_rebootstrap_prefill_failures(self) -> None:
-        while True:
-            try:
-                req = self._failed_rebootstrap_prefill_reqs.get_nowait()
-            except queue.Empty:
-                return
-            if not getattr(req, "finished_output", False):
-                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
-
-    def _get_rebootstrap_prefill_session(self) -> requests.Session:
-        session = getattr(self._rebootstrap_prefill_sessions, "session", None)
-        if session is None:
-            session = requests.Session()
-            self._rebootstrap_prefill_sessions.session = session
-        return session
-
-    def submit_rebootstrap_prefill(self, decode_req: DecodeRequest) -> None:
-        req = decode_req.req
-        prefill_url = req.pd_rebootstrap_prefill_url
-        if not prefill_url:
-            self._abort_rebootstrap_prefill(
-                decode_req,
-                "PD retract rebootstrap requires pd_rebootstrap_prefill_url from the router.",
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                stream_output=True,
-            )
-            return
-
-        payload = {
-            "input_ids": list(req.origin_input_ids) + list(req.output_ids),
+        The dispatch itself (shared executor + HTTP session + failure handling)
+        lives on the kv manager; here we only assemble the request body so the
+        sampling-param allow-list stays next to the scheduler. ``input_ids`` are
+        coerced to plain ``int`` so the payload is always JSON-serializable even
+        when ``origin_input_ids``/``output_ids`` hold numpy scalars.
+        """
+        return {
+            "input_ids": [int(x) for x in req.origin_input_ids]
+            + [int(x) for x in req.output_ids],
             "sampling_params": self._sampling_params_for_rebootstrap(req),
             "return_logprob": False,
             "stream": False,
@@ -696,46 +637,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             "bootstrap_host": req.bootstrap_host,
             "bootstrap_port": req.bootstrap_port,
             "bootstrap_room": req.bootstrap_room,
-            "pd_rebootstrap_prefill_url": prefill_url,
+            "pd_rebootstrap_prefill_url": req.pd_rebootstrap_prefill_url,
             "pd_rebootstrap_forced_output_id": req.pd_rebootstrap_forced_output_id,
             "priority": req.priority,
             "extra_key": req.extra_key,
             "routing_key": req.routing_key,
             "disagg_prefill_dp_rank": req.disagg_prefill_dp_rank,
         }
-
-        def _post_rebootstrap() -> None:
-            try:
-                response = self._get_rebootstrap_prefill_session().post(
-                    prefill_url.rstrip("/") + "/generate",
-                    json=payload,
-                    timeout=envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(),
-                )
-                if response.status_code >= 400:
-                    logger.error(
-                        "PD rebootstrap prefill failed for rid=%s status=%s body=%s",
-                        req.rid,
-                        response.status_code,
-                        response.text[:512],
-                    )
-                    self._abort_rebootstrap_prefill(
-                        decode_req,
-                        "PD retract rebootstrap prefill request failed.",
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        stream_output=False,
-                    )
-            except Exception:
-                logger.exception(
-                    "PD rebootstrap prefill request failed for rid=%s", req.rid
-                )
-                self._abort_rebootstrap_prefill(
-                    decode_req,
-                    "PD retract rebootstrap prefill request failed.",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    stream_output=False,
-                )
-
-        self._rebootstrap_prefill_executor.submit(_post_rebootstrap)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         input_len = self._rebootstrap_prefill_len(req)
@@ -1264,7 +1172,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_prefix_len=total_prefix_len,
             )
             if decode_req.is_rebootstrap:
-                self.submit_rebootstrap_prefill(decode_req)
+                decode_req.kv_receiver.dispatch_prefill_recompute(
+                    self._build_rebootstrap_payload(decode_req.req)
+                )
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -2138,8 +2048,6 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        self.disagg_decode_prealloc_queue.drain_rebootstrap_prefill_failures()
-
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

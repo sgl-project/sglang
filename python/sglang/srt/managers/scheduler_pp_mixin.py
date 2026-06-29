@@ -1377,8 +1377,6 @@ class SchedulerPPMixin:
         return None
 
     def process_prealloc_queue(self: Scheduler, prealloc_rids: Optional[List[str]]):
-        self.disagg_decode_prealloc_queue.drain_rebootstrap_prefill_failures()
-
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return [[], []]

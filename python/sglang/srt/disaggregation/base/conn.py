@@ -214,6 +214,19 @@ class BaseKVReceiver(ABC):
         """
         pass
 
+    def dispatch_prefill_recompute(self, payload: dict) -> None:
+        """
+        Drive a PD true-retraction rebootstrap: ask the original prefill worker
+        to recompute this request's prefix KV under the current weights.
+
+        Only transfer backends that talk to a real prefill ``/generate`` endpoint
+        (``CommonKVReceiver`` subclasses) implement this. The default fails the
+        request gracefully via ``abort()`` so unsupported backends (e.g. fake
+        transfer) surface a normal ``KVPoll.Failed`` instead of raising into the
+        scheduler loop.
+        """
+        self.abort()
+
 
 class BaseKVBootstrapServer(ABC):
     @abstractmethod
