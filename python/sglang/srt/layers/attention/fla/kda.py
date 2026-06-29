@@ -1128,9 +1128,9 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    del Aqk, v_new, h
+    del Aqk, v_new
 
-    return o
+    return o, None, h
 
 
 def chunk_kda(
@@ -1156,7 +1156,7 @@ def chunk_kda(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o = chunk_kda_fwd(
+    o, last_recurrent_state, h = chunk_kda_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
@@ -1170,4 +1170,4 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
     )
-    return o
+    return o, last_recurrent_state, h
