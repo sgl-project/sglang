@@ -53,7 +53,7 @@
 #     --chunked-prefill-size 4096 \
 #     --max-prefill-tokens 16384 \
 #     --max-running-requests 32 \
-#     --cuda-graph-max-bs 16 \
+#     --cuda-graph-max-bs-decode 16 \
 #     --enable-metrics \
 #     --disable-radix-cache
 #
