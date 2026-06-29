@@ -1,7 +1,24 @@
 import copy
 import unittest
+from array import array
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+import numpy as np
+import torch
+
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+    MultimodalProcessorOutput,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -16,6 +33,121 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class TestTokenizedReqInputMsgpack(unittest.TestCase):
+    def _make_mm_inputs(self, device="cpu"):
+        return MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(0, 1)],
+                    format=MultimodalInputFormat.NORMAL,
+                    feature=torch.tensor(
+                        [[1.0, 2.0]], dtype=torch.float32, device=device
+                    ),
+                    model_specific_data={
+                        "image_grid_thw": torch.tensor(
+                            [[1, 1, 2]], dtype=torch.int64, device=device
+                        ),
+                        "patch_counts": np.array([2], dtype=np.int32),
+                        "names": ["image0"],
+                    },
+                )
+            ],
+            input_ids=[1, 2],
+            padded_input_ids=[10, 10],
+            im_token_id=10,
+            mrope_positions=torch.tensor([[0, 1]], dtype=torch.int64, device=device),
+            token_type_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
+        )
+
+    def _round_trip(self, req):
+        req.wrap_pickle_fields()
+        decoded = msgpack_decode(msgpack_encode(req))
+        decoded.unwrap_pickle_fields()
+        return decoded
+
+    def test_generate_mm_inputs_round_trip_without_pickle_wrapper(self):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=self._make_mm_inputs(),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        self.assertIsInstance(decoded.mm_inputs, MultimodalProcessorOutput)
+        item = decoded.mm_inputs.mm_items[0]
+        self.assertIsInstance(item, MultimodalDataItem)
+        self.assertEqual(item.modality, Modality.IMAGE)
+        self.assertTrue(torch.equal(item.feature, torch.tensor([[1.0, 2.0]])))
+        self.assertTrue(
+            torch.equal(
+                item.model_specific_data["image_grid_thw"],
+                torch.tensor([[1, 1, 2]], dtype=torch.int64),
+            )
+        )
+        np.testing.assert_array_equal(
+            item.model_specific_data["patch_counts"],
+            np.array([2], dtype=np.int32),
+        )
+        self.assertTrue(
+            torch.equal(
+                decoded.mm_inputs.mrope_positions,
+                torch.tensor([[0, 1]], dtype=torch.int64),
+            )
+        )
+
+    def test_embedding_mm_inputs_round_trip_without_pickle_wrapper(self):
+        decoded = self._round_trip(
+            TokenizedEmbeddingReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                mm_inputs=self._make_mm_inputs(),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+            )
+        )
+
+        self.assertIsInstance(decoded.mm_inputs, MultimodalProcessorOutput)
+        self.assertTrue(
+            torch.equal(
+                decoded.mm_inputs.mm_items[0].feature,
+                torch.tensor([[1.0, 2.0]]),
+            )
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_generate_mm_inputs_round_trip_preserves_cuda_tensor_device(self):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=self._make_mm_inputs(device="cuda:0"),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        item = decoded.mm_inputs.mm_items[0]
+        self.assertEqual(item.feature.device.type, "cuda")
+        self.assertEqual(item.model_specific_data["image_grid_thw"].device.type, "cuda")
+        self.assertEqual(decoded.mm_inputs.mrope_positions.device.type, "cuda")
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
