@@ -1523,21 +1523,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
-        # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
-        # TODO: Move this online-quantization reporting out of ModelRunner.
-        quantized_layers = getattr(
-            getattr(self.model, "quant_config", None), "quantized_layers", None
-        )
-        if (
-            self.server_args.quantization is not None
-            and isinstance(quantized_layers, tuple)
-            and len(quantized_layers) == 2
-        ):
-            layer_types, quantized_layers_count = quantized_layers
-            logger.info(
-                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
-            )
-
         if self.server_args.debug_tensor_dump_output_folder is not None:
             dump_folder = self.server_args.debug_tensor_dump_output_folder
             if self.spec_algorithm.is_eagle():
