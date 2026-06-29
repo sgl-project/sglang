@@ -1089,3 +1089,57 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     else:
         output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
     return output.to(dtype=src_dtype)
+
+
+def fused_rmsnorm_rope(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    head_dim: int,
+    eps: float,
+) -> torch.Tensor:
+    """Fused RMSNorm + interleaved RoPE.
+
+    Uses Triton kernel on CUDA, falls back to pure PyTorch otherwise.
+
+    Args:
+        x: Input tensor [B, S, D] or [*, D] (bf16/fp16).
+        weight: RMSNorm weight [D].
+        cos: Precomputed cosine [S, head_dim//2] float32.
+        sin: Precomputed sine [S, head_dim//2] float32.
+        head_dim: Per-head dimension (e.g. 128).
+        eps: RMSNorm epsilon.
+
+    Returns:
+        Output tensor, same shape and dtype as x.
+    """
+    if x.is_cuda:
+        from sglang.jit_kernel.diffusion.triton.fused_rmsnorm_rope import (
+            fused_rmsnorm_rope as _fused_rmsnorm_rope_triton,
+        )
+
+        return _fused_rmsnorm_rope_triton(x, weight, cos, sin, head_dim, eps)
+
+    # Pure-PyTorch fallback for non-CUDA execution
+    orig_dtype = x.dtype
+    x_fp32 = x.float()
+
+    # RMSNorm
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x_fp32 * torch.rsqrt(variance + eps) * weight.float()
+
+    # Interleaved RoPE
+    shape = x_normed.shape
+    x_normed = x_normed.view(*shape[:-1], -1, head_dim)
+    x1 = x_normed[..., ::2]  # even elements
+    x2 = x_normed[..., 1::2]  # odd elements
+
+    cos_v = cos.unsqueeze(-2).to(x_normed.dtype)  # [S, 1, head_dim//2]
+    sin_v = sin.unsqueeze(-2).to(x_normed.dtype)
+
+    o1 = x1 * cos_v - x2 * sin_v
+    o2 = x1 * sin_v + x2 * cos_v
+
+    out = torch.stack((o1, o2), dim=-1).flatten(-2).flatten(-2)
+    return out.to(orig_dtype)
