@@ -180,6 +180,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         _prefill_backend_name = (
             _cg_cfg.prefill.backend if _cg_cfg is not None else Backend.TC_PIECEWISE
         )
+        # Stored because capture_prepare()/load_batch() run during tc_piecewise's
+        # compile pass — before self.backend is assigned — so they cannot key off
+        # isinstance(self.backend, BreakableCudaGraphBackend).
+        self.prefill_backend_name = _prefill_backend_name
         if (
             _prefill_backend_name == Backend.BREAKABLE
             and model_runner.spec_algorithm.is_eagle()
@@ -617,7 +621,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=bs,
                 input_ids=_slot("input_ids"),
-                input_embeds=None,
+                # BCG captures a text-only graph (can_run_graph rejects
+                # multimodal), so it forces input_embeds=None; tc_piecewise must
+                # keep the captured input_embeds slot or multimodal LM prefill
+                # loses its image embeddings (NaN logits).
+                input_embeds=(
+                    None
+                    if self.prefill_backend_name == Backend.BREAKABLE
+                    else (
+                        _slot("input_embeds")
+                        if registry.has_slot("input_embeds")
+                        else None
+                    )
+                ),
                 req_pool_indices=shape_inputs["req_pool_indices"],
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=None,
@@ -779,10 +795,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         input_ids = _slot("input_ids")
-        # input_embeds path is rejected by can_run_graph (multimodal-only); BCG
-        # mirrors PCG: only support input_ids, falling back to eager for
-        # input_embeds requests.
-        input_embeds = None
+        # BCG captures a text-only graph (can_run_graph rejects multimodal, so
+        # input_embeds requests fall back to eager) and forces input_embeds=None;
+        # tc_piecewise keeps the captured input_embeds slot so multimodal LM
+        # prefill replays with its image embeddings instead of NaN logits.
+        input_embeds = (
+            None
+            if self.prefill_backend_name == Backend.BREAKABLE
+            else (_slot("input_embeds") if registry.has_slot("input_embeds") else None)
+        )
         positions = _slot("positions")
         out_cache_loc = _slot("out_cache_loc")
         mrope_positions = (
