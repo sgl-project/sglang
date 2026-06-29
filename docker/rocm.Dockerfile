@@ -63,9 +63,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
 # ROCm SDK and PyTorch dependencies
-ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/v2-staging/gfx950-dcgpu/"
+ARG PIP_EXTRA_INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
 # Pin to a specific ROCm SDK version (e.g. 7.14.0a20260604). Leave empty for latest.
-ARG ROCM_SDK_VERSION=""
+ARG ROCM_SDK_VERSION="7.15.0a20260628"
 ARG TORCH_VERSION="2.10.0"
 ARG TORCHVISION_VERSION="0.25.0"
 ARG TORCHAUDIO_VERSION="2.10.0"
@@ -74,10 +74,7 @@ ARG TORCHAUDIO_VERSION="2.10.0"
 RUN ROCM_SPEC="${ROCM_SDK_VERSION:+==${ROCM_SDK_VERSION}}" \
     && python3 -m pip install --no-cache-dir \
          --index-url "${PIP_EXTRA_INDEX_URL}" \
-         "rocm${ROCM_SPEC}" \
-         "rocm-sdk-core${ROCM_SPEC}" \
-         "rocm-sdk-devel${ROCM_SPEC}" \
-         "rocm-sdk-libraries-gfx950-dcgpu${ROCM_SPEC}"
+         "rocm[libraries,devel,device-gfx950]${ROCM_SPEC}"
 
 # Initialize ROCm SDK
 RUN rocm-sdk init && rocm-sdk targets
@@ -774,7 +771,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
         fi \
      && pip install -r python/requirements.txt \
      && if [ "$GPU_ARCH" = "gfx950-rocm7_14" ]; then \
-            TRITON_WHEEL_VERSION_SUFFIX=+rocm7.14.0a20260612 pip install -e .; \
+            TRITON_WHEEL_VERSION_SUFFIX=+rocm7.15.0a20260628 pip install -e .; \
         else \
             pip install -e .; \
         fi \
