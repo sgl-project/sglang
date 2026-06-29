@@ -45,9 +45,7 @@ class TestDSALayerShardUtils(CustomTestCase):
         )
 
         def broadcast(tensor, layer_id, *, src_tensor, use_layer_broadcast_comm):
-            broadcasts.append(
-                (tensor, layer_id, src_tensor, use_layer_broadcast_comm)
-            )
+            broadcasts.append((tensor, layer_id, src_tensor, use_layer_broadcast_comm))
 
         pool._broadcast_tensor_from_owner = broadcast
         MLATokenToKVPool.prefetch_kv_buffer(

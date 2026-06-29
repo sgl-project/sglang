@@ -144,7 +144,7 @@ class CommonKVManager(BaseKVManager):
         hybrid_mla_needs_all_cp_ranks = self.is_hybrid_mla_backend and (
             self.attn_cp_size > 1 or disaggregation_mode == DisaggregationMode.DECODE
         )
-        
+
         layer_split_needs_all_cp_ranks = (
             getattr(server_args, "enable_dsa_cache_layer_split", False)
             and self.attn_cp_size > 1
@@ -345,9 +345,8 @@ class CommonKVManager(BaseKVManager):
             target_cp_ranks = [self.attn_cp_rank]
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
-            pull_from_all_cp_ranks = (
-                self.enable_all_cp_ranks_for_transfer
-                or getattr(info, "enable_dsa_cache_layer_split", False)
+            pull_from_all_cp_ranks = self.enable_all_cp_ranks_for_transfer or getattr(
+                info, "enable_dsa_cache_layer_split", False
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
@@ -1397,9 +1396,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
-                enable_dsa_cache_layer_split=bool(
-                    self.enable_dsa_cache_layer_split
-                ),
+                enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

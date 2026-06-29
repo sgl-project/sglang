@@ -1140,7 +1140,9 @@ class Glm4MoeModel(nn.Module):
                     hidden_states,
                     forward_batch,
                     residual,
-                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(i),
+                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
+                        i
+                    ),
                 )
 
         if normal_end_layer != self.end_layer:

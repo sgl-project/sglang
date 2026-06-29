@@ -2249,6 +2249,7 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
     @property
     def layer_shard_enabled(self) -> bool:
         return bool(getattr(self.full_kv_pool, "layer_shard_enabled", False))
@@ -2270,7 +2271,6 @@ class HybridLinearKVPool(KVCache):
             return True
         full_layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool._is_layer_owned(full_layer_id)
-
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
