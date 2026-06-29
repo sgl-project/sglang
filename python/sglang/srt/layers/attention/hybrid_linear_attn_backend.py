@@ -1174,6 +1174,25 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
 
         pool = self.linear_attn_backend.req_to_token_pool
+        # Option A (SGLANG_GDN_STASH_ELIM): when the verify conv wrote its output into a
+        # persistent per-layer buffer, recover k/v as strided views of it instead of from
+        # a copied stash. persist[layer_id] is token-major [max_bs, T, conv_dim]; k/v are
+        # column slices with token-stride = conv_dim and contiguous features, which the
+        # recover kernels read directly via their parameterized token stride.
+        persist_per_layer: dict = getattr(
+            self.linear_attn_backend, "_conv_out_persist", {}
+        )
+
+        def _persist_kv(layer_id, stash, b_rows):
+            """Post-conv (k, v) views from the persistent conv-out buffer, shaped
+            [1, b_rows*T, Hk, Dk] / [1, b_rows*T, Hv, Dv]."""
+            persist = persist_per_layer[layer_id]
+            q_dim, k_dim, v_dim, Hk, Dk, Hv, Dv = stash["conv_dims"]
+            n_tok = b_rows * cache_steps
+            mixed = persist[:b_rows].reshape(n_tok, q_dim + k_dim + v_dim)
+            k = mixed[:, q_dim : q_dim + k_dim].view(1, n_tok, Hk, Dk)
+            v = mixed[:, q_dim + k_dim : q_dim + k_dim + v_dim].view(1, n_tok, Hv, Dv)
+            return k, v
 
         # Recovery runs outside the captured graph. Derive per-call sizes from
         # current tensors because the stash spans multiple batch-size captures.
@@ -1249,9 +1268,19 @@ class HybridLinearAttnBackend(AttentionBackend):
                     # Zero-copy views: no cat or zero-fill GPU kernels are launched.
                     # Rows B..B_pad-1 may contain stale data but are never read by
                     # the kernel when their accepted_steps entry is 0.
-                    k_bat = stash["k"][0, :actual_seq_len_pad].view(
-                        B_pad, T, stash["k"].shape[2], stash["k"].shape[3]
-                    )
+                    if stash.get("conv_dims") is not None:
+                        # Option A: build k/v [B_pad, T, H, D] from the persistent
+                        # conv-out buffer (q==k for this kernel: it l2-norms both).
+                        k_pv, v_bat = _persist_kv(layer_id, stash, B_pad)
+                        k_bat = k_pv.view(B_pad, T, k_pv.shape[2], k_pv.shape[3])
+                        v_bat = v_bat.view(B_pad, T, v_bat.shape[2], v_bat.shape[3])
+                    else:
+                        k_bat = stash["k"][0, :actual_seq_len_pad].view(
+                            B_pad, T, stash["k"].shape[2], stash["k"].shape[3]
+                        )
+                        v_bat = stash["v"][0, :actual_seq_len_pad].view(
+                            B_pad, T, stash["v"].shape[2], stash["v"].shape[3]
+                        )
                     gated_delta_rule_mtp(
                         A_log=stash["A_log"].detach().float(),
                         a=stash["a"][:actual_seq_len_pad].view(
@@ -1260,9 +1289,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                         dt_bias=stash["dt_bias"].detach(),
                         q=k_bat,
                         k=k_bat,
-                        v=stash["v"][0, :actual_seq_len_pad].view(
-                            B_pad, T, stash["v"].shape[2], stash["v"].shape[3]
-                        ),
+                        v=v_bat,
                         b=stash["b"][:actual_seq_len_pad].view(
                             B_pad, T, stash["b"].shape[-1]
                         ),
@@ -1282,14 +1309,20 @@ class HybridLinearAttnBackend(AttentionBackend):
                 layer_cache = pool.mamba2_layer_cache(layer_id)
                 layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
 
+                if stash.get("conv_dims") is not None:
+                    k_recov, v_recov = _persist_kv(layer_id, stash, batch_size)
+                else:
+                    k_recov = stash["k"][:, :actual_seq_len]
+                    v_recov = stash["v"][:, :actual_seq_len]
+
                 fused_sigmoid_gating_delta_rule_recover_final_state(
                     A_log=stash["A_log"],
                     a=stash["a"][:actual_seq_len],
                     dt_bias=stash["dt_bias"],
                     softplus_beta=1.0,
                     softplus_threshold=20.0,
-                    k=stash["k"][:, :actual_seq_len],
-                    v=stash["v"][:, :actual_seq_len],
+                    k=k_recov,
+                    v=v_recov,
                     b=stash["b"][:actual_seq_len],
                     initial_state_source=layer_ssm_states,
                     initial_state_indices=state_idx_i32,

@@ -284,8 +284,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Values are stable tensors or parameters; per-call sizes are derived
         # from runtime tensors because the dict spans multiple CUDA graph captures.
         self._no_cache_stash: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Option A (SGLANG_GDN_STASH_ELIM): per-layer persistent post-conv output
+        # buffer, token-major [max_bs, draft, conv_dim]. The verify conv writes into
+        # it (out=) so recovery reads k/v as strided views directly — no stash copy.
+        self._conv_out_persist: Dict[int, torch.Tensor] = {}
         # Cached once on first forward; stable across calls.
         self._no_cache_draft_token_num: Optional[int] = None
+        # Lazily-created side stream + fork/join events for SGLANG_GDN_STASH_OVERLAP:
+        # run the recovery-stash copies concurrently with the WY verify kernel.
+        # Created once (stable identity) so CUDA-graph replay re-uses them.
+        self._stash_stream: Optional[torch.cuda.Stream] = None
+        self._stash_fork_ev: Optional[torch.cuda.Event] = None
+        self._stash_join_ev: Optional[torch.cuda.Event] = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -389,6 +399,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
 
+        # One-time bf16 pre-cast of the fp32 GDN decay/bias weights, done OUTSIDE CUDA
+        # graph capture (during eager prefill warmup, which always precedes verify-graph
+        # capture). The WY output-only verify kernel reads A_log/dt_bias as bf16; without
+        # this, its internal fp32->bf16 cast misses the JIT cache at capture time and gets
+        # baked into the captured decode graph, re-running ~1.3us serially before every WY
+        # launch (1 per GDN layer per step). Pre-casting here is bit-identical to that
+        # internal cast (same .to(bf16)) — only the timing moves to warmup, so accept
+        # length / accuracy are unchanged. Stored on the layer (persistent, graph-stable).
+        if (
+            getattr(layer, "_gdn_A_log_bf16", None) is None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            layer._gdn_A_log_bf16 = layer.A_log.detach().to(torch.bfloat16).contiguous()
+            layer._gdn_dt_bias_bf16 = (
+                layer.dt_bias.detach().to(torch.bfloat16).contiguous()
+            )
+
         query_start_loc = forward_metadata.query_start_loc
         cache_indices = forward_metadata.mamba_cache_indices
         retrieve_next_token = forward_metadata.retrieve_next_token
@@ -411,11 +438,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         if is_target_verify:
+            from sglang.srt.environ import envs
+
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
+            # Option A: write the post-conv output into a persistent token-major buffer
+            # [max_bs, draft, conv_dim] so recovery can read k/v as strided views (no
+            # stash copy). The out= arg is persist[:bs].transpose(1,2), which carries the
+            # same [batch, conv_dim, draft] strides empty_like(x) would have produced — so
+            # the downstream transpose+view stays a no-copy view.
+            _conv_out_arg = None
+            if (
+                intermediate_state_cache is None
+                and envs.SGLANG_GDN_STASH_ELIM.get()
+            ):
+                conv_dim = mixed_qkv_reshaped.shape[1]
+                max_bs = self.req_to_token_pool.size
+                pbuf = self._conv_out_persist.get(layer.layer_id)
+                if (
+                    pbuf is None
+                    or pbuf.shape[0] < batch_size
+                    or pbuf.shape[1] != draft_token_num
+                    or pbuf.shape[2] != conv_dim
+                ):
+                    with torch.inference_mode(False):
+                        pbuf = torch.empty(
+                            (max_bs, draft_token_num, conv_dim),
+                            dtype=mixed_qkv_reshaped.dtype,
+                            device=mixed_qkv_reshaped.device,
+                        )
+                    self._conv_out_persist[layer.layer_id] = pbuf
+                _conv_out_arg = pbuf[:batch_size].transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -428,6 +484,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_token=retrieve_next_token,
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
+                out=_conv_out_arg,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
@@ -464,6 +521,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
+            from sglang.srt.environ import envs
+
+            # Overlap the recovery stash onto a side stream (concurrent with the WY
+            # verify kernel) when enabled. _stash_forked tracks whether we issued the
+            # fork so the post-verify join only runs when it did.
+            _stash_overlap = envs.SGLANG_GDN_STASH_OVERLAP.get()
+            # Option A: skip the k/v stash copies entirely — recovery reads k/v as
+            # strided views of the persistent conv-out buffer (written above via out=).
+            # a/b still come from the projection (not the conv) and are stashed normally.
+            _stash_elim = envs.SGLANG_GDN_STASH_ELIM.get()
+            _stash_forked = False
             # In cache_mode=none, keep post-conv GDN inputs for accepted-state
             # recovery. Persistent buffers give CUDA graph replay stable addresses.
             if intermediate_state_cache is None:
@@ -475,21 +543,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 actual_seq_len = query.shape[1]
 
                 stash_entry = self._no_cache_stash.get(layer.layer_id)
-                if stash_entry is None or stash_entry["k"].shape[1] < max_tokens:
+                if stash_entry is None or stash_entry["a"].shape[0] < max_tokens:
                     # Allocate outside inference_mode so buffers can be updated
                     # across forward invocations.
                     with torch.inference_mode(False):
                         stash_entry = {
-                            "k": torch.empty(
-                                (key.shape[0], max_tokens, *key.shape[2:]),
-                                dtype=key.dtype,
-                                device=key.device,
-                            ),
-                            "v": torch.empty(
-                                (value.shape[0], max_tokens, *value.shape[2:]),
-                                dtype=value.dtype,
-                                device=value.device,
-                            ),
                             "a": torch.empty(
                                 (max_tokens, *a.shape[1:]),
                                 dtype=a.dtype,
@@ -503,22 +561,85 @@ class GDNAttnBackend(MambaAttnBackendBase):
                             "A_log": layer.A_log,
                             "dt_bias": layer.dt_bias,
                         }
+                        if not _stash_elim:
+                            stash_entry["k"] = torch.empty(
+                                (key.shape[0], max_tokens, *key.shape[2:]),
+                                dtype=key.dtype,
+                                device=key.device,
+                            )
+                            stash_entry["v"] = torch.empty(
+                                (value.shape[0], max_tokens, *value.shape[2:]),
+                                dtype=value.dtype,
+                                device=value.device,
+                            )
                     self._no_cache_stash[layer.layer_id] = stash_entry
+                if _stash_elim:
+                    # Geometry for recovery to slice k/v out of the [B, T, conv_dim]
+                    # persistent conv-out buffer. Stable per layer; set every call is fine.
+                    stash_entry["conv_dims"] = (
+                        layer.q_dim,
+                        layer.k_dim,
+                        layer.v_dim,
+                        layer.num_k_heads,
+                        layer.head_k_dim,
+                        layer.num_v_heads,
+                        layer.head_v_dim,
+                    )
                 # In-place slice copy with no new allocation; captured replays
                 # refresh the stable buffer slice for that graph's batch size.
-                stash_entry["k"][:, :actual_seq_len].copy_(key)
-                stash_entry["v"][:, :actual_seq_len].copy_(value)
-                stash_entry["a"][:actual_seq_len].copy_(a)
-                stash_entry["b"][:actual_seq_len].copy_(b)
+                if _stash_overlap:
+                    # Fork the 4 stash copies onto a side stream so they run
+                    # concurrently with the WY verify kernel below (both only READ the
+                    # conv output; the stash writes a disjoint buffer -> no hazard).
+                    # fork_ev marks the point where key/value/a/b are ready on the
+                    # current stream; the side stream waits on it, then copies; the
+                    # join (after target_verify) makes the current stream wait on the
+                    # completion so the later eager recovery's wait_stream observes it.
+                    # Capture-safe: the bracketing events record the cross-stream deps
+                    # into the CUDA graph.
+                    if self._stash_stream is None:
+                        self._stash_stream = torch.cuda.Stream()
+                        self._stash_fork_ev = torch.cuda.Event()
+                        self._stash_join_ev = torch.cuda.Event()
+                    self._stash_fork_ev.record()
+                    self._stash_stream.wait_event(self._stash_fork_ev)
+                    with torch.cuda.stream(self._stash_stream):
+                        if not _stash_elim:
+                            stash_entry["k"][:, :actual_seq_len].copy_(key)
+                            stash_entry["v"][:, :actual_seq_len].copy_(value)
+                        stash_entry["a"][:actual_seq_len].copy_(a)
+                        stash_entry["b"][:actual_seq_len].copy_(b)
+                        self._stash_join_ev.record(self._stash_stream)
+                    _stash_forked = True
+                else:
+                    if not _stash_elim:
+                        stash_entry["k"][:, :actual_seq_len].copy_(key)
+                        stash_entry["v"][:, :actual_seq_len].copy_(value)
+                    stash_entry["a"][:actual_seq_len].copy_(a)
+                    stash_entry["b"][:actual_seq_len].copy_(b)
                 # Do not store per-call sizes or tensor aliases in the stash;
                 # eager recovery derives them from current runtime tensors.
                 if self._no_cache_draft_token_num is None:
                     self._no_cache_draft_token_num = (
                         forward_batch.spec_info.draft_token_num
                     )
+            # Feed the pre-cast bf16 weights to the WY (cache_mode=none) verify so its
+            # internal cast hits the early-return (no per-step cast in the graph). Only
+            # for WY: the full-mode state kernel reads A_log at full fp32 precision, so it
+            # must keep the original fp32 weight (passing bf16 would change full-mode math).
+            from sglang.srt.environ import envs
+            from sglang.srt.server_args import get_global_server_args
+
+            _use_wy_verify = (
+                get_global_server_args().gdn_mtp_cache_mode == "none"
+                and envs.SGLANG_GDN_WY_VERIFY.get()
+                and getattr(layer, "_gdn_A_log_bf16", None) is not None
+            )
+            _verify_A_log = layer._gdn_A_log_bf16 if _use_wy_verify else layer.A_log
+            _verify_dt_bias = layer._gdn_dt_bias_bf16 if _use_wy_verify else layer.dt_bias
             core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
+                A_log=_verify_A_log,
+                dt_bias=_verify_dt_bias,
                 q=query,
                 k=key,
                 v=value,
@@ -532,6 +653,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
+            if _stash_forked:
+                # Join: the WY verify kernel has been issued on this stream, so it
+                # overlapped the side-stream stash. Now make this stream wait on the
+                # stash completion so the captured graph's tail — and the later eager
+                # recovery's wait_stream(current) — observes the finished stash.
+                torch.cuda.current_stream().wait_event(self._stash_join_ev)
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(

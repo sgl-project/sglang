@@ -439,6 +439,20 @@ class Envs:
     # recurrence recover kernel — the hybrid (FI WY verify + Triton recovery)
     # that avoids the slower FlashInfer recovery path.
     SGLANG_GDN_FI_RECOVERY = EnvBool(True)
+    # Overlap the gdn_mtp_cache_mode=none recovery stash (post-conv k/v/a/b copies)
+    # onto a side stream so it runs concurrently with the WY verify kernel instead of
+    # serializing before it. The stash and the verify only READ the conv output; the
+    # stash writes a disjoint buffer, so they have no hazard. A join after the verify
+    # kernel ensures the later (eager) recovery still observes the completed stash.
+    SGLANG_GDN_STASH_OVERLAP = EnvBool(False)
+
+    # gdn_mtp_cache_mode=none, Option A: have the verify-path conv write its post-conv
+    # output into a persistent per-layer buffer (out=), so the deferred accepted-state
+    # recovery reads k/v directly from it instead of from a copied stash. Removes the
+    # per-step k/v stash copies from the verify critical path (they relocate onto the
+    # already-overlapped recovery side stream). The existing recovery-join guard
+    # protects the buffer from the next verify forward. Off by default (prototype).
+    SGLANG_GDN_STASH_ELIM = EnvBool(False)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)

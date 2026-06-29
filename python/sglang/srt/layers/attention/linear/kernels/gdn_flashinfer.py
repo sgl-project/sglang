@@ -369,11 +369,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                     )
                 _WYDBG["n"] += 1
 
-            # bf16 kernel expects: q/k/v/a/b bf16, A_log/dt_bias float32,
-            # initial_state_source bf16 pool [pool_size, HV, V, K]. Input prep
-            # mirrors decode() on SM100 so dtypes stay consistent.
+            # bf16 kernel expects: q/k/v/a/b bf16, initial_state_source bf16 pool.
+            # State kernel wants A_log fp32; the WY kernel reads A_log/dt_bias as bf16
+            # and casts internally — so for WY pass the persistent weight directly
+            # (A_log.detach(), same data_ptr each call) instead of .float(). This drops
+            # the per-call fp32 round-trip AND lets the WY wrapper cache the bf16 cast
+            # by data_ptr (the cast then vanishes from the captured graph).
+            _alog = A_log.detach() if _use_wy else A_log.detach().float()
             output_fi = gated_delta_rule_mtp_bf16_state(
-                A_log=A_log.detach().float(),
+                A_log=_alog,
                 a=a_mtp,
                 dt_bias=dt_bias.detach(),
                 q=query_mtp,
