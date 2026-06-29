@@ -103,6 +103,19 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class _MaxLevelFilter(logging.Filter):
+    """Allow log records whose level is below the given threshold."""
+
+    def __init__(self, exclusive_upper_bound: int):
+        super().__init__()
+        self.exclusive_upper_bound = exclusive_upper_bound
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.exclusive_upper_bound
+
+
 torch_release = pkg_version.parse(torch.__version__).release
 
 
@@ -1388,12 +1401,23 @@ def configure_logger(server_args, prefix: str = ""):
         return
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+    formatter = logging.Formatter(format, datefmt="%Y-%m-%d %H:%M:%S")
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+    stdout_handler.addFilter(_MaxLevelFilter(logging.ERROR))
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.ERROR)
+    stderr_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        handler.close()
+    root_logger.setLevel(getattr(logging, server_args.log_level.upper()))
+    root_logger.addHandler(stdout_handler)
+    root_logger.addHandler(stderr_handler)
 
     # Suppress noisy httpx/httpcore loggers in every process that calls
     # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
