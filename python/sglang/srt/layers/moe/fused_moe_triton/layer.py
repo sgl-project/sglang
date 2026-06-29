@@ -48,6 +48,7 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -207,7 +208,7 @@ class FusedMoE(torch.nn.Module):
         # DeepEP/MegaMOE use one physical shared slot per rank. Other backends
         # keep the shared expert as a global slot.
         # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
-        if num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        if has_per_rank_fused_shared_slots(num_fused_shared_experts):
             num_shared_slots = num_fused_shared_experts * self.moe_ep_size
         else:
             num_shared_slots = num_fused_shared_experts

@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.topk import (
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
 )
-from sglang.srt.layers.moe.utils import uses_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,7 @@ class HashTopK(nn.Module):
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if self.num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots():
+        if has_per_rank_fused_shared_slots(self.num_fused_shared_experts):
             n = self.num_fused_shared_experts
             topk_output = topk_output._replace(
                 topk_ids=topk_output.topk_ids.new_empty(
@@ -210,8 +210,8 @@ class HashTopK(nn.Module):
             topk_weights = topk_weights * self.routed_scaling_factor
 
         num_fused_shared_experts = self.num_fused_shared_experts
-        use_per_rank_shared_slots = (
-            num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+        use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
+            num_fused_shared_experts
         )
 
         log2phy_prob = None
