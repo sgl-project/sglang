@@ -1,0 +1,53 @@
+# GCP Cloud Build: bake the SM120 fork branch into an SGLang serving image and
+# push it to Artifact Registry. Equivalent to `git fetch ... && git reset --hard`
+# on the box, but produces a deployable image for your GKE SM120 nodes.
+#
+# Submit (context = this folder, which holds Dockerfile.serve):
+#
+#   gcloud builds submit tools/sm120 \
+#     --config tools/sm120/cloudbuild.yaml \
+#     --substitutions=\
+#_BASE_IMAGE=<your-working-sglang-sm120-image>,\
+#_IMAGE=us-docker.pkg.dev/$PROJECT_ID/sglang/sglang-sm120,\
+#_BRANCH=sm120-glm5.2-fp8
+#
+# Then deploy by pointing your GKE Deployment at:
+#   ${_IMAGE}:${_BRANCH}   (also tagged :${SHORT_SHA-less} latest)
+
+substitutions:
+  _BASE_IMAGE: "lmsysorg/sglang:latest"        # MUST be an image that works on SM120
+  _REPO: "https://github.com/shivajid/sglang.git"
+  _BRANCH: "sm120-glm5.2-fp8"
+  _IMAGE: "us-docker.pkg.dev/${PROJECT_ID}/sglang/sglang-sm120"
+
+options:
+  machineType: "E2_HIGHCPU_32"   # large base image; give the builder room
+  diskSizeGb: 200
+
+timeout: 3600s
+
+steps:
+  - id: build
+    name: "gcr.io/cloud-builders/docker"
+    dir: "."
+    args:
+      - "build"
+      - "-f"
+      - "Dockerfile.serve"
+      - "--build-arg"
+      - "SGLANG_IMAGE=${_BASE_IMAGE}"
+      - "--build-arg"
+      - "SGLANG_REPO=${_REPO}"
+      - "--build-arg"
+      - "SGLANG_BRANCH=${_BRANCH}"
+      - "--build-arg"
+      - "CACHEBUST=${BUILD_ID}"     # always re-fetch the latest branch tip
+      - "-t"
+      - "${_IMAGE}:${_BRANCH}"
+      - "-t"
+      - "${_IMAGE}:${BUILD_ID}"
+      - "."
+
+images:
+  - "${_IMAGE}:${_BRANCH}"
+  - "${_IMAGE}:${BUILD_ID}"
