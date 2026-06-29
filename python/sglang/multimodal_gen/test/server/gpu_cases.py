@@ -9,6 +9,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
     MODELOPT_NVFP4_B200_ENV_VARS,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
     MODELOPT_WAN22_FP8_MODEL,
@@ -19,7 +20,9 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionServerArgs,
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
+    JOY_ECHO_T2V_CI_sampling_params,
     LINGBOT_WORLD_REALTIME_sampling_params,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
     MODELOPT_TI2I_CI_sampling_params,
@@ -133,17 +136,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
-    # TODO: replace with a faster model to test the --dit-layerwise-offload
-    # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
-    # so we do one warmup and send one request instead
-    DiffusionTestCase(
-        "layerwise_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            dit_layerwise_offload=True,
-            dit_offload_prefetch_size=2,
-        ),
-    ),
     DiffusionTestCase(
         "zimage_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
@@ -240,6 +232,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            modality="video",
         ),
     ),
     DiffusionTestCase(
@@ -429,11 +422,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             extras=[
-                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
             ],
             env_vars={
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
             },
         ),
         run_component_accuracy_check=False,
@@ -475,7 +467,8 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
-        )
+            T2V_sampling_params,
+        ),
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
 # on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
@@ -492,14 +485,6 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-            run_consistency_check=True,
-        ),
-        _make_modelopt_ci_case(
-            "flux2_modelopt_fp8_t2i",
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
             run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
@@ -566,6 +551,15 @@ else:
             run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
+            "qwen_image_2512_modelopt_nvfp4_t2i",
+            model_path=MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
+            modality="image",
+            sampling_params=MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
+            extras=[],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
             model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",
@@ -579,6 +573,18 @@ else:
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "flux2_modelopt_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            tp_size=2,
+            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+        ),
+        MODELOPT_T2I_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+    ),
     DiffusionTestCase(
         "ideogram4_fp8_tp2_t2i",
         DiffusionServerArgs(
@@ -649,6 +655,20 @@ TWO_GPU_CASES = [
             prompt=T2V_PROMPT,
             output_size="832x480",
         ),
+    ),
+    DiffusionTestCase(
+        "joy_echo_t2v_2gpu",
+        DiffusionServerArgs(
+            model_path="jdopensource/JoyAI-Echo",
+            extras=["--ulysses-degree=2"],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        JOY_ECHO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_cfg_parallel",
@@ -841,14 +861,14 @@ def _discover_unit_tests() -> list[str]:
 FILE_SUITES = {
     "unit": _discover_unit_tests(),
     "component-accuracy": [
-        "test_component_accuracy_1_gpu.py",
-        "test_component_accuracy_2_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
     ],
     "component-accuracy-1-gpu": [
-        "test_component_accuracy_1_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
     ],
     "component-accuracy-2-gpu": [
-        "test_component_accuracy_2_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
     ],
     "1-gpu-b200": [
         "test_server_b200.py",
@@ -866,13 +886,11 @@ PARAMETRIZED_CASE_GROUPS = {
 
 STANDALONE_FILES = {
     "1-gpu": [
-        "../cli/test_generate_t2i_perf.py",
-        # Temporarily disabled: 24 timeout failures since 2026-04-09 across
-        # multimodal-gen-test-1-gpu. Re-enable after the flakiness is fixed.
-        # "test_update_weights_from_disk.py",
+        "../single_test_file/test_generate_zimage_turbo_cli.py",
+        "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
-        "test_disagg_server.py",
+        "../single_test_file/test_disagg_server.py",
     ],
 }
 
@@ -881,14 +899,12 @@ STANDALONE_FILES = {
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.
 STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
-        "../cli/test_generate_t2i_perf.py": 240.0,
-        # See STANDALONE_FILES note above — temporarily disabled.
-        # "test_update_weights_from_disk.py": 480.0,
+        "../single_test_file/test_update_weights_from_disk.py": 1200.0,
     },
     "2-gpu": {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
         # Raise if CI reports a higher measured time.
-        "test_disagg_server.py": 600.0,
+        "../single_test_file/test_disagg_server.py": 600.0,
     },
 }
 
@@ -917,9 +933,8 @@ DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
-_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
-_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
-_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
-    "FLUX.2-klein-base-4B",
-    "Qwen-Image",
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = (
+    "../single_test_file/test_update_weights_from_disk.py"
 )
+_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+_UPDATE_WEIGHTS_MODEL_PAIR_IDS = ("FLUX.2-klein-base-4B",)

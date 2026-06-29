@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -35,10 +36,6 @@ from functools import lru_cache
 
 import torch
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-)
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 
 # Blockwise quantization group sizes: number of elements sharing one scale factor
@@ -213,12 +210,13 @@ def init_mori_op(
     dispatch_dtype=DispatchDtype.bf16,
     combine_dtype=CombineDtype.bf16,
     enable_sdma=False,
+    use_external_inp_buf=True,
 ):
 
     import mori
 
-    world_size = get_moe_expert_parallel_world_size()
-    rank = get_moe_expert_parallel_rank()
+    world_size = get_parallel().moe_ep_size
+    rank = get_parallel().moe_ep_rank
 
     gpu_per_node = 8 if world_size >= 8 else world_size
 
@@ -257,7 +255,10 @@ def init_mori_op(
     data_type = fp8_dtype
     scale_type_size = torch.float32.itemsize
 
-    if dispatch_dtype == DispatchDtype.fp8:
+    if dispatch_dtype == DispatchDtype.bf16:
+        data_type = params_dtype
+        scale_dim = 0
+    elif dispatch_dtype == DispatchDtype.fp8:
         scale_dim = hidden_size // FP8_BLOCK_SIZE
     elif dispatch_dtype == DispatchDtype.fp4:
         # FP4 kernel still takes the original hidden size and do quantization
@@ -290,6 +291,7 @@ def init_mori_op(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
         f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
         f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} "
+        f"{use_external_inp_buf=} "
     )
 
     def check_mori_compatibility(kwargs: dict) -> None:
@@ -321,6 +323,7 @@ def init_mori_op(
         max_total_recv_tokens=get_int_env_var(
             "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
         ),
+        use_external_inp_buf=use_external_inp_buf,
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
@@ -389,6 +392,7 @@ class _MoriEPDispatcherImplBase:
         )
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
+        self.use_external_inp_buf = True
 
         self._mori_op = None
         self.dispatch_dtype = DispatchDtype.bf16
@@ -418,6 +422,7 @@ class _MoriEPDispatcherImplBase:
                 self.dispatch_dtype,
                 self.combine_dtype,
                 self.enable_sdma,
+                self.use_external_inp_buf,
             )
         return self._mori_op
 
@@ -511,6 +516,9 @@ class _MoriEPDispatcherImplBase:
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    def _combine_kwargs(self, hidden_states: torch.Tensor) -> dict:
+        return {}
 
 
 class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
@@ -773,7 +781,10 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     if self.enable_sdma
                     else self.mori_op.combine
                 )
-                combined_hidden_states = combine_fn(hidden_states, None, topk_ids)[0]
+                combine_kwargs = self._combine_kwargs(hidden_states)
+                combined_hidden_states = combine_fn(
+                    hidden_states, None, topk_ids, **combine_kwargs
+                )[0]
                 if self.enable_sdma:
                     self.mori_op.combine_recv()
 
@@ -786,8 +797,9 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             combined_hidden_states.record_stream(comm_stream)
 
         else:
+            combine_kwargs = self._combine_kwargs(hidden_states)
             combined_hidden_states = self.mori_op.combine(
-                hidden_states, None, topk_ids
+                hidden_states, None, topk_ids, **combine_kwargs
             )[0]
 
         return combined_hidden_states, done_event
@@ -1045,7 +1057,7 @@ class MoriEPDispatcher(BaseDispatcher):
         # experts that are not local to this rank.
         self.expert_mask_gpu = None
         if _use_aiter and num_experts is not None and num_local_experts is not None:
-            ep_rank = get_moe_expert_parallel_rank()
+            ep_rank = get_parallel().moe_ep_rank
             expert_mask = torch.zeros(
                 num_experts,
                 device=torch.cuda.current_device(),
