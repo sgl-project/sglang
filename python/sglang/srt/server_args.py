@@ -3183,9 +3183,17 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
         rules = [
             # MLA prefill takes a different attn-forward path under BCG.
             ("MLA attention", lambda: self.use_mla_backend()),
+            # DSV4 is BCG-compatible but introduces heavy memory pressure: the
+            # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
+            (
+                "DeepSeek-V4 (heavy capture-pool memory pressure)",
+                lambda: is_deepseek_v4(self.get_model_config().hf_config),
+            ),
             # CP all_gather replay size mismatch under BCG.
             ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
             # BCG capture + LoRA adapter weights exceed host RAM headroom.
