@@ -153,8 +153,18 @@ class SelfBenchmark:
             return
 
         # Synthetic requests are owned by normal scheduler/result processing after
-        # injection, so do not advance or advertise readiness until that state drains.
-        if self._current is not None or self._has_inflight_work():
+        # injection. Record a completed current point as soon as its tracked
+        # requests finish, but do not inject more work or advertise readiness
+        # until all scheduler-owned state drains.
+        if self._current is not None:
+            # Disaggregated prefill can mark a synthetic request finished after
+            # observe_forward_pass() has already checked it. Re-check here so a
+            # point completed by post-forward transfer processing can advance.
+            if self._current_point_finished():
+                self._save_current_point()
+            else:
+                return
+        if self._has_inflight_work():
             return
 
         if self.phase == BenchmarkPhase.WARMUP:
