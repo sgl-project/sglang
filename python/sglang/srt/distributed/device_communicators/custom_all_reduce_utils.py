@@ -12,7 +12,7 @@ import sys
 import tempfile
 from functools import wraps
 from itertools import product
-from typing import Callable, Dict, List, Optional, Sequence, TypeVar
+from typing import Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import torch
 import torch.distributed as dist
@@ -56,6 +56,7 @@ if _is_hip:
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+NvmlDeviceIdentifier = Union[int, str]
 
 
 def update_environment_variables(envs: Dict[str, str]):
@@ -349,13 +350,43 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     return wrapper
 
 
+def _get_cuda_nvml_device_identifier(
+    device: torch.device,
+) -> NvmlDeviceIdentifier:
+    props = torch.cuda.get_device_properties(device)
+    uuid = getattr(props, "uuid", None)
+    if uuid:
+        uuid = str(uuid)
+        return uuid if uuid.startswith(("GPU-", "MIG-")) else f"GPU-{uuid}"
+
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    get_nvml_device_index = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if get_nvml_device_index is not None:
+        return int(get_nvml_device_index(device_index))
+
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if cuda_visible_devices:
+        return int(cuda_visible_devices.split(",")[device_index])
+    return device_index
+
+
+def _get_nvml_handle(identifier: NvmlDeviceIdentifier):
+    if isinstance(identifier, str):
+        return pynvml.nvmlDeviceGetHandleByUUID(identifier)
+    return pynvml.nvmlDeviceGetHandleByIndex(identifier)
+
+
 @with_nvml_context
-def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
+def is_full_nvlink(
+    device_identifiers: List[NvmlDeviceIdentifier], world_size: int
+) -> bool:
     if _is_hip:
         """
         query if the set of gpus are fully connected by xgmi (1 hop)
         """
-        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
+        handles = [amdsmi_get_processor_handles()[i] for i in device_identifiers]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:
@@ -372,7 +403,7 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         """
         query if the set of gpus are fully connected by nvlink (1 hop)
         """
-        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+        handles = [_get_nvml_handle(identifier) for identifier in device_identifiers]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:
@@ -445,19 +476,24 @@ def can_use_custom_all_reduce_with_nvlink(
         )
         return
 
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    if _is_cuda:
+        device_identifier = _get_cuda_nvml_device_identifier(device)
+        device_identifiers = [device_identifier for _ in range(world_size)]
+        dist.all_gather_object(device_identifiers, device_identifier, group=group)
     else:
-        device_ids = list(range(torch.cuda.device_count()))
-    physical_device_id = device_ids[device.index]
-    tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-    gather_list = [
-        torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-    ]
-    dist.all_gather(gather_list, tensor, group=group)
-    physical_device_ids = [int(t) for t in gather_list]
-    full_nvlink = is_full_nvlink(physical_device_ids, world_size)
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        if cuda_visible_devices:
+            device_ids = list(map(int, cuda_visible_devices.split(",")))
+        else:
+            device_ids = list(range(torch.cuda.device_count()))
+        physical_device_id = device_ids[device.index]
+        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
+        gather_list = [
+            torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
+        ]
+        dist.all_gather(gather_list, tensor, group=group)
+        device_identifiers = [int(t) for t in gather_list]
+    full_nvlink = is_full_nvlink(device_identifiers, world_size)
 
     # test nvlink first, this will filter out most of the cases
     # where custom allreduce is not supported
