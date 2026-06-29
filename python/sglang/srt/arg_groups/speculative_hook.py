@@ -330,13 +330,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             f"{threshold}."
         )
 
-    if not server_args.enable_tf32_matmul:
-        server_args.enable_tf32_matmul = True
-        logger.info(
-            "Enable TF32 matmul for DSpark speculative decoding to speed up "
-            "FP32 confidence and gate GEMMs."
-        )
-
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
         logger.warning(
