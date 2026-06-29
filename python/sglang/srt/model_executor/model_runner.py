@@ -470,7 +470,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.eagle_aux_hidden_state_layer_ids = eagle_config[
                         "eagle_aux_hidden_state_layer_ids"
                     ]
-                except:
+                except (AttributeError, KeyError, TypeError):
                     # if there is no aux layer, set to None
                     self.eagle_aux_hidden_state_layer_ids = None
 
@@ -1191,7 +1191,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     from mooncake import ep as mooncake_ep
 
                     mooncake_ep.set_device_filter(mooncake_ib_device)
-                except:
+                except (ImportError, RuntimeError):
                     pass  # A warning will be raised in `init_distributed_environment`
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
