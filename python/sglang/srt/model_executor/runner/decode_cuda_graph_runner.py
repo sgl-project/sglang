@@ -320,7 +320,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
-            is_hybrid_swa=model_runner.is_hybrid_swa,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
@@ -329,9 +328,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # buffer for `out_cache_loc_full_physical`
             # and pin it into the pool's `_precomputed_loc` at capture time
             # (see `capture_one_batch_size` below).
-            enable_shared_kv_pool=getattr(
-                model_runner, "enable_shared_kv_pool", False
-            ),
+            enable_shared_kv_pool=model_runner.enable_shared_kv_pool,
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -531,7 +528,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         translate/clamp nodes (Invariant 2), keeping baseline cg_on
         byte-identical.
         """
-        if not getattr(self.model_runner, "enable_shared_kv_pool", False):
+        if not self.model_runner.enable_shared_kv_pool:
             return
         alloc = self.model_runner.token_to_kv_pool_allocator
         buffers = self.buffers

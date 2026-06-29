@@ -334,6 +334,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._stats_peak_pending_pages: int = 0
         self._stats_n_emits: int = 0
         self._stats_last_emit_ts: float = _time_mod.monotonic()
+        # Guard so the at-exit / signal-handler final emit fires at most once.
+        self._stats_final_emitted: bool = False
         # Force a final stats emit at process exit so the workload-end
         # state is captured even when the last `_flush` happened more
         # than `_LAZY_COMPACTION_STATS_INTERVAL_SEC` before shutdown.
@@ -1884,7 +1886,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         if not _LAZY_COMPACTION_STATS_ENABLED:
             return
-        if getattr(self, "_stats_final_emitted", False):
+        if self._stats_final_emitted:
             return
         try:
             cur_holes = int(self._free_phys_pages.shape[0])

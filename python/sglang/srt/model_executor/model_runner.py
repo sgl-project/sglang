@@ -420,9 +420,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
-        self.enable_shared_kv_pool = getattr(
-            server_args, "enable_shared_kv_pool", False
-        )
+        self.enable_shared_kv_pool = server_args.enable_shared_kv_pool
 
 
         self.remote_instance_transfer_engine = None
@@ -3131,7 +3129,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         earlier, so it never reaches here. The SWA write loc is NOT handled here:
         it rides the backend `swa_out_cache_loc` rail, consumed directly in
         `SharedSWAKVPool.set_kv_buffer`."""
-        if getattr(self, "enable_shared_kv_pool", False):
+        if self.enable_shared_kv_pool:
             alloc = self.token_to_kv_pool_allocator
             if (
                 forward_batch.out_cache_loc is not None

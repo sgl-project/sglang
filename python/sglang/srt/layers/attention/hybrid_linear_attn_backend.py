@@ -890,6 +890,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # One-time guard for the causal-conv kernel-choice log line.
+        self._logged_conv_kernel_choice = False
         config = model_runner.mamba2_config
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
@@ -979,7 +981,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         """
         la_backend = get_global_server_args().linear_attn_backend
         resolved = use_triton_causal_conv or (la_backend == "triton")
-        if not getattr(self, "_logged_conv_kernel_choice", False):
+        if not self._logged_conv_kernel_choice:
             self._logged_conv_kernel_choice = True
             logger.info(
                 "[mamba] causal-conv kernel = %s (linear_attn_backend=%s)",

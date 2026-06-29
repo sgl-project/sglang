@@ -881,7 +881,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # this check catches it before the clamp hides it.
         if (
             envs.SGLANG_DEBUG_CHECK_V2P_TOMBSTONES.get()
-            and getattr(model_runner, "enable_shared_kv_pool", False)
+            and model_runner.enable_shared_kv_pool
             and ret.out_cache_loc is not None
         ):
             alloc = model_runner.token_to_kv_pool_allocator

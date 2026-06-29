@@ -526,7 +526,7 @@ class ModelRunnerKVCacheMixin:
         # Supports hybrid Mamba (mambaish_config is not None) and hybrid SWA
         # (is_hybrid_swa is True and not DSV4).
         if (
-            getattr(self.server_args, "enable_shared_kv_pool", False)
+            self.server_args.enable_shared_kv_pool
             and self.server_args.disaggregation_mode == "null"
             and self.req_to_token_pool is None
         ):
