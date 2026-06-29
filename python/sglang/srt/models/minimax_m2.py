@@ -1320,6 +1320,14 @@ class MiniMaxM2ForCausalLM(nn.Module):
             num_experts=self.config.num_local_experts,
         )
 
+        expert_params_mapping_fused = FusedMoE.make_expert_params_mapping_fused(
+            ckpt_gate_up_proj_name="w13",
+            ckpt_down_proj_name="w2",
+            ckpt_gate_up_proj_bias_name="w13_bias",
+            ckpt_down_proj_bias_name="w2_bias",
+            num_experts=self.config.num_local_experts,
+        )
+
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
@@ -1374,7 +1382,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
+                # Try fused expert mapping first (for w13)
+                mapped = False
+                for mapping in expert_params_mapping_fused:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
@@ -1383,16 +1393,55 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
+                    # Use the fused weight loader if available, or standard one
+                    weight_loader = getattr(
+                        param, "weight_loader_fused", param.weight_loader
                     )
+
+                    # Check signature to call correctly
+                    import inspect
+
+                    sig = inspect.signature(weight_loader)
+                    if "expert_id" in sig.parameters:
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                    else:
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                        )
+                    mapped = True
                     break
-                else:
+
+                if not mapped:
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        mapped = True
+                        break
+
+                if not mapped:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
