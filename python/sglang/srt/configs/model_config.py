@@ -505,9 +505,9 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Step3p5MTP"
         if (
             is_draft_model
-            and self.hf_config.architectures[0] == "Gigachat35ForCausalLM"
+            and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
-            self.hf_config.architectures[0] = "Gigachat35ForCausalLMNextN"
+            self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
@@ -687,8 +687,8 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
-            or "Gigachat35ForCausalLM" in self.hf_config.architectures
-            or "Gigachat35ForCausalLMNextN" in self.hf_config.architectures
+            or "GigaChat35ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA

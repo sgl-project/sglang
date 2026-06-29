@@ -22,7 +22,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.srt.configs.gigachat35 import Gigachat35Config
+from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
@@ -48,7 +48,7 @@ from sglang.srt.utils import BumpAllocator, add_prefix, make_layers
 _GATED_NORM_LOW_RANK = 16
 
 
-class Gigachat35GatedRMSNorm(nn.Module):
+class GigaChat35GatedRMSNorm(nn.Module):
     """RMSNorm (optionally zero-centered) followed by a low-rank sigmoid gate.
 
     ``scale`` folds the optional MLA ``alpha`` factor into the q/kv a-norms.
@@ -112,7 +112,7 @@ class Gigachat35GatedRMSNorm(nn.Module):
 
 
 def build_norm(
-    config: Gigachat35Config, hidden_size: int, scale: float = 1.0
+    config: GigaChat35Config, hidden_size: int, scale: float = 1.0
 ) -> nn.Module:
     """Construct the configured norm for a GigaChat 3.5 module."""
     norm_type = getattr(config, "norm_type", "LlamaRMSNorm")
@@ -122,7 +122,7 @@ def build_norm(
     if norm_type == "ZeroCenteredRMSNorm":
         return GemmaRMSNorm(hidden_size, eps=eps)
     if norm_type in ("ZeroCenteredGatedNorm", "GatedNorm"):
-        return Gigachat35GatedRMSNorm(
+        return GigaChat35GatedRMSNorm(
             hidden_size,
             eps=eps,
             layernorm_gating_weight=getattr(config, "layernorm_gating_weight", 2.0),
@@ -132,7 +132,7 @@ def build_norm(
     raise ValueError(f"Unsupported norm_type for GigaChat 3.5: {norm_type!r}")
 
 
-class Gigachat35PassthroughNorm(nn.Module):
+class GigaChat35PassthroughNorm(nn.Module):
     """Identity norm with the fused residual-add convention.
 
     Used as the ``input_layernorm`` slot when a layer has no pre-norm
@@ -154,7 +154,7 @@ class Gigachat35PassthroughNorm(nn.Module):
         return merged, merged
 
 
-class Gigachat35MlpPrepNorm(nn.Module):
+class GigaChat35MlpPrepNorm(nn.Module):
     """Pre-MLP norm wrapper that folds the post-attention (sandwich) norm.
 
     Replaces the LayerCommunicator's ``post_attention_layernorm`` slot so the
@@ -207,7 +207,7 @@ def _remap_gigachat_weight_names(weights):
         yield name, loaded_weight
 
 
-class Gigachat35GatedDeltaNet(Qwen3GatedDeltaNet):
+class GigaChat35GatedDeltaNet(Qwen3GatedDeltaNet):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -242,7 +242,7 @@ class Gigachat35GatedDeltaNet(Qwen3GatedDeltaNet):
             self.norm.weight.weight_loader = _fold_loader
 
 
-class Gigachat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
+class GigaChat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -361,10 +361,10 @@ class Gigachat35AttentionMLA(deepseek_v2.DeepseekV2AttentionMLA):
             self._gate_input = None
 
 
-class Gigachat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
+class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
     def __init__(
         self,
-        config: Gigachat35Config,
+        config: GigaChat35Config,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -384,7 +384,7 @@ class Gigachat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
         self.use_linear_attn = config.is_linear_attention_layer(attn_layer_id)
 
         if self.use_linear_attn:
-            self.self_attn = Gigachat35GatedDeltaNet(
+            self.self_attn = GigaChat35GatedDeltaNet(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
@@ -395,7 +395,7 @@ class Gigachat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
                 self.self_attn.out_proj.reduce_results = False
             self.layer_communicator.qkv_latent_func = None
         else:
-            self.self_attn = Gigachat35AttentionMLA(
+            self.self_attn = GigaChat35AttentionMLA(
                 config=config,
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -437,9 +437,9 @@ class Gigachat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
         )
 
         self._attn_prepare_layernorm = (
-            self.input_layernorm if self._use_pre else Gigachat35PassthroughNorm()
+            self.input_layernorm if self._use_pre else GigaChat35PassthroughNorm()
         )
-        self._mlp_prepare_layernorm = Gigachat35MlpPrepNorm(
+        self._mlp_prepare_layernorm = GigaChat35MlpPrepNorm(
             pre_layernorm=self.post_attention_layernorm if self._use_pre else None,
             post_layernorm=self.post_self_attn_layernorm,
         )
@@ -506,10 +506,10 @@ class Gigachat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
         return hidden_states, residual
 
 
-class Gigachat35Model(nn.Module):
+class GigaChat35Model(nn.Module):
     def __init__(
         self,
-        config: Gigachat35Config,
+        config: GigaChat35Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -532,7 +532,7 @@ class Gigachat35Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: Gigachat35DecoderLayer(
+            lambda idx, prefix: GigaChat35DecoderLayer(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -597,10 +597,10 @@ class Gigachat35Model(nn.Module):
         return hidden_states
 
 
-class Gigachat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
+class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
     def __init__(
         self,
-        config: Gigachat35Config,
+        config: GigaChat35Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -612,7 +612,7 @@ class Gigachat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         get_global_server_args().disable_shared_experts_fusion = True
         self.num_fused_shared_experts = 0
 
-        self.model = Gigachat35Model(
+        self.model = GigaChat35Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         if self.pp_group.is_last_rank:
@@ -668,4 +668,4 @@ class Gigachat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         return super().post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
 
-EntryClass = [Gigachat35ForCausalLM]
+EntryClass = [GigaChat35ForCausalLM]

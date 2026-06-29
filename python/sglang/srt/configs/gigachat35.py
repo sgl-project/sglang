@@ -24,7 +24,7 @@ _REQUIRED_LINEAR_ATTRS = (
 )
 
 
-class Gigachat35Config(PretrainedConfig):
+class GigaChat35Config(PretrainedConfig):
     model_type = "gigachat3_5"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -240,9 +240,12 @@ from sglang.srt.configs.linear_attn_model_registry import (  # noqa: E402
 
 register_linear_attn_model(
     LinearAttnModelSpec(
-        config_class=Gigachat35Config,
+        config_class=GigaChat35Config,
         backend_class_name="sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend",
-        arch_names=["Gigachat35ForCausalLM", "Gigachat35ForCausalLMNextN"],
+        arch_names=[
+            "GigaChat35ForCausalLM",
+            "GigaChat35ForCausalLMNextN",
+        ],
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,
     )

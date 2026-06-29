@@ -2829,8 +2829,8 @@ class ServerArgs:
                     "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
                 )
         elif model_arch in [
-            "Gigachat35ForCausalLM",
-            "Gigachat35ForCausalLMNextN",
+            "GigaChat35ForCausalLM",
+            "GigaChat35ForCausalLMNextN",
         ]:
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
