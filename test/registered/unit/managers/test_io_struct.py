@@ -2,6 +2,7 @@ import copy
 import unittest
 from array import array
 
+import msgspec
 import numpy as np
 import torch
 
@@ -9,6 +10,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    _restore_torch_tensor,
+    enc_hook,
     msgpack_decode,
     msgpack_encode,
 )
@@ -53,6 +56,9 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                         ),
                         "patch_counts": np.array([2], dtype=np.int32),
                         "names": ["image0"],
+                        "count": np.int64(2),
+                        "enabled": np.bool_(True),
+                        "size": (336, 336),
                     },
                 )
             ],
@@ -90,21 +96,26 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         item = decoded.mm_inputs.mm_items[0]
         self.assertIsInstance(item, MultimodalDataItem)
         self.assertEqual(item.modality, Modality.IMAGE)
-        self.assertTrue(torch.equal(item.feature, torch.tensor([[1.0, 2.0]])))
+        self.assertTrue(
+            torch.equal(item.feature, torch.tensor([[1.0, 2.0]], device="cpu"))
+        )
         self.assertTrue(
             torch.equal(
                 item.model_specific_data["image_grid_thw"],
-                torch.tensor([[1, 1, 2]], dtype=torch.int64),
+                torch.tensor([[1, 1, 2]], dtype=torch.int64, device="cpu"),
             )
         )
         np.testing.assert_array_equal(
             item.model_specific_data["patch_counts"],
             np.array([2], dtype=np.int32),
         )
+        self.assertEqual(item.model_specific_data["count"], 2)
+        self.assertIs(item.model_specific_data["enabled"], True)
+        self.assertEqual(item.model_specific_data["size"], [336, 336])
         self.assertTrue(
             torch.equal(
                 decoded.mm_inputs.mrope_positions,
-                torch.tensor([[0, 1]], dtype=torch.int64),
+                torch.tensor([[0, 1]], dtype=torch.int64, device="cpu"),
             )
         )
 
@@ -123,7 +134,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 decoded.mm_inputs.mm_items[0].feature,
-                torch.tensor([[1.0, 2.0]]),
+                torch.tensor([[1.0, 2.0]], device="cpu"),
             )
         )
 
@@ -197,6 +208,95 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
         self.assertIsInstance(ipc_extra["nested"][1], torch.Size)
         self.assertIsInstance(decoded_proxy.sync_data_meta["shape"], torch.Size)
         self.assertIsInstance(decoded_proxy.sync_data_meta["dtype"], np.dtype)
+
+    def test_cuda_ipc_proxy_tensor_fallback_round_trip(self):
+        proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+        proxy.proxy_state = {
+            "ipc_extra": None,
+            "tensor_data": torch.tensor([1.0, 2.0], device="cpu"),
+        }
+        proxy.reconstruct_tensor = None
+        proxy.sync_data_meta = {
+            "handle": "dummy",
+            "shape": (1,),
+            "dtype": np.dtype("uint8"),
+        }
+        proxy.sync_buffer = None
+
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].model_specific_data["ipc_proxy"] = proxy
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_proxy = decoded.mm_inputs.mm_items[0].model_specific_data["ipc_proxy"]
+        self.assertTrue(
+            torch.equal(
+                decoded_proxy.proxy_state["tensor_data"],
+                torch.tensor([1.0, 2.0], device="cpu"),
+            )
+        )
+
+    def test_evs_model_specific_data_round_trip(self):
+        mm_inputs = self._make_mm_inputs()
+        item = mm_inputs.mm_items[0]
+        item.modality = Modality.VIDEO
+        item.model_specific_data.update(
+            {
+                "thw_grids": [(2, 3, 4)],
+                "pre_chunked_input_ids": [1, 2, 3],
+            }
+        )
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_item = decoded.mm_inputs.mm_items[0]
+        self.assertEqual(decoded_item.thw_grids, [[2, 3, 4]])
+        self.assertEqual(decoded_item.pre_chunked_input_ids, [1, 2, 3])
+
+    def test_torch_tensor_ext_wire_format(self):
+        ext = enc_hook(torch.tensor([1, 2], dtype=torch.int16, device="cpu"))
+        self.assertIsInstance(ext, msgspec.msgpack.Ext)
+        self.assertEqual(ext.code, 2)
+        self.assertEqual(
+            bytes(ext.data).hex(),
+            "949102a5696e743136c40401000200a3637075",
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_empty_cpu_tensor_restore_ignores_default_device(self):
+        previous_device = torch.get_default_device()
+        try:
+            torch.set_default_device("cuda")
+            tensor = _restore_torch_tensor((0,), "float32", b"", "cpu")
+            self.assertEqual(tensor.device.type, "cpu")
+        finally:
+            torch.set_default_device(previous_device)
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):

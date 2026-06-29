@@ -53,13 +53,15 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import (
-    CudaIpcTensorTransportProxy,
     Modality,
+)
+from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput as MMProcessorPayload,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
@@ -113,6 +115,7 @@ class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
     data: bytes
 
 
+# Stable wire IDs. Changing these requires updating the golden-wire test.
 _MSGPACK_EXT_ARRAY = 1
 _MSGPACK_EXT_TORCH_TENSOR = 2
 _MSGPACK_EXT_NP_ARRAY = 3
@@ -2157,11 +2160,11 @@ def unwrap_from_pickle(obj: Optional[object]) -> Optional[object]:
 
 
 def _pack_ext(code: int, obj: object) -> msgspec.msgpack.Ext:
-    return msgspec.msgpack.Ext(code, msgspec.msgpack.encode(obj))
+    return msgspec.msgpack.Ext(code, msgspec.msgpack.encode(obj, enc_hook=enc_hook))
 
 
 def _unpack_ext(data: memoryview) -> object:
-    return msgspec.msgpack.decode(data)
+    return msgspec.msgpack.decode(data, ext_hook=ext_hook)
 
 
 def _torch_dtype_name(dtype: torch.dtype) -> str:
@@ -2175,7 +2178,7 @@ def _torch_dtype_from_name(name: str) -> torch.dtype:
 def _restore_torch_tensor(shape, dtype: str, data: bytes, device: str = "cpu"):
     tensor_dtype = _torch_dtype_from_name(dtype)
     if len(data) == 0:
-        tensor = torch.empty(shape, dtype=tensor_dtype)
+        tensor = torch.empty(shape, dtype=tensor_dtype, device="cpu")
     else:
         tensor = torch.frombuffer(bytearray(data), dtype=tensor_dtype).reshape(shape)
     if device != "cpu":
@@ -2285,6 +2288,10 @@ def enc_hook(obj: Any) -> Any:
         )
     elif isinstance(obj, np.floating):
         return float(obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
     elif isinstance(obj, CudaIpcTensorTransportProxy):
         return _pack_ext(
             _MSGPACK_EXT_CUDA_IPC_TENSOR_PROXY,
