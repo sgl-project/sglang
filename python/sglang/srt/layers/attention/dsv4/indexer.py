@@ -34,10 +34,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-if is_fp8_fnuz():
-    FP8_DTYPE = torch.float8_e4m3fnuz
-else:
-    FP8_DTYPE = torch.float8_e4m3fn
+FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
