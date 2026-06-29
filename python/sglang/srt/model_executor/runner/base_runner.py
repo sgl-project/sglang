@@ -312,9 +312,15 @@ class BaseRunner(ABC):
             get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
             or (model_uses_modelopt_fp8 and is_sm100_supported())
         )
+        sparse_mla_needs_autotune = (
+            mr.server_args.dsa_decode_backend == "flashinfer_sparse_mla"
+        )
 
         if not (
-            moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
+            moe_needs_autotune
+            or fp4_gemm_needs_autotune
+            or fp8_gemm_needs_autotune
+            or sparse_mla_needs_autotune
         ):
             return False
 
@@ -367,6 +373,28 @@ class BaseRunner(ABC):
                 autotune_dummy_run_mode(),
             ):
                 self._dummy_run(batch_size=batch_size, buffers=buffers)
+                # FlashInfer routes sparse MLA batches above 64 tokens through
+                # the prefill kernel. Run a representative decode shape so its
+                # chunks-per-block tuner covers all decode token buckets.
+                if mr.server_args.dsa_decode_backend == "flashinfer_sparse_mla":
+                    num_tokens_per_bs = 1
+                    if mr.spec_algorithm.is_speculative():
+                        num_tokens_per_bs = (
+                            mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                                mr.server_args.speculative_num_draft_tokens,
+                                mr.is_draft_worker,
+                            )
+                        )
+                    if batch_size * num_tokens_per_bs > 64:
+                        decode_tune_bs = min(
+                            batch_size, max(1, 16 // num_tokens_per_bs)
+                        )
+                        if decode_tune_bs * num_tokens_per_bs <= 64:
+                            self._dummy_run(
+                                batch_size=decode_tune_bs,
+                                buffers=buffers,
+                                forward_mode_override=ForwardMode.DECODE,
+                            )
         torch.cuda.current_stream().wait_stream(mr.forward_stream)
         logger.info("FlashInfer autotune completed.")
 
@@ -385,6 +413,8 @@ class BaseRunner(ABC):
                 str(mr.dtype),
                 str(server_args.quantization),
                 str(server_args.moe_runner_backend),
+                str(server_args.dsa_prefill_backend),
+                str(server_args.dsa_decode_backend),
                 str(mr.tp_size),
                 str(mr.pp_size),
                 str(mr.dp_size),

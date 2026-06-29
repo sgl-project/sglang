@@ -256,6 +256,114 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             server_args._validate_hisparse_kv_cache_dtype()
 
 
+class TestGlmSm120DsaBackendPolicy(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_glm_sm120_fp8_defaults_to_trtllm_until_dependency_release(
+        self, _mock_is_hip
+    ):
+        server_args = ServerArgs(model_path="dummy")
+
+        server_args._set_default_dsa_backends(
+            kv_cache_dtype="fp8_e4m3",
+            major=12,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        self.assertEqual(server_args.dsa_prefill_backend, "trtllm")
+        self.assertEqual(server_args.dsa_decode_backend, "trtllm")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_explicit_flashinfer_defaults_unspecified_side_to_flashinfer(
+        self, _mock_is_hip
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            dsa_decode_backend="flashinfer_sparse_mla",
+        )
+
+        server_args._set_default_dsa_backends(
+            kv_cache_dtype="fp8_e4m3",
+            major=12,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        self.assertEqual(server_args.dsa_prefill_backend, "flashinfer_sparse_mla")
+        self.assertEqual(server_args.dsa_decode_backend, "flashinfer_sparse_mla")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_non_glm_sm120_keeps_existing_trtllm_default(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy")
+
+        server_args._set_default_dsa_backends(
+            kv_cache_dtype="fp8_e4m3",
+            major=12,
+            model_arch="DeepseekV32ForCausalLM",
+        )
+
+        self.assertEqual(server_args.dsa_prefill_backend, "trtllm")
+        self.assertEqual(server_args.dsa_decode_backend, "trtllm")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_explicit_trtllm_defaults_unspecified_side_to_trtllm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            dsa_prefill_backend="trtllm",
+        )
+
+        server_args._set_default_dsa_backends(
+            kv_cache_dtype="fp8_e4m3",
+            major=12,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        self.assertEqual(server_args.dsa_prefill_backend, "trtllm")
+        self.assertEqual(server_args.dsa_decode_backend, "trtllm")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_rejects_unsupported_backend_for_glm_sm120_fp8(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            dsa_prefill_backend="fa3",
+        )
+
+        with self.assertRaisesRegex(ValueError, "supports only"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=12,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_rejects_mixed_trtllm_and_flashinfer_layouts(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            dsa_prefill_backend="trtllm",
+            dsa_decode_backend="flashinfer_sparse_mla",
+        )
+
+        with self.assertRaisesRegex(ValueError, "same DSA backend"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=12,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_rejects_flashinfer_backend_for_non_glm_model(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            dsa_prefill_backend="flashinfer_sparse_mla",
+            dsa_decode_backend="flashinfer_sparse_mla",
+        )
+
+        with self.assertRaisesRegex(ValueError, "GlmMoeDsaForCausalLM"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=12,
+                model_arch="DeepseekV32ForCausalLM",
+            )
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the

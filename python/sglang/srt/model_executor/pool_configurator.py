@@ -176,11 +176,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            # Keep pool sizing aligned with the actual backend-specific layout.
+            # DSA FP8 backends can store scales and BF16 RoPE data alongside KV.
+            mla_kv_cache_dim = mr.calculate_mla_kv_cache_dim()
+            cell_size = mla_kv_cache_dim * num_layers * kv_size
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
