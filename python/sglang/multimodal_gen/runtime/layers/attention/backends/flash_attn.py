@@ -1,11 +1,21 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
+import inspect
+import os
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+)
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -14,6 +24,95 @@ from sglang.multimodal_gen.runtime.platforms import (
 
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _is_fp4_dtype(dtype: torch.dtype) -> bool:
+    return hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2
+
+
+def _is_nvfp4_fa4_enabled() -> bool:
+    return (
+        bool(envs.SGLANG_DIFFUSION_NVFP4_FA4)
+        or os.environ.get("FASTVIDEO_NVFP4_FA4", "0") == "1"
+    )
+
+
+def _has_fa4_fp4_support() -> bool:
+    try:
+        from flash_attn.cute import flash_attn_func
+
+        return "mSFQ" in inspect.signature(flash_attn_func).parameters
+    except Exception:
+        return False
+
+
+def _nvfp4_quantize_for_fa4(
+    tensor_4d: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize [batch, seqlen, heads, head_dim] Q/K into FA4's FP4/SF layout."""
+    from flashinfer.quantization import SfLayout, nvfp4_quantize
+
+    batch, seqlen, nheads, headdim = tensor_4d.shape
+    if headdim % 64 != 0:
+        raise ValueError(f"NVFP4 FA4 requires head_dim divisible by 64, got {headdim}.")
+
+    sf_vec_size = 16
+    tile_m = 128
+    seqlen_padded = (seqlen + tile_m - 1) // tile_m * tile_m
+    if seqlen_padded != seqlen:
+        tensor_4d = F.pad(tensor_4d, (0, 0, 0, 0, 0, seqlen_padded - seqlen))
+
+    t2d = tensor_4d.reshape(batch * seqlen_padded, nheads * headdim)
+    global_sf = torch.ones(1, device=t2d.device, dtype=torch.float32)
+    fp4_data, sf_data = nvfp4_quantize(
+        t2d, global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+
+    fp4_tensor = (
+        fp4_data.reshape(batch, seqlen_padded, nheads, headdim // 2)
+        .view(torch.int8)
+        .view(torch.float4_e2m1fn_x2)
+    )
+
+    atom_m0, atom_m1, atom_k = 32, 4, 4
+    rest_m = seqlen_padded // tile_m
+    sf_k_per_head = headdim // sf_vec_size
+    rest_k = sf_k_per_head // atom_k
+
+    total_m_tiles = batch * rest_m
+    total_k_tiles = (nheads * sf_k_per_head) // atom_k
+    sf_swizzled = sf_data.reshape(
+        total_m_tiles, total_k_tiles, atom_m0, atom_m1, atom_k
+    )
+    sf_decomposed = sf_swizzled.reshape(
+        batch, rest_m, nheads, rest_k, atom_m0, atom_m1, atom_k
+    )
+    sf_canonical = sf_decomposed.permute(0, 2, 1, 3, 4, 5, 6).contiguous()
+    sf_mma = sf_canonical.permute(4, 5, 2, 6, 3, 1, 0)
+
+    return fp4_tensor, sf_mma
+
+
+def _validate_fake_input_dtypes(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mSFQ: Optional[torch.Tensor],
+    mSFK: Optional[torch.Tensor],
+) -> None:
+    if mSFQ is not None or mSFK is not None or _is_fp4_dtype(q.dtype):
+        assert _is_fp4_dtype(q.dtype), "FP4 path expects FP4-packed Q"
+        assert q.dtype == k.dtype, "Q and K must have the same dtype"
+        assert v.dtype in [
+            torch.float16,
+            torch.bfloat16,
+        ], "V must be float16 or bfloat16 for FP4 Q/K attention"
+    else:
+        assert q.dtype in [
+            torch.float16,
+            torch.bfloat16,
+        ], "inputs must be float16 or bfloat16"
+        assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
 
 
 # -----------------------------
@@ -48,6 +147,9 @@ def flash_attn_varlen_func_fake_out(
     sm_margin: int = 0,
     return_softmax_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
     ver: int = 4,
 ) -> torch.Tensor:
     assert ver == 4, "only support flash attention v4"
@@ -67,19 +169,15 @@ def flash_attn_varlen_func_fake_out(
         assert cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32"
         assert cu_seqlens_q.stride(0) == 1, "cu_seqlens_q must be contiguous"
 
-    assert q.dtype in [
-        torch.float16,
-        torch.bfloat16,
-    ], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    _validate_fake_input_dtypes(q, k, v, mSFQ, mSFK)
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
-    alignment = 16 // q.element_size()
+    alignment = 16 // v.element_size()
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
 
     q_batch_seqlen_shape = (
         (batch_size, seqlen_q) if cu_seqlens_q is None else (q.shape[0],)
     )
-    out = q.new_empty(*q_batch_seqlen_shape, num_head, head_dim_v)
+    out = v.new_empty(*q_batch_seqlen_shape, num_head, head_dim_v)
     return out
 
 
@@ -108,6 +206,9 @@ def flash_attn_varlen_func_fake_out_lse(
     sm_margin: int = 0,
     return_softmax_lse: bool = True,
     sinks: Optional[torch.Tensor] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
     ver: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert ver == 4, "only support flash attention v4"
@@ -129,13 +230,9 @@ def flash_attn_varlen_func_fake_out_lse(
         assert cu_seqlens_q.dtype == torch.int32, "cu_seqlens_q must be int32"
         assert cu_seqlens_q.stride(0) == 1, "cu_seqlens_q must be contiguous"
 
-    assert q.dtype in [
-        torch.float16,
-        torch.bfloat16,
-    ], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    _validate_fake_input_dtypes(q, k, v, mSFQ, mSFK)
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
-    alignment = 16 // q.element_size()
+    alignment = 16 // v.element_size()
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
 
     q_batch_seqlen_shape = (
@@ -147,8 +244,8 @@ def flash_attn_varlen_func_fake_out_lse(
         else (num_head, total_q)
     )
 
-    out = q.new_empty(*q_batch_seqlen_shape, num_head, head_dim_v)
-    lse = q.new_empty(lse_shape, dtype=torch.float32)
+    out = v.new_empty(*q_batch_seqlen_shape, num_head, head_dim_v)
+    lse = v.new_empty(lse_shape, dtype=torch.float32)
     return out, lse
 
 
@@ -183,6 +280,9 @@ def flash_attn_varlen_func_op(
     sm_margin: int = 0,
     return_softmax_lse: bool = False,
     sinks: Optional[torch.Tensor] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
     ver: int = 4,
 ) -> torch.Tensor:
     if window_size is None:
@@ -217,6 +317,9 @@ def flash_attn_varlen_func_op(
         sm_margin=sm_margin,
         return_softmax_lse=False,
         sinks=sinks,
+        mSFQ=mSFQ,
+        mSFK=mSFK,
+        mSFV=mSFV,
         ver=ver,
     )
 
@@ -247,6 +350,9 @@ def flash_attn_varlen_func_op_lse(
     sm_margin: int = 0,
     return_softmax_lse: bool = True,
     sinks: Optional[torch.Tensor] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
     ver: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if window_size is None:
@@ -281,16 +387,12 @@ def flash_attn_varlen_func_op_lse(
         sm_margin=sm_margin,
         return_softmax_lse=True,
         sinks=sinks,
+        mSFQ=mSFQ,
+        mSFK=mSFK,
+        mSFV=mSFV,
         ver=ver,
     )
 
-
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
-)
 
 fa_ver = 3
 
@@ -370,6 +472,27 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.attention_metadata = FlashAttentionMetadata()
+        self.nvfp4_fa4 = bool(extra_impl_args.get("nvfp4_fa4", False)) or (
+            _is_nvfp4_fa4_enabled()
+        )
+        if self.nvfp4_fa4:
+            cap = torch.cuda.get_device_capability()
+            if cap not in [(10, 0), (10, 3)]:
+                raise RuntimeError(
+                    "NVFP4 FA4 attention requires Blackwell "
+                    f"(sm100a/sm103a), got sm{cap[0]}{cap[1]}."
+                )
+            if fa_ver != 4:
+                raise RuntimeError("NVFP4 FA4 attention requires FA4 backend.")
+            if head_size < 128:
+                raise RuntimeError(
+                    f"NVFP4 FA4 attention requires head_size >= 128, got {head_size}."
+                )
+            if not _has_fa4_fp4_support():
+                raise ImportError(
+                    "NVFP4 FA4 attention requires flash_attn.cute with "
+                    "mSFQ/mSFK support. Install hao-ai-lab/flash-attention-fp4@fp4."
+                )
 
     def forward(
         self,
@@ -390,6 +513,19 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
+
+        if self.nvfp4_fa4:
+            if return_softmax_lse:
+                raise NotImplementedError(
+                    "NVFP4 FA4 attention does not support return_softmax_lse yet."
+                )
+            return self._forward_nvfp4(
+                query,
+                key,
+                value,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
 
         # FA version selection:
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)
@@ -443,3 +579,40 @@ class FlashAttentionImpl(AttentionImpl):
             return out_tensor
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
+
+    def _forward_nvfp4(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        orig_seqlen_q = query.shape[1]
+        orig_seqlen_k = key.shape[1]
+
+        q_fp4, q_sf = _nvfp4_quantize_for_fa4(query)
+        k_fp4, k_sf = _nvfp4_quantize_for_fa4(key)
+
+        q_fp4 = q_fp4[:, :orig_seqlen_q]
+        k_fp4 = k_fp4[:, :orig_seqlen_k]
+
+        output = flash_attn_varlen_func_op(
+            q=q_fp4,
+            k=k_fp4,
+            v=value,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            return_softmax_lse=False,
+            mSFQ=q_sf,
+            mSFK=k_sf,
+            ver=fa_ver,
+        )
+        if isinstance(output, tuple):
+            return output[0]
+        return output

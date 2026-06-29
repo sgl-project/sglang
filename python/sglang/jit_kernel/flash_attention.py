@@ -236,11 +236,15 @@ def flash_attn_varlen_func(
     sinks=None,
     score_mod=None,
     aux_tensors=None,
+    mSFQ=None,
+    mSFK=None,
+    mSFV=None,
     ver=3,
     out=None,
 ):
-
     if ver == 3:
+        if mSFQ is not None or mSFK is not None or mSFV is not None:
+            raise NotImplementedError("FA3 does not support block-scaled Q/K/V.")
         return fa3_flash_attn_varlen_func(
             q,
             k,
@@ -294,6 +298,9 @@ def flash_attn_varlen_func(
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            mSFQ=mSFQ,
+            mSFK=mSFK,
+            mSFV=mSFV,
             return_softmax_lse=return_softmax_lse,
         )
     else:

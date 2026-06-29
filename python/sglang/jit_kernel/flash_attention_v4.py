@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+from functools import lru_cache
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -7,8 +9,10 @@ import torch
 from sglang.kernel_api_logging import debug_kernel_api
 
 try:
+    from flash_attn.cute import flash_attn_func as _flash_attn_func
     from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
 except Exception as _e:  # pragma: no cover
+    _flash_attn_func = None
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
 else:
@@ -17,6 +21,54 @@ else:
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+@lru_cache(maxsize=1)
+def _flash_attn_func_supports_blockscale() -> bool:
+    if _flash_attn_func is None:
+        return False
+    try:
+        return "mSFQ" in inspect.signature(_flash_attn_func).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _raise_missing_blockscale_support() -> None:
+    raise ImportError(
+        "FA4 block-scaled FP4 attention requires a flash_attn.cute build with "
+        "mSFQ/mSFK support, for example hao-ai-lab/flash-attention-fp4@fp4."
+    ) from _flash_attn_import_error
+
+
+@lru_cache(maxsize=1)
+def _flash_attn_varlen_signature() -> tuple[set[str], bool]:
+    signature = inspect.signature(_flash_attn_varlen_func)
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    )
+    return set(signature.parameters), accepts_kwargs
+
+
+def _call_flash_attn_varlen_func(**kwargs):
+    params, accepts_kwargs = _flash_attn_varlen_signature()
+    if accepts_kwargs:
+        return _flash_attn_varlen_func(**kwargs)
+
+    call_kwargs = {}
+    for key, value in kwargs.items():
+        if key in params:
+            call_kwargs[key] = value
+            continue
+        if key in ("max_seqlen_q", "max_seqlen_k"):
+            continue
+        if value is None or (key == "return_lse" and value is False):
+            continue
+        raise TypeError(
+            "flash_attn.cute.flash_attn_varlen_func from this build does not "
+            f"support the requested argument: {key}"
+        )
+    return _flash_attn_varlen_func(**call_kwargs)
 
 
 @debug_kernel_api
@@ -41,6 +93,9 @@ def flash_attn_varlen_func(
     pack_gqa: Optional[bool] = None,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
     return_softmax_lse: bool = False,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -62,7 +117,51 @@ def flash_attn_varlen_func(
     if window_size == (-1, -1):
         window_size = (None, None)
 
-    result = _flash_attn_varlen_func(
+    if mSFQ is not None or mSFK is not None or mSFV is not None:
+        if not _flash_attn_func_supports_blockscale():
+            _raise_missing_blockscale_support()
+        if any(
+            tensor is not None
+            for tensor in (
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                page_table,
+            )
+        ):
+            raise NotImplementedError(
+                "FA4 block-scaled FP4 attention currently supports only dense "
+                "non-varlen diffusion attention."
+            )
+        if score_mod is not None or aux_tensors is not None:
+            raise NotImplementedError(
+                "FA4 block-scaled FP4 attention does not support score_mod or "
+                "aux_tensors yet."
+            )
+
+        result = _flash_attn_func(
+            q=q,
+            k=k,
+            v=v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            softcap=0.0 if softcap is None else softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            mSFQ=mSFQ,
+            mSFK=mSFK,
+            mSFV=mSFV,
+        )
+        if return_softmax_lse:
+            return result
+        if isinstance(result, tuple):
+            return result[0]
+        return result
+
+    result = _call_flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
