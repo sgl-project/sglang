@@ -41,6 +41,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 from torch.profiler import record_function
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # `alloc_extend_kernel` / `alloc_decode_kernel` are not on the package's
@@ -51,14 +52,13 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.shared_kv_pool import SharedKVPool
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.shared_kv_pool import SharedKVPool
 from sglang.srt.mem_cache.triton_ops.virtual_slot import (
     alloc_bind_inplace,
     translate_kv_indices_inplace,
 )
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,7 @@ import atexit
 import signal
 import time as _time_mod  # local alias so tests can patch
 import weakref
+
 _LAZY_COMPACTION_STATS_ENABLED = envs.SGLANG_LOG_LAZY_COMPACTION_STATS.get()
 _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     envs.SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC.get()
@@ -86,8 +87,9 @@ _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
 # enabled. The signal handler below iterates this on SIGTERM/SIGINT and
 # emits each instance's final counters before re-raising the default
 # behavior. WeakSet so a dropped allocator doesn't leak.
-_STATS_INSTANCES: "weakref.WeakSet[MultiEndedAllocator]" = weakref.WeakSet()
+_STATS_INSTANCES: weakref.WeakSet[MultiEndedAllocator] = weakref.WeakSet()
 _SIGNAL_HANDLERS_INSTALLED = False
+
 
 def _emit_all_final_stats(reason: str) -> None:
     """Emit the FINAL line for every live MultiEndedAllocator. Tagged
@@ -210,9 +212,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         #   joint byte-budget check on the SWA composite.
         self.page_size = page_size
         self.num_pages = max_slots // page_size
-        self.min_page_index = (
-            self.min_slot_index + page_size - 1
-        ) // page_size  # ceil
+        self.min_page_index = (self.min_slot_index + page_size - 1) // page_size  # ceil
         self.entry_bytes_per_page = self.entry_bytes * page_size
 
         # v -> p, sized by PAGES (not slots). Page id 0 ↔ page 0 is the
@@ -235,15 +235,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # (matches table sizing).
         self.num_virtual_ids = self.num_pages
 
-        self._peer: Optional["MultiEndedAllocator"] = None
+        self._peer: Optional[MultiEndedAllocator] = None
 
         # Inverse history of relocations (for spec rollback). Each entry is
         # one batch (src_phys_tensor, dst_phys_tensor, v_moved_tensor) — all
         # at PAGE granularity. The composite calls `clear_inverse_history`
         # after each `free` so it stays bounded.
-        self._inverse_history: List[
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
+        self._inverse_history: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
+            []
+        )
 
         # --- Lazy compaction state ---
         #
@@ -308,7 +308,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # by the dict reference so drain can `torch.cat` it onto
         # `_free_phys_pages` without an H2D copy.
         self._pending_reuse: Dict[
-            "torch.cuda.Event",
+            torch.cuda.Event,
             Tuple[List[int], torch.Tensor],
         ] = {}
         # Parallel CPU mirror of all pages currently in
@@ -351,7 +351,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
-        self._latest_forward_done_event: Optional["torch.cuda.Event"] = None
+        self._latest_forward_done_event: Optional[torch.cuda.Event] = None
         # Most-recently-launched forward's metadata for the write-race
         # check in `_flush`. Stored as a single
         # (forward_done_event, out_cache_loc_virtual TENSOR) tuple — NOT
@@ -369,9 +369,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # simplified design just stores the tensor reference; `_flush`
         # materializes the write-set LAZILY on schedule_stream only when
         # a survivor candidate actually needs to be checked.
-        self._inflight_forward: Optional[
-            Tuple["torch.cuda.Event", torch.Tensor]
-        ] = None
+        self._inflight_forward: Optional[Tuple[torch.cuda.Event, torch.Tensor]] = None
 
         # Per-call move cap on non-urgent
         # `_flush`. Without this, a single `flush_opportunistic` invoked
@@ -388,9 +386,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # for benchmarking. The urgent path (`alloc*` shortfall retry)
         # is NOT capped — it must drain everything to satisfy correctness.
         self._lazy_max_moves_per_call = int(
-            os.environ.get(
-                "SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL", "4096"
-            )
+            os.environ.get("SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL", "4096")
         )
 
         self.clear()
@@ -416,11 +412,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- peer binding --
 
-    def bind_peer(self, peer: "MultiEndedAllocator") -> None:
+    def bind_peer(self, peer: MultiEndedAllocator) -> None:
         self._peer = peer
 
     @property
-    def peer(self) -> Optional["MultiEndedAllocator"]:
+    def peer(self) -> Optional[MultiEndedAllocator]:
         return self._peer
 
     # -- state --
@@ -463,9 +459,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.free_group: List[torch.Tensor] = []
         self._inverse_history.clear()
         # Lazy compaction state — no-op when lazy_compaction=False.
-        self._free_phys_pages = torch.empty(
-            0, dtype=torch.int64, device=self.device
-        )
+        self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self._pending_reuse.clear()
         self._pending_reuse_pages_cpu.clear()
         self.live_page_count = 0
@@ -792,12 +786,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         drained_t = self._free_phys_pages[:n_drain]
                         self._free_phys_pages = self._free_phys_pages[n_drain:]
                     else:
-                        drained_t = (
-                            self._free_phys_pages[-n_drain:].flip(0)
-                        )
-                        self._free_phys_pages = (
-                            self._free_phys_pages[:-n_drain]
-                        )
+                        drained_t = self._free_phys_pages[-n_drain:].flip(0)
+                        self._free_phys_pages = self._free_phys_pages[:-n_drain]
                 else:
                     # Unsorted — take from front regardless of direction.
                     drained_t = self._free_phys_pages[:n_drain]
@@ -939,9 +929,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.take_physical_pages"):
             return self.take_physical(num_pages * self.page_size)
 
-    def bind(
-        self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor
-    ) -> None:
+    def bind(self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor) -> None:
         """Bind page-granular virtual ids to page-granular physical ids.
 
         For page_size == 1, virtual_ids and physical_ids are slot ids.
@@ -1001,16 +989,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         with record_function("MultiEndedAlloc._alloc_bind_fast_or_slow"):
             if N == 0:
-                return torch.empty(
-                    0, dtype=torch.int64, device=self.device
-                )
+                return torch.empty(0, dtype=torch.int64, device=self.device)
 
             # FAST PATH: eager mode (no holes ever accumulate) OR
             # lazy mode with no current holes. One fused kernel.
-            if (
-                not self.lazy_compaction
-                or self._free_phys_pages.numel() == 0
-            ):
+            if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
                 # Capture watermark BEFORE advancing so we can compute
                 # the kernel's `start_phys` from the pre-extension value.
                 start_wm = self.watermark_physical
@@ -1145,15 +1128,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # The transient `tmp` is fresh per call but caching-allocator-
                 # cached under cuda-graph capture; the observable mutation is
                 # `out.copy_(tmp)` into the stable buffer.
-                tmp = torch.index_select(
-                    self.virtual_to_physical, 0, virt_tokens
-                )
+                tmp = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
                 tmp = torch.clamp_min(tmp, 0)
                 out.copy_(tmp)
                 return out
-            result = torch.index_select(
-                self.virtual_to_physical, 0, virt_tokens
-            )
+            result = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
             return torch.clamp_min(result, 0)
         # page_size > 1: page math.
         # Note: `virt_pages` and `offsets` are fresh tensors (results of
@@ -1163,9 +1142,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virt_pages = virt_tokens // self.page_size  # fresh int64[N]
         offsets = virt_tokens % self.page_size  # fresh int64[N]
         if out is not None:
-            torch.index_select(
-                self.virtual_to_physical, 0, virt_pages, out=out
-            )
+            torch.index_select(self.virtual_to_physical, 0, virt_pages, out=out)
             out.mul_(self.page_size)
             out.add_(offsets)
             # Tombstoned page: -1 * ps + offset is in [-ps, -1]; clamp to 0.
@@ -1233,9 +1210,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             phys_pages = self._alloc_bind_fast_or_slow(v_pages, num_pages)
             if phys_pages is None:
                 # Undo the virtual pop.
-                self.free_virtual_ids = torch.cat(
-                    [v_pages, self.free_virtual_ids]
-                )
+                self.free_virtual_ids = torch.cat([v_pages, self.free_virtual_ids])
                 return None
             if self.page_size == 1:
                 # Avoid the extra reshape — v_pages already IS the token id list.
@@ -1302,9 +1277,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         pages to the same virtual pages (the SWA composite handles this).
         """
         with record_function("MultiEndedAlloc.alloc_extend"):
-            assert self.is_id_owner, (
-                f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
-            )
+            assert (
+                self.is_id_owner
+            ), f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
             if num_new_pages is None:
                 num_new_pages = get_num_new_pages(
                     seq_lens=seq_lens_cpu,
@@ -1391,9 +1366,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         → CUDA OOB).
         """
         with record_function("MultiEndedAlloc.alloc_decode"):
-            assert self.is_id_owner, (
-                f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
-            )
+            assert (
+                self.is_id_owner
+            ), f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
             bs = len(seq_lens)
             # Compute num_new_pages BEFORE the kernel so we can snapshot the
             # exact slice of `free_virtual_ids` the kernel will consume.
@@ -1422,9 +1397,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             else:
                 new_virtual_pages = None
 
-            out_indices = torch.empty(
-                (bs,), dtype=torch.int64, device=self.device
-            )
+            out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
             with record_function("MultiEndedAlloc.alloc_decode.kernel"):
                 alloc_decode_kernel[(bs,)](
                     seq_lens,
@@ -1511,9 +1484,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # Un-map; (if id-owner) recycle the virtual page ids.
             self.virtual_to_physical[free_v_pages] = -1
             if self.is_id_owner:
-                self.free_virtual_ids = torch.cat(
-                    [self.free_virtual_ids, free_v_pages]
-                )
+                self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._compact_pending(freed_p_pages)
 
     def _free_lazy(self, free_index: torch.Tensor) -> None:
@@ -1551,9 +1522,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     # `torch.unique` to avoid its output-size sync.
                     free_v_pages = free_v_pages_raw
                 else:
-                    free_v_pages = torch.unique(
-                        free_v_pages_raw // self.page_size
-                    )
+                    free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
             # Tombstone safety check (debug-gated for perf — the .item() sync
             # would otherwise dominate the lazy path's CPU cost).
@@ -1569,14 +1538,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.virtual_to_physical[free_v_pages] = -1
             self.physical_to_virtual[freed_p_pages] = -1
             if self.is_id_owner:
-                self.free_virtual_ids = torch.cat(
-                    [self.free_virtual_ids, free_v_pages]
-                )
+                self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             # ONE torch.cat. No sort, no absorb, no watermark mutation.
             # Pure GPU op.
-            self._free_phys_pages = torch.cat(
-                [self._free_phys_pages, freed_p_pages]
-            )
+            self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
             if _SORT_FREE_LIST_AFTER_MERGE:
                 # Optional sort — keeps the list always-sorted so `_flush`
                 # can skip its sort step, at the cost of one extra GPU
@@ -1605,9 +1570,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return
         self._stats_n_release_batch += 1
         with record_function("MultiEndedAlloc._release_phys_pages_batch"):
-            self._free_phys_pages = torch.cat(
-                [self._free_phys_pages, pages]
-            )
+            self._free_phys_pages = torch.cat([self._free_phys_pages, pages])
             if _SORT_FREE_LIST_AFTER_MERGE:
                 self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
@@ -1683,13 +1646,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         )
 
         if src_list:
-            src_pages = torch.tensor(
-                src_list, dtype=torch.int64, device=self.device
-            )
-            dst_pages = torch.tensor(
-                dst_list, dtype=torch.int64, device=self.device
-            )
-            v_moved = self.physical_to_virtual[src_pages].clone()  # read before clearing
+            src_pages = torch.tensor(src_list, dtype=torch.int64, device=self.device)
+            dst_pages = torch.tensor(dst_list, dtype=torch.int64, device=self.device)
+            v_moved = self.physical_to_virtual[
+                src_pages
+            ].clone()  # read before clearing
 
             # Expand page ids to token ids for the move kernel (which is
             # token-granular, see memory_pool.py:2204 `move_kv_cache_native`).
@@ -1700,12 +1661,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 offsets = torch.arange(
                     self.page_size, dtype=torch.int64, device=self.device
                 )
-                src_t = (
-                    src_pages[:, None] * self.page_size + offsets
-                ).reshape(-1)
-                dst_t = (
-                    dst_pages[:, None] * self.page_size + offsets
-                ).reshape(-1)
+                src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
+                dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
 
             # Data copy. MHA (full) -> SharedMHATokenToKVPool.move_kv_cache(dst, src);
             # Mamba -> SharedMambaPool._copy_from_physical(src, dst) (un-translated —
@@ -1732,9 +1689,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- lazy compaction primitives --
 
-    def set_latest_forward_done_event(
-        self, event: Optional["torch.cuda.Event"]
-    ) -> None:
+    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Scheduler-facing hook: stash the `forward_done` event of the
         most-recently-launched forward batch (recorded on `forward_stream`
         right after `forward_batch_generation`). `_pending_reuse` uses
@@ -1746,7 +1701,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     def set_inflight_forward(
         self,
-        forward_done: "torch.cuda.Event",
+        forward_done: torch.cuda.Event,
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
         """Scheduler-facing hook: stash the just-launched forward's
@@ -1853,9 +1808,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # Read current snapshot of pressure indicators (cheap CPU metadata).
         cur_holes = int(self._free_phys_pages.shape[0])
         cur_pending = len(self._pending_reuse_pages_cpu)
-        self._stats_peak_free_list_len = max(
-            self._stats_peak_free_list_len, cur_holes
-        )
+        self._stats_peak_free_list_len = max(self._stats_peak_free_list_len, cur_holes)
         self._stats_peak_pending_pages = max(
             self._stats_peak_pending_pages, cur_pending
         )
@@ -1944,9 +1897,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return
         with record_function("MultiEndedAlloc._drain_pending_reuse"):
             ready_tensors: List[torch.Tensor] = []
-            ready_entries: List[
-                Tuple["torch.cuda.Event", List[int]]
-            ] = []
+            ready_entries: List[Tuple[torch.cuda.Event, List[int]]] = []
             for event, (cpu_list, gpu_tensor) in self._pending_reuse.items():
                 if event is None or event.query():
                     # Sync-free — event.query() is non-blocking.
@@ -1977,9 +1928,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     # Keep the sort-invariant on the post-cat tensor so
                     # subsequent `take_physical` calls (and the next
                     # `_flush`) can skip sorting.
-                    self._free_phys_pages, _ = torch.sort(
-                        self._free_phys_pages
-                    )
+                    self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
     def maybe_drain_pending_reuse(self) -> None:
         """Public scheduler hook. Called once per scheduler step
@@ -2055,7 +2004,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # behind the cursor; we'll never revisit them).
                 while j >= 0 and holes_cpu[j] > p:
                     j -= 1
-                is_hole = (j >= 0 and holes_cpu[j] == p)
+                is_hole = j >= 0 and holes_cpu[j] == p
                 if is_hole or p in self._pending_reuse_pages_cpu:
                     if is_hole:
                         j -= 1  # consume the hole entry
@@ -2072,7 +2021,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             while p < self.num_pages:
                 while j < len(holes_cpu) and holes_cpu[j] < p:
                     j += 1
-                is_hole = (j < len(holes_cpu) and holes_cpu[j] == p)
+                is_hole = j < len(holes_cpu) and holes_cpu[j] == p
                 if is_hole or p in self._pending_reuse_pages_cpu:
                     if is_hole:
                         j += 1
@@ -2172,10 +2121,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # the list is already sorted because `_free_lazy` and
             # `_drain_pending_reuse` sort after every cat). Either way,
             # `_free_phys_pages` is sorted ASCENDING after this step.
-            if (
-                not _SORT_FREE_LIST_AFTER_MERGE
-                and self._free_phys_pages.numel() > 1
-            ):
+            if not _SORT_FREE_LIST_AFTER_MERGE and self._free_phys_pages.numel() > 1:
                 self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
             # Step 3: ONE D2H sync — `.tolist()` of the sorted
@@ -2276,11 +2222,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             n_dst_consumed = 0
 
             # Per-call move cap on non-urgent flushes.
-            move_cap = (
-                self._lazy_max_moves_per_call
-                if not urgent
-                else None
-            )
+            move_cap = self._lazy_max_moves_per_call if not urgent else None
 
             n_moves = 0
             # Outer loop: stop when no more dsts available.
@@ -2296,9 +2238,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # Case A: write race.
                 if write_set is None:
                     materialized = self._materialize_inflight_write_set()
-                    write_set = (
-                        materialized if materialized is not None else set()
-                    )
+                    write_set = materialized if materialized is not None else set()
                 if write_set and src in write_set:
                     if urgent:
                         # Commit any moves accumulated so far so the
@@ -2317,9 +2257,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         # most ONE in-flight forward.
                         inflight = self._inflight_forward
                         if inflight is not None:
-                            torch.cuda.current_stream().wait_event(
-                                inflight[0]
-                            )
+                            torch.cuda.current_stream().wait_event(inflight[0])
                             self._inflight_forward = None
                         write_set = set()  # forward drained → no race
                         latest_event = None
@@ -2399,9 +2337,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     break
 
             # Commit any final accumulated batch.
-            self._commit_move_batch(
-                srcs, dsts, v_moveds, latest_event, released_fired
-            )
+            self._commit_move_batch(srcs, dsts, v_moveds, latest_event, released_fired)
             n_moves += len(srcs)
 
             if single_pass_absorb:
@@ -2432,13 +2368,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # entries), then merge the freed srcs back in ONE cat.
                 if n_dst_consumed > 0:
                     if self.grow_direction == "up":
-                        self._free_phys_pages = (
-                            self._free_phys_pages[n_dst_consumed:]
-                        )
+                        self._free_phys_pages = self._free_phys_pages[n_dst_consumed:]
                     else:
-                        self._free_phys_pages = (
-                            self._free_phys_pages[:-n_dst_consumed]
-                        )
+                        self._free_phys_pages = self._free_phys_pages[:-n_dst_consumed]
                 if released_fired:
                     self._release_phys_pages_batch(
                         released_fired[0]
@@ -2458,7 +2390,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         srcs: List[int],
         dsts: List[int],
         v_moveds: List[int],
-        latest_event: Optional["torch.cuda.Event"],
+        latest_event: Optional[torch.cuda.Event],
         released_fired: List[torch.Tensor],
     ) -> None:
         """Issue ONE `move_kv_cache` + ONE bulk v2p/p2v remap for the
@@ -2478,15 +2410,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if not srcs:
             return
         with record_function("MultiEndedAlloc._commit_move_batch"):
-            src_pages_t = torch.tensor(
-                srcs, dtype=torch.int64, device=self.device
-            )
-            dst_pages_t = torch.tensor(
-                dsts, dtype=torch.int64, device=self.device
-            )
-            v_moveds_t = torch.tensor(
-                v_moveds, dtype=torch.int64, device=self.device
-            )
+            src_pages_t = torch.tensor(srcs, dtype=torch.int64, device=self.device)
+            dst_pages_t = torch.tensor(dsts, dtype=torch.int64, device=self.device)
+            v_moveds_t = torch.tensor(v_moveds, dtype=torch.int64, device=self.device)
             # Expand to token granularity if page_size > 1 (the move
             # kernel is token-granular — see memory_pool.py).
             if self.page_size == 1:
@@ -2497,20 +2423,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     dtype=torch.int64,
                     device=self.device,
                 )
-                src_t = (
-                    src_pages_t[:, None] * self.page_size + offsets
-                ).reshape(-1)
-                dst_t = (
-                    dst_pages_t[:, None] * self.page_size + offsets
-                ).reshape(-1)
+                src_t = (src_pages_t[:, None] * self.page_size + offsets).reshape(-1)
+                dst_t = (dst_pages_t[:, None] * self.page_size + offsets).reshape(-1)
             # ONE KV copy on schedule_stream covering every (src→dst).
             move_fn = getattr(self._kvcache, "move_kv_cache", None)
             if move_fn is not None:
                 move_fn(dst_t, src_t)
             else:
-                copy_phys = getattr(
-                    self._kvcache, "_copy_from_physical", None
-                )
+                copy_phys = getattr(self._kvcache, "_copy_from_physical", None)
                 assert copy_phys is not None, (
                     f"sub-pool {self.sub_pool_name!r} supports neither "
                     "move_kv_cache nor _copy_from_physical"
@@ -2520,9 +2440,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.virtual_to_physical[v_moveds_t] = dst_pages_t
             self.physical_to_virtual[dst_pages_t] = v_moveds_t
             self.physical_to_virtual[src_pages_t] = -1
-            self._inverse_history.append(
-                (src_pages_t, dst_pages_t, v_moveds_t)
-            )
+            self._inverse_history.append((src_pages_t, dst_pages_t, v_moveds_t))
             # Src disposition — ONE entry per batch (NOT one per src).
             # When the event has fired, accumulate the src pages in the
             # flush-scoped `released_fired` list (merged into
@@ -2532,9 +2450,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # value is the (cpu_list, gpu_tensor) tuple, and the GPU tensor
             # is the SAME `src_pages_t` we already built above (no second
             # H2D copy at drain time).
-            event_fired = (
-                latest_event is None or latest_event.query()
-            )
+            event_fired = latest_event is None or latest_event.query()
             if event_fired:
                 released_fired.append(src_pages_t)
             else:
@@ -2573,10 +2489,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.flush_opportunistic"):
             if not self.lazy_compaction:
                 return 0
-            if (
-                self._free_phys_pages.numel() == 0
-                and not self._pending_reuse
-            ):
+            if self._free_phys_pages.numel() == 0 and not self._pending_reuse:
                 return 0
             return self._flush(urgent=False)
 
@@ -2673,11 +2586,13 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.mamba_allocator)
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
 
-        # The mamba pool's allocator is wired later, NOT here: it borrows
-        # `translate` from a `SharedMambaSlotAllocator` (the physical view) that
-        # wraps this very `self.mamba_allocator` and doesn't exist yet —
-        # `init_shared_mamba_pools` calls `mamba_pool.attach_allocator(...)` once
-        # this composite returns. The full-attn KV pool needs no allocator: write
+        # The mamba slot allocator (the PHYSICAL view) is built later, NOT here:
+        # `init_shared_mamba_pools` wraps this very `self.mamba_allocator` in a
+        # `SharedMambaSlotAllocator` once this composite returns. That wrapper owns
+        # the virtual->physical `translate`; the mamba pool itself is a pure
+        # PHYSICAL store and never translates — callers resolve v2p first (via
+        # `req_to_token_pool.translate_mamba_indices` / the HybridLinearKVPool
+        # HiCache hook). The full-attn KV pool likewise needs no allocator: write
         # locations are resolved in the attention metadata (no pool-side v2p).
 
         self.is_not_in_free_group = True
@@ -2895,7 +2810,10 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.clear_inverse_history()
 
     def backup_state(self):
-        return [self.full_attn_allocator.backup_state(), self.mamba_allocator.backup_state()]
+        return [
+            self.full_attn_allocator.backup_state(),
+            self.mamba_allocator.backup_state(),
+        ]
 
     def restore_state(self, state):
         assert len(state) == 2
@@ -2911,9 +2829,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     # -- Lazy compaction hooks --
 
-    def set_latest_forward_done_event(
-        self, event: Optional["torch.cuda.Event"]
-    ) -> None:
+    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Scheduler-facing: forwards the per-batch `forward_done` event to
         BOTH sub-allocators so each side's `_flush` can gate src reuse on
         the in-flight reader settling. No-op when `lazy_compaction=False`."""
@@ -2923,7 +2839,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def set_inflight_forward(
         self,
-        forward_done: "torch.cuda.Event",
+        forward_done: torch.cuda.Event,
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
         """Hand the just-launched forward's metadata to BOTH sub-pools.
@@ -2971,8 +2887,10 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             fa = self.full_attn_allocator
             ma = self.mamba_allocator
             if (
-                fa._free_phys_pages.numel() == 0 and not fa._pending_reuse
-                and ma._free_phys_pages.numel() == 0 and not ma._pending_reuse
+                fa._free_phys_pages.numel() == 0
+                and not fa._pending_reuse
+                and ma._free_phys_pages.numel() == 0
+                and not ma._pending_reuse
             ):
                 return 0
             return fa.flush_opportunistic() + ma.flush_opportunistic()
@@ -3170,12 +3088,8 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
         else:
             gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
-        R_f = (
-            fa.num_pages - fa.min_page_index - fa._allocated_pages()
-        )
-        R_s = (
-            sa.num_pages - sa.min_page_index - sa._allocated_pages()
-        )
+        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
+        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
 
         if not self.lazy_compaction:
             # Eager: no holes — collapse to the original joint formula.
@@ -3221,14 +3135,12 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # checker.
     def _conserve_full_available_size(self) -> int:
         return (
-            self._full_max_total_num_tokens
-            - self.full_attn_allocator.allocated_count()
+            self._full_max_total_num_tokens - self.full_attn_allocator.allocated_count()
         )
 
     def _conserve_swa_available_size(self) -> int:
         return (
-            self._swa_max_total_num_tokens
-            - self.swa_attn_allocator.allocated_count()
+            self._swa_max_total_num_tokens - self.swa_attn_allocator.allocated_count()
         )
 
     # PHYSICAL per-side views — what every SCHEDULING / eviction consumer
@@ -3692,9 +3604,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- Lazy compaction hooks --
 
-    def set_latest_forward_done_event(
-        self, event: Optional["torch.cuda.Event"]
-    ) -> None:
+    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forwards the per-batch `forward_done` event to BOTH sub-
         allocators. No-op when `lazy_compaction=False`."""
         with record_function("SharedSWAAlloc.set_latest_forward_done_event"):
@@ -3703,7 +3613,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def set_inflight_forward(
         self,
-        forward_done: "torch.cuda.Event",
+        forward_done: torch.cuda.Event,
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
         """Hand the just-launched forward's metadata to BOTH sub-pools.
@@ -3740,8 +3650,10 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             fa = self.full_attn_allocator
             sa = self.swa_attn_allocator
             if (
-                fa._free_phys_pages.numel() == 0 and not fa._pending_reuse
-                and sa._free_phys_pages.numel() == 0 and not sa._pending_reuse
+                fa._free_phys_pages.numel() == 0
+                and not fa._pending_reuse
+                and sa._free_phys_pages.numel() == 0
+                and not sa._pending_reuse
             ):
                 return 0
             return fa.flush_opportunistic() + sa.flush_opportunistic()

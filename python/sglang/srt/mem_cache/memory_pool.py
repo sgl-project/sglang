@@ -970,6 +970,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
+        """Virtual->physical mamba-slot translate. Identity for a static pool
+        (slots are physical); SharedHybridReqToTokenPool overrides it for the
+        shared KV pool, where mamba slot ids are virtual. Callers translate
+        before calling the pool's physical-id state ops (copy_from / clear_slots
+        / get_cpu_copy / load_cpu_copy)."""
+        return mamba_indices
+
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
@@ -2370,6 +2378,11 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
+        # virtual->physical mamba-slot translate for the HiCache offload path
+        # (get_cpu_copy/load_cpu_copy). Identity for a static pool (slots are
+        # physical); set to the SharedMambaSlotAllocator's `translate` for the
+        # shared KV pool, where mamba_indices arrive virtual.
+        self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a SharedMHATokenToKVPool
@@ -2541,8 +2554,10 @@ class HybridLinearKVPool(KVCache):
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+        # mamba_pool is a pure store on PHYSICAL ids; translate the (virtual,
+        # for the shared pool) mamba_indices first.
         mamba_cpu = (
-            self.mamba_pool.get_cpu_copy(mamba_indices)
+            self.mamba_pool.get_cpu_copy(self._mamba_translate(mamba_indices))
             if mamba_indices is not None
             else None
         )
@@ -2552,7 +2567,9 @@ class HybridLinearKVPool(KVCache):
         kv_cpu, mamba_cpu = cache_cpu
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
         if mamba_cpu is not None and mamba_indices is not None:
-            self.mamba_pool.load_cpu_copy(mamba_cpu, mamba_indices)
+            self.mamba_pool.load_cpu_copy(
+                mamba_cpu, self._mamba_translate(mamba_indices)
+            )
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]

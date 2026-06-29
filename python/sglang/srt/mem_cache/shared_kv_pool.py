@@ -649,7 +649,6 @@ class SharedMambaPool(MambaPool):
 
         self._shared_buffer = shared_buffer
         self._sub_pool_name = sub_pool_name
-        self._external_allocator = None  # set via attach_allocator
 
         # Replicate the state MambaPool.__init__ would have set.
         self._max_size = max_slots - 1  # -1 for reserved slot 0
@@ -732,46 +731,18 @@ class SharedMambaPool(MambaPool):
             self.num_mamba_layers,
         )
 
-    # -- allocator wiring (the allocator is the PHYSICAL view) --
-    #
-    # This pool is the VIRTUAL view: its public surface is virtual-id indexed and
-    # it knows nothing of the v<->physical mapping. Slot lifecycle (alloc/free/
-    # clear/sizing/free-list) and that mapping (the `translate`) live in its
-    # allocator (`SharedMambaSlotAllocator`, the PHYSICAL view) — mirroring how
-    # `SharedMHATokenToKVPool` defers slot ownership + `translate_kv_loc` to its
-    # KV allocator. The public state ops below receive VIRTUAL ids (the upstream
-    # `req.mamba_pool_idx` contract) and borrow the allocator's `translate` the
-    # moment before touching the buffer; they hold no v2p logic themselves.
-
-    def attach_allocator(self, allocator) -> None:
-        """Wire the `SharedMambaSlotAllocator` this pool translates through."""
-        self._external_allocator = allocator
+    # Pure PHYSICAL store: this pool holds no v<->physical mapping. The public
+    # state ops (copy_from / clear_slots / get_cpu_copy / load_cpu_copy) are
+    # inherited from MambaPool and operate on PHYSICAL slot ids. Callers resolve
+    # virtual->physical via the slot allocator before calling — the
+    # scheduler/backend/radix/compaction paths via
+    # `SharedHybridReqToTokenPool.translate_mamba_indices`, the HiCache offload
+    # path via `HybridLinearKVPool` (which threads the same translate).
 
     def _copy_from_physical(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        """Un-translated copy on PHYSICAL slot ids — used by the allocator's
-        `_compact_pending` (which already holds physical ids)."""
+        """Physical-slot copy — used by the allocator's `_compact_pending`
+        (which already holds physical ids)."""
         MambaPool.copy_from(self, src_index, dst_index)
-
-    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        # Public: callers (radix-cache COW) pass VIRTUAL ids.
-        tr = self._external_allocator.translate
-        return MambaPool.copy_from(self, tr(src_index), tr(dst_index))
-
-    def clear_slots(self, indices: torch.Tensor):
-        # Public: the deferred-clear path (`_execute_deferred_mamba_cow_and_clear`)
-        # feeds `req.mamba_pool_idx` — VIRTUAL ids. Translate to PHYSICAL via the
-        # allocator before zeroing, else the inherited `MambaPool.clear_slots`
-        # would index the physical state buffer with virtual ids and zero the
-        # WRONG slots (stale state -> divergent decode; clobbers a peer slot).
-        return MambaPool.clear_slots(self, self._external_allocator.translate(indices))
-
-    def get_cpu_copy(self, indices):
-        return MambaPool.get_cpu_copy(self, self._external_allocator.translate(indices))
-
-    def load_cpu_copy(self, mamba_cache_cpu, indices):
-        return MambaPool.load_cpu_copy(
-            self, mamba_cache_cpu, self._external_allocator.translate(indices)
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1202,23 +1173,26 @@ def init_shared_mamba_pools(
         lazy_compaction=lazy_compaction,
     )
 
-    # Wire the mamba slot allocator (PHYSICAL view). The composite above created
+    # Build the mamba slot allocator (PHYSICAL view). The composite above created
     # the mamba `MultiEndedAllocator` (`allocator.mamba_allocator`); it drives
-    # compaction directly via the pool's `_copy_from_physical` (a kvcache ref, not
-    # an attach). Wrap that MEA in a `SharedMambaSlotAllocator` that presents the
+    # compaction directly via the pool's `_copy_from_physical` (a kvcache ref).
+    # Wrap that MEA in a `SharedMambaSlotAllocator` that presents the
     # `MambaSlotAllocator` interface (alloc/free/clear/sizing/group) the inherited
     # `HybridReqToTokenPool` + scheduler drive, and owns the virtual->physical
-    # `translate`. This is the SOLE `attach_allocator` for the mamba pool (the
-    # composite deliberately does not attach the raw MEA — it has no `.translate`):
-    # the pool, the VIRTUAL view, borrows `translate` from this wrapper and holds
-    # no v2p logic. `_shared_mamba_size` excludes the reserved slot 0.
+    # `translate`. `_shared_mamba_size` excludes the reserved slot 0.
     mamba_slot_allocator = SharedMambaSlotAllocator(
         allocator.mamba_allocator,
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
+    # The mamba pool is a pure PHYSICAL store: it holds no v<->physical mapping.
+    # `translate` lives ONLY here, and callers resolve virtual->physical before
+    # touching the pool — the scheduler/backend/radix/compaction paths via
+    # `req_to_token_pool.translate_mamba_indices` (which delegates to this
+    # allocator), and the HiCache offload path via the HybridLinearKVPool's
+    # `_mamba_translate` hook wired below.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
-    req_to_token_pool.mamba_pool.attach_allocator(mamba_slot_allocator)
+    token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
 
     logger.info(
         "[shared-pool] ============================================================"

@@ -66,8 +66,11 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_clear_indices is not None
             and len(forward_batch.mamba_clear_indices) > 0
         ):
+            # mamba_pool is a pure PHYSICAL store; translate the (virtual, for the
+            # shared pool) slot ids before zeroing — else clear_slots would zero
+            # the WRONG physical slots. Identity for the non-shared pool.
             self.req_to_token_pool.mamba_pool.clear_slots(
-                forward_batch.mamba_clear_indices
+                self._maybe_translate_mamba_indices(forward_batch.mamba_clear_indices)
             )
         if (
             forward_batch.mamba_cow_src_indices is not None
@@ -83,9 +86,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.mamba_cow_dst_indices,
                 )
             else:
+                # mamba_pool is a pure PHYSICAL store; translate both COW slot
+                # ids virtual->physical (identity for the non-shared pool).
                 self.req_to_token_pool.mamba_pool.copy_from(
-                    forward_batch.mamba_cow_src_indices,
-                    forward_batch.mamba_cow_dst_indices,
+                    self._maybe_translate_mamba_indices(
+                        forward_batch.mamba_cow_src_indices
+                    ),
+                    self._maybe_translate_mamba_indices(
+                        forward_batch.mamba_cow_dst_indices
+                    ),
                 )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
@@ -95,8 +104,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self, mamba_indices: torch.Tensor
     ) -> torch.Tensor:
         """Shared KV pool: ``get_mamba_indices`` returns *virtual* per-request
-        mamba ids; translate them to *physical* slot ids. No-op for the
-        non-shared ``HybridReqToTokenPool`` (it has no ``translate_mamba_indices``).
+        mamba ids; translate them to *physical* slot ids. Identity for the
+        non-shared ``HybridReqToTokenPool`` (its ``translate_mamba_indices``
+        returns the indices unchanged).
 
         MUST be applied EVERYWHERE the mamba indices feed the SSM/conv kernels:
         the eager ``_forward_metadata`` AND the cuda-graph
@@ -107,10 +117,10 @@ class MambaAttnBackendBase(AttentionBackend):
         while cg_off (eager) was correct. The translate runs in replay-prep
         (eager, before ``graph.replay()``), so it reads the LIVE v2p table
         post-compaction; the physical result is copied into the stable buffer the
-        captured graph reads.
+        captured graph reads. Also gates the mamba-pool state ops (clear_slots /
+        copy_from), which write the PHYSICAL state buffer directly.
         """
-        _translate = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
-        return _translate(mamba_indices) if _translate is not None else mamba_indices
+        return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -135,13 +145,11 @@ class MambaAttnBackendBase(AttentionBackend):
         # virtual->physical gather reads only real ids; padded rows are then
         # poisoned to -1 (the mamba kernels skip -1).
         mamba_cache_indices = self._maybe_translate_mamba_indices(mamba_cache_indices)
-        _translate_mamba = getattr(
-            self.req_to_token_pool, "translate_mamba_indices", None
-        )
-        if _translate_mamba is not None and forward_batch.mamba_track_indices is not None:
+        if forward_batch.mamba_track_indices is not None:
             # The *_track_* index derivations below index by mamba slot too
-            # (speculative path; spec is off for the shared pool today).
-            forward_batch.mamba_track_indices = _translate_mamba(
+            # (speculative path; spec is off for the shared pool today). Identity
+            # for the non-shared pool.
+            forward_batch.mamba_track_indices = self._maybe_translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
         _real_bs = forward_batch._original_batch_size
@@ -319,13 +327,14 @@ class MambaAttnBackendBase(AttentionBackend):
         # PLACE on the captured registry slot. The eager `_forward_metadata`
         # translates it (L133-138); this replay path must too, else the captured
         # decode track-save (`conv_states[mamba_track_indices] = …`) writes to the
-        # wrong/untranslated slot. No-op for the non-shared pool (no
-        # `translate_mamba_indices`) and at capture.
+        # wrong/untranslated slot. Identity (and same-tensor → no copy) for the
+        # non-shared pool, and skipped at capture.
         if not in_capture:
-            _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
             _mt = forward_batch.mamba_track_indices
-            if _tr is not None and _mt is not None and _mt.numel() > 0:
-                _mt.copy_(_tr(_mt))
+            if _mt is not None and _mt.numel() > 0:
+                _phys = self._maybe_translate_mamba_indices(_mt)
+                if _phys is not _mt:
+                    _mt.copy_(_phys)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
@@ -931,14 +940,15 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         # (`conv_states[mamba_track_indices]`, hybrid_linear_attn_backend.py:947 →
         # mamba_state_scatter_triton) indexed conv with VIRTUAL ids → wrong
         # physical slot (NaN) / freed-slot sentinel (OOB). Mirrors the working
-        # index staged by `_replay_metadata` above. No-op for the non-shared pool
-        # (no `translate_mamba_indices`) and at capture. The freed-slot -1 result
-        # is now skipped by the kernel's pad_slot_id guard.
+        # index staged by `_replay_metadata` above. Identity (and same-tensor →
+        # no copy) for the non-shared pool, and skipped at capture. The freed-slot
+        # -1 result is now skipped by the kernel's pad_slot_id guard.
         if not in_capture:
-            _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
             _mt = forward_batch.mamba_track_indices
-            if _tr is not None and _mt is not None and _mt.numel() > 0:
-                _mt.copy_(_tr(_mt))
+            if _mt is not None and _mt.numel() > 0:
+                _phys = self._maybe_translate_mamba_indices(_mt)
+                if _phys is not _mt:
+                    _mt.copy_(_phys)
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
@@ -956,7 +966,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             self.mamba_chunk_size,
             forward_batch,
         )
-
 
     def _select_causal_conv_backend(self, use_triton_causal_conv: bool) -> bool:
         """Decide the causal-conv kernel: it FOLLOWS ``--linear-attn-backend``.
@@ -989,6 +998,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 la_backend,
             )
         return resolved
+
     def forward(
         self,
         mixer: MambaMixer2,
@@ -1099,7 +1109,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
-
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
