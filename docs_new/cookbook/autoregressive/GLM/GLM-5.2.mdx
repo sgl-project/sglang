@@ -53,7 +53,7 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.2-benchmarks.jsx
 <Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
-  **Benchmark methodology.** Speed numbers are measured with real weights, `--random-range-ratio 1.0` (the `bench_serving` default `0.0` samples each request's input/output length in `[1, max]`, which makes runs incomparable), and `--flush-cache` per run, on `main @ 09ca4fc`. Spec-decoding cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` so the numbers are stable and comparable: low-latency (MTP 5-1-6) uses `3.5` (match-expected: 50% accept 3 / 50% accept 4), balanced (MTP 1-1-2) uses `2` (accept 2 of 2). High-throughput has no spec, so no env. `--load-format dummy` was verified to diverge from real weights (dummy skews MoE routing ~39% faster on spec cells), so all cells use real weights. See each cell's comment in `glm-5.2-benchmarks.jsx` for its exact env.
+  Speed numbers are measured with real weights, `--random-range-ratio 1.0`, `--flush-cache`, on `main @ 09ca4fc`. Spec cells pin the EAGLE acceptance length via the serve env `SGLANG_SIMULATE_ACC_LEN` (low-latency 5-1-6 = 3.5, balanced 1-1-2 = 2); high-throughput has no spec.
 </Note>
 
 <Note>
