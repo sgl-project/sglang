@@ -224,10 +224,6 @@ class FutureMap:
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
-        if self.spec_algo.is_dflash() and getattr(
-            draft_input, "direct_carry_valid", False
-        ):
-            return
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
@@ -266,17 +262,10 @@ class FutureMap:
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
-        # schedule). DFLASH intentionally keeps host-side lengths lagging and
-        # uses its carried KV allocation watermark for planning, so only the GPU
-        # seq_lens is resolved there. Other spec-v2 algorithms still need the CPU
-        # mirror for host planning; use a private D2H stream for those copies.
+        # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
+        # opt out take the GPU-only path below. A private D2H stream overlaps the copy.
         draft_input = batch.spec_info
         if draft_input is None:
-            return
-        if self.spec_algo.is_dflash() and getattr(
-            draft_input, "direct_carry_valid", False
-        ):
-            batch.seq_lens = draft_input.new_seq_lens
             return
 
         fi = draft_input.future_indices
@@ -289,11 +278,6 @@ class FutureMap:
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
-
-        if self.spec_algo.is_dflash():
-            # DFLASH keeps seq_lens_cpu as the lagging committed host view;
-            # planning/reserved host lengths live on DFlashDraftInputV2.
-            return
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
