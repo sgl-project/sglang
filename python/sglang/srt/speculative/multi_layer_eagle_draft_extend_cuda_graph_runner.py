@@ -666,9 +666,10 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.raw_bs = raw_bs
         self.bs = bs
         self.raw_num_tokens = num_tokens
-        self.seq_lens_sum = (
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-        )
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        self.seq_lens_sum = seq_lens_sum
 
         self._prepare_extra(forward_batch)
 
