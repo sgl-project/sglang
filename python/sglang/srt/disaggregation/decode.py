@@ -1050,22 +1050,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return ring_rows.astype(np.int32)
 
             state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[List] = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                else:
-                    state_indices.append(None)
+            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+                # DSV4 on NPU: per-pool dst page indices, produced by the same
+                # shared builder prefill uses so src/dst line up positionally.
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    build_dsv4_kv_transfer_payloads,
+                )
+
+                state_indices: Optional[List] = build_dsv4_kv_transfer_payloads(
+                    self.req_to_token_pool,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                    self.token_to_kv_pool_allocator.page_size,
+                    self.scheduler.sliding_window_size,
+                    state_types,
+                )
+            else:
+                state_indices: Optional[List] = []
+                for st in state_types:
+                    if st == StateType.MAMBA:
+                        state_indices.append(_mamba_payload())
+                    elif st == StateType.SWA:
+                        state_indices.append(_swa_payload())
+                    elif st == StateType.DSA:
+                        state_indices.append(_dsa_payload())
+                    elif st == StateType.MINIMAX_INDEX_K:
+                        # Index rows live at the same loc as main KV on the same
+                        # page_size, so reuse the full-seq page-ids.
+                        state_indices.append(_dsa_payload())
+                    elif st == StateType.SWA_RING:
+                        state_indices.append(_swa_ring_payload())
+                    else:
+                        state_indices.append(None)
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1385,6 +1401,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_len > 0
                 else torch.tensor([-1], dtype=torch.int64, device=device)
             )
+            # DSV4-on-NPU allocator: reserves c4/c128 + tail compress-state pools
+            # as transfer dst; None for non-DSV4 (plain path).
+            dsv4_alloc = (
+                self.token_to_kv_pool_allocator
+                if hasattr(self.token_to_kv_pool_allocator, "c4_attn_allocator")
+                else None
+            )
+            dsv4_kwargs = {}
+            if dsv4_alloc is not None:
+                dsv4_kwargs = dict(
+                    req_pool_indices=torch.tensor(
+                        [req.req_pool_idx], dtype=torch.int64, device=device
+                    ),
+                    dsv4_state_lens=dsv4_alloc.compute_dsv4_state_lens_extend(
+                        [req], [fill_len]
+                    ),
+                    req_to_token_pool=self.req_to_token_pool,
+                )
             if self._uses_swa_tail_prealloc() and prefix_len == 0:
                 # Tail-only SWA allocation: only valid when prefix_len == 0.
                 # When prefix_len > 0 (radix cache hit), we fall back to
@@ -1398,6 +1432,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     last_loc=last_loc,
                     extend_num_tokens=fill_len,
                     swa_tail_len=self._swa_tail_len(fill_len),
+                    **dsv4_kwargs,
                 )
                 req.swa_evicted_seqlen = fill_len - self._swa_tail_len(fill_len)
             else:
@@ -1410,6 +1445,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
                     extend_num_tokens=delta_len,
+                    **dsv4_kwargs,
+                )
+            # Unwrap the DSV4OutCacheLoc bundle: full-pool loc for the base write,
+            # plus the five per-req tables (disagg bypasses the batch hook).
+            if dsv4_alloc is not None and kv_loc is not None:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    write_dsv4_prealloc_tables,
+                )
+
+                dsv4_bundle = kv_loc
+                kv_loc = dsv4_bundle.out_full_loc
+                write_dsv4_prealloc_tables(
+                    self.req_to_token_pool,
+                    req,
+                    total_prefix_len,
+                    fill_len,
+                    dsv4_bundle,
                 )
 
         assert kv_loc is not None, (

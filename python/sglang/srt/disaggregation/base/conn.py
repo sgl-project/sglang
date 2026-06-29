@@ -22,6 +22,14 @@ class StateType(str, enum.Enum):
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
+    # DSV4-on-NPU per-pool components (no full-token contiguous space); each
+    # page-indexed on its own pool, registered in this fixed order.
+    DSV4_SWA = "dsv4_swa"
+    DSV4_C4 = "dsv4_c4"
+    DSV4_C128 = "dsv4_c128"
+    DSV4_INDEXER = "dsv4_indexer"
+    DSV4_C4_STATE = "dsv4_c4_state"
+    DSV4_C128_STATE = "dsv4_c128_state"
 
 
 @dataclasses.dataclass

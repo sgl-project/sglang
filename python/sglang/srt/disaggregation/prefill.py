@@ -1062,22 +1062,38 @@ class SchedulerDisaggregationPrefillMixin:
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            state_indices = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.MINIMAX_INDEX_K:
-                    # Index rows live at the same loc as main KV on the same
-                    # page_size, so reuse the full-seq page-ids.
-                    state_indices.append(_dsa_payload())
-                elif st == StateType.SWA_RING:
-                    state_indices.append(_swa_ring_payload())
-                else:
-                    state_indices.append(None)
+            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
+                # DSV4 on NPU: every component is a per-pool transfer, produced
+                # by the shared builder (same logic as decode → indices align).
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    build_dsv4_kv_transfer_payloads,
+                )
+
+                state_indices = build_dsv4_kv_transfer_payloads(
+                    self.req_to_token_pool,
+                    req.req_pool_idx,
+                    seq_len,
+                    page_size,
+                    self.sliding_window_size,
+                    state_types,
+                )
+            else:
+                state_indices = []
+                for st in state_types:
+                    if st == StateType.MAMBA:
+                        state_indices.append(_mamba_payload())
+                    elif st == StateType.SWA:
+                        state_indices.append(_swa_payload())
+                    elif st == StateType.DSA:
+                        state_indices.append(_dsa_payload())
+                    elif st == StateType.MINIMAX_INDEX_K:
+                        # Index rows live at the same loc as main KV on the same
+                        # page_size, so reuse the full-seq page-ids.
+                        state_indices.append(_dsa_payload())
+                    elif st == StateType.SWA_RING:
+                        state_indices.append(_swa_ring_payload())
+                    else:
+                        state_indices.append(None)
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):

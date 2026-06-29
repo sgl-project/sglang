@@ -6,6 +6,7 @@ import numpy as np
 import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
@@ -17,8 +18,26 @@ from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
+# DSV4-on-NPU per-pool components; sent via the same _send_kvcache_generic
+# (page-indexed) path as SWA.
+_DSV4_KVCACHE_STATE_TYPES = (
+    StateType.DSV4_SWA,
+    StateType.DSV4_C4,
+    StateType.DSV4_C128,
+    StateType.DSV4_INDEXER,
+    StateType.DSV4_C4_STATE,
+    StateType.DSV4_C128_STATE,
+)
+
 
 class AscendKVManager(MooncakeKVManager):
+    def _is_generic_kvcache_state_type(self, st: StateType) -> bool:
+        # DSV4 per-pool components also use the page-indexed send path.
+        return (
+            super()._is_generic_kvcache_state_type(st)
+            or st in _DSV4_KVCACHE_STATE_TYPES
+        )
+
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()
