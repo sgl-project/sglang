@@ -610,6 +610,16 @@ class TransformersBase(nn.Module):
             else True
         )
 
+        # Transformers v5 no longer sets pad/bos/eos token IDs to None by default
+        # on PretrainedConfig — they are only present when the config.json contains
+        # them. Trust-remote-code models written for v4 may access these attributes
+        # directly (e.g. `config.pad_token_id`) and crash with AttributeError when
+        # the field is absent. Restore the v4 default-None behavior here so all
+        # trust_remote_code models see a consistent config surface.
+        for _token_attr in ("pad_token_id", "bos_token_id", "eos_token_id"):
+            if not hasattr(self.config, _token_attr):
+                setattr(self.config, _token_attr, None)
+
         # Initialize on meta device to avoid premature GPU allocation
         self.text_config._attn_implementation = "sglang"
         if supports_backend:
