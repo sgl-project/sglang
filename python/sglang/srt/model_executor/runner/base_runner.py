@@ -254,7 +254,12 @@ class BaseRunner(ABC):
     def _should_run_flashinfer_autotune(
         self, *, for_speculative_draft: bool = False
     ) -> bool:
-        """Check if flashinfer autotune should be run."""
+        """Return whether this runner should run FlashInfer autotune.
+
+        In speculative mode, the default call is for target-worker warmup and
+        returns True only for target workers. Draft graph-capture paths pass
+        for_speculative_draft=True, which returns True only for draft workers.
+        """
         mr = self.model_runner
         if str(mr.device).split(":")[0] != "cuda":
             return False
@@ -471,10 +476,9 @@ class BaseRunner(ABC):
         The PP-parallel DeepGEMM warmup sweeps batch sizes far larger than any
         runner's max_bs (up to ~n_sms*block_m), so no pre-allocated runner buffer
         set fits; it builds one here and hands it to _dummy_run (reused across the
-        sweep; _dummy_run slices it per shape). The flashinfer autotune does NOT
-        use this -- it reuses an existing runner's buffers via _autotune_buffers
-        (the eager input registry, or the decode cuda-graph runner's captured
-        buffers).
+        sweep; _dummy_run slices it per shape). Eager FlashInfer autotune also
+        allocates decode-shaped scratch buffers here. Decode cuda-graph autotune
+        reuses the captured runner buffers instead.
         """
         mr = self.model_runner
         return _allocate_decode_buffers(
