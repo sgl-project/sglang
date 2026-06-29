@@ -191,6 +191,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    dst_kv_item_lens: List[int]
 
     @property
     def engine_key(self) -> str:
@@ -218,6 +219,14 @@ class KVArgsRegisterInfo:
             if len(payload) > 12 and payload[12]
             else []
         )
+        # Per-layer KV item lens (payload[13]); falls back to broadcasting
+        # the scalar dst_kv_item_len across every dst KV descriptor when
+        # the sender is older and does not include this slot.
+        dst_kv_item_lens = (
+            list(struct.unpack(f"{len(payload[13]) // 4}I", payload[13]))
+            if len(payload) > 13 and len(payload[13]) > 0
+            else [dst_kv_item_len] * len(dst_kv_mem_descs)
+        )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -231,6 +240,7 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=dst_kv_item_len,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            dst_kv_item_lens=dst_kv_item_lens,
         )
 
 
@@ -753,11 +763,13 @@ class MoriKVManager(CommonKVManager):
         # Reuse grouped indices across all layers/tensors that share the same item length.
         return grouped_plan.materialize(item_len)
 
-    def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
+    def _build_tp_slice_config(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        src_item_len: int,
+        dst_item_len: int,
+    ) -> TPSliceConfig:
         page_size = self.kv_args.page_size
-
-        src_item_len = self.kv_args.kv_item_lens[0]
-        dst_item_len = peer_info.dst_kv_item_len
 
         bytes_per_token_src = src_item_len // page_size
         bytes_per_token_dst = dst_item_len // page_size
@@ -878,15 +890,29 @@ class MoriKVManager(CommonKVManager):
             )
         )
         statuses: List[TransferStatus] = []
-        kv_item_len = self.kv_args.kv_item_lens[0]
+        src_kv_item_lens = self.kv_args.kv_item_lens
+        dst_kv_item_lens = peer_info.dst_kv_item_lens
+        start_layer = self.kv_args.prefill_start_layer
+
+        def _layer_item_lens(src_idx: int, dst_idx: int) -> tuple[int, int]:
+            src_len = src_kv_item_lens[src_idx]
+            dst_len = dst_kv_item_lens[dst_idx] if dst_kv_item_lens else src_len
+            if src_len != dst_len:
+                raise ValueError(
+                    "MoRI requires matching src/dst KV item lens per layer: "
+                    f"src_idx={src_idx} ({src_len}) vs dst_idx={dst_idx} "
+                    f"({dst_len})"
+                )
+            return src_len, dst_len
 
         if self.is_mla_backend:
             src_descs, dst_descs, layers_current_pp_stage = (
                 self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
             for layer_id in range(layers_current_pp_stage):
+                src_item_len, _ = _layer_item_lens(layer_id, start_layer + layer_id)
                 layer_plan = self._build_contiguous_transfer_plan(
-                    grouped_plan, self.kv_args.kv_item_lens[layer_id]
+                    grouped_plan, src_item_len
                 )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
@@ -904,43 +930,66 @@ class MoriKVManager(CommonKVManager):
             dst_v_descs,
             layers_current_pp_stage,
         ) = self._get_mha_mem_desc_slices(peer_info.dst_kv_mem_descs)
+        # MHA KV item lens layout: K-layers first, then V-layers.
+        # Source has num_local_layers per side; destination spans the full
+        # decode-side model so K starts at start_layer and V starts at
+        # dst_total_layers + start_layer.
+        num_local_layers = layers_current_pp_stage
+        dst_total_layers = len(peer_info.dst_kv_mem_descs) // 2
+        k_src_off = 0
+        v_src_off = num_local_layers
+        k_dst_off = start_layer
+        v_dst_off = dst_total_layers + start_layer
 
         if peer_info.decode_tp_size != self.attn_tp_size:
-            tp_cfg = self._build_tp_slice_config(peer_info)
-            slice_plan = self._build_tp_slice_transfer_plan(
-                prefill_kv_indices, dst_kv_indices, tp_cfg
-            )
             for layer_id in range(layers_current_pp_stage):
+                k_src_len, k_dst_len = _layer_item_lens(
+                    k_src_off + layer_id, k_dst_off + layer_id
+                )
+                k_tp_cfg = self._build_tp_slice_config(peer_info, k_src_len, k_dst_len)
+                k_slice_plan = self._build_tp_slice_transfer_plan(
+                    prefill_kv_indices, dst_kv_indices, k_tp_cfg
+                )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
                         src_k_descs[layer_id],
                         dst_k_descs[layer_id],
-                        slice_plan,
+                        k_slice_plan,
                     )
+                )
+                v_src_len, v_dst_len = _layer_item_lens(
+                    v_src_off + layer_id, v_dst_off + layer_id
+                )
+                v_tp_cfg = self._build_tp_slice_config(peer_info, v_src_len, v_dst_len)
+                v_slice_plan = self._build_tp_slice_transfer_plan(
+                    prefill_kv_indices, dst_kv_indices, v_tp_cfg
                 )
                 statuses.extend(
                     self._submit_batch_transfer_plan(
                         src_v_descs[layer_id],
                         dst_v_descs[layer_id],
-                        slice_plan,
+                        v_slice_plan,
                     )
                 )
             return statuses
 
-        layer_plan = self._build_contiguous_transfer_plan(grouped_plan, kv_item_len)
         for layer_id in range(layers_current_pp_stage):
+            k_src_len, _ = _layer_item_lens(k_src_off + layer_id, k_dst_off + layer_id)
+            k_layer_plan = self._build_contiguous_transfer_plan(grouped_plan, k_src_len)
             statuses.extend(
                 self._submit_batch_transfer_plan(
                     src_k_descs[layer_id],
                     dst_k_descs[layer_id],
-                    layer_plan,
+                    k_layer_plan,
                 )
             )
+            v_src_len, _ = _layer_item_lens(v_src_off + layer_id, v_dst_off + layer_id)
+            v_layer_plan = self._build_contiguous_transfer_plan(grouped_plan, v_src_len)
             statuses.extend(
                 self._submit_batch_transfer_plan(
                     src_v_descs[layer_id],
                     dst_v_descs[layer_id],
-                    layer_plan,
+                    v_layer_plan,
                 )
             )
         return statuses
@@ -1641,6 +1690,9 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_state_dim_per_tensor = pack_int_lists(
             self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
+        packed_kv_item_lens = b"".join(
+            struct.pack("I", item_len) for item_len in self.kv_mgr.kv_args.kv_item_lens
+        )
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -1661,6 +1713,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        packed_kv_item_lens,
                     ]
                 )
 
