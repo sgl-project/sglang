@@ -1086,7 +1086,7 @@ class EmbeddingRequest(BaseModel):
 
 
 class EmbeddingObject(BaseModel):
-    embedding: List[float]
+    embedding: List[float] | Dict[int, float]
     index: int
     object: str = "embedding"
 
