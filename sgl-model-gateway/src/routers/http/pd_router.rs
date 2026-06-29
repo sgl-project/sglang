@@ -702,8 +702,53 @@ impl PDRouter {
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        let prefill_future = prefill_request.send();
+        let decode_future = decode_request.send();
+
+        tokio::pin!(prefill_future);
+        tokio::pin!(decode_future);
+
+        // Use select! instead of join! to detect prefill failure early.
+        // In PD disaggregation, if prefill fails, decode will hang forever
+        // waiting for KV cache that will never arrive. We must cancel decode
+        // and return the prefill error immediately.
+        let (prefill_result, decode_result) = tokio::select! {
+            prefill_res = &mut prefill_future => {
+                let prefill_failed = match &prefill_res {
+                    Ok(resp) => !resp.status().is_success(),
+                    Err(_) => true,
+                };
+                if prefill_failed {
+                    // Prefill failed - decode will hang forever waiting for KV
+                    // cache. Return prefill error immediately; dropping
+                    // decode_future on return cancels the pending request.
+                    error!(
+                        "Prefill failed, cancelling decode request to avoid hang. \
+                         prefill_url={}", prefill.url()
+                    );
+                    events::RequestReceivedEvent {}.emit();
+                    return match self
+                        .process_prefill_response(prefill_res, prefill.url(), false)
+                        .await
+                    {
+                        Err(error_response) => error_response,
+                        Ok((status, _)) => error::internal_error(
+                            "prefill_unexpected",
+                            format!(
+                                "Prefill status {} was not caught by process_prefill_response",
+                                status
+                            ),
+                        ),
+                    };
+                }
+                // Prefill succeeded, wait for decode normally
+                (prefill_res, decode_future.await)
+            }
+            decode_res = &mut decode_future => {
+                // Decode completed first (e.g. immediate error), wait for prefill
+                (prefill_future.await, decode_res)
+            }
+        };
 
         events::RequestReceivedEvent {}.emit();
 
