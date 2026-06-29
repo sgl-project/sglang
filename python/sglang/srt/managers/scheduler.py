@@ -3921,15 +3921,24 @@ class Scheduler(
         else:
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
-        for req in reqs:
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
-                # Abort method 3: set `to_finish`
-                # The request will still run one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
-                logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+        # In PP mode, there are multiple microbatches (running_mbs).
+        # abort_request is called with self.running_batch set to only one of them.
+        # We must also check all other microbatches to ensure the request is aborted.
+        mb_reqs = (
+            [reqs]
+            if not hasattr(self, "running_mbs")
+            else [mb.reqs for mb in self.running_mbs]
+        )
+        for reqs in mb_reqs:
+            for req in reqs:
+                if not req.finished() and (
+                    recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                ):
+                    # Abort method 3: set `to_finish`
+                    # The request will still run one decode forward pass.
+                    # Then we reuse all existing code to clean up the KV cache allocation.
+                    logger.debug(f"Abort running request. {req.rid=}")
+                    req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
