@@ -319,9 +319,9 @@ class TestDraftTailBufferControlBatchAndSnapshots(CustomTestCase):
             ),
             collect_stats=True,
         )
-        self.assertEqual(stats["commit_rids"], ["r"])
-        self.assertEqual(stats["committed_segment_lens_by_req"], [1])
-        self.assertEqual(stats["matched_tail_lens_by_req"], [1])
+        self.assertEqual(stats.commit_rids, ["r"])
+        self.assertEqual(stats.committed_segment_lens, [1])
+        self.assertEqual(stats.matched_tail_lens, [1])
         self.assertEqual(buf.get_committed_len("r"), 1)
         # Close via control batch removes the state.
         buf.apply_control_batch(
@@ -472,10 +472,10 @@ class TestDraftTailBufferPendingEdgeCases(CustomTestCase):
             ),
             collect_stats=True,
         )
-        self.assertEqual(stats["pending_expected_lens_before_by_req"], [1])
-        self.assertEqual(stats["pending_expected_added_by_req"], [1])
-        self.assertEqual(stats["pending_expected_lens_after_by_req"], [2])
-        self.assertEqual(stats["matched_tail_lens_by_req"], [0])
+        self.assertEqual(stats.pending_expected_lens_before, [1])
+        self.assertEqual(stats.pending_expected_added, [1])
+        self.assertEqual(stats.pending_expected_lens_after, [2])
+        self.assertEqual(stats.matched_tail_lens, [0])
         self.assertEqual(buf.get_committed_len("r"), 1)
         # The drafter then catches up and confirms both queued tokens in order.
         buf.append_draft_stream_batch(
@@ -610,10 +610,10 @@ class TestDraftTailBufferMultiRequest(CustomTestCase):
             ),
             collect_stats=True,
         )
-        self.assertEqual(stats["commit_rids"], ["a", "b"])
-        self.assertEqual(stats["committed_segment_lens_by_req"], [1, 2])
-        self.assertEqual(stats["matched_tail_lens_by_req"], [1, 1])
-        self.assertEqual(stats["pending_expected_lens_after_by_req"], [0, 1])
+        self.assertEqual(stats.commit_rids, ["a", "b"])
+        self.assertEqual(stats.committed_segment_lens, [1, 2])
+        self.assertEqual(stats.matched_tail_lens, [1, 1])
+        self.assertEqual(stats.pending_expected_lens_after, [0, 1])
         self.assertEqual(buf.get_committed_len("a"), 1)
         self.assertEqual(buf.get_committed_len("b"), 1)
 
