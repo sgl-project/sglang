@@ -43,6 +43,18 @@ if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
 elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
     pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
 
+# SM120 (Blackwell desktop / RTX PRO 6000) has no Hopper WGMMA. tilelang would
+# otherwise emit wgmma (tl::wait_wgmma) for these gemms and fail to compile, so
+# force the MMA path on SM120. Empty (no-op) on every other architecture, so
+# Hopper/SM100 behavior is unchanged. Merge `**_SM120_WGMMA_OFF` into each
+# kernel's pass_configs.
+from sglang.srt.utils import is_sm120_supported as _is_sm120_supported
+
+_SM120_WGMMA_OFF = {}
+if _is_sm120_supported() and hasattr(tilelang.PassConfigKey, "TL_DISABLE_WGMMA"):
+    _SM120_WGMMA_OFF[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
+    pass_configs[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
+
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -255,6 +267,7 @@ def fp8_index(
 @tilelang.jit(
     out_idx=[-1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
@@ -435,6 +448,7 @@ def sparse_attention_fwd_kernel_v1(
         "--ptxas-options=-v,--register-usage-level=10",
         "-DNDEBUG",
     ],
+    pass_configs=_SM120_WGMMA_OFF,
 )  # type: ignore
 def sparse_attention_fwd_kernel_v2(
     num_heads: int,
@@ -820,6 +834,7 @@ def sparse_attention_fwd_kernel_v2(
 @tilelang.jit(
     out_idx=[-2, -1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
@@ -998,6 +1013,7 @@ def sparse_mla_fwd_decode_partial(
 @tilelang.jit(
     out_idx=[-1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
@@ -1581,6 +1597,7 @@ def _topk_length_sentinel(device: torch.device, batch: int) -> torch.Tensor:
 @tilelang.jit(
     out_idx=[-2, -1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -2222,6 +2239,7 @@ def dpsk_v4_fp8_partial_kernel(
 @tilelang.jit(
     out_idx=[-2, -1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
