@@ -1771,6 +1771,7 @@ class DeepseekV2AttentionMLA(
         )
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
+            and not get_global_server_args().enable_deterministic_inference
             and not self.is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
@@ -1985,6 +1986,24 @@ class DeepseekV2AttentionMLA(
         # bypass the adapter because it reads weight.T directly.
         lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
         if (
+            (not isinstance(hidden_states, tuple))
+            and get_global_server_args().enable_deterministic_inference
+            and not lora_active
+            and hidden_states.dim() == 2
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+        ):
+            from sglang.srt.batch_invariant_ops import matmul_persistent
+
+            proj = self.fused_qkv_a_proj_with_mqa
+            bias = None if proj.skip_bias_add else proj.bias
+            qkv_latent = matmul_persistent(
+                hidden_states.contiguous(),
+                proj.weight.t(),
+                bias=bias,
+            )
+        elif (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
