@@ -740,8 +740,10 @@ class Envs:
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
 
-    # Breakable CUDA Graph
+    # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
+    SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)

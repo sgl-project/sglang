@@ -247,9 +247,10 @@ class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
 
-    def __init__(self) -> None:
-        self._segments: list[torch.cuda.CUDAGraph] = []
+    def __init__(self, deduped_cuda_graph=None) -> None:
+        self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
+        self._deduped_cuda_graph = deduped_cuda_graph
 
     def replay(self) -> None:
         stream = torch.cuda.current_stream()
@@ -261,6 +262,16 @@ class BreakableCUDAGraph:
                     self._break_fns[i]()
         finally:
             _current_stream_var.reset(token)
+
+    def _append_segment(
+        self, graph: torch.cuda.CUDAGraph, needs_instantiate: bool
+    ) -> None:
+        if self._deduped_cuda_graph is not None:
+            self._segments.append(self._deduped_cuda_graph.register(graph))
+            return
+        if needs_instantiate:
+            graph.instantiate()
+        self._segments.append(graph)
 
 
 class BreakableCUDAGraphCapture:
@@ -292,6 +303,8 @@ class BreakableCUDAGraphCapture:
         self._capture_token = None
         self._stream_token = None
         self._forked_token = None
+        self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._current_graph_needs_instantiate = False
 
     def __enter__(self):
         _install_wait_stream_hook()
@@ -320,11 +333,16 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
-        graph = torch.cuda.CUDAGraph()
+        try:
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            self._current_graph_needs_instantiate = True
+        except TypeError:
+            graph = torch.cuda.CUDAGraph()
+            self._current_graph_needs_instantiate = False
         graph.capture_begin(
             pool=self._pool, capture_error_mode=self._capture_error_mode
         )
-        self.cuda_graph._segments.append(graph)
+        self._current_graph = graph
 
     def _end_current_segment(self) -> None:
         # Auto-join any side streams forked during this segment but not joined.
@@ -336,7 +354,12 @@ class BreakableCUDAGraphCapture:
                 if _is_stream_capturing(side):
                     _original_wait_stream(main_stream, side)
             forked.clear()
-        self.cuda_graph._segments[-1].capture_end()
+        graph = self._current_graph
+        assert graph is not None
+        graph.capture_end()
+        self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
+        self._current_graph = None
+        self._current_graph_needs_instantiate = False
 
 
 @eager_on_graph(True)
