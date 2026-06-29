@@ -133,4 +133,5 @@ class Mixer2RMSNormGated(MultiPlatformOp):
             group_size=self.group_size,
             norm_before_gate=False,
             is_rms_norm=True,
+            group_size=self.group_size,
         )
