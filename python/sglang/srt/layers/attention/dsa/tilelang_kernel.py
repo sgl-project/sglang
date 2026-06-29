@@ -1,4 +1,5 @@
 import functools
+import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -50,10 +51,17 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 # kernel's pass_configs.
 from sglang.srt.utils import is_sm120_supported as _is_sm120_supported
 
+_IS_SM120 = _is_sm120_supported()
 _SM120_WGMMA_OFF = {}
-if _is_sm120_supported() and hasattr(tilelang.PassConfigKey, "TL_DISABLE_WGMMA"):
+if _IS_SM120 and hasattr(tilelang.PassConfigKey, "TL_DISABLE_WGMMA"):
     _SM120_WGMMA_OFF[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
     pass_configs[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
+
+# SM120 (RTX PRO 6000) caps dynamic shared memory at ~100 KB, vs 228 KB on
+# Hopper/SM100 that the DSA attention kernel was tuned for (block_I=64 needs
+# ~166 KB). Use a smaller K block on SM120 so the kernel fits; env-overridable
+# for tuning (must divide topk and keep topk/block_I even).
+_SM120_DSA_BLOCK_I = int(os.environ.get("SGLANG_SM120_DSA_BLOCK_I", "32"))
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
@@ -1412,8 +1420,10 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
+        # SM120 has ~100 KB smem; shrink the K block so the kernel fits.
+        _kw = {"block_I": _SM120_DSA_BLOCK_I} if _IS_SM120 else {}
         kernel = sparse_attention_fwd_kernel_v2(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **_kw
         )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
