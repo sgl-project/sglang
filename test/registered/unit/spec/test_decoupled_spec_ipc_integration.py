@@ -13,6 +13,7 @@ from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
     DraftMeshMessage,
+    DraftMeshMessageType,
     DraftSync,
     DraftTailStreamOutput,
     DraftTailStreamOutputBatch,
@@ -283,8 +284,62 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                     )
                 ),
             )
+            # Router-level invariant: _route_* (driven here via _step) rejects a
+            # tail batch for the wrong verifier. Production containment of that
+            # raise by the daemon loop is covered by the _run tests below.
             with self.assertRaises(RuntimeError):
                 proxy._step()
+        finally:
+            v_tp.close()
+            d_tp.close()
+
+    def test_proxy_run_terminates_loudly_on_wrong_verifier_rank(self):
+        # The daemon loop must NOT let a router RuntimeError escape and silently
+        # kill the proxy for all requests: _run logs it and breaks cleanly.
+        # (Phase 5c will quarantine the offending request instead.)
+        _mesh, v_tp, d_tp, _buf, proxy, _token = self._wire()
+        try:
+            d_tp.send(
+                0,
+                DraftMeshMessage.from_tail_stream_output_batch(
+                    DraftTailStreamOutputBatch(
+                        outputs=[
+                            DraftTailStreamOutput(
+                                src_drafter_rank=0,
+                                dst_verifier_rank=9,
+                                request_id="r",
+                                base_committed_len=0,
+                                new_token_pos=0,
+                                new_token=1,
+                            )
+                        ]
+                    )
+                ),
+            )
+            # _run returns (breaks) instead of propagating, and logs loudly.
+            with self.assertLogs("sglang.srt.speculative.draft_proxy", level="ERROR"):
+                proxy._run()
+        finally:
+            v_tp.close()
+            d_tp.close()
+
+    def test_token_run_terminates_loudly_on_malformed_control(self):
+        # Mirror of the proxy test on the drafter side: a malformed control
+        # envelope makes _route_control_message raise; _run must contain it.
+        _mesh, v_tp, d_tp, _buf, _proxy, token = self._wire()
+        try:
+            # CONTROL_BATCH message_type with a None payload is malformed.
+            v_tp.send(
+                0,
+                DraftMeshMessage(
+                    message_type=DraftMeshMessageType.CONTROL_BATCH,
+                    control_batch=None,
+                ),
+            )
+            with self.assertLogs(
+                "sglang.srt.speculative.token_sync_thread", level="ERROR"
+            ):
+                token._run()
         finally:
             v_tp.close()
             d_tp.close()

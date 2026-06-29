@@ -13,6 +13,7 @@ runs ``_run()`` on a daemon thread.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 
@@ -28,6 +29,11 @@ from sglang.srt.speculative.decoupled_spec_transport import (
 )
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer
 
+logger = logging.getLogger(__name__)
+
+# The proxy has no send-side wakeup, so a freshly submitted control waits up to
+# this long before the loop services the send queue. This bounded (<=1ms) control
+# latency is intentional (matches the PR's poll(1ms)).
 DRAFT_PROXY_IDLE_WAIT_TIMEOUT_S = 0.001  # 1ms
 
 
@@ -67,6 +73,8 @@ class DraftProxyThread:
         self.draft_tail_buffer.close()
         if self._thread.is_alive():
             self._thread.join(timeout=1.0)
+            if self._thread.is_alive():
+                logger.warning("Draft proxy thread did not exit within 1.0s of close()")
         self.transport.close()
 
     def submit_control_batch(self, batch: DraftControlBatch) -> None:
@@ -89,6 +97,12 @@ class DraftProxyThread:
                 if not self._step():
                     self.transport.wait_for_input(DRAFT_PROXY_IDLE_WAIT_TIMEOUT_S)
             except TransportClosed:
+                break
+            except Exception:
+                # Without this, a routing error from _route_* escapes the loop
+                # and silently kills the proxy for all requests. Die loudly;
+                # phase 5c will quarantine the offending request instead.
+                logger.exception("Draft proxy thread terminating on unexpected error")
                 break
 
     def _drain_send_queue(self) -> bool:
@@ -118,6 +132,11 @@ class DraftProxyThread:
     def _route_tail_message(
         self, message: DraftMeshMessage
     ) -> DraftTailStreamOutputBatch:
+        """Validate + verifier-rank-check one tail stream batch.
+
+        Raises on a malformed envelope or a batch for the wrong verifier; ``_run``
+        catches that and terminates loudly (5c will quarantine instead).
+        """
         if not isinstance(message, DraftMeshMessage):
             raise RuntimeError(f"Unexpected draft proxy message: {message}")
         if (

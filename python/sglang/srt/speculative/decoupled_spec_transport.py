@@ -220,6 +220,9 @@ class FakeTransportMesh:
         with self._cond:
             if endpoint in self._dead:
                 # Drop: the target peer is dead. 5c decides how the sender reacts.
+                logger.debug(
+                    "FakeTransportMesh dropping message to dead endpoint %s", endpoint
+                )
                 return
             self._inboxes.setdefault(endpoint, deque()).append(message)
             self._cond.notify_all()
