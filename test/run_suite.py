@@ -300,8 +300,17 @@ def load_live_est(
     suite_est = partition_model.get("est", {}).get(suite)
     if not isinstance(suite_est, dict) or not suite_est:
         return None
+    # Per-file keys are repo-relative paths -> absolute (matches
+    # `CIRegistry.filename` shape produced by the suite glob). Bundle
+    # keys (`group:<key>` recorded by `_run_one_bundle`) are not
+    # filesystem paths and must be preserved verbatim so the bundle
+    # lookup in `_bundle_in_process_groups` can find them.
     return {
-        os.path.join(repo_root, relpath): float(elapsed)
+        (
+            relpath
+            if relpath.startswith("group:")
+            else os.path.join(repo_root, relpath)
+        ): float(elapsed)
         for relpath, elapsed in suite_est.items()
     }
 
