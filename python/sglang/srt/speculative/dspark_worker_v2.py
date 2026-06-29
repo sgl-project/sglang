@@ -282,6 +282,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_hidden = raw if isinstance(raw, torch.Tensor) else raw.hidden_states
         if block_hidden is None:
             raise RuntimeError("DSpark draft model returned no block hidden states.")
+        block_hidden = block_hidden[: bs * int(self.block_size)]
         return block_hidden.view(bs, int(self.block_size), -1)
 
     def _refine_block_markov(

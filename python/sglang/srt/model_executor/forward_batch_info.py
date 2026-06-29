@@ -1386,6 +1386,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self._original_batch_size is not None:
             self.batch_size = self._original_batch_size
         bs = self.batch_size
+        if isinstance(logits_output, torch.Tensor):
+            return
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
