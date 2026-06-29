@@ -26,6 +26,9 @@ FROM ${SGLANG_IMAGE}
 ARG SGLANG_REPO=https://github.com/shivajid/sglang.git
 ARG SGLANG_BRANCH=sm120-glm5.2-fp8
 ARG SGLANG_DIR=/sgl-workspace/sglang
+# Bump to force a fresh git fetch (otherwise Docker caches the checkout layer and
+# rebuilds keep stale code). build_and_validate.sh passes a timestamp.
+ARG CACHEBUST=0
 
 # The official image installs sglang editable from ${SGLANG_DIR}; updating the
 # checkout there updates the imported code. Fall back gracefully if the layout
@@ -33,6 +36,7 @@ ARG SGLANG_DIR=/sgl-workspace/sglang
 RUN if [ -d "${SGLANG_DIR}/.git" ]; then \
         cd "${SGLANG_DIR}" && \
         git config --global --add safe.directory "${SGLANG_DIR}" && \
+        echo "cachebust=${CACHEBUST}" && \
         git fetch --depth=1 "${SGLANG_REPO}" "${SGLANG_BRANCH}" && \
         git checkout -B "${SGLANG_BRANCH}" FETCH_HEAD && \
         git log --oneline -3 ; \

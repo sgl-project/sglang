@@ -24,6 +24,7 @@ docker build -f Dockerfile \
   --build-arg SGLANG_IMAGE="${BASE_IMAGE}" \
   --build-arg SGLANG_REPO="${REPO}" \
   --build-arg SGLANG_BRANCH="${BRANCH}" \
+  --build-arg CACHEBUST="$(date +%s)" \
   -t "${IMAGE_TAG}" .
 
 if [ "${NO_RUN:-0}" = "1" ]; then
