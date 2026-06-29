@@ -256,13 +256,17 @@ def check_sm120_routing():
     """Validate dsa_backend's SM120 routing helper: fp8 KV (+ matching shapes)
     must route to the triton kernel (finite tensor), and bf16 KV must fall back
     (return None). This exercises the gate that selects triton during serving."""
-    print("\n=== [4/4] dsa_backend SM120 routing (_sm120_triton_sparse_mla) ===")
+    print("\n=== [4/4] SM120 attention routing (sm120_triton_sparse_mla) ===")
     import types
 
+    # Import from triton_sparse_mla (light module) rather than dsa_backend, which
+    # pulls in the flashinfer.comm chain that can fail at import in some images.
     try:
-        from sglang.srt.layers.attention.dsa_backend import _sm120_triton_sparse_mla
+        from sglang.srt.layers.attention.dsa.triton_sparse_mla import (
+            sm120_triton_sparse_mla as _sm120_triton_sparse_mla,
+        )
     except Exception as e:  # noqa: BLE001
-        print("SKIP: could not import dsa_backend routing helper:")
+        print("SKIP: could not import routing helper:")
         print(" ", repr(e))
         return None  # skipped, not a hard failure
 

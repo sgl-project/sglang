@@ -69,35 +69,11 @@ _IS_GFX95 = is_gfx95_supported()
 # regardless of __init__ ordering / partial patch application.
 _IS_SM120 = is_sm120_supported()
 
-
-def _sm120_triton_sparse_mla(layer, q_nope, q_rope, kv_cache, page_table_1):
-    """SM120 has no working tilelang sparse-attention kernel (it is Hopper-only:
-    166 KB smem / block_I=64 hardwired, exceeds SM120's ~100 KB). Use the portable
-    triton sparse-MLA kernel instead when shapes/dtype match (fp8 KV, 16 q-heads,
-    d_v=512, tail=64, topk=2048 -- i.e. GLM-5.2 absorbed MLA). Returns the attn
-    output, or None to fall back to the (tilelang) path.
-    """
-    if q_rope is None:
-        return None
-    if not (
-        kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-        and layer.tp_q_head_num == 16
-        and layer.v_head_dim == 512
-        and (layer.head_dim - layer.v_head_dim) == 64
-        and page_table_1.shape[-1] == 2048
-    ):
-        return None
-    from sglang.srt.layers.attention.dsa.triton_sparse_mla import triton_sparse_mla_fwd
-
-    return triton_sparse_mla_fwd(
-        q_nope=q_nope,
-        q_rope=q_rope,
-        kv=kv_cache,
-        indices=page_table_1.unsqueeze(1),
-        sm_scale=layer.scaling,
-        d_v=layer.v_head_dim,
-    )
-
+# SM120 DSA attention routing helper lives in triton_sparse_mla (a light module)
+# so tools can import it without pulling in the heavy dsa_backend import chain.
+from sglang.srt.layers.attention.dsa.triton_sparse_mla import (
+    sm120_triton_sparse_mla as _sm120_triton_sparse_mla,
+)
 
 if is_cuda():
     import deep_gemm

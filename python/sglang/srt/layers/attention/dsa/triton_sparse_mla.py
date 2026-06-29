@@ -158,3 +158,33 @@ def triton_sparse_mla_fwd(
         D_TAIL=d_tail,
     )
     return out.unsqueeze(0)
+
+
+def sm120_triton_sparse_mla(layer, q_nope, q_rope, kv_cache, page_table_1):
+    """SM120 has no working tilelang sparse-attention kernel (it is Hopper-only:
+    166 KB smem / block_I=64 hardwired, exceeds SM120's ~100 KB). Use this triton
+    sparse-MLA kernel instead when shapes/dtype match (fp8 KV, 16 q-heads,
+    d_v=512, tail=64, topk=2048 -- i.e. GLM-5.2 absorbed MLA). Returns the attn
+    output, or None to fall back to the (tilelang) path.
+
+    Lives here (not in dsa_backend) so it can be imported without pulling in the
+    heavy dsa_backend import chain (flashinfer.comm etc.).
+    """
+    if q_rope is None:
+        return None
+    if not (
+        kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        and layer.tp_q_head_num == 16
+        and layer.v_head_dim == 512
+        and (layer.head_dim - layer.v_head_dim) == 64
+        and page_table_1.shape[-1] == 2048
+    ):
+        return None
+    return triton_sparse_mla_fwd(
+        q_nope=q_nope,
+        q_rope=q_rope,
+        kv=kv_cache,
+        indices=page_table_1.unsqueeze(1),
+        sm_scale=layer.scaling,
+        d_v=layer.v_head_dim,
+    )
