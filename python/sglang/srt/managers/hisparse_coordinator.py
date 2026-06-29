@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple, Union
+from typing import Dict, List, NamedTuple, Optional, Union
 
 import torch
 
@@ -57,6 +57,7 @@ class HiSparseCoordinator:
         device: str,
         tp_group,
         host_to_device_ratio: int = 2,
+        shared_index_layers: Optional[List[bool]] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -185,6 +186,50 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
+
+        self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
+        assert len(self._is_shared_index_layer) == layer_num, (
+            f"shared_index_layers length {len(self._is_shared_index_layer)} "
+            f"!= KV pool layer_num {layer_num}"
+        )
+        self.enable_prefetch = any(self._is_shared_index_layer)
+
+        # anchor layer_id -> consecutive skip layers that reuse its index.
+        self._prefetch_groups: Dict[int, List[int]] = {}
+        # skip layer_id -> its position within its group
+        self._prefetch_slot = [0] * layer_num
+        if self.enable_prefetch:
+            anchor = None
+            for i, is_shared in enumerate(self._is_shared_index_layer):
+                if not is_shared:
+                    anchor = i  # compute layer; anchors the skip layers after it
+                else:
+                    assert anchor is not None, (
+                        f"shared-index (skip) layer {i} has no preceding compute "
+                        "layer; the model's index-topk pattern is invalid"
+                    )
+                    group = self._prefetch_groups.setdefault(anchor, [])
+                    self._prefetch_slot[i] = len(group)
+                    group.append(i)
+
+            max_group_size = max(len(g) for g in self._prefetch_groups.values())
+            self.prefetch_stream = device_module.Stream()
+            self._prefetch_events = [
+                device_module.Event() for _ in range(max_group_size)
+            ]
+            self.prefetch_device_locs = torch.full(
+                (max_group_size, max_num_req_slots, self.top_k),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            logger.info(
+                "HiSparse: shared-index prefetch enabled; %d anchor group(s), "
+                "%d skip layer(s) of %d total.",
+                len(self._prefetch_groups),
+                sum(self._is_shared_index_layer),
+                layer_num,
+            )
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -802,17 +847,20 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 
-    def swap_in_selected_pages(
+    def _run_swap_in_kernel(
         self,
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
     ) -> torch.Tensor:
-        """Swap selected top-k tokens into device memory and return their indices."""
         num_reqs = req_pool_indices.size(0)
-
-        top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        out_locs = (
+            self.prefetch_device_locs[self._prefetch_slot[layer_id]]
+            if self.enable_prefetch and self._is_shared_index_layer[layer_id]
+            else self.top_k_device_locs_buffer
+        )
+        top_k_indices = out_locs[:num_reqs]
         top_k_indices.fill_(-1)
 
         # todo, adjustable for performance
@@ -841,3 +889,46 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
         )
         return top_k_indices
+
+    def swap_in_selected_pages(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Swap selected top-k tokens into device memory and return their indices."""
+        if not self.enable_prefetch:
+            return self._run_swap_in_kernel(
+                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+            )
+
+        num_reqs = req_pool_indices.size(0)
+        if self._is_shared_index_layer[layer_id]:
+            # Skip layer: wait for its prefetched swap-in, then return the slots.
+            slot = self._prefetch_slot[layer_id]
+            self._prefetch_events[slot].wait(device_module.current_stream())
+            return self.prefetch_device_locs[slot][:num_reqs]
+
+        # Anchor (compute) layer: swap in synchronously, then prefetch its skips.
+        anchor_locs = self._run_swap_in_kernel(
+            req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+        )
+        group = self._prefetch_groups.get(layer_id)
+        if group:
+            # Fork: the prefetch stream must observe the shared index (produced on
+            # the current stream by the indexer) before reading it.
+            self.prefetch_stream.wait_stream(device_module.current_stream())
+            # Each skip layer reruns the full (plan + IO) swap-in kernel. Splitting
+            # plan from IO would drop the redundant per-layer planning, but
+            # benchmarks show that overhead is small and overlapped, so the simpler
+            # fused path is kept; revisit if planning ever dominates.
+            with device_module.stream(self.prefetch_stream):
+                for skip_layer in group:
+                    self._run_swap_in_kernel(
+                        req_pool_indices, compressed_seq_lens, top_k_result, skip_layer
+                    )
+                    self._prefetch_events[self._prefetch_slot[skip_layer]].record(
+                        self.prefetch_stream
+                    )
+        return anchor_locs
