@@ -14,6 +14,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from http import HTTPStatus
+from multiprocessing import Queue
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
@@ -35,6 +36,7 @@ from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     video_meta_attrs_for,
 )
+from sglang.srt.disaggregation.image_loader import _MultiImageProcessingLoader
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -74,6 +76,7 @@ from sglang.srt.utils.network import (
     get_local_ip_auto,
     get_zmq_socket,
 )
+from sglang.srt.utils.nvtx_utils import profile_range as nvtx_range
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +101,44 @@ ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
 # if the batch worker stalls (NCCL hang, dead worker proc, etc.).
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
+
+# Overlapped image loading: a pool of worker processes pulls collected batches
+# off ``image_processing_queue``, loads/decodes their images off the GPU path,
+# and pushes the loaded payload onto ``image_processed_queue`` so a separate
+# event-loop thread can run the GPU encode while the next batch is still loading.
+IMAGE_LOADER_NUM_WORKERS = envs.SGLANG_ENCODER_IMAGE_LOADER_WORKERS.get()
+image_processing_queue: "Queue" = Queue(maxsize=65535)
+image_processed_queue: "Queue" = Queue(maxsize=65535)
+
+
+def _image_loader_worker(input_queue: "Queue", output_queue: "Queue") -> None:
+    """Loader-process entrypoint: decode a batch's images off the GPU path.
+
+    Runs in each ``_MultiImageProcessingLoader`` worker process. Pulls flattened
+    image references for one collected batch, decodes them, and forwards the
+    decoded images (in the same flattened order) back to the scheduler. Decode
+    failures are propagated as an exception payload so the consumer can fail the
+    batch's futures instead of hanging.
+
+    This is a module-level function (not a bound method) so it pickles cleanly
+    into the worker processes under spawn/forkserver start methods.
+    """
+    while True:
+        flat_refs, images_per_request, batch_id = input_queue.get()
+        try:
+            loaded = []
+            for ref in flat_refs:
+                if isinstance(ref, dict):
+                    loaded.append(ref)
+                    continue
+                img, _ = load_image(ref, False)
+                if not isinstance(img, torch.Tensor) and img.mode != "RGB":
+                    img = img.convert("RGB")
+                loaded.append(img)
+            output_queue.put((loaded, images_per_request, batch_id))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Image loader worker failed for batch {batch_id}: {e}")
+            output_queue.put((e, images_per_request, batch_id))
 
 
 class MMError(Exception):
@@ -1420,12 +1461,12 @@ class MMEncoder:
 
         return normalized
 
-    async def _process_mm_items(self, mm_items, modality):
+    async def _process_mm_items(self, mm_items, modality, preloaded_items=None):
         model_preprocessor = getattr(self.model, "preprocess_mm_for_encoder", None)
 
         if modality == Modality.IMAGE:
             processor_input = await self._process_image_items(
-                mm_items, model_preprocessor
+                mm_items, model_preprocessor, preloaded_images=preloaded_items
             )
         elif modality == Modality.VIDEO:
             processor_input = await self._process_video_items(
@@ -1442,10 +1483,17 @@ class MMEncoder:
         get_feature_method = getattr(target, f"get_{modality.name.lower()}_feature")
         return processor_input, get_feature_method
 
-    async def _process_image_items(self, mm_items, model_preprocessor):
+    async def _process_image_items(
+        self, mm_items, model_preprocessor, preloaded_images=None
+    ):
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
-        images = await self._flatten_and_load_images(mm_items)
+        # Loader processes already decoded the images (flattened in the same
+        # order as _flatten_nested_items); skip the synchronous load step.
+        if preloaded_images is not None:
+            images = preloaded_images
+        else:
+            images = await self._flatten_and_load_images(mm_items)
         if model_preprocessor:
             return model_preprocessor(images, Modality.IMAGE, self.vision_config)
         image_config = self.vision_config.get("image", {})
@@ -1975,9 +2023,21 @@ class MMEncoder:
         )
 
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self,
+        requests: List[dict],
+        modality: Modality,
+        preloaded_images: Optional[List] = None,
+        images_per_request: Optional[List[int]] = None,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
-        """Cross-request encoder fusion (image/audio). No cache path."""
+        """Cross-request encoder fusion (image/audio). No cache path.
+
+        ``preloaded_images`` (rank-0 only) are images already decoded by the
+        loader processes, flattened in the same order as ``_flatten_nested_items``
+        would produce, letting this rank skip the synchronous load step. TP
+        workers receive the same request batch over ZMQ without preloaded images
+        and load them inline; both paths produce identical grids so the
+        collective broadcast stays aligned.
+        """
         # items_per_req counts grid entries (post-expansion) so per-request
         # slicing of grid_dim/final_slices stays aligned for processors that
         # expand one leaf into multiple grids (e.g. Kimi-VL/K25 dict-of-images).
@@ -1989,7 +2049,9 @@ class MMEncoder:
         total = sum(items_per_req)
 
         try:
-            mm_inputs, get_feat = await self._process_mm_items(flat_items, modality)
+            mm_inputs, get_feat = await self._process_mm_items(
+                flat_items, modality, preloaded_items=preloaded_images
+            )
         except NotImplementedError as e:
             return self._batch_set_error(
                 requests, modality, InternalError(f"Not implemented error: {e}")
@@ -2272,12 +2334,34 @@ class EncoderScheduler:
         self.request_timeout = max(1.0, float(request_timeout))
         self.pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
+        # batch_id -> (group, modality, start_time) for batches whose images are
+        # being loaded out-of-process. process_batch_separate looks them back up
+        # once the loaded payload arrives on image_processed_queue.
+        self.batch_info_map: Dict = {}
+        self.image_loader: Optional[_MultiImageProcessingLoader] = None
 
     def start(self) -> None:
         if self._worker_task is None:
-            self._worker_task = asyncio.create_task(self._batch_worker())
+            # Spawn the loader process pool that decodes images off the GPU path.
+            self.image_loader = _MultiImageProcessingLoader(
+                IMAGE_LOADER_NUM_WORKERS,
+                _image_loader_worker,
+                image_processing_queue,
+                image_processed_queue,
+            )
+            self._worker_task = asyncio.create_task(
+                self._batch_worker(image_processing_queue)
+            )
+            # Run the GPU-encode stage on its own event loop in a worker thread so
+            # that the next batch's images keep loading (in the loader processes)
+            # while the current batch is encoding on the GPU.
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(
+                None, self.preprocess_batch_thread, image_processed_queue
+            )
             logger.info(
-                f"EncoderScheduler started with max_batch_size={self.max_batch_size}"
+                f"EncoderScheduler started with max_batch_size={self.max_batch_size}, "
+                f"image_loader_workers={IMAGE_LOADER_NUM_WORKERS}"
             )
 
     async def stop(self) -> None:
@@ -2319,18 +2403,26 @@ class EncoderScheduler:
                 break
         return batch
 
-    async def _batch_worker(self) -> None:
+    async def _batch_worker(self, loader_queue: "Queue") -> None:
         while True:
             batch: List[PendingRequest] = []
             try:
-                batch = await self._collect_batch()
+                with nvtx_range("encoder._collect_batch"):
+                    batch = await self._collect_batch()
                 groups: Dict[Modality, List[PendingRequest]] = defaultdict(list)
                 for p in batch:
                     groups[
                         Modality.from_str(p.request.get("modality", "image"))
                     ].append(p)
                 for modality, group in groups.items():
-                    await self._dispatch_group(group, modality)
+                    if modality == Modality.IMAGE:
+                        # Offload image decoding to the loader processes; the GPU
+                        # encode runs later on process_batch_separate's loop.
+                        self._enqueue_for_loading(loader_queue, group, modality)
+                    else:
+                        # AUDIO loading is cheap and VIDEO can't fuse, so keep
+                        # them on the inline path.
+                        await self._dispatch_group(group, modality)
             except asyncio.CancelledError:
                 for p in batch:
                     if not p.future.done():
@@ -2343,6 +2435,91 @@ class EncoderScheduler:
                 for p in batch:
                     if not p.future.done():
                         p.future.set_exception(e)
+
+    def _enqueue_for_loading(
+        self,
+        loader_queue: "Queue",
+        group: List[PendingRequest],
+        modality: Modality,
+    ) -> None:
+        """Hand a collected group off to the loader processes.
+
+        The flattened image references for every request are pushed onto
+        ``loader_queue`` keyed by a fresh ``batch_id``; the group itself is
+        stashed in ``batch_info_map`` so process_batch_separate can pair the
+        loaded images back up with their pending futures.
+        """
+        # Drop structurally-bad requests up front so the flattened image refs
+        # stay aligned with the validated group that process_batch_separate
+        # eventually dispatches. (Mirrors the validation in _dispatch_group.)
+        valid: List[PendingRequest] = []
+        for p in group:
+            err = self._validate_request_shape(p.request)
+            if err is None:
+                valid.append(p)
+                continue
+            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
+            if not p.future.done():
+                p.future.set_exception(BadRequestError(err))
+        if not valid:
+            return
+        group = valid
+
+        batch_id = uuid.uuid4()
+        # Flatten per-request image references, tracking how many belong to each
+        # request so the loaded images can be regrouped after decoding.
+        flat_refs: List = []
+        images_per_request: List[int] = []
+        for p in group:
+            leaves = MMEncoder._flatten_nested_items(p.request["mm_items"])
+            images_per_request.append(len(leaves))
+            flat_refs.extend(leaves)
+        self.batch_info_map[batch_id] = (group, modality, time.time())
+        loader_queue.put((flat_refs, images_per_request, batch_id))
+
+    def preprocess_batch_thread(self, output_queue: "Queue") -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.process_batch_separate(output_queue))
+        finally:
+            loop.close()
+
+    async def process_batch_separate(self, output_queue: "Queue") -> None:
+        """Consume loaded image batches and run the GPU encode for each.
+
+        Runs on its own event loop (preprocess_batch_thread) so that decoding the
+        next batch's images overlaps with the current batch's GPU forward pass.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                with nvtx_range("encoder.process_batch_separate"):
+                    payload = await loop.run_in_executor(None, output_queue.get)
+                    loaded_images, images_per_request, batch_id = payload
+                    info = self.batch_info_map.pop(batch_id, None)
+                    if info is None:
+                        logger.error(f"Unknown batch_id from loader: {batch_id}")
+                        continue
+                    group, modality, _start = info
+                    # A loader worker reports a decode failure by sending the
+                    # exception in place of the loaded images; fail the batch's
+                    # futures instead of dispatching to the GPU.
+                    if isinstance(loaded_images, Exception):
+                        for p in group:
+                            if not p.future.done():
+                                p.future.set_exception(loaded_images)
+                        continue
+                    await self._dispatch_group(
+                        group,
+                        modality,
+                        preloaded_images=loaded_images,
+                        images_per_request=images_per_request,
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Error in EncoderScheduler loader consumer: {e}", exc_info=True
+                )
 
     @staticmethod
     def _validate_request_shape(req: dict) -> Optional[str]:
@@ -2364,7 +2541,11 @@ class EncoderScheduler:
         return None
 
     async def _dispatch_group(
-        self, group: List[PendingRequest], modality: Modality
+        self,
+        group: List[PendingRequest],
+        modality: Modality,
+        preloaded_images: Optional[List] = None,
+        images_per_request: Optional[List[int]] = None,
     ) -> None:
         # Video can't fuse (per-video preprocess kwargs vary).
         if modality not in _BATCHABLE_MODALITIES:
@@ -2373,19 +2554,24 @@ class EncoderScheduler:
 
         # Drop structurally-bad requests before broadcasting; otherwise TP
         # workers would join batch_encode collectives that rank-0 has already
-        # abandoned.
-        valid: List[PendingRequest] = []
-        for p in group:
-            err = self._validate_request_shape(p.request)
-            if err is None:
-                valid.append(p)
-                continue
-            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
-            if not p.future.done():
-                p.future.set_exception(BadRequestError(err))
-        if not valid:
-            return
-        group = valid
+        # abandoned. When images were preloaded out-of-process, _enqueue_for_loading
+        # already validated and aligned the group, so skip re-validation to keep
+        # preloaded_images / images_per_request aligned with `group`.
+        if preloaded_images is None:
+            valid: List[PendingRequest] = []
+            for p in group:
+                err = self._validate_request_shape(p.request)
+                if err is None:
+                    valid.append(p)
+                    continue
+                logger.error(
+                    f"Dropping req_id={p.request.get('req_id')} from batch: {err}"
+                )
+                if not p.future.done():
+                    p.future.set_exception(BadRequestError(err))
+            if not valid:
+                return
+            group = valid
 
         requests = [p.request for p in group]
         start = time.time()
@@ -2402,7 +2588,12 @@ class EncoderScheduler:
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
 
         try:
-            results = await self.encoder.batch_encode(requests, modality)
+            results = await self.encoder.batch_encode(
+                requests,
+                modality,
+                preloaded_images=preloaded_images,
+                images_per_request=images_per_request,
+            )
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
