@@ -1,0 +1,130 @@
+name: Nightly PD-Disagg Cross-Node Bench (AMD MI35x)
+
+# Phase 1: workflow_dispatch only. Run by hand from the GitHub UI after
+# you've SSH'd onto a runner host that has keys + network reach into the two
+# Conductor MI35x nodes (Pensando RoCE fabric). runs-on stays `arc-mi300x-pd`
+# (the future ARC scale set name) so the workflow file doesn't need editing
+# when we cut over.
+#
+# NOTE: Slurm-gated target nodes (pam_slurm_adopt) need an active allocation
+# before the runner can SSH into them.
+#
+# Phase 2: enable the cron stanza once the runner is wired up and the first
+# few manual runs are clean.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefill_node:
+        description: 'SSH target (user@ip) for prefill node'
+        required: true
+        type: string
+      decode_node:
+        description: 'SSH target (user@ip) for decode node'
+        required: true
+        type: string
+      prefill_ip:
+        description: 'RoCE-routable IP of prefill node'
+        required: true
+        type: string
+      decode_ip:
+        description: 'RoCE-routable IP of decode node'
+        required: true
+        type: string
+      container:
+        description: 'docker container name on both nodes'
+        required: true
+        type: string
+        default: 'mori_bench'
+      remote_workdir:
+        description: 'workdir inside container (cache_bench.py is pushed here)'
+        required: true
+        type: string
+        default: '/sgl-workspace/ci_pd'
+      model_path:
+        description: 'model path inside container (MXFP4 for MI35x/gfx950)'
+        required: false
+        type: string
+        default: '/data/models/DeepSeek-V4-Flash-MXFP4'
+      tp_size:
+        description: 'tensor-parallel size per role'
+        required: false
+        type: string
+        default: '8'
+      transfer_backend:
+        description: 'KV transfer backend (mooncake needs the #27730-bumped image)'
+        required: false
+        type: choice
+        default: 'mori'
+        options:
+          - mori
+          - mooncake
+      bench_conc:
+        description: 'cache_bench --max-concurrency'
+        required: false
+        type: string
+        default: '4'
+      bench_nprompts:
+        required: false
+        type: string
+        default: '32'
+      bench_outlen:
+        required: false
+        type: string
+        default: '200'
+
+  # schedule:
+  #   - cron: '0 7 * * *'   # enable once Phase 2 runner is stable
+
+concurrency:
+  group: nightly-pd-amd-crossnode
+  cancel-in-progress: false
+
+jobs:
+  crossnode-pd:
+    # Phase 1: change to a self-hosted label you can hand-trigger from. The
+    # important thing is that this host has SSH keys for prefill_node /
+    # decode_node and IP reachability to prefill_ip / decode_ip.
+    # Phase 2: once the ARC scale set is up, the label below picks it up.
+    runs-on: [self-hosted, arc-mi300x-pd]
+
+    timeout-minutes: 90
+
+    env:
+      PREFILL_NODE: ${{ inputs.prefill_node }}
+      DECODE_NODE:  ${{ inputs.decode_node }}
+      PREFILL_IP:   ${{ inputs.prefill_ip }}
+      DECODE_IP:    ${{ inputs.decode_ip }}
+      CONTAINER:    ${{ inputs.container }}
+      REMOTE_WORKDIR: ${{ inputs.remote_workdir }}
+      MODEL_PATH:     ${{ inputs.model_path }}
+      TP_SIZE:        ${{ inputs.tp_size }}
+      TRANSFER_BACKEND: ${{ inputs.transfer_backend }}
+      BENCH_CONC:     ${{ inputs.bench_conc }}
+      BENCH_NPROMPTS: ${{ inputs.bench_nprompts }}
+      BENCH_OUTLEN:   ${{ inputs.bench_outlen }}
+
+    steps:
+      - name: Checkout sglang
+        uses: actions/checkout@v4
+
+      - name: Sanity-check SSH to both target nodes
+        run: |
+          for tgt in "$PREFILL_NODE" "$DECODE_NODE"; do
+            ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 \
+              "$tgt" "echo reachable: \$(hostname); rocm-smi --showid | head -3"
+          done
+
+      - name: Run cross-node 1P1D benchmark
+        run: |
+          export RESULTS_DIR="${GITHUB_WORKSPACE}/results"
+          bash ci_bootstrap/scripts/run_cross_node_pd.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pd-crossnode-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
