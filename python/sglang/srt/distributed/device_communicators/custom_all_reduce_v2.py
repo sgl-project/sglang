@@ -12,7 +12,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
-from sglang.srt.distributed.device_communicators.custom_all_reduce_vmm_utils import (
+from sglang.srt.distributed.device_communicators.vmm_utils import (
     VmmGraphInputManager,
     is_vmm_pointer,
 )
