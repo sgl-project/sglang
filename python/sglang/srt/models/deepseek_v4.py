@@ -1734,12 +1734,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
 
+        clone_for_dspark_dp = (
+            is_dp_attention_enabled()
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_dspark()
+        )
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if clone_for_dspark_dp:
+                hidden_states = hidden_states.clone()
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
         # cross-layer fusion, and the final layer is completed in DeepseekV4Model.
+        if clone_for_dspark_dp:
+            hidden_states = hidden_states.clone()
         return hidden_states, residual, post, comb
 
 
