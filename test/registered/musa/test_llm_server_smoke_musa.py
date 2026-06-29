@@ -28,7 +28,7 @@ class TestMusaDeepSeekV2LiteChatServerSmoke(DefaultServerBase):
         served_model_name,
         "--attention-backend",
         "fa3",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "32",
         "--tp-size",
         "1",
