@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -139,6 +140,34 @@ class NextNDisabledConfig:
 NextNConfig = NextNEnabledConfig | NextNDisabledConfig
 
 
+# Regex to extract expert_id and projection name from weight names like
+# "model.layers.5.mlp.experts.42.gate_proj.weight" or "...experts.42.w1.input_scale"
+_EXPERT_WEIGHT_RE = re.compile(r"experts\.(\d+)\.([^.]+)\.")
+
+
+def _build_expert_proj_map(
+    expert_params_mapping: List[Tuple[str, str, int, str]],
+) -> Dict[str, Tuple[str, str]]:
+    """Build a dict mapping projection_name -> (param_name_prefix, shard_id).
+
+    Uses only the first expert's entries (expert_id=0) since all experts share
+    the same projection-to-param mapping.  For example:
+        "gate_proj" -> ("experts.w13_", "w1")
+        "down_proj" -> ("experts.w2_",  "w2")
+        "up_proj"   -> ("experts.w13_", "w3")
+    """
+    proj_map: Dict[str, Tuple[str, str]] = {}
+    for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+        if expert_id != 0:
+            continue
+        # weight_name looks like "experts.0.gate_proj."
+        parts = weight_name.split(".")
+        if len(parts) >= 3:
+            proj = parts[2]
+            proj_map[proj] = (param_name, shard_id)
+    return proj_map
+
+
 class DeepseekV2WeightLoaderMixin:
     """Mixin for loading weights in DeepSeek V2/V3 models."""
 
@@ -186,6 +215,10 @@ class DeepseekV2WeightLoaderMixin:
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
+
+        # Pre-build dict for O(1) expert projection lookup instead of O(N) scan.
+        expert_proj_map = _build_expert_proj_map(expert_params_mapping)
+        num_experts = self.config.n_routed_experts + self.num_fused_shared_experts
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
@@ -297,34 +330,39 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        if _is_npu:
-                            name = name.replace("weight_packed", "weight")
-                        name = name.replace(weight_name, param_name)
-                        if name not in params_dict:
-                            continue
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        maybe_executor_submit(
-                            executor=executor,
-                            futures=futures,
-                            use_async=use_async_loading,
-                            func=weight_loader,
-                            func_args=(
-                                param,
-                                loaded_weight,
-                                name,
-                            ),
-                            func_kwargs={
-                                "shard_id": shard_id,
-                                "expert_id": expert_id,
-                            },
-                        )
-                        break
-                    else:
+                    # Fast O(1) dict lookup for expert weights.
+                    expert_match = _EXPERT_WEIGHT_RE.search(name)
+                    matched_expert = False
+                    if expert_match:
+                        expert_id = int(expert_match.group(1))
+                        proj_name = expert_match.group(2)
+                        proj_entry = expert_proj_map.get(proj_name)
+                        if proj_entry is not None and expert_id < num_experts:
+                            param_name, shard_id = proj_entry
+                            weight_name = f"experts.{expert_id}.{proj_name}."
+                            if _is_npu:
+                                name = name.replace("weight_packed", "weight")
+                            name = name.replace(weight_name, param_name)
+                            if name in params_dict:
+                                param = params_dict[name]
+                                weight_loader = param.weight_loader
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(
+                                        param,
+                                        loaded_weight,
+                                        name,
+                                    ),
+                                    func_kwargs={
+                                        "shard_id": shard_id,
+                                        "expert_id": expert_id,
+                                    },
+                                )
+                                matched_expert = True
+                    if not matched_expert:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
