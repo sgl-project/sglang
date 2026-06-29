@@ -165,6 +165,29 @@ def parse_args():
         help="API format to use: 'sglang' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
+    # === Long-running stability benchmark options ===
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=0.0,
+        help="Total duration (seconds) for the long-running stability benchmark. "
+        "When > 0, the long-run mode is enabled: the benchmark stops immediately "
+        "once duration is reached; whenever a client finishes its session_rounds, "
+        "a new session is started (history is reset) so the load keeps going. "
+        "When = 0, the original behavior (stop after total_requests) is used.",
+    )
+    parser.add_argument(
+        "--min-session-rounds",
+        type=int,
+        default=5,
+        help="Minimum number of rounds per session in long-run mode (inclusive).",
+    )
+    parser.add_argument(
+        "--max-session-rounds",
+        type=int,
+        default=25,
+        help="Maximum number of rounds per session in long-run mode (inclusive).",
+    )
     return parser.parse_args()
 
 
@@ -210,6 +233,7 @@ class ReadyQueue:
 
 class WorkloadGenerator:
     def __init__(self, args):
+        self.args = args
         self.api_format = args.api_format
         self.model_path = args.model_path
 
@@ -230,6 +254,30 @@ class WorkloadGenerator:
 
         self.sent_requests = 0
         self.completed_requests = 0
+
+        # === Long-run mode flags ===
+        self.long_run = args.duration > 0
+        self.duration = args.duration
+        self.deadline = None  # set in run() based on start_time
+        if self.long_run:
+            if args.min_session_rounds < 1:
+                raise ValueError(
+                    f"--min-session-rounds must be >= 1, got {args.min_session_rounds}"
+                )
+            if args.min_session_rounds > args.max_session_rounds:
+                raise ValueError(
+                    f"--min-session-rounds ({args.min_session_rounds}) must be "
+                    f"<= --max-session-rounds ({args.max_session_rounds})"
+                )
+            self.min_session_rounds = args.min_session_rounds
+            self.max_session_rounds = args.max_session_rounds
+            # Long-run mode is primarily designed for the OpenAI chat format.
+            # The sglang format may also work but is not the main target.
+            if self.api_format != "openai":
+                print(
+                    "[WARN] long-run mode is designed for --api-format=openai. "
+                    "sglang mode may also work but is not the primary target."
+                )
 
         # Resolve per-client round counts
         min_rounds = args.min_rounds
@@ -359,7 +407,20 @@ class WorkloadGenerator:
         self.candidate_inputs = self.candidate_inputs[args.num_clients :]
 
         self.response_queue = queue.Queue()
-        self.pbar = tqdm(total=self.total_requests)
+        # In long-run mode, `total` is only a rough estimate used to render the
+        # progress bar; it is NOT used as a termination condition.
+        if self.long_run:
+            # Estimate: assume each request takes ~ 1 / request_rate seconds.
+            est_total = max(
+                1,
+                int(
+                    self.duration
+                    * max(self.request_rate, 1.0)
+                ),
+            )
+            self.pbar = tqdm(total=est_total, desc="long-run")
+        else:
+            self.pbar = tqdm(total=self.total_requests)
         self.performance_metrics = {
             "ttft": [],
             "itl": [],
@@ -385,12 +446,59 @@ class WorkloadGenerator:
         self.max_parallel = args.max_parallel
         self.output_length = args.output_length
 
+    def _stop(self):
+        """Stop predicate for long-run mode: stop as soon as deadline is hit."""
+        return (
+            self.long_run
+            and self.deadline is not None
+            and time.perf_counter() >= self.deadline
+        )
+
+    def _sample_one_prompt(self):
+        """Sample a new initial prompt on demand (used when starting a new
+        session in long-run mode)."""
+        return sample_random_requests(
+            input_len=self.args.request_length,
+            output_len=self.args.output_length,
+            num_prompts=1,
+            range_ratio=self.args.range_ratio,
+            tokenizer=self.tokenizer,
+            dataset_path=self.args.dataset_path,
+            random_sample=not self.args.disable_random_sample,
+            return_text=False,
+        )[0]
+
+    def _sample_one_sub_question(self):
+        """Sample one new sub-question on demand (used in long-run mode to
+        avoid exhausting the pre-generated sub-question pool)."""
+        sub_q_len = (
+            self.args.sub_question_input_length
+            if self.args.sub_question_input_length != 0
+            else self.args.request_length
+        )
+        return sample_random_requests(
+            input_len=sub_q_len,
+            output_len=self.args.output_length,
+            num_prompts=1,
+            range_ratio=self.args.range_ratio,
+            tokenizer=self.tokenizer,
+            dataset_path=self.args.dataset_path,
+            random_sample=not self.args.disable_random_sample,
+            return_text=False,
+        )[0]
+
     async def handle_request(self, item):
         client_id, payload = item
         try:
             response = await self.request_func(payload, self.url, self.pbar)
-            if self.pbar.n == self.pbar.total:
-                self.finished_time = time.perf_counter()
+            if self.long_run:
+                # Long-run mode: stop immediately when deadline is reached;
+                # use deadline (not pbar) as the terminating condition.
+                if self.finished_time is None and self._stop():
+                    self.finished_time = time.perf_counter()
+            else:
+                if self.pbar.n == self.pbar.total:
+                    self.finished_time = time.perf_counter()
             self.response_queue.put((client_id, response))
         except Exception as e:
             print(f"Request failed for client {client_id}: {e}")
@@ -402,6 +510,9 @@ class WorkloadGenerator:
     def request_sender(self):
         async def request_loop():
             while True:
+                # Long-run mode: exit immediately once deadline is reached.
+                if self._stop():
+                    break
                 if self.sent_requests - self.completed_requests < self.max_parallel:
                     new_request = self.ready_queue.pop()
                     if new_request:
@@ -411,7 +522,7 @@ class WorkloadGenerator:
                     await asyncio.sleep(0.05)
                     continue
 
-                if self.pbar.n == self.pbar.total:
+                if not self.long_run and self.pbar.n == self.pbar.total:
                     break
 
                 # Calculate Poisson-distributed wait time
@@ -436,10 +547,17 @@ class WorkloadGenerator:
         next_round_reqs = []
         current_barrier_round = 0
         barrier_round_completed = 0
+        # Use a shorter queue timeout in long-run mode so we can exit promptly
+        # once the deadline is reached.
+        get_timeout = 1 if self.long_run else 10
         while True:
+            # Long-run mode: exit immediately once deadline is reached;
+            # we no longer wait for in-flight responses.
+            if self.long_run and self._stop():
+                break
             try:
                 client_id, response = self.response_queue.get(
-                    timeout=10
+                    timeout=get_timeout
                 )  # Block until response is available
                 if not response.success:
                     print(f"Request failed for client {client_id}: {response.error}")
@@ -482,8 +600,62 @@ class WorkloadGenerator:
                 self.completed_requests += 1
 
                 client_total = self.client_records[client_id]["total_rounds"]
-                if self.client_records[client_id]["round"] < client_total:
-                    sub_q = self.sub_question_inputs.pop()
+                need_next_round = (
+                    self.client_records[client_id]["round"] < client_total
+                )
+                # Long-run mode: if the current session has reached its
+                # configured number of rounds, reset history and start a new
+                # session; otherwise just continue to the next round.
+                if self.long_run and not need_next_round and not self._stop():
+                    # === Reset session ===
+                    new_prompt = self._sample_one_prompt()
+                    new_prompt_ids = list(new_prompt.prompt)
+                    new_total = random.randint(
+                        self.min_session_rounds, self.max_session_rounds
+                    )
+                    if self.api_format == "openai":
+                        new_history = [
+                            {
+                                "role": "user",
+                                "content": self.tokenizer.decode(new_prompt_ids),
+                            }
+                        ]
+                        self.client_records[client_id] = {
+                            "round": 0,
+                            "history": new_history,
+                            "total_rounds": new_total,
+                        }
+                        new_req = (
+                            client_id,
+                            gen_payload_openai(
+                                new_history,
+                                new_prompt.output_len,
+                                self.model_path,
+                            ),
+                        )
+                    else:
+                        self.client_records[client_id] = {
+                            "round": 0,
+                            "history": new_prompt_ids,
+                            "total_rounds": new_total,
+                        }
+                        new_req = (
+                            client_id,
+                            gen_payload(
+                                new_prompt_ids,
+                                new_prompt.output_len,
+                                self.lora_path,
+                            ),
+                        )
+                    self.ready_queue.append(new_req)
+                    # already enqueued as round 1 of the new session
+                    need_next_round = False
+
+                if need_next_round:
+                    if self.long_run:
+                        sub_q = self._sample_one_sub_question()
+                    else:
+                        sub_q = self.sub_question_inputs.pop()
                     if self.api_format == "openai":
                         # Append sub-question as a new user message
                         sub_q_text = self.tokenizer.decode(list(sub_q.prompt))
@@ -537,7 +709,10 @@ class WorkloadGenerator:
                         current_barrier_round += 1
                         barrier_round_completed = 0
             except queue.Empty:
-                if self.pbar.n == self.pbar.total:
+                if self.long_run:
+                    if self._stop():
+                        break
+                elif self.pbar.n == self.pbar.total:
                     break
             except ValueError as e:
                 print(f"Error processing response for client {client_id}: {e}")
@@ -557,12 +732,19 @@ class WorkloadGenerator:
         response_thread = threading.Thread(target=self.response_handler, daemon=True)
 
         self.start_time = time.perf_counter()
+        if self.long_run:
+            self.deadline = self.start_time + self.duration
         request_thread.start()
         response_thread.start()
 
         request_thread.join()
         response_thread.join()
         self.pbar.close()
+
+        # Fallback: ensure finished_time is set in long-run mode in case
+        # neither of the two threads hit the assignment branch.
+        if self.finished_time is None:
+            self.finished_time = time.perf_counter()
 
         duration = self.finished_time - self.start_time
         sorted_ttft = sorted(self.performance_metrics["ttft"])
@@ -630,7 +812,12 @@ class WorkloadGenerator:
                     self.performance_metrics["generated_len"]
                 )
                 / duration,
-                "throughput": self.pbar.total / duration,
+                # Use the number of successfully completed requests (which is
+                # also what `total_requests` reports above) instead of
+                # `pbar.total`. In long-run mode `pbar.total` is just a rough
+                # estimate (duration * request_rate) used for the progress bar
+                # and does NOT reflect the actual completed throughput.
+                "throughput": len(self.performance_metrics["ttft"]) / duration,
                 "cache_hit_rate": (
                     0
                     if sum(self.performance_metrics["prompt_len"]) == 0
@@ -740,16 +927,30 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    if args.disable_auto_run:
+    if args.duration > 0:
+        # Long-run mode: single run with the user-specified rate; do NOT
+        # call flush_cache so that the system reaches/keeps a steady state.
+        print(
+            f"Long-run mode: duration={args.duration}s, "
+            f"clients={args.num_clients}, "
+            f"session_rounds=[{args.min_session_rounds}, {args.max_session_rounds}], "
+            f"rate={args.request_rate}"
+        )
+        request_rates = [args.request_rate]
+        auto_flush = False
+    elif args.disable_auto_run:
         print("Running with specified request rate...")
         request_rates = [args.request_rate]
+        auto_flush = True
     else:
         print("Auto-running with different request rates...")
         request_rates = [16, 14, 12, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+        auto_flush = True
 
     for rate in request_rates:
         args.request_rate = rate
-        requests.post(flush_cache_url)
-        time.sleep(1)
+        if auto_flush:
+           requests.post(flush_cache_url)
+           time.sleep(1)
         performance_data = WorkloadGenerator(args).run()
         log_to_jsonl_file(performance_data, args.log_file, tag=args.tag)
