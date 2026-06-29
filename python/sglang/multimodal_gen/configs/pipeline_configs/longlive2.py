@@ -16,7 +16,7 @@ logger = init_logger(__name__)
 class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
 
     is_causal: bool = True
-    task_type: ModelTaskType = ModelTaskType.T2V
+    task_type: ModelTaskType = ModelTaskType.TI2V
     vae_precision: str = "bf16"
 
     flow_shift: float | None = 5.0
@@ -49,7 +49,10 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
         )
         return adjusted_num_frames
 
+    def postprocess_image_latent(self, latent_condition, batch):
+        return latent_condition[:, :, :1]
+
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.vae_config.load_encoder = False
+        self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True

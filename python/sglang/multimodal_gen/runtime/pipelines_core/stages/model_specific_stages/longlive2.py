@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
     CausalDMDDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageVAEEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationSpec,
     LatentPreparationStage,
@@ -366,6 +369,14 @@ class LongLive2TextEncodingStage(TextEncodingStage):
             batch.prompt = original_prompt
 
 
+class LongLive2ImageVAEEncodingStage(ImageVAEEncodingStage):
+    def preprocess(self, image):
+        image = super().preprocess(image)
+        if image.ndim == 5:
+            image = image.squeeze(2)
+        return image
+
+
 class LongLive2LatentPreparationStage(LatentPreparationStage):
     def get_latent_preparation_spec(
         self,
@@ -428,6 +439,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         self.causal_kv_cache_neg: list | None = None
         self.crossattn_cache_neg: list | None = None
         self._rope_temporal_offset = 0.0
+        self._i2v_image_latent: torch.Tensor | None = None
 
     def _get_causal_dmd_latents(self, batch: Req) -> torch.Tensor:
         latents = super()._get_causal_dmd_latents(batch)
@@ -441,6 +453,20 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         if self._use_cfg(batch):
             return self._forward_one_shot_cfg(batch, server_args)
         return self._forward_one_shot(batch, server_args)
+
+    @staticmethod
+    def _i2v_clamp_active(batch: Req) -> bool:
+        image_latent = getattr(batch, "image_latent", None)
+        return image_latent is not None and image_latent.shape[2] == 1
+
+    def _prepare_i2v_clamp(self, current_latents, start_frame):
+        clamp_latent = self._i2v_image_latent if start_frame == 0 else None
+        if clamp_latent is None:
+            return None, 0
+        clamp_latent = clamp_latent.to(
+            device=current_latents.device, dtype=current_latents.dtype
+        )
+        return clamp_latent, clamp_latent.shape[2]
 
     @staticmethod
     def _use_cfg(batch: Req) -> bool:
@@ -770,7 +796,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             )
 
         current_start_frame = 0
-        if getattr(batch, "image_latent", None) is not None:
+        clamp_i2v = self._i2v_clamp_active(batch)
+        self._i2v_image_latent = batch.image_latent if clamp_i2v else None
+        if getattr(batch, "image_latent", None) is not None and not clamp_i2v:
             image_latent = batch.image_latent
             assert image_latent is not None
             input_frames = image_latent.shape[2]
@@ -973,7 +1001,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         )
 
         current_start_frame = 0
-        if getattr(batch, "image_latent", None) is not None:
+        clamp_i2v = self._i2v_clamp_active(batch)
+        self._i2v_image_latent = batch.image_latent if clamp_i2v else None
+        if getattr(batch, "image_latent", None) is not None and not clamp_i2v:
             image_latent = batch.image_latent
             assert image_latent is not None
             input_frames = image_latent.shape[2]
@@ -1264,8 +1294,15 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         timesteps = scheduler.timesteps.to(device)
         current_latents = chunk_latents
         attn_metadata = None
+        clamp_latent, context_frames = self._prepare_i2v_clamp(
+            current_latents, start_frame
+        )
+        if clamp_latent is not None:
+            current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
+            if clamp_latent is not None:
+                current_latents[:, :, :context_frames] = clamp_latent
             latent_model_input = prepare_model_input(current_latents).to(target_dtype)
             attn_metadata = self._build_causal_attn_metadata(
                 batch,
@@ -1280,6 +1317,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 .to(device=latent_model_input.device, dtype=torch.float32)
                 .expand(batch_size, latent_model_input.shape[2])
             )
+            if clamp_latent is not None:
+                timestep_2d = timestep_2d.clone()
+                timestep_2d[:, :context_frames] = 0
             flow_pred = self._forward_causal_transformer(
                 batch,
                 latent_model_input=latent_model_input,
@@ -1305,6 +1345,8 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
             )[0]
 
             current_latents = next_latents
+            if clamp_latent is not None:
+                current_latents[:, :, :context_frames] = clamp_latent
 
             if progress_bar is not None:
                 progress_bar.update()
@@ -1346,8 +1388,15 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         current_latents = chunk_latents
         attn_metadata = None
         guidance_scale = self._guidance_scale(batch)
+        clamp_latent, context_frames = self._prepare_i2v_clamp(
+            current_latents, start_frame
+        )
+        if clamp_latent is not None:
+            current_latents = current_latents.clone()
 
         for current_timestep, timestep in enumerate(timesteps):
+            if clamp_latent is not None:
+                current_latents[:, :, :context_frames] = clamp_latent
             latent_model_input = prepare_model_input(current_latents).to(target_dtype)
             attn_metadata = self._build_causal_attn_metadata(
                 batch,
@@ -1362,6 +1411,9 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 .to(device=latent_model_input.device, dtype=torch.float32)
                 .expand(batch_size, latent_model_input.shape[2])
             )
+            if clamp_latent is not None:
+                timestep_2d = timestep_2d.clone()
+                timestep_2d[:, :context_frames] = 0
             flow_pred_cond = self._forward_causal_transformer(
                 batch,
                 latent_model_input=latent_model_input,
@@ -1405,6 +1457,8 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 return_dict=False,
             )[0]
             current_latents = next_latents
+            if clamp_latent is not None:
+                current_latents[:, :, :context_frames] = clamp_latent
 
             if progress_bar is not None:
                 progress_bar.update()

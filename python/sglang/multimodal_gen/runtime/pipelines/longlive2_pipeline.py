@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.pipelines.wan_causal_dmd_pipeline import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.longlive2 import (
     LongLive2CausalDenoisingStage,
+    LongLive2ImageVAEEncodingStage,
     LongLive2LatentPreparationStage,
     LongLive2TextEncodingStage,
 )
@@ -33,6 +34,12 @@ class LongLive2Pipeline(WanCausalDMDPipeline):
             LongLive2TextEncodingStage(
                 text_encoders=[self.get_module("text_encoder")],
                 tokenizers=[self.get_module("tokenizer")],
+            )
+        )
+        self.add_stage(
+            LongLive2ImageVAEEncodingStage(
+                vae=self.get_module("vae"),
+                component_name="vae",
             )
         )
         self.add_stage(
