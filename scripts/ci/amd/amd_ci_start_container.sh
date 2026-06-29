@@ -291,11 +291,189 @@ else
     CACHE_VOLUME=""
 fi
 
+echo "=========================================="
+echo "Host cache mount diagnostics"
+echo "=========================================="
+echo "Hostname:        $(hostname)"
+echo "Expected cache:  ${CACHE_HOST}"
+if [[ -d "$CACHE_HOST" ]]; then
+    echo "Status:          PRESENT - will mount ${CACHE_HOST} -> /sgl-data"
+    ls -ld "$CACHE_HOST" 2>/dev/null || true
+    df -h "$CACHE_HOST" 2>/dev/null || true
+    echo "Top-level entries (first 20):"
+    ls -la "$CACHE_HOST" 2>/dev/null | head -20 || true
+else
+    echo "Status:          MISSING - /sgl-data inside container will be ephemeral"
+    echo "                 HF models / MIOPEN cache will NOT persist between runs"
+fi
+
+echo ""
+echo "Other candidate cache locations on host:"
+for candidate in \
+    /home/runner/sgl-data \
+    /home/runner/sglang-data \
+    /home/runner/cache \
+    /home/runner/.cache \
+    /home/runner/_work/_tool \
+    /home/runner/_work/_actions \
+    /sgl-data \
+    /sglang-data \
+    /mnt/sgl-data \
+    /mnt/sglang-data \
+    /mnt/cache \
+    /data \
+    /data/sgl-data \
+    /data/sglang-data \
+    /data2 \
+    /data2/sgl-data \
+    /data2/sglang-data \
+    /data2/models \
+    /data2/models/huggingface \
+    /data2/models/huggingface/hub \
+    /run/sgl-data \
+    /run/sglang-data \
+    /run/cache \
+    /run/runner/sgl-data \
+    /run/runner/sglang-data \
+    /scratch \
+    /cache \
+    /opt/cache \
+    /var/cache/sglang; do
+    if [[ -e "$candidate" ]]; then
+        if [[ -d "$candidate" ]]; then
+            size=$(du -sh "$candidate" 2>/dev/null | cut -f1)
+            echo "  EXISTS  ${candidate} (dir, size=${size:-?})"
+        else
+            echo "  EXISTS  ${candidate} (not a dir)"
+        fi
+    fi
+done
+
+echo ""
+echo "Host /home contents:"
+ls -la /home 2>/dev/null || echo "  (cannot list /home)"
+echo ""
+echo "Host /home/runner contents:"
+ls -la /home/runner 2>/dev/null || echo "  (cannot list /home/runner)"
+echo ""
+echo "Host /mnt contents:"
+ls -la /mnt 2>/dev/null || echo "  (cannot list /mnt)"
+echo ""
+echo "Host /run contents (often the persistent NVMe on MI runners):"
+ls -la /run 2>/dev/null || echo "  (cannot list /run)"
+echo ""
+echo "Host /run subdirectory sizes (top-level only):"
+du -sh /run/* 2>/dev/null | sort -hr | head -20 || true
+echo ""
+echo "Host /run/* one level deeper (max-depth 2):"
+find /run -maxdepth 2 -type d 2>/dev/null | head -40 || true
+echo ""
+echo "Host /data contents:"
+ls -la /data 2>/dev/null || echo "  (cannot list /data or does not exist)"
+echo ""
+echo "Host /data2 contents:"
+ls -la /data2 2>/dev/null || echo "  (cannot list /data2 or does not exist)"
+echo ""
+echo "Host filesystem usage:"
+df -h 2>/dev/null | head -25 || true
+echo ""
+echo "Persistent-looking mounts (excluding tmpfs/overlay/proc/sys/cgroup):"
+awk '$3 != "tmpfs" && $3 != "overlay" && $3 != "proc" && $3 != "sysfs" && $3 != "cgroup" && $3 != "cgroup2" && $3 != "devpts" && $3 != "mqueue" {print $1, "->", $2, "type", $3}' /proc/mounts 2>/dev/null || true
+echo "=========================================="
+
+echo "=========================================="
+echo "Host network diagnostics"
+echo "=========================================="
+echo "DNS servers (/etc/resolv.conf):"
+grep -E '^(nameserver|search)' /etc/resolv.conf 2>/dev/null || echo "  (no /etc/resolv.conf)"
+echo ""
+echo "Default route:"
+ip route show default 2>/dev/null || echo "  (no ip command)"
+echo ""
+echo "Interfaces (brief):"
+ip -br addr 2>/dev/null || ifconfig -a 2>/dev/null || echo "  (no ip/ifconfig)"
+echo ""
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not available on host; skipping latency/throughput tests"
+else
+    HOST_CURL_AUTH=()
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+        HOST_CURL_AUTH=(-H "Authorization: Bearer ${HF_TOKEN}")
+    fi
+
+    echo "Endpoint latency (curl --max-time 15):"
+    for url in \
+        https://huggingface.co/api/models/gpt2 \
+        https://huggingface.co/api/models/meta-llama/Llama-3.1-8B-Instruct \
+        https://cdn-lfs.huggingface.co/ \
+        https://github.com \
+        https://pypi.org/simple/ \
+        http://10.245.143.50:5000/v2/; do
+        result=$(curl -sS -o /dev/null --max-time 15 "${HOST_CURL_AUTH[@]}" \
+            -w "dns=%{time_namelookup}s conn=%{time_connect}s ssl=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s http=%{http_code}" \
+            "$url" 2>&1) || result="FAILED (timeout / network error)"
+        printf '  %-70s %s\n' "$url" "$result"
+    done
+    echo ""
+
+    echo "HF CDN throughput test: first 10MB of public gpt2 weights (follow redirects)"
+    speed_url="https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
+    curl -sS -L -o /dev/null --range 0-10485759 --max-time 60 \
+        -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code} effective_url=%{url_effective}\n" \
+        "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
+fi
+
+echo ""
+echo "Link MTU:"
+ip -o link show 2>/dev/null | awk -F': ' '{print "  " $2}' | head -10 || echo "  (no ip command)"
+
+echo ""
+echo "Path MTU to huggingface.co (tracepath):"
+if command -v tracepath >/dev/null 2>&1; then
+    tracepath -n huggingface.co 2>&1 | head -15 || true
+else
+    echo "  (tracepath not installed)"
+fi
+
+echo ""
+echo "Key TCP sysctls (host):"
+for k in \
+    net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_timestamps; do
+    val=$(sysctl -n "$k" 2>/dev/null) && printf "  %-40s %s\n" "$k" "$val" || printf "  %-40s (unavailable)\n" "$k"
+done
+
+echo ""
+echo "Path / RTT to huggingface.co (mtr -rnzc 10, ~10s):"
+if command -v mtr >/dev/null 2>&1; then
+    mtr -rnzbc 10 --no-dns huggingface.co 2>&1 | head -30 || true
+elif command -v traceroute >/dev/null 2>&1; then
+    echo "  mtr not installed; using traceroute -n -w 2 (max 15 hops):"
+    traceroute -n -w 2 -m 15 huggingface.co 2>&1 | head -20 || true
+else
+    echo "  (neither mtr nor traceroute installed)"
+fi
+echo "=========================================="
+
 echo "Launching container: ci_sglang"
+# EXPERIMENT: --network=host to bypass Docker bridge NAT overhead.
+# Previous in-container TLS handshake to huggingface.co was ~2x slower than host
+# (228ms vs 107ms), suggesting NAT/bridge adds ~120ms latency. Disagg variant
+# (amd_ci_start_container_disagg.sh) already uses --network=host as precedent.
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
+  --privileged \
+  --network=host \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
@@ -310,6 +488,148 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang bash -lc '
+  numa_balancing_path=/proc/sys/kernel/numa_balancing
+
+  if [[ ! -r "${numa_balancing_path}" ]]; then
+    echo "WARNING: ${numa_balancing_path} is not readable; skipping NUMA balancing check" >&2
+    exit 0
+  fi
+
+  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
+
+  if [[ "$(cat "${numa_balancing_path}")" != "0" ]]; then
+    if [[ -w "${numa_balancing_path}" ]]; then
+      if echo 0 > "${numa_balancing_path}"; then
+        echo "Disabled kernel.numa_balancing for AMD CI"
+      else
+        echo "WARNING: failed to disable kernel.numa_balancing" >&2
+      fi
+    else
+      echo "WARNING: ${numa_balancing_path} is not writable; unable to disable NUMA balancing" >&2
+    fi
+  fi
+
+  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
+'
+
+docker exec ci_sglang bash -lc '
+  echo "=========================================="
+  echo "In-container /sgl-data mount diagnostics"
+  echo "=========================================="
+
+  if [[ ! -e /sgl-data ]]; then
+    echo "WARNING: /sgl-data does NOT exist inside container"
+    echo "         HF / MIOPEN cache paths will fail or be created in container layer"
+  else
+    is_mount=0
+    if command -v mountpoint >/dev/null 2>&1 && mountpoint -q /sgl-data 2>/dev/null; then
+      is_mount=1
+    elif [[ "$(stat -c %d / 2>/dev/null)" != "$(stat -c %d /sgl-data 2>/dev/null)" ]]; then
+      is_mount=1
+    fi
+
+    if [[ "$is_mount" == "1" ]]; then
+      echo "Status: /sgl-data IS a host volume mount (cache will persist)"
+    else
+      echo "WARNING: /sgl-data is NOT a host mount (same device as /)"
+      echo "         Cache is ephemeral - HF downloads will repeat every run"
+    fi
+
+    ls -ld /sgl-data 2>/dev/null || true
+    df -h /sgl-data 2>/dev/null || true
+    echo "Top-level entries (first 20):"
+    ls -la /sgl-data 2>/dev/null | head -20 || true
+    echo "HF hub cache (first 20):"
+    ls -la /sgl-data/hf-cache/hub 2>/dev/null | head -20 || echo "  (hf-cache/hub not present)"
+  fi
+  echo "=========================================="
+'
+
+docker exec ci_sglang bash -lc '
+  echo "=========================================="
+  echo "In-container network diagnostics"
+  echo "=========================================="
+  echo "DNS servers (/etc/resolv.conf):"
+  grep -E "^(nameserver|search)" /etc/resolv.conf 2>/dev/null || echo "  (no /etc/resolv.conf)"
+  echo ""
+  echo "Default route:"
+  ip route show default 2>/dev/null || echo "  (no ip command)"
+  echo ""
+  echo "Interfaces (brief):"
+  ip -br addr 2>/dev/null || ifconfig -a 2>/dev/null || echo "  (no ip/ifconfig)"
+  echo ""
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not available in container; skipping latency/throughput tests"
+  else
+    CURL_AUTH=()
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+      CURL_AUTH=(-H "Authorization: Bearer ${HF_TOKEN}")
+    fi
+
+    echo "Endpoint latency (curl --max-time 15):"
+    for url in \
+      https://huggingface.co/api/models/gpt2 \
+      https://huggingface.co/api/models/meta-llama/Llama-3.1-8B-Instruct \
+      https://cdn-lfs.huggingface.co/ \
+      https://github.com \
+      https://pypi.org/simple/ \
+      http://10.245.143.50:5000/v2/; do
+      result=$(curl -sS -o /dev/null --max-time 15 "${CURL_AUTH[@]}" \
+        -w "dns=%{time_namelookup}s conn=%{time_connect}s ssl=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s http=%{http_code}" \
+        "$url" 2>&1) || result="FAILED (timeout / network error)"
+      printf "  %-70s %s\n" "$url" "$result"
+    done
+    echo ""
+
+    echo "HF CDN throughput test: first 10MB of public gpt2 weights (follow redirects)"
+    speed_url="https://huggingface.co/gpt2/resolve/main/pytorch_model.bin"
+    curl -sS -L -o /dev/null --range 0-10485759 --max-time 60 \
+      -w "  total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download} http=%{http_code} effective_url=%{url_effective}\n" \
+      "$speed_url" 2>&1 || echo "  FAILED (timeout / connection error)"
+  fi
+
+  echo ""
+  echo "Link MTU (container):"
+  ip -o link show 2>/dev/null | awk -F": " "{print \"  \" \$2}" | head -10 || echo "  (no ip command)"
+
+  echo ""
+  echo "Path MTU to huggingface.co (tracepath):"
+  if command -v tracepath >/dev/null 2>&1; then
+    tracepath -n huggingface.co 2>&1 | head -15 || true
+  else
+    echo "  (tracepath not installed)"
+  fi
+
+  echo ""
+  echo "Key TCP sysctls (container):"
+  for k in \
+    net.ipv4.tcp_congestion_control \
+    net.core.default_qdisc \
+    net.core.rmem_max \
+    net.core.wmem_max \
+    net.ipv4.tcp_rmem \
+    net.ipv4.tcp_wmem \
+    net.ipv4.tcp_window_scaling \
+    net.ipv4.tcp_mtu_probing \
+    net.ipv4.tcp_timestamps; do
+    val=$(sysctl -n "$k" 2>/dev/null) && printf "  %-40s %s\n" "$k" "$val" || printf "  %-40s (unavailable)\n" "$k"
+  done
+
+  echo ""
+  echo "Path / RTT to huggingface.co (mtr -rnzc 10, ~10s):"
+  if command -v mtr >/dev/null 2>&1; then
+    mtr -rnzbc 10 --no-dns huggingface.co 2>&1 | head -30 || true
+  elif command -v traceroute >/dev/null 2>&1; then
+    echo "  mtr not installed; using traceroute -n -w 2 (max 15 hops):"
+    traceroute -n -w 2 -m 15 huggingface.co 2>&1 | head -20 || true
+  else
+    echo "  (neither mtr nor traceroute installed)"
+  fi
+  echo "=========================================="
+'
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
