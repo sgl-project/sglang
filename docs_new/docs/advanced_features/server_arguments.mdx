@@ -304,7 +304,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--timeout-keep-alive`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override `SGLANG_TIMEOUT_KEEP_ALIVE` for the public HTTP listener (seconds). The 5s env default is conservative; raise to ~65s when fronting Go (`net/http`, 90s default), reqwest (90s), or Node (60s) clients to avoid pool-reuse races that cost ~1 RTT + TLS handshake on each "lost race".</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>(uvicorn only) Override `SGLANG_TIMEOUT_KEEP_ALIVE` for the public HTTP listener (seconds). The 5s env default is conservative; raise to ~65s when fronting Go (`net/http`, 90s default), reqwest (90s), or Node (60s) clients to avoid pool-reuse races that cost ~1 RTT + TLS handshake on each "lost race". Has no effect with `--enable-http2` (Granian) — Granian's HTTP/1.1 idle timeout is not exposed.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int (env default 5)</td>
     </tr>

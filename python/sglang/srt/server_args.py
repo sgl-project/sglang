@@ -548,7 +548,7 @@ class ServerArgs:
     # behind the embedded server defaults. None means "use server default".
     timeout_keep_alive: A[
         Optional[int],
-        "Override SGLANG_TIMEOUT_KEEP_ALIVE for the public HTTP listener (seconds). Defaults to the env var (5s); raise to ~65s when fronting clients with long-idle pool keep-alive (Go, reqwest, Node) to avoid pool-reuse races.",
+        "(uvicorn only) Override SGLANG_TIMEOUT_KEEP_ALIVE for the public HTTP listener (seconds). Defaults to the env var (5s); raise to ~65s when fronting clients with long-idle pool keep-alive (Go, reqwest, Node) to avoid pool-reuse races. Has no effect with --enable-http2 (Granian) — Granian's HTTP/1.1 idle timeout is not exposed and HTTP/2 uses stream-level keep-alive instead.",
     ] = None
     http_backlog: A[
         int,
