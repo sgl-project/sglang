@@ -572,24 +572,24 @@ class MQALayer(nn.Module):
         cache_loc: torch.Tensor,
         attn_backend,
     ) -> None:
-        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-            quant_to_nope_fp8_rope_bf16_pack_triton,
-        )
-
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            kv = qkv_a[..., self.q_lora_rank :]
         else:
-            kv = self._compute_kv_bf16(x, positions)
+            kv, _ = self.wkv(x)
 
         token_to_kv_pool = attn_backend.token_to_kv_pool
         swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(cache_loc).to(
             torch.int32
         )
-        token_to_kv_pool.set_swa_key_buffer_radix(
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             swa_loc=swa_loc,
-            cache_nope_fp8_rope_bf16_pack=quant_to_nope_fp8_rope_bf16_pack_triton(kv),
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=positions,
         )
 
     def _forward_prepare_multi_stream(
