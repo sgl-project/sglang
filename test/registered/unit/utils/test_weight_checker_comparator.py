@@ -133,7 +133,12 @@ class TestCompareQuantPair(CustomTestCase):
         reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         with patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 128 * 128):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
-        self.assertEqual(chunked, reference)
+        eq_c, max_c, mean_c, ex_c = chunked
+        eq_r, max_r, mean_r, ex_r = reference
+        self.assertEqual((eq_c, max_c, ex_c), (eq_r, max_r, ex_r))
+        # mean_abs_err sums abs-diff in a different order when chunked, so it is
+        # not bit-identical across chunk boundaries; compare within tolerance.
+        self.assertAlmostEqual(mean_c, mean_r, places=7)
 
     @staticmethod
     def _quantize_partial(weight: torch.Tensor, scale_margin: float):
