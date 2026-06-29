@@ -15,7 +15,6 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor as _Compresso
 from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
     fused_ape_pool_norm_rope,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.deepseek_v4_rope import (
     apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
