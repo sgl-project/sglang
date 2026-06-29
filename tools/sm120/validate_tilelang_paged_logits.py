@@ -126,16 +126,52 @@ def main():
         print(repr(e))
         return 1
 
+    print(f"out shape={tuple(out.shape)} dtype={out.dtype}")
+
     ok = True
-    max_abs = 0.0
+    worst_finite = 0.0
+    total_nan_inf = 0
+    total_mismatch = 0
+    total_elems = 0
+    first_report = True
     for b in range(BATCH):
         n = int(seq_lens[b].item())
         a = out[b, :n].float()
         r = ref[b, :n].float()
-        max_abs = max(max_abs, (a - r).abs().max().item())
-        if not torch.allclose(a, r, atol=1e-2, rtol=1e-2):
+        total_elems += n
+
+        nan_inf = int((~torch.isfinite(a)).sum().item())
+        total_nan_inf += nan_inf
+
+        diff = (a - r).abs()
+        finite = torch.isfinite(diff)
+        if finite.any():
+            worst_finite = max(worst_finite, diff[finite].max().item())
+
+        close = torch.isclose(a, r, atol=1e-2, rtol=1e-2)
+        bad = int((~close).sum().item())
+        total_mismatch += bad
+
+        if (nan_inf or bad) and first_report:
+            first_report = False
+            idx = (~close).nonzero(as_tuple=True)[0][:6].tolist()
+            print(f"\n[batch {b}] first mismatches at positions {idx}")
+            print(f"  tilelang: {[round(a[i].item(), 4) for i in idx]}")
+            print(f"  torch ref:{[round(r[i].item(), 4) for i in idx]}")
+            # ratio helps spot a constant scale/sign error
+            ratios = []
+            for i in idx:
+                rv = r[i].item()
+                ratios.append(round(a[i].item() / rv, 4) if rv != 0 else float("nan"))
+            print(f"  ratio a/r:{ratios}")
+
+        if nan_inf or bad:
             ok = False
-    print(f"max abs diff (valid region) = {max_abs:.4g}")
+
+    print(f"\nelements compared (valid): {total_elems}")
+    print(f"nan/inf in tilelang output: {total_nan_inf}")
+    print(f"mismatched elements:        {total_mismatch}")
+    print(f"worst finite abs diff:      {worst_finite:.4g}")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
