@@ -5,9 +5,9 @@ metatags:
 ---
 
 This guide explains the role of each parameter used in SGLang deployments on Ascend NPU. It uses
-the [DeepSeek-V3.2 best practice configuration](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice#deepseek-v3-2-128k-1k-26ms-on-a3-32-cards-disaggregation-mode)
+the [DeepSeek-V3.2 best practice configuration](/docs/hardware-platforms/ascend-npus/best_practice/deepseek_v3_2#pd-disaggregation)
 as the reference example. For a complete list of tested deployment configurations, see the
-[Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice) page.
+[Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/best_practice) page.
 
 <Note>
   Parameters in this guide fall into two categories:
@@ -238,7 +238,7 @@ These arguments and environment variables are critical for tuning decode perform
       <td>Enabled</td>
     </tr>
     <tr>
-      <td>`--cuda-graph-max-bs`</td>
+      <td>`--cuda-graph-max-bs-decode`</td>
       <td>Caps the maximum batch size for which CUDA Graphs are captured. Larger values cover more batch sizes but increase graph capture time and memory overhead. If your `max-running-requests` is high but typical batch sizes are lower, use a smaller value to reduce capture overhead. Tune based on your observed batch size distribution during serving.</td>
       <td>`4`</td>
     </tr>
@@ -794,7 +794,7 @@ Casts model weight tensors to the Ascend NPU ACL FRACTAL_NZ format (format 29) f
 
 ## See Also
 
-- [Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice) — Complete deployment configurations and benchmark results for all supported models
+- [Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/best_practice) — Complete deployment configurations and benchmark results for all supported models
 - [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables) — Reference for all Ascend NPU-related environment variables
 - [DeepSeek V3.2 Guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2) — Detailed usage guide for DeepSeek V3.2 deployment
 - [Expert Parallelism](/docs/advanced_features/expert_parallelism) — DeepEP configuration and tuning guide
