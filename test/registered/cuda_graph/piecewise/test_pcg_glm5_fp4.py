@@ -13,11 +13,11 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-b200")
 
-GLM5_FP4_MODEL = "nvidia/GLM-5-NVFP4"
+GLM5_FP4_MODEL = "nvidia/GLM-5.2-NVFP4"
 
 
 class TestPCGGlm5Fp4(CustomTestCase):
-    """PCG prefill on GLM-5-NVFP4 (DSA model, TP=4, B200).
+    """PCG prefill on GLM-5.2-NVFP4 (DSA model, TP=4, B200).
 
     GLM-5 uses GlmMoeDsaForCausalLM (DSA attention). This test verifies that
     piecewise CUDA graph works correctly after the DSA indexer was updated to

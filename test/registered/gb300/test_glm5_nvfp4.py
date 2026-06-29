@@ -8,7 +8,7 @@ from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300-glm5-nvfp4", nightly=True)
 
-MODEL_PATH = "nvidia/GLM-5-NVFP4"
+MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
 
 COMMON_ARGS = [
     "--trust-remote-code",
@@ -36,7 +36,7 @@ DP_MTP_ARGS = [
 
 
 class TestGlm5Nvfp4(unittest.TestCase):
-    """GLM-5 NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
+    """GLM-5.2 NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_glm5_nvfp4(self):
         variants = [
@@ -58,7 +58,7 @@ class TestGlm5Nvfp4(unittest.TestCase):
 
         run_combined_tests(
             models=variants,
-            test_name="GLM-5-NVFP4",
+            test_name="GLM-5.2-NVFP4",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",
