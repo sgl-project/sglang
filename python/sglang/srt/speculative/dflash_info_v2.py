@@ -46,7 +46,6 @@ class DFlashDraftInputV2(SpecInput):
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
     hidden_states: torch.Tensor
-    verify_done: Optional[torch.cuda.Event] = None
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -113,7 +112,6 @@ class DFlashDraftInputV2(SpecInput):
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int64),
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int64),
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
-            verify_done=None,
         )
 
     def prepare_for_decode(self, batch: ScheduleBatch):
@@ -126,9 +124,6 @@ class DFlashDraftInputV2(SpecInput):
         the overallocated mapping.
         """
         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
-        if plan_stream is None and self.verify_done is not None:
-            # Ensure previous forward is completed before mutating shared buffers.
-            self.verify_done.synchronize()
 
         bs = batch.batch_size()
         if bs == 0:
@@ -191,9 +186,6 @@ class DFlashDraftInputV2(SpecInput):
                 # have just been rebuilt on the scheduler stream by filter/merge ops.
                 # The plan stream must wait for those writes before reading them.
                 plan_stream.wait_stream(caller_stream)
-
-            if plan_stream is not None and self.verify_done is not None:
-                plan_stream.wait_event(self.verify_done)
 
             cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
             nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
