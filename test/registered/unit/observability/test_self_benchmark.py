@@ -360,6 +360,37 @@ class TestSelfBenchmark(CustomTestCase):
             16,
         )
 
+    def test_maybe_schedule_next_advances_current_point_finished_after_observe(self):
+        benchmark = SelfBenchmark(_make_scheduler("/tmp/unused.json"))
+        point = BenchmarkPoint(point_type="prefill", isl=32)
+        req = _FakeReq(finished=False)
+        benchmark.phase = BenchmarkPhase.SWEEP
+        benchmark._grid = [point]
+        benchmark._grid_index = 0
+        benchmark._current = BenchmarkPointResult(point=point)
+        benchmark._active_reqs = [req]
+
+        fpm = ForwardPassMetrics(
+            scheduled_requests=ScheduledRequestMetrics(
+                num_prefill_requests=1,
+                sum_prefill_tokens=32,
+                sum_prefill_kv_tokens=0,
+            )
+        )
+        batch = types.SimpleNamespace(forward_mode=_FakeForwardMode(is_extend=True))
+
+        benchmark.observe_forward_pass(batch, fpm)
+        self.assertIsNotNone(benchmark._current)
+        self.assertEqual(len(benchmark._results), 0)
+
+        req._finished = True
+        benchmark.maybe_schedule_next()
+
+        self.assertIsNone(benchmark._current)
+        self.assertEqual(benchmark._grid_index, 1)
+        self.assertEqual(len(benchmark._results), 1)
+        self.assertEqual(len(benchmark._results[0].fpms), 1)
+
     def test_decode_grid_preserves_room_for_one_decode_token(self):
         scheduler = _make_scheduler("/tmp/unused.json")
         scheduler.max_req_input_len = 16
