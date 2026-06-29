@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToToke
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
 )
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -1184,11 +1185,18 @@ class HiMambaRadixCache(MambaRadixCache):
             return IncLockRefResult(delta=0)
 
         delta = 0
+        result = IncLockRefResult(delta=delta)
         if node.mamba_value is not None:
             if node.mamba_lock_ref == 0:
                 self.mamba_evictable_size_ -= len(node.mamba_value)
                 self.mamba_protected_size_ += len(node.mamba_value)
             node.mamba_lock_ref += 1
+        else:
+            # Tombstone at acquire time; tell the paired dec to skip the
+            # mamba branch in case load-back revives mamba_value meanwhile.
+            result.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
+                node.id
+            )
 
         while node != self.root_node:
             if node.evicted:
@@ -1205,7 +1213,8 @@ class HiMambaRadixCache(MambaRadixCache):
                 self.evictable_full_device_leaves.discard(node)
             node.full_lock_ref += 1
             node = node.parent
-        return IncLockRefResult(delta=delta)
+        result.delta = delta
+        return result
 
     def dec_lock_ref(
         self, node: TreeNode, params: Optional[DecLockRefParams] = None
@@ -1215,7 +1224,14 @@ class HiMambaRadixCache(MambaRadixCache):
 
         delta = 0
 
-        if node.mamba_value is not None and node.mamba_lock_ref > 0:
+        skip_mamba_ids = (
+            params.skip_lock_node_ids.get(ComponentType.MAMBA, ())
+            if params is not None
+            else ()
+        )
+        skip_mamba = node.id in skip_mamba_ids
+
+        if not skip_mamba and node.mamba_value is not None and node.mamba_lock_ref > 0:
             if node.mamba_lock_ref == 1:
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
