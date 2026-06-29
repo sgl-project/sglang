@@ -115,14 +115,9 @@ def build_inputs(device="cuda"):
     return q, kv, weight, seq_lens, page_table
 
 
-def main():
-    if not torch.cuda.is_available():
-        print("CUDA required"); return 1
-    major, minor = torch.cuda.get_device_capability()
-    print(f"Device cc: sm_{major}{minor}  ({torch.cuda.get_device_name()})")
-
-    # Only the kernel under test is imported from sglang. This import is safe; it
-    # does NOT pull in the flashinfer.comm chain (which can fail in some images).
+def check_paged_logits():
+    """Numerically validate the FP8 paged-MQA-logits kernel vs the torch ref."""
+    print("\n=== [1/2] DSA indexer paged-logits kernel (fp8_paged_mqa_logits) ===")
     from sglang.srt.layers.attention.dsa.tilelang_kernel import (
         tilelang_fp8_paged_mqa_logits,
     )
@@ -186,8 +181,63 @@ def main():
     print(f"nan/inf in tilelang output: {total_nan_inf}")
     print(f"mismatched elements:        {total_mismatch}")
     print(f"worst finite abs diff:      {worst_finite:.4g}")
-    print("PASS" if ok else "FAIL")
-    return 0 if ok else 1
+    print("paged-logits: PASS" if ok else "paged-logits: FAIL")
+    return ok
+
+
+# --- DSA sparse-attention kernel (sparse_attention_fwd_kernel_v2) -------------
+# This kernel previously failed to *compile* on SM120 (Hopper WGMMA / wait_wgmma).
+# With the _SM120_WGMMA_OFF (disable_wgmma) fix it should lower via MMA. This is a
+# compile + finiteness check (no closed-form reference for sparse MLA attention).
+SA_TOKENS = 64
+SA_HEADS = 16        # GLM-5.2 attn heads per GPU are padded to 16 (e.g. 64/TP8 -> 8 -> 16)
+SA_D_V = 512         # kv_lora_rank
+SA_TAIL = 64         # qk_rope_head_dim
+SA_TOPK = 2048       # index_topk
+SA_NUM_KV = 8192
+
+
+def check_sparse_attention():
+    print("\n=== [2/2] DSA sparse-attention kernel (sparse_attention_fwd_kernel_v2) ===")
+    from sglang.srt.layers.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+
+    dim = SA_D_V + SA_TAIL
+    dev = "cuda"
+    q = torch.randn(SA_TOKENS, SA_HEADS, dim, device=dev, dtype=torch.bfloat16)
+    kv = torch.randn(SA_NUM_KV, 1, dim, device=dev, dtype=torch.bfloat16)
+    indices = torch.randint(
+        0, SA_NUM_KV, (SA_TOKENS, 1, SA_TOPK), device=dev, dtype=torch.int32
+    )
+    sm_scale = 1.0 / (dim ** 0.5)
+
+    try:
+        out = tilelang_sparse_fwd(q, kv, indices, sm_scale, d_v=SA_D_V)
+    except Exception as e:  # noqa: BLE001
+        print("TILELANG COMPILE/RUN FAILED:")
+        print(repr(e))
+        return False
+
+    finite = torch.isfinite(out).all().item()
+    print(f"out shape={tuple(out.shape)} dtype={out.dtype} all_finite={finite}")
+    print("sparse-attention: PASS" if finite else "sparse-attention: FAIL (non-finite)")
+    return bool(finite)
+
+
+def main():
+    if not torch.cuda.is_available():
+        print("CUDA required"); return 1
+    major, minor = torch.cuda.get_device_capability()
+    print(f"Device cc: sm_{major}{minor}  ({torch.cuda.get_device_name()})")
+
+    ok_logits = check_paged_logits()
+    ok_attn = check_sparse_attention()
+
+    print("\n==================== SUMMARY ====================")
+    print(f"  paged-logits kernel:    {'PASS' if ok_logits else 'FAIL'}")
+    print(f"  sparse-attention kernel:{'PASS' if ok_attn else 'FAIL'}")
+    all_ok = ok_logits and ok_attn
+    print("OVERALL:", "PASS" if all_ok else "FAIL")
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
