@@ -628,9 +628,10 @@ def multinomial_with_seed(
 
     # NOTE (sehoon): it is critical to keep gumbel noise calculation in float64 to avoid numerical instability.
     # keeping logprobs in float64 is less critical, but we found it's still safer to keep it in float64.
-    x = hashed.to(torch.float64) / torch.iinfo(torch.uint32).max
+    # Use midpoint binning (hash + 0.5) / 2^32 to map into open (0, 1), avoiding -log(-log(1.0)) = +inf.
+    x = (hashed.to(torch.float64) + 0.5) / (2.0**32)
 
-    # x is a uniform sample in [0, 1]. get gumbel noise from it.
+    # x is a uniform sample in (0, 1). get gumbel noise from it.
     # which is equivalent to -log(-log(x))
     # keep everything in in-place operations to avoid unnecessary memory allocations.
     x.log_().clamp_(min=torch.finfo(x.dtype).min).neg_()  # -log(x)
