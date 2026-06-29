@@ -1494,7 +1494,10 @@ def initialize_dummy_weights(
         if torch.is_floating_point(param):
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
-            if torch.finfo(param.data.dtype).bits < 16:
+            # Tensor subclasses such as MXFP8 wrappers expose a low-bit raw
+            # storage dtype through `.data`, but their wrapper `uniform_` also
+            # updates side tensors such as block scales.
+            if torch.finfo(param.dtype).bits < 16:
                 # uniform_ doesn't support < 16-bit datatypes (FP8)
                 dtype = param.data.dtype
                 tmp_param = param.data.to(torch.float16)
