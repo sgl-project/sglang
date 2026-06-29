@@ -4,6 +4,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     decode_attention_fwd,
     decode_attention_fwd_grouped,
@@ -318,6 +319,101 @@ class TestTritonAttention(CustomTestCase):
         # Loop through the values and call the method
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
+
+    def _test_extend_attention_gqa_verify_once(
+        self, B, prefix_len, draft_num, H_Q, H_KV, D
+    ):
+        # Verify-shape (EAGLE3/MTP): a handful of query tokens (draft_num) per
+        # request against a long paged prefix, with GQA grouping. On HIP this
+        # exercises the GQA-grouped split-K verify kernel; the override below
+        # forces the per-query-head `_fwd_kernel` as the reference. On non-HIP
+        # both runs take the per-head path (the GQA gate requires HIP).
+        dtype = torch.bfloat16
+        device = get_device()
+
+        b_seq_len_prefix = torch.full(
+            (B,), prefix_len, dtype=torch.int32, device=device
+        )
+        b_seq_len_extend = torch.full((B,), draft_num, dtype=torch.int32, device=device)
+        b_seq_len = b_seq_len_prefix + b_seq_len_extend
+
+        b_start_loc = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
+        b_start_loc_extend = torch.zeros((B,), dtype=torch.int32, device=device)
+        b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
+
+        kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1 : B + 1] = torch.cumsum(b_seq_len_prefix[:B], dim=0)
+        kv_indices = torch.zeros(
+            (b_seq_len_prefix.sum().item(),), dtype=torch.int32, device=device
+        )
+        for i in range(B):
+            kv_indices[kv_indptr[i] : kv_indptr[i + 1]] = torch.arange(
+                b_start_loc[i], b_start_loc[i] + b_seq_len_prefix[i], device=device
+            )
+
+        total_token_num = torch.sum(b_seq_len).item()
+        extend_token_num = torch.sum(b_seq_len_extend).item()
+        k_buffer = torch.empty(
+            (total_token_num, H_KV, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+        v_buffer = torch.empty(
+            (total_token_num, H_KV, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+
+        k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device=device)
+        v_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype, device=device)
+        q_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device=device)
+        for i in range(B):
+            extend_start_in_buffer = b_start_loc[i] + b_seq_len_prefix[i]
+            extend_end_in_buffer = b_start_loc[i] + b_seq_len[i]
+            extend_start = b_start_loc_extend[i]
+            extend_end = b_start_loc_extend[i] + b_seq_len_extend[i]
+            k_extend[extend_start:extend_end] = k_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            v_extend[extend_start:extend_end] = v_buffer[
+                extend_start_in_buffer:extend_end_in_buffer
+            ]
+            q_extend[extend_start:extend_end] = torch.empty(
+                (b_seq_len_extend[i], H_Q, D), dtype=dtype, device=device
+            ).normal_(mean=0.1, std=0.2)
+
+        max_len_extend = draft_num
+        qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+        qo_indptr[1 : B + 1] = torch.cumsum(b_seq_len_extend[:B], dim=0)
+
+        def _run():
+            o = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device=device)
+            extend_attention_fwd(
+                q_extend,
+                k_extend,
+                v_extend,
+                o,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                max_len_extend,
+                1.0,
+                1.0,
+            )
+            return o
+
+        with envs.SGLANG_DISABLE_GQA_VERIFY_KERNEL.override(True):
+            o_ref = _run()  # per-query-head _fwd_kernel
+        o_gqa = _run()  # GQA split-K path on HIP
+
+        self.assertTrue(torch.allclose(o_gqa, o_ref, rtol=1e-2, atol=2e-3))
+
+    def test_extend_attention_gqa_verify(self):
+        # (B, prefix_len, draft_num, H_Q, H_KV, D); H_Q/H_KV is the GQA group.
+        for draft_num in [1, 4, 8]:
+            self._test_extend_attention_gqa_verify_once(4, 2048, draft_num, 12, 2, 128)
 
     def test_extend_attention_block_sizes(self):
         from sglang.srt.layers.attention.triton_ops import extend_attention as ea

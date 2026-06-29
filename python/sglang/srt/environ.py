@@ -586,6 +586,10 @@ class Envs:
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    # Kill-switch for the GQA-grouped split-K extend-attention verify kernel
+    # (EAGLE3/MTP few-query path). When True, falls back to the per-query-head
+    # `_fwd_kernel`. Off in prod (the GQA path is taken when its shape gates hit).
+    SGLANG_DISABLE_GQA_VERIFY_KERNEL = EnvBool(False)
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
