@@ -105,7 +105,7 @@ MiMo-V2.5-Pro can also be served on TPU via [sgl-jax](https://github.com/sgl-pro
 | TPU Type | Topology | Chips/Node | Nodes | Total Chips | JAX Devices/Chip | Total JAX Devices (= `--tp-size`) |
 | --- | --- | --- | --- | --- | --- | --- |
 | **v7x** | 2×2×4 | 4 | 4 | 16 | 2 | 32 |
-| **v6e** | 4×4×4 | 4 | 16 | 64 | 1 | 64 |
+| **v6e** | 8x8 | 4 | 16 | 64 | 1 | 64 |
 
 > v7x exposes **2 logical JAX devices per chip**, so `--tp-size = 16 chips × 2 = 32`. v6e exposes 1 device per chip, so `--tp-size = 64`. Always set `--tp-size` to the total JAX device count across all nodes, not the chip count.
 
