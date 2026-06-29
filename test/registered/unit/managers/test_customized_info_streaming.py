@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 
 
 CUSTOMIZED_INFO_FIELD = "sampled_token_ids_copy"

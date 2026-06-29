@@ -5,7 +5,7 @@ from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import base_engine_kwargs
 
-register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=127, stage="extra-a", runner_config="1-gpu-large")
 
 
 _SWA_MODEL = "openai/gpt-oss-20b"

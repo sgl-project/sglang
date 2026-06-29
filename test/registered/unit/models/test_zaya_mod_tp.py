@@ -25,7 +25,7 @@ from sglang.srt.models.zaya import mod_blend, mod_premask_experts
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _reference_blend(
