@@ -601,6 +601,10 @@ class DataParallelController:
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        # Retain the full first child init dict so callers that build
+        # the upstream handshake (run_data_parallel_controller_process,
+        # below) can forward every field — not just the two limits.
+        self.scheduler_init_info = scheduler_info[0]
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
@@ -695,10 +699,12 @@ def run_data_parallel_controller_process(
             proc.pid for proc in controller.scheduler_procs if proc is not None
         ]
         pipe_writer.send(
+            # Spread the first child scheduler's full init dict (status +
+            # both max_* limits + the multimodal/tokenizer metadata added
+            # by the get_init_info patch above) so dp_size > 1 doesn't
+            # strip them before they reach the gRPC servicer.
             {
-                "status": "ready",
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
+                **controller.scheduler_init_info,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
