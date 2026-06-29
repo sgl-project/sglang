@@ -552,11 +552,7 @@ class DeepseekV4HipRadixBackend(
             is_prefill=True,
         )
         self._attach_unified_kv_prefill_meta(
-            core_attn_metadata,
-            req_pool_indices,
-            seq_lens,
-            extend_seq_lens,
-            extend_seq_lens_cpu,
+            core_attn_metadata, req_pool_indices, seq_lens, extend_seq_lens
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -1095,7 +1091,6 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: List[int],
     ) -> None:
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1107,16 +1102,9 @@ class DeepseekV4HipRadixBackend(
         bs = req_pool_indices.shape[0]
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
-        # token -> req index (length L = sum(extend_seq_lens)).
-        # Pass output_size so repeat_interleave does not read sum(extend_seq_lens)
-        # back from the GPU: the tensor-repeats form otherwise forces a D2H sync
-        # that serializes batch N execution with batch N+1 scheduling. (Matches
-        # the CUDA backend _expand_prefill_casually_vectorized.)
-        output_size = sum(extend_seq_lens_cpu)
+        # token -> req index (length L = sum(extend_seq_lens))
         bid = torch.repeat_interleave(
-            torch.arange(bs, device=device, dtype=torch.int64),
-            extend_seq_lens,
-            output_size=output_size,
+            torch.arange(bs, device=device, dtype=torch.int64), extend_seq_lens
         )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
