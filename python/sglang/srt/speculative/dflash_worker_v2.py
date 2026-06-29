@@ -33,7 +33,10 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func, draft_tp_context
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    draft_tp_context,
+)
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -1613,9 +1616,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 draft_hidden = draft_logits_output.hidden_states
                 if draft_hidden is None:
-                    raise RuntimeError(
-                        "DFLASH draft model returned no hidden states."
-                    )
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
                 draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
