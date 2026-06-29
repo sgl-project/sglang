@@ -22,6 +22,9 @@
 ARG SGLANG_IMAGE=lmsysorg/sglang:latest
 FROM ${SGLANG_IMAGE}
 
+# Some base images are missing the `distro` module (needed transitively at import).
+RUN pip install --no-cache-dir distro
+
 # --- Pull the fork branch containing the SM120 changes (editable source install) ---
 ARG SGLANG_REPO=https://github.com/shivajid/sglang.git
 ARG SGLANG_BRANCH=sm120-glm5.2-fp8
