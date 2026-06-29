@@ -1088,18 +1088,17 @@ class Qwen2_5_VLModel(nn.Module):
                 self.rope_deltas = rope_deltas
             else:
                 batch_size, seq_length, _ = inputs_embeds.shape
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
                 if cache_position is not None:
                     delta = (cache_position[0] + self.rope_deltas).to(
                         inputs_embeds.device
                     )
                 else:
-                    delta = torch.zeros(
-                        (batch_size, seq_length), device=inputs_embeds.device
-                    )
-                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
-                position_ids += delta.to(position_ids.device)
+                    delta = torch.zeros(batch_size, 1, device=inputs_embeds.device)
+                position_ids = (
+                    (torch.arange(seq_length, device=inputs_embeds.device) + delta)
+                    .unsqueeze(0)
+                    .expand(3, -1, -1)
+                )
 
         outputs = self.language_model(
             input_ids=None,
