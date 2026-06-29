@@ -35,7 +35,7 @@ try:
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     use_flashinfer = True
-except ImportError:
+except (ImportError, AssertionError):
     use_flashinfer = False
 
 logger = logging.getLogger(__name__)
