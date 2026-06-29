@@ -264,7 +264,7 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      rm go1.22.2.linux-amd64.tar.gz && \
      mkdir -p build && \
      cd build && \
-     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON && \
+     cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF && \
      make -j "$(nproc)" && make install; \
     fi
 
