@@ -1,14 +1,14 @@
-"""Double Sparsity selector — replaces NSA Indexer.forward selection role.
+"""Double Sparsity selector — holds the bound runtime selection state.
 
-This is the **placeholder** implementation. It returns deterministic
-sequence-order-ascending logical token positions so that the FlashMLA
-block-table plumbing in ``DeepseekV2AttentionMLA.forward_core`` can be
-wired and tested end-to-end before real selection kernels land. The
-placeholder guard refuses to serve real traffic; production must call
-``bind_runtime_data`` with the real ``ChannelMask`` before serving.
+The selector owns the per-rank bound state (channel mask, absorbed projection,
+process group) installed by ``bind_runtime_data`` at startup. Until then it is
+"unbound" (``IS_PLACEHOLDER``), and ``assert_real_selector_or_placeholder_allowed``
+refuses to serve traffic — production must bind the real ``ChannelMask`` first.
 
-The class does NOT inherit from any HiSparse base and is NOT registered in
-``_ALGORITHM_REGISTRY``.
+Production selection runs through ``selection_kernel.retrieve_topk_graph_safe``
+(called directly from ``deepseek_v2``); the eager :meth:`retrieve_topk` here is a
+unit-test reference path. The class does NOT inherit from any HiSparse base and
+is NOT registered in ``_ALGORITHM_REGISTRY``.
 """
 
 from __future__ import annotations
@@ -46,25 +46,12 @@ class DoubleSparsityTPMisconfigured(RuntimeError):
 
 
 class DoubleSparsitySelector:
-    """Sequence-order-ascending top-K logical-token selector.
+    """Holds the bound DS selection state; ``IS_PLACEHOLDER`` until bound.
 
-    Two modes:
-
-    * **Placeholder** (default after construction). ``retrieve_topk`` returns
-      deterministic ascending logical token positions so the downstream
-      FlashMLA wiring is exercisable in unit tests before real selection
-      kernels and a real channel mask are wired. Production serving is
-      refused by the placeholder guard until ``bind_runtime_data`` flips the
-      selector into real mode.
-
-    * **Real** — after :meth:`bind_runtime_data` is called with a loaded
-      :class:`ChannelMask`, the selector switches to the real score →
-      all-reduce → top-K flow from :mod:`selection_kernel`, scoring the
-      resident MLA latent through the bind-time absorbed projection.
-      ``IS_PLACEHOLDER`` flips to ``False``.
-
-    The class does NOT inherit from any HiSparse base and is NOT registered
-    in ``_ALGORITHM_REGISTRY``.
+    Constructed unbound (``IS_PLACEHOLDER=True``); :meth:`bind_runtime_data`
+    installs the loaded :class:`ChannelMask` + absorbed projection + process
+    group and flips ``IS_PLACEHOLDER`` to ``False``. The eager :meth:`retrieve_topk`
+    is a unit-test reference (production uses ``retrieve_topk_graph_safe``).
     """
 
     IS_PLACEHOLDER: bool = True

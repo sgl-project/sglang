@@ -1,21 +1,9 @@
 """GPU paged absorbed-latent score kernel (production DS selection score).
 
-Companion to ``absorbed_latent.py``: the same identity
-``score[b, t] = agg_h ( v_h[b] · c_kv[t] )`` (``scorer_norm="off"``), but the key
-side is read from the RESIDENT paged fp8 MLA latent instead of a materialized
-signature table, with per-128-channel-block dequantization done in-register. The
-query-side projection ``v_h`` is built once per step on the host
-(``absorbed_latent.absorbed_latent_v``) and handed to the kernel, so the kernel
-is a paged ``max_h Σ_l v_h[b,h,l] · dequant(latent[slot,l])`` reduction.
-
-The kernel uses a persistent-worker topology: a static ``(bs, WORKERS)`` grid,
-each worker striding over the token blocks it owns, loop bound = the LIVE block
-count, written-then-``seq_len`` masking in selection order. The per-element
-dequant-then-dot matches the CPU reference value-for-value (only fp32 summation
-order reassociates), so the CPU ``absorbed_latent_score_logical`` is its exact
-oracle. This is the production DS selection score path. Value-affecting (the fp8
-latent vs the bf16-pre-quant label), declared, recall-gated — not a bit-identity
-claim.
+Computes ``score[b, t] = agg_h ( v_h[b] · dequant(latent[slot, t]) )`` from the
+RESIDENT paged fp8 MLA latent, with per-128-channel-block dequant done
+in-register. ``v_h`` is built once per step host-side. Value-affecting vs the
+bf16 pre-quant label (fp8 latent + tf32 MMA + fp32 reassociation), recall-gated.
 """
 
 from __future__ import annotations
@@ -87,11 +75,9 @@ if _HAS_TRITON:
         ROPE_DIM: tl.constexpr,
         WORKERS: tl.constexpr,
     ):
-        # Persistent-worker layout: static (bs, WORKERS) grid; each worker
-        # strides its token blocks; the
-        # loop bound is the LIVE block count (device-computed from seq_len). The
-        # full-width torch.topk consumer scans the whole scratch, so dead blocks
-        # are filled with -inf when STORE_DEAD_NEG_INF is set.
+        # Persistent-worker layout: static (bs, WORKERS) grid, each worker strides
+        # its token blocks. Dead blocks get -inf (STORE_DEAD_NEG_INF) so the
+        # full-width topk consumer can scan the whole scratch.
         batch_id = tl.program_id(0)
         worker = tl.program_id(1)
 
@@ -137,13 +123,10 @@ if _HAS_TRITON:
                 else:
                     valid = pos_valid
 
-                # Block-scale reassociation with a tensor-core MMA: per 128-wide
-                # latent block, partial[tok, h] = Σ_{l∈blk} v[h,l]·fp8(latent[tok,l])
-                # via tl.dot, then weight by that token's fp32 block scale and
-                # accumulate fp32 per head — never materializing a [TOKEN_BLOCK, lora]
-                # dequant tile (what the spilled per-head vector loop did). Real
-                # arithmetic is identical to dequant-then-dot; only the tf32 MMA and
-                # the fp32 reassociation differ (declared value-affecting, recall-gated).
+                # Per 128-wide latent block: partial[tok,h] = Σ v[h,l]·fp8(latent[tok,l])
+                # via tl.dot, scaled by the token's fp32 block scale, accumulated fp32
+                # per head — no full [TOKEN_BLOCK, lora] dequant tile. tf32 MMA + fp32
+                # reassociation differ from dequant-then-dot (value-affecting, recall-gated).
                 acc = tl.zeros((TOKEN_BLOCK, H_POW2), dtype=tl.float32)
                 for blk in range(nblk_lat):
                     cols = blk * block_size + c_offs
@@ -166,8 +149,7 @@ if _HAS_TRITON:
                     )  # [block_size, H_POW2]
                     partial = tl.dot(lat_blk, v_blk_t, allow_tf32=True)  # [TB, H_POW2]
                     if BF16_LATENT:
-                        # bf16 resident k_nope is already the dequantized latent
-                        # value — no per-128-block fp8 scale to reapply.
+                        # bf16 resident k_nope is already dequantized — no fp8 scale.
                         acc += partial
                     else:
                         sc_blk = tl.load(
@@ -178,14 +160,11 @@ if _HAS_TRITON:
                         acc += partial * sc_blk[:, None]
 
                 if COSINE:
-                    # Direction-normalize each per-head dot into a cosine score
-                    # BEFORE the head reduce: acc[t,h] /= (|Q_label_h|·|K_label_h[t]|
-                    # + eps). q_norm is per (batch, head); k_norm is per (physical
-                    # slot, head), gathered with the SAME safe_phys physical-slot
-                    # index the latent uses. Pad heads (h >= num_heads) load 1.0 so
-                    # their already-zero dot stays 0 before the h_mask reduce. This
-                    # is the only difference from the raw dot — COSINE=False elides
-                    # the whole block, so scorer_norm="off" stays byte-identical.
+                    # Cosine-normalize each per-head dot before the head reduce:
+                    # acc[t,h] /= (|Q_h|·|K_h[t]| + eps). k_norm gathered with the SAME
+                    # safe_phys index as the latent. Pad heads load 1.0 so their zero
+                    # dot stays 0. COSINE=False elides this, keeping scorer_norm="off"
+                    # byte-identical.
                     qn = tl.load(
                         q_norm_ptr + batch_id * qn_stride_b + h_offs,
                         mask=h_mask,
@@ -201,13 +180,10 @@ if _HAS_TRITON:
                     acc = acc / (qn[None, :] * kn + eps)
 
                 if HAS_ROPE:
-                    # Add the RoPE term q_pe_h·k_pe[t] per head BEFORE the head
-                    # reduce — rank tokens by the full attention logit (no-PE
-                    # absorbed dot + rope), not no-PE alone. k_pe[t] is the
-                    # resident post-RoPE rope key (shared across heads in MLA);
-                    # q_pe[h] the post-RoPE query. rope[t,h] = Σ_r k_pe[t,r]·q_pe[h,r]
-                    # via a [TOKEN_BLOCK, ROPE_DIM] @ [ROPE_DIM, H_POW2] MMA. Pad
-                    # heads load 0 (h_mask) so their rope add is 0 before the reduce.
+                    # Add the RoPE term q_pe[h]·k_pe[t] per head before the reduce so
+                    # tokens rank by the full logit (no-PE dot + rope), not no-PE alone.
+                    # k_pe is shared across heads in MLA. Pad heads load 0 so their rope
+                    # add is 0 before the reduce.
                     r_offs = tl.arange(0, ROPE_DIM)
                     kpe_blk = tl.load(
                         kpe_ptr + safe_phys[:, None] * kpe_stride_t + r_offs[None, :],
@@ -273,13 +249,6 @@ def absorbed_score_paged_fp8(
 ) -> torch.Tensor:
     """Paged absorbed score from the resident fp8 latent — GPU.
 
-    ``token_block=128`` + ``num_warps=2`` + ``num_stages=2`` is the measured-best
-    config (captured-replay sweep: 19.4 µs/call ≈ 15.2k µs/window at the bs=29/H=8/
-    width=5120/seq=4608 op point, under the ~23.1k logical-score bucket). The MMA
-    inner loop tiles ``[TOKEN_BLOCK, 128] @ [128, H_pow2]`` per latent block, so both
-    ``TOKEN_BLOCK`` and the head tile are floored at 16 for tensor cores. Triton's
-    default ``num_warps=4`` over-subscribes this shape (~2× slower) — hence the knob.
-
     Args:
         v: ``[bs, H, lora]`` fp32 — the per-head query projection ``v_h`` (from
             ``absorbed_latent.absorbed_latent_v``).
@@ -288,9 +257,8 @@ def absorbed_score_paged_fp8(
         req_pool_indices / req_to_token / seq_lens: paging, as in the production
             logical scorer.
         written: optional ``[max_tokens]`` bool; ``None`` treats all slots written.
-        out: optional pre-allocated ``[bs_buf, max_seq_len]`` fp32 destination. When
-            given, the kernel writes into ``out[:bs, :max_seq_len]`` (the graph-safe
-            zero-alloc path) instead of a fresh ``torch.empty`` (the diagnostic path).
+        out: optional pre-allocated ``[bs_buf, max_seq_len]`` fp32 destination; the
+            graph-safe zero-alloc path writes into ``out[:bs, :max_seq_len]``.
 
     Returns:
         ``[bs, max_seq_len]`` fp32 scores (``-inf`` on unwritten / out-of-range).
@@ -301,8 +269,7 @@ def absorbed_score_paged_fp8(
     max_tokens = latent_fp8.shape[0]
     assert lora % block_size == 0, f"lora {lora} not a multiple of block {block_size}"
     nblk = lora // block_size
-    # BF16 resident path: the latent IS the dequantized k_nope, so there is no
-    # per-128-block fp8 scale (latent_scales is a harmless unused dummy).
+    # BF16 resident path: latent IS the dequantized k_nope; no fp8 scale (dummy).
     bf16_latent = latent_fp8.dtype == torch.bfloat16
     if not bf16_latent:
         assert latent_scales.shape == (
@@ -312,9 +279,8 @@ def absorbed_score_paged_fp8(
     device = v.device
     if max_seq_len <= 0:
         return torch.full((bs, 1), float("-inf"), dtype=torch.float32, device=device)
-    # `written is None` means treat every slot as written — drive the kernel via the
-    # HAS_WRITTEN=False constexpr instead of materializing a per-call ones tensor
-    # (a per-call torch.ones would break the graph-safe zero-alloc contract).
+    # `written is None` treats every slot as written via HAS_WRITTEN=False — a per-call
+    # torch.ones would break the graph-safe zero-alloc contract.
     has_written = written is not None
     written_ptr = written if has_written else v
 
@@ -331,10 +297,8 @@ def absorbed_score_paged_fp8(
     num_workers = max(1, min(int(workers), num_token_blocks))
     grid = (bs, num_workers)
 
-    # Cosine division tensors. When cosine, q_norm is [bs, H] and key_norm_cache is
-    # the layer's [max_tokens, H] resident key-norm cache (gathered by physical
-    # slot). When off, pass v as a harmless non-null pointer (COSINE=False makes the
-    # kernel never dereference it) and zero strides, so the raw-dot launch is
+    # Cosine division tensors. When off, pass v as a harmless non-null pointer with
+    # zero strides — COSINE=False never dereferences it, so the raw-dot launch is
     # byte-identical.
     if cosine:
         assert q_norm is not None and key_norm_cache is not None, (
@@ -354,11 +318,9 @@ def absorbed_score_paged_fp8(
         kn_stride_h = 0
 
     # RoPE term. When off, pass v as a harmless non-null pointer with zero strides —
-    # HAS_ROPE=False makes the kernel never dereference it, so the no-rope launch is
-    # byte-identical. q_pe is [bs, H, rope_dim] post-RoPE; k_pe is the resident
-    # [max_tokens, rope_dim] bf16 RoPE key.
+    # HAS_ROPE=False never dereferences it, so the no-rope launch is byte-identical.
     # rope inputs are a PAIR: exactly-one-present is a wiring bug — fail closed rather
-    # than silently launching no-PE (which would drop the rope term unnoticed).
+    # than silently dropping the rope term.
     if (q_pe is None) != (k_pe is None):
         raise ValueError(
             "absorbed_score_paged_fp8: q_pe and k_pe must be provided together; got "
@@ -489,11 +451,10 @@ def absorbed_latent_score_logical_paged(
             scratch_q=scratch_q,
         )
         if cosine:
-            # Cosine denominator's query side: q_norm = ||q_sel|| over the label-dim
-            # axis. absorbed_latent_v_into just wrote q_sel (the weighted channel
-            # gather) into scratch_qsel[:bs, :, :label_dim], so norm it in place
-            # (out=) into scratch_qnorm — 0-alloc, exactly the reference's
-            # q_sel.norm(dim=-1). The kernel reads q_norm during the same launch.
+            # Cosine query-side norm: q_norm = ||q_sel|| over the label-dim axis.
+            # absorbed_latent_v_into wrote q_sel into scratch_qsel[:bs, :, :label_dim];
+            # norm it in place (out=) into scratch_qnorm — 0-alloc, matching the
+            # reference q_sel.norm(dim=-1).
             assert scratch_qnorm is not None and key_norm_cache is not None, (
                 "cosine graph-safe score requires scratch_qnorm and the layer's "
                 "key_norm_cache; one is None."

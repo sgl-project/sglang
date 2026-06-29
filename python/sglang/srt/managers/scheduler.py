@@ -3707,14 +3707,10 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        # Exclude private, dynamically-stashed runtime attributes (leading
-        # underscore) from the serialized internal state. ServerArgs config
-        # fields are all public; the underscore-prefixed attrs are runtime
-        # bind state — notably Double Sparsity stashes CUDA tensors / pools
-        # (`_ds_channel_selection`, `_ds_token_to_kv_pool`, ...). Serializing
-        # those over the ZMQ pyobj
-        # IPC pickles tensors and crashes `recv_pyobj` (torch.load), taking the
-        # whole server down on any `/get_server_info` call.
+        # Skip private, dynamically-stashed runtime attrs (leading underscore):
+        # ServerArgs config fields are all public, while underscore-prefixed
+        # attrs are runtime bind state — e.g. Double Sparsity stashes CUDA
+        # tensors there, which would crash the ZMQ pyobj serialization.
         ret = {
             k: v
             for k, v in vars(get_global_server_args()).items()

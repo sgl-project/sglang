@@ -1,14 +1,9 @@
 """Configuration dataclass for standalone Double Sparsity.
 
-The configuration surface is intentionally narrow: ``top_k``, ``page_size``,
-``channel_mask_path``, ``device_buffer_size``, plus a free ``extra`` dict.  No
-``selection_mode`` / ``top_p`` / ``min_top_k`` / ``max_top_k`` — top-p selection
-(Twilight) is a separate follow-on with its own ABI design.
-
-``top_k`` counts maximum **tokens** per request (not pages).  At the DSA
-index-topk operating point this matches the model's intrinsic ``index_topk=2048``.
-``device_buffer_size`` is the score-scratch buffer cap (maximum concurrently
-live tokens for the decode scoring scratch tensor).
+The configuration surface is intentionally narrow: ``channel_mask_path`` (the
+only required field), ``top_k``, ``page_size``, the selector variants below, and
+a free ``extra`` dict. ``top_k`` counts maximum **tokens** per request (not
+pages); at the DSA operating point it matches the model's ``index_topk=2048``.
 """
 
 from __future__ import annotations
@@ -21,11 +16,8 @@ _ALLOWED_FIELDS = {
     "top_k",
     "page_size",
     "channel_mask_path",
-    "device_buffer_size",
     "scorer_norm",
     "head_agg",
-    "anchor_mode",
-    "anchor_budget",
     "selector_width_buckets",
     "selector_width_overflow_policy",
     "score_reduce_dtype",
@@ -34,36 +26,18 @@ _ALLOWED_FIELDS = {
     "extra",
 }
 
-# Flag-gated non-learned selector variants (config-borne, not env, so they reach
-# the TP worker processes that run the selector). The served default is cosine +
-# current-slot inclusion (the two restored fixes); "off" (raw channel-dot) and
-# current-excluded stay reachable by explicit config for bisection.
-#
-# scorer_norm: "cosine" (direction-normalized) is the default served scorer (the
-#   restored Fix B) and is graph-safe: it divides each per-head dot by the query/key
-#   norms — the key norm gathered from a resident-latent cache, the query norm
-#   computed allocation-free per step — on top of the SAME raw-dot numerator. "off"
-#   (raw channel-dot) is the explicit bisection control. The absorbed-latent identity
-#   (score = max_h v_h · c_kv) is the numerator both share; cosine adds the per-head
-#   norm division, and ds_scorer_is_graph_safe() returns True for both.
+# Selector variants are config-borne (not env) so they reach the TP worker
+# processes that run the selector.
+# scorer_norm: "cosine" (default, per-head dot divided by query/key norms) or
+#   "off" (raw channel-dot). Both share the absorbed-latent numerator
+#   (score = max_h v_h · c_kv) and are graph-safe.
 # head_agg: cross-head score reduction, "max" (default) or "mean".
-# anchor_mode: which deterministic positions to always force-include in the
-#   selection — "off" (default, none), "recency" (most-recent), "global"
-#   (earliest stable), or "strided" (evenly spaced over [0, seq_len)).
-# anchor_budget: how many anchor positions to force-include; 0 disables.
 _ALLOWED_SCORER_NORM = ("off", "cosine")
-# The served default is the restored cosine scorer (the Fix-B direction normalization);
-# "off" (raw channel-dot) stays reachable by explicit config for bisection. A config that
-# omits scorer_norm now serves cosine.
 _DEFAULT_SCORER_NORM = "cosine"
-# The served default also force-includes the current decode slot (the Fix-A current-slot
-# inclusion); explicit `false` keeps the current-excluded raw behavior for bisection.
+# Force-include the current decode slot (seq_len-1) in its own selected set.
 _DEFAULT_INCLUDE_CURRENT_SLOT = True
 _ALLOWED_HEAD_AGG = ("max", "mean")
 _DEFAULT_HEAD_AGG = "max"
-_ALLOWED_ANCHOR_MODE = ("off", "recency", "global", "strided")
-_DEFAULT_ANCHOR_MODE = "off"
-_DEFAULT_ANCHOR_BUDGET = 0
 
 
 _DEFAULT_TOP_K = (
@@ -78,7 +52,6 @@ _DEFAULT_SELECTOR_WIDTH_BUCKETS = (5120,)
 _ALLOWED_OVERFLOW_POLICY = ("full_fallback", "fail_closed")
 _DEFAULT_OVERFLOW_POLICY = "full_fallback"
 _DEFAULT_PAGE_SIZE = 64  # FlashMLA KV layout requirement
-_DEFAULT_DEVICE_BUFFER_SIZE = 4096  # score-scratch buffer cap in tokens
 
 
 @dataclass
@@ -86,28 +59,20 @@ class DoubleSparsityConfig:
     channel_mask_path: str
     top_k: int = _DEFAULT_TOP_K
     page_size: int = _DEFAULT_PAGE_SIZE
-    device_buffer_size: int = _DEFAULT_DEVICE_BUFFER_SIZE
     scorer_norm: str = _DEFAULT_SCORER_NORM
     head_agg: str = _DEFAULT_HEAD_AGG
-    anchor_mode: str = _DEFAULT_ANCHOR_MODE
-    anchor_budget: int = _DEFAULT_ANCHOR_BUDGET
     selector_width_buckets: List[int] = field(
         default_factory=lambda: list(_DEFAULT_SELECTOR_WIDTH_BUCKETS)
     )
     selector_width_overflow_policy: str = _DEFAULT_OVERFLOW_POLICY
     score_reduce_dtype: str = "bf16"
-    # include_current_slot: served fix for the current-decode-slot exclusion. When
-    # on, the production graph-safe selector force-includes the current decode
-    # token's own logical slot (seq_len-1) in its selected set, overriding the
-    # slot-validity -inf mask for THAT slot only (every other reused slot stays
-    # masked, so the stale-slot hazard is not reopened). ON by default (the served
-    # Fix A); explicit `false` keeps the current-excluded raw behavior for bisection.
+    # Force-include the current decode token's own slot (seq_len-1), overriding
+    # the slot-validity -inf mask for that one slot only.
     include_current_slot: bool = _DEFAULT_INCLUDE_CURRENT_SLOT
-    # rope_aware_score: add the RoPE term q_pe·k_pe[t] to the absorbed selection
-    # score (raw-dot + rope), recovering long-context accuracy. OFF by default → the
-    # production score is unchanged (byte-identical kernel launch). Only valid with
-    # scorer_norm="off"; every non-validated runtime (bf16 KV, spec/MTP/DCP/NSA, etc.)
-    # fails closed at the selection site rather than silently scoring no-PE.
+    # Add the RoPE term q_pe·k_pe[t] to the absorbed score to recover long-context
+    # accuracy. Off by default (byte-identical kernel launch); requires
+    # scorer_norm="off" and fails closed at the selection site on any
+    # non-validated runtime (bf16 KV, spec/MTP/DCP/NSA) rather than scoring no-PE.
     rope_aware_score: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -122,16 +87,6 @@ class DoubleSparsityConfig:
             raise ValueError(
                 f"Double Sparsity 'head_agg' must be one of "
                 f"{list(_ALLOWED_HEAD_AGG)}, got {self.head_agg!r}."
-            )
-        if self.anchor_mode not in _ALLOWED_ANCHOR_MODE:
-            raise ValueError(
-                f"Double Sparsity 'anchor_mode' must be one of "
-                f"{list(_ALLOWED_ANCHOR_MODE)}, got {self.anchor_mode!r}."
-            )
-        if not isinstance(self.anchor_budget, int) or self.anchor_budget < 0:
-            raise ValueError(
-                f"Double Sparsity 'anchor_budget' must be a non-negative integer, "
-                f"got {self.anchor_budget!r}."
             )
         if not isinstance(self.selector_width_buckets, list) or any(
             not isinstance(w, int) or isinstance(w, bool) or w <= 0
@@ -191,11 +146,6 @@ class DoubleSparsityConfig:
         if not isinstance(self.channel_mask_path, str) or not self.channel_mask_path:
             raise ValueError(
                 "Double Sparsity 'channel_mask_path' must be a non-empty string."
-            )
-        if not isinstance(self.device_buffer_size, int) or self.device_buffer_size <= 0:
-            raise ValueError(
-                f"Double Sparsity 'device_buffer_size' must be a positive integer, "
-                f"got {self.device_buffer_size!r}."
             )
         if not isinstance(self.extra, dict):
             raise ValueError(
@@ -260,13 +210,8 @@ def parse_double_sparsity_config(payload: str) -> DoubleSparsityConfig:
         channel_mask_path=data["channel_mask_path"],
         top_k=int(data.get("top_k", _DEFAULT_TOP_K)),
         page_size=int(data.get("page_size", _DEFAULT_PAGE_SIZE)),
-        device_buffer_size=int(
-            data.get("device_buffer_size", _DEFAULT_DEVICE_BUFFER_SIZE)
-        ),
         scorer_norm=str(data.get("scorer_norm", _DEFAULT_SCORER_NORM)),
         head_agg=str(data.get("head_agg", _DEFAULT_HEAD_AGG)),
-        anchor_mode=str(data.get("anchor_mode", _DEFAULT_ANCHOR_MODE)),
-        anchor_budget=int(data.get("anchor_budget", _DEFAULT_ANCHOR_BUDGET)),
         selector_width_buckets=_coerce_width_buckets(
             data.get("selector_width_buckets", list(_DEFAULT_SELECTOR_WIDTH_BUCKETS))
         ),

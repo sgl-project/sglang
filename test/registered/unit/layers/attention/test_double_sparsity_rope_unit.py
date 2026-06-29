@@ -19,7 +19,6 @@ rope term is added per head BEFORE the head reduce (the property the SUM compose
 from __future__ import annotations
 
 import json
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -111,19 +110,10 @@ def _server_args(**kwargs):
 
 
 class TestRopeAwareStartupGate(unittest.TestCase):
-    """Init/startup fail-closed gate in validate_double_sparsity (AC-5, init layer).
-
-    Covers the scope leaks the in-loop selection-site guard cannot reach (CPU/NPU and
-    graphs-off decode bypass _select_topk_indices entirely). CPU-only.
+    """Init/startup fail-closed gate in validate_double_sparsity (the rope gate
+    fires before the model-capability check). Covers the graphs-off decode path
+    that bypasses _select_topk_indices entirely. CPU-only.
     """
-
-    def setUp(self):
-        # validate_double_sparsity reaches a model-capability check only AFTER the rope
-        # gate; the rope gate fires first, so the adapter env is a harmless safety net.
-        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
-
-    def tearDown(self):
-        os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
 
     def test_graphs_off_rejected(self):
         with self.assertRaises(ValueError) as ctx:
@@ -194,25 +184,6 @@ class TestRopeAwareFailClosedFallback(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             retrieve_topk_graph_safe(**common, q_pe=torch.zeros(bs, num_heads, ROPE))
         self.assertIn("rope", str(ctx.exception).lower())
-
-    def test_capture_decode_step_raises_when_rope_on(self):
-        from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
-            capture_decode_step,
-        )
-
-        selector = SimpleNamespace(config=SimpleNamespace(rope_aware_score=True))
-        state = SimpleNamespace(max_seq_len=4)
-        with self.assertRaises(RuntimeError) as ctx:
-            capture_decode_step(
-                selector,
-                state=state,
-                queries=torch.zeros(1, 2, 4),
-                layer_id=0,
-                req_pool_indices=torch.zeros(1, dtype=torch.int32),
-                sparse_mask=torch.ones(1, 4, dtype=torch.bool),
-                seq_lens=torch.full((1,), 4, dtype=torch.int32),
-            )
-        self.assertIn("rope_aware_score", str(ctx.exception))
 
 
 def _reduce_worker(rank, world_size, port, out_q):

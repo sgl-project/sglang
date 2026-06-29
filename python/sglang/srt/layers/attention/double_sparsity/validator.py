@@ -25,7 +25,6 @@ Enforces, at server startup:
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -83,8 +82,7 @@ def validate_double_sparsity(server_args: ServerArgs) -> None:
             "--enable-double-sparsity requires --double-sparsity-config to be set "
             "with at least 'channel_mask_path'. Example: --double-sparsity-config "
             '\'{"top_k": 2048, "page_size": 64, '
-            '"channel_mask_path": "/path/to/channel_mask.safetensors", '
-            '"device_buffer_size": 4096}\'.'
+            '"channel_mask_path": "/path/to/channel_mask.safetensors"}\'.'
         )
 
     from sglang.srt.layers.attention.double_sparsity.config import (
@@ -98,12 +96,9 @@ def validate_double_sparsity(server_args: ServerArgs) -> None:
             "Double Sparsity requires 'channel_mask_path' in --double-sparsity-config."
         )
 
-    # Production-path selector-variant safety (startup gate). This
-    # ds_scorer_is_graph_safe() guard covers any non-graph-safe variant: raw-dot
-    # "off", cosine (the in-kernel per-head division + resident key-norm cache, on
-    # both the FP8 and BF16 KV paths), head_agg (mean), and anchor_mode
-    # (recency/global/strided) are all graph-safe so it does not fire for them; it
-    # remains the single startup gate so a future non-graph-safe variant can re-enable it.
+    # Production-path selector-variant safety (startup gate). Both supported
+    # scorers (cosine, raw-dot "off") are graph-safe, so this does not fire for
+    # them; it remains the single startup gate for a future non-graph-safe variant.
     from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
         ds_scorer_is_graph_safe,
     )
@@ -248,7 +243,9 @@ def validate_double_sparsity(server_args: ServerArgs) -> None:
             model_topk = get_dsa_index_topk(hf_config)
             if model_topk > 0:
                 if config.top_k != model_topk:
-                    if os.environ.get("SGLANG_DS_ALLOW_TOPK_MISMATCH") != "1":
+                    from sglang.srt.environ import envs
+
+                    if not envs.SGLANG_DS_ALLOW_TOPK_MISMATCH.get():
                         raise ValueError(
                             f"Double Sparsity top_k={config.top_k} does not match the model's "
                             f"DSA index_topk={model_topk}. The two must agree for the "

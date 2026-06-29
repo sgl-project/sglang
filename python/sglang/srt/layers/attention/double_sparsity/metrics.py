@@ -1,13 +1,7 @@
-"""Prometheus metrics + per-request meta_info for Double Sparsity.
+"""Prometheus metrics for Double Sparsity.
 
-All metric names live under the ``sglang_double_sparsity_*`` namespace per
-(deliberately distinct from any ``sglang_hisparse_*`` namespace,
-because DS is standalone).
-
-Surfaces:
-
-* ``sglang_double_sparsity_channel_mask_valid`` — Gauge per rank, ``1`` once
-  the channel mask file has been loaded and validated, ``0`` otherwise.
+Exposes ``sglang_double_sparsity_channel_mask_valid`` — a per-rank Gauge set to
+``1`` once the channel mask file has been loaded and validated.
 """
 
 from __future__ import annotations
@@ -26,13 +20,8 @@ _metric_objs: Dict[str, Any] = {}
 
 
 def _try_register() -> None:
-    """Lazy-register metrics with prometheus_client when first used.
-
-    SGLang's metrics infrastructure may or may not be active in any given
-    process (CLI tests, calibration scripts, etc.). The lazy path keeps the
-    selection hot path import-light.
-    """
-
+    """Lazy-register the gauge on first use (prometheus_client may be absent in
+    CLI / calibration processes; the hot path stays import-light)."""
     global _metrics_registered
     if _metrics_registered:
         return
@@ -63,15 +52,8 @@ def mark_channel_mask_valid(valid: bool) -> None:
 
 
 def reset_for_testing() -> None:
-    """Clear registered metric state. Tests only.
-
-    Also unregisters the underlying collectors from the default
-    ``prometheus_client.REGISTRY`` so a subsequent ``_try_register()`` does
-    not raise ``ValueError: Duplicated timeseries``. The ``unregister`` call
-    is best-effort: ``KeyError`` is suppressed for collectors that were
-    never registered (e.g. when prometheus_client is unavailable).
-    """
-
+    """Clear registered metric state and unregister the collectors so a later
+    ``_try_register()`` does not raise ``Duplicated timeseries``. Tests only."""
     global _metrics_registered
     with _lock:
         try:

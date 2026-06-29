@@ -13,7 +13,6 @@ exercised by later milestones.
 
 from __future__ import annotations
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -37,10 +36,7 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 
 def _valid_payload(path: str = "/tmp/cm.safetensors") -> str:
-    return (
-        '{"top_k": 2048, "page_size": 64, '
-        f'"channel_mask_path": "{path}", "device_buffer_size": 4096}}'
-    )
+    return '{"top_k": 2048, "page_size": 64, ' f'"channel_mask_path": "{path}"}}'
 
 
 class TestDoubleSparsityConfigParser(unittest.TestCase):
@@ -48,7 +44,6 @@ class TestDoubleSparsityConfigParser(unittest.TestCase):
         cfg = parse_double_sparsity_config(_valid_payload())
         self.assertEqual(cfg.top_k, 2048)
         self.assertEqual(cfg.page_size, 64)
-        self.assertEqual(cfg.device_buffer_size, 4096)
         self.assertEqual(cfg.extra, {})
         self.assertIsInstance(cfg, DoubleSparsityConfig)
 
@@ -56,7 +51,7 @@ class TestDoubleSparsityConfigParser(unittest.TestCase):
         payload = (
             '{"top_k": 2048, "page_size": 64, '
             '"channel_mask_path": "/tmp/cm.safetensors", '
-            '"device_buffer_size": 4096, "extra": {"experiment": "x"}}'
+            '"extra": {"experiment": "x"}}'
         )
         cfg = parse_double_sparsity_config(payload)
         self.assertEqual(cfg.extra, {"experiment": "x"})
@@ -72,7 +67,7 @@ class TestDoubleSparsityConfigParser(unittest.TestCase):
         self.assertIn("top_p", str(ctx.exception))
 
     def test_missing_channel_mask_path(self):
-        payload = '{"top_k": 2048, "page_size": 64, "device_buffer_size": 4096}'
+        payload = '{"top_k": 2048, "page_size": 64}'
         with self.assertRaises(ValueError) as ctx:
             parse_double_sparsity_config(payload)
         self.assertIn("channel_mask_path", str(ctx.exception))
@@ -84,7 +79,7 @@ class TestDoubleSparsityConfigParser(unittest.TestCase):
     def test_invalid_top_k(self):
         payload = (
             '{"top_k": 0, "page_size": 64, '
-            '"channel_mask_path": "/tmp/cm.safetensors", "device_buffer_size": 4096}'
+            '"channel_mask_path": "/tmp/cm.safetensors"}'
         )
         with self.assertRaises(ValueError):
             parse_double_sparsity_config(payload)
@@ -215,13 +210,9 @@ class TestValidator(unittest.TestCase):
 
     def test_missing_config(self):
         args = self._args(enable_double_sparsity=True, double_sparsity_config=None)
-        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
-        try:
-            with self.assertRaises(ValueError) as ctx:
-                validate_double_sparsity(args)
-            self.assertIn("channel_mask_path", str(ctx.exception))
-        finally:
-            os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+        with self.assertRaises(ValueError) as ctx:
+            validate_double_sparsity(args)
+        self.assertIn("channel_mask_path", str(ctx.exception))
 
     def test_disaggregation_rejected(self):
         args = self._args(
@@ -229,13 +220,9 @@ class TestValidator(unittest.TestCase):
             disaggregation_mode="decode",
             double_sparsity_config=_valid_payload(),
         )
-        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
-        try:
-            with self.assertRaises(ValueError) as ctx:
-                validate_double_sparsity(args)
-            self.assertIn("disaggregation", str(ctx.exception).lower())
-        finally:
-            os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+        with self.assertRaises(ValueError) as ctx:
+            validate_double_sparsity(args)
+        self.assertIn("disaggregation", str(ctx.exception).lower())
 
     def test_hierarchical_cache_rejected(self):
         # The hierarchical-cache check fires before the payload check, so no
@@ -261,13 +248,9 @@ class TestValidator(unittest.TestCase):
             double_sparsity_config=_valid_payload(),
             page_size=32,
         )
-        os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
-        try:
-            with self.assertRaises(ValueError) as ctx:
-                validate_double_sparsity(args)
-            self.assertIn("page_size", str(ctx.exception))
-        finally:
-            os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+        with self.assertRaises(ValueError) as ctx:
+            validate_double_sparsity(args)
+        self.assertIn("page_size", str(ctx.exception))
 
     def test_valid_path(self):
         import os as _os
@@ -301,31 +284,16 @@ class TestValidator(unittest.TestCase):
                 dsa_decode_backend="flashmla_kv",
                 disable_radix_cache=True,
             )
-            os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
-            os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
-            try:
-                validate_double_sparsity(args)
-                self.assertIsInstance(
-                    args._double_sparsity_parsed_config, DoubleSparsityConfig
-                )
-            finally:
-                os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
-                os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+            validate_double_sparsity(args)
+            self.assertIsInstance(
+                args._double_sparsity_parsed_config, DoubleSparsityConfig
+            )
 
-    def test_capability_check_uses_existing_model_config_symbol(self):
-        """Regression: the DS validator's capability check imported a stale
-        `is_deepseek_nsa` after model_config renamed it to `is_deepseek_dsa`,
-        raising ImportError at server startup (DS boot crashed before model
-        load). Lock that the validator references the existing symbol and that
-        the symbol classifies DeepSeek-V3.2 as a DSA model."""
-        import inspect
-
+    def test_capability_check_classifies_dsa_model(self):
+        """The capability symbol the DS validator imports classifies DeepSeek
+        V3.2 as a DSA model and a non-DSA arch as not."""
         from sglang.srt.configs.model_config import is_deepseek_dsa
-        from sglang.srt.layers.attention.double_sparsity import validator as _v
 
-        src = inspect.getsource(_v)
-        self.assertNotIn("is_deepseek_nsa", src)
-        self.assertIn("is_deepseek_dsa", src)
         self.assertTrue(
             is_deepseek_dsa(
                 SimpleNamespace(
@@ -378,13 +346,7 @@ class TestValidator(unittest.TestCase):
                 dsa_decode_backend="flashmla_kv",
                 disable_radix_cache=True,
             )
-            os.environ["SGLANG_DS_ALLOW_PLACEHOLDER"] = "1"
-            os.environ["SGLANG_DS_ALLOW_NO_ADAPTER"] = "1"
-            try:
-                validate_double_sparsity(args)
-            finally:
-                os.environ.pop("SGLANG_DS_ALLOW_PLACEHOLDER", None)
-                os.environ.pop("SGLANG_DS_ALLOW_NO_ADAPTER", None)
+            validate_double_sparsity(args)
         gauge = m._metric_objs.get("channel_mask_valid")
         self.assertIsNotNone(gauge, "channel_mask_valid gauge should be registered")
         self.assertEqual(
@@ -481,166 +443,62 @@ class TestPageTableAdapter(unittest.TestCase):
 
         return logical_to_physical
 
-    def test_basic_req_to_token_gather(self):
-        """Logical positions are gathered from req_to_token; -1 padding preserved."""
-        adapter = self._adapter()
-        req_to_token = torch.tensor(
-            [[10, 20, 30, 40, 50, 60, 70, 80]], dtype=torch.int32
-        )
-        selected = torch.tensor([[0, 2, 4, -1, -1, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0], dtype=torch.int32)
-        out = torch.full_like(selected, -1)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(out[0, 0].item(), 10)  # req_to_token[0, 0]
-        self.assertEqual(out[0, 1].item(), 30)  # req_to_token[0, 2]
-        self.assertEqual(out[0, 2].item(), 50)  # req_to_token[0, 4]
-        self.assertEqual(out[0, 3].item(), -1)  # padding preserved
-        self.assertEqual(error_count, 0)
-
-    def test_padding_minus_one_preserved(self):
-        """Positions equal to -1 must remain -1 in the output."""
-        adapter = self._adapter()
-        req_to_token = torch.arange(100, dtype=torch.int32).unsqueeze(0)
-        selected = torch.tensor([[-1, -1, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0], dtype=torch.int32)
-        out = torch.zeros_like(selected)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertTrue(torch.all(out == -1).item())
-        self.assertEqual(error_count, 0)
-
-    def test_bad_pool_index_row_gets_minus_one(self):
-        """Rows where req_pool_indices is out of range for req_to_token get all -1."""
-        adapter = self._adapter()
-        req_to_token = torch.tensor([[10, 20, 30]], dtype=torch.int32)  # 1 pool row
-        selected = torch.tensor([[0, 1, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([5], dtype=torch.int32)  # bad: only 1 pool row
-        out = torch.zeros_like(selected)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertTrue(torch.all(out == -1).item())
-        self.assertEqual(error_count, 1)
-
-    def test_error_count_matches_bad_pool_rows(self):
-        """error_count equals the number of out-of-range req_pool_indices rows."""
-        adapter = self._adapter()
-        req_to_token = torch.arange(20, dtype=torch.int32).reshape(2, 10)
-        selected = torch.tensor([[0, 1, -1], [0, 2, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0, 99], dtype=torch.int32)  # row 1 bad
-        out = torch.full_like(selected, -1)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(error_count, 1)
-
-    def test_empty_batch_returns_zero(self):
-        """bs=0 gives error_count=0 and out remains -1."""
-        adapter = self._adapter()
-        req_to_token = torch.zeros((1, 10), dtype=torch.int32)
-        selected = torch.zeros((0, 4), dtype=torch.int32)
-        req_pool_indices = torch.zeros((0,), dtype=torch.int32)
-        out = torch.full((0, 4), -1, dtype=torch.int32)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(error_count, 0)
-        self.assertEqual(out.shape[0], 0)
-
-    def test_out_tensor_modified_in_place(self):
-        """The pre-allocated out tensor is written in-place."""
-        adapter = self._adapter()
-        req_to_token = torch.tensor([[100, 200, 300]], dtype=torch.int32)
-        selected = torch.tensor([[0, 2, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0], dtype=torch.int32)
-        out = torch.full((1, 3), -99, dtype=torch.int32)
-        original_data_ptr = out.data_ptr()
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(out.data_ptr(), original_data_ptr)  # same storage
-        self.assertEqual(out[0, 0].item(), 100)
-        self.assertEqual(out[0, 1].item(), 300)
-        self.assertEqual(out[0, 2].item(), -1)
-        self.assertEqual(error_count, 0)
-
-    def test_all_bad_pool_gives_all_minus_one(self):
-        """When all rows have bad pool indices, output is all -1."""
-        adapter = self._adapter()
-        req_to_token = torch.zeros((1, 10), dtype=torch.int32)
-        selected = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([99, 100], dtype=torch.int32)  # all bad
-        out = torch.zeros((2, 3), dtype=torch.int32)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertTrue(torch.all(out == -1).item())
-        self.assertEqual(error_count, 2)
-
-    def test_mixed_valid_invalid_pool(self):
-        """Valid pool rows get correct physical slots; invalid rows get -1."""
-        adapter = self._adapter()
-        req_to_token = torch.tensor([[5, 10, 15, 20]], dtype=torch.int32)
-        selected = torch.tensor([[0, 2, -1], [1, 3, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0, 99], dtype=torch.int32)  # row 1 bad
-        out = torch.full((2, 3), -99, dtype=torch.int32)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(out[0, 0].item(), 5)  # req_to_token[0, 0]
-        self.assertEqual(out[0, 1].item(), 15)  # req_to_token[0, 2]
-        self.assertEqual(out[0, 2].item(), -1)  # padding
-        self.assertTrue(torch.all(out[1] == -1).item())  # bad pool → all -1
-        self.assertEqual(error_count, 1)
-
-    def test_physical_slots_from_req_to_token(self):
-        """Physical slot values are exactly req_to_token[pool, position]."""
-        adapter = self._adapter()
-        torch.manual_seed(42)
-        req_to_token = torch.randint(0, 65536, (4, 32), dtype=torch.int32)
-        selected = torch.tensor([[0, 5, 10, 15, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([2], dtype=torch.int32)
-        out = torch.full((1, 5), -1, dtype=torch.int32)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(out[0, 0].item(), req_to_token[2, 0].item())
-        self.assertEqual(out[0, 1].item(), req_to_token[2, 5].item())
-        self.assertEqual(out[0, 2].item(), req_to_token[2, 10].item())
-        self.assertEqual(out[0, 3].item(), req_to_token[2, 15].item())
-        self.assertEqual(out[0, 4].item(), -1)
-        self.assertEqual(error_count, 0)
-
-    def test_multi_pool_rows_each_use_own_pool(self):
-        """Each batch row uses its own pool row from req_to_token."""
+    def test_gather_per_pool_with_padding(self):
+        """Each row gathers req_to_token[its pool, position]; -1 positions stay -1."""
         adapter = self._adapter()
         req_to_token = torch.tensor([[1, 2, 3, 4], [10, 20, 30, 40]], dtype=torch.int32)
         selected = torch.tensor([[0, 3, -1], [1, 2, -1]], dtype=torch.int32)
         req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
-        out = torch.full((2, 3), -1, dtype=torch.int32)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertEqual(out[0, 0].item(), 1)  # req_to_token[0, 0]
-        self.assertEqual(out[0, 1].item(), 4)  # req_to_token[0, 3]
-        self.assertEqual(out[1, 0].item(), 20)  # req_to_token[1, 1]
-        self.assertEqual(out[1, 1].item(), 30)  # req_to_token[1, 2]
-        self.assertEqual(error_count, 0)
-
-    def test_negative_pool_index_treated_as_error(self):
-        """Negative req_pool_indices are out-of-range → those rows get -1."""
-        adapter = self._adapter()
-        req_to_token = torch.arange(10, dtype=torch.int32).unsqueeze(0)
-        selected = torch.tensor([[0, 1, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([-1], dtype=torch.int32)
-        out = torch.zeros((1, 3), dtype=torch.int32)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertTrue(torch.all(out == -1).item())
-        self.assertEqual(error_count, 1)
-
-    def test_empty_selection_all_padding(self):
-        """When all positions are -1, output is all -1 with no errors."""
-        adapter = self._adapter()
-        req_to_token = torch.arange(20, dtype=torch.int32).unsqueeze(0)
-        selected = torch.full((1, 5), -1, dtype=torch.int32)
-        req_pool_indices = torch.tensor([0], dtype=torch.int32)
-        out = torch.zeros((1, 5), dtype=torch.int32)
-        error_count = adapter(selected, req_pool_indices, req_to_token, out)
-        self.assertTrue(torch.all(out == -1).item())
-        self.assertEqual(error_count, 0)
-
-    def test_output_dtype_is_int32(self):
-        """Output tensor retains int32 dtype (type-stable adapter)."""
-        adapter = self._adapter()
-        req_to_token = torch.arange(10, dtype=torch.int32).unsqueeze(0)
-        selected = torch.tensor([[0, 2, -1]], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0], dtype=torch.int32)
-        out = torch.full((1, 3), -1, dtype=torch.int32)
+        out = torch.full((2, 3), -99, dtype=torch.int32)
+        ptr = out.data_ptr()
         adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(out.data_ptr(), ptr)  # in-place write
         self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out[0].tolist(), [1, 4, -1])  # pool 0; padding preserved
+        self.assertEqual(out[1].tolist(), [20, 30, -1])  # pool 1
+
+    def test_out_of_range_pool_rows_map_to_minus_one(self):
+        """Out-of-range and negative req_pool_indices rows are filled with -1;
+        valid rows are unaffected."""
+        adapter = self._adapter()
+        req_to_token = torch.tensor([[5, 10, 15, 20]], dtype=torch.int32)
+        selected = torch.tensor([[0, 2, -1], [1, 3, -1], [0, 1, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([0, 99, -1], dtype=torch.int32)  # rows 1,2 bad
+        out = torch.full((3, 3), -99, dtype=torch.int32)
+        adapter(selected, req_pool_indices, req_to_token, out)
+        self.assertEqual(out[0].tolist(), [5, 15, -1])  # valid
+        self.assertTrue(torch.all(out[1] == -1).item())  # out-of-range pool
+        self.assertTrue(torch.all(out[2] == -1).item())  # negative pool
+
+    def test_empty_batch(self):
+        adapter = self._adapter()
+        out = torch.full((0, 4), -1, dtype=torch.int32)
+        adapter(
+            torch.zeros((0, 4), dtype=torch.int32),
+            torch.zeros((0,), dtype=torch.int32),
+            torch.zeros((1, 10), dtype=torch.int32),
+            out,
+        )
+        self.assertEqual(out.shape[0], 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "exercises the Triton kernel")
+    def test_cuda_triton_matches_cpu(self):
+        """The CUDA Triton path produces the same gather as the torch fallback."""
+        adapter = self._adapter()
+        torch.manual_seed(42)
+        req_to_token = torch.randint(0, 65536, (4, 32), dtype=torch.int32)
+        selected = torch.tensor([[0, 5, 10, -1], [3, 31, -1, -1]], dtype=torch.int32)
+        req_pool_indices = torch.tensor([2, 99], dtype=torch.int32)  # row 1 bad
+        out_cpu = torch.full((2, 4), -1, dtype=torch.int32)
+        adapter(selected, req_pool_indices, req_to_token, out_cpu)
+        out_cuda = torch.full((2, 4), -1, dtype=torch.int32, device="cuda")
+        adapter(
+            selected.cuda(),
+            req_pool_indices.cuda(),
+            req_to_token.cuda(),
+            out_cuda,
+        )
+        self.assertEqual(out_cuda.cpu().tolist(), out_cpu.tolist())
 
 
 class TestChannelMaskLoader(unittest.TestCase):
@@ -1445,21 +1303,11 @@ class TestBf16ResidentCosine(unittest.TestCase):
     torch.cuda.is_available(), "current-slot force-include is a Triton kernel"
 )
 class TestIncludeCurrentSlotForceInclude(unittest.TestCase):
-    """AC-7/AC-5/AC-4: the current-slot +inf force-include fails closed on a
-    selector-width miss (no clamp to a different token) and, for cosine, only
-    fires when the row q-norm and the current physical-slot k-norm are finite.
-    Only the current slot (seq_len-1) is ever touched (H3 preserved)."""
+    """The current-slot +inf force-include fails closed on a selector-width miss
+    (no clamp to a different token) and, for cosine, only fires when the row
+    q-norm is finite. Only the current slot (seq_len-1) is ever touched."""
 
-    def _run(
-        self,
-        seq_len,
-        max_seq_len,
-        *,
-        cosine=False,
-        qnorm_row=None,
-        cur_knorm_row=None,
-        H=2,
-    ):
+    def _run(self, seq_len, max_seq_len, *, cosine=False, qnorm_row=None, H=2):
         from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
             _force_include_current_slot,
         )
@@ -1468,29 +1316,13 @@ class TestIncludeCurrentSlotForceInclude(unittest.TestCase):
         bs = 1
         scores = torch.zeros((bs, max_seq_len), dtype=torch.bfloat16, device=dev)
         seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=dev)
-        scratch_qnorm = key_norm_cache = req_pool = rtt = None
-        layer_id = 0
+        scratch_qnorm = None
         if cosine:
             scratch_qnorm = torch.tensor(
                 [qnorm_row if qnorm_row is not None else [1.0] * H],
                 dtype=torch.float32,
                 device=dev,
             )
-            req_pool = torch.tensor([0], dtype=torch.int32, device=dev)
-            max_ctx = max_seq_len + 4
-            # current physical slot for logical seq_len-1 is phys=7 (arbitrary).
-            phys = 7
-            rtt = torch.zeros((1, max_ctx), dtype=torch.int32, device=dev)
-            if 0 <= seq_len - 1 < max_ctx:
-                rtt[0, seq_len - 1] = phys
-            max_tokens = 16
-            key_norm_cache = torch.ones(
-                (1, max_tokens, H), dtype=torch.float32, device=dev
-            )
-            if cur_knorm_row is not None:
-                key_norm_cache[0, phys] = torch.tensor(
-                    cur_knorm_row, dtype=torch.float32, device=dev
-                )
         _force_include_current_slot(
             scores,
             seq_lens,
@@ -1498,17 +1330,13 @@ class TestIncludeCurrentSlotForceInclude(unittest.TestCase):
             bs,
             cosine=cosine,
             scratch_qnorm=scratch_qnorm,
-            key_norm_cache=key_norm_cache,
-            layer_id=layer_id,
-            req_pool_indices=req_pool,
-            req_to_token=rtt,
         )
         return scores
 
     def test_rawdot_in_range_forces_current_only(self):
         scores = self._run(5, 8)  # cur = 4
         self.assertTrue(torch.isinf(scores[0, 4]).item())
-        # H3: nothing else touched.
+        # nothing else touched.
         others = torch.cat([scores[0, :4], scores[0, 5:]])
         self.assertFalse(torch.isinf(others).any().item())
 
@@ -1518,37 +1346,60 @@ class TestIncludeCurrentSlotForceInclude(unittest.TestCase):
         self.assertFalse(torch.isinf(scores).any().item())
 
     def test_cosine_finite_forces(self):
-        scores = self._run(
-            5, 8, cosine=True, qnorm_row=[1.0, 2.0], cur_knorm_row=[1.0, 1.0]
-        )
+        scores = self._run(5, 8, cosine=True, qnorm_row=[1.0, 2.0])
         self.assertTrue(torch.isinf(scores[0, 4]).item())
 
     def test_cosine_nan_qnorm_no_force(self):
-        scores = self._run(
-            5, 8, cosine=True, qnorm_row=[float("nan"), 1.0], cur_knorm_row=[1.0, 1.0]
-        )
+        scores = self._run(5, 8, cosine=True, qnorm_row=[float("nan"), 1.0])
         self.assertFalse(torch.isinf(scores).any().item())
 
     def test_cosine_inf_qnorm_no_force(self):
-        scores = self._run(
-            5, 8, cosine=True, qnorm_row=[float("inf"), 1.0], cur_knorm_row=[1.0, 1.0]
-        )
+        scores = self._run(5, 8, cosine=True, qnorm_row=[float("inf"), 1.0])
         self.assertFalse(torch.isinf(scores).any().item())
-
-    def test_cosine_nan_current_knorm_still_forces(self):
-        # The current decode token's KV is valid by construction, so a NaN in its
-        # (lagging) key-norm CACHE entry must NOT drop it — only the row q-norm
-        # and width gate the current-slot force-include.
-        scores = self._run(
-            5, 8, cosine=True, qnorm_row=[1.0, 1.0], cur_knorm_row=[float("nan"), 1.0]
-        )
-        self.assertTrue(torch.isinf(scores[0, 4]).item())
 
     def test_cosine_width_miss_fails_closed(self):
-        scores = self._run(
-            12, 8, cosine=True, qnorm_row=[1.0, 1.0], cur_knorm_row=[1.0, 1.0]
-        )
+        scores = self._run(12, 8, cosine=True, qnorm_row=[1.0, 1.0])
         self.assertFalse(torch.isinf(scores).any().item())
+
+
+class TestSelectorWidthLadder(unittest.TestCase):
+    """The CUDA-graph selector-width ladder (keyed (bs, width)) is load-bearing
+    for decode throughput; these pure functions decide which widths are captured
+    and which graph a live sequence replays into."""
+
+    def _fns(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            compute_ds_selector_widths,
+            ds_covering_width,
+        )
+
+        return compute_ds_selector_widths, ds_covering_width
+
+    def test_full_fallback_appends_full_width_and_dedups(self):
+        compute, _ = self._fns()
+        # Compact buckets below full are kept; the full width is the fallback;
+        # buckets >= full and duplicates are dropped; result is ascending.
+        self.assertEqual(
+            compute([5120, 5120, 999999], 202000, "full_fallback"), [5120, 202000]
+        )
+
+    def test_fail_closed_drops_full_and_requires_a_compact_bucket(self):
+        compute, _ = self._fns()
+        self.assertEqual(compute([5120], 202000, "fail_closed"), [5120])
+        with self.assertRaises(ValueError):
+            compute([], 202000, "fail_closed")
+
+    def test_covering_width_picks_smallest_ge_seqlen(self):
+        _, covering = self._fns()
+        self.assertEqual(covering([5120, 202000], 4096, "full_fallback"), 5120)
+        self.assertEqual(covering([5120, 202000], 5121, "full_fallback"), 202000)
+
+    def test_covering_width_overflow_behaviour(self):
+        _, covering = self._fns()
+        # full_fallback returns the largest captured width; fail_closed raises.
+        self.assertEqual(covering([5120], 9999, "full_fallback"), 5120)
+        with self.assertRaises(RuntimeError):
+            covering([5120], 9999, "fail_closed")
 
 
 if __name__ == "__main__":

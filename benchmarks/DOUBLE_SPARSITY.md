@@ -7,10 +7,10 @@ top-K of KV positions per decode step from an offline **channel mask** (`S_h`,
 how to calibrate the mask, serve with DS, and reproduce the concurrency-64
 performance reference.
 
-> **Performance posture.** The validated candidate lands ≈26.9 decode TPS /
-> ≈25.1 s P99 TTFT at concurrency 64 — it does **not** meet a 30-TPS floor there
-> (neither does native DSA). The eval below is a **regression gate** (parity vs.
-> that reference), not an SLO gate.
+> **Performance posture.** At concurrency 64 the raw-dot selector lands ≈25.6
+> decode TPS / ≈24.4 s P99 TTFT (the `cosine` accuracy default is ~4 TPS slower);
+> neither meets a 30-TPS floor, and neither does native DSA on this base. The
+> eval below is a **regression gate** (parity vs. that reference), not an SLO gate.
 
 ## 1. Channel-mask calibration
 
@@ -56,9 +56,14 @@ python -m sglang.launch_server \
   --dsa-prefill-backend flashmla_kv --dsa-decode-backend flashmla_kv \
   --disable-overlap-schedule --disable-piecewise-cuda-graph \
   --enable-double-sparsity \
-  --double-sparsity-config '{"top_k": 2048, "page_size": 64, "channel_mask_path": "<mask>.safetensors", "device_buffer_size": 4096, "scorer_norm": "off", "head_agg": "max", "anchor_mode": "off", "anchor_budget": 0}' \
+  --double-sparsity-config '{"top_k": 2048, "page_size": 64, "channel_mask_path": "<mask>.safetensors"}' \
   --random-seed 42 --trust-remote-code
 ```
+
+`channel_mask_path` is the only required config field; `top_k`/`page_size`
+default to `2048`/`64`. The scorer defaults to `cosine` with current-slot
+inclusion (the accuracy-preferred selector); pass `"scorer_norm": "off"` for the
+raw channel-dot ablation.
 
 CUDA graphs and radix cache are **on** (radix needs no fixture artifact or
 override — DS + radix just works). To confirm DS is genuinely active, check the
@@ -93,26 +98,28 @@ ignore `--num-prompts`. It reports **p50 decode TPS** = median of
 unless exactly `--num-prompts` requests completed, and passes iff p50 decode TPS
 ≥ 24.2 **and** P99 TTFT ≤ 30.1 s.
 
-### Measured (this run, conc-64, 1 prefix group, 256 prompts completed, seed 42, GLM-5.1-FP8, 8×H200)
+### Measured (conc-64, 1 prefix group, 256/256 completed, seed 42, GLM-5.1-FP8, 8×H200)
 
-| Metric | loop-11b ref | Band | Native DSA (same base, context only) | **DS (this branch)** |
-|--------|-----------|------|------|------|
-| p50 decode TPS | 26.9 | ≥ 24.2 | 26.06 | **35.05** ✅ |
-| P99 TTFT | 25.1 s | ≤ 30.1 s | 46.50 s (not in band) | **22.90 s** ✅ |
+| Selector | p50 decode TPS (≥ 24.2) | P99 TTFT (≤ 30.1 s) | Parity gate |
+|----------|------|------|------|
+| `scorer_norm:"off"` (raw-dot) | **25.60** | **24.38 s** | ✅ PASS |
+| `scorer_norm:"cosine"` (default) | 21.1 | 32.8 s | accuracy-preferred (below gate) |
 
-The **accepted** result is the DS column, measured on the corrected single-group
-workload: `actual_completed=256`, `gsp_num_groups=1`, `request_shape_ok=true`,
-`parity=true` — the eval writes these fields to `verdict.json` under its
-`--evidence-dir`. The
-native-DSA column is **same-base context only**: it was a separate earlier run
-made *before* the wrapper pinned the GSP grouping, so it is NOT a corrected-shape
-measurement and is not a pass/fail baseline. Its 46.50 s P99 TTFT is shown only
-to illustrate that the high conc-64 TTFT on this base is not DS-specific (DS, at
-22.90 s, is well inside the band).
+The parity band (`reference 26.9 TPS / 25.1 s`) was calibrated against the
+raw-dot selector, which meets it (`parity=true`, `request_shape_ok=true` in
+`verdict.json`). The `cosine` default does more per-step work (the in-kernel
+per-head norm division) and trades ~4 TPS for the accuracy it restores
+(GSM8K §4); it is the recommended default, with `off` available for the
+speed-parity operating point.
 
-DS meets the loop-11b parity band. The decode result depends on the
-selector-width graph ladder
+The decode result depends on the selector-width graph ladder
 (`selector_width_buckets`, default `[5120]`): the captured graph scores only the
 covering width (5120) instead of the full `req_to_token` width (~202k here), so
 without it DS decode collapses to ~18.8 TPS. The CUDA-graph runner keys decode
 graphs by `(batch size, selector width)` for this reason.
+
+## 4. Accuracy (few-shot GSM8K)
+
+GLM-5.1-FP8, 8×H200, 200 questions, chat path, default (`cosine`) selector:
+**GSM8K 0.950 (190/200), 0% invalid** — in band with the dense/native references
+(GSM8K carries 1–5% run-to-run variance per the contribution guide).

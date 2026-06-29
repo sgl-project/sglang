@@ -1943,7 +1943,7 @@ class ServerArgs:
     ] = False
     double_sparsity_config: A[
         Optional[str],
-        'JSON string for Double Sparsity. Required fields: top_k, page_size, channel_mask_path, device_buffer_size. Example: \'{"top_k": 2048, "page_size": 64, "channel_mask_path": "/cluster-storage/models/glm51-fp8-channel-mask-s256.safetensors", "device_buffer_size": 4096}\'.',
+        'JSON string for Double Sparsity. Required field: channel_mask_path (top_k/page_size default to 2048/64). Example: \'{"top_k": 2048, "page_size": 64, "channel_mask_path": "/cluster-storage/models/glm51-fp8-channel-mask-s256.safetensors"}\'.',
     ] = None
 
     # -------------------------------------------------------------------------

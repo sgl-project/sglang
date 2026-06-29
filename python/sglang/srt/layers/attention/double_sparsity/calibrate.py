@@ -1,46 +1,16 @@
 """Offline calibration script for the Double Sparsity channel mask file.
 
-The calibrator runs a forward pass over a calibration corpus on the target
-model, accumulates **Method 1** ``mean(abs(Q_nope * K_nope))`` per-channel
-importance (hooks on both ``kv_b_proj`` K-side and ``q_b_proj`` Q-side),
-selects the top-``label_dim`` channels per (layer, head), and writes a
-``safetensors`` file that the runtime selector consumes.
+Runs a forward pass over a calibration corpus, accumulates Method 1
+``mean(abs(Q_nope * K_nope))`` per-channel importance (hooks on the
+``kv_b_proj`` K-side and ``q_b_proj`` Q-side), selects the top-``label_dim``
+channels per (layer, head), and writes a ``safetensors`` mask for the runtime
+selector. Default dataset is Pile-val; ``--dataset`` overrides; ``--allow-synthetic``
+enables a CI/dev-only NIAH fallback.
 
-Default production dataset: Pile validation (``mit-han-lab/pile-val-backup``),
-shuffled with ``seed=42``, tokenized and concatenated into exactly 256 fixed
-blocks of 512 tokens each. ``--dataset`` overrides with a path to an external
-newline-delimited corpus. ``--allow-synthetic`` enables a small NIAH-shaped
-synthetic fallback reserved for CI and developer smoke tests only.
-
-Production recipe (GLM-5.1-FP8 on H200 cluster, FP8 serving) — the validated
-recipe that produces the channel mask (see benchmarks/DOUBLE_SPARSITY.md for the
-mask + corpus provenance):
-
-    python -m sglang.srt.layers.attention.double_sparsity.calibrate \\
-        --model /path/to/GLM-5.1-FP8 \\
-        --dtype fp8_e4m3 --kv-cache-dtype fp8_e4m3 --tp 8 \\
-        --output /path/to/glm51-fp8-channel-mask.safetensors \\
-        --label-dim 32 --page-size 64 --num-samples 256 --block-size 512 \\
-        --seed 42 \\
-        --dataset /path/to/calibration-corpus.txt -v
-
-(``--label-dim 32`` is GLM-proportionate — it covers GLM's wider
-``qk_nope_head_dim``; the earlier DeepSeek-V3.2 mask used ``--dtype bfloat16
---label-dim 16``. ``--dtype`` is a model-load hint only; see below.)
-
-``--dtype`` is a recorded forward-stability hint only — it no longer feeds the
-load: the checkpoint is loaded in its native (FP8) dtype via
-``torch_dtype="auto"`` and HF/Accelerate shards it across the visible GPUs via
-``device_map="auto"`` (a large FP8 checkpoint does not fit one rank). ``--tp``
-is likewise recorded metadata; it does NOT spawn a distributed group, so set it
-to match the serving TP (8) for provenance fidelity while ``device_map="auto"``
-does the actual sharding. ``--kv-cache-dtype`` is what goes into the mask
-metadata; it must match ``--kv-cache-dtype`` at serving time (``fp8_e4m3`` for
-the dense-prefill/sparse-decode serving path). The committed run passed an
-explicit local ``--dataset`` corpus (Pile-val streaming order is not
-seed-deterministic); without ``--dataset`` it streams ``pile-val-backup``.
-
-CI runs with ``--allow-synthetic`` against a tiny fixture (no network, <1 min).
+``--dtype`` and ``--tp`` are recorded metadata only: the checkpoint loads in its
+native dtype (``torch_dtype="auto"``) sharded by ``device_map="auto"``, with no
+distributed group. ``--kv-cache-dtype`` goes into the mask metadata and must
+match the serving ``--kv-cache-dtype``.
 """
 
 from __future__ import annotations
@@ -67,14 +37,7 @@ _SUPPORTED_DTYPES = ("fp8_e4m3", "bfloat16")
 def _niah_synthetic_prompts(
     num_samples: int, ctx_len: int, *, seed: int = 0
 ) -> List[str]:
-    """Generate NIAH-shaped synthetic prompts.
-
-    Each prompt is a deterministic "haystack" of repeated filler tokens with
-    one "needle" sentence at a random position. The exact tokenization
-    depends on the model's tokenizer; the prompt strings are designed to be
-    short enough that even a 32K-token tokenizer expands to roughly
-    ``ctx_len`` tokens per prompt.
-    """
+    """Generate NIAH-shaped synthetic prompts (deterministic haystack + one needle)."""
 
     rng = torch.Generator().manual_seed(seed)
     needle = "The hidden password is 47-RAVEN-92."
@@ -124,17 +87,13 @@ def _extract_mla_nope_prefix(
     nope_dim: int,
     suffix_dim: int,
 ) -> torch.Tensor:
-    """Extract the noPE prefix from an MLA projection output by reshaping first.
+    """Extract the noPE prefix from an MLA projection output, reshaping before slicing.
 
-    MLA projections interleave per-head blocks:
-    ``kv_b_proj`` → ``[K_nope_h0 | V_h0 | K_nope_h1 | V_h1 | ...]``
-    ``q_b_proj``  → ``[Q_nope_h0 | Q_rope_h0 | Q_nope_h1 | Q_rope_h1 | ...]``
-
-    Flat-slicing the first ``H * nope_dim`` columns before reshape selects V or
-    RoPE columns from later heads.  The correct approach: flatten all leading
-    dimensions first (handles both 2-D ``[tokens, width]`` from cached-key paths
-    and 3-D ``[batch, seq, width]`` from HuggingFace forward hooks), then reshape
-    ``[-1, H, nope_dim + suffix_dim]``, then slice ``[..., :nope_dim]``.
+    MLA projections interleave per-head blocks (``kv_b_proj`` → ``[K_nope|V]``
+    per head; ``q_b_proj`` → ``[Q_nope|Q_rope]`` per head), so flat-slicing the
+    first ``H*nope_dim`` columns before reshape wrongly picks V/RoPE columns from
+    later heads. Flatten leading dims first (handles 2-D and 3-D inputs), reshape
+    ``[-1, H, nope_dim+suffix_dim]``, then slice ``[..., :nope_dim]``.
     """
     flat = tensor.reshape(-1, tensor.shape[-1])
     return flat.reshape(-1, num_heads, nope_dim + suffix_dim)[
@@ -223,10 +182,8 @@ def _summarize_param_placement(model) -> Dict[str, Any]:
 def _log_param_dtype_device_report(model) -> Dict[str, Any]:
     """Log and return the parameter dtype + device-placement report.
 
-    Surfaces (a) whether the FP8 block-quantized checkpoint stayed FP8 or was
-    silently upcast to bf16/fp16, and (b) how Accelerate dispatched modules
-    across the visible GPUs. This is the evidence the one-block dry-run checks
-    before a full multi-block calibration is started.
+    Surfaces whether the FP8 checkpoint stayed FP8 (vs a silent bf16/fp16 upcast)
+    and how Accelerate dispatched modules across GPUs — the evidence the dry-run gates on.
     """
     report = _summarize_param_placement(model)
     logger.info(
@@ -247,13 +204,11 @@ def _log_param_dtype_device_report(model) -> Dict[str, Any]:
 
 
 def _enforce_dry_run_placement(report: Dict[str, Any]) -> None:
-    """Fail-closed validation of a dry-run load on CUDA for an FP8 checkpoint.
+    """Fail-closed validation of a dry-run FP8 load on CUDA.
 
-    Raises ``RuntimeError`` on a silently-degraded load — an off-GPU placement
+    Raises ``RuntimeError`` on a silently-degraded load: off-GPU placement
     (cpu/disk/meta offload), a single-GPU placement that did not shard, or a
-    bf16/fp16 upcast (no float8 parameters) — so the operator never proceeds to a
-    full multi-block calibration from a bad load. The caller logs the full
-    histogram before this runs.
+    bf16/fp16 upcast (no float8 parameters).
     """
     param_devices = set(report["device_counts"])
     off_gpu = sorted(
@@ -295,15 +250,11 @@ def _config_is_fp8(config) -> bool:
 def _resolve_calibration_config(model_path: str):
     """Resolve the HF config for calibration, remapping the unregistered V3.2.
 
-    transformers has no ``deepseek_v32`` config/modeling and the checkpoint ships
-    no remote code, so ``AutoModelForCausalLM`` cannot load it directly.
-    DeepSeek-V3.2 is DeepSeek-V3 plus the DSA sparse-attention indexer, which is
-    irrelevant to channel-importance calibration (only the MLA ``kv_b_proj`` /
-    ``q_b_proj`` projections matter, and they are identical to V3). So when the
-    on-disk ``model_type`` is ``deepseek_v32`` we remap it to ``deepseek_v3`` and
-    load the FP8 weights under the transformers V3 modeling. If the raw config
-    cannot be read (e.g. unit fakes with no ``config.json``), fall back to the
-    plain ``AutoConfig.from_pretrained`` path.
+    transformers has no ``deepseek_v32`` modeling and the checkpoint ships no
+    remote code, but V3.2 is V3 plus the DSA indexer (irrelevant to calibration —
+    only the identical MLA ``kv_b_proj``/``q_b_proj`` projections matter), so remap
+    ``deepseek_v32`` → ``deepseek_v3``. Falls back to ``AutoConfig.from_pretrained``
+    when the raw config cannot be read.
     """
     from transformers import AutoConfig, PretrainedConfig
 
@@ -326,20 +277,13 @@ def _resolve_calibration_config(model_path: str):
 
 
 def _force_triton_fp8_for_calibration() -> None:
-    """Skip the DeepGEMM hub kernel and use transformers' finegrained-fp8 Triton path.
+    """Force transformers' FP8 matmul onto the finegrained-fp8 Triton path.
 
-    transformers' ``w8a8_fp8_matmul`` prefers the ``kernels-community/deep-gemm``
-    hub kernel for 128x128 block FP8 and otherwise (on ``ImportError``) falls back
-    to the ``kernels-community/finegrained-fp8`` Triton kernel. DeepGEMM is a JIT
-    kernel whose hub repo carries a large cutlass source tree; fetching it is
-    unreliable under HF Hub rate limiting (429 storms with multi-minute backoffs)
-    and the cached build's metadata schema is rejected by the installed
-    ``kernels`` package — either way it raises a non-``ImportError`` deep inside
-    the fetch, which escapes transformers' ``except ImportError`` and crashes the
-    forward. The finegrained-fp8 Triton kernel is small, loads cleanly, and is
-    numerically equivalent — the right choice for a one-time calibration. Force
-    DeepGEMM to report ``ImportError`` immediately (no fetch attempted) so the
-    forward goes straight to the Triton path. Idempotent.
+    The DeepGEMM hub kernel's fetch pulls a large cutlass tree that is unreliable
+    under HF Hub rate limiting and raises a non-``ImportError`` deep inside the
+    fetch, escaping transformers' ``except ImportError`` and crashing the forward.
+    Making ``_load_deepgemm_kernel`` raise ``ImportError`` immediately routes the
+    forward to the numerically-equivalent Triton fallback. Idempotent.
     """
     try:
         from transformers.integrations import finegrained_fp8 as _fgfp8
@@ -362,12 +306,9 @@ def _force_triton_fp8_for_calibration() -> None:
 def _load_calibration_model(model_path: str, use_cuda: bool):
     """Load the calibration model + tokenizer + resolved config.
 
-    Loads the checkpoint in its native dtype (no bf16/fp16 upcast) and lets
-    HF/Accelerate shard modules across the visible GPUs. A large FP8
-    block-quantized checkpoint (e.g. GLM-5.1-FP8) loaded as bf16 would roughly
-    double the footprint and pin the model to one device, neither of which fits
-    one H200. ``--dtype`` is the recorded forward-stability hint and no longer
-    feeds the load.
+    Loads in native dtype (no bf16/fp16 upcast) and shards across visible GPUs via
+    Accelerate: a large FP8 checkpoint loaded as bf16 would roughly double the
+    footprint and pin to one device, neither of which fits one H200.
     """
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -378,11 +319,9 @@ def _load_calibration_model(model_path: str, use_cuda: bool):
         ) from exc
 
     config = _resolve_calibration_config(model_path)
-    # Keep device_map="auto" (full GPU placement): a per-GPU max_memory cap makes
-    # accelerate spill modules to cpu/disk, which the on-the-fly finegrained-fp8
-    # quantizer rejects. The large-FP8 mid-load OOM is fragmentation (the failed
-    # alloc is small while ~12 GiB sits reserved-but-unallocated), so the fix is
-    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the launch env, not a cap.
+    # device_map="auto" (full GPU placement): a per-GPU max_memory cap spills
+    # modules to cpu/disk, which the finegrained-fp8 quantizer rejects. Mid-load
+    # OOM is fragmentation — fix with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         config=config,
@@ -413,30 +352,11 @@ def _collect_channel_importance(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the calibration forward pass and return ``(importance, weights)``.
 
-    The real path implements **Method 1** from the original DoubleSparse paper:
-    ``mean(abs(Q_nope * K_nope))`` per channel, accumulated over tokens and
-    forward passes.  Both a Q-projection hook and a K-projection hook are
-    registered per layer.  When both fire for the same pass the element-wise
-    Q*K product is computed and added to the running importance tensor.  If a
-    layer's Q projection cannot be found the accumulator falls back to
-    K-only L2 with a logged warning.
-
-    For MLA layers (DeepSeek V3.2):
-    * K side — ``kv_b_proj`` output ``[T, H*(nope+v)]``; reshape to
-      ``[T, H, nope+v]`` FIRST, then slice ``[..., :nope_dim]``.
-    * Q side — ``q_b_proj`` output ``[T, H*(nope+rope)]``; reshape to
-      ``[T, H, nope+rope]`` FIRST, then slice ``[..., :nope_dim]``.
-
-    The reshape-before-slice order is critical: flat-slicing first picks V or
-    RoPE columns from later heads (the exact bug fixed in dsa_backend.py:
-    flat-slicing would pick V/RoPE columns from later heads).
-
-    For standard attention (Llama / GLM):
-    * K side — ``k_proj`` or ``wk`` output → reshape ``[T, H, head_dim]``.
-    * Q side — ``q_proj`` output → reshape ``[T, H, head_dim]``.
-
-    The synthetic-statistics path is gated behind ``allow_synthetic=True``
-    and is reserved for CI fixtures + developer smoke tests.
+    Implements Method 1 ``mean(abs(Q_nope * K_nope))`` per channel: per-layer Q
+    and K forward hooks accumulate the element-wise product, falling back to
+    K-only L2 when a layer's Q projection is absent. MLA outputs are reshaped
+    per-head before slicing the noPE prefix (see ``_extract_mla_nope_prefix``).
+    ``allow_synthetic`` gates a CI/dev-only synthetic path.
     """
 
     if allow_synthetic and (
@@ -455,8 +375,6 @@ def _collect_channel_importance(
         importance = torch.rand((L, H, D), generator=rng, dtype=torch.float32)
         return importance, importance / importance.sum(dim=-1, keepdim=True)
 
-    # Real forward-pass calibration: load the model + tokenizer, register
-    # Method 1 Q+K hooks per attention layer, accumulate importance, then reduce.
     logger.info(
         "Loading %s for calibration (dtype=%s tp=%d num_prompts=%d method=Method1_QK).",
         model_path,
@@ -475,17 +393,14 @@ def _collect_channel_importance(
     use_cuda = torch.cuda.is_available()
     model, tokenizer, config = _load_calibration_model(model_path, use_cuda)
     report = _log_param_dtype_device_report(model)
-    # Fail-closed dry-run gate: on CUDA with an FP8 checkpoint, reject a load that
-    # offloaded off-GPU, did not shard across GPUs, or silently upcast away the
-    # FP8 weights — before spending a full multi-block calibration on it.
+    # Fail-closed gate before a full run: reject off-GPU/un-sharded/upcast loads.
     if dry_run_blocks > 0 and use_cuda and _config_is_fp8(config):
         _enforce_dry_run_placement(report)
 
     num_layers = int(getattr(config, "num_hidden_layers", num_layers_hint or 0))
     num_heads = int(getattr(config, "num_attention_heads", num_heads_hint or 0))
-    # For DeepSeek MLA the per-head K-noPE width is `qk_nope_head_dim`; for
-    # plain Llama/GLM-style attention there is no such split and the per-head
-    # K width equals `head_dim`.  The channel mask indices into K-noPE space.
+    # MLA per-head K-noPE width is `qk_nope_head_dim`; plain attention has no
+    # split, so K width equals `head_dim`. The mask indices into K-noPE space.
     qk_nope_head_dim = int(getattr(config, "qk_nope_head_dim", 0))
     v_head_dim = int(getattr(config, "v_head_dim", 0))
     head_dim = int(getattr(config, "head_dim", head_dim_hint or 0)) or (
@@ -519,8 +434,7 @@ def _collect_channel_importance(
     importance = torch.zeros((num_layers, num_heads, k_head_dim), dtype=torch.float32)
     seen = [0] * num_layers
 
-    # Per-layer buffers for coordinating Q and K from the same forward pass.
-    # Both hooks write here; _accumulate fires once both are populated.
+    # Per-layer Q/K buffers; _accumulate_method1 fires once both are populated.
     _q_buf: List[Optional[torch.Tensor]] = [None] * num_layers
     _k_buf: List[Optional[torch.Tensor]] = [None] * num_layers
 
@@ -555,7 +469,6 @@ def _collect_channel_importance(
     for layer_idx, layer in enumerate(getattr(model, "model", model).layers):
         attn = getattr(layer, "self_attn", layer)
 
-        # --- K projection ---
         k_proj = getattr(attn, "k_proj", None)
         kv_b_proj = getattr(attn, "kv_b_proj", None)
         wk = getattr(attn, "wk", None)
@@ -570,7 +483,6 @@ def _collect_channel_importance(
 
         is_mla_k = k_source == "kv_b_proj"
 
-        # --- Q projection (Method 1) ---
         q_b_proj = getattr(attn, "q_b_proj", None)
         q_proj_mod = getattr(attn, "q_proj", None)
         wq = getattr(attn, "wq", None)
@@ -609,7 +521,6 @@ def _collect_channel_importance(
                 t = tensor.detach().to(torch.float32)
                 if is_mla:
                     if full_w is not None and t.shape[-1] == full_w:
-                        # Reshape per-head first, then slice K_nope prefix.
                         k_nope = _extract_mla_nope_prefix(
                             t, num_heads, k_head_dim, v_head_dim
                         )
@@ -648,7 +559,6 @@ def _collect_channel_importance(
                     return
                 t = tensor.detach().to(torch.float32)
                 if is_mla and full_w is not None and t.shape[-1] == full_w:
-                    # Reshape per-head first, then slice Q_nope prefix.
                     q_nope = _extract_mla_nope_prefix(
                         t, num_heads, k_head_dim, qk_rope_head_dim
                     )
@@ -674,7 +584,6 @@ def _collect_channel_importance(
         if has_q:
             handles.append(qproj.register_forward_hook(_make_q_hook(layer_idx)))
 
-    # Build the input feed: either fixed Pile-val token blocks or tokenized prompts.
     if use_pile_val:
         _bsz = block_size or 512
         logger.info(
@@ -693,10 +602,9 @@ def _collect_channel_importance(
             tok_kwargs["truncation"] = True
         token_blocks = None
 
-    # With device_map="auto" the model is dispatched across GPUs and has no
-    # single ``model.device``; inputs must land on the device hosting the input
-    # embedding (the first module Accelerate executes). Resolve defensively so a
-    # dispatched real model, a plain single-device model, and unit fakes all work.
+    # device_map="auto" leaves no single model.device; inputs must land on the
+    # device hosting the input embedding (first module Accelerate runs). Resolve
+    # defensively so dispatched, single-device, and fake models all work.
     def _resolve_input_device() -> torch.device:
         get_emb = getattr(model, "get_input_embeddings", None)
         if callable(get_emb):
@@ -768,10 +676,8 @@ def calibrate(args: argparse.Namespace) -> str:
         raise ValueError(
             f"--dtype must be one of {_SUPPORTED_DTYPES}, got {args.dtype!r}."
         )
-    # --kv-cache-dtype controls what goes into the mask metadata (must match the
-    # serving --kv-cache-dtype).  When omitted it defaults to --dtype for backward
-    # compatibility, but they are semantically distinct: --dtype is the model-load
-    # forward dtype; --kv-cache-dtype is the runtime serving dtype.
+    # --kv-cache-dtype goes into mask metadata and must match the serving value;
+    # defaults to --dtype when omitted, though the two are semantically distinct.
     mask_dtype: str = getattr(args, "kv_cache_dtype", None) or args.dtype
     if mask_dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
@@ -795,9 +701,8 @@ def calibrate(args: argparse.Namespace) -> str:
         prompts = _niah_synthetic_prompts(args.num_samples, args.ctx_len)
         dataset_source = "niah_synthetic"
     else:
-        # Production path: Pile validation, seed=42, exactly num_samples × block_size tokens.
-        # Block construction happens inside _collect_channel_importance after the tokenizer
-        # is loaded so token IDs are concatenated correctly across document boundaries.
+        # Production path: Pile-val. Block construction is deferred to
+        # _collect_channel_importance so token IDs concatenate across doc boundaries.
         prompts = [
             ""
         ] * args.num_samples  # length-hint only; content ignored when use_pile_val=True

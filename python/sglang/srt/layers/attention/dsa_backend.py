@@ -1579,11 +1579,6 @@ class DeepseekSparseAttnBackend(
 
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[metadata_key]
-        if metadata.ds_graph_state is not None:
-            # Stamp the replay identity the selection-capture dump reads
-            # post-forward (host-only; see DSGraphState.last_replay_graph_key).
-            metadata.ds_graph_state.last_replay_graph_key = metadata_key
-            metadata.ds_graph_state.replay_prep_count += 1
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = metadata.page_table_1.shape[1]
@@ -1759,11 +1754,6 @@ class DeepseekSparseAttnBackend(
 
         metadata_key = self._ds_decode_metadata_key(bs)
         metadata = self.decode_cuda_graph_metadata[metadata_key]
-        if metadata.ds_graph_state is not None:
-            # Stamp the replay identity the selection-capture dump reads
-            # post-forward (host-only; see DSGraphState.last_replay_graph_key).
-            metadata.ds_graph_state.last_replay_graph_key = metadata_key
-            metadata.ds_graph_state.replay_prep_count += 1
 
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False

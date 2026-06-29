@@ -93,23 +93,13 @@ def assert_rope_fp8_resident(resident_dtype) -> None:
 
 
 def ds_scorer_is_graph_safe(config) -> bool:
-    """``True`` iff the configured selector variants are all on the graph-safe
-    path, so the selector can run under CUDA-graph capture.
-
-    All supported variants are graph-safe: ``scorer_norm`` ("cosine" = the
-    in-kernel per-head division by the query/key norms with a resident key-norm
-    cache; "off" = raw channel-dot), ``head_agg`` (mean) lives in the absorbed
-    paged score kernel, and ``anchor_mode`` (recency/global/strided) is a
-    tensorized fixed-shape post-topK force-include in ``retrieve_topk_graph_safe``.
-    None require ``--disable-cuda-graph``. Retained as the single guard predicate
-    so a future non-graph-safe variant can re-introduce a gate here.
+    """``True`` iff every configured selector variant runs under CUDA-graph
+    capture. Both supported scorers (cosine, raw-dot "off") are graph-safe;
+    retained as the single guard so a future non-graph-safe variant can gate here.
     """
     if config is None:
         return True
-    scorer_norm = getattr(config, "scorer_norm", "off")
-    # off (raw dot) and cosine (in-kernel division + resident key-norm cache) are
-    # both graph-safe; any other value fails closed.
-    return scorer_norm in ("off", "cosine")
+    return getattr(config, "scorer_norm", "off") in ("off", "cosine")
 
 
 _score_reduce_fallback_logged = False
@@ -371,139 +361,6 @@ def select_topk_sequence_order(
     return selected, valid_lengths.to(torch.int32)
 
 
-def _anchor_positions_tensor(
-    seq_lens: torch.Tensor, eb: torch.Tensor, A: int, mode: str
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Tensorized ``_anchor_positions``: ``[bs, A]`` anchor logical positions +
-    ``[bs, A]`` validity (slot ``i`` valid iff ``i < eb`` and, for strided, it is
-    the first occurrence of its value). Graph-safe (no host sync, fixed shape)."""
-    device = seq_lens.device
-    bs = seq_lens.shape[0]
-    i = torch.arange(A, device=device).view(1, A)
-    n = seq_lens.view(bs, 1).to(torch.int64)
-    ebv = eb.view(bs, 1)
-    valid = i < ebv
-    if mode == "recency":
-        pos = n - ebv + i
-    elif mode == "global":
-        pos = i.expand(bs, A).clone()
-    elif mode == "strided":
-        denom = (ebv - 1).clamp(min=1).to(torch.float64)
-        step = (n - 1).to(torch.float64) / denom
-        pos = torch.round(i.to(torch.float64) * step).to(torch.int64)
-        pos = torch.where(ebv == 1, torch.zeros_like(pos), pos)
-        # strided's set-dedup: values are ascending in i, so a duplicate is == prev.
-        prev = torch.cat(
-            [torch.full((bs, 1), -1, dtype=torch.int64, device=device), pos[:, :-1]],
-            dim=1,
-        )
-        valid = valid & (pos != prev)
-    else:
-        pos = torch.zeros(bs, A, dtype=torch.int64, device=device)
-        valid = torch.zeros(bs, A, dtype=torch.bool, device=device)
-    pos = torch.where(valid, pos, torch.full_like(pos, -1))
-    return pos, valid
-
-
-def _stable_argsort_ascending(
-    key: torch.Tensor, tiebreak_pos: torch.Tensor
-) -> torch.Tensor:
-    """Argsort ``key`` ascending with ``tiebreak_pos`` ascending as the stable
-    tie-break (two stable passes). Mirrors the eager list ``.sort(key=score)``,
-    which keeps the original position-ascending order among equal scores."""
-    order_p = torch.argsort(tiebreak_pos, dim=1, stable=True)
-    key_p = torch.gather(key, 1, order_p)
-    order_k = torch.argsort(key_p, dim=1, stable=True)
-    return torch.gather(order_p, 1, order_k)
-
-
-def _force_include_anchor(
-    indices: torch.Tensor,
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    anchor_budget: int,
-    anchor_mode: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Force each request's deterministic anchor positions (per ``anchor_mode``)
-    into the selection, evicting the lowest-scoring non-anchor selected positions
-    (stable position-ascending tie-break) and preserving the per-row selected
-    count.
-
-    Fully tensorized (no per-row Python loop, no ``.item()`` host sync, fixed
-    shapes), so it is graph-safe and is used by BOTH the eager logical path and
-    the graph-safe Triton path — guaranteeing identical selection. Bit-identical
-    to the former per-row reference (fuzz-verified) including the over-budget
-    clamp (``effective_budget = min(anchor_budget, valid_count, seq_len)``) and
-    strided set-dedup.
-    """
-    if anchor_mode == "off" or anchor_budget <= 0:
-        return indices.to(torch.int32), (indices >= 0).to(torch.int32).sum(-1)
-    device = indices.device
-    bs, K = indices.shape
-    max_seq = scores.shape[1]
-    # Bound the [bs, A] temporaries: the effective budget is
-    # min(anchor_budget, valid_count, seq_len) and valid_count <= K, so anchor
-    # slots beyond K (or max_seq) can never be valid. Clamping A here is
-    # bit-identical (clamped-out slots would be invalid anyway) but stops a
-    # pathological opt-in anchor_budget from over-allocating scratch.
-    A = min(int(anchor_budget), K, max_seq)
-    pos = indices.to(torch.int64)
-    real_mask = pos >= 0
-    real_count = real_mask.sum(1)
-    n = seq_lens.to(torch.int64)
-    eb = torch.minimum(torch.full_like(real_count, A), real_count)
-    eb = torch.minimum(eb, n)  # _anchor_positions further clamps the budget to n
-
-    apos, avalid = _anchor_positions_tensor(n, eb, A, anchor_mode)
-    psafe = pos.clamp(min=0)
-
-    # max_seq-wide membership masks (an extra sentinel column absorbs -1 pads).
-    sel_mask = torch.zeros(bs, max_seq + 1, dtype=torch.bool, device=device)
-    sel_mask.scatter_(
-        1, torch.where(real_mask, pos, torch.full_like(pos, max_seq)), True
-    )
-    sel_mask = sel_mask[:, :max_seq]
-    anc_mask = torch.zeros(bs, max_seq + 1, dtype=torch.bool, device=device)
-    anc_mask.scatter_(
-        1, torch.where(avalid, apos, torch.full_like(apos, max_seq)), True
-    )
-    anc_mask = anc_mask[:, :max_seq]
-
-    missing = avalid & ~torch.gather(sel_mask, 1, apos.clamp(min=0))  # [bs,A]
-    evictable = real_mask & ~torch.gather(anc_mask, 1, psafe)  # [bs,K]
-    k = torch.minimum(missing.sum(1), evictable.sum(1))  # [bs]
-
-    # Evict the k lowest-score evictables (score asc, position asc tie-break).
-    big_score = torch.finfo(torch.float32).max
-    evict_score = torch.where(
-        evictable,
-        torch.gather(scores, 1, psafe),
-        torch.full((bs, K), big_score, dtype=scores.dtype, device=device),
-    )
-    order = _stable_argsort_ascending(evict_score, pos)
-    rank = torch.empty_like(order)
-    rank.scatter_(1, order, torch.arange(K, device=device).view(1, K).expand(bs, K))
-    drop = evictable & (rank < k.view(bs, 1))
-    keep = real_mask & ~drop
-
-    # Insert the first k missing anchors (ascending position).
-    miss_rank = torch.cumsum(missing.to(torch.int64), dim=1) - 1
-    insert = missing & (miss_rank < k.view(bs, 1))
-
-    # Combine keep + inserted positions, sort ascending, pad to K with -1.
-    big = max_seq + 10
-    keep_pos = torch.where(keep, psafe, torch.full_like(psafe, big))
-    ins_pos = torch.where(
-        insert,
-        apos.clamp(min=0),
-        torch.full((bs, A), big, dtype=torch.int64, device=device),
-    )
-    combined, _ = torch.sort(torch.cat([keep_pos, ins_pos], dim=1), dim=1)
-    out = combined[:, :K]
-    out = torch.where(out >= big, torch.full_like(out, -1), out).to(torch.int32)
-    return out, (out >= 0).to(torch.int32).sum(-1)
-
-
 def absorbed_topk_select(
     *,
     queries: torch.Tensor,
@@ -617,36 +474,20 @@ if _TRITON_AVAILABLE:
         scores_ptr,  # [bs, max_seq_len] authoritative topk_scores (bf16 or fp32)
         seq_lens_ptr,  # [bs] int32
         qnorm_ptr,  # [bs, H] fp32 — per-row query selection-channel norms (cosine)
-        knorm_ptr,  # [max_tokens, H] fp32 — key_norm_cache[layer_id] (cosine)
-        req_to_token_ptr,  # [num_pool, max_ctx] int32 (cosine)
-        req_pool_ptr,  # [bs] int32 (cosine)
         scores_row_stride,
         qnorm_row_stride,
-        knorm_row_stride,
-        rtt_row_stride,
         max_seq_len,
         H,
         BLOCK_H: tl.constexpr,
         COSINE: tl.constexpr,
     ):
         # One program per row. Force-include the current decode slot (logical
-        # position seq_len-1) by writing +inf, FAIL-CLOSED: write nothing when
-        # seq_len-1 is outside the scored width [0, max_seq_len) (no clamp to a
-        # different token). For cosine, additionally require the row's q-norm to
-        # be finite (a NaN/inf q-norm means a meaningless cosine score for the
-        # row, so it must not be force-selected). Reads the existing buffers in
-        # place — zero allocation, graph-safe.
-        #
-        # The current slot's own key-norm is intentionally NOT gated: the current
-        # decode token's KV is valid by construction (just computed this step), so
-        # it is never a stale-reuse hazard (H3 is already enforced by the
-        # written-bit mask, which keeps every OTHER reused slot -inf-masked). Its
-        # key-norm CACHE entry can still be NaN at selection time because the
-        # populate hook lags one step; gating on that lagging cache value wrongly
-        # drops the valid current token and regressed the served gate 0.970 ->
-        # 0.640. The knorm/req_to_token kernel args are kept reserved for a future
-        # current-slot k-norm gate once the populate timing (handoff §4-step-2) is
-        # fixed so the current slot's cache entry is finite at selection time.
+        # position seq_len-1) by writing +inf. FAIL-CLOSED: write nothing when
+        # seq_len-1 is outside the scored width [0, max_seq_len). For cosine,
+        # additionally require the row's q-norm to be finite. In place — zero
+        # allocation, graph-safe. The current slot's own key-norm is NOT gated:
+        # the current decode token's KV is valid by construction, and its cache
+        # entry can lag one step (gating on it regressed the gate 0.970 -> 0.640).
         b = tl.program_id(0)
         cur = tl.load(seq_lens_ptr + b).to(tl.int32) - 1
         in_range = (cur >= 0) & (cur < max_seq_len)
@@ -677,65 +518,41 @@ def _force_include_current_slot(
     *,
     cosine: bool,
     scratch_qnorm: Optional[torch.Tensor],  # fp32 [max_bs, H] (cosine)
-    key_norm_cache: Optional[torch.Tensor],  # fp32 [L, max_tokens, H] (cosine)
-    layer_id: int,
-    req_pool_indices: Optional[torch.Tensor],  # int32 [bs] (cosine)
-    req_to_token: Optional[torch.Tensor],  # int32 [num_pool, max_ctx] (cosine)
 ) -> None:
     """Fail-closed current-slot +inf force-include.
 
-    0-alloc / graph-safe: a single Triton program per row reads the existing
-    buffers and writes +inf in place only for a width-covered current slot
-    (no clamp-to-wrong-token fallback) whose row q-norm is finite (cosine).
-    The current slot's OWN key-norm is NOT gated: the current decode token's KV
-    is valid by construction. The ``key_norm_cache``/``req_pool_indices``/
-    ``req_to_token`` args are reserved for re-enabling that gate once the
-    current-slot key-norm-cache populate timing is fixed (see the kernel note).
+    0-alloc / graph-safe: a single Triton program per row writes +inf in place
+    only for a width-covered current slot whose row q-norm is finite (cosine).
+    The current slot's own key-norm is NOT gated — the current decode token's KV
+    is valid by construction.
     """
     if bs <= 0 or max_seq_len <= 0:
         return
     if cosine:
-        # Cosine force-include requires the norm caches + page map to verify
-        # finiteness; if any is absent, fail closed (do not force-include without
-        # the finite-norm guarantee).
-        if (
-            scratch_qnorm is None
-            or key_norm_cache is None
-            or req_pool_indices is None
-            or req_to_token is None
-        ):
+        # Cosine needs the q-norm scratch to verify finiteness; absent it, fail
+        # closed (do not force-include without the finite-norm guarantee).
+        if scratch_qnorm is None:
             return
         H = int(scratch_qnorm.shape[1])
-        knorm_layer = key_norm_cache[layer_id]  # [max_tokens, H] view (0-alloc)
         _current_slot_force_include_kernel[(bs,)](
             topk_scores,
             seq_lens,
             scratch_qnorm,
-            knorm_layer,
-            req_to_token,
-            req_pool_indices,
             topk_scores.stride(0),
             scratch_qnorm.stride(0),
-            knorm_layer.stride(0),
-            req_to_token.stride(0),
             max_seq_len,
             H,
             BLOCK_H=triton.next_power_of_2(H),
             COSINE=True,
         )
     else:
-        # raw-dot: no norm gate; width fail-closed only. Dummy pointers for the
-        # cosine-only args are never dereferenced (COSINE=False is constexpr).
+        # raw-dot: no norm gate; width fail-closed only. qnorm_ptr is never
+        # dereferenced (COSINE=False is constexpr) so pass the scores buffer.
         _current_slot_force_include_kernel[(bs,)](
             topk_scores,
             seq_lens,
             topk_scores,
-            topk_scores,
-            seq_lens,
-            seq_lens,
             topk_scores.stride(0),
-            0,
-            0,
             0,
             max_seq_len,
             1,
@@ -760,15 +577,8 @@ def retrieve_topk_graph_safe(
     out_lengths: torch.Tensor,
     # Pre-allocated scratch tensors (required for CUDA / Triton fast path)
     scratch_scores: Optional[torch.Tensor] = None,  # fp32 [max_bs, max_seq_len]
-    scratch_topk_values: Optional[torch.Tensor] = None,  # fp32 [max_bs, max_top_k]
-    scratch_topk_indices: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
-    scratch_invalid_mask: Optional[torch.Tensor] = None,  # bool [max_bs, max_top_k]
-    scratch_sorted_vals: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
-    scratch_boundary: Optional[torch.Tensor] = None,  # int64 [max_bs, 1] = max_seq_len
-    scratch_valid_i64: Optional[torch.Tensor] = None,  # int64 [max_bs, 1]
     per_request_valid: Optional[torch.Tensor] = None,  # bool [bs, max_seq_len]
     scratch_pv_mask: Optional[torch.Tensor] = None,  # bool [max_bs, max_seq_len]
-    scratch_throwaway_idx: Optional[torch.Tensor] = None,  # int64 [max_bs, max_top_k]
     scratch_scores_bf16: Optional[torch.Tensor] = None,  # bf16 [max_bs, max_seq_len]
     radix_topk_scratch: Optional[dict] = None,  # topk_kernel scratch bundle
     topk_block: int = 1024,
@@ -777,8 +587,6 @@ def retrieve_topk_graph_safe(
     score_reduce_bf16: bool = False,
     scorer_norm: str = "off",
     head_agg: str = "max",
-    anchor_mode: str = "off",
-    anchor_budget: int = 0,
     absorbed_latent_fp8: Optional[torch.Tensor] = None,
     absorbed_latent_scales: Optional[torch.Tensor] = None,
     absorbed_w_sel: Optional[torch.Tensor] = None,
@@ -788,7 +596,6 @@ def retrieve_topk_graph_safe(
     scratch_absorbed_sel_i64: Optional[torch.Tensor] = None,  # int64 [H, label_dim]
     scratch_absorbed_q: Optional[torch.Tensor] = None,  # fp32 [max_bs, H, nope_dim]
     include_current_slot: bool = False,
-    scratch_cur_index: Optional[torch.Tensor] = None,  # int64 [max_bs]
     key_norm_cache: Optional[torch.Tensor] = None,  # fp32 [L, max_tokens, H] (cosine)
     scratch_qnorm: Optional[torch.Tensor] = None,  # fp32 [max_bs, H] (cosine)
     q_pe: Optional[
@@ -807,29 +614,22 @@ def retrieve_topk_graph_safe(
     slot-validity bitmap ``[L, T]`` so a reused physical slot's stale latent is
     masked to ``-inf`` until its fresh KV write lands.
 
-    On CUDA with Triton + all scratch buffers provided: uses an allocation-free
-    pipeline.  After a single warmup call, subsequent calls perform zero new
-    CUDA allocations:
+    On CUDA with Triton + the score scratch and radix top-k bundle provided, the
+    pipeline is allocation-free after a single warmup call: the paged absorbed
+    kernel fills ``scratch_scores`` in place, the optional ``per_request_valid``
+    mask and current-slot force-include write the authoritative buffer in place,
+    and the sequence-order radix top-k emits ascending ``-1``-padded indices.
 
-        1. the paged absorbed kernel fills ``scratch_scores`` directly.
-        2. (optional) ``per_request_valid`` is applied via in-place masked_fill_.
-        3. ``topk`` with ``out=(values, indices)`` (allocation-free after warmup).
-        4. ``isneginf`` + ``masked_fill_`` to sentinel-out invalid entries.
-        5. ``topk(largest=False, sorted=True)`` for an allocation-free ascending sort.
-        6. ``ge`` + ``masked_fill_`` to convert sentinels to ``-1`` in output.
-        7. ``searchsorted`` with ``out=`` for valid_lengths.
-
-    Fallback path (CPU, or scratch tensors missing): calls the eager
+    Fallback path (CPU, or scratch missing): calls the eager
     :func:`absorbed_topk_select`.  This branch is intended for unit tests;
     do NOT route production graph capture through it.
     """
     bs = req_pool_indices.shape[0]
     device = queries.device
 
-    # scorer_norm="off" is the raw absorbed dot (the absorbed-latent identity);
-    # "cosine" divides each per-head dot by the query/key norms in the same kernel
-    # (the numerator IS the raw dot, so the identity still holds). Both are served
-    # on this graph-safe path. Any other value is unsupported.
+    # scorer_norm="off" is the raw absorbed dot; "cosine" divides each per-head
+    # dot by the query/key norms in the same kernel (the numerator IS the raw
+    # dot, so the identity still holds). Any other value is unsupported.
     assert scorer_norm in ("off", "cosine"), (
         "Double Sparsity selection supports scorer_norm in ('off', 'cosine'); "
         f"got {scorer_norm!r}."
@@ -844,13 +644,7 @@ def retrieve_topk_graph_safe(
         _TRITON_AVAILABLE
         and device.type == "cuda"
         and scratch_scores is not None
-        and scratch_topk_values is not None
-        and scratch_topk_indices is not None
-        and scratch_invalid_mask is not None
-        and scratch_sorted_vals is not None
-        and scratch_boundary is not None
-        and scratch_valid_i64 is not None
-        and scratch_throwaway_idx is not None
+        and radix_topk_scratch is not None
     )
 
     # CPU / no-scratch fallback (unit tests): the eager absorbed_topk_select
@@ -925,19 +719,10 @@ def retrieve_topk_graph_safe(
     # kernel-name matching. Host-side annotations: they mark eager decode and
     # the capture-time launches; CUDA-graph replay does not re-emit them.
     scores_view = scratch_scores[:bs, :max_seq_len]
-    # Dead positions (past seq_len) only need -inf when a full-width consumer
-    # reads them: the legacy torch.topk pipeline scans the whole scratch, the
-    # recall oracle ranks the full score row, and the anchor force-include is
-    # defensive-listed. The sequence-bounded radix selector reads none of them.
-    _store_dead = radix_topk_scratch is None or anchor_mode != "off"
-    # Score the logical positions straight from the resident fp8 latent into
-    # scratch_scores IN PLACE. v_h is built into scratch_absorbed_v
-    # allocation-free, then the paged absorbed kernel writes the score; from here
-    # the path is reduce + radix top-k. The absorbed paged kernel always stores
-    # -inf over dead positions, matching _store_dead's full-width consumers.
-    # The resident latent is required. Scales are required only for the fp8 path;
-    # the bf16 KV path passes the dequantized k_nope directly (scales=None), and
-    # the score kernel's BF16_LATENT branch skips the per-block fp8 scale.
+    # Score the logical positions straight from the resident latent into
+    # scratch_scores IN PLACE (v_h built into scratch_absorbed_v allocation-free),
+    # then reduce + radix top-k. Scales are required only for the fp8 path; the
+    # bf16 KV path passes the dequantized k_nope directly (scales=None).
     assert absorbed_latent_fp8 is not None, (
         "Double Sparsity graph-safe selection requires the resident latent "
         "(absorbed_latent_fp8)."
@@ -1007,15 +792,11 @@ def retrieve_topk_graph_safe(
     torch.cuda.nvtx.range_pop()
 
     # The radix selector upcasts score loads in-register, so the reduced bf16
-    # buffer can be its authoritative input: the compared values are
-    # bit-identical to the fp32 copy-back (bf16→fp32 is exact) and the
-    # copy-back kernel disappears. The full-row fp32 consumers — the legacy
-    # torch.topk pipeline, the recall oracle's ranking, and the anchor
-    # force-include — keep the copy-back.
+    # buffer can be its authoritative input directly: the compared values are
+    # bit-identical to the fp32 copy-back (bf16→fp32 is exact) and the copy-back
+    # kernel disappears.
     bf16_used = score_reduce_bf16 and scratch_scores_bf16 is not None
-    bf16_authoritative = (
-        radix_topk_scratch is not None and bf16_used and anchor_mode == "off"
-    )
+    bf16_authoritative = bf16_used
     topk_scores = scores_view
     if (
         process_group is not None
@@ -1048,122 +829,42 @@ def retrieve_topk_graph_safe(
         # so the masked selection is identical on either dtype.
         topk_scores.masked_fill_(pv_view, float("-inf"))
 
-    # Force-include the current decode slot (logical position seq_len-1) in its
-    # own selected set. The slot-validity bitmap masks the freshly-allocated slot
-    # to -inf during scoring (a reused physical slot must not be picked on its
-    # stale latent), but the current token's own KV IS valid at attention time.
-    # Re-include it by overriding its score to +inf AFTER the validity mask and
-    # BEFORE the top-k, writing the AUTHORITATIVE buffer (bf16(+inf) upcasts to
-    # fp32(+inf), so the selection is identical on either dtype). Only seq_len-1
-    # is touched, so every other reused slot stays -inf-masked — the stale-slot
-    # hazard is not reopened. FAIL-CLOSED: the helper writes +inf only for a
-    # width-covered seq_len-1 (NO clamp to a different token on a selector-width
-    # miss) and, for cosine, only when the row's q-norm is finite. The current
-    # slot's own key-norm is not gated (the current token's KV is valid by
-    # construction). 0-alloc / graph-safe Triton helper.
+    # Force-include the current decode slot (logical position seq_len-1): the
+    # slot-validity bitmap masks the freshly-allocated slot to -inf during
+    # scoring, but the current token's own KV is valid at attention time. Override
+    # its score to +inf AFTER the validity mask and BEFORE the top-k. Only
+    # seq_len-1 is touched, so every other reused slot stays -inf-masked.
+    # FAIL-CLOSED: +inf only for a width-covered seq_len-1 (no clamp) and, for
+    # cosine, only when the row's q-norm is finite.
     if include_current_slot and max_seq_len > 0:
         _force_include_current_slot(
             topk_scores,
             seq_lens,
             max_seq_len,
             bs,
-            cosine=(scorer_norm == "cosine"),
+            cosine=cosine,
             scratch_qnorm=scratch_qnorm,
-            key_norm_cache=key_norm_cache,
-            layer_id=layer_id,
-            req_pool_indices=req_pool_indices,
-            req_to_token=req_to_token,
         )
 
+    # Sequence-aware deterministic radix top-k: work proportional to each row's
+    # live window, exact (score desc, pos asc) selection emitted in ascending
+    # order directly. Fixed grids; allocation-free with the scratch bundle.
     torch.cuda.nvtx.range_push("ds_topk_select")
-    if radix_topk_scratch is not None:
-        # Sequence-aware deterministic radix top-k: work proportional to each
-        # row's live window, exact (score desc, pos asc) selection emitted in
-        # ascending order directly (replaces the two full-width torch.topk
-        # passes below). Fixed grids; allocation-free with the scratch bundle.
-        from sglang.srt.layers.attention.double_sparsity.topk_kernel import (
-            select_topk_sequence_order_triton,
-        )
+    from sglang.srt.layers.attention.double_sparsity.topk_kernel import (
+        select_topk_sequence_order_triton,
+    )
 
-        select_topk_sequence_order_triton(
-            topk_scores,
-            seq_lens,
-            max_top_k,
-            out_indices=out_indices,
-            out_lengths=out_lengths,
-            block=topk_block,
-            **radix_topk_scratch,
-        )
-        if max_top_k < out_indices.shape[1]:
-            out_indices[:bs, max_top_k:].fill_(-1)
-    else:
-        effective_k = min(max_top_k, max_seq_len)
-        topk_vals_view = scratch_topk_values[:bs, :effective_k]
-        topk_idx_view = scratch_topk_indices[:bs, :effective_k]
-        invalid_view = scratch_invalid_mask[:bs, :effective_k]
-        sorted_vals_view = scratch_sorted_vals[:bs, :effective_k]
-        boundary_view = scratch_boundary[:bs]
-        valid_i64_view = scratch_valid_i64[:bs]
-
-        # Step 1: top-K by score (unsorted, largest).
-        torch.topk(
-            scores_view,
-            effective_k,
-            dim=-1,
-            largest=True,
-            sorted=False,
-            out=(topk_vals_view, topk_idx_view),
-        )
-
-        # Step 2: sentinel-out invalid (-inf) entries; replace their position with max_seq_len.
-        torch.isneginf(topk_vals_view, out=invalid_view)
-        topk_idx_view.masked_fill_(invalid_view, max_seq_len)
-
-        # Step 3: ascending sort using topk(largest=False, sorted=True).
-        # PyTorch's topk requires output indices NOT to alias input — aliasing
-        # corrupts the read (observed: input [3, 1] → output values [0, 1]).
-        # Route throwaway gather indices into a dedicated scratch.
-        assert (
-            scratch_throwaway_idx is not None
-        ), "scratch_throwaway_idx is required for the graph-safe topk pipeline"
-        throwaway_view = scratch_throwaway_idx[:bs, :effective_k]
-        torch.topk(
-            topk_idx_view,
-            effective_k,
-            dim=-1,
-            largest=False,
-            sorted=True,
-            out=(sorted_vals_view, throwaway_view),
-        )
-
-        # Step 4: copy sorted positions to int32 output, then sentinel → -1.
-        out_indices[:bs, :effective_k].copy_(sorted_vals_view)
-        torch.ge(sorted_vals_view, max_seq_len, out=invalid_view)
-        out_indices[:bs, :effective_k].masked_fill_(invalid_view, -1)
-        if effective_k < out_indices.shape[1]:
-            out_indices[:bs, effective_k:].fill_(-1)
-
-        # Step 5: count valid (< max_seq_len) entries via searchsorted on the sorted vector.
-        boundary_view.fill_(max_seq_len)
-        torch.searchsorted(
-            sorted_vals_view, boundary_view, right=False, out=valid_i64_view
-        )
-        out_lengths[:bs].copy_(valid_i64_view.squeeze(-1))
+    select_topk_sequence_order_triton(
+        topk_scores,
+        seq_lens,
+        max_top_k,
+        out_indices=out_indices,
+        out_lengths=out_lengths,
+        block=topk_block,
+        **radix_topk_scratch,
+    )
+    if max_top_k < out_indices.shape[1]:
+        out_indices[:bs, max_top_k:].fill_(-1)
     torch.cuda.nvtx.range_pop()
-
-    # Graph-safe anchor-budget force-include: tensorized, fixed-shape, no
-    # host sync — bit-identical to the eager path (same _force_include_anchor).
-    # Off by default; under CUDA-graph capture the extra ops are captured once and
-    # replay reuses their memory (alloc-free on replay).
-    if anchor_mode != "off" and anchor_budget > 0:
-        a_idx, a_len = _force_include_anchor(
-            out_indices[:bs, :max_top_k],
-            scores_view,
-            seq_lens,
-            int(anchor_budget),
-            anchor_mode,
-        )
-        out_indices[:bs, :max_top_k].copy_(a_idx)
-        out_lengths[:bs].copy_(a_len)
 
     return out_indices, out_lengths

@@ -2557,12 +2557,6 @@ class DeepseekV2AttentionMLA(
                         out_indices=_ds_graph_state.selected_indices,
                         out_lengths=_ds_graph_state.valid_lengths,
                         scratch_scores=_ds_graph_state.scratch_scores,
-                        scratch_topk_values=_ds_graph_state.scratch_topk_values,
-                        scratch_topk_indices=_ds_graph_state.scratch_topk_indices,
-                        scratch_invalid_mask=_ds_graph_state.scratch_invalid_mask,
-                        scratch_sorted_vals=_ds_graph_state.scratch_sorted_vals,
-                        scratch_boundary=_ds_graph_state.scratch_boundary,
-                        scratch_valid_i64=_ds_graph_state.scratch_valid_i64,
                         # Compact selector variants score the [0, W) prefix;
                         # width dispatch guarantees live rows fit, so a wider
                         # mask's tail beyond W is dead by construction.
@@ -2573,45 +2567,26 @@ class DeepseekV2AttentionMLA(
                             else _sparse_mask[:, :_max_seq_len]
                         ),
                         scratch_pv_mask=_ds_graph_state.scratch_pv_mask,
-                        scratch_throwaway_idx=_ds_graph_state.scratch_throwaway_idx,
-                        scratch_scores_bf16=getattr(
-                            _ds_graph_state, "scratch_scores_bf16", None
-                        ),
+                        scratch_scores_bf16=_ds_graph_state.scratch_scores_bf16,
                         radix_topk_scratch=_radix_topk_scratch(_ds_graph_state),
-                        topk_block=getattr(_ds_graph_state, "topk_block", 1024),
+                        topk_block=_ds_graph_state.topk_block,
                         process_group=getattr(_selector, "process_group", None),
                         reduce_ca=getattr(_selector, "reduce_ca", None),
-                        score_reduce_bf16=(
-                            getattr(_selector.config, "score_reduce_dtype", "bf16")
-                            == "bf16"
-                        ),
-                        scorer_norm=getattr(_selector.config, "scorer_norm", "off"),
-                        head_agg=getattr(_selector.config, "head_agg", "max"),
-                        anchor_mode=getattr(_selector.config, "anchor_mode", "off"),
-                        anchor_budget=getattr(_selector.config, "anchor_budget", 0),
+                        score_reduce_bf16=_selector.config.score_reduce_dtype == "bf16",
+                        scorer_norm=_selector.config.scorer_norm,
+                        head_agg=_selector.config.head_agg,
                         absorbed_latent_fp8=_absorbed_latent_fp8,
                         absorbed_latent_scales=_absorbed_latent_scales,
                         absorbed_w_sel=_selector.absorbed_w_sel,
-                        scratch_absorbed_v=getattr(
-                            _ds_graph_state, "scratch_absorbed_v", None
-                        ),
-                        scratch_absorbed_qsel=getattr(
-                            _ds_graph_state, "scratch_absorbed_qsel", None
-                        ),
-                        scratch_absorbed_sel_i64=getattr(
-                            _ds_graph_state, "scratch_absorbed_sel_i64", None
-                        ),
-                        scratch_absorbed_q=getattr(
-                            _ds_graph_state, "scratch_absorbed_q", None
-                        ),
+                        scratch_absorbed_v=_ds_graph_state.scratch_absorbed_v,
+                        scratch_absorbed_qsel=_ds_graph_state.scratch_absorbed_qsel,
+                        scratch_absorbed_sel_i64=_ds_graph_state.scratch_absorbed_sel_i64,
+                        scratch_absorbed_q=_ds_graph_state.scratch_absorbed_q,
                         include_current_slot=bool(
-                            getattr(_selector.config, "include_current_slot", False)
-                        ),
-                        scratch_cur_index=getattr(
-                            _ds_graph_state, "scratch_cur_index", None
+                            _selector.config.include_current_slot
                         ),
                         key_norm_cache=getattr(_sw_backend, "_ds_key_norm_cache", None),
-                        scratch_qnorm=getattr(_ds_graph_state, "scratch_qnorm", None),
+                        scratch_qnorm=_ds_graph_state.scratch_qnorm,
                         q_pe=_rope_q_pe,
                         k_pe=_rope_k_pe,
                     )
@@ -2664,17 +2639,11 @@ class DeepseekV2AttentionMLA(
                 if envs.SGLANG_DSA_FUSE_TOPK.get():
                     _rpi = getattr(forward_batch, "req_pool_indices", None)
                     if req_to_token is not None and _rpi is not None:
-                        _lp_err = (
-                            _ds_graph_state.lp_error_scratch
-                            if _ds_graph_state is not None
-                            else None
-                        )
                         logical_to_physical(
                             selected_indices=selected_indices,
                             req_pool_indices=_rpi,
                             req_to_token=req_to_token,
                             out=ds_out,
-                            error_scratch=_lp_err,
                         )
                     else:
                         # Fused path needs physical slots but no req_to_token to
