@@ -331,8 +331,51 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_sparse_q8", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+    "flashmla_kv",
+    "flashinfer_sparse_mla",
+    "fa3",
+    "tilelang",
+    "trtllm",
 ]
+
+
+def _validate_flashinfer_sparse_mla_backend(
+    *,
+    model_arch: str,
+    device_sm_major: int,
+    kv_cache_dtype: torch.dtype,
+    prefill_impl: _DSA_IMPL_T,
+    decode_impl: _DSA_IMPL_T,
+    enable_hisparse: bool,
+) -> bool:
+    selected = {prefill_impl, decode_impl}
+    uses_flashinfer_sparse_mla = "flashinfer_sparse_mla" in selected
+    is_glm_sm12_fp8 = (
+        model_arch == "GlmMoeDsaForCausalLM"
+        and device_sm_major == 12
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and not _is_hip
+    )
+    if uses_flashinfer_sparse_mla and not is_glm_sm12_fp8:
+        raise ValueError(
+            "flashinfer_sparse_mla supports only GLM DSA with FP8 KV cache "
+            "on NVIDIA SM120/SM121."
+        )
+    if is_glm_sm12_fp8:
+        unsupported = selected - {"flashinfer_sparse_mla"}
+        if unsupported:
+            raise ValueError(
+                "GLM DSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
+                "only flashinfer_sparse_mla, "
+                f"but got {sorted(unsupported)}."
+            )
+        if enable_hisparse:
+            raise ValueError(
+                "flashinfer_sparse_mla does not support --enable-hisparse."
+            )
+    return uses_flashinfer_sparse_mla
 
 
 class DeepseekSparseAttnBackend(
@@ -490,8 +533,26 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_identity_scale: Optional[torch.Tensor] = None
         self._q8kv8_qpad_buf: Optional[torch.Tensor] = None
 
+        uses_flashinfer_sparse_mla = _validate_flashinfer_sparse_mla_backend(
+            model_arch=model_runner.model_config.hf_config.architectures[0],
+            device_sm_major=self.device_sm_major,
+            kv_cache_dtype=self.kv_cache_dtype,
+            prefill_impl=self.dsa_prefill_impl,
+            decode_impl=self.dsa_decode_impl,
+            enable_hisparse=model_runner.server_args.enable_hisparse,
+        )
+
+        if uses_flashinfer_sparse_mla:
+            self.workspace_buffer = get_buffer(
+                "dsa_flashinfer_sparse_mla_workspace",
+                lambda: torch.zeros(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                ),
+            )
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
@@ -2090,6 +2151,19 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif dsa_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                page_table_1 = topk_indices
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2232,6 +2306,17 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif self.dsa_decode_impl == "flashinfer_sparse_mla":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2501,6 +2586,35 @@ class DeepseekSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
         return o
+
+    def _forward_flashinfer_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sm_scale: float,
+        skip_softmax_threshold_scale_factor: float | None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.flash_mla_sm120 import (
+            flashinfer_sparse_mla_forward,
+        )
+
+        assert self.workspace_buffer is not None
+        return flashinfer_sparse_mla_forward(
+            q=q_all,
+            kv_cache=kv_cache,
+            indices=page_table_1,
+            seq_lens=seq_lens,
+            workspace_buffer=self.workspace_buffer,
+            page_size=self.real_page_size,
+            kv_cache_dim=self.kv_cache_dim,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            sm_scale=sm_scale,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
 
     def _forward_flashmla_kv(
         self,

@@ -474,3 +474,43 @@ def _flash_mla_flashinfer(
     )
 
     return (output.unsqueeze(1), None)
+
+
+def flashinfer_sparse_mla_forward(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    page_size: int,
+    kv_cache_dim: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sm_scale: float,
+    skip_softmax_threshold_scale_factor: float | None,
+) -> torch.Tensor:
+    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    topk = indices.shape[1]
+    result = trtllm_batch_decode_with_kv_cache_mla(
+        query=q.unsqueeze(1),
+        kv_cache=kv_cache.view(torch.uint8)
+        .view(-1, page_size, kv_cache_dim)
+        .unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=indices.unsqueeze(1),
+        seq_lens=seq_lens,
+        max_seq_len=topk,
+        sparse_mla_top_k=topk,
+        bmm1_scale=float(sm_scale),
+        bmm2_scale=1.0,
+        kv_scale_format="arbitrary_fp32",
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+    return result.squeeze(1)
