@@ -159,11 +159,8 @@ class EagleDraftInput(SpecInput):
     hidden_states: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # NSA/DSA indexer topk computed on the first MTP draft step and reused by the
-    # rest (index_share_for_mtp_iteration). Carried here, not on ForwardBatch:
-    # the per-step eager/graph forward runs on a copied ForwardBatch, so a
-    # writeback there is dropped, whereas spec_info is shared by reference across
-    # the draft steps (same path as hidden_states).
+    # Carried on spec_info, not ForwardBatch: each draft step runs on a copied
+    # ForwardBatch, so a writeback there is dropped (spec_info is shared by ref).
     mtp_topk_indices: Optional[torch.Tensor] = None
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
