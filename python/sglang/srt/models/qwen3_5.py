@@ -142,6 +142,9 @@ if _is_cuda:
         fused_qk_gemma_rmsnorm_rope_gate,
     )
 
+if _is_cpu:
+    fused_sigmoid_mul = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,

@@ -50,6 +50,7 @@ from sglang.srt.managers.io_struct import (
     async_sock_recv,
     async_sock_send,
     sock_send,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
@@ -2398,12 +2399,14 @@ class EncoderScheduler:
         for sock in self.send_sockets:
             sock_send(
                 sock,
-                {
-                    "type": "batch_encode",
-                    "modality": modality.name,
-                    "requests": requests,
-                    "enter_time": start,
-                },
+                wrap_as_pickle(
+                    {
+                        "type": "batch_encode",
+                        "modality": modality.name,
+                        "requests": requests,
+                        "enter_time": start,
+                    }
+                ),
             )
 
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
@@ -2449,7 +2452,7 @@ class EncoderScheduler:
             req = p.request
             try:
                 for sock in self.send_sockets:
-                    sock_send(sock, req)
+                    sock_send(sock, wrap_as_pickle(req))
                 result = await self.encoder.encode_request(req, modality)
                 if not p.future.done():
                     p.future.set_result(result)
@@ -2738,7 +2741,7 @@ class DPDispatcher:
         )
 
         try:
-            await async_sock_send(self.dispatch_sockets[rank], request)
+            await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
             # An alive-but-stuck worker (NCCL deadlock etc.) wouldn't trip
             # the watchdog, so bound the wait explicitly.
             return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
@@ -2787,7 +2790,7 @@ class DPDispatcher:
             f"dp_rank={rank}, pending={self.pending_counts}"
         )
         try:
-            await async_sock_send(self.dispatch_sockets[rank], request)
+            await async_sock_send(self.dispatch_sockets[rank], wrap_as_pickle(request))
             return await asyncio.wait_for(future, timeout=ENCODER_REQ_TIMEOUT)
         except asyncio.TimeoutError:
             self.pending_futures[rank].pop(key, None)
@@ -2828,7 +2831,9 @@ class DPDispatcher:
                 self.req_id_to_rank[req_id] = rank
                 rank_keys.append((rank, req_id))
                 request_copy = {**request, "req_id": req_id}
-                await async_sock_send(self.dispatch_sockets[rank], request_copy)
+                await async_sock_send(
+                    self.dispatch_sockets[rank], wrap_as_pickle(request_copy)
+                )
                 futures.append(future)
             # Concurrent wait → total bounded by eff_timeout, not
             # dp_size × eff_timeout.
@@ -3056,7 +3061,7 @@ async def _dp_worker_handle_request(
     # pyzmq async send isn't safe for concurrent senders.
     try:
         async with send_lock:
-            await async_sock_send(send_sock, envelope)
+            await async_sock_send(send_sock, wrap_as_pickle(envelope))
     except Exception:
         logger.error(
             f"DP worker {dp_rank} failed to send envelope for "
@@ -3618,7 +3623,7 @@ async def handle_encode_request(request: dict):
                     )
             else:
                 for socket in send_sockets:
-                    sock_send(socket, request)
+                    sock_send(socket, wrap_as_pickle(request))
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                     await encoder.encode_request(request, modality)
                 )
@@ -3839,7 +3844,7 @@ async def health_generate():
 
         # Broadcast to other TP ranks so distributed ops stay in sync
         for socket in send_sockets:
-            sock_send(socket, dummy_request)
+            sock_send(socket, wrap_as_pickle(dummy_request))
 
         # Run encode on rank 0 with timeout
         _, _, _, error_msg, _ = await asyncio.wait_for(
