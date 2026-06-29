@@ -293,6 +293,15 @@ class DSparkWorkerV2(BaseSpecWorker):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bs = int(block_hidden.shape[0])
         block_size = int(self.block_size)
+        if bs == 0:
+            empty_tokens = torch.empty(
+                (0, block_size), dtype=torch.int64, device=block_hidden.device
+            )
+            empty_confidence = torch.empty(
+                (0, block_size), dtype=torch.float32, device=block_hidden.device
+            )
+            return empty_tokens, empty_confidence
+
         markov_head = self._draft_inner.markov_head
         confidence_head = self._draft_inner.confidence_head
         lm_head = self.draft_model.lm_head
@@ -539,16 +548,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs, block_size
         )
 
-        correct_len, _ = compute_dflash_correct_drafts_and_bonus(
-            candidates=candidates,
-            target_predict=target_predict,
-        )
-        confident_prefix = self._confident_prefix(confidence)
-        correct_len = torch.minimum(
-            correct_len.to(torch.int64), confident_prefix.to(torch.int64)
-        )
-        bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(1)
-        commit_lens = correct_len.to(torch.int32) + 1
+        if bs == 0:
+            correct_len = torch.empty((0,), dtype=torch.int64, device=device)
+            bonus_tokens = torch.empty((0,), dtype=torch.int64, device=device)
+            commit_lens = torch.empty((0,), dtype=torch.int32, device=device)
+        else:
+            correct_len, _ = compute_dflash_correct_drafts_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
+            )
+            confident_prefix = self._confident_prefix(confidence)
+            correct_len = torch.minimum(
+                correct_len.to(torch.int64), confident_prefix.to(torch.int64)
+            )
+            bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(
+                1
+            )
+            commit_lens = correct_len.to(torch.int32) + 1
 
         out_tokens = torch.empty((bs, block_size), dtype=torch.int64, device=device)
         if block_size > 1:
@@ -567,16 +583,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
-        hidden = hidden.view(bs, block_size, -1)
-        commit_mask = (
-            self._block_pos_offsets.unsqueeze(0)
-            < commit_lens.unsqueeze(1).to(torch.int64)
-        ).reshape(-1)
-        self._materialize_main_hidden_to_draft_kv(
-            main_hidden=hidden.reshape(-1, hidden.shape[-1])[commit_mask],
-            cache_loc=verify_out_cache_loc[commit_mask],
-            positions=positions[commit_mask],
-        )
+        if bs > 0:
+            hidden = hidden.view(bs, block_size, -1)
+            commit_mask = (
+                self._block_pos_offsets.unsqueeze(0)
+                < commit_lens.unsqueeze(1).to(torch.int64)
+            ).reshape(-1)
+            self._materialize_main_hidden_to_draft_kv(
+                main_hidden=hidden.reshape(-1, hidden.shape[-1])[commit_mask],
+                cache_loc=verify_out_cache_loc[commit_mask],
+                positions=positions[commit_mask],
+            )
 
         logits_output.hidden_states = None
 
