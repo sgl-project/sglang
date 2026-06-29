@@ -93,7 +93,6 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
-    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -235,7 +234,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
@@ -251,7 +252,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -804,12 +804,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ):
                     kwargs["input_embeds"] = self.buffers.input_embeds[:num_tokens]
 
-                return forward(
+                out = forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
                     **kwargs,
                 )
+                dflash_sampler = getattr(
+                    self.model_runner, "dflash_draft_sampler", None
+                )
+                if dflash_sampler is not None:
+                    # Must be captured here, or replay leaves a stale output buffer
+                    # the worker would read as valid tokens -- fail loudly instead.
+                    if (
+                        not isinstance(out, LogitsProcessorOutput)
+                        or out.hidden_states is None
+                    ):
+                        raise RuntimeError(
+                            "DFLASH draft sampler set but the draft forward has no "
+                            "hidden_states to capture into the graph."
+                        )
+                    dflash_sampler(out.hidden_states)
+                return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
             canary_ctx = (
@@ -979,6 +995,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         with timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
+            # Snapshot built -- publish a read-done event for the WAR barrier.
+            # Only plain DECODE: the captured decode graph reads only its static
+            # snapshot, so the forward is done reading the shared pool here. Spec
+            # verify (target_verify/dllm_extend) replays on this runner too, but
+            # those are NOT the step's last shared-buffer-reading phase (eagle
+            # publishes from draft_extend; ngram/dflash must not publish here),
+            # and some verify graphs may read beyond the snapshot in replay.
+            if forward_batch.forward_mode.is_decode():
+                read_done = self.device_module.Event()
+                read_done.record()
+                self.model_runner.war_fastpath_read_done_event = read_done
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):

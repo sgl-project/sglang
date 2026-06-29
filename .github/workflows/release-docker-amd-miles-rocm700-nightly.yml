@@ -18,6 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - gpu_arch: gfx950
+            rocm_tag: rocm700-mi35x
+            sglang_image_tag: v0.5.10-rocm700-mi35x
           - gpu_arch: gfx942
             rocm_tag: rocm700-mi30x
             sglang_image_tag: v0.5.10-rocm700-mi30x
@@ -77,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ["gfx942"]
+        gpu_arch: ["gfx950", "gfx942"]
     steps:
       - name: Download image tag artifact
         uses: actions/download-artifact@v4

@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.utils.dcp_utils import DecodeContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
@@ -503,6 +504,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
+    # For decode context parallel
+    attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
+
+    # Decode context parallel KV write mask.
+    dcp_kv_mask: Optional[torch.Tensor] = None
+
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
@@ -856,6 +863,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        if (
+            getattr(model_runner, "dcp_size", 1) > 1
+            and ret.out_cache_loc is not None
+            and is_hip()
+        ):
+            ret.dcp_kv_mask = (
+                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+            )
 
         return ret
 
@@ -1335,6 +1351,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if getattr(spec_info, "topk_index", None) is not None:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
+                )
+            if getattr(spec_info, "draft_probs", None) is not None:
+                spec_info.draft_probs = self._pad_tensor_to_size(
+                    spec_info.draft_probs, bs
                 )
             if getattr(spec_info, "num_correct_drafts", None) is not None:
                 spec_info.num_correct_drafts = self._pad_tensor_to_size(
