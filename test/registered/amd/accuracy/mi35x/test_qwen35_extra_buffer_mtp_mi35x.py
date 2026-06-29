@@ -119,7 +119,7 @@ class TestQwen35ExtraBufferMTPMI35x(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k_radix_spec(self):
-        requests.get(self.base_url + "/flush_cache")
+        requests.get(self.base_url + "/flush_cache", timeout=60)
 
         args = SimpleNamespace(
             model=self.model,
@@ -143,7 +143,7 @@ class TestQwen35ExtraBufferMTPMI35x(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/server_info")
+        server_info = requests.get(self.base_url + "/server_info", timeout=60)
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
