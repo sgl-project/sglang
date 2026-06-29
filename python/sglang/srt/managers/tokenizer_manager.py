@@ -2321,7 +2321,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
+            if len(token_logprobs_val[i]) > 0:
                 ret.append(
                     self.detokenize_logprob_tokens(
                         token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
