@@ -4,6 +4,7 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -195,6 +196,7 @@ class TestHunyuanDetectorDetectAndParse(CustomTestCase):
         )
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 2)
+        self.assertEqual([call.tool_index for call in result.calls], [0, 1])
         self.assertEqual(json.loads(result.calls[0].parameters)["city"], "Beijing")
         self.assertEqual(json.loads(result.calls[1].parameters)["city"], "Hangzhou")
 
@@ -227,6 +229,39 @@ class TestHunyuanDetectorDetectAndParse(CustomTestCase):
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(result.calls[0].name, "get_current_date")
         self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual([call.tool_index for call in result.calls], [0, 1])
+
+    def test_forwarded_unknown_tool_gets_ordinal_index(self):
+        text = (
+            "<tool_calls>"
+            "<tool_call>get_current_date<tool_sep></tool_call>"
+            "<tool_call>nonexistent<tool_sep></tool_call>"
+            "<tool_call>search<tool_sep>"
+            "<arg_key>query</arg_key><arg_value>test</arg_value>"
+            "</tool_call>"
+            "</tool_calls>"
+        )
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 3)
+        self.assertEqual(
+            [call.name for call in result.calls],
+            ["get_current_date", "nonexistent", "search"],
+        )
+        self.assertEqual([call.tool_index for call in result.calls], [0, 1, 2])
+
+    def test_single_slot_three_tool_gets_zero_index(self):
+        text = (
+            "<tool_calls><tool_call>calculate<tool_sep>"
+            "<arg_key>expression</arg_key><arg_value>2+2</arg_value>"
+            "</tool_call></tool_calls>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "calculate")
+        self.assertEqual(result.calls[0].tool_index, 0)
 
     def test_three_parallel_tool_calls(self):
         text = (
@@ -245,9 +280,7 @@ class TestHunyuanDetectorDetectAndParse(CustomTestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "get_weather")
         self.assertEqual(result.calls[2].name, "get_current_date")
-        # tool_index maps to position in tools list
-        self.assertEqual(result.calls[0].tool_index, 1)  # get_weather is index 1
-        self.assertEqual(result.calls[2].tool_index, 0)  # get_current_date is index 0
+        self.assertEqual([call.tool_index for call in result.calls], [0, 1, 2])
 
 
 class TestHunyuanDetectorArgDeserialization(CustomTestCase):
@@ -351,9 +384,7 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
     def test_complete_tool_call_single_chunk(self):
         detector = self._new_detector()
         text = (
-            "<tool_calls>"
-            "<tool_call>get_current_date<tool_sep></tool_call>"
-            "</tool_calls>"
+            "<tool_calls><tool_call>get_current_date<tool_sep></tool_call></tool_calls>"
         )
         result = detector.parse_streaming_increment(text, self.tools)
         collected = _collect_streamed_tool_calls(result.calls)
