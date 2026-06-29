@@ -131,6 +131,33 @@ def _build_nvfp4_megamoe_scales(layer: FusedMoE) -> None:
     )
 
 
+def _build_flashinfer_cutedsl_megamoe_layer(
+    layer: FusedMoE, *, megakernel_config: object, weights: object
+) -> None:
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+    )
+
+    world_size, rank = _layer_ep_world_rank(layer)
+
+    layer.flashinfer_megamoe_layer = MoEEpMegaLayer(
+        bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
+        fleet_params=FleetParams(
+            num_experts=layer.num_experts,
+            max_tokens_per_rank=_resolve_max_tokens_per_rank(),
+            token_hidden_size=layer.hidden_size,
+            weights=weights,
+        ),
+        backend=MegaConfig(
+            megakernel=megakernel_config,
+            preprocess_weights=True,
+        ),
+    )
+
+
 def build_flashinfer_megamoe_layer(layer: FusedMoE) -> None:
     """Construct + cache a MoEEpMegaLayer from the layer's loaded FP4 weights.
 
@@ -171,7 +198,6 @@ def build_flashinfer_megamoe_layer(layer: FusedMoE) -> None:
                 top_k=layer.top_k,
                 activation_clamp=layer.moe_runner_config.swiglu_limit,
             ),
-            stage_inputs=True,
             preprocess_weights=True,
         ),
     )
@@ -182,10 +208,6 @@ def build_flashinfer_nvfp4_megamoe_layer(layer: FusedMoE) -> None:
         return
 
     from flashinfer.moe_ep import (
-        BootstrapConfig,
-        FleetParams,
-        MegaConfig,
-        MoEEpMegaLayer,
         MoEWeightPack,
         Nvfp4CutedslMegaMoeConfig,
     )
@@ -212,41 +234,68 @@ def build_flashinfer_nvfp4_megamoe_layer(layer: FusedMoE) -> None:
             f"ep_size, got {layer.num_experts=} and {layer.moe_ep_size=}."
         )
 
-    world_size, rank = _layer_ep_world_rank(layer)
-
     _build_nvfp4_megamoe_scales(layer)
 
     input_norm_const = _scalar_float(layer.w13_input_scale_quant)
     layer.flashinfer_megamoe_input_norm_const = input_norm_const
     gate_up_clamp = layer.moe_runner_config.swiglu_limit
-    max_tokens = _resolve_max_tokens_per_rank()
 
-    layer.flashinfer_megamoe_layer = MoEEpMegaLayer(
-        bootstrap=BootstrapConfig(world_size=world_size, rank=rank),
-        fleet_params=FleetParams(
-            num_experts=layer.num_experts,
-            max_tokens_per_rank=max_tokens,
-            token_hidden_size=layer.hidden_size,
-            weights=MoEWeightPack(
-                w13=layer.w13_weight.data,
-                w2=layer.w2_weight.data,
-                w13_scale=layer.w13_weight_scale.data,
-                w2_scale=layer.w2_weight_scale.data,
-            ),
+    _build_flashinfer_cutedsl_megamoe_layer(
+        layer,
+        weights=MoEWeightPack(
+            w13=layer.w13_weight.data,
+            w2=layer.w2_weight.data,
+            w13_scale=layer.w13_weight_scale.data,
+            w2_scale=layer.w2_weight_scale.data,
         ),
-        backend=MegaConfig(
-            megakernel=Nvfp4CutedslMegaMoeConfig(
-                intermediate_size=layer.intermediate_size_per_partition,
-                top_k=layer.top_k,
-                gate_up_clamp=gate_up_clamp,
-                apply_topk_in_fc1=True,
-                input_norm_const=input_norm_const,
-                fc1_alpha=layer.flashinfer_megamoe_fc1_alpha,
-                fc2_alpha=layer.flashinfer_megamoe_fc2_alpha,
-                fc1_norm_const=layer.flashinfer_megamoe_fc1_norm_const,
-            ),
-            stage_inputs=True,
-            preprocess_weights=True,
+        megakernel_config=Nvfp4CutedslMegaMoeConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            gate_up_clamp=gate_up_clamp,
+            apply_topk_in_fc1=True,
+            input_norm_const=input_norm_const,
+            fc1_alpha=layer.flashinfer_megamoe_fc1_alpha,
+            fc2_alpha=layer.flashinfer_megamoe_fc2_alpha,
+            fc1_norm_const=layer.flashinfer_megamoe_fc1_norm_const,
+        ),
+    )
+
+
+def build_flashinfer_mxfp8_megamoe_layer(layer: FusedMoE) -> None:
+    if getattr(layer, "flashinfer_megamoe_layer", None) is not None:
+        return
+
+    from flashinfer.moe_ep import MoEWeightPack, Mxfp8CutedslMegaMoeConfig
+
+    if layer.hidden_size % 128 != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 MegaMOE requires hidden_size to be a multiple "
+            f"of 128, got {layer.hidden_size}."
+        )
+    if layer.intermediate_size_per_partition % 128 != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 MegaMOE requires intermediate_size_per_partition "
+            f"to be a multiple of 128, got {layer.intermediate_size_per_partition}."
+        )
+    if layer.num_experts % layer.moe_ep_size != 0:
+        raise ValueError(
+            "FlashInfer MXFP8 MegaMOE requires num_experts to be divisible by "
+            f"ep_size, got {layer.num_experts=} and {layer.moe_ep_size=}."
+        )
+
+    _build_flashinfer_cutedsl_megamoe_layer(
+        layer,
+        weights=MoEWeightPack(
+            w13=layer.w13_weight.data,
+            w2=layer.w2_weight.data,
+            w13_scale=layer.w13_weight_scale_inv.data,
+            w2_scale=layer.w2_weight_scale_inv.data,
+        ),
+        megakernel_config=Mxfp8CutedslMegaMoeConfig(
+            intermediate_size=layer.intermediate_size_per_partition,
+            top_k=layer.top_k,
+            kind="mxfp8_e4m3",
+            gate_up_clamp=layer.moe_runner_config.swiglu_limit,
         ),
     )
 
@@ -282,8 +331,11 @@ def _ensure_shared_workspace(mega) -> None:
         getattr(kc, "gate_up_clamp", None),
         getattr(kc, "activation_clamp", None),
         getattr(kc, "apply_topk_in_fc1", None),
+        getattr(kc, "kind", None),
+        getattr(kc, "in_kernel_fc2_reduce", None),
+        getattr(kc, "token_back_by_dispatch", None),
         getattr(kc, "fast_math", None),
-        mc.stage_inputs,
+        mc.quantize_input,
     )
     shared = _SHARED_MEGA_WORKSPACE.get(key)
     if shared is None:
