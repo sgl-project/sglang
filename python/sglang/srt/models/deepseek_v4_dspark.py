@@ -7,7 +7,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -251,8 +250,7 @@ class DeepseekV4ForCausalLMDSpark(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            return self.model(input_ids, positions, forward_batch)
+        return self.model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=False, is_dspark=True)
