@@ -286,39 +286,57 @@ def get_max_seq_length(regex_str: str):
 
 MAX_LEN = 2**30
 
+# Hoist token-kind sets and other ``sre_parse`` constants out of the inner loop:
+# the original ``token in {sre_parse.LITERAL, ...}`` literal rebuilt the set on
+# every iteration because its members are attribute lookups, not compile-time
+# constants. Hoisting them makes the membership test a single C-level hash
+# lookup against a pre-built ``frozenset``.
+#
+# ``LITERAL``    -- ``value`` is any one character
+# ``IN``         -- Any character within ``value``
+# ``ANY``        -- "."
+_SINGLE_CHAR_TOKENS = frozenset({sre_parse.LITERAL, sre_parse.IN, sre_parse.ANY})
+_REPEAT_TOKENS = frozenset({sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT})
+_SUBPATTERN_TOKEN = sre_parse.SUBPATTERN
+_BRANCH_TOKEN = sre_parse.BRANCH
+_AT_TOKEN = sre_parse.AT
+_MAXREPEAT = sre_parse.MAXREPEAT
+
 
 def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
     total = 0
     for token, value in subpattern:
-        if token in {
-            sre_parse.LITERAL,  # `value` is any one character
-            sre_parse.IN,  # Any character within `value`
-            sre_parse.ANY,  # "."
-        }:
+        if token in _SINGLE_CHAR_TOKENS:
             total += 1
-        elif token == sre_parse.SUBPATTERN:
+        elif token == _SUBPATTERN_TOKEN:
             # EG: (a\d+) ->
             # [(SUBPATTERN,
             #   (1, 0, 0, [(LITERAL, 97),
             #              (MAX_REPEAT, (1, MAXREPEAT, [(IN, [(CATEGORY, CATEGORY_DIGIT)])]))]))]
             _, _, _, inner_subpattern = value
             total += _max_length_from_subpattern(inner_subpattern)
-        elif token == sre_parse.BRANCH:
+        elif token == _BRANCH_TOKEN:
             _, branches = value
             total += max(_max_length_from_subpattern(branch) for branch in branches)
-        elif token in {sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT}:
+        elif token in _REPEAT_TOKENS:
             _, max_num_repeat, inner_subpattern = value
-            if max_num_repeat == sre_parse.MAXREPEAT:
-                total += MAX_LEN
-            else:
-                total += max_num_repeat * _max_length_from_subpattern(inner_subpattern)
-        elif token == sre_parse.AT:
-            # These are zero-width assertions like ^, $, and \b that don't add to the max
-            # length
-            total += 0
+            if max_num_repeat == _MAXREPEAT:
+                # Unbounded repeat saturates the upper bound; nothing else in
+                # the pattern can lower it below ``MAX_LEN``.
+                return MAX_LEN
+            total += max_num_repeat * _max_length_from_subpattern(inner_subpattern)
+        elif token == _AT_TOKEN:
+            # Zero-width assertions like ^, $, and \b that don't add to the max
+            # length.
+            continue
         else:
             logger.warning(f"Got unhandled regex token: {token}")
+            return MAX_LEN
 
-            total += MAX_LEN
+        # Once the bound has saturated, further additions can't change the
+        # downstream behaviour (callers compare against ``MAX_LEN`` and use
+        # the result as a buffer size capped by ``len(output_ids)``).
+        if total >= MAX_LEN:
+            return MAX_LEN
 
     return total

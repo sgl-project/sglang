@@ -519,6 +519,21 @@ class TestRegexMaxLength(CustomTestCase):
         result = get_max_seq_length("(?<=x)y")
         self.assertGreaterEqual(result, MAX_LEN)
 
+    def test_unbounded_repeat_short_circuits_at_max_len(self):
+        """Test that an unbounded repeat early-exits at MAX_LEN even when
+        followed by additional contributing terms (the saturated bound is the
+        only thing callers care about)."""
+        # 'a*b{5}' would have summed to ``MAX_LEN + 5`` with the previous
+        # implementation. Saturating at ``MAX_LEN`` is consistent with how the
+        # value is consumed downstream (see ``Req.get_tail_decoded_str``).
+        self.assertEqual(get_max_seq_length("a*b{5}"), MAX_LEN)
+
+    def test_long_literal_does_not_overflow(self):
+        """Test that a long literal sequence accumulates correctly without
+        triggering the saturation guard prematurely."""
+        # 1024 characters is well below ``MAX_LEN`` (=2**30).
+        self.assertEqual(get_max_seq_length("a" * 1024), 1024)
+
 
 if __name__ == "__main__":
     unittest.main()
