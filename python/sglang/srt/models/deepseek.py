@@ -234,6 +234,7 @@ class DeepseekAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        head_dim: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
@@ -257,7 +258,7 @@ class DeepseekAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
+        self.head_dim = head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -326,10 +327,15 @@ class DeepseekDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        # CPU uses attr of original_num_attention_heads for padding needs, others stay unchanged.
+        head_dim = self.hidden_size // getattr(
+            config, "original_num_attention_heads", config.num_attention_heads
+        )
         self.self_attn = DeepseekAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,

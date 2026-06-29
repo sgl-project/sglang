@@ -187,8 +187,14 @@ def adjust_config_with_unaligned_cpu_tp(
 ) -> ModelConfig:
     # Support the case where the num_attention_heads is not divisible by the TP size.
     weight_block_size = may_get_weight_block_size(model_config, load_config)
-
-    for config in [model_config.hf_config, model_config.hf_text_config]:
+    config_list = [
+        model_config,
+        model_config.hf_config,
+        model_config.hf_text_config,
+    ]
+    if hasattr(model_config.hf_config, "text_config"):
+        config_list.append(model_config.hf_config.text_config)
+    for config in config_list:
         update_config(
             config,
             "original_num_attention_heads",
@@ -229,11 +235,7 @@ def adjust_config_with_unaligned_cpu_tp(
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
 
         num_attention_heads = num_key_value_heads * query_heads_per_kv
-        for config in [
-            model_config,
-            model_config.hf_config,
-            model_config.hf_text_config,
-        ]:
+        for config in config_list:
             update_config(config, "num_key_value_heads", num_key_value_heads)
             update_config(config, "num_attention_heads", num_attention_heads)
 
