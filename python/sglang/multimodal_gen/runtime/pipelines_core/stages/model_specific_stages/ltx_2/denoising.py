@@ -167,6 +167,13 @@ class LTX2DenoisingStage(DenoisingStage):
             return StageParallelismType.CFG_PARALLEL
         return StageParallelismType.REPLICATED
 
+    def cfg_parallel_local_batch_fields(
+        self, batch: Req, server_args: ServerArgs
+    ) -> tuple[str, ...]:
+        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+            return ("latents", "audio_latents")
+        return ()
+
     @staticmethod
     def _combine_cfg_parallel_av(
         video: torch.Tensor,

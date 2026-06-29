@@ -617,7 +617,8 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
      && cd triton-custom \
      && git checkout ${TRITON_COMMIT} \
      && pip install -r python/requirements.txt \
-     && pip install -e .; \
+     && pip install -e . \
+     && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
     fi
 
 # -----------------------

@@ -15,7 +15,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -585,6 +588,29 @@ class TestWarmupModeNormalization(unittest.TestCase):
         self.assertFalse(sa.server_warmup)
         self.assertEqual(sa.warmup_mode, "request")
 
+    def test_legacy_warmup_on_uses_defaulted_server_mode(self):
+        # `serve --warmup` (legacy ON, mode defaulted to "server" but not
+        # explicit) must resolve to server-based warmup, not silently downgrade
+        # to request mode.
+        sa = self._resolve(warmup_mode="server", warmup=True, explicit=("warmup",))
+        self.assertEqual(sa.warmup_mode, "server")
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+
+    def test_legacy_warmup_with_resolutions_runs_server_warmup(self):
+        # Dead-zone regression: `serve --warmup --warmup-resolutions X` must run
+        # server-based (synthetic) warmup, not end up with no warmup at all
+        # (request-based warmup bails out when warmup_resolutions is set).
+        sa = self._resolve(
+            warmup_mode="server",
+            warmup=True,
+            warmup_resolutions=["1024x1024"],
+            explicit=("warmup",),
+        )
+        self.assertTrue(sa.warmup)
+        self.assertTrue(sa.server_warmup)
+        self.assertEqual(sa.warmup_mode, "server")
+
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
@@ -795,6 +821,7 @@ class TestOffloadDefaults(unittest.TestCase):
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
         ltx_deployment = LTX2PipelineConfig().get_model_deployment_config()
+        ltx23_config = LTX23PipelineConfig()
         sana_wm_deployment = SanaWMPipelineConfig().get_model_deployment_config()
 
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
@@ -816,6 +843,18 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             ltx_deployment.auto_disable_component_offload_components, ("dit",)
         )
+        self.assertEqual(
+            ltx_deployment.auto_cfg_parallel_degree_by_num_gpus, ((4, 1), (8, 1))
+        )
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(4), 1)
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(8), 1)
+        self.assertEqual(ltx_deployment.get_auto_cfg_parallel_degree(2), 2)
+        self.assertFalse(
+            LTX2PipelineConfig().dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
+        self.assertFalse(
+            ltx23_config.dit_config.arch_config.enable_packed_qkv_input_a2a
+        )
 
         self.assertEqual(sana_wm_deployment.fsdp_auto_min_available_memory_gb, 60)
         self.assertTrue(sana_wm_deployment.auto_dit_layerwise_offload)
@@ -833,6 +872,32 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
+    def test_cache_dit_rejects_explicit_fsdp(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            with self.assertRaisesRegex(ValueError, "FSDP inference"):
+                self._from_dict_with_pipeline_config(
+                    SanaWMPipelineConfig(),
+                    kwargs={
+                        "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                        "num_gpus": 2,
+                        "use_fsdp_inference": True,
+                    },
+                )
+
+    def test_cache_dit_auto_disables_implicit_fsdp(self):
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            args = self._from_dict_with_pipeline_config(
+                SanaWMPipelineConfig(),
+                kwargs={
+                    "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
     def test_auto_multi_gpu_sana_wm_realtime_disables_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
             SanaWMRealtimeConfig(),
@@ -845,6 +910,24 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
+
+    def test_auto_ltx23_large_gpu_counts_prefer_sp_over_cfg_parallel(self):
+        for num_gpus in (4, 8):
+            with self.subTest(num_gpus=num_gpus):
+                args = self._from_dict_with_pipeline_config(
+                    LTX2PipelineConfig(),
+                    kwargs={
+                        "model_path": "Lightricks/LTX-2.3",
+                        "num_gpus": num_gpus,
+                        "performance_mode": "auto",
+                    },
+                )
+
+                self.assertFalse(args.enable_cfg_parallel)
+                self.assertEqual(args.cfg_parallel_degree, 1)
+                self.assertEqual(args.sp_degree, num_gpus)
+                self.assertEqual(args.ulysses_degree, num_gpus)
+                self.assertEqual(args.ring_degree, 1)
 
     def test_manual_mode_preserves_unset_performance_args(self):
         args = self._from_dict_with_pipeline_config(
@@ -882,7 +965,7 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_auto_ltx_snapshot_keeps_dit_offload_and_replaces_encoder_cpu_offload(
+    def test_auto_ltx_original_replaces_component_cpu_offload(
         self,
     ):
         args = self._from_dict_with_pipeline_config(
@@ -891,13 +974,12 @@ class TestOffloadDefaults(unittest.TestCase):
             kwargs={
                 "model_path": "Lightricks/LTX-2.3",
                 "pipeline_class_name": "LTX2TwoStageHQPipeline",
-                "ltx2_two_stage_device_mode": "snapshot",
                 "performance_mode": "auto",
             },
         )
 
-        self.assertEqual(args.ltx2_two_stage_device_mode, "snapshot")
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
+        self.assertFalse(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -1179,6 +1261,25 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
+    def test_ltx23_snapshot_device_mode_is_deprecated_alias_for_original(self):
+        args = self._from_dict_with_pipeline_config(
+            LTX2PipelineConfig(),
+            memory_gb=140,
+            available_memory_gb=134,
+            kwargs={
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "pipeline_class_name": "LTX2TwoStagePipeline",
+                "ltx2_two_stage_device_mode": "snapshot",
+            },
+        )
+
+        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
     def test_explicit_layerwise_components_preserved_in_ltx23_resident(self):
         args = self._from_dict_with_pipeline_config(
             LTX2PipelineConfig(),
@@ -1441,6 +1542,49 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(server_args.use_fsdp_inference)
         self.assertFalse(server_args.enable_cfg_parallel)
+
+    def test_ltx23_snapshot_device_mode_cli_alias_is_accepted(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Lightricks/LTX-2.3",
+            "--pipeline-class-name",
+            "LTX2TwoStagePipeline",
+            "--ltx2-two-stage-device-mode",
+            "snapshot",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            patch.object(
+                PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cuda",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=140 * 1024**3,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                return_value=134,
+            ),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
 
 
 class TestFSDPShardConditions(unittest.TestCase):
