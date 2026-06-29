@@ -190,7 +190,10 @@ def check_paged_logits():
 # With the _SM120_WGMMA_OFF (disable_wgmma) fix it should lower via MMA. This is a
 # compile + finiteness check (no closed-form reference for sparse MLA attention).
 SA_TOKENS = 64
-SA_HEADS = 16        # GLM-5.2 attn heads per GPU are padded to 16 (e.g. 64/TP8 -> 8 -> 16)
+# GLM-5.2 has 64 attn heads. Under --enable-dp-attention each rank carries the
+# full 64 (attention is not TP-sharded); under plain TP it would be fewer. Test
+# 64 since that's the DP-attention serving config.
+SA_HEADS = 64
 SA_D_V = 512         # kv_lora_rank
 SA_TAIL = 64         # qk_rope_head_dim
 SA_TOPK = 2048       # index_topk

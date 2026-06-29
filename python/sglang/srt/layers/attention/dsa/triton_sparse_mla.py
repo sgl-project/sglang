@@ -160,25 +160,45 @@ def triton_sparse_mla_fwd(
     return out.unsqueeze(0)
 
 
+_sm120_route_logged = False
+
+
 def sm120_triton_sparse_mla(layer, q_nope, q_rope, kv_cache, page_table_1):
     """SM120 has no working tilelang sparse-attention kernel (it is Hopper-only:
     166 KB smem / block_I=64 hardwired, exceeds SM120's ~100 KB). Use this triton
-    sparse-MLA kernel instead when shapes/dtype match (fp8 KV, 16 q-heads,
-    d_v=512, tail=64, topk=2048 -- i.e. GLM-5.2 absorbed MLA). Returns the attn
-    output, or None to fall back to the (tilelang) path.
+    sparse-MLA kernel instead when the absorbed-MLA shapes/dtype match (fp8 KV,
+    d_v=512, tail=64, topk=2048 -- the GLM-5.2 DSA path). The head count is NOT
+    fixed: under DP-attention each rank carries the full 64 heads; under plain TP
+    it is fewer. The triton kernel handles any (power-of-2) head count. Returns
+    the attn output, or None to fall back to the (tilelang) path.
 
     Lives here (not in dsa_backend) so it can be imported without pulling in the
     heavy dsa_backend import chain (flashinfer.comm etc.).
     """
+    global _sm120_route_logged
     if q_rope is None:
         return None
-    if not (
+
+    h = layer.tp_q_head_num
+    ok = (
         kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-        and layer.tp_q_head_num == 16
+        and h in (16, 32, 64, 128)
         and layer.v_head_dim == 512
         and (layer.head_dim - layer.v_head_dim) == 64
         and page_table_1.shape[-1] == 2048
-    ):
+    )
+    if not _sm120_route_logged:
+        _sm120_route_logged = True
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "SM120 DSA attention: %s triton sparse-MLA "
+            "(heads=%s kv_dtype=%s v_head_dim=%s head_dim=%s topk=%s)",
+            "USING" if ok else "FALLING BACK (tilelang) -- gate not matched, from",
+            h, kv_cache.dtype, layer.v_head_dim, layer.head_dim,
+            page_table_1.shape[-1],
+        )
+    if not ok:
         return None
     return triton_sparse_mla_fwd(
         q_nope=q_nope,
