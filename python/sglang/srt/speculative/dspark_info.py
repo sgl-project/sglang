@@ -34,11 +34,14 @@ class DSparkVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
     num_tokens_per_batch: int = -1
+    num_tokens_per_req: int = -1
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DSPARK_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
+        if self.num_tokens_per_req == -1:
+            self.num_tokens_per_req = int(self.draft_token_num)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
