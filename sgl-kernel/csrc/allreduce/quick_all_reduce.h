@@ -159,8 +159,7 @@ struct DeviceComms {
     HIP_CHECK(hipMalloc(&d_flag_counters, kMaxNumBlocks * sizeof(uint32_t)));
     {
       std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
-      HIP_CHECK(hipMemcpy(
-          d_flag_counters, init_color.data(), kMaxNumBlocks * sizeof(uint32_t), hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(d_flag_counters, init_color.data(), kMaxNumBlocks * sizeof(uint32_t), hipMemcpyHostToDevice));
     }
 
     // Device-side list of IPC buffers.
