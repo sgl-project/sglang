@@ -317,12 +317,19 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
         return index_buf_accessor.GetKAndS.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
         )
 
     def set_index_k_scale_buffer(
@@ -978,14 +985,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
+        seq_len_tensor: torch.Tensor,
         page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.get_index_k_scale_buffer(
-            compress_layer_id, seq_len, page_indices
+            compress_layer_id,
+            seq_len_tensor,
+            page_indices,
+            seq_len_sum,
+            max_seq_len,
         )
 
     def set_index_k_scale_buffer(
