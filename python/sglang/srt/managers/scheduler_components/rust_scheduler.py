@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import msgpack_decode
 
 if TYPE_CHECKING:
@@ -71,20 +72,33 @@ class RustServer:
         # pinning / NUMA isolation. setdefault so an explicit choice still wins.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+        # Per-DP-rank HTTP port (Mode A). `maybe_create` runs once per DP group
+        # (gated on the group's first TP rank), so with dp_size>1 the embedded
+        # frontends would otherwise all bind the same `host:port`. Offset by the
+        # attention DP rank so an external router / client load-balancer can
+        # target `port + dp_rank`. dp_size==1 keeps `bind=None`, letting the Rust
+        # side resolve `host:port` from server_args. The standalone-api-server
+        # mode (dp ranks headless behind one api-server) is handled separately.
+        dp_rank = scheduler.ps.attn_dp_rank
+        bind = None
+        if server_args.dp_size > 1 and not envs.SGLANG_RUST_STANDALONE_API_SERVER.get():
+            bind = f"{server_args.host}:{server_args.port + dp_rank}"
+
         # The bind address (host:port), tokenizer source/revision, and
         # tokenizer/detok worker counts all live in the dumped `server_args`
         # blob, so the Rust side resolves them itself (tokenizer_path falls back
-        # to model_path there). Only the Python-computed core partition — which
-        # isn't part of server_args — needs passing here.
+        # to model_path there). Only the Python-computed core partition and the
+        # per-DP-rank `bind` override (neither part of server_args) pass here.
         server = Server(
             pin_cores=cores is not None,
             cores=cores,
+            bind=bind,
             server_args_json=cls._build_server_args(scheduler),
         )
         logger.info(
-            "SGLANG_RUST_SERVER enabled: embedded Rust server listening on %s:%s",
-            server_args.host,
-            server_args.port,
+            "SGLANG_RUST_SERVER enabled: embedded Rust server (dp_rank=%s) listening on %s",
+            dp_rank,
+            bind or f"{server_args.host}:{server_args.port}",
         )
         return cls(server)
 

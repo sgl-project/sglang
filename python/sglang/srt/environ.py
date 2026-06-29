@@ -909,6 +909,11 @@ class Envs:
 
     # Sglang Rust Server
     SGLANG_RUST_SERVER = EnvBool(False)
+    # With SGLANG_RUST_SERVER + dp_size>1: run the DP ranks headless (TCP) behind
+    # a single standalone Rust api-server process. Unset → embedded frontend per
+    # DP rank (Mode A: each DP rank serves HTTP on port+dp_rank; external router
+    # / client load-balancer fans out).
+    SGLANG_RUST_STANDALONE_API_SERVER = EnvBool(False)
 
 
 envs = Envs()
