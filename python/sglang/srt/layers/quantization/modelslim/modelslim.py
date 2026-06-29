@@ -12,9 +12,11 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP8Scheme,
+    ModelSlimQFP8DynamicKVFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
@@ -32,11 +34,28 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
     from sglang.srt.layers.quantization.modelslim.schemes import (
+        ModelSlimKVSchemeBase,
         ModelSlimLinearScheme,
         ModelSlimMoEScheme,
     )
 
 logger = logging.getLogger(__name__)
+
+
+class ModelSlimQFP8DynamicKVFP8Method(QuantizeMethodBase):
+    def __init__(self, scheme: ModelSlimQFP8DynamicKVFP8Scheme):
+        self.scheme = scheme
+
+    def create_weights(self, layer: torch.nn.Module, *args, **kwargs):
+        self.scheme.create_weights(layer, *args, **kwargs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.scheme.process_weights_after_loading(layer)
+
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise RuntimeError(
+            "ModelSlimQFP8DynamicKVFP8Method.apply should not be called."
+        )
 
 
 # func refers to RMSNorm.__init__
@@ -155,6 +174,10 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
+        kv_method = self._maybe_get_kv_method(layer, prefix)
+        if kv_method is not None:
+            return kv_method
+
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
@@ -184,6 +207,29 @@ class ModelSlimConfig(QuantizationConfig):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
         return None
+
+    def get_kv_scheme(
+        self, layer: torch.nn.Module, prefix: str, quant_type: str
+    ) -> "ModelSlimKVSchemeBase":
+        del layer
+        if quant_type == "Q_FP8_DYNAMIC_KV_FP8":
+            return ModelSlimQFP8DynamicKVFP8Scheme(
+                quant_config=self.quant_description, prefix=prefix
+            )
+        raise NotImplementedError(
+            f"No ModelSlim KV scheme registered for quant_type={quant_type!r}."
+        )
+
+    def _maybe_get_kv_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        kv_quant_type = self.quant_description.get(f"{prefix}.quant_type")
+        if kv_quant_type != "Q_FP8_DYNAMIC_KV_FP8":
+            return None
+
+        return ModelSlimQFP8DynamicKVFP8Method(
+            self.get_kv_scheme(layer, prefix, kv_quant_type)
+        )
 
     def get_linear_scheme(
         self, layer: torch.nn.Module, prefix: Optional[str] = None

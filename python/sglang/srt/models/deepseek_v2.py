@@ -1753,6 +1753,8 @@ class DeepseekV2AttentionMLA(
         self.w_kc = None
         self.w_vc = None
         self.w_scale = 1.0
+        self.kv_quant_method = None
+        self._init_kv_quant_weights(quant_config, prefix)
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -1784,6 +1786,26 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    def _init_kv_quant_weights(
+        self, quant_config: Optional[QuantizationConfig], prefix: str
+    ) -> None:
+        if quant_config is None or not _is_npu:
+            return
+
+        self.kv_quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        if self.kv_quant_method is None:
+            return
+
+        self.kv_quant_method.create_weights(
+            self,
+            num_heads=self.num_local_heads,
+            num_kv_heads=1,
+        )
+
+    def refresh_fa_k_scale_params(self) -> None:
+        if self.kv_quant_method is not None:
+            self.kv_quant_method.process_weights_after_loading(self)
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch

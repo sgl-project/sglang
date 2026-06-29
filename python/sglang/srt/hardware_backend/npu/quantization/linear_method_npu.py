@@ -172,6 +172,8 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.weight_original = layer.weight.clone()
+        layer.weight_scale_original = layer.weight_scale.clone()
         weight = layer.weight.data
         if weight.dtype == torch.float8_e4m3fn:
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
