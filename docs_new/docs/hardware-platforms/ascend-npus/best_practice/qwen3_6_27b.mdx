@@ -4,21 +4,25 @@ metatags:
   description: "Best Practice for Qwen3.6-27B on Ascend NPU"
 ---
 
-This guide describes the best practice data for Qwen3.6-27B on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for Qwen3.6-27B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.6-27B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/qwen3_6_27b).
+</Note>
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
-| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1024x1024 (30)+1024 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1024x1024-30-out1024-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 1080p_30+256 | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-1p-in1080p-30-out256-50ms) |
+| Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-27b-2p-in64k-out1k-prefix90-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 1 | PD Mixed | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 128K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 16K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms) |
 | Qwen3.6-27B | Atlas 800I A3 | 2 | PD Mixed | 64K+1K | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-6-27b-w8a8-2p-in64k-out1k-50ms) |
 
 ## Optimal Configuration
+
+<a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3.6-27B 1P IN1024X1024 30 OUT1024 50ms
 
@@ -30,7 +34,7 @@ This guide describes the best practice data for Qwen3.6-27B on the Ascend NPU.
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 1024x1024 (30)+1024
 
@@ -131,7 +135,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 1080p_30+256
 
@@ -230,7 +234,7 @@ python -m sglang.bench_serving \
 
 **Deploy Mode**: PD Mixed
 
-**Quantization**: W8A8 INT8
+**Quantization**: BF16
 
 **Dataset**: 64K+1K (90% prefix cache hit rate)
 
@@ -320,8 +324,6 @@ python -m sglang.bench_serving \
     --num-prompts 80 \
     --request-rate inf
 ```
-
-<a id="single-node" title="Referenced by external docs. Verify before removing."></a>
 
 ### Qwen3.6-27B W8A8 1P IN3K5 OUT1K5 50ms
 
@@ -553,13 +555,13 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
+export GDN_ATTN_BACKEND_TRITON=1
 export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_SOCKET_IFNAME=<network-interface>
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=130
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=100
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -572,16 +574,14 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
-    --max-prefill-tokens 50000 \
+    --max-prefill-tokens 58000 \
     --disable-radix-cache \
     --trust-remote-code \
-    --max-running-requests 28 \
-    --max-mamba-cache-size 50 \
-    --mem-fraction-static 0.7 \
-    --cuda-graph-bs 2 8 12 16 20 24 26 28 \
-    --enable-multimodal \
+    --max-running-requests 29 \
+    --max-mamba-cache-size 58 \
+    --mem-fraction-static 0.68 \
+    --cuda-graph-bs 1 2 8 12 16 20 24 26 28 29 \
     --quantization modelslim \
-    --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
     --speculative-algorithm NEXTN \
@@ -600,10 +600,10 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --max-concurrency 28 \
+    --max-concurrency 29 \
     --random-input-len 16000 \
     --random-output-len 1000 \
-    --num-prompts 112 \
+    --num-prompts 116 \
     --random-range-ratio 1
 ```
 
