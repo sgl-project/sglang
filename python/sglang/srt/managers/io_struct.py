@@ -444,7 +444,7 @@ class GenerateReqInput:
             num = self.batch_size * self.parallel_sample_num
 
         # Expand input based on type
-        self._expand_inputs(num)
+        self._expand_inputs()
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
@@ -456,7 +456,7 @@ class GenerateReqInput:
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
 
-    def _expand_inputs(self, num):
+    def _expand_inputs(self):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
         if self.text is not None:
             if not isinstance(self.text, list):
