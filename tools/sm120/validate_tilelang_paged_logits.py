@@ -83,13 +83,17 @@ def fp8_paged_mqa_logits_torch_ref(
 
 def build_inputs(device="cuda"):
     torch.manual_seed(0)
-    q = torch.randn(BATCH, 1, NUM_HEADS, HEAD_DIM, device=device).to(FP8)
+    # Use *valid* fp8 values (quantized from floats), not random bytes: random
+    # uint8 includes fp8-e4m3 NaN patterns (0x7F/0xFF) and huge magnitudes, which
+    # would make both the kernel and the reference produce NaN/garbage.
+    q = (torch.randn(BATCH, 1, NUM_HEADS, HEAD_DIM, device=device) * 0.5).to(FP8)
     weight = torch.randn(BATCH, NUM_HEADS, device=device, dtype=torch.float32)
     head_dim_sf = HEAD_DIM + 4
     kv = torch.zeros(NUM_PAGES, BLOCK, 1, head_dim_sf, device=device, dtype=torch.uint8)
-    kv[..., :HEAD_DIM] = torch.randint(
-        0, 255, (NUM_PAGES, BLOCK, 1, HEAD_DIM), device=device, dtype=torch.uint8
-    )
+    kv_vals_fp8 = (
+        torch.randn(NUM_PAGES, BLOCK, 1, HEAD_DIM, device=device) * 0.5
+    ).to(FP8)
+    kv[..., :HEAD_DIM] = kv_vals_fp8.view(torch.uint8)
     scales = (torch.rand(NUM_PAGES, BLOCK, 1, 1, device=device) + 0.1).to(torch.float32)
     kv[..., HEAD_DIM:] = scales.view(torch.uint8)
     seq_lens = torch.full((BATCH,), MAX_SEQ - 7, device=device, dtype=torch.int32)
