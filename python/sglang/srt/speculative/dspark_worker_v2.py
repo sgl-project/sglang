@@ -10,6 +10,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
@@ -81,18 +82,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             target_worker.model_runner.model_config.context_len
         )
         saved_server_args = get_global_server_args()
-        self._draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
+        draft_init_tp_context = (
+            draft_tp_context(get_attention_tp_group())
+            if server_args.enable_dp_attention
+            else empty_context()
         )
+        with (
+            draft_init_tp_context,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self._draft_worker = TpModelWorker(
+                server_args=draft_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=0,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                dp_rank=dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+            )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
         self._draft_worker.draft_runner = self.draft_model_runner
@@ -178,18 +189,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
 
         torch.get_device_module(self.device).synchronize()
-        first_match = (candidates[:, 0] == target_predict[:, 0]).to(torch.float32)
-        full_match = (candidates == target_predict).to(torch.float32).mean(dim=0)
+        shifted_match = (candidates[:, 1:] == target_predict[:, :-1]).to(
+            torch.float32
+        )
         sample_n = min(4, candidates.shape[0])
         logger.warning(
             "[DSPARK_DEBUG_ACCEPT] tp_rank=%s dp_rank=%s bs=%s "
-            "first_match=%.4f per_pos_match=%s correct_len=%s "
+            "first_draft_match=%.4f per_draft_pos_match=%s correct_len=%s "
             "cand0=%s tgt0=%s conf0=%s",
             self.tp_rank,
             self.dp_rank,
             candidates.shape[0],
-            float(first_match.mean().item()),
-            [round(float(x), 4) for x in full_match.detach().cpu().tolist()],
+            float(shifted_match[:, 0].mean().item()),
+            [round(float(x), 4) for x in shifted_match.mean(dim=0).cpu().tolist()],
             correct_len[:sample_n].detach().cpu().tolist(),
             candidates[:sample_n].detach().cpu().tolist(),
             target_predict[:sample_n].detach().cpu().tolist(),
