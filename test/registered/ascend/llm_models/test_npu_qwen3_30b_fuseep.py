@@ -24,8 +24,6 @@ class TestQwen330Bw8a8FuseEP(GSM8KAscendMixin, CustomTestCase):
         "--trust-remote-code",
         "--mem-fraction-static",
         0.8,
-        "--max-running-requests",
-        128,
         "--attention-backend",
         "ascend",
         "--cuda-graph-max-bs-decode",
