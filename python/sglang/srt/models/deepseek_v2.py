@@ -1559,6 +1559,7 @@ class DeepseekV2AttentionMLA(
         layer_id: int = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream_2: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
         dsa_enable_prefill_cp: bool = False,
@@ -1656,7 +1657,10 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("indexer", prefix),
                 quant_config=quant_config,
                 layer_id=layer_id,
-                alt_stream=alt_stream,
+                # The indexer runs on self.alt_stream (see forward_absorb_prepare)
+                # and uses this second stream for its internal q/k overlap, so the
+                # two must differ. Fall back to alt_stream if no second stream.
+                alt_stream=alt_stream_2 if alt_stream_2 is not None else alt_stream,
             )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
@@ -2032,6 +2036,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream_2: Optional[torch.cuda.Stream] = None,
         dsa_enable_prefill_cp: bool = False,
         mla_enable_prefill_cp: bool = False,
     ) -> None:
@@ -2073,6 +2078,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            alt_stream_2=alt_stream_2,
             is_nextn=is_nextn,
             dsa_enable_prefill_cp=dsa_enable_prefill_cp,
             mla_enable_prefill_cp=mla_enable_prefill_cp,
@@ -2368,6 +2374,13 @@ class DeepseekV2Model(nn.Module):
             )
             else None
         )
+        # Second side stream dedicated to the DSA indexer's internal q/k
+        # dual-stream overlap (CUDA only). With three streams the main q-prep
+        # chain runs on the default stream, the indexer (q-path + logits + topk)
+        # on alt_stream, and the indexer's k-path on alt_stream_2 -- so the
+        # indexer keeps its internal q||k overlap while the whole indexer
+        # overlaps the main chain. See forward_absorb_prepare.
+        self.alt_stream_2 = torch.cuda.Stream() if _is_cuda else None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -2377,6 +2390,7 @@ class DeepseekV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=self.alt_stream,
+                alt_stream_2=self.alt_stream_2,
                 dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
                 mla_enable_prefill_cp=self.mla_enable_prefill_cp,
             ),

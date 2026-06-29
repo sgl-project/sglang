@@ -1559,6 +1559,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        indexer_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1590,6 +1591,7 @@ class DeepseekSparseAttnBackend(
                 is_neox,
                 llama_4_scaling,
                 is_prefill=True,
+                indexer_alt_stream=indexer_alt_stream,
             )
 
         if k is not None:
@@ -1794,6 +1796,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        indexer_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1815,6 +1818,7 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                indexer_alt_stream=indexer_alt_stream,
             )
 
         if k is not None:
@@ -2353,6 +2357,7 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         is_prefill: bool = False,
+        indexer_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
@@ -2405,6 +2410,13 @@ class DeepseekSparseAttnBackend(
             q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # Join the indexer that forward_absorb_prepare launched on alt_stream.
+        # The fused rope-quant + kv store above ran on the current stream
+        # concurrently with the indexer's q/k prep + logits + topk on the side
+        # streams; wait for it before consuming topk_indices (first topk use).
+        if indexer_alt_stream is not None:
+            torch.cuda.current_stream().wait_stream(indexer_alt_stream)
 
         # Align topk_indices with q dimensions
         if topk_indices is not None:

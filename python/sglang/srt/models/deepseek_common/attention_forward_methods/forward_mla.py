@@ -227,6 +227,33 @@ class DeepseekMLAForwardMixin:
             attn_output_buf=attn_output_buf,
         )
 
+    def _dsa_indexer_overlap_active(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether the DSA indexer is overlapped with the main q-prep chain on
+        a side stream. Decode-style forwards only (decode/idle plus the EAGLE
+        target-verify and draft-extend forwards), where the q_b_proj and indexer
+        chains are independent until the sparse-MLA kernel reads topk_indices.
+        Gating on is_decode_or_idle() alone left the MLA block serial under
+        speculative decoding (the target forward runs in target_verify). Excludes
+        the piecewise/breakable-graph surface (traced custom op rejects the
+        alt_stream kwarg; it has its own split-op dispatch).
+        """
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        return (
+            self.use_dsa
+            and self.alt_stream is not None
+            and get_is_capture_mode()
+            and not is_in_tc_piecewise_cuda_graph()
+            and not is_in_breakable_cuda_graph()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+        )
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -248,6 +275,11 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
+        # Set to self.alt_stream when the indexer is launched there and
+        # forward_absorb_core must join it before consuming topk_indices; None
+        # means no overlap engaged (serial / skip_topk) so the backend skips the
+        # join.
+        self._dsa_indexer_join_stream = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -331,13 +363,58 @@ class DeepseekMLAForwardMixin:
                 if q_lora is None:
                     q_lora = q
 
-            # overlap q_b_proj and indexer during decode
-            if (
-                self.alt_stream is not None
-                and get_is_capture_mode()
-                and forward_batch.forward_mode.is_decode_or_idle()
+            # skip_topk (shared) layers carry no indexer weights in the
+            # checkpoint, so they reuse the carried topk and never run the
+            # indexer. Do NOT widen `not self.skip_topk` to `or prev_topk_indices
+            # is None` (the upstream gate): that recomputes with an uninitialized
+            # indexer whenever cross-layer propagation is unavailable (e.g. the
+            # TBO op path drops topk_indices), reintroducing the >index_topk
+            # garbling. The is_nextn clause is the sole intentional fallback
+            # (layer 78 has its own weights).
+            def _run_indexer():
+                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
+                    return self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
+                # skip_topk reuses prev layer's indices; mirror into this layer's
+                # slot so the captured buffer matches what's used.
+                return maybe_capture_indexer_topk(self.layer_id, prev_topk_indices)
+
+            # Only engage alt_stream when the indexer actually runs; skip_topk
+            # layers just reuse the carried topk (no real GPU work), so the
+            # cross-stream sync pair would be pure added latency.
+            run_indexer = not self.skip_topk or (
+                self.is_nextn and prev_topk_indices is None
+            )
+            indexer_overlap = (
+                run_indexer
                 and q_lora is not None
-            ):
+                and self._dsa_indexer_overlap_active(forward_batch)
+            )
+            if indexer_overlap and self._fuse_rope_for_trtllm_mla(forward_batch):
+                # 3-stream trtllm fp8 path. The indexer runs on alt_stream and
+                # uses its own second stream (alt_stream_2) for the internal
+                # q||k overlap, so the indexer chain stays as short as possible.
+                # The ENTIRE main q-prep chain -- q_b_proj, the kv_b absorb GEMM,
+                # and the backend's fused rope-quant + kv store -- stays on the
+                # current stream and hides under the indexer. They are
+                # independent until the sparse-MLA kernel reads topk_indices, so
+                # _forward_trtllm joins alt_stream (via _dsa_indexer_join_stream)
+                # right before that, rather than syncing here.
+                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.alt_stream):
+                    topk_indices = _run_indexer()
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                self._dsa_indexer_join_stream = self.alt_stream
+            elif indexer_overlap:
+                # Non-trtllm path: the backend can't defer the topk join, so we
+                # can only overlap q_b_proj (on alt_stream) with the indexer (on
+                # the current stream) and must sync before the absorb bmm.
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
@@ -345,28 +422,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                # skip_topk (shared) layers carry no indexer weights in the
-                # checkpoint, so they must reuse the carried topk and never run
-                # the indexer. Do NOT widen this to `or prev_topk_indices is
-                # None` (the upstream gate): that recomputes with an
-                # uninitialized indexer whenever cross-layer propagation is
-                # unavailable (e.g. the TBO op path drops topk_indices),
-                # reintroducing the >index_topk garbling. The is_nextn clause is
-                # the sole intentional fallback (layer 78 has its own weights).
-                if not self.skip_topk or (self.is_nextn and prev_topk_indices is None):
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
-                    )
-                else:
-                    # skip_topk reuses prev layer's indices; mirror into this
-                    # layer's slot so the captured buffer matches what's used.
-                    topk_indices = maybe_capture_indexer_topk(
-                        self.layer_id, prev_topk_indices
-                    )
+                topk_indices = _run_indexer()
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -379,23 +435,7 @@ class DeepseekMLAForwardMixin:
                     fusion_plan = self._make_mla_bmm_fusion_plan(q, q_nope)
 
                 if q_lora is not None:
-                    # See the skip_topk note above: shared layers have no
-                    # indexer weights, so this gate must not fall back to
-                    # computing when prev_topk_indices is None.
-                    if not self.skip_topk or (
-                        self.is_nextn and prev_topk_indices is None
-                    ):
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
-                    else:
-                        topk_indices = maybe_capture_indexer_topk(
-                            self.layer_id, prev_topk_indices
-                        )
+                    topk_indices = _run_indexer()
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -671,6 +711,14 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
+                    # forward_absorb_prepare sets _dsa_indexer_join_stream only
+                    # when it actually launched the indexer on alt_stream; hand
+                    # it to the backend so it joins right before consuming
+                    # topk_indices (after the fused rope-quant + kv store),
+                    # letting the main chain overlap the indexer. None (e.g.
+                    # skip_topk layers) means no overlap engaged, so no join.
+                    if self._dsa_indexer_join_stream is not None:
+                        extra_args["indexer_alt_stream"] = self._dsa_indexer_join_stream
                 if fusion_plan is not None:
                     bmm_attention_fn = (
                         bcg_mla_bmm_then_unified_attention
