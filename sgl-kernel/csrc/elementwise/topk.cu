@@ -276,12 +276,15 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
   const auto row_start = 0;
-  const auto length = lengths[bid];
   const auto src_page_entry = src_page_table + bid * src_stride;
   const auto dst_page_entry = dst_page_table + bid * TopK;
   const auto score = input + bid * input_stride;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+  const auto length = lengths[bid];
   if (length <= TopK) {
-    return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
+    naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
     fast_topk_cuda_tl(score, s_indices, row_start, length);
@@ -295,6 +298,9 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     const auto pos_1 = s_indices[idx_1];
     dst_page_entry[idx_1] = src_page_entry[pos_1];
   }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // prefill
@@ -492,8 +498,28 @@ void fast_topk_transform_interface(
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
   if (is_decode) {
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
+#ifndef USE_ROCM
+    cudaLaunchConfig_t config;
+    config.gridDim = grid;
+    config.blockDim = block;
+    config.dynamicSmemBytes = kSmem;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(
+        &config,
+        topk_transform_decode_kernel,
+        params,
+        dst_page_table.data_ptr<int32_t>(),
+        src_page_table.data_ptr<int32_t>(),
+        src_stride);
+#else
     topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
         params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+#endif
   } else {
     setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
     topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
