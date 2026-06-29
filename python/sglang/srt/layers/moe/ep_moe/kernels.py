@@ -937,7 +937,11 @@ def _fwd_kernel_ep_scatter_psum_init(
 
     off_expert = tl.arange(0, BLOCK_E)
     for start_m in tl.range(0, cur_token_num, BLOCK_E, num_stages=4):
-        tl.store(m_indices + cur_start + start_m + off_expert, cur_expert)
+        # cur_token_num need not be a multiple of BLOCK_E; mask the tail block so
+        # the final partial iteration does not write past this expert's region
+        # (which is packed right up against the next expert) and corrupt it.
+        idx = cur_start + start_m + off_expert
+        tl.store(m_indices + idx, cur_expert, mask=idx < cur_end)
 
 
 @torch.no_grad()

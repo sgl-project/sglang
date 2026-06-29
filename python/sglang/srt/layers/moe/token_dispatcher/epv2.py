@@ -286,6 +286,7 @@ class _EpV2Impl:
         use_masked = use_expand_layout and not get_is_extend_in_batch()
 
         if self._uses_fp8_dispatch_output():
+            _ensure_fp8_quant_available()
             if use_masked:
                 # _run_masked_gemm consumes plain per-token-group fp32 scales and
                 # does its own e8m0/tma-major alignment, so dispatch a plain
