@@ -219,6 +219,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     def _run_draft_block(
         self,
         *,
+        batch: ScheduleBatch,
         bs: int,
         block_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -249,6 +250,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             spec_info=draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        if self.server_args.enable_dp_attention and batch.global_num_tokens is not None:
+            draft_global_num_tokens = [
+                int(x) * int(self.block_size) for x in batch.global_num_tokens
+            ]
+            draft_forward_batch.original_global_num_tokens_cpu = (
+                batch.global_num_tokens
+            )
+            draft_forward_batch.global_num_tokens_cpu = draft_global_num_tokens
+            draft_forward_batch.global_num_tokens_gpu = torch.tensor(
+                draft_global_num_tokens, dtype=torch.int64, device=device
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_cpu = (
+                draft_global_num_tokens
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+                draft_global_num_tokens, dtype=torch.int64, device=device
+            )
 
         from sglang.srt.layers.attention import deepseek_v4_backend as _dsv4_be
 
@@ -480,6 +498,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_moe_a2a_backend_context(),
         ):
             block_hidden = self._run_draft_block(
+                batch=model_worker_batch,
                 bs=bs,
                 block_ids=block_ids,
                 positions=positions,
