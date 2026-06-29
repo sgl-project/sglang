@@ -4492,6 +4492,20 @@ class ServerArgs:
                 "via --enforce-disable-flashinfer-allreduce-fusion."
             )
 
+        # FlashInfer allreduce fusion has no SM120 (Blackwell desktop / RTX PRO
+        # 6000) kernel; _resolve_backend() rejects it and crashes at warmup. If it
+        # was requested (e.g. via the deprecated --enable-flashinfer-allreduce-fusion
+        # flag or an explicit backend), disable it with a warning rather than fail.
+        if (
+            self.flashinfer_allreduce_fusion_backend is not None
+            and is_sm120_supported()
+        ):
+            logger.warning(
+                "FlashInfer allreduce fusion is not supported on SM120; "
+                "disabling it. SM120 multi-GPU TP uses standard all-reduce."
+            )
+            self.flashinfer_allreduce_fusion_backend = None
+
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
         if model_arch in [
             "Qwen3_5ForConditionalGeneration",

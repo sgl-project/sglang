@@ -902,8 +902,14 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            # deep_gemm has no SM120 kernel and the SM120 indexer (tilelang/torch)
+            # ignores this schedule metadata, so skip the (crashing) call there.
+            paged_mqa_schedule_metadata = (
+                None
+                if self.is_sm120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
             )
 
         metadata = DSAMetadata(
@@ -1179,8 +1185,14 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            # deep_gemm has no SM120 kernel and the SM120 indexer (tilelang/torch)
+            # ignores this schedule metadata, so skip the (crashing) call there.
+            paged_mqa_schedule_metadata = (
+                None
+                if self.is_sm120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
             )
 
         metadata = DSAMetadata(
@@ -1350,8 +1362,12 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded,
                 bs,
             )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            new_schedule = (
+                None
+                if self.is_sm120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                )
             )
             if metadata.paged_mqa_schedule_metadata is None:
                 object.__setattr__(
@@ -1550,8 +1566,12 @@ class DeepseekSparseAttnBackend(
                     metadata.dsa_seqlens_expanded,
                     bs,
                 )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            new_schedule = (
+                None
+                if self.is_sm120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                )
             )
             if metadata.paged_mqa_schedule_metadata is None:
                 object.__setattr__(
