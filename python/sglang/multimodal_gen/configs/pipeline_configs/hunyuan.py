@@ -163,7 +163,10 @@ class FastHunyuanConfig(HunyuanConfig):
     # already have the desired values from HunyuanConfig
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # Threshold left unset so the global video default applies (see
+        # DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB in ServerArgsAutoTuner); the old
+        # 150GB bar was needlessly high. The VAE-only resident set is kept because
+        # the Hunyuan video DiT/encoders are too large to keep resident alongside it.
         return ModelDeploymentConfig(
-            auto_disable_component_offload_min_available_memory_gb=150,
             auto_disable_component_offload_components=("vae",),
         )

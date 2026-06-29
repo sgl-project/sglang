@@ -32,6 +32,20 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
     (LAYERWISE_OFFLOAD_VAE_GROUP, "vae_cpu_offload"),
 )
 
+# Available-memory (GiB) thresholds above which `auto` performance mode keeps a
+# model's auxiliary components (text/image encoders, VAE) resident on GPU instead
+# of layerwise-offloading them. Used as the default when a model's
+# ModelDeploymentConfig does not pin an explicit
+# auto_disable_component_offload_min_available_memory_gb.
+#
+# Image models carry tiny VAEs (<1GB) and modest text encoders (<=~20GB), so the
+# whole auxiliary set fits resident on any datacenter-class GPU -- keeping it
+# resident avoids paying a CPU->GPU reload on every (typically bsz=1, <=4K) decode.
+# Video models carry much larger VAEs/encoders, so they only stay resident on
+# very-high-memory GPUs and otherwise keep offloading to save VRAM.
+IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
+DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
+
 
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
@@ -45,6 +59,24 @@ class ServerArgsAutoTuner:
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
+
+    def _resolve_auto_disable_component_offload_threshold_gb(
+        self, deployment_config: ModelDeploymentConfig
+    ) -> float | None:
+        """Available-memory threshold (GiB) above which auto policy keeps a model's
+        auxiliary components resident instead of layerwise-offloading them.
+
+        Priority: explicit per-model deployment config > task-type default >
+        global default. Returns None only if a model explicitly opts out.
+        """
+        explicit = (
+            deployment_config.auto_disable_component_offload_min_available_memory_gb
+        )
+        if explicit is not None:
+            return explicit
+        if self.server_args.pipeline_config.task_type.is_image_gen():
+            return IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB
+        return DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
 
     def adjust_based_on_performance_mode(self) -> None:
         """Adjust the server args based on the performance mode"""
@@ -96,8 +128,8 @@ class ServerArgsAutoTuner:
 
         min_available_gb = self._get_min_available_device_memory_gb()
         deployment_config = self._deployment_config()
-        disable_threshold_gb = (
-            deployment_config.auto_disable_component_offload_min_available_memory_gb
+        disable_threshold_gb = self._resolve_auto_disable_component_offload_threshold_gb(
+            deployment_config
         )
         if (
             min_available_gb is not None
@@ -400,8 +432,8 @@ class ServerArgsAutoTuner:
             return components
 
         deployment_config = self._deployment_config()
-        threshold_gb = (
-            deployment_config.auto_disable_component_offload_min_available_memory_gb
+        threshold_gb = self._resolve_auto_disable_component_offload_threshold_gb(
+            deployment_config
         )
         if threshold_gb is None:
             return components
