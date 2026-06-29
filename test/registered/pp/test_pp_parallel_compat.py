@@ -68,8 +68,6 @@ class _Qwen3MoePPCompatMixin:
             top_p=0.95,
             top_k=20,
             base_url=self.base_url,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
