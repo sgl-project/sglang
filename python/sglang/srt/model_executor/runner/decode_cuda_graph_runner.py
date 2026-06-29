@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe import is_decode_tbo_enabled
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
@@ -448,7 +449,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
         is_tbo_supported = (
-            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
+            (
+                forward_batch.can_run_tbo
+                or (
+                    not is_decode_tbo_enabled()
+                    and (
+                        self.capture_forward_mode.is_decode()
+                        or self.capture_forward_mode.is_target_verify()
+                    )
+                )
+            )
+            if self.enable_two_batch_overlap
+            else True
         )
 
         is_ngram_supported = (
@@ -766,7 +778,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
-            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            if not (
+                not is_decode_tbo_enabled()
+                and (
+                    self.capture_forward_mode.is_decode()
+                    or self.capture_forward_mode.is_target_verify()
+                )
+            ):
+                self.tbo_plugin.capture_one_batch_size(
+                    forward_batch, num_tokens=num_tokens
+                )
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
@@ -941,7 +962,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         # Padded tokens aren't read, so skip zeroing them.
-        if self.enable_two_batch_overlap:
+        if self.enable_two_batch_overlap and not (
+            not is_decode_tbo_enabled()
+            and (
+                self.capture_forward_mode.is_decode()
+                or self.capture_forward_mode.is_target_verify()
+            )
+        ):
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
                 bs=bs,

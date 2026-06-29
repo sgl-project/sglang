@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Callable, List
 
 from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.moe import is_decode_tbo_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -54,6 +55,12 @@ class TboAttnBackend(AttentionBackend):
         bs = fb_view.batch_size
         forward_mode = fb_view.forward_mode
         spec_info = fb_view.spec_info
+        if not is_decode_tbo_enabled() and (
+            forward_mode.is_decode() or forward_mode.is_target_verify()
+        ):
+            # Decode-only TBO disabled: replay_prepare did not split this batch,
+            # so there are no children to dispatch.
+            return
         token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
