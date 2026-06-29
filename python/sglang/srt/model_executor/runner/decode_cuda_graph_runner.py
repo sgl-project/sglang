@@ -330,9 +330,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
             # When shared pool is enabled, allocate a capture-stable int64
-            # buffer for `out_cache_loc_full_physical`
-            # and pin it into the pool's `_precomputed_loc` at capture time
-            # (see `capture_one_batch_size` below).
+            # buffer for `out_cache_loc_full_physical`; capture points the
+            # forward_batch's `out_cache_loc_full_physical` at it so it flows
+            # into `KVWriteLoc.full_loc` (see `capture_one_batch_size` below).
             enable_shared_kv_pool=model_runner.enable_shared_kv_pool,
         )
         self.buffers.share_buffers()
@@ -522,11 +522,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         Reads the *virtual* ``out_cache_loc`` graph buffer + the live v2p table
         and writes the full-physical (int64) graph buffer in place (via
-        ``out=``). The pinned ``set_full_loc`` (in ``capture_one_shape``) points
-        the pool's ``_precomputed_loc`` at the SAME buffer, so the captured
-        per-layer ``set_kv_buffer`` consumes it via its data-ptr fast path. This
-        is the shared-pool replacement for an eager per-step write-loc translate
-        on the cg_on critical path. (The SWA write loc rides the backend
+        ``out=``). ``capture_one_shape`` points the capture forward_batch's
+        ``out_cache_loc_full_physical`` at the SAME buffer, so it flows into
+        ``KVWriteLoc.full_loc`` and the captured per-layer ``set_kv_buffer``
+        writes it directly (the pool never translates). This is the shared-pool
+        replacement for an eager per-step write-loc translate on the cg_on
+        critical path. (The SWA write loc rides the backend
         ``cuda_graph_swa_out_cache_loc`` rail, refilled by the backend at replay.)
 
         No-op for non-shared pools — the captured graph then has zero
@@ -747,15 +748,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
-        # Defense-in-depth: each per-shape capture pinned set_full_loc to the
-        # captured slot-0 translate buffer (out_cache_loc=0 -> v2p[0]=0 ->
-        # physical slot 0). Clear it so no stale pin survives into the first real
-        # (eager) prefill. The eager path now re-pins the correct live translate
-        # (`_shared_pool_eager_precompute_and_pin`); this is an
-        # independently-sufficient backstop — with the pin None, `set_kv_buffer`
-        # falls back to the correct per-call v2p gather. No-op for non-shared pools.
-        if hasattr(self.model_runner.token_to_kv_pool, "set_full_loc"):
-            self.model_runner.token_to_kv_pool.set_full_loc(None)
+        # No pool-side pin to clear: the captured full-physical write loc is
+        # bound via the capture forward_batch's `out_cache_loc_full_physical`
+        # (-> `KVWriteLoc.full_loc`), and the eager path carries its own per-batch
+        # `out_cache_loc_full_physical` in the attention metadata.
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
@@ -836,9 +832,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # model forward reads the physical loc buffer via set_kv_buffer.
                 # Reads the virtual `out_cache_loc` graph buffer (refilled by the
                 # buffer registry each replay) + the live v2p; writes the
-                # full-physical graph buffer that set_full_loc pinned above. (The
-                # SWA write loc rides the backend `swa_out_cache_loc` rail.)
-                # No-op for non-shared pools.
+                # full-physical graph buffer that forward_batch.out_cache_loc_full_physical
+                # points at (-> KVWriteLoc.full_loc). (The SWA write loc rides the
+                # backend `swa_out_cache_loc` rail.) No-op for non-shared pools.
                 self._capture_shared_pool_write_translate(out_cache_loc, num_tokens)
 
                 # Graph-recordable READ-path metadata prep — the upstream #27091
@@ -920,13 +916,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            # full_loc precompute pin for the captured forward. (The SWA write
-            # loc is not pinned: it rides the backend `swa_out_cache_loc` rail,
-            # consumed directly in `SharedSWAKVPool.set_kv_buffer`.)
-            if self.buffers.out_cache_loc_full_physical is not None and hasattr(
-                self.model_runner.token_to_kv_pool, "set_full_loc"
-            ):
-                self.model_runner.token_to_kv_pool.set_full_loc(
+            # Full-physical write loc lives in the attention metadata: point the
+            # capture forward_batch's `out_cache_loc_full_physical` at the
+            # capture-stable graph buffer (filled IN-graph by
+            # `_capture_shared_pool_write_translate` above) so it flows into
+            # `KVWriteLoc.full_loc` and the captured `set_kv_buffer` reads it —
+            # no pool-side pin. (The SWA write loc rides the backend
+            # `swa_out_cache_loc` rail, consumed in `SharedSWAKVPool.set_kv_buffer`.)
+            if self.buffers.out_cache_loc_full_physical is not None:
+                forward_batch.out_cache_loc_full_physical = (
                     self.buffers.out_cache_loc_full_physical[:num_tokens]
                 )
 

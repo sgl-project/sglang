@@ -1279,6 +1279,7 @@ class TritonAttnBackend(AttentionBackend):
                 loc_info = KVWriteLoc(
                     forward_batch.out_cache_loc,
                     self.forward_metadata.swa_out_cache_loc,
+                    full_loc=forward_batch.out_cache_loc_full_physical,
                 )
                 if layer.k_scale is None:
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
@@ -1724,6 +1725,7 @@ class TritonAttnBackend(AttentionBackend):
                     KVWriteLoc(
                         forward_batch.out_cache_loc,
                         self.forward_metadata.swa_out_cache_loc,
+                        full_loc=forward_batch.out_cache_loc_full_physical,
                     ),
                     k,
                     v,

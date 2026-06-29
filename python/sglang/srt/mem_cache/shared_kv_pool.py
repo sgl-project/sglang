@@ -412,10 +412,9 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
     relocation uses the native move (strided views break the tiled Triton kernel
     that assumes stride == row bytes).
 
-    When `attach_allocator` has been called (always, for the shared-pool path),
-    `set_kv_buffer` receives **virtual** slot ids and translates them to physical
-    via the allocator's `virtual_to_physical` table — or uses the per-batch
-    precomputed `set_loc(...)` value when available.
+    `set_kv_buffer` receives PHYSICAL slot ids (the full-physical
+    `KVWriteLoc.full_loc` / swa-physical `swa_out_cache_loc` resolved in the
+    attention metadata) and writes them directly — the pool never translates.
     """
 
     def __init__(
@@ -436,22 +435,8 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         self._sub_pool_name = sub_pool_name
         self._k_views = k_buffer
         self._v_views = v_buffer
-        self._external_allocator = None  # set via attach_allocator
-        # When non-None, `set_kv_buffer` uses this directly and
-        # skips the per-call `v2p[loc]` gather — required for cuda-graph
-        # capture (per-call gather is not capture-replayable), also a small
-        # perf win on the non-graph path (one gather per batch instead of
-        # one per layer per batch). Set by `set_loc(loc)`; cleared via
-        # `set_loc(None)` after the batch returns. Slice-safety: if a
-        # sub-batched caller passes a `loc` whose `data_ptr()` differs from
-        # the precomputed buffer, we fall through to the per-call translate
-        # — see `set_kv_buffer` below.
-        self._precomputed_loc: Optional[torch.Tensor] = None
-        # Cached for the `set_kv_buffer` translate path. The K/V
-        # strided views are TOKEN-granular (one row per slot), so paging
-        # doesn't change view construction — only the translate from virtual
-        # TOKEN id → physical TOKEN id goes through page math when
-        # page_size > 1.
+        # page_size for the 4-D view stride math in `_create_buffers` /
+        # `move_kv_cache` (the K/V strided views are TOKEN-granular).
         self._page_size = page_size
 
         super().__init__(
@@ -519,36 +504,6 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         # per-sub-pool accounting would double-count.
         return 0, 0
 
-    # -- virtual->physical wiring --
-
-    def attach_allocator(self, allocator) -> None:
-        """Wire the `MultiEndedAllocator` whose `virtual_to_physical` table this
-        pool uses to translate slot ids in `set_kv_buffer`."""
-        self._external_allocator = allocator
-
-    def set_loc(self, loc: Optional[torch.Tensor]) -> None:
-        """Precomputed full-physical token ids for the next forward batch.
-
-        When set (non-None), ``set_kv_buffer`` uses these directly and skips
-        the per-call ``self._external_allocator.virtual_to_physical[loc]``
-        gather — required for cuda-graph capture (the per-call gather is not
-        capture-replayable). Pass ``None`` to clear (defensive, recommended
-        at the end of each forward to preserve slice-safety for callers like
-        ``unified_attention_with_output`` that pass a sub-slice of
-        ``out_cache_loc``).
-
-        Type contract: ``loc.dtype`` must be a 64- or 32-bit integer; the
-        full-physical pin stores int64 (matches the v2p_full table —
-        ``ForwardBatch.out_cache_loc_full_physical``). The 4-D advanced-indexing
-        write in ``set_kv_buffer`` tolerates either dtype as an index tensor.
-        """
-        if loc is not None:
-            assert loc.dtype in (torch.int64, torch.int32), (
-                f"SharedMHATokenToKVPool.set_loc: loc.dtype must be int64 "
-                f"(full-physical) or int32; got {loc.dtype}."
-            )
-        self._precomputed_loc = loc
-
     def set_kv_buffer(
         self,
         layer,
@@ -558,7 +513,6 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         k_scale=None,
         v_scale=None,
         layer_id_override: Optional[int] = None,
-        already_physical: bool = False,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         # `dcp_kv_mask` is forwarded unconditionally by the parent
@@ -589,45 +543,12 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         # merge rule at page_size > 1; we use the same code path at
         # page_size == 1 for consistency.
         with record_function("SharedMHA.set_kv_buffer"):
-            # Step 1: resolve `loc` to PHYSICAL TOKEN ids.
-            # `already_physical`: `loc` is pre-translated (e.g. swa-physical from
-            # the backend's `forward_metadata.swa_out_cache_loc`) — use it as-is,
-            # skipping both the precomputed fast path and the v2p translate.
-            if already_physical:
-                pass
-            # Fast path: if `_precomputed_loc` matches `loc` (by data_ptr+shape),
-            # use the precomputed full-physical value directly.
-            elif (
-                self._precomputed_loc is not None
-                and loc is not None
-                and loc.data_ptr() == self._precomputed_loc.data_ptr()
-                and loc.shape == self._precomputed_loc.shape
-            ):
-                loc = self._precomputed_loc
-            elif self._external_allocator is not None:
-                # Step 1b: `loc` arrives as VIRTUAL TOKEN ids (shared-pool
-                # path); translate to physical TOKEN ids. Page-aware math:
-                #   virt_pages = loc // page_size
-                #   offsets = loc % page_size
-                #   phys_tokens = v2p[virt_pages] * page_size + offsets
-                # At ps=1 this is just `v2p[loc]`. Tombstoned entries (-1 in
-                # v2p, from free / _compact_pending) are clamped to 0 so any
-                # write lands in physical slot 0 (the padding sink —
-                # `min_slot_index` invariant). Safe by the dummy-write proof.
-                if self._page_size == 1:
-                    loc = self._external_allocator.virtual_to_physical[loc]
-                    loc = torch.clamp_min(loc, 0)
-                else:
-                    ps = self._page_size
-                    virt_pages = loc // ps
-                    offsets = loc % ps
-                    phys_pages = self._external_allocator.virtual_to_physical[
-                        virt_pages
-                    ]
-                    loc = phys_pages * ps + offsets
-                    loc = torch.clamp_min(loc, 0)
+            # `loc` is PHYSICAL token ids: the write location is fully resolved in
+            # the attention metadata (`KVWriteLoc.full_loc` / the SWA pool's
+            # `swa_out_cache_loc`) before reaching here, so the pool does NO v2p
+            # translate and holds no allocator / location state.
 
-            # Step 2: replicate the parent's dtype-cast logic inline.
+            # Step 1: replicate the parent's dtype-cast logic inline.
             if cache_k.dtype != self.dtype:
                 if k_scale is not None:
                     cache_k.div_(k_scale)
@@ -1389,10 +1310,6 @@ class SharedSWAKVPool(SWAKVPool):
         # views (which translate virtual TOKEN ids → physical TOKEN ids via
         # page math when page_size > 1).
         self.page_size = page_size
-        # Per-batch full-physical loc for the full-attention layers, forwarded
-        # to `full_kv_pool.set_loc(loc)` so the underlying SharedMHATokenToKVPool
-        # bypasses its per-call v2p translate during `set_kv_buffer`.
-        self.full_loc: Optional[torch.Tensor] = None
         self.layer_transfer_counter = None
 
         # The parent class exposes `size` / `size_swa` as plain attributes
@@ -1515,20 +1432,6 @@ class SharedSWAKVPool(SWAKVPool):
         swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
         return (swa_phys_pages * ps + offsets).to(torch.int32)
 
-    def set_full_loc(self, loc: Optional[torch.Tensor]) -> None:
-        """Per-batch full-physical loc for the full-attention layers.
-
-        Stores ``loc`` and forwards to ``full_kv_pool.set_loc(loc)`` so the
-        underlying ``SharedMHATokenToKVPool`` bypasses its per-call v2p translate
-        during ``set_kv_buffer`` (the SWA write loc, by contrast, rides the
-        backend ``swa_out_cache_loc`` rail — see ``set_kv_buffer``).
-
-        Pass ``None`` to clear (defensive, recommended at end of forward to
-        preserve slice-safety for sub-batched callers).
-        """
-        self.full_loc = loc
-        self.full_kv_pool.set_loc(loc)
-
     def get_state_buf_infos(self):
         return self.swa_kv_pool.get_contiguous_buf_infos()
 
@@ -1582,16 +1485,14 @@ class SharedSWAKVPool(SWAKVPool):
         forward by the attention backend — eager via `init_forward_metadata`,
         cuda graph via `cuda_graph_swa_out_cache_loc` (refilled at replay). SWA
         layers write the already-swa-physical `swa_loc` directly; full layers
-        write the virtual `loc`, translated to physical inside
-        `SharedMHATokenToKVPool.set_kv_buffer` (or via the `set_full_loc` pin)."""
-        loc, swa_loc = unwrap_write_loc(loc_info)
+        write the full-physical `full_loc` carried in the write metadata. Both
+        are PHYSICAL — the pool never translates."""
+        _, swa_loc, full_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
-            # `swa_loc` is ALREADY swa-physical (full virtual -> swa-physical via
-            # `translate_loc_from_full_to_swa`). Pass `already_physical=True` so
-            # `SharedMHATokenToKVPool.set_kv_buffer` skips its virtual->physical
-            # v2p translate (re-translating would be wrong). Routed through the
+            # `swa_loc` is ALREADY swa-physical (the backend's `swa_out_cache_loc`
+            # rail); the pool writes physical locs directly. Routed through the
             # SharedMHATokenToKVPool override (NOT the grandparent
             # `MHATokenToKVPool`) because its 4-D LAYER_MAJOR view can't take the
             # parent's `k_cache.view(-1, row_dim)`.
@@ -1607,33 +1508,21 @@ class SharedSWAKVPool(SWAKVPool):
                 k_scale,
                 v_scale,
                 layer_id_override=pool_layer_id,
-                already_physical=True,
             )
             return
-        # Full layer. When the per-batch full-physical loc is pinned
-        # (`set_full_loc` -> `self.full_loc`, also mirrored into
-        # `full_kv_pool._precomputed_loc`), pass it so the data-ptr fast path
-        # in `SharedMHATokenToKVPool.set_kv_buffer` fires and SKIPS the
-        # per-call `v2p[loc]` gather + clamp_min on this (and every other)
-        # full-attention layer. `self.full_loc` is already full-PHYSICAL and
-        # tombstone-clamped (`translate_kv_loc` clamps), so no re-translate is
-        # needed. Falls back to the (virtual) `loc` — translated per call by
-        # `SharedMHATokenToKVPool` — when no precompute is pinned (slice-safe
-        # path for sub-batched callers, which clear `full_loc` first).
-        if self.full_loc is not None:
-            self.full_kv_pool.set_kv_buffer(
-                None,
-                self.full_loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=pool_layer_id,
-            )
-            return
+        # Full layer. The full-PHYSICAL write loc is carried in the write metadata
+        # (`KVWriteLoc.full_loc`, from `ForwardBatch.out_cache_loc_full_physical` —
+        # translated once per forward and tombstone-clamped by `translate_kv_loc`).
+        # The shared pool always precomputes it (eager + cuda-graph capture), so
+        # it must be present.
+        assert full_loc is not None, (
+            "SharedSWAKVPool.set_kv_buffer: full layer received no full_loc; "
+            "ForwardBatch.out_cache_loc_full_physical must be precomputed for the "
+            "shared KV pool."
+        )
         self.full_kv_pool.set_kv_buffer(
             None,
-            loc,
+            full_loc,
             cache_k,
             cache_v,
             k_scale,

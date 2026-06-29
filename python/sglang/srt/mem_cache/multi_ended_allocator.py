@@ -2673,15 +2673,12 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.mamba_allocator)
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
 
-        # Wire the full-attn pool to translate slot ids via its allocator (the
-        # MEA exposes the v2p table the KV pool reads directly). The mamba pool is
-        # NOT wired here: it borrows `translate` from a `SharedMambaSlotAllocator`
-        # (the physical view) that does not exist yet — it wraps this very
-        # `self.mamba_allocator`. `init_shared_mamba_pools` builds that wrapper and
-        # calls `mamba_pool.attach_allocator(slot_allocator)` once this composite
-        # returns. (Attaching the raw MEA here would be dead wiring — overwritten
-        # immediately, and the MEA has no `.translate` the pool could use.)
-        kvcache.full_kv_pool.attach_allocator(self.full_attn_allocator)
+        # The mamba pool's allocator is wired later, NOT here: it borrows
+        # `translate` from a `SharedMambaSlotAllocator` (the physical view) that
+        # wraps this very `self.mamba_allocator` and doesn't exist yet —
+        # `init_shared_mamba_pools` calls `mamba_pool.attach_allocator(...)` once
+        # this composite returns. The full-attn KV pool needs no allocator: write
+        # locations are resolved in the attention metadata (no pool-side v2p).
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
@@ -3092,9 +3089,9 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
         self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
 
-        # Wire the pools to translate slot ids via their allocators.
-        kvcache.full_kv_pool.attach_allocator(self.full_attn_allocator)
-        kvcache.swa_kv_pool.attach_allocator(self.swa_attn_allocator)
+        # The full/SWA KV pools need no allocator wiring: write locations are
+        # resolved in the attention metadata (no pool-side v2p translate). The
+        # composite keeps the allocators for its own read-path translates.
         kvcache.attach_allocators(
             full_allocator=self.full_attn_allocator,
             swa_allocator=self.swa_attn_allocator,

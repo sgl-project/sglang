@@ -1134,13 +1134,23 @@ class HybridReqToTokenPool(ReqToTokenPool):
 class KVWriteLoc:
     """Write target(s) for ``KVCache.set_kv_buffer``.
 
-    ``loc`` is the full-pool write location; ``swa_loc`` is the pre-translated
-    full->SWA location for hybrid SWA pools (``None`` otherwise). Bundling them
-    lets a backend issue one ``set_kv_buffer`` call regardless of pool type.
+    All location info lives here (in the attention metadata), NOT in the pool:
+    - ``loc``: the full-pool write location (VIRTUAL under the shared KV pool).
+    - ``swa_loc``: the pre-translated full->SWA-physical location for hybrid SWA
+      pools (``None`` otherwise).
+    - ``full_loc``: the pre-translated full-PHYSICAL location for the shared KV
+      pool (``None`` otherwise), computed once per forward in attention metadata
+      (``ForwardBatch.out_cache_loc_full_physical``). The shared full pool writes
+      it directly; the pool never translates (replacing the former per-layer v2p
+      gather / ``set_full_loc`` pin).
+
+    Bundling them lets a backend issue one ``set_kv_buffer`` call regardless of
+    pool type.
     """
 
     loc: torch.Tensor
     swa_loc: Optional[torch.Tensor] = None
+    full_loc: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         # swa_out_cache_loc is computed once at metadata-init time from the
@@ -1153,10 +1163,10 @@ class KVWriteLoc:
 
 
 def unwrap_write_loc(loc_info):
-    """Return ``(loc, swa_loc)`` from a ``KVWriteLoc`` or a bare loc tensor."""
+    """Return ``(loc, swa_loc, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
     if isinstance(loc_info, KVWriteLoc):
-        return loc_info.loc, loc_info.swa_loc
-    return loc_info, None
+        return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
+    return loc_info, None, None
 
 
 class KVCache(abc.ABC):
@@ -1648,7 +1658,7 @@ class MHATokenToKVPool(KVCache):
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
@@ -2123,7 +2133,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA-FP4)")
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -2424,12 +2434,6 @@ class HybridLinearKVPool(KVCache):
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
 
-        # Per-batch full-physical loc, pinned by `set_full_loc`. When set
-        # (shared-pool path), `set_kv_buffer` passes it to the underlying
-        # SharedMHATokenToKVPool so its data-ptr fast path fires and skips the
-        # per-call v2p gather on every full-attention layer.
-        self.full_loc: Optional[torch.Tensor] = None
-
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
@@ -2505,13 +2509,14 @@ class HybridLinearKVPool(KVCache):
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
+        # All write-location info lives in the metadata (`KVWriteLoc`); the pool
+        # holds none. `full_loc` is the shared pool's pre-translated full-PHYSICAL
+        # loc; for a static pool it's None and `loc` is already physical. Either
+        # way the write loc is PHYSICAL — the pool writes it directly.
+        loc, _, full_loc = unwrap_write_loc(loc)
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
-            # Fast path: when the per-batch full-physical loc is pinned
-            # (`set_full_loc`), pass it so SharedMHATokenToKVPool's data-ptr
-            # fast path fires and skips the per-call v2p gather. Falls back to
-            # the (virtual) `loc` when no precompute is pinned (non-shared path).
-            write_loc = self.full_loc if self.full_loc is not None else loc
+            write_loc = full_loc if full_loc is not None else loc
             self.full_kv_pool.set_kv_buffer(
                 None,
                 write_loc,
@@ -2530,14 +2535,6 @@ class HybridLinearKVPool(KVCache):
                     cache_k,
                     cache_v,
                 )
-
-    def set_full_loc(self, loc: Optional[torch.Tensor]) -> None:
-        """Per-batch full-physical loc for the full-attention layers. Forwards
-        to ``full_kv_pool.set_loc`` when the underlying pool exposes it (the
-        shared-pool ``SharedMHATokenToKVPool``); no-op for a static pool."""
-        if hasattr(self.full_kv_pool, "set_loc"):
-            self.full_loc = loc
-            self.full_kv_pool.set_loc(loc)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
@@ -2702,7 +2699,7 @@ class MLATokenToKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
@@ -2908,7 +2905,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         # loc_info may be a KVWriteLoc; MLA pools have no SWA target.
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8

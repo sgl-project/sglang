@@ -1,26 +1,20 @@
 """Routing tests for the composite write paths (`SharedSWAKVPool`,
 `HybridLinearKVPool`).
 
-Two routing contracts are pinned here:
+All write-location info travels in the attention metadata (`KVWriteLoc`); the
+pools hold none and never translate — the write loc reaching `set_kv_buffer` is
+always PHYSICAL. Two routing contracts are pinned here:
 
-1. Full-attention `set_full_loc` fast path. `ForwardBatch.init_new` precomputes
-   the full-physical write location ONCE per batch
-   (`out_cache_loc_full_physical = allocator.translate_kv_loc(out_cache_loc)`)
-   and `model_runner` pins it via `pool.set_full_loc(...)`. Per-layer
-   `set_kv_buffer` must forward the pinned `full_loc` (full-physical) to the
-   inner `SharedMHATokenToKVPool` so its data-ptr fast path fires and skips the
-   per-call `virtual_to_physical[loc]` gather. A prior bug forwarded the
-   *virtual* `loc` instead (data-ptr never matched), so the gather fired every
-   full-attention layer every forward.
+1. Full-attention. The full-physical loc is carried in `KVWriteLoc.full_loc`
+   (from `ForwardBatch.out_cache_loc_full_physical`) and written directly.
+   `SharedSWAKVPool` asserts it's present (the shared pool always precomputes
+   it); `HybridLinearKVPool` falls back to `loc` for a static (non-shared) pool,
+   where `loc` is itself already physical.
+2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` rail
+   (`KVWriteLoc.swa_loc`) and is written directly.
 
-2. SWA write rides the backend `swa_out_cache_loc` rail. `SharedSWAKVPool`
-   consumes the pre-translated swa-physical `swa_loc` bundled in the
-   `KVWriteLoc` (produced once per forward by the attention backend) and writes
-   it directly with `already_physical=True`, so the inner pool does NOT
-   re-translate it through the SWA v2p table.
-
-They are pure dispatch tests: the inner sub-pools are recording stubs, so no
-GPU / real buffers are needed (CPU CI).
+Pure dispatch tests: the inner sub-pools are recording stubs, so no GPU / real
+buffers are needed (CPU CI).
 
     python -m pytest test/registered/unit/mem_cache/test_full_loc_fast_path.py -v
 """
@@ -35,6 +29,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+def _loc_info(virtual_loc, swa_phys=None, full_phys=None):
+    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+    return KVWriteLoc(virtual_loc, swa_phys, full_phys)
+
+
 class _RecordingPool:
     """Stub sub-pool that records the `loc` and kwargs passed to `set_kv_buffer`."""
 
@@ -44,16 +44,11 @@ class _RecordingPool:
     def set_kv_buffer(self, layer, loc, cache_k, cache_v, *args, **kwargs):
         self.calls.append((loc, kwargs))
 
-    # `set_full_loc` forwards the pin to the inner pool via `set_loc`; present
-    # for completeness (the tests pin `full_loc` directly).
-    def set_loc(self, loc):
-        pass
-
 
 class TestSharedSWARouting(unittest.TestCase):
-    """`SharedSWAKVPool.set_kv_buffer` routing: full layers forward the pinned
-    full-physical `full_loc`; SWA layers ride the backend `swa_out_cache_loc`
-    rail (write `swa_loc` directly with `already_physical=True`)."""
+    """`SharedSWAKVPool.set_kv_buffer` routing: full layers write the full-physical
+    `full_loc`; SWA layers write the swa-physical `swa_loc`. Both come from the
+    write metadata; the pool never translates."""
 
     def _make_bare_pool(self):
         from sglang.srt.mem_cache.shared_kv_pool import SharedSWAKVPool
@@ -64,53 +59,47 @@ class TestSharedSWARouting(unittest.TestCase):
         pool.swa_kv_pool = _RecordingPool()
         # layer 0 -> full attention; layer 1 -> SWA. (pool_layer_id, is_swa)
         pool.layers_mapping = {0: (0, False), 1: (0, True)}
-        pool.full_loc = None
         return pool
 
-    def _loc_info(self, virtual_loc, swa_phys):
-        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-
-        return KVWriteLoc(virtual_loc, swa_phys)
-
-    def test_full_layer_forwards_full_loc_when_pinned(self):
+    def test_full_layer_writes_full_loc(self):
         pool = self._make_bare_pool()
         virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
-        full_phys = torch.tensor([3, 4, 5], dtype=torch.int64)  # translated
-        pool.full_loc = full_phys
+        full_phys = torch.tensor([3, 4, 5], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=0)  # full layer
-        ck = torch.zeros(3, 4, 8)
-        cv = torch.zeros(3, 4, 8)
-        pool.set_kv_buffer(layer, self._loc_info(virtual_loc, swa_phys), ck, cv)
-
-        self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, _ = pool.full_kv_pool.calls[0]
-        # Must forward the pinned full-physical tensor (same object), NOT the
-        # virtual loc — otherwise the inner data-ptr fast path can't fire.
-        self.assertIs(forwarded, full_phys)
-        self.assertIsNot(forwarded, virtual_loc)
-
-    def test_full_layer_falls_back_to_loc_when_not_pinned(self):
-        pool = self._make_bare_pool()
-        virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
-        swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
-        pool.full_loc = None  # no precompute pinned (slice-safe fallback)
-
-        layer = types.SimpleNamespace(layer_id=0)
         pool.set_kv_buffer(
             layer,
-            self._loc_info(virtual_loc, swa_phys),
+            _loc_info(virtual_loc, swa_phys, full_phys),
             torch.zeros(3, 4, 8),
             torch.zeros(3, 4, 8),
         )
 
         self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, _ = pool.full_kv_pool.calls[0]
-        # Fallback: forward the (virtual) loc for per-call translate.
-        self.assertIs(forwarded, virtual_loc)
+        forwarded, kwargs = pool.full_kv_pool.calls[0]
+        # Forward the full-physical tensor from the write metadata, NOT the
+        # virtual loc. No `already_physical` — the pool only ever gets physical.
+        self.assertIs(forwarded, full_phys)
+        self.assertIsNot(forwarded, virtual_loc)
+        self.assertNotIn("already_physical", kwargs)
 
-    def test_swa_layer_writes_swa_loc_already_physical(self):
+    def test_full_layer_requires_full_loc(self):
+        pool = self._make_bare_pool()
+        virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
+        swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
+
+        layer = types.SimpleNamespace(layer_id=0)
+        # No full_loc precomputed -> fail loud (the shared pool must precompute
+        # out_cache_loc_full_physical) rather than write a virtual loc as physical.
+        with self.assertRaises(AssertionError):
+            pool.set_kv_buffer(
+                layer,
+                _loc_info(virtual_loc, swa_phys),
+                torch.zeros(3, 4, 8),
+                torch.zeros(3, 4, 8),
+            )
+
+    def test_swa_layer_writes_swa_loc(self):
         pool = self._make_bare_pool()
         virtual_loc = torch.tensor([10, 11, 12], dtype=torch.int64)
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
@@ -118,18 +107,16 @@ class TestSharedSWARouting(unittest.TestCase):
         layer = types.SimpleNamespace(layer_id=1)  # SWA layer
         pool.set_kv_buffer(
             layer,
-            self._loc_info(virtual_loc, swa_phys),
+            _loc_info(virtual_loc, swa_phys),
             torch.zeros(3, 4, 8),
             torch.zeros(3, 4, 8),
         )
 
         self.assertEqual(len(pool.swa_kv_pool.calls), 1)
         forwarded, kwargs = pool.swa_kv_pool.calls[0]
-        # SWA write rides the backend rail: forward the swa-physical loc
-        # directly, with already_physical=True so the inner pool skips its
-        # virtual->swa-physical v2p translate.
+        # SWA write rides the backend rail: forward the swa-physical loc directly.
         self.assertIs(forwarded, swa_phys)
-        self.assertTrue(kwargs.get("already_physical"))
+        self.assertNotIn("already_physical", kwargs)
         # Full pool untouched for an SWA layer.
         self.assertEqual(len(pool.full_kv_pool.calls), 0)
 
@@ -143,15 +130,16 @@ class TestSharedSWARouting(unittest.TestCase):
         with self.assertRaises(AssertionError):
             pool.set_kv_buffer(
                 layer,
-                self._loc_info(virtual_loc, None),
+                _loc_info(virtual_loc, None),
                 torch.zeros(3, 4, 8),
                 torch.zeros(3, 4, 8),
             )
 
 
 class TestHybridLinearFullLocRouting(unittest.TestCase):
-    """`HybridLinearKVPool.set_kv_buffer` (non-MLA) must forward the pinned
-    full-physical `full_loc` on full-attention layers."""
+    """`HybridLinearKVPool.set_kv_buffer` (non-MLA) writes the full-physical
+    `full_loc` from the write metadata when present (shared pool), else the
+    already-physical `loc` (static pool). No translate, no `already_physical`."""
 
     def _make_bare_pool(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -160,38 +148,45 @@ class TestHybridLinearFullLocRouting(unittest.TestCase):
         pool.full_kv_pool = _RecordingPool()
         pool.use_mla = False
         pool.full_attention_layer_id_mapping = {0: 0}
-        pool.full_loc = None
         return pool
 
-    def test_forwards_full_loc_when_pinned(self):
+    def test_writes_full_loc_from_write_loc(self):
         pool = self._make_bare_pool()
         virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
         full_phys = torch.tensor([2, 3, 4], dtype=torch.int64)
-        pool.full_loc = full_phys
 
         layer = types.SimpleNamespace(layer_id=0)
         pool.set_kv_buffer(
-            layer, virtual_loc, torch.zeros(3, 4, 8), torch.zeros(3, 4, 8)
+            layer,
+            _loc_info(virtual_loc, full_phys=full_phys),
+            torch.zeros(3, 4, 8),
+            torch.zeros(3, 4, 8),
         )
 
         self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, _ = pool.full_kv_pool.calls[0]
+        forwarded, kwargs = pool.full_kv_pool.calls[0]
         self.assertIs(forwarded, full_phys)
         self.assertIsNot(forwarded, virtual_loc)
+        self.assertNotIn("already_physical", kwargs)
 
-    def test_falls_back_to_loc_when_not_pinned(self):
+    def test_falls_back_to_loc_when_absent(self):
+        # Static (non-shared) pool: no full_loc bundled; `loc` is already
+        # physical, so write it directly.
         pool = self._make_bare_pool()
-        virtual_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
-        pool.full_loc = None
+        phys_loc = torch.tensor([7, 8, 9], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=0)
         pool.set_kv_buffer(
-            layer, virtual_loc, torch.zeros(3, 4, 8), torch.zeros(3, 4, 8)
+            layer,
+            _loc_info(phys_loc),
+            torch.zeros(3, 4, 8),
+            torch.zeros(3, 4, 8),
         )
 
         self.assertEqual(len(pool.full_kv_pool.calls), 1)
-        forwarded, _ = pool.full_kv_pool.calls[0]
-        self.assertIs(forwarded, virtual_loc)
+        forwarded, kwargs = pool.full_kv_pool.calls[0]
+        self.assertIs(forwarded, phys_loc)
+        self.assertNotIn("already_physical", kwargs)
 
 
 if __name__ == "__main__":
