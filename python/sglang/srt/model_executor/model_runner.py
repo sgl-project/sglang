@@ -2406,13 +2406,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def init_cublas(self):
-        """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
-        dtype = torch.float16
-        device = "cuda"
-        a = torch.ones((16, 16), dtype=dtype, device=device)
-        b = torch.ones((16, 16), dtype=dtype, device=device)
-        c = a @ b
-        return c
+        """Warm up cuBLAS/cuBLASLt to avoid lazy-init errors during CUDA graph capture.
+
+        On Blackwell (SM120) + cuBLAS < 13.2, FP32 cublasSgemm is broken for
+        matrices > 16x16, so we only warm up FP16/BF16.  Both the legacy cublas
+        (matmul operator) and the cuBLASLt (F.linear) paths are exercised.
+        """
+        device = self.device if hasattr(self, 'device') and self.device else 'cuda'
+        for dtype in [torch.float16, torch.bfloat16]:
+            for size in [(16, 16), (128, 256)]:
+                a = torch.ones(size, dtype=dtype, device=device)
+                b = torch.ones((size[1], size[0]), dtype=dtype, device=device)
+                c = a @ b
+                torch.nn.functional.linear(
+                    a, torch.ones((size[0], size[1]), dtype=dtype, device=device)
+                )
+                del a, b, c
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
