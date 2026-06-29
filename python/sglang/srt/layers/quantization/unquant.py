@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,14 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_hip_external_llmm1_enabled = get_bool_env_var("SGLANG_HIP_EXTERNAL_LLMM1") and _is_hip
+_hip_external_llmm1_rows_per_block = int(
+    os.getenv("SGLANG_HIP_EXTERNAL_LLMM1_ROWS_PER_BLOCK", "2")
+)
+_hip_external_llmm1_so_path = os.getenv("SGLANG_HIP_EXTERNAL_LLMM1_SO_PATH")
+_hip_external_llmm1_op = None
+_hip_external_llmm1_load_attempted = False
+_hip_external_llmm1_logged_shapes = set()
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -60,6 +69,70 @@ if _use_aiter:
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+
+def _get_hip_external_llmm1_op():
+    global _hip_external_llmm1_enabled
+    global _hip_external_llmm1_load_attempted
+    global _hip_external_llmm1_op
+
+    if not _hip_external_llmm1_enabled:
+        return None
+    if _hip_external_llmm1_op is not None:
+        return _hip_external_llmm1_op
+    if _hip_external_llmm1_load_attempted:
+        return None
+
+    _hip_external_llmm1_load_attempted = True
+    try:
+        if not _hip_external_llmm1_so_path:
+            raise RuntimeError("SGLANG_HIP_EXTERNAL_LLMM1_SO_PATH is not set")
+        torch.ops.load_library(_hip_external_llmm1_so_path)
+        _hip_external_llmm1_op = torch.ops._rocm_C.LLMM1
+        logger.info(
+            "Enabled HIP external LLMM1 fast path with rows_per_block=%d",
+            _hip_external_llmm1_rows_per_block,
+        )
+        return _hip_external_llmm1_op
+    except Exception as e:
+        logger.warning("Disabled HIP external LLMM1 fast path: %s", e)
+        _hip_external_llmm1_enabled = False
+        return None
+
+
+def _maybe_apply_hip_external_llmm1(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    llmm1_op = _get_hip_external_llmm1_op()
+    if (
+        llmm1_op is None
+        or bias is not None
+        or x.device.type != "cuda"
+        or x.dtype not in (torch.float16, torch.bfloat16)
+        or type(layer.weight.data) is not torch.Tensor
+    ):
+        return None
+
+    x_view = x.reshape(-1, x.shape[-1])
+    n = x_view.shape[0]
+    m = layer.weight.shape[0]
+    k = layer.weight.shape[1]
+    if n != 1 or m % 4 != 0 or k > 8192:
+        return None
+
+    key = (n, m, k, x.dtype)
+    if key not in _hip_external_llmm1_logged_shapes:
+        logger.info(
+            "Routing shape=%s through HIP external LLMM1 fast path with rows_per_block=%d",
+            key,
+            _hip_external_llmm1_rows_per_block,
+        )
+        _hip_external_llmm1_logged_shapes.add(key)
+
+    out = llmm1_op(layer.weight, x_view, _hip_external_llmm1_rows_per_block)
+    return out.reshape(*x.shape[:-1], layer.weight.shape[0])
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -149,7 +222,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
-        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+        out = _maybe_apply_hip_external_llmm1(layer, x, bias)
+        if out is not None:
+            return out
+
+        if _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         return F.linear(x, layer.weight, bias)
