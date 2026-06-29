@@ -4178,12 +4178,20 @@ class ServerArgs:
             "Gemma3nForCausalLM",
             "Gemma3nForConditionalGeneration",
         ]:
-            # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
-            # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
-            logger.warning(
-                f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
-            )
-            self.disable_hybrid_swa_memory = True
+            if (
+                model_arch == "Gemma3ForConditionalGeneration"
+                and os.environ.get("SGLANG_GEMMA3_ENABLE_HYBRID_SWA") == "1"
+            ):
+                logger.warning(
+                    "Enable experimental hybrid SWA memory for Gemma3ForConditionalGeneration."
+                )
+            else:
+                # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with gemma2 model.
+                # It failed at this test: https://github.com/sgl-project/sglang/actions/runs/16255155597/job/45890331952#step:4:736
+                logger.warning(
+                    f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
+                )
+                self.disable_hybrid_swa_memory = True
         elif model_arch in (
             "Gemma4ForConditionalGeneration",
             "Gemma4ForCausalLM",
@@ -4206,11 +4214,17 @@ class ServerArgs:
 
             prefill_backend, decode_backend = self.get_attention_backends()
             accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
+            if os.environ.get("SGLANG_FLASHINFER_VOSPLIT") == "1":
+                accepted_backends = accepted_backends + ("flashinfer",)
+                logger.warning(
+                    "Enable experimental FlashInfer attention backend for Gemma4 "
+                    "under SGLANG_FLASHINFER_VOSPLIT=1."
+                )
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
+                f"Gemma4 only supports {accepted_backends} attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
 
@@ -4914,6 +4928,8 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                         ]
+                        if is_sm120_supported():
+                            KV4_FA4_MHA_BACKEND_CHOICES.append("flashinfer")
                         assert (
                             self.decode_attention_backend_str
                             in KV4_FA4_MHA_BACKEND_CHOICES
@@ -4936,12 +4952,19 @@ class ServerArgs:
                             f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {self.attention_backend}"
                         )
                     else:  # !FA4 + MHA
+                        # NVFP4 KV is uint8-packed; only a backend with an fp4
+                        # unpack/dequant path can read it. triton / torch_native /
+                        # flex_attention route the extend op to Triton's
+                        # extend_attention_fwd, whose `tl.dot` rejects the uint8
+                        # KV ("only int8 supported") and SIGQUITs the scheduler on
+                        # the first prefill (notably Gemma-4, whose default backend
+                        # is triton). Restrict KV4 MHA to the fp4-capable kernels so
+                        # an incompatible choice fails clearly at startup instead.
                         KV4_ATTENTION_MHA_BACKEND_CHOICES = [
-                            "triton",
-                            "torch_native",
-                            "flex_attention",
                             "trtllm_mha",
                         ]
+                        if is_sm120_supported():
+                            KV4_ATTENTION_MHA_BACKEND_CHOICES.append("flashinfer")
                         assert (
                             self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
                         ), (
