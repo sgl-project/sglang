@@ -1,7 +1,8 @@
 ---
 title: SGLang installation with NPUs support
+description: "Complete installation guide for SGLang on Ascend NPUs, including component version mapping, environment setup, and launching inference services."
 ---
-You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
+You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are operating at optimal performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
 ## Component Version Mapping For SGLang
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -452,7 +453,7 @@ python3 -m sglang_router.launch_router \
 #### PD Mixed Scene
 ```bash Command
 python3 -m sglang.launch_server \
-    --model-path Qwen3-VL-30B-A3B-Instruct \
+    --model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
     --host 127.0.0.1 \
     --port 8000 \
     --tp 4 \
