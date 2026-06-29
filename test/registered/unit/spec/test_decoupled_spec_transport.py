@@ -53,7 +53,7 @@ def _tail_msg(rid="r", verifier_rank=0, tok=7) -> DraftMeshMessage:
         request_id=rid,
         base_committed_len=0,
         new_token_pos=0,
-        new_token_id=tok,
+        new_token=tok,
     )
     return DraftMeshMessage.from_tail_stream_output_batch(
         DraftTailStreamOutputBatch(outputs=[out])
@@ -133,7 +133,7 @@ class TestFakeTransport(CustomTestCase):
         self.assertEqual(
             got2.message_type, DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
         )
-        self.assertEqual(got2.tail_stream_output_batch.outputs[0].new_token_id, 42)
+        self.assertEqual(got2.tail_stream_output_batch.outputs[0].new_token, 42)
 
     def test_try_recv_empty_returns_none(self):
         _mesh, a, _b = self._pair()

@@ -52,7 +52,7 @@ def _drain_all(token):
     # Drain everything including full commit segments.
     return token.collect_ready_draft_controls(
         lambda inbox: inbox.extract_ready_controls_locked(
-            lambda seg: len(seg.committed_token_ids)
+            lambda seg: len(seg.committed_tokens)
         )
     )
 
@@ -91,7 +91,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                             request_id="r",
                             src_verifier_rank=0,
                             dst_drafter_rank=0,
-                            committed_output_ids=[],
+                            committed_outputs=[],
                         )
                     ],
                 )
@@ -114,7 +114,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                             request_id="r",
                             base_committed_len=0,
                             new_token_pos=0,
-                            new_token_id=100,
+                            new_token=100,
                         )
                     ]
                 )
@@ -136,7 +136,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                             src_verifier_rank=0,
                             dst_drafter_rank=0,
                             pre_verify_committed_len=0,
-                            committed_token_ids=[100],
+                            committed_tokens=[100],
                         )
                     ],
                 )
@@ -146,7 +146,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
             token._step()
             ready2 = _drain_all(token)
             self.assertEqual(len(ready2.ready_commit_segments), 1)
-            self.assertEqual(ready2.ready_commit_segments[0].committed_token_ids, [100])
+            self.assertEqual(ready2.ready_commit_segments[0].committed_tokens, [100])
 
             # 6. verifier closes the request.
             proxy.submit_control_batch(
@@ -185,7 +185,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                                 request_id="x",
                                 src_verifier_rank=0,
                                 dst_drafter_rank=5,
-                                committed_output_ids=[],
+                                committed_outputs=[],
                             )
                         ],
                     )
@@ -237,7 +237,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                             request_id="a",
                             base_committed_len=0,
                             new_token_pos=0,
-                            new_token_id=10,
+                            new_token=10,
                         ),
                         DraftTailStreamOutput(
                             src_drafter_rank=0,
@@ -245,7 +245,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                             request_id="b",
                             base_committed_len=0,
                             new_token_pos=0,
-                            new_token_id=20,
+                            new_token=20,
                         ),
                     ]
                 )
@@ -253,8 +253,8 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
             token._step()
             m0 = v0_tp.try_recv()
             m1 = v1_tp.try_recv()
-            self.assertEqual(m0.tail_stream_output_batch.outputs[0].new_token_id, 10)
-            self.assertEqual(m1.tail_stream_output_batch.outputs[0].new_token_id, 20)
+            self.assertEqual(m0.tail_stream_output_batch.outputs[0].new_token, 10)
+            self.assertEqual(m1.tail_stream_output_batch.outputs[0].new_token, 20)
         finally:
             d_tp.close()
             v0_tp.close()
@@ -277,7 +277,7 @@ class TestDecoupledSpecIpcIntegration(CustomTestCase):
                                 request_id="r",
                                 base_committed_len=0,
                                 new_token_pos=0,
-                                new_token_id=1,
+                                new_token=1,
                             )
                         ]
                     )
