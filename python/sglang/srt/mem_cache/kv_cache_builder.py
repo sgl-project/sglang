@@ -52,17 +52,17 @@ def get_draft_kv_pool(
     spec_algorithm: SpeculativeAlgorithm,
     server_args: ServerArgs,
 ):
-    """Return (draft_token_to_kv_pool, draft_model_config) for the current
-    draft worker, or (None, None) when no draft KV pool is available."""
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
     if draft_worker is None or spec_algorithm.is_ngram():
-        return None, None
+        return None
 
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool, draft_runner.model_config
+    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
@@ -78,7 +78,7 @@ def maybe_register_hicache_draft(
     if not enable_hierarchical_cache:
         return
 
-    draft_kv_pool, _ = get_draft_kv_pool(
+    draft_kv_pool = get_draft_kv_pool(
         draft_worker=draft_worker,
         spec_algorithm=spec_algorithm,
         server_args=server_args,
