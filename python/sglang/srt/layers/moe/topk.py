@@ -100,7 +100,6 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
-    is_deepep_class_backend,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.utils import MultiPlatformOp
@@ -1801,13 +1800,13 @@ def _post_process_topk_ids(
         recorder_topk_ids = topk_ids
 
     _aiter_append = num_fused_shared_experts > 0 and _use_aiter
-    _deepep_remap = num_fused_shared_experts > 0 and is_deepep_class_backend()
     _per_rank_shared_slot_remap = (
         num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
     )
+    _aiter_fused_append_remap = _aiter_append and _per_rank_shared_slot_remap
 
-    if _aiter_append and _deepep_remap:
-        # Fused path: append shared experts AND apply the DeepEP interleaved
+    if _aiter_fused_append_remap:
+        # Fused path: append shared experts AND apply the per-rank shared-slot
         # remap in a single Triton kernel. This replaces the original
         # fused_append_shared_experts() + eager per-rank shared-slot remap pair,
         # collapsing ~6 launch-bound elementwise kernels/layer (div_floor / add /
@@ -1865,10 +1864,10 @@ def _post_process_topk_ids(
             N,  # base id for shared experts
         )
 
-    if _per_rank_shared_slot_remap and not (_aiter_append and _deepep_remap):
+    if _per_rank_shared_slot_remap and not _aiter_fused_append_remap:
         # DeepEP/MegaMOE: remap to interleaved expert layout where each rank's
-        # shared expert has a unique ID for dispatch routing. The aiter+DeepEP
-        # path above already performs this remap in the fused append kernel.
+        # shared expert has a unique ID for dispatch routing. The aiter path
+        # above already performs this remap in the fused append kernel.
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None
