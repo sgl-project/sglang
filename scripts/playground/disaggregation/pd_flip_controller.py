@@ -15,9 +15,25 @@ import json
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 from urllib import error, request
 from urllib.parse import urljoin
+
+try:
+    from pd_flip_monitor import ClusterSLOSnapshot, PDFlipSLOMonitor
+except ModuleNotFoundError:
+    import importlib.util
+
+    _MONITOR_PATH = Path(__file__).with_name("pd_flip_monitor.py")
+    _MONITOR_SPEC = importlib.util.spec_from_file_location(
+        "pd_flip_monitor", _MONITOR_PATH
+    )
+    _MONITOR_MODULE = importlib.util.module_from_spec(_MONITOR_SPEC)
+    sys.modules[_MONITOR_SPEC.name] = _MONITOR_MODULE
+    _MONITOR_SPEC.loader.exec_module(_MONITOR_MODULE)
+    ClusterSLOSnapshot = _MONITOR_MODULE.ClusterSLOSnapshot
+    PDFlipSLOMonitor = _MONITOR_MODULE.PDFlipSLOMonitor
 
 
 JsonDict = Dict[str, Any]
@@ -38,7 +54,12 @@ class HttpClient:
 
     def get_json(self, base_url: str, path: str) -> Any:
         req = self._request(base_url, path, method="GET")
-        return self._open_json(req)
+        body = self._open_text(req)
+        return json.loads(body) if body else {}
+
+    def get_text(self, base_url: str, path: str) -> str:
+        req = self._request(base_url, path, method="GET")
+        return self._open_text(req)
 
     def post_json(self, base_url: str, path: str, payload: JsonDict) -> Any:
         body = json.dumps(payload).encode("utf-8")
@@ -58,11 +79,10 @@ class HttpClient:
             req.add_header("Authorization", f"Bearer {self.api_key}")
         return req
 
-    def _open_json(self, req: request.Request) -> Any:
+    def _open_text(self, req: request.Request) -> str:
         try:
             with request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body) if body else {}
+                return resp.read().decode("utf-8")
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"{req.full_url} returned HTTP {exc.code}: {body}") from exc
@@ -180,6 +200,15 @@ class FlipExecutionResult:
     metrics: List[NodeMetrics] = field(default_factory=list)
     total_seconds: float = 0.0
     migration_seconds: float = 0.0
+
+
+@dataclass
+class MonitorLoopResult:
+    success: bool
+    message: str
+    iterations: int
+    snapshots: List[JsonDict] = field(default_factory=list)
+    actions: List[Any] = field(default_factory=list)
 
 
 class PDFlipController:
@@ -341,6 +370,68 @@ class PDFlipController:
                 migration_seconds=migration_seconds,
             )
 
+    def monitor(
+        self,
+        *,
+        slo_monitor: PDFlipSLOMonitor,
+        enter_threshold: float,
+        exit_threshold: float,
+        commit_threshold: float,
+        iterations: int,
+        poll_interval_seconds: float,
+    ) -> MonitorLoopResult:
+        snapshots: List[JsonDict] = []
+        actions: List[Any] = []
+        for idx in range(max(1, iterations)):
+            metrics = self.collect_metrics()
+            snapshot = slo_monitor.collect_cluster(
+                (m.name, m.worker_url, m.effective_role) for m in metrics
+            )
+            snapshots.append(snapshot.to_dict())
+            if _prefill_risk(snapshot, enter_threshold):
+                source = self._select_source(
+                    metrics,
+                    source_name=None,
+                    expected_role="decode",
+                    prefer_high_load=True,
+                )
+                target = self._select_decode_migration_target(metrics, source)
+                result = self._execute_d_to_p_two_phase(
+                    source=source,
+                    target=target,
+                    slo_monitor=slo_monitor,
+                    enter_threshold=enter_threshold,
+                    exit_threshold=exit_threshold,
+                    commit_threshold=commit_threshold,
+                )
+                actions.append(result)
+                return MonitorLoopResult(
+                    success=result.success,
+                    message=result.message,
+                    iterations=idx + 1,
+                    snapshots=snapshots,
+                    actions=actions,
+                )
+            if _decode_risk(snapshot, enter_threshold):
+                result = self.execute(direction="p_to_d")
+                actions.append(result)
+                return MonitorLoopResult(
+                    success=result.success,
+                    message=result.message,
+                    iterations=idx + 1,
+                    snapshots=snapshots,
+                    actions=actions,
+                )
+            time.sleep(poll_interval_seconds)
+
+        return MonitorLoopResult(
+            success=True,
+            message="no flip decision",
+            iterations=max(1, iterations),
+            snapshots=snapshots,
+            actions=actions,
+        )
+
     def _execute_d_to_p(
         self,
         source: NodeMetrics,
@@ -433,6 +524,243 @@ class PDFlipController:
             {"worker_id": source.router_worker_id, "draining": False},
         )
         return migration_seconds
+
+    def _execute_d_to_p_two_phase(
+        self,
+        *,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        slo_monitor: PDFlipSLOMonitor,
+        enter_threshold: float,
+        exit_threshold: float,
+        commit_threshold: float,
+    ) -> FlipExecutionResult:
+        started = time.monotonic()
+        records: List[ActionRecord] = []
+        session_id = f"pd-flip-{source.name}-to-{target.name}"
+        monitor_nodes = [
+            (metric.name, metric.worker_url, metric.effective_role)
+            for metric in self.collect_metrics()
+        ]
+
+        try:
+            self._post_router(
+                records,
+                "router_drain_source",
+                source,
+                "/pd_flip/router/worker/drain",
+                {"worker_id": source.router_worker_id, "draining": True},
+            )
+            self._post_worker(
+                records,
+                "pause_source_admission",
+                source,
+                "/pd_flip/runtime_role/admission",
+                {"paused": True},
+            )
+
+            migration_started = time.monotonic()
+            source_start = self._post_worker(
+                records,
+                "start_decode_migration_source",
+                source,
+                "/pd_flip/migration/source/start",
+                {"session_id": session_id, "target_url": target.worker_url},
+            )
+            manifests = _response_manifests(source_start)
+            self._post_worker(
+                records,
+                "prepare_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/prepare",
+                {
+                    "session_id": session_id,
+                    "source_url": source.worker_url,
+                    "manifests": manifests,
+                    "prepare_only": True,
+                    "adopt_on_commit": True,
+                },
+            )
+
+            transfer_result = self._wait_two_phase_migration_or_recovery(
+                records=records,
+                source=source,
+                target=target,
+                slo_monitor=slo_monitor,
+                monitor_nodes=monitor_nodes,
+                exit_threshold=exit_threshold,
+            )
+            migration_seconds = time.monotonic() - migration_started
+            if transfer_result == "recovered":
+                self._abort_two_phase_migration(source, target, session_id, records)
+                self._cleanup_source_after_failure(source, records)
+                return FlipExecutionResult(
+                    success=True,
+                    message="SLO recovered during preparing; migration aborted",
+                    direction="d_to_p",
+                    source=source.name,
+                    target_role="decode",
+                    migration_target=target.name,
+                    actions=records,
+                    total_seconds=time.monotonic() - started,
+                    migration_seconds=migration_seconds,
+                )
+
+            snapshot = slo_monitor.collect_cluster(monitor_nodes)
+            if not _prefill_risk(snapshot, commit_threshold):
+                self._abort_two_phase_migration(source, target, session_id, records)
+                self._cleanup_source_after_failure(source, records)
+                return FlipExecutionResult(
+                    success=True,
+                    message="SLO recovered before commit; migration aborted",
+                    direction="d_to_p",
+                    source=source.name,
+                    target_role="decode",
+                    migration_target=target.name,
+                    actions=records,
+                    total_seconds=time.monotonic() - started,
+                    migration_seconds=migration_seconds,
+                )
+
+            self._post_worker(
+                records,
+                "commit_decode_migration_target",
+                target,
+                "/pd_flip/migration/target/commit",
+                {"session_id": session_id},
+            )
+            released_rids = _manifest_rids(manifests)
+            self._post_worker(
+                records,
+                "finish_decode_migration_source",
+                source,
+                "/pd_flip/migration/source/finish",
+                {"session_id": session_id, "released_rids": released_rids},
+            )
+            self._wait_source_idle(records, source)
+            self._post_worker(
+                records,
+                "set_source_runtime_role",
+                source,
+                "/pd_flip/runtime_role/set",
+                {"role": "prefill", "force": False},
+            )
+            self._post_router(
+                records,
+                "refresh_router_source_role",
+                source,
+                "/pd_flip/router/worker/role",
+                {
+                    "worker_id": source.router_worker_id,
+                    "role": "prefill",
+                    "bootstrap_port": source.bootstrap_port,
+                    "draining": False,
+                },
+            )
+            self._post_worker(
+                records,
+                "resume_source_admission",
+                source,
+                "/pd_flip/runtime_role/admission",
+                {"paused": False},
+            )
+            self._post_router(
+                records,
+                "router_undrain_source",
+                source,
+                "/pd_flip/router/worker/drain",
+                {"worker_id": source.router_worker_id, "draining": False},
+            )
+            return FlipExecutionResult(
+                success=True,
+                message="pd flip committed after two-phase migration",
+                direction="d_to_p",
+                source=source.name,
+                target_role="prefill",
+                migration_target=target.name,
+                actions=records,
+                total_seconds=time.monotonic() - started,
+                migration_seconds=migration_seconds,
+            )
+        except Exception as exc:
+            self._abort_two_phase_migration(source, target, session_id, records)
+            self._cleanup_source_after_failure(source, records)
+            return FlipExecutionResult(
+                success=False,
+                message=str(exc),
+                direction="d_to_p",
+                source=source.name,
+                target_role="prefill",
+                migration_target=target.name,
+                actions=records,
+                total_seconds=time.monotonic() - started,
+            )
+
+    def _wait_two_phase_migration_or_recovery(
+        self,
+        *,
+        records: List[ActionRecord],
+        source: NodeMetrics,
+        target: NodeMetrics,
+        slo_monitor: PDFlipSLOMonitor,
+        monitor_nodes: List[Tuple[str, str, str]],
+        exit_threshold: float,
+    ) -> str:
+        deadline = time.monotonic() + self.config.migration_timeout_seconds
+        while time.monotonic() <= deadline:
+            snapshot = slo_monitor.collect_cluster(monitor_nodes)
+            if _prefill_recovered(snapshot, exit_threshold):
+                return "recovered"
+            source_status = self._record_get(
+                records,
+                "wait_decode_migration_source",
+                source.name,
+                source.worker_url,
+                "/pd_flip/migration/status",
+            )
+            target_status = self._record_get(
+                records,
+                "wait_decode_migration_target",
+                target.name,
+                target.worker_url,
+                "/pd_flip/migration/status",
+            )
+            if _migration_response_complete(source_status) and _migration_response_complete(
+                target_status
+            ):
+                return "transferred"
+            time.sleep(self.config.migration_poll_interval_seconds)
+        raise TimeoutError("two-phase D->P migration timed out")
+
+    def _abort_two_phase_migration(
+        self,
+        source: NodeMetrics,
+        target: NodeMetrics,
+        session_id: str,
+        records: List[ActionRecord],
+    ) -> None:
+        for node, path, payload in (
+            (
+                target,
+                "/pd_flip/migration/target/abort",
+                {"session_id": session_id, "reason": "monitor aborted preparing"},
+            ),
+            (
+                source,
+                "/pd_flip/migration/abort",
+                {"session_id": session_id, "reason": "monitor aborted preparing"},
+            ),
+        ):
+            try:
+                self._post_worker(
+                    records,
+                    "abort_decode_migration",
+                    node,
+                    path,
+                    payload,
+                )
+            except Exception:
+                pass
 
     def _execute_p_to_d(
         self,
@@ -1019,6 +1347,21 @@ def _find_metric(metrics: List[NodeMetrics], name_or_worker_id: str) -> Optional
     return None
 
 
+def _prefill_risk(snapshot: ClusterSLOSnapshot, threshold: float) -> bool:
+    attainment = snapshot.prefill_slo_attainment
+    return attainment is not None and attainment < threshold
+
+
+def _decode_risk(snapshot: ClusterSLOSnapshot, threshold: float) -> bool:
+    attainment = snapshot.decode_slo_attainment
+    return attainment is not None and attainment < threshold
+
+
+def _prefill_recovered(snapshot: ClusterSLOSnapshot, threshold: float) -> bool:
+    attainment = snapshot.prefill_slo_attainment
+    return attainment is not None and attainment >= threshold
+
+
 def load_config(path: str) -> PDClusterConfig:
     with open(path, "r", encoding="utf-8") as f:
         return PDClusterConfig.from_dict(json.load(f))
@@ -1089,6 +1432,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     execute = subparsers.add_parser("execute", help="Execute a PD role flip")
     execute.add_argument("--direction", choices=["d_to_p", "p_to_d"], required=True)
     execute.add_argument("--source-name", default=None)
+
+    monitor = subparsers.add_parser("monitor", help="Run monitor-driven PD flip loop")
+    monitor.add_argument("--ttft-slo", type=float, required=True)
+    monitor.add_argument("--tpot-slo", type=float, required=True)
+    monitor.add_argument("--window-seconds", type=float, default=30.0)
+    monitor.add_argument("--enter-threshold", type=float, default=0.9)
+    monitor.add_argument("--exit-threshold", type=float, default=0.95)
+    monitor.add_argument("--commit-threshold", type=float, default=0.9)
+    monitor.add_argument("--iterations", type=int, default=1)
+    monitor.add_argument("--poll-interval", type=float, default=1.0)
     return parser
 
 
@@ -1110,6 +1463,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output = controller.execute(
                 direction=args.direction,
                 source_name=args.source_name,
+            )
+        elif args.command == "monitor":
+            slo_monitor = PDFlipSLOMonitor(
+                ttft_slo_seconds=args.ttft_slo,
+                tpot_slo_seconds=args.tpot_slo,
+                window_seconds=args.window_seconds,
+                client=client,
+            )
+            output = controller.monitor(
+                slo_monitor=slo_monitor,
+                enter_threshold=args.enter_threshold,
+                exit_threshold=args.exit_threshold,
+                commit_threshold=args.commit_threshold,
+                iterations=args.iterations,
+                poll_interval_seconds=args.poll_interval,
             )
         else:
             parser.error(f"unknown command {args.command}")

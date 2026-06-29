@@ -59,6 +59,8 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetAbortReq,
+    PDFlipMigrationTargetCommitReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleReqOutput,
@@ -853,6 +855,18 @@ class TokenizerControlMixin:
 
     async def prepare_pd_flip_migration_target(
         self: TokenizerManager, obj: PDFlipMigrationTargetPrepareReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def commit_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetCommitReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def abort_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetAbortReq
     ) -> List[PDFlipMigrationReqOutput]:
         self.auto_create_handle_loop()
         return await self.pd_flip_migration_communicator(obj)

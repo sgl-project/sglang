@@ -1748,6 +1748,8 @@ class PDFlipMigrationTargetPrepareReq(BaseReq):
     source_url: Optional[str] = None
     manifests: List[Dict[str, Any]] = field(default_factory=list)
     adopt_on_success: bool = False
+    prepare_only: bool = False
+    adopt_on_commit: bool = True
 
 
 @dataclass
@@ -1759,6 +1761,18 @@ class PDFlipMigrationStatusReq(BaseReq):
 class PDFlipMigrationSourceFinishReq(BaseReq):
     session_id: Optional[str] = None
     released_rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationTargetCommitReq(BaseReq):
+    session_id: Optional[str] = None
+    rids: Optional[List[str]] = None
+
+
+@dataclass
+class PDFlipMigrationTargetAbortReq(BaseReq):
+    session_id: Optional[str] = None
+    reason: str = ""
 
 
 @dataclass

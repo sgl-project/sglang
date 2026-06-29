@@ -23,6 +23,7 @@ class FlipTransition(Enum):
     START_PREPARING = "start_preparing"
     START_FLIPPING = "start_flipping"
     FINISH_FLIPPING = "finish_flipping"
+    RECOVER_SAFE = "recover_safe"
     PREPARING_NOT_READY = "preparing_not_ready"
     FLIPPING_NOT_READY = "flipping_not_ready"
     ABORT = "abort"
@@ -139,6 +140,177 @@ class SLOThresholdFlipEvaluator:
         return max(0.0, self.slo_threshold - attainment)
 
 
+class PDRatioSLOFlipEvaluator:
+    """P/D ratio policy with simple enter/exit hysteresis.
+
+    The policy still consumes the same ``ClusterSnapshot`` shape as the
+    threshold evaluator. It adds consecutive-window gating and explicit metadata
+    so the monitor/controller can explain why a nearby P/D ratio was selected.
+    """
+
+    def __init__(
+        self,
+        enter_threshold: float = 0.9,
+        exit_threshold: Optional[float] = None,
+        commit_threshold: Optional[float] = None,
+        min_enter_windows: int = 1,
+        min_exit_windows: int = 1,
+    ):
+        self.enter_threshold = enter_threshold
+        self.exit_threshold = exit_threshold if exit_threshold is not None else enter_threshold
+        self.commit_threshold = (
+            commit_threshold if commit_threshold is not None else enter_threshold
+        )
+        self.min_enter_windows = max(1, int(min_enter_windows))
+        self.min_exit_windows = max(1, int(min_exit_windows))
+        self._last_enter_direction = FlipDirection.NONE
+        self._enter_windows = 0
+        self._exit_windows = 0
+
+    def evaluate(self, snapshot: ClusterSnapshot) -> FlipDecision:
+        decision = self._evaluate_once(snapshot, self.enter_threshold)
+        if not decision.should_flip:
+            self._last_enter_direction = FlipDirection.NONE
+            self._enter_windows = 0
+            return decision
+
+        if decision.direction == self._last_enter_direction:
+            self._enter_windows += 1
+        else:
+            self._last_enter_direction = decision.direction
+            self._enter_windows = 1
+
+        if self._enter_windows < self.min_enter_windows:
+            return FlipDecision.stay_safe(
+                f"waiting for enter hysteresis {self._enter_windows}/{self.min_enter_windows}"
+            )
+        return decision
+
+    def evaluate_recovery(
+        self, snapshot: ClusterSnapshot, direction: FlipDirection
+    ) -> Optional[FlipDecision]:
+        if direction == FlipDirection.D_TO_P:
+            if snapshot.prefill_slo_attainment is None:
+                return None
+            recovered = self._attainment_at_or_above(
+                snapshot.prefill_slo_attainment, self.exit_threshold
+            )
+            reason = "prefill SLO recovered above exit threshold"
+        elif direction == FlipDirection.P_TO_D:
+            if snapshot.decode_slo_attainment is None:
+                return None
+            recovered = self._attainment_at_or_above(
+                snapshot.decode_slo_attainment, self.exit_threshold
+            )
+            reason = "decode SLO recovered above exit threshold"
+        else:
+            return None
+
+        if recovered:
+            self._exit_windows += 1
+            if self._exit_windows >= self.min_exit_windows:
+                return FlipDecision.stay_safe(reason)
+            return self._keep_direction_decision(
+                snapshot,
+                direction,
+                f"waiting for exit hysteresis {self._exit_windows}/{self.min_exit_windows}",
+            )
+        else:
+            self._exit_windows = 0
+        return self._keep_direction_decision(
+            snapshot, direction, "SLO still inside preparing hysteresis band"
+        )
+
+    def _evaluate_once(
+        self, snapshot: ClusterSnapshot, threshold: float
+    ) -> FlipDecision:
+        prefill_deficit = self._deficit(snapshot.prefill_slo_attainment, threshold)
+        decode_deficit = self._deficit(snapshot.decode_slo_attainment, threshold)
+
+        if prefill_deficit <= 0 and decode_deficit <= 0:
+            return FlipDecision.stay_safe("both SLO attainments are inside safe region")
+
+        candidates = []
+        if prefill_deficit > 0 and snapshot.decode_nodes > 0:
+            candidates.append((prefill_deficit, FlipDirection.D_TO_P, "prefill"))
+        if decode_deficit > 0 and snapshot.prefill_nodes > 0:
+            candidates.append((decode_deficit, FlipDirection.P_TO_D, "decode"))
+        if not candidates:
+            return FlipDecision.stay_safe("no eligible node exists for the risky SLO")
+
+        deficit, direction, risky_role = max(candidates, key=lambda item: item[0])
+        if direction == FlipDirection.D_TO_P:
+            if snapshot.role != "decode":
+                return FlipDecision.stay_safe("local node is not decode; skip D->P")
+            target_prefill_nodes = snapshot.prefill_nodes + 1
+            target_decode_nodes = max(0, snapshot.decode_nodes - 1)
+        else:
+            if snapshot.role != "prefill":
+                return FlipDecision.stay_safe("local node is not prefill; skip P->D")
+            target_prefill_nodes = max(0, snapshot.prefill_nodes - 1)
+            target_decode_nodes = snapshot.decode_nodes + 1
+
+        return FlipDecision(
+            should_flip=True,
+            direction=direction,
+            reason=f"{risky_role} SLO below P/D policy threshold",
+            target_prefill_nodes=target_prefill_nodes,
+            target_decode_nodes=target_decode_nodes,
+            metadata={
+                "policy": "pd_ratio_slo",
+                "risky_role": risky_role,
+                "deficit": deficit,
+                "enter_threshold": self.enter_threshold,
+                "exit_threshold": self.exit_threshold,
+                "commit_threshold": self.commit_threshold,
+                "current_pd_ratio": self._ratio(snapshot.prefill_nodes, snapshot.decode_nodes),
+                "target_pd_ratio": self._ratio(target_prefill_nodes, target_decode_nodes),
+            },
+        )
+
+    def _keep_direction_decision(
+        self, snapshot: ClusterSnapshot, direction: FlipDirection, reason: str
+    ) -> FlipDecision:
+        if direction == FlipDirection.D_TO_P:
+            target_prefill_nodes = snapshot.prefill_nodes + 1
+            target_decode_nodes = max(0, snapshot.decode_nodes - 1)
+        elif direction == FlipDirection.P_TO_D:
+            target_prefill_nodes = max(0, snapshot.prefill_nodes - 1)
+            target_decode_nodes = snapshot.decode_nodes + 1
+        else:
+            return FlipDecision.stay_safe(reason)
+
+        return FlipDecision(
+            should_flip=True,
+            direction=direction,
+            reason=reason,
+            target_prefill_nodes=target_prefill_nodes,
+            target_decode_nodes=target_decode_nodes,
+            metadata={
+                "policy": "pd_ratio_slo",
+                "enter_threshold": self.enter_threshold,
+                "exit_threshold": self.exit_threshold,
+                "commit_threshold": self.commit_threshold,
+                "current_pd_ratio": self._ratio(snapshot.prefill_nodes, snapshot.decode_nodes),
+                "target_pd_ratio": self._ratio(target_prefill_nodes, target_decode_nodes),
+            },
+        )
+
+    @staticmethod
+    def _deficit(attainment: Optional[float], threshold: float) -> float:
+        if attainment is None:
+            return 0.0
+        return max(0.0, threshold - attainment)
+
+    @staticmethod
+    def _attainment_at_or_above(attainment: Optional[float], threshold: float) -> bool:
+        return attainment is not None and attainment >= threshold
+
+    @staticmethod
+    def _ratio(prefill_nodes: int, decode_nodes: int) -> str:
+        return f"{prefill_nodes}:{decode_nodes}"
+
+
 class FlipStateMachine:
     def __init__(
         self,
@@ -160,6 +332,9 @@ class FlipStateMachine:
         self.last_completed_decision: Optional[FlipDecision] = None
         self.last_completed_direction = FlipDirection.NONE
         self.last_abort_reason = ""
+        self.last_recovery_reason = ""
+        self.last_prepare_not_ready_reason = ""
+        self.prepare_started_at: Optional[float] = None
         self.last_eval_time: Optional[float] = None
         self.last_snapshot: Optional[ClusterSnapshot] = None
         self.last_event = FlipEvent(
@@ -219,6 +394,14 @@ class FlipStateMachine:
             if self.last_completed_decision
             else "",
             "last_abort_reason": self.last_abort_reason,
+            "last_recovery_reason": self.last_recovery_reason,
+            "last_prepare_not_ready_reason": self.last_prepare_not_ready_reason,
+            "prepare_started_at": self.prepare_started_at,
+            "prepare_elapsed_seconds": self._prepare_elapsed_seconds(),
+            "commit_ready": self.last_event.transition == FlipTransition.START_FLIPPING,
+            "abort_ready": self.last_event.transition
+            in (FlipTransition.ABORT, FlipTransition.RECOVER_SAFE),
+            "migration_commit_mode": self._migration_commit_mode(decision),
             "snapshot": asdict(self.last_snapshot) if self.last_snapshot else None,
         }
 
@@ -234,6 +417,8 @@ class FlipStateMachine:
         self.state = FlipState.SAFE
         self.direction = FlipDirection.NONE
         self.pending_decision = None
+        self.prepare_started_at = None
+        self.last_prepare_not_ready_reason = ""
         self.last_abort_reason = reason
         event = FlipEvent(
             transition=FlipTransition.ABORT,
@@ -268,6 +453,9 @@ class FlipStateMachine:
         self.state = FlipState.PREPARING
         self.direction = decision.direction
         self.pending_decision = decision
+        self.prepare_started_at = now
+        self.last_recovery_reason = ""
+        self.last_prepare_not_ready_reason = ""
         return FlipEvent(
             transition=FlipTransition.START_PREPARING,
             from_state=old_state,
@@ -279,16 +467,48 @@ class FlipStateMachine:
 
     def _tick_preparing(self, snapshot: ClusterSnapshot) -> FlipEvent:
         decision = self._require_decision()
-        if not self.prepare_flip(snapshot, decision):
+        recovery_decision = self._evaluate_recovery(snapshot)
+        if recovery_decision is not None and not self._same_direction(
+            recovery_decision
+        ):
+            return self._recover_to_safe(
+                recovery_decision.reason or "SLO recovered",
+                recovery_decision,
+            )
+
+        if snapshot.metadata.get("commit_decision") is False:
+            self.last_prepare_not_ready_reason = "commit_decision_not_ready"
             return self._event(
                 FlipTransition.PREPARING_NOT_READY,
                 FlipState.PREPARING,
-                decision.reason,
+                self.last_prepare_not_ready_reason,
+                decision,
+            )
+
+        if snapshot.metadata.get("kv_pretransfer_complete") is False:
+            self.last_prepare_not_ready_reason = "kv_pretransfer_not_ready"
+            return self._event(
+                FlipTransition.PREPARING_NOT_READY,
+                FlipState.PREPARING,
+                self.last_prepare_not_ready_reason,
+                decision,
+            )
+
+        if not self.prepare_flip(snapshot, decision):
+            self.last_prepare_not_ready_reason = (
+                snapshot.metadata.get("prepare_not_ready_reason")
+                or "prepare_callback_not_ready"
+            )
+            return self._event(
+                FlipTransition.PREPARING_NOT_READY,
+                FlipState.PREPARING,
+                self.last_prepare_not_ready_reason,
                 decision,
             )
 
         old_state = self.state
         self.state = FlipState.FLIPPING
+        self.last_prepare_not_ready_reason = ""
         return FlipEvent(
             transition=FlipTransition.START_FLIPPING,
             from_state=old_state,
@@ -313,6 +533,8 @@ class FlipStateMachine:
         self.state = FlipState.SAFE
         self.direction = FlipDirection.NONE
         self.pending_decision = None
+        self.prepare_started_at = None
+        self.last_prepare_not_ready_reason = ""
         self.last_completed_decision = decision
         self.last_completed_direction = direction
         self.last_abort_reason = ""
@@ -330,6 +552,49 @@ class FlipStateMachine:
         if evaluate is not None:
             return evaluate(snapshot)
         return self.evaluator(snapshot)
+
+    def _evaluate_recovery(self, snapshot: ClusterSnapshot) -> Optional[FlipDecision]:
+        if snapshot.metadata.get("slo_recovered") is True:
+            return FlipDecision.stay_safe(
+                str(snapshot.metadata.get("recovery_reason") or "SLO recovered")
+            )
+        if not self._has_slo_attainment(snapshot):
+            return None
+        evaluate_recovery = getattr(self.evaluator, "evaluate_recovery", None)
+        if evaluate_recovery is not None:
+            return evaluate_recovery(snapshot, self.direction)
+        return self._evaluate(snapshot)
+
+    @staticmethod
+    def _has_slo_attainment(snapshot: ClusterSnapshot) -> bool:
+        return (
+            snapshot.prefill_slo_attainment is not None
+            or snapshot.decode_slo_attainment is not None
+        )
+
+    def _same_direction(self, decision: FlipDecision) -> bool:
+        return decision.should_flip and decision.direction == self.direction
+
+    def _recover_to_safe(
+        self, reason: str, decision: Optional[FlipDecision] = None
+    ) -> FlipEvent:
+        old_state = self.state
+        old_direction = self.direction
+        old_decision = self.pending_decision
+        self.state = FlipState.SAFE
+        self.direction = FlipDirection.NONE
+        self.pending_decision = None
+        self.prepare_started_at = None
+        self.last_recovery_reason = reason
+        self.last_prepare_not_ready_reason = ""
+        return FlipEvent(
+            transition=FlipTransition.RECOVER_SAFE,
+            from_state=old_state,
+            to_state=self.state,
+            direction=old_direction,
+            reason=reason,
+            decision=decision or old_decision,
+        )
 
     def _require_decision(self) -> FlipDecision:
         if self.pending_decision is None:
@@ -355,6 +620,18 @@ class FlipStateMachine:
     @staticmethod
     def _ready(snapshot: ClusterSnapshot, decision: FlipDecision) -> bool:
         return True
+
+    def _prepare_elapsed_seconds(self) -> Optional[float]:
+        if self.prepare_started_at is None or self.last_snapshot is None:
+            return None
+        return max(0.0, self.last_snapshot.timestamp - self.prepare_started_at)
+
+    @staticmethod
+    def _migration_commit_mode(decision: Optional[FlipDecision]) -> str:
+        if decision is None:
+            return "none"
+        value = decision.metadata.get("migration_commit_mode")
+        return str(value) if value else "two_phase"
 
     @staticmethod
     def _source_role(direction: FlipDirection) -> Optional[str]:

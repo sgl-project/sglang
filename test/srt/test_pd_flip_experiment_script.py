@@ -268,6 +268,53 @@ class TestPDFlipExperimentScript(unittest.TestCase):
         )
 
     def test_docker_env_default_uses_eight_gpus_per_worker(self):
+        values = self._read_docker_env()
+
+        self.assertEqual(int(values["TP_SIZE"]) * int(values["DP_SIZE"]), 8)
+
+    def test_docker_env_declares_four_cloud_hosts_and_monitor_thresholds(self):
+        values = self._read_docker_env()
+
+        self.assertEqual(values["NODE0_HOST"], "cloud-099")
+        self.assertEqual(values["NODE1_HOST"], "cloud-100")
+        self.assertEqual(values["NODE2_HOST"], "cloud-101")
+        self.assertEqual(values["NODE3_HOST"], "cloud-102")
+        self.assertEqual(values["NODE0_ROLE"], "prefill")
+        self.assertEqual(values["NODE1_ROLE"], "prefill")
+        self.assertEqual(values["NODE2_ROLE"], "decode")
+        self.assertEqual(values["NODE3_ROLE"], "decode")
+        self.assertIn("TTFT_SLO_SECONDS", values)
+        self.assertIn("TPOT_SLO_SECONDS", values)
+        self.assertIn("PD_FLIP_ENTER_THRESHOLD", values)
+        self.assertIn("PD_FLIP_EXIT_THRESHOLD", values)
+        self.assertIn("PD_FLIP_COMMIT_THRESHOLD", values)
+
+    def test_docker_controller_script_supports_execute_action(self):
+        script = (DOCKER_DIR / "run_controller.sh").read_text()
+
+        self.assertIn("execute)", script)
+        self.assertIn("execute --direction", script)
+
+    def test_docker_harness_declares_monitor_runner(self):
+        controller_script = (DOCKER_DIR / "run_controller.sh").read_text()
+        monitor_path = DOCKER_DIR / "run_monitor.sh"
+        monitor_script = monitor_path.read_text()
+        windows_runner = (DOCKER_DIR / "windows_four_node.ps1").read_text()
+
+        self.assertIn("monitor)", controller_script)
+        self.assertIn("run_monitor.sh", controller_script)
+        self.assertTrue(monitor_path.stat().st_mode & 0o111)
+        self.assertIn("pd_flip_controller.py", monitor_script)
+        self.assertIn("monitor", monitor_script)
+        self.assertIn("--ttft-slo", monitor_script)
+        self.assertIn("--tpot-slo", monitor_script)
+        self.assertIn("--commit-threshold", monitor_script)
+        self.assertIn("cloud-099", windows_runner)
+        self.assertIn("cloud-102", windows_runner)
+        self.assertIn("start-monitor", windows_runner)
+        self.assertIn("sync-env", windows_runner)
+
+    def _read_docker_env(self):
         values = {}
         for line in (DOCKER_DIR / "env.example").read_text().splitlines():
             line = line.strip()
@@ -275,14 +322,7 @@ class TestPDFlipExperimentScript(unittest.TestCase):
                 continue
             key, value = line.split("=", 1)
             values[key] = value
-
-        self.assertEqual(int(values["TP_SIZE"]) * int(values["DP_SIZE"]), 8)
-
-    def test_docker_controller_script_supports_execute_action(self):
-        script = (DOCKER_DIR / "run_controller.sh").read_text()
-
-        self.assertIn("execute)", script)
-        self.assertIn("execute --direction", script)
+        return values
 
     def _server_info(self, state, idle, direction="d_to_p", current_role="decode"):
         return {

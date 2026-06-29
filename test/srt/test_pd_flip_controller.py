@@ -188,6 +188,37 @@ class ExecutingFakeClient(FakeClient):
         return {"success": True, "status": {"role": payload.get("role")}}
 
 
+class MonitorFakeClient(FakeClient):
+    def get_text(self, base_url, path):
+        if path != "/metrics":
+            raise AssertionError(f"unexpected GET text {base_url} {path}")
+        return """
+sglang:time_to_first_token_seconds_bucket{le="0.2"} 10
+sglang:time_to_first_token_seconds_bucket{le="+Inf"} 10
+sglang:inter_token_latency_seconds_bucket{le="0.02"} 20
+sglang:inter_token_latency_seconds_bucket{le="+Inf"} 20
+"""
+
+
+class SequenceSLOMonitor:
+    def __init__(self, script, prefill_attainments):
+        self.script = script
+        self.prefill_attainments = list(prefill_attainments)
+        self.collects = []
+
+    def collect_cluster(self, nodes):
+        self.collects.append(list(nodes))
+        idx = min(len(self.collects) - 1, len(self.prefill_attainments) - 1)
+        return self.script.ClusterSLOSnapshot(
+            timestamp=float(len(self.collects)),
+            prefill_nodes=1,
+            decode_nodes=2,
+            prefill_slo_attainment=self.prefill_attainments[idx],
+            decode_slo_attainment=1.0,
+            nodes=[],
+        )
+
+
 class TestPDFlipController(unittest.TestCase):
     def setUp(self):
         self.script = load_script_module()
@@ -425,6 +456,88 @@ class TestPDFlipController(unittest.TestCase):
             )
 
         self.assertEqual(rc, 1)
+
+    def test_main_monitor_returns_no_flip_when_slo_is_safe(self):
+        client = MonitorFakeClient()
+        self.script.HttpClient = lambda api_key=None, timeout_seconds=10.0: client
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            rc = self.script.main(
+                [
+                    "--router-url",
+                    "http://router",
+                    "--node",
+                    "name=node-a,worker_url=http://node-a:30000,router_worker_id=node-a,bootstrap_port=8997",
+                    "--node",
+                    "name=node-b,worker_url=http://node-b:30000,router_worker_id=node-b,bootstrap_port=8997",
+                    "--node",
+                    "name=node-c,worker_url=http://node-c:30000,router_worker_id=node-c,bootstrap_port=8997",
+                    "monitor",
+                    "--ttft-slo",
+                    "0.2",
+                    "--tpot-slo",
+                    "0.02",
+                    "--iterations",
+                    "1",
+                    "--poll-interval",
+                    "0",
+                ]
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertIn("no flip decision", stdout.getvalue())
+        self.assertEqual(client.posts, [])
+
+    def test_monitor_aborts_two_phase_migration_when_slo_recovers(self):
+        client = ExecutingFakeClient()
+        controller = self.script.PDFlipController(self.config, client)
+        slo_monitor = SequenceSLOMonitor(self.script, [0.80, 0.96])
+
+        result = controller.monitor(
+            slo_monitor=slo_monitor,
+            enter_threshold=0.90,
+            exit_threshold=0.95,
+            commit_threshold=0.90,
+            iterations=1,
+            poll_interval_seconds=0.0,
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("SLO recovered", result.message)
+        paths = [path for _, path, _ in client.posts]
+        self.assertIn("/pd_flip/migration/target/abort", paths)
+        self.assertIn("/pd_flip/migration/abort", paths)
+        self.assertNotIn("/pd_flip/migration/target/commit", paths)
+        self.assertNotIn("/pd_flip/runtime_role/set", paths)
+        self.assertEqual(result.actions[0].target_role, "decode")
+
+    def test_monitor_commits_two_phase_migration_when_slo_remains_risky(self):
+        client = ExecutingFakeClient()
+        controller = self.script.PDFlipController(self.config, client)
+        slo_monitor = SequenceSLOMonitor(self.script, [0.80, 0.80, 0.80])
+
+        result = controller.monitor(
+            slo_monitor=slo_monitor,
+            enter_threshold=0.90,
+            exit_threshold=0.95,
+            commit_threshold=0.90,
+            iterations=1,
+            poll_interval_seconds=0.0,
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("committed", result.message)
+        self.assertEqual(result.actions[0].target_role, "prefill")
+        target_prepare = [
+            post for post in client.posts if post[1] == "/pd_flip/migration/target/prepare"
+        ][0]
+        self.assertIs(target_prepare[2]["prepare_only"], True)
+        self.assertIs(target_prepare[2]["adopt_on_commit"], True)
+        paths = [path for _, path, _ in client.posts]
+        self.assertIn("/pd_flip/migration/target/commit", paths)
+        self.assertIn("/pd_flip/migration/source/finish", paths)
+        self.assertIn("/pd_flip/runtime_role/set", paths)
 
 
 if __name__ == "__main__":

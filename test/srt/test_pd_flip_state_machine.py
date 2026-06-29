@@ -7,6 +7,7 @@ from sglang.srt.disaggregation.flip_state_machine import (
     FlipState,
     FlipStateMachine,
     FlipTransition,
+    PDRatioSLOFlipEvaluator,
     SLOThresholdFlipEvaluator,
 )
 
@@ -47,6 +48,85 @@ class TestPDFlipStateMachine(unittest.TestCase):
         self.assertEqual(decision.direction, FlipDirection.P_TO_D)
         self.assertEqual(decision.target_prefill_nodes, 2)
         self.assertEqual(decision.target_decode_nodes, 2)
+
+    def test_pd_ratio_evaluator_waits_for_enter_hysteresis(self):
+        evaluator = PDRatioSLOFlipEvaluator(
+            enter_threshold=0.9,
+            min_enter_windows=2,
+        )
+        snapshot = ClusterSnapshot(
+            timestamp=1.0,
+            role="decode",
+            prefill_nodes=1,
+            decode_nodes=3,
+            prefill_slo_attainment=0.72,
+            decode_slo_attainment=0.96,
+        )
+
+        first = evaluator.evaluate(snapshot)
+        second = evaluator.evaluate(snapshot)
+
+        self.assertFalse(first.should_flip)
+        self.assertIn("waiting for enter hysteresis", first.reason)
+        self.assertTrue(second.should_flip)
+        self.assertEqual(second.direction, FlipDirection.D_TO_P)
+        self.assertEqual(second.metadata["policy"], "pd_ratio_slo")
+        self.assertEqual(second.metadata["current_pd_ratio"], "1:3")
+        self.assertEqual(second.metadata["target_pd_ratio"], "2:2")
+
+    def test_pd_ratio_recovery_uses_exit_hysteresis(self):
+        evaluator = PDRatioSLOFlipEvaluator(
+            enter_threshold=0.9,
+            exit_threshold=0.93,
+            min_enter_windows=1,
+            min_exit_windows=2,
+        )
+        machine = FlipStateMachine(
+            evaluator=evaluator,
+            prepare_flip=lambda snapshot, decision: bool(
+                snapshot.metadata.get("kv_pretransfer_complete", False)
+            ),
+            min_window_seconds=0.0,
+        )
+
+        machine.tick(
+            ClusterSnapshot(
+                timestamp=1.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.72,
+                decode_slo_attainment=0.96,
+            )
+        )
+        first_recovery_window = machine.tick(
+            ClusterSnapshot(
+                timestamp=2.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.94,
+                decode_slo_attainment=0.96,
+                metadata={"kv_pretransfer_complete": False},
+            )
+        )
+        second_recovery_window = machine.tick(
+            ClusterSnapshot(
+                timestamp=3.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.95,
+                decode_slo_attainment=0.96,
+                metadata={"kv_pretransfer_complete": False},
+            )
+        )
+
+        self.assertEqual(
+            first_recovery_window.transition, FlipTransition.PREPARING_NOT_READY
+        )
+        self.assertEqual(second_recovery_window.transition, FlipTransition.RECOVER_SAFE)
+        self.assertEqual(machine.state, FlipState.SAFE)
 
     def test_state_machine_progresses_through_prepare_and_flip(self):
         snapshots = [
@@ -93,6 +173,128 @@ class TestPDFlipStateMachine(unittest.TestCase):
         self.assertEqual(committed, [(3.0, FlipDirection.D_TO_P)])
         self.assertEqual(machine.status()["last_completed_target_role"], "prefill")
         self.assertEqual(machine.status()["last_completed_direction"], "d_to_p")
+
+    def test_preparing_recovers_to_safe_when_slo_returns_inside_threshold(self):
+        machine = FlipStateMachine(
+            evaluator=SLOThresholdFlipEvaluator(slo_threshold=0.9),
+            prepare_flip=lambda snapshot, decision: bool(
+                snapshot.metadata.get("kv_pretransfer_complete", False)
+            ),
+            min_window_seconds=0.0,
+        )
+
+        first = machine.tick(
+            ClusterSnapshot(
+                timestamp=1.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.72,
+                decode_slo_attainment=0.96,
+            )
+        )
+        recovered = machine.tick(
+            ClusterSnapshot(
+                timestamp=2.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.94,
+                decode_slo_attainment=0.96,
+                metadata={"kv_pretransfer_complete": False},
+            )
+        )
+
+        self.assertEqual(first.transition, FlipTransition.START_PREPARING)
+        self.assertEqual(recovered.transition, FlipTransition.RECOVER_SAFE)
+        self.assertEqual(recovered.from_state, FlipState.PREPARING)
+        self.assertEqual(recovered.to_state, FlipState.SAFE)
+        self.assertEqual(machine.state, FlipState.SAFE)
+        self.assertEqual(machine.direction, FlipDirection.NONE)
+        self.assertIsNone(machine.pending_decision)
+        self.assertEqual(machine.status()["last_recovery_reason"], "both SLO attainments are inside safe region")
+
+    def test_preparing_waits_for_kv_pretransfer_before_flipping(self):
+        machine = FlipStateMachine(
+            evaluator=SLOThresholdFlipEvaluator(slo_threshold=0.9),
+            prepare_flip=lambda snapshot, decision: bool(
+                snapshot.metadata.get("kv_pretransfer_complete", False)
+            ),
+            min_window_seconds=0.0,
+        )
+
+        machine.tick(
+            ClusterSnapshot(
+                timestamp=1.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.72,
+                decode_slo_attainment=0.96,
+            )
+        )
+        waiting = machine.tick(
+            ClusterSnapshot(
+                timestamp=2.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.73,
+                decode_slo_attainment=0.96,
+                metadata={"kv_pretransfer_complete": False},
+            )
+        )
+        ready = machine.tick(
+            ClusterSnapshot(
+                timestamp=3.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.74,
+                decode_slo_attainment=0.96,
+                metadata={"kv_pretransfer_complete": True},
+            )
+        )
+
+        self.assertEqual(waiting.transition, FlipTransition.PREPARING_NOT_READY)
+        self.assertEqual(waiting.to_state, FlipState.PREPARING)
+        self.assertEqual(ready.transition, FlipTransition.START_FLIPPING)
+        self.assertEqual(ready.to_state, FlipState.FLIPPING)
+
+    def test_preparing_can_be_held_by_commit_decision(self):
+        machine = FlipStateMachine(
+            evaluator=SLOThresholdFlipEvaluator(slo_threshold=0.9),
+            min_window_seconds=0.0,
+        )
+
+        machine.tick(
+            ClusterSnapshot(
+                timestamp=1.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.72,
+                decode_slo_attainment=0.96,
+            )
+        )
+        event = machine.tick(
+            ClusterSnapshot(
+                timestamp=2.0,
+                role="decode",
+                prefill_nodes=1,
+                decode_nodes=3,
+                prefill_slo_attainment=0.73,
+                decode_slo_attainment=0.96,
+                metadata={
+                    "kv_pretransfer_complete": True,
+                    "commit_decision": False,
+                },
+            )
+        )
+
+        self.assertEqual(event.transition, FlipTransition.PREPARING_NOT_READY)
+        self.assertEqual(event.reason, "commit_decision_not_ready")
+        self.assertEqual(machine.state, FlipState.PREPARING)
 
     def test_state_machine_stays_safe_without_flip_decision(self):
         machine = FlipStateMachine(

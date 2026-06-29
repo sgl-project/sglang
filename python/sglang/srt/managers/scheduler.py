@@ -147,6 +147,8 @@ from sglang.srt.managers.io_struct import (
     PDFlipMigrationSourceFinishReq,
     PDFlipMigrationSourceStartReq,
     PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetAbortReq,
+    PDFlipMigrationTargetCommitReq,
     PDFlipMigrationTargetPrepareReq,
     PDRuntimeRoleAdmissionReq,
     PDRuntimeRoleReqOutput,
@@ -1458,8 +1460,10 @@ class Scheduler(
         status["migration_transferred_reqs"] = migration_status["transferred_reqs"]
         status["migration_released_reqs"] = migration_status["released_reqs"]
         status["migration_failed_reqs"] = migration_status["failed_reqs"]
+        status["migration_held_reqs"] = migration_status["held_reqs"]
         status["migration_last_error"] = migration_status["last_error"]
         status["migration_dry_run"] = migration_status["dry_run"]
+        status["migration_prepare_only"] = migration_status["prepare_only"]
         if migration_status["enabled"] and status.get("direction") == "d_to_p":
             status["active_request_migration_strategy"] = (
                 "decode_to_decode_kv_transfer"
@@ -1693,6 +1697,9 @@ class Scheduler(
             "last_error": real_error,
             "dry_run": not bool(target_entries),
             "adopt_on_success": recv_req.adopt_on_success,
+            "prepare_only": recv_req.prepare_only,
+            "adopt_on_commit": recv_req.adopt_on_commit,
+            "held_reqs": 0,
             "target_entries": target_entries,
         }
         if target_entries:
@@ -1702,6 +1709,88 @@ class Scheduler(
             message=real_error or "target migration session prepared",
             status=self._pd_flip_migration_status_dict(),
             manifests=manifests,
+        )
+
+    def commit_pd_flip_migration_target(
+        self, recv_req: PDFlipMigrationTargetCommitReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message="no target migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not target",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        self._pd_flip_target_pump_transfer(session)
+        entries = session.get("target_entries") or {}
+        requested = set(recv_req.rids or entries.keys())
+        not_ready = sorted(
+            rid
+            for rid, entry in entries.items()
+            if rid in requested and entry.get("phase") != "transferred_held"
+        )
+        if not_ready:
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"target migration commit still pending for rids={not_ready}",
+                status=self._pd_flip_migration_status_dict(),
+                manifests=list(session.get("manifests", [])),
+            )
+
+        committed = 0
+        for rid, entry in entries.items():
+            if rid not in requested:
+                continue
+            if session.get("adopt_on_commit", True):
+                self._pd_flip_adopt_target_request(entry)
+            else:
+                self._pd_flip_release_target_request(entry)
+            entry["phase"] = "committed"
+            entry["held"] = False
+            committed += 1
+
+        session["state"] = "target_committed"
+        session["held_reqs"] = max(0, int(session.get("held_reqs", 0)) - committed)
+        session["released_reqs"] = int(session.get("released_reqs", 0)) + committed
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="target migration session committed",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=list(session.get("manifests", [])),
+        )
+
+    def abort_pd_flip_migration_target(
+        self, recv_req: PDFlipMigrationTargetAbortReq
+    ) -> PDFlipMigrationReqOutput:
+        session = getattr(self, "pd_flip_migration_session", None)
+        if not session:
+            return PDFlipMigrationReqOutput(
+                success=True,
+                message="no target migration session exists",
+                status=self._pd_flip_migration_status_dict(),
+            )
+        if session.get("role") != "target":
+            return PDFlipMigrationReqOutput(
+                success=False,
+                message=f"local migration role is {session.get('role')}, not target",
+                status=self._pd_flip_migration_status_dict(),
+            )
+
+        self._pd_flip_abort_target_session(
+            session, recv_req.reason or "target migration aborted"
+        )
+        return PDFlipMigrationReqOutput(
+            success=True,
+            message="target migration session aborted",
+            status=self._pd_flip_migration_status_dict(),
+            manifests=list(session.get("manifests", [])),
         )
 
     def get_pd_flip_migration_status(
@@ -1775,15 +1864,62 @@ class Scheduler(
     ) -> PDFlipMigrationReqOutput:
         session = getattr(self, "pd_flip_migration_session", None)
         if session:
-            session["state"] = "aborted"
-            session["last_error"] = recv_req.reason or "migration aborted"
-            session["pending_reqs"] = 0
-            session["failed_reqs"] = len(session.get("manifests", []))
+            reason = recv_req.reason or "migration aborted"
+            if session.get("role") == "target":
+                self._pd_flip_abort_target_session(session, reason)
+            elif session.get("role") == "source":
+                self._pd_flip_abort_source_session(session, reason)
+            else:
+                session["state"] = "aborted"
+                session["last_error"] = reason
+                session["pending_reqs"] = 0
+                session["failed_reqs"] = len(session.get("manifests", []))
         return PDFlipMigrationReqOutput(
             success=True,
             message="migration aborted",
             status=self._pd_flip_migration_status_dict(),
         )
+
+    def _pd_flip_abort_source_session(
+        self, session: Dict[str, Any], reason: str
+    ) -> None:
+        for entry in (session.get("source_entries") or {}).values():
+            sender = entry.get("sender")
+            if sender is not None and hasattr(sender, "abort"):
+                try:
+                    sender.abort()
+                except Exception:
+                    pass
+            self._pd_flip_free_source_metadata(entry)
+        session["state"] = "source_aborted"
+        session["last_error"] = reason
+        session["pending_reqs"] = 0
+        session["failed_reqs"] = 0
+
+    def _pd_flip_abort_target_session(
+        self, session: Dict[str, Any], reason: str
+    ) -> None:
+        released = 0
+        for entry in (session.get("target_entries") or {}).values():
+            decode_req = entry.get("decode_req")
+            receiver = getattr(decode_req, "kv_receiver", None)
+            if receiver is not None and hasattr(receiver, "abort"):
+                try:
+                    receiver.abort()
+                except Exception:
+                    pass
+            if not entry.get("request_adopted"):
+                self._pd_flip_release_target_request(entry)
+                released += 1
+            self._pd_flip_free_target_metadata(entry)
+            entry["phase"] = "aborted"
+            entry["held"] = False
+        session["state"] = "target_aborted"
+        session["last_error"] = reason
+        session["pending_reqs"] = 0
+        session["held_reqs"] = 0
+        session["released_reqs"] = int(session.get("released_reqs", 0)) + released
+        session["failed_reqs"] = 0
 
     def _pd_flip_can_use_real_migration(self) -> bool:
         return (
@@ -2277,11 +2413,17 @@ class Scheduler(
                         entry
                     ):
                         transferred.add(rid)
-                        entry["phase"] = "transferred"
+                        entry["phase"] = (
+                            "transferred_held"
+                            if session.get("prepare_only", False)
+                            else "transferred"
+                        )
                         if getattr(decode_req, "kv_receiver", None) is not None:
                             decode_req.kv_receiver.clear()
                             decode_req.kv_receiver = None
-                        if session.get("adopt_on_success", False):
+                        if session.get("prepare_only", False):
+                            entry["held"] = True
+                        elif session.get("adopt_on_success", False):
                             self._pd_flip_adopt_target_request(entry)
                         else:
                             self._pd_flip_release_target_request(entry)
@@ -2299,11 +2441,18 @@ class Scheduler(
         session["failed_rids"] = failed
         session["transferred_reqs"] = len(transferred)
         session["failed_reqs"] = len(failed)
+        session["held_reqs"] = sum(
+            1
+            for entry in entries.values()
+            if entry.get("phase") == "transferred_held" and entry.get("held")
+        )
         session["pending_reqs"] = max(
             0, len(session.get("manifests", [])) - len(transferred) - len(failed)
         )
         if failed:
             session["state"] = "target_failed"
+        elif session.get("held_reqs", 0) > 0:
+            session["state"] = "target_transferred_held"
         elif session["pending_reqs"] == 0:
             session["state"] = "target_transferred"
 
@@ -2527,8 +2676,10 @@ class Scheduler(
                 "transferred_reqs": 0,
                 "released_reqs": 0,
                 "failed_reqs": 0,
+                "held_reqs": 0,
                 "last_error": "",
                 "dry_run": False,
+                "prepare_only": False,
             }
         return {
             "enabled": True,
@@ -2539,8 +2690,10 @@ class Scheduler(
             "transferred_reqs": int(session.get("transferred_reqs", 0)),
             "released_reqs": int(session.get("released_reqs", 0)),
             "failed_reqs": int(session.get("failed_reqs", 0)),
+            "held_reqs": int(session.get("held_reqs", 0)),
             "last_error": session.get("last_error", ""),
             "dry_run": bool(session.get("dry_run", False)),
+            "prepare_only": bool(session.get("prepare_only", False)),
         }
 
     def _pd_flip_migration_is_active(self) -> bool:
@@ -2744,6 +2897,14 @@ class Scheduler(
                 (
                     PDFlipMigrationTargetPrepareReq,
                     self.prepare_pd_flip_migration_target,
+                ),
+                (
+                    PDFlipMigrationTargetCommitReq,
+                    self.commit_pd_flip_migration_target,
+                ),
+                (
+                    PDFlipMigrationTargetAbortReq,
+                    self.abort_pd_flip_migration_target,
                 ),
                 (PDFlipMigrationStatusReq, self.get_pd_flip_migration_status),
                 (
