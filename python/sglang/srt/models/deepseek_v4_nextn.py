@@ -120,6 +120,18 @@ class DeepseekV4ModelNextN(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
+        if x.numel() > 0:
+            from sglang.srt.layers.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+            )
+
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.rms_norm_eps)
