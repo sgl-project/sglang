@@ -151,7 +151,6 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
@@ -216,10 +215,6 @@ def _freqs_cis_to_cos_sin(
     sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
-
-
-# Shared freqs_cis tensors keyed by the RoPE parameters.
-_PRECOMPUTED_FREQS_CIS: dict[tuple, torch.Tensor] = {}
 
 
 if TYPE_CHECKING:
@@ -356,26 +351,15 @@ class MQALayer(nn.Module):
         # YARN-corrected inv_freq); only the rope base differs (rope_theta vs compress_rope_theta).
         original_seq_len = rope_scaling["original_max_position_embeddings"]
 
-        freqs_cis_key = (
-            self.qk_rope_head_dim,
-            config.max_position_embeddings,
-            original_seq_len,
-            rope_base,
-            rope_scaling["factor"],
-            rope_scaling["beta_fast"],
-            rope_scaling["beta_slow"],
+        freqs_cis = precompute_freqs_cis(
+            dim=self.qk_rope_head_dim,
+            seqlen=config.max_position_embeddings,
+            original_seq_len=original_seq_len,
+            base=rope_base,
+            factor=rope_scaling["factor"],
+            beta_fast=rope_scaling["beta_fast"],
+            beta_slow=rope_scaling["beta_slow"],
         )
-        if freqs_cis_key not in _PRECOMPUTED_FREQS_CIS:
-            _PRECOMPUTED_FREQS_CIS[freqs_cis_key] = precompute_freqs_cis(
-                dim=self.qk_rope_head_dim,
-                seqlen=config.max_position_embeddings,
-                original_seq_len=original_seq_len,
-                base=rope_base,
-                factor=rope_scaling["factor"],
-                beta_fast=rope_scaling["beta_fast"],
-                beta_slow=rope_scaling["beta_slow"],
-            )
-        freqs_cis = _PRECOMPUTED_FREQS_CIS[freqs_cis_key]
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 

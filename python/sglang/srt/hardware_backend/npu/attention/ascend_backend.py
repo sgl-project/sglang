@@ -666,10 +666,8 @@ class AscendAttnBackend(AttentionBackend):
         if self.is_hybrid_swa:
             metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
                 self.full_to_swa_index_mapping[
-                    self.req_to_token[
-                        req_pool_indices[:bs], 0 : max_len : self.page_size
-                    ]
-                ]
+                    self.req_to_token[req_pool_indices[:bs], :max_len]
+                ][:, :: self.page_size]
                 // self.page_size
             )
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
