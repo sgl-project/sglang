@@ -179,39 +179,49 @@ class TestSelfBenchmark(CustomTestCase):
 
     def test_output_invalidation_replaces_stale_result_for_worker_path(self):
         with TemporaryDirectory() as tmpdir:
+            # dp_rank 0 writes the caller-assigned base path; a stale prior-run
+            # result there must be invalidated at init.
             output_path = f"{tmpdir}/benchmark.json"
-            stale_path = (
-                f"{tmpdir}/benchmark_role-null_node-0_dp-0_tp-0_atp-0_acp-0.json"
-            )
-            with open(stale_path, "w") as f:
+            with open(output_path, "w") as f:
                 json.dump({"valid": True, "run_id": "old-run"}, f)
 
             scheduler = _make_scheduler(output_path)
             scheduler.instance_id = "new-run"
             benchmark = SelfBenchmark(scheduler)
 
-            self.assertEqual(benchmark._output_path, stale_path)
+            self.assertEqual(benchmark._output_path, output_path)
             with open(benchmark._output_path) as f:
                 output = json.load(f)
             self.assertFalse(output["valid"])
             self.assertEqual(output["status"], "running")
             self.assertEqual(output["run_id"], "new-run")
 
-    def test_output_path_is_role_and_rank_qualified(self):
+    def test_output_path_follows_dp_rank_contract(self):
         with TemporaryDirectory() as tmpdir:
+            output_path = f"{tmpdir}/benchmark.json"
+            # dp_rank 0 -> caller-assigned base path, unchanged.
+            dp0 = SelfBenchmark(_make_scheduler(output_path))
+            self.assertEqual(dp0._output_path, output_path)
+
+            # dp_rank N -> the "_dpN" sibling the consumer addresses.
+            dp1_scheduler = _make_scheduler(output_path)
+            dp1_scheduler.ps.dp_rank = 1
+            dp1 = SelfBenchmark(dp1_scheduler)
+            self.assertEqual(dp1._output_path, f"{tmpdir}/benchmark_dp1.json")
+
+    def test_role_recorded_in_contents_not_path(self):
+        with TemporaryDirectory() as tmpdir:
+            # Role/run/rank identity lives in the file contents, not the
+            # filename; co-located workers are kept distinct by the caller
+            # assigning a unique base path, not by namespacing the filename.
             output_path = f"{tmpdir}/benchmark.json"
             prefill_scheduler = _make_scheduler(output_path)
             prefill_scheduler.disaggregation_mode = DisaggregationMode.PREFILL
-            decode_scheduler = _make_scheduler(output_path)
-            decode_scheduler.disaggregation_mode = DisaggregationMode.DECODE
-
             prefill_benchmark = SelfBenchmark(prefill_scheduler)
-            decode_benchmark = SelfBenchmark(decode_scheduler)
 
-            self.assertIn("role-prefill", prefill_benchmark._output_path)
-            self.assertIn("role-decode", decode_benchmark._output_path)
-            self.assertNotEqual(
-                prefill_benchmark._output_path, decode_benchmark._output_path
+            self.assertEqual(prefill_benchmark._output_path, output_path)
+            self.assertEqual(
+                prefill_benchmark._identity["disaggregation_mode"], "prefill"
             )
 
     def test_finish_waits_for_inflight_scheduler_state(self):
