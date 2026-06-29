@@ -1124,16 +1124,11 @@ class Scheduler(
         )
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
-        draft_token_to_kv_pool, model_config = kv_cache_builder.get_draft_kv_pool(
+        draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
         )
-        # Default to the target model_config so the MetadataBuffers branches
-        # below can always access it; overridden by the draft model_config
-        # when this node runs a spec module.
-        if model_config is None:
-            model_config = self.model_config
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
