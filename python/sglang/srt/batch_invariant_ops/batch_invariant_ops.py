@@ -737,6 +737,11 @@ def bmm_batch_invariant(a, b, *, out=None):
         N = b.shape[2]
         dtype = a.dtype
 
+        if dtype == torch.float32:
+            return torch.baddbmm(
+                torch.empty((B, M, N), device=a.device, dtype=dtype), a, b, beta=0.0, alpha=1.0
+            )
+
         # Allocate output
         if out is None:
             c = torch.empty((B, M, N), device=a.device, dtype=dtype)
