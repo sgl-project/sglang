@@ -1047,6 +1047,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # routes through `apply` without a MoeRunner. TODO(cwan): migrate.
             pass
 
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        # Called by FusedMoEWithLoRA when the MoE LoRA runner uses the triton
+        # backend. On the triton path process_weights_after_loading() has already
+        # upcast w13/w2 to bf16, so build the quant info directly from them --
+        # the same tensors apply()'s triton branch uses.
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+        )
+
     def _apply_sm90_cutlass(self, layer, dispatch_output):
         """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
         path (PR #3084). Routed through the unified ``MoeRunner`` -- this
