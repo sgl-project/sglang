@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 _DO_COMPILE = True
 _SELECTED_CONFIGS: Dict[Tuple[int, int, int], dict] = {}
-_PARTIAL_BUFFER_CACHE: Dict[Tuple[str, int, int, int, str, str], torch.Tensor] = {}
+_PARTIAL_BUFFER_CACHE: Dict[Tuple[str, int, int, str, str], torch.Tensor] = {}
 _CONFIG_STORE = SelectedConfigStore()
 _CONFIG_PATH_LOADED: Optional[str] = None
 _AUTOTUNE_BACKENDS = ("event", "cupti", "cudagraph")
@@ -215,13 +215,16 @@ def _get_partial_buffer(
     dtype: str,
 ) -> torch.Tensor:
     device_key = str(device)
-    key = (kernel_type, split_k, M, N, device_key, dtype)
-    if key not in _PARTIAL_BUFFER_CACHE:
-        torch_dtype = torch.float32 if dtype == "float32" else torch.bfloat16
+    key = (kernel_type, split_k, N, device_key, dtype)
+    torch_dtype = torch.float32 if dtype == "float32" else torch.bfloat16
+    if key not in _PARTIAL_BUFFER_CACHE or _PARTIAL_BUFFER_CACHE[key].shape[1] < M:
         _PARTIAL_BUFFER_CACHE[key] = torch.zeros(
             (split_k, M, N), device=device, dtype=torch_dtype
         )
-    return _PARTIAL_BUFFER_CACHE[key]
+    buffer = _PARTIAL_BUFFER_CACHE[key]
+    # Return a compact contiguous view for the requested M even when the cached
+    # backing buffer has grown larger than this call needs.
+    return buffer.as_strided((split_k, M, N), (M * N, N, 1))
 
 
 def _ceildiv(value: int, divisor: int) -> int:

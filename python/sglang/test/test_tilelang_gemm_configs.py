@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import torch
 
 from sglang.srt.layers.tilelang_gemm_wrapper import runtime
 from sglang.srt.layers.tilelang_gemm_wrapper.configs import (
@@ -131,3 +132,31 @@ def test_tilelang_gemm_clear_cache_resets_loaded_configs(tmp_path, monkeypatch):
         assert runtime.list_available_configs() == []
     finally:
         runtime.clear_cache()
+
+
+def test_tilelang_gemm_partial_buffer_cache_grows_without_m_key():
+    runtime.clear_runtime_cache()
+    try:
+        small = runtime._get_partial_buffer(
+            "splitK", 2, 4, 16, torch.device("cpu"), "float32"
+        )
+        assert small.shape == (2, 4, 16)
+        assert small.is_contiguous()
+        assert len(runtime._PARTIAL_BUFFER_CACHE) == 1
+
+        large = runtime._get_partial_buffer(
+            "splitK", 2, 8, 16, torch.device("cpu"), "float32"
+        )
+        assert large.shape == (2, 8, 16)
+        assert large.is_contiguous()
+        assert len(runtime._PARTIAL_BUFFER_CACHE) == 1
+
+        small_again = runtime._get_partial_buffer(
+            "splitK", 2, 4, 16, torch.device("cpu"), "float32"
+        )
+        assert small_again.shape == (2, 4, 16)
+        assert small_again.is_contiguous()
+        assert small_again.data_ptr() == large.data_ptr()
+        assert len(runtime._PARTIAL_BUFFER_CACHE) == 1
+    finally:
+        runtime.clear_runtime_cache()
