@@ -256,7 +256,7 @@ class CommonKVManager(BaseKVManager):
             if self._prefill_recompute_executor is None:
                 workers = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
                 if workers is None:
-                    workers = 4
+                    workers = 16
                 self._prefill_recompute_executor = (
                     concurrent.futures.ThreadPoolExecutor(
                         max_workers=max(1, workers),
@@ -705,10 +705,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert end_layer is not None, (
-            "KVArgs.prefill_end_layer must be set when using "
-            "compressed-MLA PD with PP"
-        )
+        assert (
+            end_layer is not None
+        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
