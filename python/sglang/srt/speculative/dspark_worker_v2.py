@@ -406,28 +406,29 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DSpark target layers configured."
             )
-        if (
-            model_worker_batch.extend_lens is None
-            or model_worker_batch.prefix_lens is None
-        ):
-            raise RuntimeError(
-                "DSpark expected extend_lens / prefix_lens in extend mode, got None."
-            )
         if model_worker_batch.out_cache_loc is None:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
         device = next_token_ids.device
-        ctx_lens = torch.tensor(
-            model_worker_batch.extend_lens, dtype=torch.int32, device=device
-        )
-        draft_seq_lens = torch.tensor(
-            model_worker_batch.prefix_lens, dtype=torch.int32, device=device
-        )
+        extend_lens = model_worker_batch.extend_lens
+        prefix_lens = model_worker_batch.prefix_lens
+        if extend_lens is None or prefix_lens is None:
+            reqs = getattr(model_worker_batch, "reqs", None) or []
+            if len(reqs) != len(model_worker_batch.seq_lens):
+                raise RuntimeError(
+                    "DSpark expected extend_lens / prefix_lens in extend mode, "
+                    "and could not rebuild them from batch requests."
+                )
+            prefix_lens = [len(req.prefix_indices) for req in reqs]
+            extend_lens = [req.extend_range.length for req in reqs]
+
+        ctx_lens = torch.tensor(extend_lens, dtype=torch.int32, device=device)
+        draft_seq_lens = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
         positions, _ = compute_position(
             self.model_runner.server_args.attention_backend,
             draft_seq_lens,
             ctx_lens,
-            int(sum(model_worker_batch.extend_lens)),
+            int(sum(extend_lens)),
         )
         self._materialize_main_hidden_to_draft_kv(
             main_hidden=logits_output.hidden_states,
