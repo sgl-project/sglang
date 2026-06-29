@@ -1144,9 +1144,22 @@ class ModelConfig:
 
         if quant_algo == "MIXED_PRECISION":
             architectures = getattr(self.hf_config, "architectures", []) or []
-            if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
+            is_nemotron_h = getattr(
+                self.hf_config, "model_type", None
+            ) == "nemotron_h" or any(
                 arch.startswith("NemotronH") for arch in architectures
-            ):
+            )
+            # w4afp8 is the loader for W4A8 (INT4 weight + FP8 activation) MoE
+            # checkpoints; the modelopt_mixed loader handles per-layer FP8 / NVFP4 /
+            # MXFP8. Route a MIXED_PRECISION checkpoint to modelopt_mixed only when it
+            # actually contains a microscaling / NVFP4 layer (which w4afp8 cannot
+            # consume); otherwise keep the previous w4afp8 route so existing W4A8 MoE
+            # checkpoints are unaffected.
+            layer_algos = {
+                str(info.get("quant_algo", "")).upper()
+                for info in json_quant_configs.get("quantized_layers", {}).values()
+            }
+            if is_nemotron_h or (layer_algos & {"MXFP8", "NVFP4", "MXFP4"}):
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):

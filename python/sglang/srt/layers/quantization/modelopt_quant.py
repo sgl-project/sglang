@@ -266,7 +266,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
     ):
         super().__init__()
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
@@ -753,6 +753,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
+            if quant_algo == "MXFP8":
+                return ModelOptMxfp8LinearMethod()
             return UnquantizedLinearMethod()
 
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
@@ -2449,3 +2451,162 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         return StandardCombineInput(hidden_states=output)
+
+
+class ModelOptMxfp8LinearMethod(LinearMethodBase):
+    """MXFP8 (W8A8 microscaling) linear method for ModelOpt MIXED_PRECISION checkpoints.
+
+    This class is modeled after ModelOptFp4LinearMethod.
+
+    Loads block-32 E4M3 weights with E8M0 per-block scales, as exported by
+    ModelOpt's MXFP8QTensor (weight: float8_e4m3fn [out, in]; weight_scale:
+    uint8 E8M0 biased exponent, bias=127, [out, in/32]). Activations are dynamic
+    microscaling, so there is no stored input_scale.
+
+    The GEMM runs on the FlashInfer CUTLASS MXFP8 kernel (``flashinfer.mm_mxfp8``,
+    ``backend="cutlass"``): the fp8 weight is consumed directly, the UE8M0 block
+    scale is interleaved into the kernel's swizzled layout at load, and activations
+    are dynamically MXFP8-quantized per call. Small linears that don't meet the
+    kernel's 128-tile alignment (e.g. Qwen3.5's fused in_proj_ba gate, N=16 per
+    TP=4 shard) fall back to bf16.
+    """
+
+    BLOCK = 32
+
+    def __init__(self, quant_config=None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        del input_size, output_size
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
+        if input_size_per_partition % self.BLOCK != 0:
+            raise ValueError(
+                "MXFP8 requires in_features divisible by "
+                f"{self.BLOCK}, got {input_size_per_partition}"
+            )
+        # E4M3 weight [out, in]; input_dim/output_dim drive TP sharding. Because
+        # in_per_partition is a multiple of BLOCK, every TP shard boundary is also a
+        # block boundary, so the E8M0 scale (dim 1 = in/BLOCK) shards consistently.
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale",
+            ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // self.BLOCK,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            ),
+        )
+
+    # The CUTLASS mm_mxfp8 kernel tiles the GEMM and requires per-shard N and K to
+    # be multiples of 128. Small linears that don't meet this -- notably Qwen3.5's
+    # fused in_proj_ba (b+a gates, N=64 -> 16 per TP=4 shard) -- are dequantized to
+    # bf16 and run through a plain GEMM. These are tiny (e.g. 2048x16), so the cost
+    # is negligible and bf16 is numerically safer for the decay/gate projections.
+    ALIGN = 128
+
+    def _kernel_aligned(self, layer) -> bool:
+        return (
+            layer.input_size_per_partition % self.ALIGN == 0
+            and layer.output_size_per_partition % self.ALIGN == 0
+        )
+
+    def process_weights_after_loading(self, layer) -> None:
+        if self._kernel_aligned(layer):
+            # CUTLASS mm_mxfp8 consumes the fp8 weight as-is and needs the UE8M0
+            # block scale interleaved into its swizzled layout.
+            from flashinfer import block_scale_interleave
+
+            layer.use_fused_mxfp8 = True
+            layer.weight = Parameter(
+                layer.weight.data.contiguous(), requires_grad=False
+            )
+            layer.weight_scale = Parameter(
+                block_scale_interleave(
+                    layer.weight_scale.data.contiguous().view(torch.uint8)
+                ).contiguous(),
+                requires_grad=False,
+            )
+            return
+
+        # Fallback: reconstruct the bf16 weight from the stored MX block scales
+        # (w_bf16 = fp8_weight * 2^(E8M0-127), per BLOCK along K) and drop the scale.
+        layer.use_fused_mxfp8 = False
+        w = layer.weight.data  # float8_e4m3fn [out, in]
+        out_f, in_f = w.shape
+        # uint8 E8M0 (bias 127) reinterpreted as float8_e8m0fnu casts to the 2^k value.
+        scale = layer.weight_scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+        w_bf16 = (
+            w.to(torch.float32).view(out_f, in_f // self.BLOCK, self.BLOCK)
+            * scale.unsqueeze(-1)
+        ).view(out_f, in_f).to(torch.bfloat16)
+        layer.weight = Parameter(w_bf16, requires_grad=False)
+        del layer.weight_scale
+
+    def apply(self, layer, x, bias=None):
+        if not getattr(layer, "use_fused_mxfp8", True):
+            # bf16 fallback for kernel-unaligned small linears (e.g. in_proj_ba).
+            return torch.nn.functional.linear(x, layer.weight.to(x.dtype), bias)
+
+        # FlashInfer CUTLASS MXFP8 W8A8 GEMM. Activations are dynamically MXFP8-
+        # quantized (swizzled SF layout); the weight scale was interleaved at load.
+        from sglang.srt.layers.quantization.fp8_utils import (
+            flashinfer_mm_mxfp8,
+            flashinfer_mxfp8_quantize,
+        )
+
+        out_dtype = (
+            x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        )
+        x_2d = x.view(-1, x.shape[-1]).contiguous()
+        q_x, x_scale = flashinfer_mxfp8_quantize(
+            x_2d, is_sf_swizzled_layout=True, alignment=self.BLOCK
+        )
+        weight_scale = (
+            layer.weight_scale.contiguous().t()
+            if layer.weight_scale.ndim == 2
+            else layer.weight_scale.contiguous()
+        )
+        out = flashinfer_mm_mxfp8(
+            q_x,
+            layer.weight.contiguous().t(),
+            x_scale,
+            weight_scale,
+            out_dtype=out_dtype,
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+        )
+        if bias is not None:
+            out = out + bias
+        return out.view(*x.shape[:-1], layer.weight.shape[0])

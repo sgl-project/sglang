@@ -155,6 +155,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
     </tr>
     <tr>
+      <td><code>modelopt_mixed</code></td>
+      <td>Yes (Blackwell/SM100+ for MXFP8/NVFP4 layers)</td>
+      <td>No</td>
+      <td>No</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a> mixed-precision checkpoints with per-layer FP8, NVFP4, and MXFP8; auto-selected from compatible <code>hf_quant_config.json</code> metadata</td>
+    </tr>
+    <tr>
       <td><code>nvfp4_online</code></td>
       <td>Yes (Blackwell/SM100 or SM103)</td>
       <td>No</td>
@@ -558,6 +565,14 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
         --port 30000
     ```
 
+* **Mixed Precision Models:**
+    ModelOpt `MIXED_PRECISION` checkpoints that combine FP8, NVFP4, or MXFP8 layers are auto-detected as `modelopt_mixed` when their `hf_quant_config.json` records microscaling or NVFP4 layers. Use this path for Blackwell checkpoints that mix MXFP8 dense layers with NVFP4 experts.
+    ```bash Command
+    python3 -m sglang.launch_server \
+        --model-path /path/to/modelopt-mixed-checkpoint \
+        --port 30000
+    ```
+
 ##### Creating Your Own Quantized Checkpoints
 
 If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.
@@ -616,6 +631,7 @@ python examples/usage/modelopt_quantize_and_export.py quantize \
 
 - `modelopt_fp8`: FP8 quantization with optimal performance on NVIDIA Hopper and Blackwell GPUs
 - `modelopt_fp4`: FP4 quantization with optimal performance on Nvidia Blackwell GPUs
+- `modelopt_mixed`: ModelOpt mixed-precision checkpoint loading for per-layer FP8, NVFP4, and MXFP8 on NVIDIA Blackwell GPUs
 
 ##### Python API Usage
 
