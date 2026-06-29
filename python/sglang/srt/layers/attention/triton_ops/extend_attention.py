@@ -16,6 +16,8 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -23,7 +25,7 @@ import triton.language as tl
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -31,6 +33,14 @@ if _is_cuda:
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
+_is_xpu = is_xpu()
+
+if _is_xpu:
+    # Let the Intel GPU backend emit 2D block I/O for tensor-descriptor
+    # load/stores that do not feed a tl.dot (e.g. the O_Extend output store).
+    # setdefault so an explicit user setting still wins. Must be set before the
+    # Triton kernels below are compiled.
+    os.environ.setdefault("TRITON_INTEL_ENABLE_BLOCK_IO_ALL_LAYOUTS", "1")
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -288,6 +298,7 @@ def _fwd_kernel(
     SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    MAKE_DEVICE_DESC: tl.constexpr = False,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -325,25 +336,53 @@ def _fwd_kernel(
             1.0,
         )
 
-    offs_q = (
-        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_qbs
-        + cur_head * stride_qh
-        + offs_d[None, :]
-    )
-    q = tl.load(
-        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
-    )
-
-    if BLOCK_DPE > 0:
-        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        offs_qpe = (
+    # Token rows of this sequence's extend region live in
+    # [cur_seq_extend_start_idx, cur_seq_extend_start_idx + cur_seq_len_extend);
+    # used as the descriptor row-shape so out-of-range rows zero-pad (matching
+    # mask_m) without ever reading a neighbouring sequence.
+    cur_seq_extend_end_idx = cur_seq_extend_start_idx + cur_seq_len_extend
+    q_row_off = cur_seq_extend_start_idx + cur_block_m * BLOCK_M
+    if MAKE_DEVICE_DESC:
+        # Q is a contiguous (token, head_dim) tile -> 2D device-side descriptor.
+        # Fold the head into the base so the descriptor stays 2D; col shape Lq
+        # masks the padded head_dim (== old mask_d).
+        q_desc = tl.make_tensor_descriptor(
+            base=Q_Extend + cur_head * stride_qh,
+            shape=(cur_seq_extend_end_idx, Lq),
+            strides=(stride_qbs, 1),
+            block_shape=(BLOCK_M, BLOCK_DMODEL),
+        )
+        q = q_desc.load([q_row_off, 0])
+    else:
+        offs_q = (
             (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
             * stride_qbs
             + cur_head * stride_qh
-            + offs_dpe[None, :]
+            + offs_d[None, :]
         )
-        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+        q = tl.load(
+            Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+        )
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        if MAKE_DEVICE_DESC:
+            # The rope sub-tile is the same buffer, columns [BLOCK_DMODEL, Lq).
+            qpe_desc = tl.make_tensor_descriptor(
+                base=Q_Extend + cur_head * stride_qh,
+                shape=(cur_seq_extend_end_idx, Lq),
+                strides=(stride_qbs, 1),
+                block_shape=(BLOCK_M, BLOCK_DPE),
+            )
+            qpe = qpe_desc.load([q_row_off, BLOCK_DMODEL])
+        else:
+            offs_qpe = (
+                (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+                * stride_qbs
+                + cur_head * stride_qh
+                + offs_dpe[None, :]
+            )
+            qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
     # stage 1: compute scores with prefix
     offs_n = tl.arange(0, BLOCK_N)
@@ -497,28 +536,56 @@ def _fwd_kernel(
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
-            # load k in transposed way
-            offs_k = (
-                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                + cur_kv_head * stride_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-            )
+            if MAKE_DEVICE_DESC:
+                # K_Extend is contiguous (token, head_dim). Describe it natively
+                # (last stride == 1) and transpose the loaded (BLOCK_N,
+                # BLOCK_DMODEL) block to the (BLOCK_DMODEL, BLOCK_N) the dot
+                # wants -- this keeps the fast path (a last-stride != 1
+                # descriptor would not). Row shape masks past the extend end.
+                k_desc = tl.make_tensor_descriptor(
+                    base=K_Extend + cur_kv_head * stride_kh,
+                    shape=(cur_seq_extend_end_idx, Lq),
+                    strides=(stride_kbs, 1),
+                    block_shape=(BLOCK_N, BLOCK_DMODEL),
+                )
+                k = k_desc.load([cur_seq_extend_start_idx + start_n, 0]).T
+            else:
+                # load k in transposed way
+                offs_k = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                    + cur_kv_head * stride_kh
+                    + offs_d[:, None]
+                )
+                k = tl.load(
+                    K_Extend + offs_k,
+                    mask=(mask_n[None, :]) & (mask_d[:, None]),
+                    other=0.0,
+                )
 
             qk = tl.dot(q, k, out_dtype=tl.float32)
             if BLOCK_DPE > 0:
-                offs_kpe = (
-                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                    + cur_kv_head * stride_kh
-                    + offs_dpe[:, None]
-                )
-                kpe = tl.load(
-                    K_Extend + offs_kpe,
-                    mask=mask_n[None, :],
-                    other=0.0,
-                )
+                if MAKE_DEVICE_DESC:
+                    kpe_desc = tl.make_tensor_descriptor(
+                        base=K_Extend + cur_kv_head * stride_kh,
+                        shape=(cur_seq_extend_end_idx, Lq),
+                        strides=(stride_kbs, 1),
+                        block_shape=(BLOCK_N, BLOCK_DPE),
+                    )
+                    kpe = kpe_desc.load(
+                        [cur_seq_extend_start_idx + start_n, BLOCK_DMODEL]
+                    ).T
+                else:
+                    offs_kpe = (
+                        (cur_seq_extend_start_idx + start_n + offs_n[None, :])
+                        * stride_kbs
+                        + cur_kv_head * stride_kh
+                        + offs_dpe[:, None]
+                    )
+                    kpe = tl.load(
+                        K_Extend + offs_kpe,
+                        mask=mask_n[None, :],
+                        other=0.0,
+                    )
                 qk += tl.dot(qpe, kpe)
 
             qk *= sm_scale
@@ -539,14 +606,25 @@ def _fwd_kernel(
             p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
-            offs_v = (
-                (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
-                + cur_kv_head * stride_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-            )
+            if MAKE_DEVICE_DESC:
+                # V_Extend is contiguous (token, head_dim) -> 2D descriptor;
+                # col shape Lv masks the padded head_dim (== old mask_dv).
+                v_desc = tl.make_tensor_descriptor(
+                    base=V_Extend + cur_kv_head * stride_vh,
+                    shape=(cur_seq_extend_end_idx, Lv),
+                    strides=(stride_vbs, 1),
+                    block_shape=(BLOCK_N, BLOCK_DV),
+                )
+                v = v_desc.load([cur_seq_extend_start_idx + start_n, 0])
+            else:
+                offs_v = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                    + cur_kv_head * stride_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+                )
             p = p.to(v.dtype)
             acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -563,24 +641,40 @@ def _fwd_kernel(
         lse = tl.log(deno) + e_max
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
-    offs_o = (
-        (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_obs
-        + cur_head * stride_oh
-        + offs_dv[None, :]
-    )
-    if STORE_TRANSPOSE:
-        tl.store(
-            O_Extend + offs_o.T,
-            (acc / deno[:, None]).T,
-            mask=(mask_m[:, None] & mask_dv[None, :]).T,
+    if MAKE_DEVICE_DESC:
+        # O_Extend is a contiguous (token, head_dim) tile -> 2D descriptor
+        # store; row/col shapes mask the padded tokens/head_dim (== old
+        # mask_m/mask_dv), and STORE_TRANSPOSE is HIP-only so this path is
+        # never transposed. Build over the extend extent (last stride == 1).
+        o_desc = tl.make_tensor_descriptor(
+            base=O_Extend + cur_head * stride_oh,
+            shape=(cur_seq_extend_end_idx, Lv),
+            strides=(stride_obs, 1),
+            block_shape=(BLOCK_M, BLOCK_DV),
+        )
+        o_desc.store(
+            [cur_seq_extend_start_idx + cur_block_m * BLOCK_M, 0],
+            (acc / deno[:, None]).to(O_Extend.dtype.element_ty),
         )
     else:
-        tl.store(
-            O_Extend + offs_o,
-            acc / deno[:, None],
-            mask=mask_m[:, None] & mask_dv[None, :],
+        offs_o = (
+            (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
+            * stride_obs
+            + cur_head * stride_oh
+            + offs_dv[None, :]
         )
+        if STORE_TRANSPOSE:
+            tl.store(
+                O_Extend + offs_o.T,
+                (acc / deno[:, None]).T,
+                mask=(mask_m[:, None] & mask_dv[None, :]).T,
+            )
+        else:
+            tl.store(
+                O_Extend + offs_o,
+                acc / deno[:, None],
+                mask=mask_m[:, None] & mask_dv[None, :],
+            )
 
 
 def extend_attention_fwd(
@@ -702,6 +796,7 @@ def extend_attention_fwd(
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
+        MAKE_DEVICE_DESC=_is_xpu,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
