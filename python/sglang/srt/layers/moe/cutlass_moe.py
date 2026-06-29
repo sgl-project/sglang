@@ -13,7 +13,6 @@ if _is_cuda:
         apply_shuffle_mul_sum,
         es_fp8_blockwise_scaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_mm,
-        es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
         shuffle_rows,
@@ -25,6 +24,7 @@ if _is_cuda:
         scaled_fp4_experts_quant,
         silu_and_mul_scaled_fp4_experts_quant_packed,
     )
+    from sglang.srt.layers.quantization.mxfp8_grouped_quant import mxfp8_grouped_quant
 
 
 def cutlass_fused_experts_fp8(
@@ -203,7 +203,7 @@ def cutlass_fused_experts_fp8(
         rep_a1_scales = torch.empty(
             (max_blockscale, k // 32), dtype=torch.uint8, device=device
         )
-        es_sm100_mxfp8_blockscaled_grouped_quant(
+        mxfp8_grouped_quant(
             rep_a,
             problem_sizes1,
             expert_offsets[:-1],
@@ -277,7 +277,7 @@ def cutlass_fused_experts_fp8(
         a2_scale = torch.empty(
             (max_blockscale, n // 32), dtype=torch.uint8, device=device
         )
-        es_sm100_mxfp8_blockscaled_grouped_quant(
+        mxfp8_grouped_quant(
             intermediate,
             problem_sizes2,
             expert_offsets[:-1],

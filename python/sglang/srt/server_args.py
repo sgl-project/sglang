@@ -278,6 +278,12 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
+MXFP8_GROUPED_QUANT_BACKEND_CHOICES = [
+    "auto",
+    "flashinfer",
+    "native",
+]
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
@@ -357,6 +363,10 @@ def add_fp8_gemm_runner_backend_choices(choices):
 
 def add_fp4_gemm_runner_backend_choices(choices):
     FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_mxfp8_grouped_quant_backend_choices(choices):
+    MXFP8_GROUPED_QUANT_BACKEND_CHOICES.extend(choices)
 
 
 def add_radix_eviction_policy_choices(choices):
@@ -1464,6 +1474,13 @@ class ServerArgs:
             help="Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default; selects flashinfer_cutedsl on SM100, marlin on SM80-SM90, flashinfer_cutlass otherwise (including SM120)), 'cutlass' (SGLang CUTLASS kernel), 'flashinfer_cutlass' (FlashInfer CUTLASS backend), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), 'marlin' (weight-only W4A16 fallback for SM80+). ",
             cli_name="--fp4-gemm-backend",
             choices=FP4_GEMM_RUNNER_BACKEND_CHOICES,
+        ),
+    ] = "auto"
+    mxfp8_grouped_quant_backend: A[
+        str,
+        Arg(
+            help="Choose the backend for CUTLASS MXFP8 MoE grouped quantization. Options: 'auto' (default, uses FlashInfer when available and native otherwise), 'flashinfer' (requires FlashInfer's migrated cuTile MXFP8 grouped quant kernel), 'native' (SGLang native sgl-kernel op). ",
+            choices=MXFP8_GROUPED_QUANT_BACKEND_CHOICES,
         ),
     ] = "auto"
     dsa_prefill_backend: A[

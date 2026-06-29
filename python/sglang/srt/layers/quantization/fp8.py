@@ -68,6 +68,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.mxfp8_grouped_quant import mxfp8_grouped_quant
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -1383,8 +1384,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             raise RuntimeError("MXFP8 MoE quantization requires SM100.")
 
         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
-            from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
-
             weight = weight.contiguous()
             num_experts, m, k = weight.shape
             assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
@@ -1413,7 +1412,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 dtype=torch.uint8,
                 device=weight.device,
             )
-            es_sm100_mxfp8_blockscaled_grouped_quant(
+            mxfp8_grouped_quant(
                 weight_flat,
                 problem_sizes,
                 expert_offsets,
