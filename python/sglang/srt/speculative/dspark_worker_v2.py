@@ -249,7 +249,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             positions = positions.to(torch.int64)
 
         attn_backend = self.draft_model_runner.attn_backend
-        with torch.inference_mode():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            torch.inference_mode(),
+        ):
             main_x = self.draft_model.project_main_hidden(main_hidden)
             for layer in self._draft_inner.layers:
                 layer.self_attn.kv_from_hidden(
