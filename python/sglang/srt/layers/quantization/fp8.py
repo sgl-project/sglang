@@ -1463,6 +1463,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.contiguous(), (16, 16)
                 )
             return
+        elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                build_flashinfer_mxfp8_megamoe_layer,
+            )
+
+            build_flashinfer_mxfp8_megamoe_layer(layer)
+            return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized

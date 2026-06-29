@@ -5373,6 +5373,24 @@ class ServerArgs:
         run_post_process_pass(self, _moe_runner_backend_quant_constraints)
 
         view = resolved_view(self)
+
+        if view.quantization == "mxfp8":
+            if view.moe_runner_backend == "auto":
+                view.moe_runner_backend = "flashinfer_trtllm"
+            elif view.moe_runner_backend not in [
+                "cutlass",
+                "flashinfer_megamoe",
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
+                logger.warning(
+                    "mxfp8 quantization supports only cutlass, "
+                    "flashinfer_megamoe, flashinfer_trtllm, or "
+                    "flashinfer_trtllm_routed backends. "
+                    f"Overriding {view.moe_runner_backend!r}."
+                )
+                view.moe_runner_backend = "flashinfer_trtllm"
+
         if view.moe_runner_backend == "flashinfer_cutlass":
             assert view.quantization in [
                 "modelopt_fp4",
@@ -5620,6 +5638,11 @@ class ServerArgs:
             if self.quantization == "modelopt_fp4":
                 assert is_sm100_supported(), (
                     "FlashInfer MegaMOE NVFP4 requires Blackwell (sm_100+) "
+                    "CUDA devices."
+                )
+            if self.quantization == "mxfp8":
+                assert is_sm100_supported(), (
+                    "FlashInfer MegaMOE MXFP8 requires Blackwell (sm_100+) "
                     "CUDA devices."
                 )
             logger.info(
