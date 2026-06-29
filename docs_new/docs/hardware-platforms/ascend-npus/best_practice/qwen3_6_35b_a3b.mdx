@@ -108,7 +108,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -204,7 +206,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -287,12 +291,13 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
+    --max-total-tokens 520960 \
     --max-prefill-tokens 128000 \
     --disable-radix-cache \
     --trust-remote-code \
     --max-running-requests 3 \
     --max-mamba-cache-size 10 \
-    --mem-fraction-static 0.63 \
+    --mem-fraction-static 0.9 \
     --cuda-graph-bs 1 2 3 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
@@ -301,7 +306,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -396,7 +403,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -495,7 +504,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -575,13 +586,14 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
+    --max-total-tokens 659840 \
     --max-prefill-tokens 43400 \
     --disable-radix-cache \
     --trust-remote-code \
     --prefill-max-requests 12 \
     --max-running-requests 122 \
     --max-mamba-cache-size 122 \
-    --mem-fraction-static 0.8 \
+    --mem-fraction-static 0.9 \
     --cuda-graph-bs 4 16 32 64 96 116 120 122 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
@@ -590,7 +602,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -686,7 +700,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -767,12 +783,13 @@ python3 -m sglang.launch_server \
     --attention-backend ascend \
     --device npu \
     --chunked-prefill-size -1 \
+    --max-total-tokens 470784 \
     --max-prefill-tokens 65536 \
     --trust-remote-code \
     --mamba-scheduler-strategy extra_buffer \
     --max-running-requests 40 \
-    --max-mamba-cache-size 210 \
-    --mem-fraction-static 0.71 \
+    --max-mamba-cache-size 200 \
+    --mem-fraction-static 0.9 \
     --cuda-graph-bs 2 8 16 24 32 36 40 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
@@ -781,7 +798,9 @@ python3 -m sglang.launch_server \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 4
+    --speculative-num-draft-tokens 4 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
@@ -882,7 +901,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --context-length 1010000
+    --context-length 1010000 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark
