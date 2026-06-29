@@ -18,18 +18,12 @@ on:
     - cron: '0 18 * * *'  # nightly, offset from other AMD nightly runs
   # TEMPORARY (remove or narrow before merging to main): workflow_dispatch and
   # schedule only register from the default branch, so a feature branch is
-  # otherwise invisible in the Actions tab. This lets the workflow run on pushes
-  # to the dev branch. NOTE: each push touching these files runs the full GPU
-  # benchmark on the self-hosted MI35x runner.
+  # otherwise invisible in the Actions tab. This lets the workflow run on every
+  # push to the dev branch. NOTE: each push runs the full GPU benchmark on the
+  # self-hosted MI35x runner.
   push:
     branches:
       - amd_benchmark
-    paths:
-      - '.github/workflows/nightly-benchmark-amd.yml'
-      - '.github/workflows/_benchmark-amd.yml'
-      - 'scripts/ci/amd/benchmark-configs.yaml'
-      - 'scripts/ci/amd/generate_benchmark_matrix.py'
-      - 'scripts/ci/amd/run_benchmark.sh'
   workflow_dispatch:
     inputs:
       ref:
