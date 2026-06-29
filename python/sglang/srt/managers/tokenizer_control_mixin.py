@@ -5,7 +5,6 @@ import hashlib
 import logging
 import time
 import uuid
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
@@ -544,13 +543,14 @@ class TokenizerControlMixin:
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
+            if is_paused:
+                results = await self.begin_weight_update_communicator(obj)
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            results = await self.begin_weight_update_communicator(obj)
-            return FanOutCommunicator.merge_results(results)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.begin_weight_update_communicator(obj)
+
+        return FanOutCommunicator.merge_results(results)
 
     async def end_weight_update(
         self: TokenizerManager,
@@ -562,13 +562,14 @@ class TokenizerControlMixin:
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
+            if is_paused:
+                results = await self.end_weight_update_communicator(obj)
 
-        lock_context = (
-            self.model_update_lock.writer_lock if not is_paused else nullcontext()
-        )
-        async with lock_context:
-            results = await self.end_weight_update_communicator(obj)
-            return FanOutCommunicator.merge_results(results)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await self.end_weight_update_communicator(obj)
+
+        return FanOutCommunicator.merge_results(results)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
