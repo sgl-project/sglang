@@ -1,0 +1,15 @@
+[package]
+name = "sglang-mem-cache"
+version = "0.1.0"
+edition = "2024"
+description = "Rust unified radix cache for SGLang"
+license = "Apache-2.0"
+
+[lib]
+name = "_mem_cache_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+tch = { version = "0.22", features = ["python-extension"] }
+thiserror = "1"

@@ -219,3 +219,21 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         streaming_wrapped,
     )
     return cache
+
+
+def _rust_unified_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
+    # Imported here so selecting another backend never imports the Rust
+    # orchestrator or its native extension.
+    from sglang.srt.mem_cache.rust_unified_radix_cache import (
+        RadixCacheInfraPyError,
+        RustUnifiedRadixCache,
+    )
+
+    if ctx.enable_hierarchical_cache:
+        raise RadixCacheInfraPyError(
+            "RustUnifiedRadixCache: hierarchical cache (HiCache) not supported"
+        )
+    return RustUnifiedRadixCache(ctx.params)
+
+
+register_radix_cache_backend("rust_unified_tree", _rust_unified_radix_cache_factory)

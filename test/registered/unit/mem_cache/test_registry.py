@@ -345,5 +345,46 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             self.assertIs(result, RadixCache.return_value)
 
 
+class TestRustUnifiedRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
+    """The Rust device-tier backend self-registers at import time and gates the
+    configs it does not support."""
+
+    BACKEND = "rust_unified_tree"
+
+    def test_backend_is_registered(self):
+        # Importing the registry registers the backend as a lazy factory that
+        # imports the native extension only when the backend is selected.
+        self.assertIn(self.BACKEND, registered_radix_cache_backends())
+        self.assertIsNotNone(get_radix_cache_factory(self.BACKEND))
+
+    def test_factory_rejects_hierarchical_cache(self):
+        # The factory imports the orchestrator (and native ext) on use, so this
+        # path needs the built extension.
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RadixCacheInfraPyError,
+            )
+        except ModuleNotFoundError:
+            self.skipTest("native extension not built; cannot import the backend")
+
+        factory = get_radix_cache_factory(self.BACKEND)
+        with self.assertRaises(RadixCacheInfraPyError):
+            factory(_make_ctx(backend=self.BACKEND, enable_hierarchical_cache=True))
+
+    def test_factory_without_extension_raises_helpful_error(self):
+        # Without the built native extension, selecting the backend should fail
+        # with a ModuleNotFoundError that names the missing extension.
+        try:
+            import sglang.srt.mem_cache._mem_cache_core  # noqa: F401
+        except ModuleNotFoundError:
+            pass
+        else:
+            self.skipTest("native extension is built; missing-extension path n/a")
+        factory = get_radix_cache_factory(self.BACKEND)
+        with self.assertRaises(ModuleNotFoundError) as cm:
+            factory(_make_ctx(backend=self.BACKEND))
+        self.assertIn("_mem_cache_core", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

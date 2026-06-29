@@ -213,7 +213,12 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
-def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
+def build_fixture(
+    cfg: CacheConfig,
+    *,
+    enable_kv_cache_events: bool = False,
+    tree_cls=UnifiedRadixCache,
+):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
     server_args = ServerArgs(model_path="dummy", page_size=cfg.page_size)
     # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
@@ -325,13 +330,13 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         page_size=cfg.page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
-        tree_components=cfg.components,
+        tree_components=cfg.components if tree_cls is UnifiedRadixCache else None,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
     )
-    tree = UnifiedRadixCache(params=cache_init_params)
+    tree = tree_cls(params=cache_init_params)
     tree.cache_init_params = cache_init_params
 
     return tree, allocator, req_to_token_pool
