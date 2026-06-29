@@ -9,6 +9,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -27,7 +31,9 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_info import DSparkDraftInputV2, DSparkVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.utils.common import empty_context
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +116,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
+        self.draft_tp_context = (
+            draft_tp_context if server_args.enable_dp_attention else empty_context
+        )
 
         if self.tp_rank == 0:
             logger.info(
@@ -152,10 +161,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
-        self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
 
     def clear_cache_pool(self):
         pass
@@ -455,19 +474,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=device,
         )
 
-        block_hidden = self._run_draft_block(
-            bs=bs,
-            block_ids=block_ids,
-            positions=positions,
-            verify_out_cache_loc=verify_out_cache_loc,
-            prefix_lens=prefix_lens,
-            req_pool_indices=req_pool_indices,
-        )
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            block_hidden = self._run_draft_block(
+                bs=bs,
+                block_ids=block_ids,
+                positions=positions,
+                verify_out_cache_loc=verify_out_cache_loc,
+                prefix_lens=prefix_lens,
+                req_pool_indices=req_pool_indices,
+            )
 
-        candidates, confidence = self._refine_block_markov(
-            block_hidden=block_hidden,
-            bonus_tokens=draft_input.bonus_tokens,
-        )
+            candidates, confidence = self._refine_block_markov(
+                block_hidden=block_hidden,
+                bonus_tokens=draft_input.bonus_tokens,
+            )
 
         verify_input = DSparkVerifyInput(
             draft_token=candidates.reshape(-1),

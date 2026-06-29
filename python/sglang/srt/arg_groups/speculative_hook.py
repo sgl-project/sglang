@@ -243,11 +243,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
-    if server_args.enable_dp_attention:
-        raise ValueError(
-            "Currently DSpark speculative decoding does not support dp attention."
-        )
-
     if server_args.pp_size != 1:
         raise ValueError(
             "Currently DSpark speculative decoding only supports pp_size == 1."
