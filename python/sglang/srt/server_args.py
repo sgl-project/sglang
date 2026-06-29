@@ -1798,6 +1798,14 @@ class ServerArgs:
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    enable_mamba_cache_stochastic_rounding: A[
+        bool,
+        "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
+    ] = False
+    mamba_cache_philox_rounds: A[
+        int,
+        "Number of Philox rounds to use for stochastic rounding of FP16 Mamba SSM cache writes. Triton uses the Triton default when set to 0; FlashInfer uses 10 rounds when set to 0.",
+    ] = 0
     mamba_full_memory_ratio: A[
         float,
         "The ratio of mamba state memory to full kv cache memory.",
@@ -5024,20 +5032,52 @@ class ServerArgs:
             self.grammar_backend = "xgrammar"
 
     def _handle_mamba_backend(self):
+        if self.mamba_cache_philox_rounds < 0:
+            raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
+
+        if self.enable_mamba_cache_stochastic_rounding:
+            if self.mamba_ssm_dtype != "float16":
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache requires "
+                    f"--mamba-ssm-dtype float16, got {self.mamba_ssm_dtype!r}. "
+                    "Run with --mamba-ssm-dtype float16 or disable "
+                    "--enable-mamba-cache-stochastic-rounding."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache is only "
+                    "supported on NVIDIA CUDA platforms. Disable "
+                    "--enable-mamba-cache-stochastic-rounding on this platform."
+                )
+            if self.mamba_backend == "triton" and not is_sm100_supported():
+                raise ValueError(
+                    "Stochastic rounding for the Mamba SSM cache with "
+                    "--mamba-backend triton requires SM100 with CUDA >= 12.8 "
+                    "because it uses the cvt.rs.f16x2.f32 PTX instruction. On "
+                    "H100/SM90, run with --mamba-backend flashinfer "
+                    "--mamba-ssm-dtype float16, or disable "
+                    "--enable-mamba-cache-stochastic-rounding."
+                )
+
         if self.mamba_backend == "flashinfer":
+            flashinfer_error = (
+                "FlashInfer mamba module not available, please check the "
+                "FlashInfer installation."
+            )
+            if self.enable_mamba_cache_stochastic_rounding:
+                flashinfer_error += (
+                    " Stochastic rounding with --mamba-backend flashinfer "
+                    "requires FlashInfer Mamba and --mamba-ssm-dtype float16."
+                )
             if is_flashinfer_available():
                 try:
                     import flashinfer.mamba  # noqa: F401
 
                     logger.info("Successfully imported FlashInfer mamba module")
                 except (ImportError, AttributeError):
-                    raise ValueError(
-                        "FlashInfer mamba module not available, please check flashinfer installation."
-                    )
+                    raise ValueError(flashinfer_error)
             else:
-                raise ValueError(
-                    "FlashInfer mamba module not available, please check flashinfer installation."
-                )
+                raise ValueError(flashinfer_error)
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
@@ -5588,8 +5628,16 @@ class ServerArgs:
             # Skip validation if disaggregation mode is decode.
             if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
                 assert (
-                    self.chunked_prefill_size
-                ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+                    self._required_mori_dispatch_tokens_per_rank()
+                ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
+                    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
+                    "must be >= the per-rank MoRI dispatch tokens "
+                    "(chunked_prefill_size by default)"
+                )
+
+    def _required_mori_dispatch_tokens_per_rank(self) -> int:
+        """Max tokens a single rank dispatches through MoRI in one forward."""
+        return self.chunked_prefill_size
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):

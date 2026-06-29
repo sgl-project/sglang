@@ -284,7 +284,7 @@ class PrefillBootstrapQueue:
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
-        assert req.pending_bootstrap, f"finalize_bootstrap is not idempotent"
+        assert req.pending_bootstrap, "finalize_bootstrap is not idempotent"
         if not self.ensure_metadata_buffer(req):
             return False
 
@@ -757,7 +757,6 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -1090,6 +1089,10 @@ class SchedulerDisaggregationPrefillMixin:
                 elif st == StateType.SWA:
                     state_indices.append(_swa_payload())
                 elif st == StateType.DSA:
+                    state_indices.append(_dsa_payload())
+                elif st == StateType.MINIMAX_INDEX_K:
+                    # Index rows live at the same loc as main KV on the same
+                    # page_size, so reuse the full-seq page-ids.
                     state_indices.append(_dsa_payload())
                 elif st == StateType.SWA_RING:
                     state_indices.append(_swa_ring_payload())

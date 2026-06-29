@@ -410,11 +410,12 @@ class CommonKVManager(BaseKVManager):
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
-            # If the server was bound to the wildcard address (0.0.0.0 / ::), use the
-            # actual local IP instead — a PUT to http://0.0.0.0:<port>/route is rejected
-            # with 403 by aiohttp ≥3.9 because 0.0.0.0 is not a valid HTTP Host value.
-            if host in ("0.0.0.0", "::"):
-                host = self.local_ip
+            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
+            # and can't be connected to; rewrite it to the same-family loopback,
+            # which the wildcard listener also binds.  (self.local_ip is wrong
+            # here — it can resolve to a different family than the listener,
+            # e.g. IPv6 while the server is bound to 0.0.0.0.)
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
@@ -1112,6 +1113,8 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
+                sock.setsockopt(zmq.RECONNECT_IVL, -1)
+                sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
