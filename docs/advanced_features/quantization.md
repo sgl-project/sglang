@@ -184,6 +184,19 @@ Several limitations currently affect offline quantized model loading in sglang, 
     auto_round:auto_awq and AWQ format:  These work as expected.
     </details>
 
+- CPU serving
+
+    AutoRound INT4 checkpoints (both `auto_round:auto_gptq` and `auto_round:auto_awq` packing formats) can be served on x86 CPUs:
+
+    ```bash
+    SGLANG_USE_CPU_ENGINE=1 python3 -m sglang.launch_server \
+        --model-path OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc \
+        --quantization auto-round \
+        --device cpu --trust-remote-code
+    ```
+
+    Dense (non-MoE) linear layers run on any x86 CPU: Intel CPUs with AMX use the optimized AMX path, while other x86 CPUs (e.g. AMD, or Intel without AMX) fall back to the AVX512 path. INT4 MoE experts still require an Intel CPU with AMX support.
+
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
 ```bash
