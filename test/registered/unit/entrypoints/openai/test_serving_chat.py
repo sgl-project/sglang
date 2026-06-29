@@ -675,6 +675,24 @@ class ServingChatTestCase(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "must be a JSON object"):
                     self.chat._process_messages(req, is_multimodal=False)
 
+    def test_dsv_encoders_handle_continue_final_message_only_assistant(self):
+        """continue_final_message may strip the only message; do not IndexError."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "assistant", "content": "partial answer"}],
+                    continue_final_message=True,
+                )
+
+                # The lone assistant message is removed by continue_final_message,
+                # so the encoder must tolerate the now-empty message list.
+                self.chat._process_messages(req, is_multimodal=False)
+
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None

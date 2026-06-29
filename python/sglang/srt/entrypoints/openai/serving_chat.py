@@ -760,7 +760,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
-            if messages[0]["role"] != "system":
+            # messages can be empty here when continue_final_message strips a lone
+            # trailing assistant message, so guard before indexing messages[0].
+            if not messages or messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
