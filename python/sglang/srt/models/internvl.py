@@ -641,6 +641,10 @@ class InternVLChatModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        if input_embeds is not None:
+            return self.language_model(
+                input_ids, positions, forward_batch, input_embeds
+            )
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
