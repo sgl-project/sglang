@@ -12,7 +12,7 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-R1
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1.5K | 18.9ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-18-9ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1.5K | 16ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-16ms) |
 | DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1K | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k-19-0ms) |
 | DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.9K+1K | 19.0ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k9-out1k-19-0ms) |
 | DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 6K+1.6K | 20.5ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in6k-out1k6-20-5ms) |
@@ -21,13 +21,13 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-R1
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DeepSeek-R1 | Atlas 800I A3 | 16 | PD Disaggregation | 3.5K+1.5K | 41ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-41ms) |
-| DeepSeek-R1 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50.36ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50-36ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 16 | PD Disaggregation | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-1p1d-16p-in3k5-out1k5-50ms) |
+| DeepSeek-R1 | Atlas 800I A3 | 8 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#deepseek-r1-w4a8-8p-in3k5-out1k5-50ms) |
 | DeepSeek-R1 | Atlas 800I A3 | 32 | PD Disaggregation | 3.5K+1.5K | 50ms | W8A8 INT8 | [Optimal Configuration](#deepseek-r1-w8a8-2p1d-32p-in3k5-out1k5-50ms) |
 
 ## Optimal Configuration
 
-### DeepSeek-R1 W4A8 1P1D 16P IN3K5 OUT1K5 41ms
+### DeepSeek-R1 W4A8 1P1D 16P IN3K5 OUT1K5 50ms
 
 **Model**: DeepSeek-R1
 
@@ -41,7 +41,7 @@ This page focuses on optimal configuration and benchmark results for DeepSeek-R1
 
 **Dataset**: 3.5K+1.5K
 
-**TPOT**: 41ms
+**TPOT**: 50ms
 
 #### Model Deployment
 
@@ -127,6 +127,8 @@ do
         --enable-dp-attention \
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -177,6 +179,8 @@ do
         --dtype bfloat16 \
         --tokenizer-worker-num 4 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -223,7 +227,7 @@ python -m sglang.bench_serving \
 
 <a id="single-node-pd-mixed" title="Referenced by external docs. Verify before removing."></a>
 
-### DeepSeek-R1 W4A8 8P IN3K5 OUT1K5 50.36ms
+### DeepSeek-R1 W4A8 8P IN3K5 OUT1K5 50ms
 
 **Model**: DeepSeek-R1
 
@@ -237,7 +241,7 @@ python -m sglang.bench_serving \
 
 **Dataset**: 3.5K+1.5K
 
-**TPOT**: 50.36ms
+**TPOT**: 50ms
 
 #### Model Deployment
 
@@ -305,7 +309,9 @@ python3 -m sglang.launch_server \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser deepseek-r1 \
+    --tool-call-parser deepseekv3
 ```
 
 #### Benchmark
@@ -327,7 +333,7 @@ python -m sglang.bench_serving \
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 18.9ms
+### DeepSeek-R1 W8A8 2P1D 32P IN3K5 OUT1K5 16ms
 
 **Model**: DeepSeek-R1
 
@@ -341,7 +347,7 @@ python -m sglang.bench_serving \
 
 **Dataset**: 3.5K+1.5K
 
-**TPOT**: 18.9ms
+**TPOT**: 16ms
 
 #### Model Deployment
 
@@ -427,6 +433,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -481,6 +489,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -632,6 +642,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -686,6 +698,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -833,6 +847,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -887,6 +903,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1034,6 +1052,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1088,6 +1108,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1234,6 +1256,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --enable-attn-tp-input-scattered \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \
@@ -1287,6 +1311,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser deepseek-r1 \
+        --tool-call-parser deepseekv3 \
         --disaggregation-transfer-backend ascend \
         --trust-remote-code \
         --attention-backend ascend \

@@ -20,6 +20,7 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
@@ -206,21 +207,46 @@ class FlashinferDispatcher(BaseDispatcher):
         payloads.append(topk_ids)
         payloads.append(topk_weights)
 
+        # runtime_max_tokens_per_rank selection
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # MoeAlltoAll uses fixed-geometry buffers shaped
+        # [ep_size, runtime_max_tokens_per_rank, ...], so every EP rank
+        # must pass the same value.  Three cases:
+        #
+        # Case 1 — max(dp_global):
+        #   DP attention with require_mlp_tp_gather=True.  The scheduler
+        #   all-gathered per-DP-rank token counts into dp_global (a list
+        #   of length dp_size); max() is uniform across all ranks and
+        #   sizes the workspace for the fattest rank.
+        #
+        # Case 2 — self.max_num_tokens (static capacity):
+        #   EP>1 during live (non-capture) inference with
+        #   require_mlp_tp_gather=False.  The scheduler only stored the
+        #   local token count, so x.shape[0] can differ across EP ranks
+        #   that span different DP groups.  The static workspace capacity
+        #   is the same on every rank, so it is always safe.
+        #
+        # Case 3 — x.shape[0] (actual tensor size):
+        #   Everything else: EP=1, sequence-parallel (post-scatter), or
+        #   CUDA graph capture.  In these situations x.shape[0] is the
+        #   same on every EP rank.  During CUDA graph capture
+        #   (get_is_capture_mode()=True) the graph runner ensures all
+        #   ranks capture with the same batch size, so we skip Case 2
+        #   and land here — using x.shape[0] avoids baking the
+        #   (potentially much larger) static max into the captured graph.
         dp_global = get_dp_global_num_tokens()
         if dp_global is not None and len(dp_global) > 1:
-            # DP attention: multiple DP ranks with different token counts.
-            # Use the max across ranks so the A2A workspace fits the fattest.
+            # Case 1
             self.runtime_max_tokens_per_rank = max(dp_global)
-        elif self.ep_size > 1 and not require_mlp_tp_gather(get_global_server_args()):
-            # require_mlp_tp_gather is False, so the scheduler collapsed
-            # global_num_tokens to the local count; x.shape[0] then differs
-            # across EP ranks and breaks the fixed-geometry MoeAlltoAll. Use
-            # the static all-rank capacity instead.
+        elif (
+            self.ep_size > 1
+            and not get_is_capture_mode()
+            and not require_mlp_tp_gather(get_global_server_args())
+        ):
+            # Case 2
             self.runtime_max_tokens_per_rank = self.max_num_tokens
         else:
-            # dp_size=1 or SP: use the actual input tensor size (post-scatter
-            # in SP mode, full batch otherwise).  Avoids the pre-scatter
-            # scheduler count which can exceed the workspace cap.
+            # Case 3
             self.runtime_max_tokens_per_rank = x.shape[0]
         if self.has_dummy_token:
             self.runtime_max_tokens_per_rank = max(self.runtime_max_tokens_per_rank, 1)

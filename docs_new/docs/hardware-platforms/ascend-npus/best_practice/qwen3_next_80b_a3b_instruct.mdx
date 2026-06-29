@@ -116,7 +116,9 @@ python3 -m sglang.launch_server \
     --max-running-requests 2 \
     --cuda-graph-bs 2 \
     --mamba-ssm-dtype bfloat16 \
-    --speculative-draft-model-path $DRAFT_MODEL_PATH
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -230,7 +232,9 @@ python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --moe-a2a-backend deepep \
     --deepep-mode auto \
-    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150
+    --cuda-graph-bs 1 2 3 4 5 6 7 8 10 12 14 16 18 20 22 24 26 28 30 32 40 44 48 52 56 60 64 72 80 88 96 104 112 120 128 136 144 150 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -344,7 +348,9 @@ python3 -m sglang.launch_server \
     --max-running-requests 16 \
     --cuda-graph-bs 2 4 8 \
     --mamba-ssm-dtype bfloat16 \
-    --speculative-draft-model-path $DRAFT_MODEL_PATH
+    --speculative-draft-model-path $DRAFT_MODEL_PATH \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen3_coder
 ```
 
 #### Benchmark

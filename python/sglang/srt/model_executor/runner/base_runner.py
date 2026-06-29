@@ -302,7 +302,13 @@ class BaseRunner(ABC):
             "modelopt_fp8",
             "modelopt_mixed",
         )
-        fp8_gemm_needs_autotune = (
+        # Online MXFP8 (microscaling) linears dispatch to flashinfer's
+        # ``mm_mxfp8``, which the flashinfer fp8 autotune dummy run does not
+        # exercise correctly -- it triggers an illegal memory access inside the
+        # mxfp8 cutlass cubin. The mxfp8 gemm is fixed-config and needs no
+        # tuning, so skip autotune for these models.
+        model_uses_mxfp8 = "mxfp8" in (mr.model_config.quantization or "")
+        fp8_gemm_needs_autotune = not model_uses_mxfp8 and (
             get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
             or (model_uses_modelopt_fp8 and is_sm100_supported())
         )
