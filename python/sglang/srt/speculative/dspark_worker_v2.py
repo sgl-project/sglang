@@ -174,7 +174,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
-            self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+            self._draft_worker.init_cuda_graphs()
 
     def clear_cache_pool(self):
         pass
