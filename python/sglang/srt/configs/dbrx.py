@@ -118,6 +118,8 @@ class DbrxFFNConfig(PretrainedConfig):
         super().__init__()
         if ffn_act_fn is None:
             ffn_act_fn = {"name": "silu"}
+        if isinstance(moe_jitter_eps, int) and not isinstance(moe_jitter_eps, bool):
+            moe_jitter_eps = float(moe_jitter_eps)
         self.ffn_act_fn = ffn_act_fn
         self.ffn_hidden_size = ffn_hidden_size
         self.moe_num_experts = moe_num_experts

@@ -4,13 +4,17 @@ Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
 """
 
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.utils.hf_transformers.common import (
+    AutoConfig,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
@@ -25,6 +29,45 @@ from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_comp
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+# ---------------------------------------------------------------------------
+# DBRX config compatibility
+# ---------------------------------------------------------------------------
+
+
+class TestDbrxConfigCompat(unittest.TestCase):
+    def test_autoconfig_accepts_integer_moe_jitter_eps(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "config.json").write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DbrxForCausalLM"],
+                        "attn_config": {
+                            "clip_qkv": 8,
+                            "kv_n_heads": 8,
+                            "model_type": "",
+                            "rope_theta": 500000,
+                        },
+                        "ffn_config": {
+                            "ffn_act_fn": {"name": "silu"},
+                            "ffn_hidden_size": 10752,
+                            "model_type": "",
+                            "moe_jitter_eps": 0,
+                            "moe_loss_weight": 0.05,
+                            "moe_num_experts": 16,
+                            "moe_top_k": 4,
+                        },
+                        "model_type": "dbrx",
+                    }
+                )
+            )
+
+            config = AutoConfig.from_pretrained(tmpdir)
+
+        self.assertIsInstance(config, DbrxConfig)
+        self.assertEqual(config.ffn_config.moe_jitter_eps, 0.0)
+        self.assertIsInstance(config.ffn_config.moe_jitter_eps, float)
 
 
 # ---------------------------------------------------------------------------
