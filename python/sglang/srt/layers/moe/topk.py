@@ -1803,9 +1803,8 @@ def _post_process_topk_ids(
     _per_rank_shared_slot_remap = (
         num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
     )
-    _aiter_fused_append_remap = _aiter_append and _per_rank_shared_slot_remap
 
-    if _aiter_fused_append_remap:
+    if _aiter_append and _per_rank_shared_slot_remap:
         # Fused path: append shared experts AND apply the per-rank shared-slot
         # remap in a single Triton kernel. This replaces the original
         # fused_append_shared_experts() + eager per-rank shared-slot remap pair,
@@ -1864,7 +1863,7 @@ def _post_process_topk_ids(
             N,  # base id for shared experts
         )
 
-    if _per_rank_shared_slot_remap and not _aiter_fused_append_remap:
+    elif _per_rank_shared_slot_remap:
         # DeepEP/MegaMOE: remap to interleaved expert layout where each rank's
         # shared expert has a unique ID for dispatch routing. The aiter path
         # above already performs this remap in the fused append kernel.
