@@ -175,7 +175,11 @@ class SchedulerBatchResultProcessor:
             return
 
         page_size = getattr(self.tree_cache, "page_size", 1)
-        prompt_fill_ids = req.fill_ids[:prompt_len]
+        # req.fill_len was truncated to kv_committed_len (= prompt_len) when the
+        # prompt-once flag was armed (decode.py), so get_fill_ids() already
+        # returns exactly the committed prompt snapshot. Use it directly instead
+        # of the legacy req.fill_ids attribute (removed by the fill_ids refactor).
+        prompt_fill_ids = req.get_fill_ids()
         radix_key_len = len(
             RadixKey(
                 prompt_fill_ids,
@@ -187,12 +191,11 @@ class SchedulerBatchResultProcessor:
             req.allow_radix_cache_insert_once = False
             return
 
-        old_fill_ids = req.fill_ids
         old_cache_protected_len = getattr(req, "cache_protected_len", 0)
         old_swa_evicted_seqlen = getattr(req, "swa_evicted_seqlen", 0)
         old_force_leaf_creation = getattr(req, "force_radix_leaf_creation", False)
+        old_fill_len = req.fill_len
 
-        req.fill_ids = prompt_fill_ids
         # DSV4 prompt donation only needs a full-attention radix leaf. Mark the
         # whole donated key as SWA-evicted so the SWA component stays tombstoned,
         # but force full leaf creation so later matches can reuse the full prefix.
@@ -219,10 +222,10 @@ class SchedulerBatchResultProcessor:
                     req.rid,
                     prompt_len,
                     radix_key_len,
-                    len(old_fill_ids),
+                    old_fill_len,
                 )
         finally:
-            req.fill_ids = old_fill_ids
+            req.fill_len = old_fill_len
             req.swa_evicted_seqlen = old_swa_evicted_seqlen
             req.force_radix_leaf_creation = old_force_leaf_creation
             if req.cache_protected_len < old_cache_protected_len:

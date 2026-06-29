@@ -22,6 +22,7 @@ def _make_queue(*, page_size: int, enable_decode_radix: bool = True):
             disaggregation_decode_enable_radix_cache=enable_decode_radix
         ),
         running_batch=SimpleNamespace(reqs=[]),
+        enable_decode_hicache=False,
     )
     queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
     queue.token_to_kv_pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
@@ -145,17 +146,21 @@ def test_dsv4_decode_radix_mtp_guard_rejects_non_minimal_paths():
 
 
 def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
+    # fill_len is truncated to prompt_len (=3) when the prompt-once flag is
+    # armed, so get_fill_ids() returns the committed prompt snapshot [1,2,3].
     req = SimpleNamespace(
         dsv4_decode_radix_cache_prompt_once=True,
         dsv4_decode_radix_cache_prompt_len=3,
         skip_radix_cache_insert=True,
         allow_radix_cache_insert_once=False,
-        fill_ids=[1, 2, 3, 4, 5],
+        full_untruncated_fill_ids=[1, 2, 3, 4, 5],
+        fill_len=3,
         extra_key=None,
         req_pool_idx=0,
         cache_protected_len=0,
         swa_evicted_seqlen=4,
     )
+    req.get_fill_ids = lambda: req.full_untruncated_fill_ids[: req.fill_len]
     tree_cache = SimpleNamespace(
         inserted_fill_ids=[],
         inserted_swa_evicted_seqlens=[],
@@ -166,7 +171,7 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     )
 
     def cache_unfinished_req(inserted_req, **_kwargs):
-        tree_cache.inserted_fill_ids.append(list(inserted_req.fill_ids))
+        tree_cache.inserted_fill_ids.append(list(inserted_req.get_fill_ids()))
         tree_cache.inserted_swa_evicted_seqlens.append(
             inserted_req.swa_evicted_seqlen
         )
@@ -198,7 +203,8 @@ def test_dsv4_prompt_insert_uses_prompt_snapshot_and_restores_fill_ids():
     assert tree_cache.inserted_swa_evicted_seqlens == [2]
     assert tree_cache.inserted_force_leaf_creation == [True]
     assert token_to_kv_pool_allocator.freed_swa_indices == [[11, 12]]
-    assert req.fill_ids == [1, 2, 3, 4, 5]
+    assert req.full_untruncated_fill_ids == [1, 2, 3, 4, 5]
+    assert req.fill_len == 3
     assert req.cache_protected_len == 2
     assert req.swa_evicted_seqlen == 4
     assert req.force_radix_leaf_creation is False
@@ -259,9 +265,9 @@ def test_dsv4_decode_radix_match_uses_full_match_for_full_only_leaf():
         swa_uuid_for_lock=None,
     )
 
-    prefix_indices, prefix_len = DecodePreallocQueue._match_prefix_and_lock(queue, req)
+    result = DecodePreallocQueue._match_prefix_and_lock(queue, req)
 
-    assert prefix_indices.tolist() == [1, 2]
-    assert prefix_len == 2
+    assert result.prefix_indices.tolist() == [1, 2]
+    assert result.l1_prefix_len == 2
     assert tree_cache.captured_params.return_full_match is True
     assert req.last_node is node
