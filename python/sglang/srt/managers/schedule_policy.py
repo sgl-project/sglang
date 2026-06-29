@@ -787,8 +787,13 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
+            # ignore_eos cannot finish early; input_embeds cannot be safely
+            # retracted (#14110's output_ids clear leaves per-step accumulators
+            # stale). Reserve the full budget for both to avoid over-admission.
             new_token_ratio = (
-                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+                1.0
+                if r.sampling_params.ignore_eos or r.input_embeds is not None
+                else self.new_token_ratio
             )
             tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
                 r.output_ids
