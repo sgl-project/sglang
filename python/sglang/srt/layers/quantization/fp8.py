@@ -1562,6 +1562,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif self.block_quant:
             # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
+            # SwiGLU gate/up half-swap for the FlashInfer cutlass backend.
+            # FlashInfer's cutlass GLU activation computes silu(second FC1 half) *
+            # (first FC1 half), but the fused gate/up weight is stored here as
+            # [gate; up] and the correct activation is silu(gate) * up, i.e.
+            # silu(first half) * (second half). Swap the two FC1 (w13) weight halves
+            # and the matching [128]-block scale rows once at load time so the kernel
+            # computes the correct activation. This is a pure weight-layout
+            # permutation applied once; the tensor-core path is unchanged.
+            if get_moe_runner_backend().is_flashinfer_cutlass() and not getattr(
+                layer, "_w13_gate_up_swapped", False
+            ):
+                _I = layer.w13_weight.shape[1] // 2
+                layer.w13_weight.data = torch.cat(
+                    [layer.w13_weight.data[:, _I:, :], layer.w13_weight.data[:, :_I, :]],
+                    dim=1,
+                ).contiguous()
+                _si = layer.w13_weight_scale_inv.shape[1] // 2
+                layer.w13_weight_scale_inv.data = torch.cat(
+                    [
+                        layer.w13_weight_scale_inv.data[:, _si:, :],
+                        layer.w13_weight_scale_inv.data[:, :_si, :],
+                    ],
+                    dim=1,
+                ).contiguous()
+                layer._w13_gate_up_swapped = True
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
@@ -1787,6 +1812,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_flashinfer_cutlass():
+            # The flashinfer_cutlass backend calls the stateless cutlass_fused_moe
+            # directly in apply(), so no MoeRunner needs to be constructed here.
+            pass
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -1821,6 +1850,53 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        # Route plain fp8 block-scale MoE through FlashInfer's cutlass_fused_moe
+        # (tensor-core FP8 block-scale grouped GEMM) when the flashinfer_cutlass
+        # backend is selected and the weights are block-quantized.
+        if get_moe_runner_backend().is_flashinfer_cutlass() and self.block_quant:
+            from flashinfer.fused_moe import cutlass_fused_moe as _fi_cutlass_fused_moe
+            from flashinfer.fused_moe.core import ActivationType as _ActType
+            from sglang.srt.layers.moe.token_dispatcher import (
+                StandardCombineInput as _StdCombine,
+            )
+            from sglang.srt.utils import next_power_of_2 as _next_pow2
+
+            _act_map = {
+                "silu": _ActType.Swiglu,
+                "relu2": _ActType.Relu2,
+            }
+            _topk_weights, _topk_ids, _ = dispatch_output.topk_output
+            _output_dtype = x.dtype
+            _fc1_scales = layer.w13_weight_scale_inv.contiguous()
+            _fc2_scales = layer.w2_weight_scale_inv.contiguous()
+            _topk_ids_int = _topk_ids.to(torch.int).contiguous()
+            _topk_weights = _topk_weights.contiguous()
+            _activation_type = _act_map.get(
+                self.moe_runner_config.activation, _ActType.Swiglu
+            )
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                _symm_output = torch.empty_like(x)
+            _output = _fi_cutlass_fused_moe(
+                input=x,
+                token_selected_experts=_topk_ids_int,
+                token_final_scales=_topk_weights,
+                fc1_expert_weights=layer.w13_weight,
+                fc2_expert_weights=layer.w2_weight,
+                output_dtype=_output_dtype,
+                quant_scales=[_fc1_scales, _fc2_scales],
+                output=_symm_output,
+                use_deepseek_fp8_block_scale=True,
+                ep_size=layer.moe_ep_size,
+                ep_rank=layer.moe_ep_rank,
+                tp_size=layer.moe_tp_size,
+                tp_rank=layer.moe_tp_rank,
+                tune_max_num_tokens=_next_pow2(x.shape[0]),
+                activation_type=_activation_type,
+            )[0]
+            return _StdCombine(hidden_states=_output)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
