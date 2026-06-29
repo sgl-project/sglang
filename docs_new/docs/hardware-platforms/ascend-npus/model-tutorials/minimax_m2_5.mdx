@@ -29,7 +29,7 @@ v0.5.13 or a later version.
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g. `--chunked-prefill-size 8192` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g. `--cuda-graph-bs 8 16 24 32 48 64 80` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g. `--cuda-graph-bs 8 16 24 32 48 64 80` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 

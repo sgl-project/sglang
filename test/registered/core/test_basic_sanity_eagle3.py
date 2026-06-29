@@ -70,7 +70,7 @@ class TestBasicSanityEagle3(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
                 "0.7",
