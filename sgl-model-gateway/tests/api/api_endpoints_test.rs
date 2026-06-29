@@ -352,7 +352,7 @@ mod model_info_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/get_model_info")
+            .uri("/model_info")
             .body(Body::empty())
             .unwrap();
 
@@ -461,7 +461,7 @@ mod model_info_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/get_model_info")
+            .uri("/model_info")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -519,7 +519,7 @@ mod model_info_tests {
         for _ in 0..5 {
             let req = Request::builder()
                 .method("GET")
-                .uri("/get_model_info")
+                .uri("/model_info")
                 .body(Body::empty())
                 .unwrap();
 
@@ -554,7 +554,7 @@ mod model_info_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/get_model_info")
+            .uri("/model_info")
             .body(Body::empty())
             .unwrap();
 
@@ -1245,7 +1245,7 @@ mod cache_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/get_loads")
+            .uri("/v1/loads")
             .body(Body::empty())
             .unwrap();
 
