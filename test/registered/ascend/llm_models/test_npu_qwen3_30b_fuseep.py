@@ -1,7 +1,9 @@
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import (
+    QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,8 +31,8 @@ class TestQwen330Bw8a8FuseEP(GSM8KAscendMixin, CustomTestCase):
         128,
         "--tp-size",
         4,
-        "--moe-a2a-backend"
-        "ascend_fuseep"
+        "--moe-a2a-backend",
+        "ascend_fuseep",
         "--fuseep-mode",
         2
     ]
