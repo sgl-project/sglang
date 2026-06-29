@@ -151,7 +151,6 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
@@ -216,10 +215,6 @@ def _freqs_cis_to_cos_sin(
     sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
-
-
-# Shared freqs_cis tensors keyed by the RoPE parameters.
-_PRECOMPUTED_FREQS_CIS: dict[tuple, torch.Tensor] = {}
 
 
 if TYPE_CHECKING:
