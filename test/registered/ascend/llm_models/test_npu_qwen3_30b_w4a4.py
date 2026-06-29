@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import QWEN3_30B_W4A4_MODELSLIM_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import ECO_TECH_QWEN3_30B_A3B_W4A4_LAOS_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -15,7 +15,7 @@ class TestQwen330Bw4a4(GSM8KAscendMixin, CustomTestCase):
     [Test Target] Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS
     """
 
-    model = QWEN3_30B_W4A4_MODELSLIM_WEIGHTS_PATH
+    model = ECO_TECH_QWEN3_30B_A3B_W4A4_LAOS_WEIGHTS_PATH
     accuracy = 0.85
     other_args = [
         "--trust-remote-code",
