@@ -1416,29 +1416,6 @@ class UpdateRefReqOutput(BaseReq):
     message: str = ""
 
 
-@dataclass
-class ReleaseRefReqInput(BaseReq):
-    rid: str = ""
-
-
-@dataclass
-class ReleaseRefReqOutput(BaseReq):
-    success: bool = True
-    message: str = ""
-
-
-@dataclass
-class UpdateRefReqInput(BaseReq):
-    rid: str = ""
-    new_priority: int = 0
-
-
-@dataclass
-class UpdateRefReqOutput(BaseReq):
-    success: bool = True
-    message: str = ""
-
-
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
