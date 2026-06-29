@@ -6,7 +6,12 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#ifdef USE_ROCM
+#include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#else
 #include <cub/cub.cuh>
+#endif
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
@@ -529,7 +534,8 @@ struct MoeLoraAlignBlockSizeKernel {
 
       dim3 blockDim(num_thread + fill_threads);
       auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
-      RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
+      RuntimeDeviceCheck(
+          cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
 
       LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
           kernel,
