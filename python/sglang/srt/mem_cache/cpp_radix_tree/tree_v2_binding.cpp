@@ -24,6 +24,7 @@ PYBIND11_MODULE(radix_tree_cpp, m) {
       .def("protected_size", &RadixTree::protected_size)
       .def("total_size", &RadixTree::total_size)
       .def("writing_through", &RadixTree::writing_through)
+      .def("insert_and_match", &RadixTree::insert_and_match)
       .def("loading_onboard", &RadixTree::loading_onboard)
       .def("commit_writing_through", &RadixTree::commit_writing_through)
       .def("commit_loading_onboard", &RadixTree::commit_loading_onboard)

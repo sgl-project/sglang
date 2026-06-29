@@ -104,6 +104,39 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   throw std::runtime_error("Not implemented yet");
 }
 
+std::tuple<
+    std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>,
+    std::size_t,
+    std::vector<at::Tensor>,
+    std::size_t,
+    NodeHandle,
+    NodeHandle>
+RadixTree::insert_and_match(const token_vec_t& _key, at::Tensor value) {
+  if (m_impl->disabled) return {};
+  _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
+
+  const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
+  const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
+
+  const auto device_node = host_prefix_length != key.size()
+                               ? m_impl->create_device_node(
+                                     host_node,
+                                     {key.begin() + host_prefix_length, key.end()},
+                                     value.slice(/*dim=*/0, host_prefix_length, key.size()))
+                               : host_node;
+  walk_to_root(device_node, [&](TreeNode* n) { n->hit_count++; });
+
+  std::vector<at::Tensor> indices{};
+  walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
+  std::reverse(indices.begin(), indices.end());
+
+  std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
+  if (!m_impl->use_hicache) {
+    return {std::move(result), host_prefix_length, std::move(indices), 0, node2id(device_node), node2id(host_node)};
+  }
+  throw std::runtime_error("Not implemented yet");
+}
+
 std::tuple<IOTicket, std::vector<at::Tensor>> RadixTree::loading_onboard(NodeHandle, at::Tensor) {
   if (m_impl->disabled) return {};
   throw std::runtime_error("Not implemented yet");
