@@ -136,10 +136,11 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
 
-    # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
-    # it triggers OOM with low memory host. Extract the threads number to
-    # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
-    # "--threads=32"
+    # nvcc --threads is appended below via SGL_KERNEL_COMPILE_THREADS (default 32).
+    # On low-memory or unified-memory hosts (Jetson, GB10/DGX Spark) the
+    # effective concurrency (MAX_JOBS x --threads) can OOM-kill the build
+    # mid-compile; override with -DSGL_KERNEL_COMPILE_THREADS=1 or =2.
+    # See README "Limit build resource usage" for empirical peak-memory data.
 
     # Supress warnings
     "-Xcompiler=-Wno-clang-format-violations"
@@ -156,7 +157,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
-set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
+set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "nvcc --threads value (default 32). Lower (e.g. 1-2) for low-memory or unified-memory hosts; see README 'Limit build resource usage' for peak-memory data.")
 
 # When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
 if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
