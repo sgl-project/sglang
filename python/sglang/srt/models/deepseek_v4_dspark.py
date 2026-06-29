@@ -7,10 +7,15 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    _DpGatheredBufferWrapper,
+    dp_gather_replicate,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -165,6 +170,17 @@ class DeepseekV4DSparkModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
+        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+            input_ids_global = torch.empty(
+                (_DpGatheredBufferWrapper._global_dp_buffer_len, 1),
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
+            input_ids_global = input_ids_global.squeeze(-1)
+        else:
+            input_ids_global = input_ids
+
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
         for layer in self.layers:
@@ -174,7 +190,7 @@ class DeepseekV4DSparkModel(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 input_ids=input_ids,
-                input_ids_global=input_ids,
+                input_ids_global=input_ids_global,
                 prev_residual=prev_residual,
                 prev_post=prev_post,
                 prev_comb=prev_comb,
