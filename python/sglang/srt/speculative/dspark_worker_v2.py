@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import deepcopy
 from typing import Optional, Tuple
 
@@ -36,6 +37,11 @@ from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_loc
 from sglang.srt.utils.common import empty_context
 
 logger = logging.getLogger(__name__)
+_DEBUG_HANG = os.getenv("SGLANG_DSPARK_DEBUG_HANG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -132,6 +138,29 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self.markov_rank,
                 self.confidence_threshold,
             )
+
+    def _debug_hang(self, stage: str, batch: Optional[ScheduleBatch] = None, **kwargs):
+        if not _DEBUG_HANG:
+            return
+
+        torch.get_device_module(self.device).synchronize()
+        mode = getattr(batch, "forward_mode", None) if batch is not None else None
+        seq_lens = getattr(batch, "seq_lens", None) if batch is not None else None
+        local_bs = None if seq_lens is None else int(seq_lens.shape[0])
+        global_tokens = (
+            getattr(batch, "global_num_tokens", None) if batch is not None else None
+        )
+        logger.warning(
+            "[DSPARK_DEBUG_HANG] stage=%s tp_rank=%s dp_rank=%s local_bs=%s "
+            "mode=%s global_num_tokens=%s extra=%s",
+            stage,
+            self.tp_rank,
+            self.dp_rank,
+            local_bs,
+            mode,
+            global_tokens,
+            kwargs,
+        )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -273,8 +302,20 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         _dsv4_be._DSPARK_BLOCK_FULL_ATTN = int(self.block_size)
         try:
+            self._debug_hang(
+                "draft_forward_begin",
+                batch,
+                bs=bs,
+                input_tokens=int(block_ids.numel()),
+            )
             with torch.inference_mode():
                 draft_runner_out = self.draft_model_runner.forward(draft_forward_batch)
+            self._debug_hang(
+                "draft_forward_end",
+                batch,
+                bs=bs,
+                input_tokens=int(block_ids.numel()),
+            )
         finally:
             _dsv4_be._DSPARK_BLOCK_FULL_ATTN = 0
 
@@ -484,6 +525,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_size = int(self.block_size)
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
+        self._debug_hang("decode_begin", model_worker_batch, bs=bs)
 
         block_ids = torch.full(
             (bs, block_size), self.noise_token_id, dtype=torch.int64, device=device
@@ -503,6 +545,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=block_size,
             device=device,
         )
+        self._debug_hang(
+            "assign_cache_locs_end",
+            model_worker_batch,
+            bs=bs,
+            cache_tokens=int(verify_out_cache_loc.numel()),
+        )
 
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
@@ -519,10 +567,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 req_pool_indices=req_pool_indices,
             )
 
+            self._debug_hang("refine_begin", model_worker_batch, bs=bs)
             candidates, confidence = self._refine_block_markov(
                 block_hidden=block_hidden,
                 bonus_tokens=draft_input.bonus_tokens,
             )
+            self._debug_hang("refine_end", model_worker_batch, bs=bs)
 
         verify_input = DSparkVerifyInput(
             draft_token=candidates.reshape(-1),
@@ -532,21 +582,26 @@ class DSparkWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         model_worker_batch.out_cache_loc = verify_out_cache_loc
+        self._debug_hang("prepare_verify_begin", model_worker_batch, bs=bs)
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
+        self._debug_hang("prepare_verify_end", model_worker_batch, bs=bs)
+        self._debug_hang("target_verify_begin", model_worker_batch, bs=bs)
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        self._debug_hang("target_verify_end", model_worker_batch, bs=bs)
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
         target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
             bs, block_size
         )
+        self._debug_hang("accept_begin", model_worker_batch, bs=bs)
 
         if bs == 0:
             correct_len = torch.empty((0,), dtype=torch.int64, device=device)
@@ -565,6 +620,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 1
             )
             commit_lens = correct_len.to(torch.int32) + 1
+        self._debug_hang("accept_end", model_worker_batch, bs=bs)
 
         out_tokens = torch.empty((bs, block_size), dtype=torch.int64, device=device)
         if block_size > 1:
@@ -589,10 +645,21 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._block_pos_offsets.unsqueeze(0)
                 < commit_lens.unsqueeze(1).to(torch.int64)
             ).reshape(-1)
+            self._debug_hang(
+                "materialize_verify_hidden_begin",
+                model_worker_batch,
+                bs=bs,
+                materialize_tokens=int(commit_mask.sum().item()),
+            )
             self._materialize_main_hidden_to_draft_kv(
                 main_hidden=hidden.reshape(-1, hidden.shape[-1])[commit_mask],
                 cache_loc=verify_out_cache_loc[commit_mask],
                 positions=positions[commit_mask],
+            )
+            self._debug_hang(
+                "materialize_verify_hidden_end",
+                model_worker_batch,
+                bs=bs,
             )
 
         logits_output.hidden_states = None
