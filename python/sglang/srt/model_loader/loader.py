@@ -327,6 +327,30 @@ def _post_load_weights(model: nn.Module) -> None:
         model.post_load_weights()
 
 
+def _trigger_lazy_module_aliases(model: nn.Module) -> None:
+    """Eagerly install module aliases that some models otherwise defer until
+    the first forward pass.
+
+    Today this only handles the DeepSeek-V2 MLA pattern where
+    ``DeepseekV2AttentionMLA`` initializes ``self.attn_mha.kv_b_proj`` to
+    ``None`` and lazily binds ``self.attn_mha.kv_b_proj = self.kv_b_proj``
+    inside ``forward_prepare``. Saved sharded checkpoints are produced
+    after a warmup forward, so they encode the parameter under the
+    ``...attn_mha.kv_b_proj.*`` key (winning the dedup in
+    ``_filter_subtensors`` because it sorts before the outer
+    ``...kv_b_proj.*``). The load-time ``state_dict`` view must therefore
+    reflect the same aliasing or the checkpoint keys are unresolvable.
+    See sgl-project/sglang#25332.
+    """
+    for module in model.modules():
+        attn_mha = getattr(module, "attn_mha", None)
+        outer_kv_b_proj = getattr(module, "kv_b_proj", None)
+        if attn_mha is None or outer_kv_b_proj is None:
+            continue
+        if getattr(attn_mha, "kv_b_proj", "MISSING") is None:
+            attn_mha.kv_b_proj = outer_kv_b_proj
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -1524,6 +1548,12 @@ class ShardedStateLoader(BaseModelLoader):
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
+                # Saved sharded checkpoints reflect aliases the model would only
+                # set up on first forward (e.g. DeepSeek-V2 MLA's
+                # `attn_mha.kv_b_proj`). Install them eagerly so the state_dict
+                # view we match against the checkpoint keys is consistent with
+                # what `save_model` produced. See #25332.
+                _trigger_lazy_module_aliases(model)
             rank = get_tensor_model_parallel_rank()
             pattern = os.path.join(
                 local_model_path,
