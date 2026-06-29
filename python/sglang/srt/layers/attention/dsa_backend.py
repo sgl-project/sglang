@@ -1236,8 +1236,8 @@ class DeepseekSparseAttnBackend(
 
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
-        fused_metadata_generation_succeeded = False
-        target_verify_ctx_lens_filled = False
+        used_fused_metadata_generation = False
+        target_verify_ctx_lens_written = False
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = metadata.page_table_1.shape[1]
@@ -1266,9 +1266,9 @@ class DeepseekSparseAttnBackend(
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
                 seqlens_expanded = cache_seqlens
                 page_indices = None
-                fused_metadata_generation_succeeded = True
+                used_fused_metadata_generation = True
 
-            if not fused_metadata_generation_succeeded:
+            if not used_fused_metadata_generation:
                 cache_seqlens = seq_lens.to(torch.int32)
                 metadata.cache_seqlens_int32.copy_(cache_seqlens)
                 metadata.cu_seqlens_k[1:].copy_(
@@ -1319,7 +1319,7 @@ class DeepseekSparseAttnBackend(
                     next_n=self.speculative_num_draft_tokens,
                     paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
                 )
-                target_verify_ctx_lens_filled = paged_mqa_ctx_lens_2d is not None
+                target_verify_ctx_lens_written = paged_mqa_ctx_lens_2d is not None
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[
                     : self.speculative_num_draft_tokens * bs
@@ -1328,9 +1328,9 @@ class DeepseekSparseAttnBackend(
                     : self.speculative_num_draft_tokens * bs
                 ]
                 page_indices = None
-                fused_metadata_generation_succeeded = True
+                used_fused_metadata_generation = True
 
-            if not fused_metadata_generation_succeeded:
+            if not used_fused_metadata_generation:
                 cache_seqlens = (seq_lens + self.speculative_num_draft_tokens).to(
                     torch.int32
                 )
@@ -1412,9 +1412,9 @@ class DeepseekSparseAttnBackend(
                 seqlens_expanded = metadata.dsa_seqlens_expanded[:total_extend_len]
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32[:total_extend_len]
                 page_indices = None
-                fused_metadata_generation_succeeded = True
+                used_fused_metadata_generation = True
 
-            if not fused_metadata_generation_succeeded:
+            if not used_fused_metadata_generation:
                 cache_seqlens = seq_lens.to(torch.int32)
                 metadata.cache_seqlens_int32.copy_(cache_seqlens)
                 metadata.cu_seqlens_k[1:].copy_(
@@ -1451,7 +1451,7 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
             else:
                 schedule_seqlens_expanded = seqlens_expanded
-            if target_verify_ctx_lens_filled:
+            if target_verify_ctx_lens_written:
                 seqlens_32_2d = metadata.paged_mqa_ctx_lens_2d
             else:
                 seqlens_32_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
@@ -1462,7 +1462,7 @@ class DeepseekSparseAttnBackend(
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
-            if not target_verify_ctx_lens_filled:
+            if not target_verify_ctx_lens_written:
                 if metadata.paged_mqa_ctx_lens_2d is None:
                     object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
                 else:
@@ -1474,7 +1474,7 @@ class DeepseekSparseAttnBackend(
             and self.dsa_index_topk is not None
         )
 
-        if not fused_metadata_generation_succeeded:
+        if not used_fused_metadata_generation:
             metadata.dsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
                 torch.cumsum(dsa_cache_seqlens, dim=0, dtype=torch.int32)
             )
@@ -1482,7 +1482,7 @@ class DeepseekSparseAttnBackend(
 
         assert self.real_page_size == metadata.page_size
         if self.real_page_size > 1:
-            if not fused_metadata_generation_succeeded:
+            if not used_fused_metadata_generation:
                 real_table = self._transform_table_1_to_real(page_indices)
                 new_rows = real_table.shape[0]
                 new_cols = real_table.shape[1]
