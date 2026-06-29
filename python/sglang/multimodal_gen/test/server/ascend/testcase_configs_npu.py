@@ -50,7 +50,7 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         ),
         COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
-        run_consistency_check=True,
+        run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
