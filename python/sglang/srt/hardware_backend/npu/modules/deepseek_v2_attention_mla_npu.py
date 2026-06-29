@@ -25,6 +25,28 @@ if TYPE_CHECKING:
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 
+def _get_fp8_kv_runtime_scale(
+    m: "DeepseekV2AttentionMLA", attr_name: str, device: torch.device
+) -> torch.Tensor | None:
+    if m.kv_cache_dtype != "fp8_e4m3":
+        return None
+
+    scale = getattr(m, attr_name, None)
+    if scale is None:
+        fallback_attr = f"_{attr_name}_fallback"
+        scale = getattr(m, fallback_attr, None)
+        if scale is None:
+            fallback = torch.ones(
+                (1, getattr(m, "num_local_kv_heads", 1)),
+                dtype=torch.float32,
+                device=device,
+            )
+            m.register_buffer(fallback_attr, fallback, persistent=False)
+            scale = getattr(m, fallback_attr)
+
+    return scale.to(device=device, dtype=torch.float32)
+
+
 # region MHA
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
@@ -90,6 +112,9 @@ def forward_mha_prepare_npu(
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
         ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+        c_kv_scale = _get_fp8_kv_runtime_scale(
+            m, "fak_descale_reciprocal", q.device
+        )
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
@@ -99,7 +124,7 @@ def forward_mha_prepare_npu(
             k_rope_cache,
             ckv_cache,
             k_rope_scale=None,
-            c_kv_scale=None,
+            c_kv_scale=c_kv_scale,
             k_rope_offset=None,
             c_kv_offset=None,
             epsilon=m.kv_a_layernorm.variance_epsilon,
@@ -167,22 +192,37 @@ def forward_mla_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
+                m.v_head_dim,
                 m.quant_config,
+                _get_fp8_kv_runtime_scale(
+                    m, "fak_descale_reciprocal", hidden_states.device
+                ),
             )
+        else:
+            m.mla_preprocess.runtime_refs["fak_descale_reciprocal"] = (
+                _get_fp8_kv_runtime_scale(
+                    m, "fak_descale_reciprocal", hidden_states.device
+                )
+            )
+        preprocess_result = m.mla_preprocess.forward(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
         (
             q_pe,
             k_pe,
             q_nope_out,
             k_nope,
+            _,
             forward_batch,
             zero_allocator,
             positions,
-        ) = m.mla_preprocess.forward(
-            positions, hidden_states, forward_batch, zero_allocator
-        )
+            _,
+            dequant_scale_q_nope,
+        ) = preprocess_result
         topk_indices = None
     else:
         q_lora = None
+        dequant_scale_q_nope = None
         if m.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -225,6 +265,51 @@ def forward_mla_prepare_npu(
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
+        if m.kv_cache_dtype == "fp8_e4m3":
+            cos = m.rotary_emb.cos_cached.to(q_nope_out.device)
+            sin = m.rotary_emb.sin_cached.to(q_nope_out.device)
+            q_nope_shape = q_nope_out.shape
+            q_nope_out, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(
+                q_nope_out.reshape(-1, q_nope_shape[-1]),
+                dst_type=torch.float8_e4m3fn,
+            )
+            q_nope_out = q_nope_out.view(q_nope_shape)
+            dequant_scale_q_nope = dequant_scale_q_nope.view(q_nope_shape[:-1]).to(
+                torch.float32
+            )
+
+            fp8_kv_scale = _get_fp8_kv_runtime_scale(
+                m, "fak_descale_float", q_pe.device
+            )
+            q_pe = (q_pe / dequant_scale_q_nope.unsqueeze(-1) / fp8_kv_scale).to(
+                torch.bfloat16
+            )
+
+            ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+            c_kv_scale = _get_fp8_kv_runtime_scale(
+                m, "fak_descale_reciprocal", q_nope_out.device
+            )
+
+            _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
+                latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),
+                m.kv_a_layernorm.weight,
+                cos,
+                sin,
+                forward_batch.out_cache_loc.to(torch.int64),
+                k_rope_cache,
+                ckv_cache,
+                k_rope_scale=None,
+                c_kv_scale=c_kv_scale,
+                k_rope_offset=None,
+                c_kv_offset=None,
+                epsilon=m.kv_a_layernorm.variance_epsilon,
+                cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+                is_output_kv=True,
+            )
+            k_pe = k_pe.reshape(-1, 1, m.qk_rope_head_dim)
+            k_nope = k_nope.reshape(-1, 1, m.kv_lora_rank)
+            dequant_scale_q_nope = dequant_scale_q_nope.unsqueeze(-1)
+
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
@@ -249,6 +334,7 @@ def forward_mla_prepare_npu(
         zero_allocator,
         positions,
         topk_indices,
+        dequant_scale_q_nope,
     )
 
 
@@ -262,7 +348,22 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    dequant_scale_q_nope=None,
 ) -> torch.Tensor:
+    extra_kwargs = {}
+    if topk_indices is not None:
+        extra_kwargs["topk_indices"] = topk_indices
+    if dequant_scale_q_nope is not None:
+        extra_kwargs["dequant_scale_q_nope"] = dequant_scale_q_nope
+        extra_kwargs["fp8_kv_scale"] = _get_fp8_kv_runtime_scale(
+            m, "fak_descale_float", q_pe.device
+        )
+        if (
+            m.kv_cache_dtype == "fp8_e4m3"
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            extra_kwargs["save_kv_cache"] = False
+
     attn_output = m.attn_mqa(
         q_nope_out,
         k_nope,
@@ -270,7 +371,7 @@ def forward_mla_core_npu(
         forward_batch,
         q_rope=q_pe,
         k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        **extra_kwargs,
     )
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
@@ -518,8 +619,10 @@ def npu_mla_preprocess(
             k_nope,
             q_lora,
             forward_batch,
+            zero_allocator,
             positions,
             dynamic_scale,
+            _,
         ) = m.mla_preprocess.forward(
             positions, hidden_states, forward_batch, zero_allocator
         )
@@ -535,9 +638,12 @@ def npu_mla_preprocess(
                     k_pe,
                     q_nope_out,
                     k_nope,
+                    _,
                     forward_batch,
                     zero_allocator,
                     positions,
+                    _,
+                    _,
                 ) = m.mla_preprocess.forward(
                     positions, hidden_states, forward_batch, zero_allocator
                 )
@@ -554,9 +660,12 @@ def npu_mla_preprocess(
                 k_pe,
                 q_nope_out,
                 k_nope,
+                _,
                 forward_batch,
                 zero_allocator,
                 positions,
+                _,
+                _,
             ) = m.mla_preprocess.forward(
                 positions, hidden_states, forward_batch, zero_allocator
             )

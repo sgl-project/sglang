@@ -4,8 +4,13 @@
 # modelslim_mxfp8 imports ModelSlimLinearScheme from this package,
 # so the base class must be imported first.
 # isort: off
-from .modelslim_scheme import ModelSlimLinearScheme, ModelSlimMoEScheme
+from .modelslim_scheme import (
+    ModelSlimKVSchemeBase,
+    ModelSlimLinearScheme,
+    ModelSlimMoEScheme,
+)
 from .modelslim_mxfp8 import ModelSlimMXFP8Scheme
+from .modelslim_q_fp8_dynamic_kv_fp8 import ModelSlimQFP8DynamicKVFP8Scheme
 
 # isort: on
 from .modelslim_w4a4_int4 import ModelSlimW4A4Int4
@@ -17,7 +22,9 @@ from .modelslim_w8a8_int8_moe import ModelSlimW8A8Int8MoE
 __all__ = [
     "ModelSlimLinearScheme",
     "ModelSlimMoEScheme",
+    "ModelSlimKVSchemeBase",
     "ModelSlimMXFP8Scheme",
+    "ModelSlimQFP8DynamicKVFP8Scheme",
     "ModelSlimW8A8Int8",
     "ModelSlimW4A4Int4",
     "ModelSlimW4A4Int4MoE",

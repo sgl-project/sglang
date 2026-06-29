@@ -313,6 +313,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.k_store_dtype = self.store_dtype
+        self.v_store_dtype = self.store_dtype
+        if self.dtype == torch.float8_e4m3fn:
+            self.k_store_dtype = torch.float8_e4m3fn
+            self.v_store_dtype = torch.bfloat16
 
         self.custom_mem_pool = None
 
@@ -326,7 +331,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     1,
                     self.kv_lora_rank,
                 ),
-                dtype=self.store_dtype,
+                dtype=self.k_store_dtype,
                 device=self.device,
             )
             self.v_buffer = torch.zeros(
@@ -337,7 +342,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     1,
                     self.qk_rope_head_dim,
                 ),
-                dtype=self.store_dtype,
+                dtype=self.v_store_dtype,
                 device=self.device,
             )
             self.index_k_buffer = None
@@ -350,7 +355,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.k_store_dtype,
                     device=self.device,
                 )
 
@@ -390,7 +395,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
+        if self.k_store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
@@ -398,7 +403,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-        if self.store_dtype != self.dtype:
+        if self.v_store_dtype == self.store_dtype and self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 

@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoE
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
-__all__ = ["ModelSlimLinearScheme", "ModelSlimMoEScheme"]
+__all__ = ["ModelSlimLinearScheme", "ModelSlimMoEScheme", "ModelSlimKVSchemeBase"]
 
 
 class ModelSlimLinearScheme(BaseLinearScheme):
@@ -98,4 +98,14 @@ class ModelSlimMoEScheme(BaseMoEScheme):
         :param bias: bias parameter
 
         """
+        raise NotImplementedError
+
+
+class ModelSlimKVSchemeBase:
+    @abstractmethod
+    def create_weights(self, *args, **kwargs):
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
         raise NotImplementedError

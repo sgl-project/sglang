@@ -684,6 +684,9 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
+            if hasattr(self_attn, "refresh_fa_k_scale_params"):
+                self_attn.refresh_fa_k_scale_params()
+
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
         """

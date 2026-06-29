@@ -193,6 +193,22 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_npu_before_atlas_a5() -> bool:
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        return False
+
+    get_device_name = getattr(torch.npu, "get_device_name", None)
+    if get_device_name is not None:
+        device_name = get_device_name(0)
+    else:
+        import torch_npu
+
+        device_name = torch_npu.npu.get_device_name(0)
+
+    return not str(device_name).startswith("Ascend950")
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (

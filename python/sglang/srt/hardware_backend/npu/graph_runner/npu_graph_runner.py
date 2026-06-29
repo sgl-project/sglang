@@ -111,11 +111,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self.if_use_v2 = any(
-            arch
-            in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
-            for arch in (model_runner.model_config.hf_config.architectures or [])
+        architectures = getattr(model_runner.model_config.hf_config, "architectures", [])
+        if_use_v2 = any(
+            arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
+            for arch in architectures
         )
+        if_use_v2 = if_use_v2 or (
+            model_runner.model_config.attention_arch == AttentionArch.MLA
+            and model_runner.server_args.kv_cache_dtype == "fp8_e4m3"
+        )
+        self.if_use_v2 = if_use_v2
 
     def _init_arch_map(self):
         if self.is_dllm:
