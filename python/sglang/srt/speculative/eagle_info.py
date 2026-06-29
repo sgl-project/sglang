@@ -180,22 +180,6 @@ class EagleDraftInput(SpecInput):
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """Decode-phase `hidden_states` width: draft self-chain output
-        (draft model writes its own last hidden back via `capture_for_decode`
-        and the draft loop). Returns None when the draft architecture doesn't
-        consume the field (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return worker.draft_runner.model_config.spec_hidden_size
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return worker.draft_runner.model_config.dtype
-
-    @classmethod
     def create_idle_input(
         cls,
         device: torch.device,
@@ -338,39 +322,6 @@ class EagleDraftExtendInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """Extend-phase `hidden_states` width: target's `spec_hidden_size`,
-        widened to `num_aux * target_hidden` for EAGLE-3 aux mode. Returns
-        None when the draft architecture doesn't consume the field
-        (e.g., STANDALONE)."""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        target_cfg = worker.target_worker.model_runner.model_config
-        if not (
-            worker.speculative_algorithm.is_eagle3()
-            and worker.eagle_use_aux_hidden_state
-        ):
-            return target_cfg.spec_hidden_size
-
-        hf_config = target_cfg.hf_config
-
-        # `num_aux` resolution: explicit attr > eagle_config layer_ids > default 3.
-        num_aux = getattr(hf_config, "num_aux_hidden_states", None)
-        if num_aux is None:
-            eagle_config = getattr(hf_config, "eagle_config", None) or {}
-            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-            num_aux = len(layer_ids) if layer_ids else 3
-
-        target_hidden = getattr(hf_config, "target_hidden_size", target_cfg.hidden_size)
-        return target_hidden * num_aux
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(

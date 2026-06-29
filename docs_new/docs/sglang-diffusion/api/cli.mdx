@@ -83,6 +83,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--sp-degree &#123;N&#125;`: sequence parallelism size
 - `--ulysses-degree &#123;N&#125;` and `--ring-degree &#123;N&#125;`: USP parallelism controls
 - `--enable-cfg-parallel &#123;true|false&#125;`: enable or explicitly disable CFG parallelism
+- `--warmup-mode &#123;off|request|server&#125;`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--attention-backend &#123;BACKEND&#125;`: attention backend for native SGLang and diffusers pipelines
 - `--component-attention-backends &#123;MAP&#125;`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config &#123;CONFIG&#125;`: attention backend configuration

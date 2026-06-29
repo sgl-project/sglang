@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
+)
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
@@ -194,7 +197,12 @@ def build_kv_cache(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        page_size=page_size,
+        # When dcp enabled, kv_pool_allocator.page_size is page_size * dcp_size.
+        # TreeCache.page_size should keep the same as allocator.page_size to
+        # avoid kv page eviction conflicts.
+        page_size=(
+            page_size if not dcp_enabled() else token_to_kv_pool_allocator.page_size
+        ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
             attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
@@ -205,6 +213,7 @@ def build_kv_cache(
         eviction_policy=server_args.radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
+        enable_session_radix_cache=server_args.enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
@@ -218,6 +227,7 @@ def build_kv_cache(
             server_args=server_args,
             params=params,
             is_hybrid_swa=is_hybrid_swa,
+            full_tokens_per_layer=full_tokens_per_layer,
             is_hybrid_ssm=is_hybrid_ssm,
             enable_hierarchical_cache=enable_hierarchical_cache,
             disable_radix_cache=disable_radix_cache,
