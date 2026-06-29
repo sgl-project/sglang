@@ -66,6 +66,27 @@ def _pool_handle_cache_clear():
         _pool_storage_cache.clear()
 
 
+# Dedicated CUDA stream(s) for IPC copy-out, one per device. The host-side sync
+# that enforces correct producer->consumer ordering (see _copy_slice_tensor_to_target)
+# is issued on this stream so it waits ONLY for the small device-local feature
+# copy, not for unrelated ViT/LLM work already queued on the consumer's default
+# stream.
+_ipc_copy_streams: dict = {}
+_ipc_copy_streams_lock = threading.Lock()
+
+
+def _get_ipc_copy_stream(device: torch.device):
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _ipc_copy_streams.get(idx)
+    if stream is None:
+        with _ipc_copy_streams_lock:
+            stream = _ipc_copy_streams.get(idx)
+            if stream is None:
+                stream = torch.cuda.Stream(device=idx)
+                _ipc_copy_streams[idx] = stream
+    return stream
+
+
 class ShmSyncBuffer:
     def __init__(self, byte_size: int = 4):
         self.buffer = shared_memory.SharedMemory(
@@ -411,11 +432,32 @@ class CudaIpcTensorTransportProxy:
         recons_shape,
         recons_dtype,
     ):
+        copy_stream = _get_ipc_copy_stream(rebuild_device)
         with torch.cuda.device(rebuild_device):
-            reconstructed_tensor = torch.empty(
-                recons_shape, dtype=recons_dtype, device=rebuild_device
-            ).contiguous()
-            reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
+            # Run the copy-out on a dedicated stream (and allocate the destination
+            # there too) so the mandatory host-side sync below waits ONLY for this
+            # device-local copy -- not for any ViT/LLM work already queued on the
+            # consumer's default stream.
+            with torch.cuda.stream(copy_stream):
+                reconstructed_tensor = torch.empty(
+                    recons_shape, dtype=recons_dtype, device=rebuild_device
+                ).contiguous()
+                reconstructed_tensor.view(torch.int8).view(-1).copy_(slice_tensor)
+
+            # CRITICAL ordering fix: block until the copy-out has actually
+            # COMPLETED before signalling (via the shm flag) that the producer may
+            # recycle this pool slice. Without it the flag is raised while the copy
+            # is still in flight; the recycler (default 50ms) then reclaims the
+            # slice, a new request overwrites it, and this tensor ends up holding
+            # ANOTHER request's image -> cross-request leakage (use-after-free).
+            copy_stream.synchronize()
+
+            # The destination was allocated on copy_stream but is consumed on the
+            # caller's stream; record it so the caching allocator does not reuse
+            # its memory while downstream work still reads it.
+            reconstructed_tensor.record_stream(
+                torch.cuda.current_stream(rebuild_device)
+            )
 
             open(SHM_LOCK_FILE, "a").close()
             # write the shm_sync_buffer with a file lock

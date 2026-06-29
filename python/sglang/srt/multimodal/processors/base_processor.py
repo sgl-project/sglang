@@ -211,6 +211,16 @@ class BaseMultimodalProcessor(ABC):
             mp_context=mp.get_context("fork"),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
+        # Dedicated pool to offload the sync HF processor (process_and_combine_mm_data,
+        # which tokenizes text + resize/patchifies images, ~hundreds of ms) off the
+        # TokenizerManager event loop so concurrent image requests don't serialize on
+        # it. Separate from io_executor so it doesn't starve image decode/fetch. Safe
+        # because the shared HF fast tokenizer is wrapped thread-safe at TM init (see
+        # TokenizerManager.maybe_init_thread_safe_tokenizer / thread_safe_tokenizer.py).
+        self.mm_processor_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=envs.SGLANG_MM_PROC_WORKERS.get(),
+            thread_name_prefix="sgl-mmproc",
+        )
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -1222,6 +1232,15 @@ class BaseMultimodalProcessor(ABC):
         )
         if isinstance(available_slice, torch.Tensor):
             available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
+            # CRITICAL ordering fix: ensure the device-local write into the shared
+            # pool has actually landed before this proxy (which carries the pool
+            # offset) can be sent to and read by the consumer PROCESS. Producer and
+            # consumer use independent CUDA contexts/streams, so the shm flag is the
+            # only cross-process signal and it cannot order GPU work -- without this
+            # sync the consumer may read a not-yet-written slice. Cheap: the
+            # tokenizer-worker process has little other GPU work and the copy is
+            # usually already complete by the time we reach here.
+            torch.cuda.current_stream(available_slice.device).synchronize()
             return CudaIpcTensorTransportProxy(
                 data=available_slice,
                 info_data=tensor,

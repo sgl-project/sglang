@@ -726,6 +726,14 @@ class Envs:
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
 
+    # VLM: multimodal processor offload (run the sync HF processor off the
+    # TokenizerManager event loop on a thread pool). SGLANG_TOKENIZER_SAFETY picks
+    # how the shared HF fast tokenizer is made thread-safe under the offload:
+    # "lock" (zero-copy RLock) or "pool" (deepcopy pool of WORKERS+1 tokenizers).
+    SGLANG_ENABLE_MM_PROCESSOR_OFFLOAD = EnvBool(False)
+    SGLANG_MM_PROC_WORKERS = EnvInt(4)
+    SGLANG_TOKENIZER_SAFETY = EnvStr("lock")
+
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)

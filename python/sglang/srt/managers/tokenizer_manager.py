@@ -272,6 +272,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Initialize tokenizer and multimodalprocessor
         self.init_tokenizer_and_processor()
 
+        # Make the shared HF tokenizer thread-safe when the mm processor is offloaded
+        self.maybe_init_thread_safe_tokenizer()
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
@@ -378,6 +381,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
+
+    def maybe_init_thread_safe_tokenizer(self):
+        # When the multimodal processor is offloaded to threads
+        # (SGLANG_ENABLE_MM_PROCESSOR_OFFLOAD), the shared HF fast tokenizer (a PyO3 RefCell) is
+        # called concurrently from the TM event loop and the offload threads,
+        # which races with "RuntimeError: Already borrowed". Wrap it in-place so
+        # every aliased reference becomes thread-safe. SGLANG_TOKENIZER_SAFETY
+        # selects the strategy: "pool" (deepcopy pool) or "lock" (shared RLock,
+        # zero-copy).
+        if self.tokenizer is None or not envs.SGLANG_ENABLE_MM_PROCESSOR_OFFLOAD.get():
+            return
+        try:
+            from sglang.srt.utils.thread_safe_tokenizer import (
+                maybe_make_thread_pool,
+                maybe_make_thread_safe_lock,
+            )
+
+            if envs.SGLANG_TOKENIZER_SAFETY.get().lower() == "pool":
+                pool_copies = envs.SGLANG_MM_PROC_WORKERS.get() + 1
+                maybe_make_thread_pool(self.tokenizer, copies=pool_copies)
+                logger.info(
+                    "Tokenizer thread-safe POOL enabled: copies=%d", pool_copies
+                )
+            else:
+                maybe_make_thread_safe_lock(self.tokenizer)
+                logger.info("Tokenizer thread-safe LOCK enabled (zero-copy)")
+        except Exception as e:
+            logger.warning(
+                "Tokenizer thread-safe init failed: %s; continuing without", e
+            )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.asyncio.Context(2)
