@@ -857,7 +857,7 @@ class Envs:
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
-    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
+    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(True)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
 
