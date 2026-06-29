@@ -40,6 +40,17 @@ from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_n
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
+
+
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config):
+    if getattr(config, "sliding_window", None) is not None:
+        return config.sliding_window - 1
+    else:
+        return None
+
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -76,6 +87,7 @@ class Qwen3Attention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         rms_norm_eps: float = None,
         attention_bias: bool = False,
+        sliding_window_size: Optional[int] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
@@ -153,6 +165,7 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=sliding_window_size,
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
@@ -335,6 +348,18 @@ class Qwen3DecoderLayer(nn.Module):
             rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
+        # Determine per-layer sliding window size
+        interleaved_sliding_window = get_attention_sliding_window_size(config)
+        layer_types = getattr(config, "layer_types", None)
+        max_window_layers = getattr(config, "max_window_layers", None)
+
+        is_sliding = False
+        if interleaved_sliding_window is not None:
+            if layer_types is not None and layer_id < len(layer_types):
+                is_sliding = layer_types[layer_id] == "sliding_attention"
+            elif max_window_layers is not None:
+                is_sliding = layer_id < max_window_layers
+
         self.self_attn = Qwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -348,6 +373,7 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
+            sliding_window_size=(interleaved_sliding_window if is_sliding else None),
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
@@ -508,6 +534,9 @@ class Qwen3ForCausalLM(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
