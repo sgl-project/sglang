@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeAlias, Union
 
 import torch
@@ -27,6 +28,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
 from sglang.srt.utils.common import is_sm120_supported
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -354,6 +357,20 @@ def fused_scale(
 
 
 class C4IndexerBackendMixin:
+    @staticmethod
+    def _log_nonpaged_indexer_decision_once(
+        instance, *, decision: str, detail: str
+    ) -> None:
+        attr = f"_nonpaged_indexer_{decision}_logged"
+        if getattr(instance, attr, False):
+            return
+        logger.info(
+            "[DSV4_NONPAGED_INDEXER] %s: %s",
+            decision.replace("_", " "),
+            detail,
+        )
+        setattr(instance, attr, True)
+
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
@@ -481,9 +498,34 @@ class C4IndexerBackendMixin:
             forward_batch=forward_batch,
             indexer_metadata=indexer_metadata,
         ):
+            if (
+                forward_batch.forward_mode == ForwardMode.EXTEND
+                and envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get()
+            ):
+                C4IndexerBackendMixin._log_nonpaged_indexer_decision_once(
+                    self,
+                    decision="eligibility_fallback",
+                    detail=(
+                        f"original_mode={getattr(forward_batch, '_original_forward_mode', None)}, "
+                        f"batch_size={forward_batch.batch_size}, "
+                        f"prefill_graph={indexer_metadata.use_prefill_cuda_graph}, "
+                        f"fp4={c4_indexer.use_fp4_indexer}, "
+                        f"tilelang={envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()}, "
+                        f"aiter={envs.SGLANG_OPT_USE_AITER_INDEXER.get()}, "
+                        f"torch_fallback={envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()}, "
+                        f"cp_size={get_attention_cp_size()}, "
+                        f"hisparse={self.hisparse_coordinator is not None}, "
+                        f"cuda={is_cuda()}, hip={is_hip()}"
+                    ),
+                )
             return None
         if indexer_metadata.nonpaged_plan is not None:
             return indexer_metadata.nonpaged_plan
+
+        def reject_plan(reason: str) -> None:
+            C4IndexerBackendMixin._log_nonpaged_indexer_decision_once(
+                self, decision="plan_fallback", detail=reason
+            )
 
         if (
             forward_batch.seq_lens is None
@@ -493,6 +535,7 @@ class C4IndexerBackendMixin:
             or forward_batch.extend_start_loc is None
             or forward_batch.extend_num_tokens is None
         ):
+            reject_plan("incomplete EXTEND metadata")
             return None
 
         def to_cpu_int_list(values) -> Optional[List[int]]:
@@ -511,6 +554,7 @@ class C4IndexerBackendMixin:
             or len(seq_lens_cpu) != 1
             or extend_lens_cpu[0] <= 0
         ):
+            reject_plan("invalid CPU sequence-length metadata")
             return None
 
         actual_queries = extend_lens_cpu[0]
@@ -524,10 +568,16 @@ class C4IndexerBackendMixin:
             or page_table.shape[0] < query_rows
             or c4_seq_lens.numel() < query_rows
         ):
+            reject_plan(
+                "single-request shape mismatch "
+                f"(query_rows={query_rows}, extend_num_tokens="
+                f"{forward_batch.extend_num_tokens})"
+            )
             return None
 
         final_c4_len = seq_lens_cpu[0] // 4
         if final_c4_len <= 0:
+            reject_plan(f"empty C4 prefix (sequence length={seq_lens_cpu[0]})")
             return None
 
         request_row = forward_batch.extend_start_loc[:1].to(torch.int64)
@@ -716,6 +766,15 @@ class C4IndexerBackendMixin:
         )
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
+            C4IndexerBackendMixin._log_nonpaged_indexer_decision_once(
+                self,
+                decision="selected",
+                detail=(
+                    f"query_rows={nonpaged_plan.query_rows}, "
+                    f"c4_len={nonpaged_plan.max_seq_len}, "
+                    f"max_seqlen_k={nonpaged_plan.max_seqlen_k}"
+                ),
+            )
             logits = self._forward_nonpaged_indexer(
                 q_indexer=q_indexer,
                 weights=weights,
