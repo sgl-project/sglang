@@ -565,9 +565,10 @@ class FusedMoE(torch.nn.Module):
             if not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
+                if loaded_weight.shape[shard_dim] != shard_size:
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, shard_size * tp_rank, shard_size
+                    )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
