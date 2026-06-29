@@ -16,6 +16,8 @@ else:
 
 
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is not None and not x.is_contiguous():
+        return x.contiguous()    
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
