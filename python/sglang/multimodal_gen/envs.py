@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
+    SGLANG_DIFFUSION_LITE_ATTENTION_BATCH_CFG: bool = True
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -262,6 +263,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
+    ),
+    # A/B kill-switch for batching CFG cond+uncond into a single batch=2 forward
+    # under the LiteAttention backend. On by default (required for correct
+    # LiteAttention skip-list state). Set to 0 to fall back to per-branch forwards.
+    "SGLANG_DIFFUSION_LITE_ATTENTION_BATCH_CFG": _lazy_bool(
+        "SGLANG_DIFFUSION_LITE_ATTENTION_BATCH_CFG", "true"
     ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"

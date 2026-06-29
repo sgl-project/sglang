@@ -1053,12 +1053,12 @@ class ServerArgs(DisaggServerArgsMixin):
                 k, v = pair.split("=", 1)
                 k = k.strip()
                 v = v.strip()
-                if v.lower() == "true":
-                    v = True
-                elif v.lower() == "false":
-                    v = False
-                elif v.replace(".", "", 1).isdigit():
-                    v = float(v) if "." in v else int(v)
+                # Coerce to bool/int/float via JSON (true/false, 4, -6.0);
+                # leave bare strings (e.g. "fa") untouched on failure.
+                try:
+                    v = json.loads(v)
+                except json.JSONDecodeError:
+                    pass
                 config[k] = v
             return config
         except Exception:

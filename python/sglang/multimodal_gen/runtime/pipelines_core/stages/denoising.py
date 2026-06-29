@@ -832,6 +832,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Prepare scheduler state before entering the shared denoising loop."""
+        if self.attn_backend.get_enum() == AttentionBackendEnum.LITE_ATTENTION:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.lite_attn import (
+                ensure_lite_attention_registry,
+                reset_all_lite_attention_skip_states,
+            )
+
+            ensure_lite_attention_registry()
+            reset_all_lite_attention_skip_states()
         self._reset_scheduler_loop_state(ctx.scheduler)
         ctx.scheduler.set_begin_index(0)
         self._init_cfg_gate_state(ctx, batch, server_args)
@@ -1452,6 +1460,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         denoising_end_time = time.time()
 
+        if (
+            not ctx.is_warmup
+            and self.attn_backend.get_enum() == AttentionBackendEnum.LITE_ATTENTION
+        ):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.lite_attn import (
+                save_lite_attention_calibration,
+            )
+
+            save_lite_attention_calibration()
+
         if num_timesteps > 0 and not ctx.is_warmup:
             self.log_info(
                 "average time per step: %.4f seconds",
@@ -1562,6 +1580,30 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
             return _unwrap(pred_t)
 
+        # LiteAttention requires cond+uncond in a single batch=2 forward so its
+        # double-buffered, batch-indexed temporal skip list keeps the two streams
+        # separate and advances its phase once per timestep. Running the branches
+        # as separate batch=1 passes (below) cross-contaminates the skip masks.
+        if self._should_batch_cfg_for_lite_attention(
+            server_args, cfg_policy, batch, current_model
+        ):
+            batched = self._try_predict_noise_cfg_batched(
+                current_model=current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=timestep_index,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                guidance=guidance,
+                latents=latents,
+                cfg_policy=cfg_policy,
+                cfg_scale=cfg_scale,
+                server_args=server_args,
+            )
+            if batched is not None:
+                return batched
+
         if (
             cfg_gate_state
             and cfg_gate_state["active"]
@@ -1628,6 +1670,178 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             cfg_scale,
             server_args.pipeline_config,
             cfg_parallel=server_args.enable_cfg_parallel,
+        )
+
+    def _should_batch_cfg_for_lite_attention(
+        self,
+        server_args: ServerArgs,
+        cfg_policy: CFGPolicy,
+        batch: Req,
+        current_model: nn.Module,
+    ) -> bool:
+        """True when standard 2-branch CFG should run as a single batch=2 forward.
+
+        Restricted to the LiteAttention backend, which needs cond+uncond in one
+        batched forward (see ``_predict_noise_with_cfg``). Kept conservative: bails
+        out for cfg-parallel, TeaCache (reads per-branch ``is_cfg_negative``), and
+        any non-standard 2-branch policy, all of which fall back to per-branch.
+        """
+        if not envs.SGLANG_DIFFUSION_LITE_ATTENTION_BATCH_CFG:
+            return False
+        try:
+            if self.attn_backend.get_enum() != AttentionBackendEnum.LITE_ATTENTION:
+                return False
+        except (NotImplementedError, AttributeError):
+            return False
+        if server_args.enable_cfg_parallel:
+            return False
+        if getattr(current_model, "enable_teacache", False):
+            return False
+        if not batch.do_classifier_free_guidance:
+            return False
+        branches = cfg_policy.branches
+        return (
+            type(cfg_policy) is CFGPolicy
+            and len(branches) == 2
+            and branches[0].is_conditional
+            and not branches[1].is_conditional
+        )
+
+    @staticmethod
+    def _double_cfg_tensor(t: Any) -> Any:
+        """Duplicate a shared (both-branch) input along the batch dim to size 2."""
+        if not torch.is_tensor(t):
+            return t
+        if t.dim() == 0:
+            return t.repeat(2)
+        if t.shape[0] == 1:
+            return torch.cat([t, t], dim=0)
+        return t
+
+    def _try_predict_noise_cfg_batched(
+        self,
+        *,
+        current_model: nn.Module,
+        latent_model_input: torch.Tensor,
+        timestep,
+        batch: Req,
+        timestep_index: int,
+        attn_metadata,
+        target_dtype,
+        guidance: torch.Tensor,
+        latents: torch.Tensor,
+        cfg_policy: CFGPolicy,
+        cfg_scale: float,
+        server_args: ServerArgs,
+    ) -> "torch.Tensor | tuple[torch.Tensor, ...] | None":
+        """Run cond+uncond as one ``batch=2`` forward; ``None`` => caller falls back.
+
+        Branch order is ``[conditional, unconditional]`` to match ``CFGPolicy.combine``.
+        Per-sample conditioning tensors (those that differ between branches and
+        carry a unit batch dim) are concatenated along the batch dim; shared
+        tensors/structures (rotary freqs, masks, scalars) are passed through
+        unchanged and broadcast over the batch. Anything that cannot be reconciled
+        returns ``None`` (before the forward) so the per-branch path runs instead.
+        """
+
+        class _CannotBatch(Exception):
+            pass
+
+        def _merge(vp: Any, vn: Any) -> Any:
+            vp_t = torch.is_tensor(vp)
+            vn_t = torch.is_tensor(vn)
+            if vp_t and vn_t:
+                # Per-sample conditioning: unit batch dim on both -> stack.
+                if vp.shape[0] == 1 and vn.shape[0] == 1:
+                    if vp.shape[1:] != vn.shape[1:]:
+                        raise _CannotBatch
+                    return torch.cat([vp, vn], dim=0)
+                # Otherwise it must be a shared, broadcastable tensor (e.g. rotary
+                # freqs with no per-sample batch dim); require it to be identical.
+                if vp.shape == vn.shape and torch.equal(vp, vn):
+                    return vp
+                raise _CannotBatch
+            if vp_t or vn_t:
+                raise _CannotBatch
+            if vp is None and vn is None:
+                return None
+            if isinstance(vp, (list, tuple)) and isinstance(vn, (list, tuple)):
+                if type(vp) is not type(vn) or len(vp) != len(vn):
+                    raise _CannotBatch
+                return type(vp)(_merge(a, b) for a, b in zip(vp, vn))
+            if isinstance(vp, dict) and isinstance(vn, dict):
+                if set(vp) != set(vn):
+                    raise _CannotBatch
+                return {k: _merge(vp[k], vn[k]) for k in vp}
+            try:
+                if bool(vp == vn):
+                    return vp
+            except Exception as exc:
+                raise _CannotBatch from exc
+            raise _CannotBatch
+
+        pos_branch, neg_branch = cfg_policy.branches[0], cfg_policy.branches[1]
+        if set(pos_branch.kwargs) != set(neg_branch.kwargs):
+            return None
+        if latent_model_input.shape[0] != 1:
+            return None
+
+        try:
+            merged_kwargs = {
+                key: _merge(pos_branch.kwargs[key], neg_branch.kwargs[key])
+                for key in pos_branch.kwargs
+            }
+        except _CannotBatch:
+            if not getattr(self, "_la_batched_cfg_fallback_logged", False):
+                logger.warning(
+                    "LiteAttention batched CFG could not merge branch kwargs; "
+                    "falling back to per-branch forwards (skip-list quality may "
+                    "degrade). This is logged once."
+                )
+                self._la_batched_cfg_fallback_logged = True
+            return None
+
+        latent_batched = torch.cat([latent_model_input, latent_model_input], dim=0)
+        timestep_batched = self._double_cfg_tensor(timestep)
+        guidance_batched = self._double_cfg_tensor(guidance)
+
+        # TeaCache is gated off in _should_batch_cfg_for_lite_attention, so the
+        # per-branch flag is irrelevant here; set it deterministically.
+        batch.is_cfg_negative = False
+        with set_forward_context(
+            current_timestep=timestep_index,
+            attn_metadata=attn_metadata,
+            forward_batch=batch,
+        ):
+            raw = self._predict_noise(
+                current_model=current_model,
+                latent_model_input=latent_batched,
+                timestep=timestep_batched,
+                target_dtype=target_dtype,
+                guidance=guidance_batched,
+                **merged_kwargs,
+            )
+
+        out = _wrap(raw)
+        if any(not torch.is_tensor(o) or o.shape[0] != 2 for o in out):
+            raise RuntimeError(
+                "LiteAttention batched CFG expected batch=2 outputs, got shapes "
+                f"{[tuple(o.shape) if torch.is_tensor(o) else type(o) for o in out]}"
+            )
+
+        def _branch_pred(idx: int):
+            pred_t = tuple(o[idx : idx + 1] for o in out)
+            if len(pred_t) == 1:
+                pred_t = (
+                    server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
+                )
+            return _unwrap(pred_t)
+
+        return cfg_policy.combine(
+            [_branch_pred(0), _branch_pred(1)],
+            batch,
+            cfg_scale,
+            server_args.pipeline_config,
         )
 
     def _build_attn_metadata(
