@@ -511,10 +511,27 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"This model supports at most {server_context_length} completion tokens."
             )
 
+        if request.stream and (request.n or 1) > 1:
+            return (
+                "Streaming is not supported when n > 1. "
+                "Either set stream=false or set n=1."
+            )
+
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
             if schema is None:
                 return "schema_ is required for json_schema response format request."
+
+        if (
+            request.continue_final_message
+            and request.messages
+            and len(request.messages) == 1
+            and getattr(request.messages[0], "role", None) == "assistant"
+        ):
+            return (
+                "continue_final_message requires at least one non-assistant message "
+                "before the final assistant message."
+            )
 
         return None
 

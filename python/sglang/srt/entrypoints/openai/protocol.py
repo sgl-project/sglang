@@ -400,6 +400,19 @@ class CompletionRequest(BaseModel):
             raise ValueError("max_tokens must be positive")
         return v
 
+    @field_validator("logit_bias")
+    @classmethod
+    def validate_logit_bias_range(cls, v):
+        if v is None:
+            return v
+        for token_id, bias in v.items():
+            if not -100 <= bias <= 100:
+                raise ValueError(
+                    f"logit_bias value {bias} for token '{token_id}' is out of range. "
+                    "Values must be between -100 and 100."
+                )
+        return v
+
 
 class SglExt(BaseModel):
     """SGLang extension fields for OpenAI-compatible responses.
@@ -868,6 +881,19 @@ class ChatCompletionRequest(BaseModel):
             }
 
         return values
+
+    @field_validator("logit_bias")
+    @classmethod
+    def validate_logit_bias_range(cls, v):
+        if v is None:
+            return v
+        for token_id, bias in v.items():
+            if not -100 <= bias <= 100:
+                raise ValueError(
+                    f"logit_bias value {bias} for token '{token_id}' is out of range. "
+                    "Values must be between -100 and 100."
+                )
+        return v
 
     def to_sampling_params(
         self,
