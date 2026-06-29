@@ -5154,10 +5154,48 @@ class TestGemma4Detector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
 
     def test_detect_and_parse_unknown_tool_index(self):
+        # tool_index is the position of the call in the response, not the
+        # position of the function in the tools list, so unknown tools still
+        # get a valid sequential index.
         text = '<|tool_call>call:unknown_func{arg:<|"|>val<|"|>}<tool_call|>'
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].tool_index, -1)
+        self.assertEqual(result.calls[0].tool_index, 0)
+
+    def test_detect_and_parse_repeated_calls_get_sequential_indices(self):
+        # Regression: multiple calls to the same function must each get a
+        # distinct, sequential tool_index (OpenAI streaming protocol requires
+        # tool_calls[i].index to be the position of the call in the array).
+        text = (
+            '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>'
+            '<|tool_call>call:get_weather{location:<|"|>Paris<|"|>}<tool_call|>'
+            '<|tool_call>call:get_weather{location:<|"|>Berlin<|"|>}<tool_call|>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 3)
+        self.assertEqual([c.tool_index for c in result.calls], [0, 1, 2])
+
+    def test_streaming_repeated_calls_get_sequential_indices(self):
+        # Regression for streaming path: three calls to the same function
+        # split across chunks must each emit a distinct sequential tool_index
+        # on both the name chunk and the args chunk.
+        self.detector = Gemma4Detector()
+        chunks = [
+            '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>',
+            '<|tool_call>call:get_weather{location:<|"|>Paris<|"|>}<tool_call|>',
+            '<|tool_call>call:get_weather{location:<|"|>Berlin<|"|>}<tool_call|>',
+        ]
+        name_indices = []
+        args_indices = []
+        for chunk in chunks:
+            res = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in res.calls:
+                if call.name is not None:
+                    name_indices.append(call.tool_index)
+                else:
+                    args_indices.append(call.tool_index)
+        self.assertEqual(name_indices, [0, 1, 2])
+        self.assertEqual(args_indices, [0, 1, 2])
 
     def test_detect_and_parse_nested_object(self):
         text = '<|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>,details:{temp:25,unit:<|"|>celsius<|"|>}}<tool_call|>'
