@@ -4,7 +4,9 @@ metatags:
   description: "Best Practice for MiniMax-M2.5 on Ascend NPU"
 ---
 
-This guide describes the best practice data for MiniMax-M2.5 on the Ascend NPU.
+<Note>
+This page focuses on optimal configuration and benchmark results for MiniMax-M2.5 on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [MiniMax-M2.5 Model Tutorial](/docs/hardware-platforms/ascend-npus/model-tutorials/minimax_m2_5).
+</Note>
 
 ### Low Latency
 
@@ -113,7 +115,9 @@ python3 -m sglang.launch_server \
     --speculative-draft-model-quantization unquant \
     --dtype bfloat16 \
     --trust-remote-code \
-    --tokenizer-worker-num 4
+    --tokenizer-worker-num 4 \
+    --reasoning-parser minimax-append-think \
+    --tool-call-parser minimax-m2
 ```
 
 #### Benchmark
@@ -203,7 +207,7 @@ python3 -m sglang.launch_server \
     --enable-prefill-delayer \
     --prefill-max-requests 10 \
     --chunked-prefill-size 67072 \
-    --max-prefill-token 67000 \
+    --max-prefill-tokens 67000 \
     --cuda-graph-bs 2 4 8 12 16 18 20 22 24 26 \
     --moe-a2a-backend ascend_fuseep \
     --fuseep-mode 2 \
@@ -312,7 +316,7 @@ python3 -m sglang.launch_server \
     --enable-prefill-delayer \
     --prefill-max-requests 4 \
     --chunked-prefill-size 160000 \
-    --max-prefill-token 80000 \
+    --max-prefill-tokens 80000 \
     --cuda-graph-bs 2 4 6 8 \
     --moe-a2a-backend ascend_fuseep \
     --fuseep-mode 2 \
@@ -423,7 +427,7 @@ python3 -m sglang.launch_server \
     --enable-prefill-delayer \
     --prefill-max-requests 3 \
     --chunked-prefill-size -1 \
-    --max-prefill-token 8192 \
+    --max-prefill-tokens 8192 \
     --cuda-graph-bs 1 2 3 4 5 6 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
@@ -527,7 +531,7 @@ python3 -m sglang.launch_server \
     --prefill-delayer-max-delay-passes 500 \
     --enable-prefill-delayer \
     --chunked-prefill-size -1 \
-    --max-prefill-token 8192 \
+    --max-prefill-tokens 8192 \
     --cuda-graph-bs 1 2 4 8 12 16 20 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
