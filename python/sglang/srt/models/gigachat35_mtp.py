@@ -1,7 +1,7 @@
 """GigaChat 3.5 multi-head MTP.
 
 Multiple heads are served Step-3.5 style by sglang's multi-layer EAGLE worker
-(``MultiLayerEagleDraftWorker``): one ``Gigachat35ForCausalLMNextN`` instance per
+(``MultiLayerEagleDraftWorker``): one ``GigaChat35ForCausalLMNextN`` instance per
 speculative step, selected by ``draft_model_idx``, with hidden-state chaining
 (``chain_mtp_hidden_states``) so each head consumes the previous head's output
 hidden state instead of always reusing the target model's.
@@ -32,8 +32,8 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     NextNEnabledConfig,
 )
 from sglang.srt.models.gigachat35 import (
-    Gigachat35Config,
-    Gigachat35DecoderLayer,
+    GigaChat35Config,
+    GigaChat35DecoderLayer,
     _remap_gigachat_weight_names,
     build_norm,
 )
@@ -41,10 +41,10 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix
 
 
-class Gigachat35ModelNextN(nn.Module):
+class GigaChat35ModelNextN(nn.Module):
     def __init__(
         self,
-        config: Gigachat35Config,
+        config: GigaChat35Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -64,7 +64,7 @@ class Gigachat35ModelNextN(nn.Module):
 
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        self.decoder = Gigachat35DecoderLayer(
+        self.decoder = GigaChat35DecoderLayer(
             config=config,
             layer_id=0,
             quant_config=quant_config,
@@ -129,10 +129,10 @@ class Gigachat35ModelNextN(nn.Module):
         return hidden_states, hidden_states_before_norm
 
 
-class Gigachat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
+class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
     def __init__(
         self,
-        config: Gigachat35Config,
+        config: GigaChat35Config,
         quant_config: Optional[QuantizationConfig] = None,
         draft_model_idx: Optional[int] = None,
         prefix: str = "",
@@ -145,7 +145,7 @@ class Gigachat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
 
-        self.model = Gigachat35ModelNextN(
+        self.model = GigaChat35ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -211,4 +211,4 @@ class Gigachat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         super().post_load_weights(is_nextn=True, weight_names=weight_names)
 
 
-EntryClass = [Gigachat35ForCausalLMNextN]
+EntryClass = [GigaChat35ForCausalLMNextN]
