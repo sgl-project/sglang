@@ -386,11 +386,11 @@ def absorbed_topk_select(
     """Selection: score → all-reduce → per-request mask → top-K → ascend,
     from the resident MLA latent.
 
-    ``score[b, t] = agg_h ( v_h[b] · c_kv[t] )`` for ``scorer_norm="off"`` — the
-    absorbed-latent identity the recall oracle already validated. The rope dims are
-    excluded by construction: ``absorbed_w_sel`` is the K-noPE ``W_UK`` rows (built
-    from ``kv_b_proj`` sliced to ``[:qk_nope_head_dim]``) and ``queries`` is the
-    no-PE query, so the score never touches a positional channel.
+    ``score[b, t] = agg_h ( v_h[b] · c_kv[t] )`` for ``scorer_norm="off"`` (the
+    absorbed-latent identity). The rope dims are excluded by construction:
+    ``absorbed_w_sel`` is the K-noPE ``W_UK`` rows (built from ``kv_b_proj`` sliced
+    to ``[:qk_nope_head_dim]``) and ``queries`` is the no-PE query, so the score
+    never touches a positional channel.
 
     Reads the paged fp8 latent (``absorbed_latent_fp8`` + ``absorbed_latent_scales``,
     the resident pool bytes) on CUDA, or a dequantized ``absorbed_latent`` ``[T, lora]``

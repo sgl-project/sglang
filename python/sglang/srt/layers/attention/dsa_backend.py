@@ -495,7 +495,7 @@ class DeepseekSparseAttnBackend(
             # Publish so the model layer's selector path (deepseek_v2) can resolve
             # it through the ForwardContext-published attention backend.
             setattr(model_runner.server_args, "_ds_slot_written", self._ds_slot_written)
-            # Cosine key-norm cache (Fix B): k_norm[layer, slot, h] =
+            # Cosine key-norm cache: k_norm[layer, slot, h] =
             # ||absorbed_w_sel[layer,h] @ dequant(resident fp8 latent[slot])||.
             # Same lifecycle as _ds_slot_written (alloc here; populate at KV-append
             # before marking the slot written; gather at decode scoring). Allocated

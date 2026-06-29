@@ -2293,377 +2293,361 @@ class DeepseekV2AttentionMLA(
                     _rtt_backend = _rtt_backend.primary
                 req_to_token = getattr(_rtt_backend, "req_to_token", None)
 
-            def _run() -> torch.Tensor:
-                assert_real_selector_or_placeholder_allowed(
-                    self.double_sparsity_selector
+            assert_real_selector_or_placeholder_allowed(self.double_sparsity_selector)
+            # Invalidate newly-allocated slots before scoring so a reused
+            # physical KV slot cannot be selected based on the stale latent
+            # left by the previously-evicted request. The invalidation runs
+            # on the slot_written validity bitmap (resolved through the
+            # ForwardContext attention backend); the companion
+            # _write_token_labels mark later in dsa_backend.py restores
+            # written=True once the fresh KV write lands. In-place index write
+            # on the preallocated bitmap (graph-safe).
+            _out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+            if _out_cache_loc is not None and _has_forward_context():
+                _sw_backend = _get_attn_backend()
+                if isinstance(_sw_backend, _TboAttnBackend):
+                    _sw_backend = _sw_backend.primary
+                _slot_written = getattr(_sw_backend, "_ds_slot_written", None)
+                if _slot_written is not None:
+                    # Device-scalar RHS (not Python `False`) so the indexed
+                    # invalidate stays a pure device-side copy — a CPU `False`
+                    # would copy CPU->CUDA, illegal under CUDA-graph capture.
+                    _slot_false = getattr(_sw_backend, "_ds_slot_written_false", None)
+                    _slot_written[layer_id, _out_cache_loc.long()] = (
+                        _slot_false if _slot_false is not None else False
+                    )
+                # Cosine: NaN-reset the key-norm cache for the SAME reused slots
+                # (before their fresh KV write repopulates them), so a written-bit
+                # race can never read a stale key norm. Device NaN scalar keeps the
+                # indexed write a pure device-side copy (graph-safe). Only the
+                # reused seq slots are touched; the +inf current-slot re-include
+                # is a separate score override at selection time.
+                _kn_cache = getattr(_sw_backend, "_ds_key_norm_cache", None)
+                if _kn_cache is not None:
+                    _kn_nan = getattr(_sw_backend, "_ds_key_norm_nan", None)
+                    _kn_cache[layer_id, _out_cache_loc.long()] = (
+                        _kn_nan if _kn_nan is not None else float("nan")
+                    )
+            # Use projected Q-noPE for DS selector when available; fall back
+            # to latent q_lora only for the placeholder path (unit tests).
+            queries_for_ds = q_nope if q_nope is not None else q_lora
+
+            # Allocation-free graph-safe path: when the DSA backend has
+            # preallocated ds_graph_state and the selector is bound on
+            # CUDA, route through retrieve_topk_graph_safe (Triton kernel +
+            # in-place topk pipeline). The captured graph stays 0-alloc
+            # after warmup.
+            #
+            # Source-of-truth resolution mirrors the MHA bypass above:
+            #   (1) `forward_batch.ds_graph_state` — set by
+            #       `dsa_backend.init_forward_metadata` for dynamic
+            #       non-graph forwards. Production ForwardBatch has no
+            #       `attn_backend` field so this is the eager source.
+            #   (2) `ForwardContext`-published `attn_backend
+            #       .forward_metadata.ds_graph_state` — for the CUDA-graph
+            #       capture/replay path, where the capture initializer
+            #       gets no `forward_batch`.
+            _selector = self.double_sparsity_selector
+            _seq_lens = getattr(forward_batch, "seq_lens", None)
+            _sparse_mask = getattr(forward_batch, "sparse_mask", None)
+            # Resolve `_dsa_metadata` from the active ForwardContext
+            # whenever possible, so both `_ds_graph_state` AND
+            # `ds_topk_indices_out` can fall back to it during CUDA-graph
+            # capture/replay (where the capture-time `ForwardBatch` is
+            # constructed without DS fields — see cuda_graph_runner.py).
+            _dsa_metadata = None
+            if _has_forward_context():
+                _fc_backend2 = _get_attn_backend()
+                if isinstance(_fc_backend2, _TboAttnBackend):
+                    _fc_backend2 = _fc_backend2.primary
+                _dsa_metadata = getattr(_fc_backend2, "forward_metadata", None)
+            _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
+            if _ds_graph_state is None and _dsa_metadata is not None:
+                _ds_graph_state = getattr(_dsa_metadata, "ds_graph_state", None)
+            # Selection always rides the production graph-safe path: every
+            # served scorer variant is graph-safe (validate_double_sparsity
+            # rejects non-graph-safe configs at startup), so the only reason
+            # to fail closed here is a missing precondition.
+            #
+            # Graph-safe selection requires BOTH the bind-time absorbed
+            # projection AND the preallocated absorbed scratch (v_h /
+            # weighted-query / int64 mask / fp32 query cast) — without them the
+            # graph-safe path would route through the allocating fallback, so
+            # insist on all of them here so the missing-scratch case fails
+            # closed below instead of allocating.
+            _has_selector_state = (
+                _selector.absorbed_w_sel is not None
+                and _ds_graph_state is not None
+                and _ds_graph_state.scratch_absorbed_v is not None
+                and _ds_graph_state.scratch_absorbed_qsel is not None
+                and _ds_graph_state.scratch_absorbed_sel_i64 is not None
+                and _ds_graph_state.scratch_absorbed_q is not None
+            )
+            _use_graph_safe = (
+                _ds_graph_state is not None
+                and _ds_graph_state.scratch_scores is not None
+                and _has_selector_state
+                and _selector.channel_mask is not None
+                and queries_for_ds.device.type == "cuda"
+                and _seq_lens is not None
+                and req_to_token is not None
+            )
+            if _use_graph_safe:
+                from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
+                    radix_topk_scratch as _radix_topk_scratch,
                 )
-                # Invalidate newly-allocated slots before scoring so a reused
-                # physical KV slot cannot be selected based on the stale latent
-                # left by the previously-evicted request. The invalidation runs
-                # on the slot_written validity bitmap (resolved through the
-                # ForwardContext attention backend); the companion
-                # _write_token_labels mark later in dsa_backend.py restores
-                # written=True once the fresh KV write lands. In-place index write
-                # on the preallocated bitmap (graph-safe).
-                _out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-                if _out_cache_loc is not None and _has_forward_context():
+                from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+                    assert_rope_fp8_resident,
+                    assert_rope_selection_supported,
+                    retrieve_topk_graph_safe,
+                )
+
+                _bs = int(forward_batch.req_pool_indices.shape[0])
+                _max_seq_len = _ds_graph_state.max_seq_len
+                if _max_seq_len <= 0:
+                    _max_seq_len = int(req_to_token.shape[1])
+
+                # Production `req_pool_indices` is int64
+                # (schedule_batch / cuda_graph_runner). The captured
+                # selector region requires int32. copy_() casts
+                # int64 → int32 in-place against pre-allocated
+                # scratch (no new allocation per call).
+                _rpi_scratch = _ds_graph_state.scratch_req_pool_indices[:_bs]
+                _rpi_scratch.copy_(forward_batch.req_pool_indices)
+                # Prefer `DSAMetadata.cache_seqlens_int32` when the
+                # metadata-owned int32 view is available; otherwise
+                # copy_() into the `scratch_seq_lens` int32 view.
+                _seq_lens_i32 = None
+                if _dsa_metadata is not None:
+                    _seq_lens_i32 = getattr(_dsa_metadata, "cache_seqlens_int32", None)
+                    if _seq_lens_i32 is not None:
+                        _seq_lens_i32 = _seq_lens_i32[:_bs]
+                if _seq_lens_i32 is None:
+                    _seq_lens_i32 = _ds_graph_state.scratch_seq_lens[:_bs]
+                    _seq_lens_i32.copy_(_seq_lens)
+
+                # Resident fp8-latent read for the absorbed scorer: the
+                # RETURNED top-K is the absorbed selection. Read this layer's
+                # fp8 nope latent + per-128-block scales off the MLA KV pool.
+                _absorbed_latent_fp8 = None
+                _absorbed_latent_scales = None
+                # rope-aware recovery tensors (off by default → both stay None →
+                # the kernel scores no-PE, byte-identical to today).
+                _rope_q_pe = None
+                _rope_k_pe = None
+                _rope_aware = getattr(_selector.config, "rope_aware_score", False)
+                if _rope_aware:
+                    # Fail closed: rope-aware selection is validated ONLY for
+                    # single-token MLA decode on fp8 KV with q_pe/positions/
+                    # rotary_emb present. Non-validated
+                    # runtimes raise rather than silently scoring no-PE. (bf16 KV is
+                    # rejected in the latent-unpack branch below via
+                    # assert_rope_fp8_resident; NSA and CPU/NPU cannot reach this DS
+                    # graph-safe path by construction.) The checks live in pure,
+                    # unit-tested helpers in selection_kernel.
+                    assert_rope_selection_supported(
+                        is_nextn=self.is_nextn,
+                        dcp_world_size=get_attention_dcp_world_size(),
+                        forward_mode_is_decode=(
+                            forward_batch.forward_mode.is_decode_or_idle()
+                        ),
+                        q_pe=q_pe,
+                        positions=positions,
+                        rotary_emb=self.rotary_emb,
+                    )
+                if _selector.absorbed_w_sel is not None:
+                    from sglang.srt.model_executor.forward_context import (
+                        get_token_to_kv_pool as _get_token_to_kv_pool,
+                    )
+
+                    if _has_forward_context():
+                        _kv_pool = _get_token_to_kv_pool()
+                        # Raw uint8 KV buffer for this layer: per-slot bytes are
+                        # [lora fp8 | nblk fp32 scales | rope] as written by the
+                        # pool's quantize_k_cache_separate. Slice the fp8 latent
+                        # and the per-128-block fp32 scales off those bytes (the
+                        # exact unpack the absorbed paged kernel consumes).
+                        _nope_u8 = _kv_pool.kv_buffer[layer_id - _kv_pool.start_layer]
+                        _lora = int(_selector.absorbed_w_sel.shape[-1])
+                        _nblk = _lora // 128
+                        if _rope_aware:
+                            # Fail closed on non-fp8 resident KV (bf16 has a
+                            # different byte layout; fp8-only first ship).
+                            assert_rope_fp8_resident(_nope_u8.dtype)
+                        if _nope_u8.dtype == torch.bfloat16:
+                            # BF16 KV cache: the resident latent IS the
+                            # dequantized k_nope (no fp8 bytes / per-block
+                            # scales). Pass the bf16 k_nope directly; the score
+                            # kernel's BF16_LATENT branch skips the fp8 scale.
+                            _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora]
+                            _absorbed_latent_scales = None
+                        else:
+                            _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora].view(
+                                torch.float8_e4m3fn
+                            )
+                            _absorbed_latent_scales = _nope_u8[
+                                :, 0, _lora : _lora + _nblk * 4
+                            ].view(torch.float32)
+                            if _rope_aware:
+                                # The resident post-RoPE k_pe view + the post-RoPE
+                                # q_pe scratch. q_pe is PRE-RoPE at selection (the
+                                # model's rotary_emb runs later in the forward), so
+                                # rotate a clone with a dummy zero key — captured
+                                # in-graph (rotary_emb already runs in the decode
+                                # forward), so it replays 0-alloc. k_pe is the bf16
+                                # rope bytes after the fp8 latent + fp32 scales.
+                                _qp = q_pe.contiguous()
+                                _rope_q_pe, _ = self.rotary_emb(
+                                    positions,
+                                    _qp.clone(),
+                                    torch.zeros_like(_qp[:, :1, :]),
+                                )
+                                _rope_k_pe = _nope_u8[:, 0, _lora + _nblk * 4 :].view(
+                                    torch.bfloat16
+                                )[:, : self.qk_rope_head_dim]
+
+                # The validity `written` arg is the slot_written bitmap [L, T]
+                # (the absorbed kernel masks unwritten slots to -inf via its
+                # HAS_WRITTEN path). Fail closed if the bitmap is absent — a
+                # missing guard would let a reused slot's stale latent be
+                # selected.
+                _sw_backend = None
+                if _has_forward_context():
                     _sw_backend = _get_attn_backend()
                     if isinstance(_sw_backend, _TboAttnBackend):
                         _sw_backend = _sw_backend.primary
-                    _slot_written = getattr(_sw_backend, "_ds_slot_written", None)
-                    if _slot_written is not None:
-                        # Device-scalar RHS (not Python `False`) so the indexed
-                        # invalidate stays a pure device-side copy — a CPU `False`
-                        # would copy CPU->CUDA, illegal under CUDA-graph capture.
-                        _slot_false = getattr(
-                            _sw_backend, "_ds_slot_written_false", None
-                        )
-                        _slot_written[layer_id, _out_cache_loc.long()] = (
-                            _slot_false if _slot_false is not None else False
-                        )
-                    # Cosine: NaN-reset the key-norm cache for the SAME reused slots
-                    # (before their fresh KV write repopulates them), so a written-bit
-                    # race can never read a stale key norm. Device NaN scalar keeps the
-                    # indexed write a pure device-side copy (graph-safe). Only the
-                    # reused seq slots are touched; the +inf current-slot re-include
-                    # is a separate score override at selection time.
-                    _kn_cache = getattr(_sw_backend, "_ds_key_norm_cache", None)
-                    if _kn_cache is not None:
-                        _kn_nan = getattr(_sw_backend, "_ds_key_norm_nan", None)
-                        _kn_cache[layer_id, _out_cache_loc.long()] = (
-                            _kn_nan if _kn_nan is not None else float("nan")
-                        )
-                # Use projected Q-noPE for DS selector when available; fall back
-                # to latent q_lora only for the placeholder path (unit tests).
-                queries_for_ds = q_nope if q_nope is not None else q_lora
-
-                # Allocation-free graph-safe path: when the DSA backend has
-                # preallocated ds_graph_state and the selector is bound on
-                # CUDA, route through retrieve_topk_graph_safe (Triton kernel +
-                # in-place topk pipeline). The captured graph stays 0-alloc
-                # after warmup.
-                #
-                # Source-of-truth resolution mirrors the MHA bypass above:
-                #   (1) `forward_batch.ds_graph_state` — set by
-                #       `dsa_backend.init_forward_metadata` for dynamic
-                #       non-graph forwards. Production ForwardBatch has no
-                #       `attn_backend` field so this is the eager source.
-                #   (2) `ForwardContext`-published `attn_backend
-                #       .forward_metadata.ds_graph_state` — for the CUDA-graph
-                #       capture/replay path, where the capture initializer
-                #       gets no `forward_batch`.
-                _selector = self.double_sparsity_selector
-                _seq_lens = getattr(forward_batch, "seq_lens", None)
-                _sparse_mask = getattr(forward_batch, "sparse_mask", None)
-                # Resolve `_dsa_metadata` from the active ForwardContext
-                # whenever possible, so both `_ds_graph_state` AND
-                # `ds_topk_indices_out` can fall back to it during CUDA-graph
-                # capture/replay (where the capture-time `ForwardBatch` is
-                # constructed without DS fields — see cuda_graph_runner.py).
-                _dsa_metadata = None
-                if _has_forward_context():
-                    _fc_backend2 = _get_attn_backend()
-                    if isinstance(_fc_backend2, _TboAttnBackend):
-                        _fc_backend2 = _fc_backend2.primary
-                    _dsa_metadata = getattr(_fc_backend2, "forward_metadata", None)
-                _ds_graph_state = getattr(forward_batch, "ds_graph_state", None)
-                if _ds_graph_state is None and _dsa_metadata is not None:
-                    _ds_graph_state = getattr(_dsa_metadata, "ds_graph_state", None)
-                # Selection always rides the production graph-safe path: every
-                # served scorer variant is graph-safe (validate_double_sparsity
-                # rejects non-graph-safe configs at startup), so the only reason
-                # to fail closed here is a missing precondition.
-                #
-                # Graph-safe selection requires BOTH the bind-time absorbed
-                # projection AND the preallocated absorbed scratch (v_h /
-                # weighted-query / int64 mask / fp32 query cast) — without them the
-                # graph-safe path would route through the allocating fallback, so
-                # insist on all of them here so the missing-scratch case fails
-                # closed below instead of allocating.
-                _has_selector_state = (
-                    _selector.absorbed_w_sel is not None
-                    and _ds_graph_state is not None
-                    and _ds_graph_state.scratch_absorbed_v is not None
-                    and _ds_graph_state.scratch_absorbed_qsel is not None
-                    and _ds_graph_state.scratch_absorbed_sel_i64 is not None
-                    and _ds_graph_state.scratch_absorbed_q is not None
-                )
-                _use_graph_safe = (
-                    _ds_graph_state is not None
-                    and _ds_graph_state.scratch_scores is not None
-                    and _has_selector_state
-                    and _selector.channel_mask is not None
-                    and queries_for_ds.device.type == "cuda"
-                    and _seq_lens is not None
-                    and req_to_token is not None
-                )
-                if _use_graph_safe:
-                    from sglang.srt.layers.attention.double_sparsity.cuda_graph import (
-                        radix_topk_scratch as _radix_topk_scratch,
-                    )
-                    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
-                        assert_rope_fp8_resident,
-                        assert_rope_selection_supported,
-                        retrieve_topk_graph_safe,
-                    )
-
-                    _bs = int(forward_batch.req_pool_indices.shape[0])
-                    _max_seq_len = _ds_graph_state.max_seq_len
-                    if _max_seq_len <= 0:
-                        _max_seq_len = int(req_to_token.shape[1])
-
-                    # Production `req_pool_indices` is int64
-                    # (schedule_batch / cuda_graph_runner). The captured
-                    # selector region requires int32. copy_() casts
-                    # int64 → int32 in-place against pre-allocated
-                    # scratch (no new allocation per call).
-                    _rpi_scratch = _ds_graph_state.scratch_req_pool_indices[:_bs]
-                    _rpi_scratch.copy_(forward_batch.req_pool_indices)
-                    # Prefer `DSAMetadata.cache_seqlens_int32` when the
-                    # metadata-owned int32 view is available; otherwise
-                    # copy_() into the `scratch_seq_lens` int32 view.
-                    _seq_lens_i32 = None
-                    if _dsa_metadata is not None:
-                        _seq_lens_i32 = getattr(
-                            _dsa_metadata, "cache_seqlens_int32", None
-                        )
-                        if _seq_lens_i32 is not None:
-                            _seq_lens_i32 = _seq_lens_i32[:_bs]
-                    if _seq_lens_i32 is None:
-                        _seq_lens_i32 = _ds_graph_state.scratch_seq_lens[:_bs]
-                        _seq_lens_i32.copy_(_seq_lens)
-
-                    # Resident fp8-latent read for the absorbed scorer: the
-                    # RETURNED top-K is the absorbed selection. Read this layer's
-                    # fp8 nope latent + per-128-block scales off the MLA KV pool.
-                    _absorbed_latent_fp8 = None
-                    _absorbed_latent_scales = None
-                    # rope-aware recovery tensors (off by default → both stay None →
-                    # the kernel scores no-PE, byte-identical to today).
-                    _rope_q_pe = None
-                    _rope_k_pe = None
-                    _rope_aware = getattr(_selector.config, "rope_aware_score", False)
-                    if _rope_aware:
-                        # Fail closed: rope-aware selection is validated ONLY for
-                        # single-token MLA decode on fp8 KV with q_pe/positions/
-                        # rotary_emb present. Non-validated
-                        # runtimes raise rather than silently scoring no-PE. (bf16 KV is
-                        # rejected in the latent-unpack branch below via
-                        # assert_rope_fp8_resident; NSA and CPU/NPU cannot reach this DS
-                        # graph-safe path by construction.) The checks live in pure,
-                        # unit-tested helpers in selection_kernel.
-                        assert_rope_selection_supported(
-                            is_nextn=self.is_nextn,
-                            dcp_world_size=get_attention_dcp_world_size(),
-                            forward_mode_is_decode=(
-                                forward_batch.forward_mode.is_decode_or_idle()
-                            ),
-                            q_pe=q_pe,
-                            positions=positions,
-                            rotary_emb=self.rotary_emb,
-                        )
-                    if _selector.absorbed_w_sel is not None:
-                        from sglang.srt.model_executor.forward_context import (
-                            get_token_to_kv_pool as _get_token_to_kv_pool,
-                        )
-
-                        if _has_forward_context():
-                            _kv_pool = _get_token_to_kv_pool()
-                            # Raw uint8 KV buffer for this layer: per-slot bytes are
-                            # [lora fp8 | nblk fp32 scales | rope] as written by the
-                            # pool's quantize_k_cache_separate. Slice the fp8 latent
-                            # and the per-128-block fp32 scales off those bytes (the
-                            # exact unpack the absorbed paged kernel consumes).
-                            _nope_u8 = _kv_pool.kv_buffer[
-                                layer_id - _kv_pool.start_layer
-                            ]
-                            _lora = int(_selector.absorbed_w_sel.shape[-1])
-                            _nblk = _lora // 128
-                            if _rope_aware:
-                                # Fail closed on non-fp8 resident KV (bf16 has a
-                                # different byte layout; fp8-only first ship).
-                                assert_rope_fp8_resident(_nope_u8.dtype)
-                            if _nope_u8.dtype == torch.bfloat16:
-                                # BF16 KV cache: the resident latent IS the
-                                # dequantized k_nope (no fp8 bytes / per-block
-                                # scales). Pass the bf16 k_nope directly; the score
-                                # kernel's BF16_LATENT branch skips the fp8 scale.
-                                _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora]
-                                _absorbed_latent_scales = None
-                            else:
-                                _absorbed_latent_fp8 = _nope_u8[:, 0, :_lora].view(
-                                    torch.float8_e4m3fn
-                                )
-                                _absorbed_latent_scales = _nope_u8[
-                                    :, 0, _lora : _lora + _nblk * 4
-                                ].view(torch.float32)
-                                if _rope_aware:
-                                    # The resident post-RoPE k_pe view + the post-RoPE
-                                    # q_pe scratch. q_pe is PRE-RoPE at selection (the
-                                    # model's rotary_emb runs later in the forward), so
-                                    # rotate a clone with a dummy zero key — captured
-                                    # in-graph (rotary_emb already runs in the decode
-                                    # forward), so it replays 0-alloc. k_pe is the bf16
-                                    # rope bytes after the fp8 latent + fp32 scales.
-                                    _qp = q_pe.contiguous()
-                                    _rope_q_pe, _ = self.rotary_emb(
-                                        positions,
-                                        _qp.clone(),
-                                        torch.zeros_like(_qp[:, :1, :]),
-                                    )
-                                    _rope_k_pe = _nope_u8[
-                                        :, 0, _lora + _nblk * 4 :
-                                    ].view(torch.bfloat16)[:, : self.qk_rope_head_dim]
-
-                    # The validity `written` arg is the slot_written bitmap [L, T]
-                    # (the absorbed kernel masks unwritten slots to -inf via its
-                    # HAS_WRITTEN path). Fail closed if the bitmap is absent — a
-                    # missing guard would let a reused slot's stale latent be
-                    # selected.
-                    _sw_backend = None
-                    if _has_forward_context():
-                        _sw_backend = _get_attn_backend()
-                        if isinstance(_sw_backend, _TboAttnBackend):
-                            _sw_backend = _sw_backend.primary
-                    _written_arg = getattr(_sw_backend, "_ds_slot_written", None)
-                    if _written_arg is None:
-                        raise RuntimeError(
-                            "Double Sparsity requires the slot_written validity "
-                            "bitmap, but it is absent on the attention backend; a "
-                            "reused KV slot's stale latent could be selected. "
-                            "Ensure the DSA backend allocated _ds_slot_written."
-                        )
-                    if _rope_aware and (_rope_q_pe is None or _rope_k_pe is None):
-                        # Catch-all fail-closed chokepoint: rope is on but the rope
-                        # tensors were not built (no absorbed_w_sel / no forward
-                        # context / non-fp8 latent). Refuse to score no-PE.
-                        raise RuntimeError(
-                            "Double Sparsity 'rope_aware_score' is on but the rope "
-                            "query/key tensors were not built (absorbed_w_sel, forward "
-                            "context, or fp8 latent unavailable); refusing to silently "
-                            "score no-PE."
-                        )
-                    retrieve_topk_graph_safe(
-                        queries=queries_for_ds,
-                        written=_written_arg,
-                        channel_selection=_selector.channel_mask.channel_selection,
-                        channel_weights=_selector.channel_mask.channel_weights,
-                        layer_id=layer_id,
-                        req_pool_indices=_rpi_scratch,
-                        req_to_token=req_to_token,
-                        seq_lens=_seq_lens_i32,
-                        max_seq_len=_max_seq_len,
-                        max_top_k=_selector.max_top_k,
-                        out_indices=_ds_graph_state.selected_indices,
-                        out_lengths=_ds_graph_state.valid_lengths,
-                        scratch_scores=_ds_graph_state.scratch_scores,
-                        # Compact selector variants score the [0, W) prefix;
-                        # width dispatch guarantees live rows fit, so a wider
-                        # mask's tail beyond W is dead by construction.
-                        per_request_valid=(
-                            _sparse_mask
-                            if _sparse_mask is None
-                            or _sparse_mask.shape[-1] <= _max_seq_len
-                            else _sparse_mask[:, :_max_seq_len]
-                        ),
-                        scratch_pv_mask=_ds_graph_state.scratch_pv_mask,
-                        scratch_scores_bf16=_ds_graph_state.scratch_scores_bf16,
-                        radix_topk_scratch=_radix_topk_scratch(_ds_graph_state),
-                        topk_block=_ds_graph_state.topk_block,
-                        process_group=getattr(_selector, "process_group", None),
-                        reduce_ca=getattr(_selector, "reduce_ca", None),
-                        score_reduce_bf16=_selector.config.score_reduce_dtype == "bf16",
-                        scorer_norm=_selector.config.scorer_norm,
-                        head_agg=_selector.config.head_agg,
-                        absorbed_latent_fp8=_absorbed_latent_fp8,
-                        absorbed_latent_scales=_absorbed_latent_scales,
-                        absorbed_w_sel=_selector.absorbed_w_sel,
-                        scratch_absorbed_v=_ds_graph_state.scratch_absorbed_v,
-                        scratch_absorbed_qsel=_ds_graph_state.scratch_absorbed_qsel,
-                        scratch_absorbed_sel_i64=_ds_graph_state.scratch_absorbed_sel_i64,
-                        scratch_absorbed_q=_ds_graph_state.scratch_absorbed_q,
-                        include_current_slot=bool(
-                            _selector.config.include_current_slot
-                        ),
-                        key_norm_cache=getattr(_sw_backend, "_ds_key_norm_cache", None),
-                        scratch_qnorm=_ds_graph_state.scratch_qnorm,
-                        q_pe=_rope_q_pe,
-                        k_pe=_rope_k_pe,
-                    )
-                    selected_indices = _ds_graph_state.selected_indices[:_bs]
-                    valid_lengths = _ds_graph_state.valid_lengths[:_bs]
-                else:
-                    # Fail closed: the eager retrieve_topk fallback does not thread
-                    # the resident fp8 latent, so selection cannot score here.
-                    # Selection only runs through the graph-safe
-                    # retrieve_topk_graph_safe above (which reads the latent).
+                _written_arg = getattr(_sw_backend, "_ds_slot_written", None)
+                if _written_arg is None:
                     raise RuntimeError(
-                        "Double Sparsity requires the graph-safe selector path "
-                        "(preallocated ds_graph_state + the resident fp8 latent); "
-                        "the eager retrieve_topk fallback is not wired for "
-                        "production selection."
+                        "Double Sparsity requires the slot_written validity "
+                        "bitmap, but it is absent on the attention backend; a "
+                        "reused KV slot's stale latent could be selected. "
+                        "Ensure the DSA backend allocated _ds_slot_written."
                     )
-                # prefer the NSA-metadata-owned buffer, allocated
-                # once per batch in init_forward_metadata (also for
-                # capture/replay). Resolve from the same real production
-                # objects used for `ds_graph_state` above:
-                #   (1) forward_batch.ds_topk_indices_out — dynamic
-                #       non-graph forwards (set by
-                #       dsa_backend.init_forward_metadata).
-                #   (2) ForwardContext-published attention backend's
-                #       forward_metadata.ds_topk_indices_out — CUDA-graph
-                #       capture/replay path (no forward_batch field).
-                # Last resort: lazy `torch.empty_like` for CPU unit tests
-                # that synthesize `forward_batch` without either source.
-                ds_out = getattr(forward_batch, "ds_topk_indices_out", None)
-                if ds_out is None and _dsa_metadata is not None:
-                    ds_out = getattr(_dsa_metadata, "ds_topk_indices_out", None)
-                bs = int(selected_indices.shape[0])
-                if ds_out is None:
-                    ds_out = torch.empty_like(selected_indices)
-                    setattr(forward_batch, "ds_topk_indices_out", ds_out)
-                elif ds_out.shape[0] != bs:
-                    ds_out = ds_out[:bs]
-                # Publish the selected-index domain that MATCHES how the DSA
-                # backend consumes topk_indices (see dsa_backend.forward_decode):
-                #   - Fused (SGLANG_DSA_FUSE_TOPK=True, the served default): the
-                #     backend uses topk_indices directly as physical page_table
-                #     slots with NO downstream transform, so publish PHYSICAL here
-                #     via the req_to_token gather. (Publishing logical here made
-                #     the kernel read KV at logical offsets -> garbage decode.)
-                #   - Non-fused: the backend runs transform_index_page_table_
-                #     decode/prefill, which gathers page_table[topk_indices] and
-                #     so REQUIRES LOGICAL positions; publishing physical there
-                #     would double-map. Publish raw logical positions.
-                # (hisparse + DS is out of scope for this path.)
-                if envs.SGLANG_DSA_FUSE_TOPK.get():
-                    _rpi = getattr(forward_batch, "req_pool_indices", None)
-                    if req_to_token is not None and _rpi is not None:
-                        logical_to_physical(
-                            selected_indices=selected_indices,
-                            req_pool_indices=_rpi,
-                            req_to_token=req_to_token,
-                            out=ds_out,
-                        )
-                    else:
-                        # Fused path needs physical slots but no req_to_token to
-                        # map with -> fail closed (no token attended) rather than
-                        # publish logical indices the fused path would misread.
-                        ds_out.fill_(-1)
+                if _rope_aware and (_rope_q_pe is None or _rope_k_pe is None):
+                    # Catch-all fail-closed chokepoint: rope is on but the rope
+                    # tensors were not built (no absorbed_w_sel / no forward
+                    # context / non-fp8 latent). Refuse to score no-PE.
+                    raise RuntimeError(
+                        "Double Sparsity 'rope_aware_score' is on but the rope "
+                        "query/key tensors were not built (absorbed_w_sel, forward "
+                        "context, or fp8 latent unavailable); refusing to silently "
+                        "score no-PE."
+                    )
+                retrieve_topk_graph_safe(
+                    queries=queries_for_ds,
+                    written=_written_arg,
+                    channel_selection=_selector.channel_mask.channel_selection,
+                    channel_weights=_selector.channel_mask.channel_weights,
+                    layer_id=layer_id,
+                    req_pool_indices=_rpi_scratch,
+                    req_to_token=req_to_token,
+                    seq_lens=_seq_lens_i32,
+                    max_seq_len=_max_seq_len,
+                    max_top_k=_selector.max_top_k,
+                    out_indices=_ds_graph_state.selected_indices,
+                    out_lengths=_ds_graph_state.valid_lengths,
+                    scratch_scores=_ds_graph_state.scratch_scores,
+                    # Compact selector variants score the [0, W) prefix;
+                    # width dispatch guarantees live rows fit, so a wider
+                    # mask's tail beyond W is dead by construction.
+                    per_request_valid=(
+                        _sparse_mask
+                        if _sparse_mask is None
+                        or _sparse_mask.shape[-1] <= _max_seq_len
+                        else _sparse_mask[:, :_max_seq_len]
+                    ),
+                    scratch_pv_mask=_ds_graph_state.scratch_pv_mask,
+                    scratch_scores_bf16=_ds_graph_state.scratch_scores_bf16,
+                    radix_topk_scratch=_radix_topk_scratch(_ds_graph_state),
+                    topk_block=_ds_graph_state.topk_block,
+                    process_group=getattr(_selector, "process_group", None),
+                    reduce_ca=getattr(_selector, "reduce_ca", None),
+                    score_reduce_bf16=_selector.config.score_reduce_dtype == "bf16",
+                    scorer_norm=_selector.config.scorer_norm,
+                    head_agg=_selector.config.head_agg,
+                    absorbed_latent_fp8=_absorbed_latent_fp8,
+                    absorbed_latent_scales=_absorbed_latent_scales,
+                    absorbed_w_sel=_selector.absorbed_w_sel,
+                    scratch_absorbed_v=_ds_graph_state.scratch_absorbed_v,
+                    scratch_absorbed_qsel=_ds_graph_state.scratch_absorbed_qsel,
+                    scratch_absorbed_sel_i64=_ds_graph_state.scratch_absorbed_sel_i64,
+                    scratch_absorbed_q=_ds_graph_state.scratch_absorbed_q,
+                    include_current_slot=bool(_selector.config.include_current_slot),
+                    key_norm_cache=getattr(_sw_backend, "_ds_key_norm_cache", None),
+                    scratch_qnorm=_ds_graph_state.scratch_qnorm,
+                    q_pe=_rope_q_pe,
+                    k_pe=_rope_k_pe,
+                )
+                selected_indices = _ds_graph_state.selected_indices[:_bs]
+                valid_lengths = _ds_graph_state.valid_lengths[:_bs]
+            else:
+                # Fail closed: the eager retrieve_topk fallback does not thread
+                # the resident fp8 latent, so selection cannot score here.
+                # Selection only runs through the graph-safe
+                # retrieve_topk_graph_safe above (which reads the latent).
+                raise RuntimeError(
+                    "Double Sparsity requires the graph-safe selector path "
+                    "(preallocated ds_graph_state + the resident fp8 latent); "
+                    "the eager retrieve_topk fallback is not wired for "
+                    "production selection."
+                )
+            # prefer the NSA-metadata-owned buffer, allocated
+            # once per batch in init_forward_metadata (also for
+            # capture/replay). Resolve from the same real production
+            # objects used for `ds_graph_state` above:
+            #   (1) forward_batch.ds_topk_indices_out — dynamic
+            #       non-graph forwards (set by
+            #       dsa_backend.init_forward_metadata).
+            #   (2) ForwardContext-published attention backend's
+            #       forward_metadata.ds_topk_indices_out — CUDA-graph
+            #       capture/replay path (no forward_batch field).
+            # Last resort: lazy `torch.empty_like` for CPU unit tests
+            # that synthesize `forward_batch` without either source.
+            ds_out = getattr(forward_batch, "ds_topk_indices_out", None)
+            if ds_out is None and _dsa_metadata is not None:
+                ds_out = getattr(_dsa_metadata, "ds_topk_indices_out", None)
+            bs = int(selected_indices.shape[0])
+            if ds_out is None:
+                ds_out = torch.empty_like(selected_indices)
+                setattr(forward_batch, "ds_topk_indices_out", ds_out)
+            elif ds_out.shape[0] != bs:
+                ds_out = ds_out[:bs]
+            # Publish the selected-index domain that MATCHES how the DSA
+            # backend consumes topk_indices (see dsa_backend.forward_decode):
+            #   - Fused (SGLANG_DSA_FUSE_TOPK=True, the served default): the
+            #     backend uses topk_indices directly as physical page_table
+            #     slots with NO downstream transform, so publish PHYSICAL here
+            #     via the req_to_token gather. (Publishing logical here made
+            #     the kernel read KV at logical offsets -> garbage decode.)
+            #   - Non-fused: the backend runs transform_index_page_table_
+            #     decode/prefill, which gathers page_table[topk_indices] and
+            #     so REQUIRES LOGICAL positions; publishing physical there
+            #     would double-map. Publish raw logical positions.
+            # (hisparse + DS is out of scope for this path.)
+            if envs.SGLANG_DSA_FUSE_TOPK.get():
+                _rpi = getattr(forward_batch, "req_pool_indices", None)
+                if req_to_token is not None and _rpi is not None:
+                    logical_to_physical(
+                        selected_indices=selected_indices,
+                        req_pool_indices=_rpi,
+                        req_to_token=req_to_token,
+                        out=ds_out,
+                    )
                 else:
-                    # Non-fused: publish LOGICAL positions; the backend's
-                    # transform_index_page_table_decode/prefill does logical->
-                    # physical itself.
-                    mtk = selected_indices.shape[1]
-                    ds_out[:, :mtk].copy_(selected_indices)
-                    if mtk < ds_out.shape[1]:
-                        ds_out[:, mtk:].fill_(-1)
-                return ds_out
-
-            # DS selection runs directly: a selector/mask/TP failure surfaces
-            # as a normal exception rather than being caught and converted into
-            # per-row "contained" abort records, which would mask correctness bugs.
-            return _run()
+                    # Fused path needs physical slots but no req_to_token to
+                    # map with -> fail closed (no token attended) rather than
+                    # publish logical indices the fused path would misread.
+                    ds_out.fill_(-1)
+            else:
+                # Non-fused: publish LOGICAL positions; the backend's
+                # transform_index_page_table_decode/prefill does logical->
+                # physical itself.
+                mtk = selected_indices.shape[1]
+                ds_out[:, :mtk].copy_(selected_indices)
+                if mtk < ds_out.shape[1]:
+                    ds_out[:, mtk:].fill_(-1)
+            return ds_out
 
         return self.indexer(
             x=x,
