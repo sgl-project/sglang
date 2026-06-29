@@ -1173,6 +1173,59 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
 
+    def test_stripped_functions_tool_call_detect_and_parse(self):
+        """Test parsing tool calls with stripped functions{name}{index} IDs.
+
+        Occurs when a client (e.g. a BFF that requires alphanumeric IDs)
+        sanitized "." and ":" out of the canonical "functions.read:0" ID and
+        round-tripped that ID through chat history. The model then mirrors the
+        sanitized format ("functionsread0", "functionsread1", ...) in
+        subsequent turns, even though sglang itself always emits the canonical
+        form. Without this fallback the calls were silently dropped.
+        """
+        text = '<|tool_calls_section_begin|><|tool_call_begin|>functionsget_weather3<|tool_call_argument_begin|>{"city": "Paris"}<|tool_call_end|><|tool_call_begin|>functionsget_weather4<|tool_call_argument_begin|>{"city": "London"}<|tool_call_end|><|tool_calls_section_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].tool_index, 3)
+        self.assertEqual(result.calls[0].parameters, '{"city": "Paris"}')
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual(result.calls[1].tool_index, 4)
+        self.assertEqual(result.calls[1].parameters, '{"city": "London"}')
+
+    def test_stripped_functions_tool_call_streaming(self):
+        """Test streaming parsing of stripped functions{name}{index} IDs."""
+        self.detector = KimiK2Detector()
+
+        chunks = [
+            "<|tool_calls_section_begin|><|tool_call_begin|>functionsget_weather3<|tool_call_argument_begin|>{",
+            '"city": "Paris"',
+            "}<|tool_call_end|>",
+            "<|tool_call_begin|>functionsget_weather4<|tool_call_argument_begin|>{",
+            '"city": "London"',
+            "}<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if tool_call_chunk.tool_index is not None:
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] += tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"}')
+        self.assertEqual(tool_calls[1]["name"], "get_weather")
+        self.assertEqual(tool_calls[1]["parameters"], '{"city": "London"}')
+
 
 class TestDeepSeekV3Detector(unittest.TestCase):
     def setUp(self):
