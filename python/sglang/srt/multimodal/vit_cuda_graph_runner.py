@@ -145,7 +145,7 @@ class ViTCudaGraphRunner:
         ca_comm = tp_group.ca_comm
         capture_ctx = ca_comm.capture() if ca_comm is not None else nullcontext()
 
-        with capture_ctx, torch.cuda.graph(graph):
+        def run_blocks():
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
@@ -167,10 +167,13 @@ class ViTCudaGraphRunner:
 
                 if override_backend == "triton_attn":
                     cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
-                elif override_backend == "fa3":
+                elif override_backend in ("fa3", "fa4"):
                     cu_seq_len_ws = [cu_seqlens_now, max_len]
                 else:
-                    raise RuntimeError("Not supported ViT attention backend")
+                    raise RuntimeError(
+                        f"Not supported ViT attention backend, \
+                                       we only support triton_attn/fa3/fa4 for now, but got {override_backend}."
+                    )
 
                 if position_embeddings is not None:
                     if layer_num == 0:
@@ -228,6 +231,18 @@ class ViTCudaGraphRunner:
                 )
             else:
                 self.block_output[graph_key] = main_out
+
+        # Warmup run: execute the blocks once outside the CUDA graph context so that
+        # any torch.compile-decorated function (e.g. apply_rotary_pos_emb_native) is
+        # compiled for the exact input shapes before capture begins. Compilation inside
+        # torch.cuda.graph() triggers inductor's SFDP initialization which does
+        # CPU->CUDA tensor copies — an operation forbidden during stream capture.
+        torch.cuda.synchronize()
+        run_blocks()
+        torch.cuda.synchronize()
+
+        with capture_ctx, torch.cuda.graph(graph):
+            run_blocks()
 
         self.block_graphs[graph_key] = graph
 
