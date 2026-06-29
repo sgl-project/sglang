@@ -136,8 +136,6 @@ class TestCompareQuantPair(CustomTestCase):
         eq_c, max_c, mean_c, ex_c = chunked
         eq_r, max_r, mean_r, ex_r = reference
         self.assertEqual((eq_c, max_c, ex_c), (eq_r, max_r, ex_r))
-        # mean_abs_err sums abs-diff in a different order when chunked, so it is
-        # not bit-identical across chunk boundaries; compare within tolerance.
         self.assertAlmostEqual(mean_c, mean_r, places=7)
 
     @staticmethod
