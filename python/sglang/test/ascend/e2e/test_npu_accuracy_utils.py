@@ -270,9 +270,6 @@ def assert_metrics(self, metrics):
         )
 
 
-MMMU_LOCAL_PATH = "/root/.cache/modelscope/hub/datasets/AI-ModelScope___mmmu"
-
-
 class TestNpuAccuracyTestCaseBase(CustomTestCase):
     model = None
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
@@ -322,17 +319,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
         host = parsed_url.hostname
@@ -347,7 +333,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     port=port,
                     model=model_name,
                     datasets=self.datasets,
-                    dataset_args=self._get_dataset_args(),
+                    dataset_args=self.dataset_args,
                     eval_batch_size=self.eval_batch_size,
                     limit=self.limit,
                     generation_config=self.generation_config,
@@ -393,7 +379,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 port=port,
                 model=model_name,
                 datasets=self.datasets,
-                dataset_args=self._get_dataset_args(),
+                dataset_args=self.dataset_args,
                 eval_batch_size=self.eval_batch_size,
                 limit=self.limit,
                 generation_config=self.generation_config,
@@ -496,17 +482,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     @check_role(allowed_roles=["master", "worker"])
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -522,7 +497,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                     port=self.port,
                     model=model_name,
                     datasets=self.datasets,
-                    dataset_args=self._get_dataset_args(),
+                    dataset_args=self.dataset_args,
                     eval_batch_size=self.eval_batch_size,
                     limit=self.limit,
                     generation_config=self.generation_config,
@@ -623,17 +598,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
                 )
 
-    def _get_dataset_args(self):
-        if "mmmu" in self.datasets:
-            base_args = {"mmmu": {"dataset_id": MMMU_LOCAL_PATH}}
-            if self.dataset_args:
-                if isinstance(self.dataset_args, dict):
-                    base_args.update(self.dataset_args)
-                elif isinstance(self.dataset_args, str):
-                    base_args.update(json.loads(self.dataset_args))
-            return base_args
-        return self.dataset_args
-
     @check_role(allowed_roles=["router"])
     def run_accuracy(self):
         parsed_url = urlparse(self.base_url)
@@ -649,7 +613,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     port=port,
                     model=model_name,
                     datasets=self.datasets,
-                    dataset_args=self._get_dataset_args(),
+                    dataset_args=self.dataset_args,
                     eval_batch_size=self.eval_batch_size,
                     limit=self.limit,
                     generation_config=self.generation_config,
