@@ -243,6 +243,9 @@ class NgramEmbeddingInfo:
     req_lens: torch.Tensor
     out_column_starts: torch.Tensor
     out_req_lens: torch.Tensor
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the token table.
+    skip_mask: Optional[torch.Tensor] = None
 
     @classmethod
     def create(
@@ -252,6 +255,7 @@ class NgramEmbeddingInfo:
         device: torch.device,
         column_starts=None,
         req_lens=None,
+        skip_mask=None,
     ) -> NgramEmbeddingInfo:
         info = cls(
             token_table=token_table,
@@ -259,6 +263,7 @@ class NgramEmbeddingInfo:
             req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_column_starts=torch.empty(batch_size, dtype=torch.int32, device=device),
             out_req_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            skip_mask=skip_mask,
         )
         if column_starts is not None:
             info.column_starts[:] = column_starts
@@ -273,6 +278,7 @@ class NgramEmbeddingInfo:
             req_lens=self.req_lens[:bs],
             out_column_starts=self.out_column_starts[:bs],
             out_req_lens=self.out_req_lens[:bs],
+            skip_mask=self.skip_mask[:bs] if self.skip_mask is not None else None,
         )
 
 
@@ -682,6 +688,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
             column_starts=column_starts,
             req_lens=req_lens,
+            skip_mask=batch.ne_skip_token_table_update,
         )
 
     def _compute_spec_mrope_positions(

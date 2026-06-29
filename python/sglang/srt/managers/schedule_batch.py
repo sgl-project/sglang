@@ -1333,6 +1333,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     ne_token_table: torch.Tensor = None
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the ngram token table.
+    ne_skip_token_table_update: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -2365,6 +2368,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             ne_token_table=self.ne_token_table,
+            ne_skip_token_table_update=self.ne_skip_token_table_update,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
@@ -2542,6 +2546,10 @@ class ModelWorkerBatch:
 
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None
+
+    # Mask marking chunked (not-yet-finished) prefill requests whose sampled
+    # pseudo next-token must NOT be written into the ngram token table.
+    ne_skip_token_table_update: Optional[torch.Tensor] = None
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None

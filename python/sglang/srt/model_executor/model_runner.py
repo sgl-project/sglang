@@ -2402,6 +2402,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ngram_embedding_info = forward_batch.ngram_embedding_info
         if ngram_embedding_info is None:
             return
+        skip_mask = ngram_embedding_info.skip_mask
+        if skip_mask is not None:
+            # Skip chunked (not-yet-finished) prefill requests: their sampled
+            # token is a pseudo prediction and must not pollute the token table.
+            indices = (~skip_mask).nonzero(as_tuple=True)[0]
+            if indices.numel() == 0:
+                return
+            update_token_table(
+                ne_token_table=ngram_embedding_info.token_table,
+                tokens=next_token_ids[indices].to(torch.int32),
+                row_indices=forward_batch.req_pool_indices[indices],
+                column_starts=forward_batch.seq_lens[indices].to(torch.int32),
+                req_lens=torch.ones(
+                    indices.numel(), dtype=torch.int32, device=next_token_ids.device
+                ),
+                ignore_tokens=None,
+            )
+            return
         ngram_embedding_info.out_column_starts[: forward_batch.batch_size] = (
             forward_batch.seq_lens
         )
