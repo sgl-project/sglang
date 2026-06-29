@@ -701,7 +701,7 @@ class MQALayer(nn.Module):
 
             token_to_kv_pool = get_token_to_kv_pool()
             swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
-            swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+            swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
             swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
             q = fused_qk_norm_rope_swa_store(
@@ -802,7 +802,7 @@ class MQALayer(nn.Module):
                 swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
                 swa_page_size, bf16_store = 1, True
             else:
-                swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+                swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
                 swa_page_size, bf16_store = (
                     token_to_kv_pool.swa_kv_pool.page_size,

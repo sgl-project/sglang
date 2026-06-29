@@ -202,8 +202,10 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sglang.jit_kernel.dsv3_router_gemm import (
+        dsv3_router_gemm as _jit_dsv3_router_gemm,
+    )
+    from sglang.jit_kernel.fused_a_gemm import dsv3_fused_a_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -214,7 +216,7 @@ elif _is_npu:
         forward_mla_prepare_npu,
     )
 elif _is_musa:
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
 else:
     pass
 
@@ -495,28 +497,16 @@ class MoEGate(nn.Module):
         ):
             logits = F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE: For some unknown reason, router_gemm seems degrade accept length.
             if (
                 _is_cuda
                 and hidden_states.shape[0] <= 16
-                and hidden_states.shape[1] == 7168
+                and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-                if _device_sm in [100, 103] and self.weight.shape[0] == 256:
-                    # TODO: will check the dtype to be bf16
-                    # router gemm output float32
-                    logits = torch.empty(
-                        hidden_states.shape[0],
-                        self.weight.shape[0],
-                        device=hidden_states.device,
-                        dtype=torch.float32,
-                    )
-                    flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
-                else:
-                    logits = dsv3_router_gemm(
-                        hidden_states, self.weight, out_dtype=torch.float32
-                    )
+                logits = _jit_dsv3_router_gemm(
+                    hidden_states, self.weight, out_dtype=torch.float32
+                )
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -937,61 +927,59 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(
+            hidden_states, gemm_output_zero_allocator
+        )
         server_args = get_global_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if server_args.enable_eplb
             else None
         )
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-        if use_flashinfer_trtllm_bypass:
-            topk_output = BypassedTopKOutput(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_config=self.topk.topk_config,
-            )
-        else:
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
-        has_shared_output = (
-            hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
-        )
-        deferred_finalize = (
-            has_shared_output
-            and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
-        )
-        if deferred_finalize:
-            final_hidden_states = self.experts.forward_deferred_finalize(
-                hidden_states, topk_output
-            )
-        elif use_flashinfer_trtllm_bypass:
-            final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
-        else:
-            final_hidden_states = self.experts(hidden_states, topk_output)
-        if (
-            not _is_cuda
-            and not _is_musa
-            and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
-        ):
-            final_hidden_states *= self.routed_scaling_factor
-
         with torch.cuda.stream(self.alt_stream):
-            shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            if use_flashinfer_trtllm_bypass:
+                topk_output = BypassedTopKOutput(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_config=self.topk.topk_config,
+                )
+            else:
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
+                )
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
+            deferred_finalize = (
+                shared_output is not None
+                and not self._shared_expert_tp1
+                and topk_output.format == TopKOutputFormat.BYPASSED
+                and self.experts.supports_deferred_finalize
             )
+            if deferred_finalize:
+                final_hidden_states = self.experts.forward_deferred_finalize(
+                    hidden_states, topk_output
+                )
+            elif use_flashinfer_trtllm_bypass:
+                final_hidden_states = self.experts.forward_impl(
+                    hidden_states, topk_output
+                )
+            else:
+                final_hidden_states = self.experts(hidden_states, topk_output)
+            if (
+                not _is_cuda
+                and not _is_musa
+                and not _use_aiter
+                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            ):
+                final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -1781,11 +1769,12 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and not self.is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
-            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 256 == 0
             and _is_cuda
-            and 90 <= _device_sm < 120
+            and _device_sm >= 90
         )
+        self.fused_a_gemm_backend = "auto"
 
         self.init_mha_forward()
         self.init_mla_forward()
@@ -1999,7 +1988,9 @@ class DeepseekV2AttentionMLA(
             and not lora_active
         ):
             qkv_latent = dsv3_fused_a_gemm(
-                hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight.T,
+                backend=self.fused_a_gemm_backend,
             )
         else:
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
@@ -2945,24 +2936,6 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
-
-
-@register_custom_op(
-    op_name="flashinfer_dsv3_router_gemm",
-    mutates_args=[],
-    fake_impl=lambda logits, hidden_states, weight: None,
-)
-def flashinfer_dsv3_router_gemm(
-    logits: torch.Tensor,
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-) -> None:
-    _raw_dsv3_router_gemm(
-        hidden_states,
-        weight.t(),
-        logits,
-        launch_with_pdl=True,
-    )
 
 
 @register_custom_op(out_shape="hidden_states")

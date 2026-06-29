@@ -643,7 +643,11 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+        MiniMaxSparseKVPool,
+    )
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -651,7 +655,16 @@ def setup_state_kv_args(
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
 
-    if hasattr(token_to_kv_pool, "get_state_buf_infos"):
+    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+        if token_to_kv_pool.index_kv_pool is not None:
+            raise NotImplementedError(
+                "PD disaggregation for MiniMax sparse layers with index value "
+                "(index_kv_pool) is not yet supported; only K-only sparse layers are."
+            )
+        if token_to_kv_pool.index_k_pool is not None:
+            dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
+            append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+    elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
