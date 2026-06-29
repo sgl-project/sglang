@@ -40,9 +40,6 @@ def sgl_build_tree_kernel_efficient_triton(
     """
     batch_idx = tl.program_id(0)
 
-    if batch_idx >= batch_size:
-        return
-
     # Calculate seq_tree_idx
     seq_len = tl.load(verified_seq_len_ptr + batch_idx)
     seq_len_prefix_sum = tl.load(seq_len_prefix_sum_ptr + batch_idx)
@@ -193,9 +190,6 @@ def verify_tree_greedy_kernel_triton(
     Each program handles one batch item.
     """
     bx = tl.program_id(0)
-
-    if bx >= batch_size:
-        return
 
     # Initialize
     last_accept_retrieve_idx = tl.load(retrieve_index_ptr + bx * num_draft_tokens)

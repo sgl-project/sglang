@@ -18,20 +18,30 @@ register_xpu_ci(est_time=360, stage="stage-b", runner_config="1-gpu-xpu")
 _is_xpu = is_xpu()
 
 
-class TestEagle3Parity(SpecParityKit, Eagle3Base):
-    """EAGLE3 spec v2 (flashinfer) greedy output == non-spec reference.
+class _Eagle3ParityBase(Eagle3Base):
+    """Shared knobs for EAGLE3 parity variants; no test methods."""
+
+    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+
+
+@unittest.skipIf(_is_xpu, "CUDA runner only")
+class TestEagle3ParityCUDA(SpecParityKit, _Eagle3ParityBase):
+    """EAGLE3 spec v2 (flashinfer, overlap) greedy output == non-spec reference.
 
     SpecParityKit is first so its setUpClass runs the reference server (and tears
     it down) before the fixture launches the spec server -- sequential, one model
     at a time.
     """
 
-    if _is_xpu:
-        disable_overlap = True
-        attention_backend = "triton"
-    else:
-        disable_overlap = False
-    env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
+    disable_overlap = False
+
+
+@unittest.skipUnless(_is_xpu, "XPU runner only")
+class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
+    """EAGLE3 parity on XPU (triton, no overlap, deterministic)."""
+
+    disable_overlap = False
+    attention_backend = "triton"
 
 
 if __name__ == "__main__":
