@@ -3485,6 +3485,13 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def clear_hicache_storage_after_weight_update(self) -> bool:
+        if not self.enable_hierarchical_cache or not self.enable_hicache_storage:
+            return True
+        if not hasattr(self.tree_cache, "clear_storage_backend"):
+            return False
+        return self.tree_cache.clear_storage_backend()
+
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():

@@ -605,7 +605,10 @@ class HiCacheFile(HiCacheStorage):
             for filename in os.listdir(self.file_path):
                 file_path = os.path.join(self.file_path, filename)
                 if os.path.isfile(file_path):
-                    os.remove(file_path)
+                    try:
+                        os.remove(file_path)
+                    except FileNotFoundError:
+                        pass
             self._evictor.clear()
             logger.info("Cleared all entries in HiCacheFile storage.")
             return True

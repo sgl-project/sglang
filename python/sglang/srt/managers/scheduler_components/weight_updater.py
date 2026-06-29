@@ -103,7 +103,19 @@ class SchedulerWeightUpdaterManager:
             flush_cache_success = self.flush_cache(
                 empty_cache=recv_req.torch_empty_cache
             )
-            assert flush_cache_success, "Cache flush failed after updating weights"
+            if not flush_cache_success:
+                raise RuntimeError("Cache flush failed after updating weights")
+            if self.scheduler is None:
+                raise RuntimeError(
+                    "Scheduler is required to invalidate HiCache storage"
+                )
+            clear_storage_success = (
+                self.scheduler.clear_hicache_storage_after_weight_update()
+            )
+            if not clear_storage_success:
+                raise RuntimeError(
+                    "HiCache storage clear failed after updating weights"
+                )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
