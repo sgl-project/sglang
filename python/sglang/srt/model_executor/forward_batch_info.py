@@ -430,8 +430,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
-    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
-    topk_indices: Optional[torch.Tensor] = None
+    # NSA/DSA indexer-topk reuse across the MTP draft steps. The flag is set per
+    # draft pass; the carried topk tensor itself lives on spec_info
+    # (EagleDraftInput.mtp_topk_indices), which is shared by reference across the
+    # per-step forwards, unlike this batch object which the eager/graph runner
+    # copies (dropping any writeback here).
     reuse_mtp_topk_indices: Optional[bool] = False
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
