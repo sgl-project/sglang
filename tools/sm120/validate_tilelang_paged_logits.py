@@ -252,6 +252,52 @@ def check_triton_sparse_attention():
     return bool(finite)
 
 
+def check_sm120_routing():
+    """Validate dsa_backend's SM120 routing helper: fp8 KV (+ matching shapes)
+    must route to the triton kernel (finite tensor), and bf16 KV must fall back
+    (return None). This exercises the gate that selects triton during serving."""
+    print("\n=== [4/4] dsa_backend SM120 routing (_sm120_triton_sparse_mla) ===")
+    import types
+
+    try:
+        from sglang.srt.layers.attention.dsa_backend import _sm120_triton_sparse_mla
+    except Exception as e:  # noqa: BLE001
+        print("SKIP: could not import dsa_backend routing helper:")
+        print(" ", repr(e))
+        return None  # skipped, not a hard failure
+
+    dev = "cuda"
+    dim = SA_D_V + SA_TAIL
+    layer = types.SimpleNamespace(
+        tp_q_head_num=SA_HEADS, v_head_dim=SA_D_V, head_dim=dim,
+        scaling=1.0 / (dim ** 0.5),
+    )
+    q_nope = (torch.randn(SA_TOKENS, SA_HEADS, SA_D_V, device=dev) * 0.5).to(FP8)
+    q_rope = (torch.randn(SA_TOKENS, SA_HEADS, SA_TAIL, device=dev) * 0.5).to(FP8)
+    page_table_1 = torch.randint(
+        0, SA_NUM_KV, (SA_TOKENS, SA_TOPK), device=dev, dtype=torch.int32
+    )
+    kv_fp8 = (torch.randn(SA_NUM_KV, 1, dim, device=dev) * 0.5).to(FP8)
+    kv_bf16 = torch.randn(SA_NUM_KV, 1, dim, device=dev, dtype=torch.bfloat16)
+
+    try:
+        out_fp8 = _sm120_triton_sparse_mla(layer, q_nope, q_rope, kv_fp8, page_table_1)
+        out_bf16 = _sm120_triton_sparse_mla(layer, q_nope, q_rope, kv_bf16, page_table_1)
+    except Exception as e:  # noqa: BLE001
+        print("ROUTING CALL FAILED:")
+        print(repr(e))
+        return False
+
+    routed = out_fp8 is not None and torch.isfinite(out_fp8).all().item()
+    fell_back = out_bf16 is None
+    print(f"fp8 KV -> triton tensor: {routed} (shape="
+          f"{tuple(out_fp8.shape) if out_fp8 is not None else None})")
+    print(f"bf16 KV -> fallback (None): {fell_back}")
+    ok = routed and fell_back
+    print("routing: PASS" if ok else "routing: FAIL")
+    return ok
+
+
 def main():
     if not torch.cuda.is_available():
         print("CUDA required"); return 1
@@ -261,13 +307,19 @@ def main():
     ok_logits = check_paged_logits()
     ok_attn = check_sparse_attention()
     ok_triton = check_triton_sparse_attention()
+    ok_routing = check_sm120_routing()
+
+    def _s(v):
+        return "SKIP" if v is None else ("PASS" if v else "FAIL")
 
     print("\n==================== SUMMARY ====================")
-    print(f"  paged-logits kernel:           {'PASS' if ok_logits else 'FAIL'}")
-    print(f"  tilelang sparse-attn (bf16):   {'PASS' if ok_attn else 'FAIL (expected on SM120: smem)'}")
-    print(f"  triton sparse-attn (fp8):      {'PASS' if ok_triton else 'FAIL'}")
-    # On SM120 the viable serving path is paged-logits + triton attention (fp8 KV).
-    sm120_path_ok = ok_logits and ok_triton
+    print(f"  paged-logits kernel:           {_s(ok_logits)}")
+    print(f"  tilelang sparse-attn (bf16):   {_s(ok_attn)} (expected FAIL on SM120: smem)")
+    print(f"  triton sparse-attn (fp8):      {_s(ok_triton)}")
+    print(f"  dsa_backend SM120 routing:     {_s(ok_routing)}")
+    # On SM120 the viable serving path is paged-logits + triton attention (fp8 KV),
+    # selected by the routing helper. (routing is SKIP-tolerant: import can be heavy.)
+    sm120_path_ok = ok_logits and ok_triton and (ok_routing is not False)
     print("SM120 serving path (paged-logits + triton attn):",
           "PASS" if sm120_path_ok else "FAIL")
     return 0 if sm120_path_ok else 1
