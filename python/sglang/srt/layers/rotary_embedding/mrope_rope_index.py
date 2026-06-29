@@ -146,7 +146,10 @@ def get_rope_index(
                     llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                 )
                 llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                    torch.arange(text_len, device=position_ids.device)
+                    .view(1, -1)
+                    .expand(3, -1)
+                    + st_idx
                 )
                 if model_type in ("qwen2_5_vl", "paddleocr_vl"):
                     range_tensor = torch.arange(llm_grid_t).view(-1, 1)
@@ -191,7 +194,10 @@ def get_rope_index(
                 )
                 text_len = len(input_tokens) - st
                 llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                    torch.arange(text_len, device=position_ids.device)
+                    .view(1, -1)
+                    .expand(3, -1)
+                    + st_idx
                 )
             llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
             position_ids[..., i, :] = llm_positions.to(position_ids.device)
@@ -294,7 +300,10 @@ def get_rope_index_qwen3_omni(
                 text_len = min_ed - st
                 if text_len != 0:
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=position_ids.device)
+                        .view(1, -1)
+                        .expand(3, -1)
+                        + st_idx
                     )
                     st_idx += text_len
                 if min_ed == ed_vision_start and ed_vision_start + 1 == ed_audio_start:
@@ -454,7 +463,10 @@ def get_rope_index_qwen3_omni(
                 )
                 text_len = len(input_tokens) - st
                 llm_pos_ids_list.append(
-                    torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                    torch.arange(text_len, device=position_ids.device)
+                    .view(1, -1)
+                    .expand(3, -1)
+                    + st_idx
                 )
             llm_positions = torch.cat(
                 [item.float() for item in llm_pos_ids_list], dim=1
@@ -803,7 +815,10 @@ def get_rope_index_ernie45(
                 else:
                     text_len = end_idx - start_idx
                     llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        torch.arange(text_len, device=position_ids.device)
+                        .view(1, -1)
+                        .expand(3, -1)
+                        + st_idx
                     )
                     video_frame_num = 1
 
