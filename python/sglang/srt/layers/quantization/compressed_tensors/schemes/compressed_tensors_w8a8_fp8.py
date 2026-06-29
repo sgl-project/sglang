@@ -5,6 +5,7 @@
 from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
@@ -28,14 +29,87 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_hip
 
-__all__ = ["CompressedTensorsW8A8Fp8"]
+__all__ = ["CompressedTensorsW8A8Fp8", "FP8_ALIGNMENT", "pad_to_alignment"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+
+# torch._scaled_mm requires both matrix dimensions divisible by 16.
+# Models where intermediate_size / tp_size is not 16-aligned
+# (e.g. 10944 / tp=8 = 1368) fail CUDA Graph capture without padding.
+FP8_ALIGNMENT = 16
+
+
+def pad_to_alignment(
+    tensor: torch.Tensor, dim: int, alignment: int = FP8_ALIGNMENT
+) -> torch.Tensor:
+    """Zero-pad tensor along dim to the next multiple of alignment.
+
+    Returns the original tensor unchanged when already aligned.
+    """
+    size = tensor.shape[dim]
+    pad = ceil_align(size, alignment) - size
+    if pad == 0:
+        return tensor
+    # F.pad takes padding in reverse-dim order, two values per dim (left, right).
+    # Index 2*(ndim-1-dim)+1 selects the right-side padding for `dim`.
+    pad_arg = [0] * (2 * tensor.ndim)
+    pad_arg[2 * (tensor.ndim - 1 - dim) + 1] = pad
+    return F.pad(tensor, pad_arg)
+
+
+def _pad_weight_to_alignment(
+    weight: torch.Tensor, weight_scale: Optional[torch.Tensor]
+) -> tuple[torch.Tensor, Optional[torch.Tensor], int, int]:
+    """Pad weight (N, K) so both dims are multiples of FP8_ALIGNMENT.
+
+    Returns (weight_t, weight_scale, orig_N, orig_K) where weight_t is transposed.
+    weight_scale is padded along dim-0 when it is per-channel (shape [N, 1]
+    or [N,]).
+    """
+    orig_n = weight.shape[0]
+    orig_k = weight.shape[1]
+    weight = pad_to_alignment(weight, dim=0)
+    weight = pad_to_alignment(weight, dim=1)
+    if weight_scale is not None and weight.shape[0] > orig_n:
+        if weight_scale.shape == (orig_n,):
+            weight_scale = weight_scale.unsqueeze(1)
+        if weight_scale.shape != (orig_n, 1):
+            raise ValueError(
+                f"Expected per-channel scale shape ({orig_n}, 1) or ({orig_n},), "
+                f"got {tuple(weight_scale.shape)}"
+            )
+        weight_scale = pad_to_alignment(weight_scale, dim=0)
+    return weight.t(), weight_scale, orig_n, orig_k
+
+
+def _cache_padding_metadata(
+    layer, weight_t: torch.Tensor, orig_n: int, orig_k: int
+) -> None:
+    """Cache padded shapes on the layer and pre-pad a copy of bias if present.
+
+    Keeps apply_weights branch-light and CUDA-Graph-friendly: no per-forward
+    shape math, no F.pad on bias, no F.pad on input when K is already aligned.
+
+    Bias is stored under `_padded_bias` rather than overwriting `layer.bias`,
+    because callers using `skip_bias_add=True` read `layer.bias` directly and
+    would see the wrong shape if we mutated it in place.
+    """
+    # weight_t is (K_padded, N_padded).
+    k_padded, n_padded = weight_t.shape
+    layer._orig_output_dim = orig_n
+    layer._pad_input_k = k_padded - orig_k
+    layer._needs_output_slice = n_padded > orig_n
+
+    bias = getattr(layer, "bias", None)
+    if bias is not None and layer._needs_output_slice:
+        layer._padded_bias = pad_to_alignment(bias.data, dim=0)
+    else:
+        layer._padded_bias = None
 
 
 strategy_to_parameter_type = {
@@ -158,8 +232,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 )
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
-            layer.weight = Parameter(weight.t(), requires_grad=False)
+
+            weight_t, _, orig_n, orig_k = _pad_weight_to_alignment(weight, None)
+            layer.weight = Parameter(weight_t, requires_grad=False)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            _cache_padding_metadata(layer, weight_t, orig_n, orig_k)
 
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
@@ -178,15 +255,21 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                # keep the weight as (N, K)
+                # keep the weight as (N, K); (16, 16) is the aiter shuffle tile
+                # size, unrelated to the torch._scaled_mm alignment requirement
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
-
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                weight_t, weight_scale, orig_n, orig_k = _pad_weight_to_alignment(
+                    weight, weight_scale
+                )
+                layer.weight = Parameter(weight_t, requires_grad=False)
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                _cache_padding_metadata(layer, weight_t, orig_n, orig_k)
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -251,13 +334,33 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
             )
-        else:
-            return apply_fp8_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
-                bias=bias,
-                use_per_token_if_dynamic=True,
-                compressed_tensor_quant=True,
-            )
+
+        # weight is stored transposed as (K_padded, N_padded). All shape math
+        # is precomputed in process_weights_after_loading and cached on `layer`
+        # so this path is branch-light and CUDA-Graph-friendly.
+        #
+        # _pad_input_k is typically 0 for column-parallel layers (K == hidden_size
+        # is naturally aligned) and non-zero for row-parallel layers where
+        # K == intermediate_size/tp_size can be misaligned.
+        if layer._pad_input_k:
+            x = F.pad(x, (0, layer._pad_input_k))
+
+        # Swap in the pre-padded bias when N was padded at load time.
+        # `_padded_bias` is None when no padding was needed OR when the layer had
+        # no bias; if the caller passed bias=None (skip_bias_add=True), keep None.
+        if bias is not None and layer._padded_bias is not None:
+            bias = layer._padded_bias
+
+        output = apply_fp8_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=layer.input_scale,
+            bias=bias,
+            use_per_token_if_dynamic=True,
+            compressed_tensor_quant=True,
+        )
+
+        if layer._needs_output_slice:
+            output = output[..., : layer._orig_output_dim]
+        return output
