@@ -108,7 +108,9 @@ python3 -m sglang.launch_server \
     --dp-size 2 \
     --mem-fraction-static 0.85 \
     --cuda-graph-bs 1 2 4 8 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80 84 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -206,7 +208,9 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.87 \
     --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -304,7 +308,9 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.87 \
     --cuda-graph-bs 1 5 15 40 70 100 120 130 140 146 150 154 156 158 160 162 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
@@ -401,7 +407,9 @@ python3 -m sglang.launch_server \
     --tp-size 2 \
     --mem-fraction-static 0.6 \
     --cuda-graph-bs 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 \
-    --dtype bfloat16
+    --dtype bfloat16 \
+    --reasoning-parser qwen3 \
+    --tool-call-parser qwen
 ```
 
 #### Benchmark
