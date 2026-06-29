@@ -1978,6 +1978,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
+                device_id=torch.device("cuda", self.gpu_id),
             )
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
