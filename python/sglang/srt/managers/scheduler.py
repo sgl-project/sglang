@@ -2293,6 +2293,21 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+
+                query_storage_hit_length = getattr(
+                    self.tree_cache, "query_storage_hit_length", None
+                )
+                if query_storage_hit_length is not None:
+                    l3_storage_hit_length = query_storage_hit_length(
+                        last_host_node,
+                        new_input_tokens,
+                        last_hash,
+                        prefix_keys,
+                    )
+                    if l3_storage_hit_length <= 0:
+                        return
+                    new_input_tokens = new_input_tokens[:l3_storage_hit_length]
+
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
