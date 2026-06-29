@@ -10,22 +10,22 @@ This page focuses on optimal configuration and benchmark results for GLM-5.1 on 
 
 ### Low Latency
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-20ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 20ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-20ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (90% prefix cache hit rate) | 25ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 65K+1.5K (90% prefix cache hit rate) | 25ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in65k-out1k5-prefix90-25ms) |
 
 ### High Throughput
 
-| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (100% prefix cache hit rate) | 33ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
-| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
+| Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | TTFT | Quantization | Configuration |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| GLM-5.1 | Atlas 800I A3 | 16 | PD Mixed | 3.5K+1.5K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 128K+1K | 56.4ms | 13.1s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in128k-out1k-56-4ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 16K+1K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 55.2ms | 7.58s | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-55-2ms) |
+| GLM-5.1 | Atlas 800I A3 | 32 | PD Disaggregation | 64K+1K | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-32p-in64k-out1k-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 65K+1.5K (100% prefix cache hit rate) | 33ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-1p1d-48p-in65k-out1k5-prefix100-33ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 128K+1K (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-2p1d-48p-in128k-out1k-prefix90-50ms) |
+| GLM-5.1 | Atlas 800I A3 | 48 | PD Disaggregation | 64K+1K (90% prefix cache hit rate) | 50ms | - | W4A8 INT8 | [Optimal Configuration](#glm-5-1-w4a8-4p1d-48p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
@@ -122,7 +122,9 @@ do
         --speculative-algorithm NEXTN \
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
-        --speculative-num-draft-tokens 4
+        --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47
         break
     fi
 done
@@ -147,7 +149,7 @@ python -m sglang.bench_serving \
 
 <a id="pd-disaggregation" title="Referenced by external docs. Verify before removing."></a>
 
-### GLM-5.1 W4A8 1P1D 32P IN128K OUT1K 20ms
+### GLM-5.1 W4A8 1P1D 32P IN128K OUT1K 56.4ms
 
 **Model**: GLM-5.1
 
@@ -161,7 +163,9 @@ python -m sglang.bench_serving \
 
 **Dataset**: 128K+1K
 
-**TPOT**: 20ms
+**TPOT**: 56.4ms
+
+**TTFT**: 13.1s
 
 #### Model Deployment
 
@@ -241,7 +245,7 @@ do
         --disaggregation-transfer-backend ascend \
         --max-running-requests 16 \
         --served-model-name glm-5 \
-        --chunked-prefill-size 16384 \
+        --chunked-prefill-size 8192 \
         --max-prefill-tokens 180000 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
@@ -255,6 +259,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -306,6 +312,8 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -452,6 +460,8 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -507,6 +517,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -547,7 +559,7 @@ python -m sglang.bench_serving \
     --random-range-ratio 1
 ```
 
-### GLM-5.1 W4A8 1P1D 32P IN64K OUT1K 20ms
+### GLM-5.1 W4A8 1P1D 32P IN64K OUT1K 55.2ms
 
 **Model**: GLM-5.1
 
@@ -561,7 +573,9 @@ python -m sglang.bench_serving \
 
 **Dataset**: 64K+1K
 
-**TPOT**: 20ms
+**TPOT**: 55.2ms
+
+**TTFT**: 7.58s
 
 #### Model Deployment
 
@@ -641,7 +655,7 @@ do
         --disaggregation-transfer-backend ascend \
         --max-running-requests 16 \
         --served-model-name glm-5 \
-        --chunked-prefill-size 16384 \
+        --chunked-prefill-size 8192 \
         --max-prefill-tokens 180000 \
         --moe-a2a-backend deepep \
         --deepep-mode normal \
@@ -655,6 +669,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -706,6 +722,8 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -854,6 +872,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -905,6 +925,8 @@ do
         --dtype bfloat16 \
         --load-balance-method round_robin \
         --speculative-draft-model-quantization unquant \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1051,6 +1073,8 @@ do
         --attn-cp-size 8 \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1106,6 +1130,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1248,6 +1274,8 @@ do
         --disable-shared-experts-fusion \
         --disable-cuda-graph \
         --dtype bfloat16 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1289,7 +1317,6 @@ do
         --quantization modelslim \
         --served-model-name glm-5 \
         --moe-a2a-backend deepep \
-        --enable-dp-attention \
         --deepep-mode low_latency \
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
@@ -1307,6 +1334,8 @@ do
         --disable-shared-experts-fusion \
         --dtype bfloat16 \
         --load-balance-method round_robin \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1455,6 +1484,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 8 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1510,6 +1541,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1664,6 +1697,8 @@ do
         --enable-dp-lm-head \
         --moe-dense-tp 1 \
         --pp-size 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
@@ -1719,6 +1754,8 @@ do
         --speculative-num-steps 3 \
         --speculative-eagle-topk 1 \
         --speculative-num-draft-tokens 4 \
+        --reasoning-parser glm45 \
+        --tool-call-parser glm47 \
         --trust-remote-code
         NODE_RANK=$i
         break
