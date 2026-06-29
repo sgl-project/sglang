@@ -144,7 +144,7 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_indices = _translate_mamba(
                 forward_batch.mamba_track_indices
             )
-        _real_bs = getattr(forward_batch, "_original_batch_size", None)
+        _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
             mamba_cache_indices[_real_bs:] = -1
@@ -323,7 +323,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # `translate_mamba_indices`) and at capture.
         if not in_capture:
             _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
-            _mt = getattr(forward_batch, "mamba_track_indices", None)
+            _mt = forward_batch.mamba_track_indices
             if _tr is not None and _mt is not None and _mt.numel() > 0:
                 _mt.copy_(_tr(_mt))
 
@@ -936,7 +936,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         # is now skipped by the kernel's pad_slot_id guard.
         if not in_capture:
             _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
-            _mt = getattr(forward_batch, "mamba_track_indices", None)
+            _mt = forward_batch.mamba_track_indices
             if _tr is not None and _mt is not None and _mt.numel() > 0:
                 _mt.copy_(_tr(_mt))
         spec_info = forward_batch.spec_info

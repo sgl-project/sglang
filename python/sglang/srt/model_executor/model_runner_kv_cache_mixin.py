@@ -403,9 +403,7 @@ class ModelRunnerKVCacheMixin:
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
-            mamba_full_memory_ratio=getattr(
-                self.server_args, "mamba_full_memory_ratio", None
-            ),
+            mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
             # Pass the model forward stream so the allocator's `free` can
             # drop a `schedule_stream.wait_stream(forward_stream)` barrier
             # at its top — required for correctness in overlap mode, where
@@ -413,7 +411,7 @@ class ModelRunnerKVCacheMixin:
             # still reading v2p / reading+writing K/V slots that the eager
             # compaction is about to relocate. A near-no-op in normal mode
             # (sampling's CPU sync already drained forward_stream).
-            forward_stream=getattr(self, "forward_stream", None),
+            forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var
             # escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
@@ -505,7 +503,7 @@ class ModelRunnerKVCacheMixin:
             # Same overlap-mode rationale as `_init_shared_mamba_pools`
             # — the allocator's `free` drops a wait_stream(forward_stream) so
             # eager compaction serializes after the in-flight forward kernels.
-            forward_stream=getattr(self, "forward_stream", None),
+            forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
         )
