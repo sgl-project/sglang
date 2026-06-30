@@ -3424,6 +3424,10 @@ class ServerArgs:
                 and decode_cuda_graph_config.backend != Backend.DISABLED
             ):
                 reserved_mem += decode_cuda_graph_config.max_bs * 2
+                # DeepEP all-to-all buffers captured in the decode graph are
+                # not covered by the max_bs term.
+                if self.moe_a2a_backend == "deepep":
+                    reserved_mem += 2 * 1024
             # Some adjustments for large parallel size
             reserved_mem += self.tp_size * self.pp_size / 8 * 1024
 
