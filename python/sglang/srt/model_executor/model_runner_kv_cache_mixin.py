@@ -576,7 +576,38 @@ class ModelRunnerKVCacheMixin:
         elif (
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
-            if self.is_hybrid_swa:
+            if is_minimax_sparse(self.model_config.hf_config):
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMiniMaxSparseKVPool,
+                )
+
+                _hf_config = self.model_config.hf_config
+                sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
+                dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(
+                    sparse_cfg
+                )
+                disable_value_sparse_layer_ids = (
+                    get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
+                )
+                self.token_to_kv_pool = NPUMiniMaxSparseKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    index_dtype=self.dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    idx_head_dim=sparse_cfg["sparse_index_dim"],
+                    dense_layer_ids=dense_layer_ids,
+                    sparse_layer_ids=sparse_layer_ids,
+                    disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            elif self.is_hybrid_swa:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )

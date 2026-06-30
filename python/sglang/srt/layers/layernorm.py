@@ -94,6 +94,7 @@ if _is_cuda or _is_xpu or _is_musa:
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
+_has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     from aiter import layernorm2d_fwd as layer_norm
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -109,6 +110,19 @@ elif _is_hip:
     except ImportError:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
+
+if _is_hip:
+    try:
+        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+            gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
+        )
+        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+            gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
+        )
+
+        _has_rocm_triton_gemma_rms_norm = True
+    except ImportError:
+        _has_rocm_triton_gemma_rms_norm = False
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
@@ -141,6 +155,8 @@ logger = logging.getLogger(__name__)
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+
+_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
 
 
 def _forward_with_allreduce_fusion(
@@ -358,6 +374,11 @@ class RMSNorm(MultiPlatformOp):
             if residual is not None:
                 return x, residual
             return x
+        if self.weight.data.dtype != x.dtype:
+            # AITER's ROCm rmsnorm2d_fwd expects weight and activation dtypes to
+            # match. FP32 weights with BF16 activations can produce finite but
+            # corrupted outputs on gfx950.
+            return self.forward_native(x, residual, post_residual_addition)
         # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
         # already-safe layout as a zero-copy path, and only normalize strided or
         # higher-rank views such as Q/K slices from packed QKV projections.
@@ -724,24 +745,24 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _use_aiter and _has_rocm_triton_gemma_rms_norm:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return rocm_triton_gemma_fused_add_rmsnorm(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+            return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
-        w = self.gemma_weight
         if _use_aiter:
-            # aiter API: rms_norm(input, weight, eps) -> output
-            #            fused_add_rms_norm(output, input, residual, residual_out, weight, eps)
-            if residual is not None:
-                output = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    output, x, residual, residual_out, w, self.variance_epsilon
-                )
-                return output, residual_out
-            return rms_norm(x, w, self.variance_epsilon)
+            # AITER's ROCm rmsnorm2d_fwd has the same dtype requirement here;
+            # keep Gemma RMSNorm on native torch math for correctness.
+            return self.forward_native(x, residual, post_residual_addition)
         else:
+            w = self.gemma_weight
             # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
             #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
             if not x.is_contiguous():
@@ -778,6 +799,20 @@ class GemmaRMSNorm(MultiPlatformOp):
             )
         return self.forward_native(x, residual, post_residual_addition)
 
+    def _forward_npu_unfused_residual(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        residual = x + residual
+        norm_out, _ = torch_npu.npu_gemma_rms_norm(
+            residual, self.weight, self.variance_epsilon
+        )
+        return norm_out, residual
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -785,8 +820,14 @@ class GemmaRMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
-            return self.forward_native(x, residual)
+            return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
+            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
+                # MiniMax-M3 hidden_size=6144 overflows UB in sgl_kernel_npu's
+                # Triton fused residual+GemmaRMSNorm kernel on Ascend.
+                return self._forward_npu_unfused_residual(
+                    x, residual, post_residual_addition
+                )
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             norm_out, residual = add_gemma_rms_norm(

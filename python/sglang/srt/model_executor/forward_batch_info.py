@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -433,6 +433,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
     topk_indices: Optional[torch.Tensor] = None
     reuse_mtp_topk_indices: Optional[bool] = False
+
+    # MiniMax-M3 sparse-attention layers whose K/V cache was written by a fused
+    # norm/RoPE/cache-store kernel during this forward pass.
+    minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information

@@ -448,6 +448,7 @@ class BaseMultimodalProcessor(ABC):
             elif processor.__class__.__name__ not in {
                 "Glm4vProcessor",
                 "Glm46VProcessor",
+                "MiniMaxVLProcessor",
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
@@ -462,6 +463,23 @@ class BaseMultimodalProcessor(ABC):
                 )
 
                 npu_apply_glm46v_image_preprocess_patch()
+                kwargs["device"] = "npu"
+            elif processor.__class__.__name__ == "MiniMaxVLProcessor":
+                from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
+                    npu_apply_minimax_m3_image_preprocess_patch,
+                    npu_apply_minimax_m3_video_preprocess_patch,
+                )
+
+                npu_apply_minimax_m3_image_preprocess_patch(
+                    processor.image_processor
+                )
+                if (
+                    hasattr(processor, "video_processor")
+                    and processor.video_processor is not None
+                ):
+                    npu_apply_minimax_m3_video_preprocess_patch(
+                        processor.video_processor
+                    )
                 kwargs["device"] = "npu"
 
         result = processor.__call__(

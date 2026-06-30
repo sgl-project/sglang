@@ -892,6 +892,15 @@ class Envs:
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
 
+    # MiniMax-M3 fused qk-norm + RoPE in attention.
+    SGLANG_OPT_USE_MINIMAX_FUSED_QKNORM_ROPE = EnvBool(True)
+
+    # MiniMax-M3 dense+sparse fused decode path (dense slab + sparse pool).
+    SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
+
+    # Kill-switch: disable MiniMax Sparse Attention (MSA) and fall back to dense.
+    SGLANG_DISABLE_MSA = EnvBool(False)
+
     # MiniMax-M3 MXFP8 MoE experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
@@ -902,6 +911,15 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+
+    # MoE router (gate) GEMM in bf16 instead of fp32.
+    SGLANG_OPT_USE_BF16_ROUTER_GEMM = EnvBool(True)
+    # Fused DeepGEMM post-reorder in the MoE dispatch path.
+    SGLANG_OPT_USE_FUSED_DEEPGEMM_POST_REORDER = EnvBool(True)
+    # Fused MoE dispatch index build.
+    SGLANG_OPT_USE_FUSED_MOE_DISPATCH_INDEX = EnvBool(True)
+    # JIT per-token-group quantization kernel for FP8 MoE.
+    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(True)
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)

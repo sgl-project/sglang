@@ -29,6 +29,7 @@ except:
     pass
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
     ceil_align,
@@ -145,6 +146,17 @@ def deep_gemm_fp8_fp8_bf16_nt(
     C: torch.Tensor,
 ) -> None:
     deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+
+
+@register_custom_op(mutates_args=["C"])
+def deep_gemm_mxfp8_fp8_bf16_nt(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_mxfp8_f8f8bf16((A, As), (B, Bs), C)
 
 
 @triton.jit
@@ -335,7 +347,6 @@ def _per_token_group_quant_8bit_raw(
     if scale_ue8m0:
         from deep_gemm import transform_sf_into_required_layout
 
-        assert group_size == 128
         x_s = transform_sf_into_required_layout(
             x_s,
             num_groups=None,
@@ -405,7 +416,6 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         scale_ue8m0=scale_ue8m0,
     )
 
-    assert group_size == 128
     output_scale = transform_sf_into_required_layout(
         output_scale_for_kernel,
         num_groups=output.shape[0],
@@ -544,9 +554,33 @@ def sglang_per_token_group_quant_fp8(
     if enable_v2 is None:
         enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
 
+    # Optimized JIT kernel for the plain (no silu-fuse, no masked-layout) path;
+    # byte-identical to AOT v2 but faster. silu/masked variants stay on AOT v2.
+    use_jit_quant = (
+        envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get()
+        # JIT kernel is byte-identical to AOT v2, so only take it when v2 is
+        # wanted; an explicit enable_v2=False (AOT-v1 intent) must fall through.
+        and enable_v2
+        and not fuse_silu_and_mul
+        and masked_m is None
+        and x.dim() == 2
+        and group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES
+    )
+
     if x.shape[0] > 0:
         # Temporary
-        if enable_sgl_per_token_group_quant_8bit:
+        if use_jit_quant:
+            sgl_per_token_group_quant_8bit_jit(
+                input=x,
+                output_q=x_q,
+                output_s=x_s,
+                group_size=group_size,
+                eps=eps,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=scale_ue8m0,
+            )
+        elif enable_sgl_per_token_group_quant_8bit:
             if enable_v2 and _is_musa:
                 # The JIT v2 .cuh uses CUDA-only inline PTX (ld/st.global.v4) and
                 # has no MUSA fallback, so keep MUSA on the AOT v2 op, which
@@ -578,15 +612,21 @@ def sglang_per_token_group_quant_fp8(
                     masked_m=masked_m,
                 )
             else:
-                sgl_per_token_group_quant_8bit_jit(
-                    input=x,
-                    output_q=x_q,
-                    output_s=x_s,
-                    group_size=group_size,
-                    eps=eps,
-                    fp8_min=fp8_min,
-                    fp8_max=fp8_max,
-                    scale_ue8m0=scale_ue8m0,
+                # enable_v2 is False only for group_size outside the v2/JIT set
+                # {16,32,64,128}; the AOT kernel's v1 path handles those, whereas
+                # the restricted JIT kernels would static_assert.
+                sgl_per_token_group_quant_8bit(
+                    x,
+                    x_q,
+                    x_s,
+                    group_size,
+                    eps,
+                    fp8_min,
+                    fp8_max,
+                    scale_ue8m0,
+                    fuse_silu_and_mul,
+                    masked_m,
+                    enable_v2=enable_v2,
                 )
         else:
             assert not enable_v2
@@ -610,7 +650,8 @@ def sglang_per_token_group_quant_fp8_row_padded(
     and scales_a). Allocating the quant outputs with rows already aligned to
     ``row_alignment`` makes the wrapper's pad_tensor() short-circuit (pad_rows
     == 0), removing 2x fill + 2x cat kernels per GEMM. Rows in [m, m_pad) are
-    uninitialized garbage; the caller must slice the GEMM output back to m.
+    zero-filled to match the legacy pad_tensor contract so the padded GEMM is
+    bit-exact; the caller still slices the GEMM output back to m.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
     assert (
@@ -634,19 +675,37 @@ def sglang_per_token_group_quant_fp8_row_padded(
         (k // group_size, m_pad), device=x.device, dtype=torch.float32
     ).transpose(0, 1)
     if m > 0:
-        sgl_per_token_group_quant_8bit(
-            x,
-            x_q[:m],
-            x_s[:m],
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            False,  # scale_ue8m0
-            False,  # fuse_silu_and_mul
-            None,  # masked_m
-            enable_v2=True,
-        )
+        if envs.SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT.get():
+            sgl_per_token_group_quant_8bit_jit(
+                input=x,
+                output_q=x_q[:m],
+                output_s=x_s[:m],
+                group_size=group_size,
+                eps=eps,
+                fp8_min=fp8_min,
+                fp8_max=fp8_max,
+                scale_ue8m0=False,
+            )
+        else:
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q[:m],
+                x_s[:m],
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                False,  # scale_ue8m0
+                False,  # fuse_silu_and_mul
+                None,  # masked_m
+                enable_v2=True,
+            )
+    if m_pad != m:
+        # Tail rows [m, m_pad) feed the cutlass GEMM's padded region; the legacy
+        # pad_tensor path zero-fills them, so zero here to stay bit-identical
+        # (torch.empty would otherwise leave garbage that perturbs the output).
+        x_q[m:].zero_()
+        x_s[m:].zero_()
     return x_q, x_s
 
 
@@ -1295,6 +1354,26 @@ def w8a8_block_fp8_matmul_deepgemm(
     return C
 
 
+def w8a8_mxfp8_matmul_deepgemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """MXFP8 GEMM via DeepGemm fp8_fp4_gemm_nt with recipe_a=(1,32), recipe_b=(1,32)."""
+    assert A.is_contiguous() and B.is_contiguous()
+    assert output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+    M = A.numel() // A.shape[-1]
+    N, K = B.shape
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+
+    deep_gemm_mxfp8_fp8_bf16_nt(A, As, B, Bs, C)
+
+    return C
+
+
 def w8a8_block_fp8_matmul_triton(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1536,6 +1615,454 @@ def mxfp8_block_scaled_matmul_triton(
         num_stages,
     )
     return output
+
+
+@triton.jit
+def _pack_mxfp8_scales_kernel(
+    scale_ptr,
+    out_ptr,
+    M: tl.constexpr,
+    K_GROUPS: tl.constexpr,
+    SCALE_K: tl.constexpr,
+    TOTAL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < TOTAL
+
+    idx256 = offs % 256
+    tmp = offs // 256
+    two = tmp % 2
+    tmp = tmp // 2
+    scale_k = tmp % SCALE_K
+    scale_m = tmp // SCALE_K
+
+    within = two * 256 + idx256
+    row_inner_32 = within // 16
+    rem = within - row_inner_32 * 16
+    row_outer_4 = rem // 4
+    k_inner_4 = rem - row_outer_4 * 4
+
+    row = scale_m * 128 + row_outer_4 * 32 + row_inner_32
+    col = scale_k * 4 + k_inner_4
+    value = tl.load(scale_ptr + row * K_GROUPS + col, mask & (row < M), other=127)
+    tl.store(out_ptr + offs, value, mask)
+
+
+def pack_mxfp8_scales_triton(scale_u8: torch.Tensor) -> torch.Tensor:
+    assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
+    scale_u8 = scale_u8.contiguous()
+    m, k_groups = scale_u8.shape
+    assert (
+        k_groups % 4 == 0
+    ), f"{k_groups=} must be divisible by 4 (K must be multiple of 128)"
+
+    scale_m = triton.cdiv(m, 128)
+    scale_k = k_groups // 4
+    out = torch.empty(
+        (1, scale_m, scale_k, 2, 256), dtype=scale_u8.dtype, device=scale_u8.device
+    )
+    total = out.numel()
+    block = 1024
+    grid = (triton.cdiv(total, block),)
+    _pack_mxfp8_scales_kernel[grid](
+        scale_u8,
+        out,
+        m,
+        k_groups,
+        scale_k,
+        total,
+        BLOCK=block,
+    )
+    return out
+
+
+@triton.jit
+def _mxfp8_grouped_block_scaled_matmul_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    expert_ids_ptr,
+    M_PAD: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    output_type: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    if output_type == 0:
+        output_dtype = tl.float32
+    elif output_type == 1:
+        output_dtype = tl.float16
+    elif output_type == 2:
+        output_dtype = tl.bfloat16
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M_PAD, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    tiles_per_expert = num_pid_m * num_pid_n
+    group_id = pid // tiles_per_expert
+    tile_id = pid - group_id * tiles_per_expert
+    pid_m = tile_id % num_pid_m
+    pid_n = tile_id // num_pid_m
+
+    group_i64 = group_id.to(tl.int64)
+    expert_i64 = tl.load(expert_ids_ptr + group_i64).to(tl.int64)
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int64)
+    offs_s = tl.arange(0, BLOCK_K // 32).to(tl.int64)
+
+    VEC_SIZE: tl.constexpr = 32
+    k_groups: tl.constexpr = K // VEC_SIZE
+
+    a_base = group_i64 * M_PAD * K
+    a_scale_base = group_i64 * M_PAD * k_groups
+    b_base = expert_i64 * N * K
+    b_scale_base = expert_i64 * N * k_groups
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
+        a = tl.load(a_ptr + a_base + offs_m[:, None] * K + k0 + offs_k[None, :])
+        b = tl.load(b_ptr + b_base + offs_n[:, None] * K + k0 + offs_k[None, :])
+        scale_a = tl.load(
+            a_scale_ptr
+            + a_scale_base
+            + offs_m[:, None] * k_groups
+            + k0 // VEC_SIZE
+            + offs_s[None, :]
+        )
+        scale_b = tl.load(
+            b_scale_ptr
+            + b_scale_base
+            + offs_n[:, None] * k_groups
+            + k0 // VEC_SIZE
+            + offs_s[None, :]
+        )
+        accumulator = tl.dot_scaled(
+            a, scale_a, "e4m3", b.T, scale_b, "e4m3", accumulator
+        )
+
+    c_base = group_i64 * M_PAD * N
+    tl.store(
+        c_ptr + c_base + offs_m[:, None] * N + offs_n[None, :],
+        accumulator.to(output_dtype),
+    )
+
+
+def mxfp8_grouped_block_scaled_matmul_triton(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    expert_ids: Optional[torch.Tensor] = None,
+    block_m: int = 128,
+    block_n: int = 256,
+    block_k: int = 128,
+    num_stages: Optional[int] = None,
+    num_warps: int = 4,
+) -> torch.Tensor:
+    if num_stages is None:
+        num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
+
+    assert a.dim() == 3
+    assert b.dim() == 3
+    assert a_scale.dim() == 3
+    assert b_scale.dim() == 3
+    num_groups, m_pad, k = a.shape
+    num_experts_b, n, k_b = b.shape
+    assert k == k_b
+    assert a_scale.shape == (num_groups, m_pad, k // 32)
+    assert b_scale.shape == (num_experts_b, n, k // 32)
+    assert m_pad % block_m == 0
+    assert n % block_n == 0
+    assert k % block_k == 0
+    if expert_ids is None:
+        assert num_groups == num_experts_b
+        expert_ids = torch.arange(num_groups, device=a.device, dtype=torch.int64)
+    else:
+        assert expert_ids.shape == (num_groups,)
+        assert expert_ids.dtype == torch.int64
+        assert expert_ids.is_cuda
+        expert_ids = expert_ids.contiguous()
+
+    if output_dtype == torch.float32:
+        output_type = 0
+    elif output_dtype == torch.float16:
+        output_type = 1
+    elif output_dtype == torch.bfloat16:
+        output_type = 2
+    else:
+        raise ValueError(f"Unsupported output dtype: {output_dtype}")
+
+    output = torch.empty((num_groups, m_pad, n), dtype=output_dtype, device=a.device)
+    grid = (num_groups * triton.cdiv(m_pad, block_m) * triton.cdiv(n, block_n),)
+    _mxfp8_grouped_block_scaled_matmul_kernel[grid](
+        a,
+        a_scale,
+        b,
+        b_scale,
+        output,
+        expert_ids,
+        m_pad,
+        n,
+        k,
+        output_type,
+        block_m,
+        block_n,
+        block_k,
+        num_stages,
+        num_warps=num_warps,
+    )
+    return output
+
+
+@triton.jit
+def _mxfp8_grouped_block_scaled_matmul_compact_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_ptr,
+    b_scale_ptr,
+    c_ptr,
+    expert_ids_ptr,
+    active_start_offsets_ptr,
+    active_route_counts_ptr,
+    MAX_M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    output_type: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    if output_type == 0:
+        output_dtype = tl.float32
+    elif output_type == 1:
+        output_dtype = tl.float16
+    elif output_type == 2:
+        output_dtype = tl.bfloat16
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(MAX_M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    tiles_per_expert = num_pid_m * num_pid_n
+    group_id = pid // tiles_per_expert
+    tile_id = pid - group_id * tiles_per_expert
+    pid_m = tile_id % num_pid_m
+    pid_n = tile_id // num_pid_m
+
+    row_start = pid_m * BLOCK_M
+    route_count = tl.load(active_route_counts_ptr + group_id)
+    if row_start >= route_count:
+        return
+
+    group_i64 = group_id.to(tl.int64)
+    route_start = tl.load(active_start_offsets_ptr + group_i64).to(tl.int64)
+    expert_i64 = tl.load(expert_ids_ptr + group_i64).to(tl.int64)
+    offs_m = row_start + tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    offs_k = tl.arange(0, BLOCK_K).to(tl.int64)
+    offs_s = tl.arange(0, BLOCK_K // 32).to(tl.int64)
+    valid_m = offs_m < route_count
+
+    VEC_SIZE: tl.constexpr = 32
+    k_groups: tl.constexpr = K // VEC_SIZE
+    b_base = expert_i64 * N * K
+    b_scale_base = expert_i64 * N * k_groups
+
+    route_rows = route_start + offs_m
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k0 in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
+        a = tl.load(
+            a_ptr + route_rows[:, None] * K + k0 + offs_k[None, :],
+            mask=valid_m[:, None],
+            other=0.0,
+        )
+        b = tl.load(b_ptr + b_base + offs_n[:, None] * K + k0 + offs_k[None, :])
+        scale_a = tl.load(
+            a_scale_ptr
+            + route_rows[:, None] * k_groups
+            + k0 // VEC_SIZE
+            + offs_s[None, :],
+            mask=valid_m[:, None],
+            other=0,
+        )
+        scale_b = tl.load(
+            b_scale_ptr
+            + b_scale_base
+            + offs_n[:, None] * k_groups
+            + k0 // VEC_SIZE
+            + offs_s[None, :]
+        )
+        accumulator = tl.dot_scaled(
+            a, scale_a, "e4m3", b.T, scale_b, "e4m3", accumulator
+        )
+
+    tl.store(
+        c_ptr + route_rows[:, None] * N + offs_n[None, :],
+        accumulator.to(output_dtype),
+        mask=valid_m[:, None] & (offs_n[None, :] < N),
+    )
+
+
+def mxfp8_grouped_block_scaled_matmul_compact_triton(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    expert_ids: torch.Tensor,
+    active_start_offsets: torch.Tensor,
+    active_route_counts: torch.Tensor,
+    max_m: int,
+    block_m: int = 128,
+    block_n: int = 256,
+    block_k: int = 128,
+    num_stages: Optional[int] = None,
+    num_warps: int = 4,
+) -> torch.Tensor:
+    if num_stages is None:
+        num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
+
+    assert a.dim() == 2
+    assert b.dim() == 3
+    assert a_scale.dim() == 2
+    assert b_scale.dim() == 3
+    total_routes, k = a.shape
+    num_experts_b, n, k_b = b.shape
+    num_groups = expert_ids.shape[0]
+    assert k == k_b
+    assert a_scale.shape == (total_routes, k // 32)
+    assert b_scale.shape == (num_experts_b, n, k // 32)
+    assert expert_ids.shape == (num_groups,)
+    assert active_start_offsets.shape == (num_groups,)
+    assert active_route_counts.shape == (num_groups,)
+    assert expert_ids.dtype == torch.int64
+    assert active_start_offsets.dtype == torch.int64
+    assert active_route_counts.dtype == torch.int64
+    assert n % block_n == 0
+    assert k % block_k == 0
+    assert max_m > 0
+
+    if output_dtype == torch.float32:
+        output_type = 0
+    elif output_dtype == torch.float16:
+        output_type = 1
+    elif output_dtype == torch.bfloat16:
+        output_type = 2
+    else:
+        raise ValueError(f"Unsupported output dtype: {output_dtype}")
+
+    output = torch.empty((total_routes, n), dtype=output_dtype, device=a.device)
+    grid = (num_groups * triton.cdiv(max_m, block_m) * triton.cdiv(n, block_n),)
+    _mxfp8_grouped_block_scaled_matmul_compact_kernel[grid](
+        a,
+        a_scale,
+        b,
+        b_scale,
+        output,
+        expert_ids.contiguous(),
+        active_start_offsets.contiguous(),
+        active_route_counts.contiguous(),
+        max_m,
+        n,
+        k,
+        output_type,
+        block_m,
+        block_n,
+        block_k,
+        num_stages,
+        num_warps=num_warps,
+    )
+    return output
+
+
+@triton.jit
+def _mxfp8_swigluoai_quant_kernel(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    N: tl.constexpr,
+    GEMM1_ALPHA: tl.constexpr,
+    GEMM1_LIMIT: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offs = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < N
+
+    input_base = row_id.to(tl.int64) * (2 * N)
+    gate = tl.load(input_ptr + input_base + offs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(input_ptr + input_base + N + offs, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.minimum(gate, GEMM1_LIMIT)
+    up = tl.clamp(up, -GEMM1_LIMIT, GEMM1_LIMIT)
+    activated = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1.0)
+    activated = activated.to(tl.bfloat16).to(tl.float32)
+
+    groups: tl.constexpr = BLOCK_N // 32
+    activated_2d = tl.reshape(activated, (groups, 32))
+    absmax = tl.max(tl.abs(activated_2d), axis=1)
+    nonzero = absmax > 0.0
+    scale_exp = tl.ceil(tl.log2(absmax / FP8_MAX))
+    scale_exp = tl.maximum(scale_exp, -127.0)
+    scale_exp = tl.minimum(scale_exp, 128.0)
+    scale = tl.exp2(scale_exp)
+    inv_scale = tl.reshape(1.0 / scale, (groups, 1))
+    q_2d = tl.clamp(activated_2d * inv_scale, -FP8_MAX, FP8_MAX)
+    q = tl.reshape(q_2d, (BLOCK_N,)).to(output_ptr.dtype.element_ty)
+
+    output_base = row_id.to(tl.int64) * N
+    tl.store(output_ptr + output_base + offs, q, mask=mask)
+
+    scale_encoded = scale_exp + 127.0
+    scale_encoded = tl.where(nonzero, scale_encoded, 0.0)
+    scale_offsets = block_id * groups + tl.arange(0, groups)
+    tl.store(
+        scale_ptr + row_id.to(tl.int64) * (N // 32) + scale_offsets,
+        scale_encoded.to(tl.uint8),
+    )
+
+
+def mxfp8_swigluoai_quantize_triton(
+    x: torch.Tensor,
+    *,
+    gemm1_alpha: float,
+    gemm1_limit: float,
+    block_n: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.is_contiguous()
+    assert x.shape[-1] % 2 == 0
+    n = x.shape[-1] // 2
+    assert n % block_n == 0
+    assert block_n % 32 == 0
+
+    x_2d = x.view(-1, x.shape[-1])
+    q = torch.empty((*x.shape[:-1], n), device=x.device, dtype=fp8_dtype)
+    scale = torch.empty((*x.shape[:-1], n // 32), device=x.device, dtype=torch.uint8)
+    grid = (x_2d.shape[0], triton.cdiv(n, block_n))
+    _mxfp8_swigluoai_quant_kernel[grid](
+        x_2d,
+        q.view(-1, n),
+        scale.view(-1, n // 32),
+        n,
+        float(gemm1_alpha),
+        float(gemm1_limit),
+        float(fp8_max),
+        block_n,
+        num_warps=4,
+        num_stages=4,
+    )
+    return q, scale
 
 
 @triton.jit

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -84,6 +85,40 @@ def _deepep_precompile_tp_barrier() -> None:
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         get_tp_group().barrier()
+
+
+def _prepare_low_latency_dispatch_inputs(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_max_dispatch_tokens_per_rank: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = hidden_states.shape[0]
+    if num_max_dispatch_tokens_per_rank <= 0:
+        raise RuntimeError(
+            "DeepEP low_latency dispatch requires a positive "
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, got "
+            f"{num_max_dispatch_tokens_per_rank}."
+        )
+    if num_tokens > num_max_dispatch_tokens_per_rank:
+        raise RuntimeError(
+            "DeepEP low_latency dispatch input exceeds the preallocated token "
+            "buffer: hidden_states.shape[0]="
+            f"{num_tokens}, SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+            f"{num_max_dispatch_tokens_per_rank}. Increase "
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK or reduce decode "
+            "concurrency/speculative tokens."
+        )
+
+    if _is_npu:
+        os.environ["MOE_ENABLE_TOPK_NEG_ONE"] = "1"
+
+    hidden_states = hidden_states.contiguous()
+    topk_weights = topk_weights.contiguous()
+    topk_dtype = torch.int32 if _is_npu else torch.int64
+    topk_ids = topk_ids.to(topk_dtype).contiguous()
+
+    return hidden_states, topk_ids, topk_weights
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -652,12 +687,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        hidden_states, topk_ids, topk_weights = _prepare_low_latency_dispatch_inputs(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            self.num_max_dispatch_tokens_per_rank,
+        )
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        hidden_states, masked_m, event, hook = self._dispatch_core(
+        hidden_states, masked_m, event, hook, topk_ids = self._dispatch_core(
             hidden_states,
             topk_ids,
         )
@@ -743,7 +783,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **fp8_deepgemm_scale_opts,
             )
         )
-        return packed_recv_hidden, self.packed_recv_count, event, hook
+        return packed_recv_hidden, self.packed_recv_count, event, hook, topk_ids
 
     def combine_a(
         self,

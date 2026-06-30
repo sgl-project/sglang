@@ -3133,6 +3133,9 @@ class MiniMaxSparseKVPool(KVCache):
         index_dtype: Optional[torch.dtype] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        main_pool_cls=MHATokenToKVPool,
+        index_kv_pool_cls=MHATokenToKVPool,
+        index_k_pool_cls=MHATokenToKOnlyPool,
     ):
         # Do not call super().__init__() — delegate to sub-pools instead.
         self.size = size
@@ -3171,7 +3174,7 @@ class MiniMaxSparseKVPool(KVCache):
             gid: i for i, gid in enumerate(local_k_only_sparse_layer_ids)
         }
 
-        self.main_pool = MHATokenToKVPool(
+        self.main_pool = main_pool_cls(
             size=size,
             page_size=page_size,
             dtype=dtype,
@@ -3185,7 +3188,7 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
         self.index_kv_pool: Optional[MHATokenToKVPool] = (
-            MHATokenToKVPool(
+            index_kv_pool_cls(
                 size=size,
                 page_size=page_size,
                 dtype=index_dtype,
@@ -3200,7 +3203,7 @@ class MiniMaxSparseKVPool(KVCache):
         )
 
         self.index_k_pool: Optional[MHATokenToKOnlyPool] = (
-            MHATokenToKOnlyPool(
+            index_k_pool_cls(
                 size=size,
                 page_size=page_size,
                 dtype=index_dtype,
@@ -3335,6 +3338,13 @@ class MiniMaxSparseKVPool(KVCache):
                 f"{list(self.index_k_layer_id_mapping.keys())}"
             )
         sub_pool = self.index_k_pool
+        if hasattr(sub_pool, "set_k_buffer"):
+            # Paged-layout pools (e.g. NPU NPUMHATokenToKOnlyPool) store K as
+            # [num_pages, page_size, head_num, head_dim]; a flat [loc] write
+            # would broadcast the page_size dim and fail (shape mismatch).
+            # Delegate to the pool's own scatter-based set_k_buffer when present.
+            sub_pool.set_k_buffer(mapped_id, loc, cache_idx_k)
+            return
         if cache_idx_k.dtype != sub_pool.dtype:
             cache_idx_k = cache_idx_k.to(sub_pool.dtype)
         if sub_pool.store_dtype != sub_pool.dtype:

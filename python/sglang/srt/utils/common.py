@@ -3748,14 +3748,26 @@ def is_gfx95_supported():
 
 @lru_cache(maxsize=1)
 def is_gfx942_supported():
-    """
-    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
-    """
+    """Returns whether the current platform is AMD gfx942 (CDNA3 / MI300)."""
     if torch.version.hip:
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
+        return "gfx942" in gcn_arch
+    return False
+
+
+@lru_cache(maxsize=1)
+def mxfp8_block_convert_required():
+    """Whether MXFP8 weights must be converted to block-fp8 [128,128] at load.
+
+    gfx942 (CDNA3) has no hardware MX-scaled matmul: ``tl.dot_scaled`` fails to
+    lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
+    checkpoints there are converted to block-fp8 [128,128] at load and run
+    through the native block-fp8 kernels. gfx95 keeps its native MX path (this
+    returns False there).
+    """
+    if not torch.version.hip:
         return False
+    return is_gfx942_supported() and not is_gfx95_supported()
 
 
 def get_hip_version():
