@@ -18,7 +18,9 @@ from sglang.jit_kernel.benchmark.utils import (
 from sglang.jit_kernel.dsv4.online_c128_mtp import _jit_online_c128_mtp_module
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(
+    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 HEAD_DIM = 512
 STATE_DIM = HEAD_DIM * 3
