@@ -5,11 +5,14 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
-from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageRMSNorm
+from sglang.multimodal_gen.runtime.models.dits.zimage import (
+    ZImageRMSNorm,
+    ZImageTransformer2DModel,
+)
 
 
 class TestZImagePipelineConfig(unittest.TestCase):
-    def test_zimage_rmsnorm_matches_native_formula(self) -> None:
+    def test_rmsnorm_native_formula(self) -> None:
         norm = ZImageRMSNorm(4, eps=1e-5)
         with torch.no_grad():
             norm.weight.copy_(torch.tensor([1.0, 0.5, 1.5, 2.0]))
@@ -25,7 +28,7 @@ class TestZImagePipelineConfig(unittest.TestCase):
         self.assertEqual(output.dtype, x.dtype)
         self.assertTrue(torch.equal(output, expected))
 
-    def test_zimage_prepares_explicit_sigmas(self) -> None:
+    def test_explicit_sigmas(self) -> None:
         """Z-Image uses the native explicit flow sigmas schedule."""
         config = ZImagePipelineConfig()
 
@@ -34,14 +37,12 @@ class TestZImagePipelineConfig(unittest.TestCase):
             [1.0, 0.75, 0.5, 0.25],
         )
 
-    def test_zimage_disables_autocast_by_default(self) -> None:
+    def test_autocast_disabled(self) -> None:
         """Official Z-Image runs bf16 weights without an outer autocast context."""
         self.assertFalse(ZImagePipelineConfig().enable_autocast)
 
     @patch("sglang.multimodal_gen.configs.pipeline_configs.zimage.get_sp_world_size")
-    def test_zimage_image_rotary_embeddings_use_patch_tokens(
-        self, mock_get_sp_world_size
-    ) -> None:
+    def test_image_rope_patch_tokens(self, mock_get_sp_world_size) -> None:
         mock_get_sp_world_size.return_value = 1
 
         config = ZImagePipelineConfig()
@@ -69,9 +70,7 @@ class TestZImagePipelineConfig(unittest.TestCase):
         self.assertEqual(image_pos_ids[-1].tolist(), [0, 0, 0])
 
     @patch("sglang.multimodal_gen.configs.pipeline_configs.zimage.get_sp_world_size")
-    def test_zimage_negative_prompt_rotary_embeddings_use_negative_prompt_len(
-        self, mock_get_sp_world_size
-    ) -> None:
+    def test_negative_rope_len(self, mock_get_sp_world_size) -> None:
         """Negative CFG branch should build RoPE positions from negative prompt embeds."""
         mock_get_sp_world_size.return_value = 1
 
@@ -99,6 +98,36 @@ class TestZImagePipelineConfig(unittest.TestCase):
         neg_cap_padded_len = 64
         self.assertEqual(cap_pos_ids.shape, (neg_cap_padded_len, 3))
         self.assertEqual(image_pos_ids[0].tolist(), [neg_cap_padded_len + 1, 0, 0])
+
+    def test_batched_rope_offsets(self) -> None:
+        model = ZImageTransformer2DModel.__new__(ZImageTransformer2DModel)
+
+        def rotary_emb(pos_ids):
+            return (
+                pos_ids.to(torch.float32),
+                (pos_ids + 1000).to(torch.float32),
+            )
+
+        model.rotary_emb = rotary_emb
+
+        images = [torch.zeros(16, 1, 60, 80), torch.zeros(16, 1, 60, 80)]
+        cap_feats = [torch.zeros(113, 2560), torch.zeros(177, 2560)]
+
+        cap_freqs, image_freqs = model._build_batched_freqs_cis(
+            images,
+            cap_feats,
+            patch_size=2,
+            f_patch_size=1,
+            image_target_len=1216,
+            cap_target_len=192,
+        )
+
+        self.assertEqual(cap_freqs[0].shape, (2, 192, 3))
+        self.assertEqual(image_freqs[0].shape, (2, 1216, 3))
+        self.assertEqual(image_freqs[0][0, 0].tolist(), [129.0, 0.0, 0.0])
+        self.assertEqual(image_freqs[0][1, 0].tolist(), [193.0, 0.0, 0.0])
+        self.assertEqual(cap_freqs[0][0, 127].tolist(), [128.0, 0.0, 0.0])
+        self.assertEqual(cap_freqs[0][0, 128].tolist(), [0.0, 0.0, 0.0])
 
 
 if __name__ == "__main__":
