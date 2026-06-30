@@ -13,6 +13,11 @@
 //! caller) and a `SelectionContext` carrying the JSON request body and the
 //! ingress-precomputed routing tokens:
 //!
+//! Every load comparison below uses [`WorkerLoads::load_of`]: the
+//! engine-reported queue depth (`num_running + num_waiting`) where a fresh
+//! [`super::engine_load::EngineLoadTable`] snapshot exists, otherwise the
+//! router-side in-flight counter `Worker::active_load()`.
+//!
 //! 1. **Load-imbalance fast-path.** If `max_load - min_load >
 //!    balance_abs_threshold` AND `max_load > min_load *
 //!    balance_rel_threshold`, skip the cache lookup and pick the
@@ -28,8 +33,7 @@
 //!    for the longest matching prefix. If `match_rate > cache_threshold`,
 //!    pick the lowest-load worker whose `url` appears in the match result.
 //!    Otherwise, fall through.
-//! 4. **Min-load fallback.** Pick the lowest-load worker by
-//!    `Worker::active_load()`.
+//! 4. **Min-load fallback.** Pick the lowest-load worker.
 //!
 //! The implementation never returns `None` for a non-empty `workers` slice;
 //! a misconfigured tree or tokenizer degrades to round-robin-with-load
@@ -37,6 +41,8 @@
 
 use crate::config::CacheAwareConfig;
 
+use crate::discovery::ModelId;
+use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
@@ -44,7 +50,9 @@ use crate::policies::{request_tokens_for, Policy, SelectionContext};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// Selection policy that scores candidates by tree-overlap with the
 /// request's prefix and falls back to load-based picking when the tree
@@ -63,6 +71,12 @@ pub struct CacheAwareZmqPolicy {
     /// degrades to min-load — the router cannot hash a prompt without
     /// a block size that matches what the worker publishes.
     block_size_oracle: Arc<BlockSizeOracle>,
+    /// Engine-reported per-worker load (running + waiting), shared with the
+    /// `KvEventIndex` load subscriber. Read once per selection; a worker with
+    /// a fresh snapshot uses it in place of the router-side in-flight counter
+    /// (`Worker::active_load`), falling back to that counter when the snapshot
+    /// is stale or absent (cold start / worker predates load publishing).
+    engine_load: Arc<EngineLoadTable>,
     /// Optional metrics sink. Set via [`Self::with_metrics`] by the policy
     /// factory for the production policy; `None` in unit tests and
     /// non-cache-aware call sites. When set, each cache-aware selection
@@ -82,18 +96,64 @@ impl std::fmt::Debug for CacheAwareZmqPolicy {
     }
 }
 
+/// Snapshot of the load-imbalance check, carried out of
+/// [`CacheAwareZmqPolicy::balance_check`] so the caller can log the
+/// numbers behind a rebalance decision.
+struct BalanceCheck {
+    min_load: usize,
+    max_load: usize,
+    abs_diff: usize,
+    imbalanced: bool,
+}
+
+/// Per-selection load lookup. Built once per `select` from a single
+/// [`EngineLoadTable::snapshot_fresh`] pass: a worker with a fresh
+/// engine-reported snapshot uses its queue depth (`num_running +
+/// num_waiting`); otherwise it falls back to the router-side in-flight
+/// counter (`Worker::active_load`). Holding the snapshot keeps every
+/// per-worker `load_of` an O(1) map lookup.
+struct WorkerLoads {
+    fresh: HashMap<String, usize>,
+}
+
+impl WorkerLoads {
+    /// Build the per-selection snapshot from one `snapshot_fresh` pass. The
+    /// single construction chokepoint guarantees every comparison in a given
+    /// `select` sees one consistent view of load.
+    fn from_engine(table: &EngineLoadTable, now: Instant) -> Self {
+        Self {
+            fresh: table.snapshot_fresh(now),
+        }
+    }
+
+    fn load_of(&self, w: &Worker) -> usize {
+        self.fresh
+            .get(w.url.as_str())
+            .copied()
+            .unwrap_or_else(|| w.active_load())
+    }
+
+    /// Number of workers whose load came from the engine (vs the router-side
+    /// fallback). Used only to annotate the rebalance log.
+    fn engine_worker_count(&self) -> usize {
+        self.fresh.len()
+    }
+}
+
 impl CacheAwareZmqPolicy {
     pub fn new(
         config: CacheAwareConfig,
         tree: Arc<HashTree>,
         tokenizers: Arc<TokenizerRegistry>,
         block_size_oracle: Arc<BlockSizeOracle>,
+        engine_load: Arc<EngineLoadTable>,
     ) -> Self {
         Self {
             config,
             tree,
             tokenizers,
             block_size_oracle,
+            engine_load,
             metrics: OnceLock::new(),
         }
     }
@@ -107,28 +167,37 @@ impl CacheAwareZmqPolicy {
         self
     }
 
-    /// Lowest-load worker — ties broken by stable iteration order (which
-    /// is the order the registry returned, i.e. dashmap-undefined). For
-    /// production traffic the ties are rare; tests pin the load skew.
-    fn pick_min_load(workers: &[Arc<Worker>]) -> Option<Arc<Worker>> {
+    /// Lowest-load worker by the per-selection load lookup — ties broken by
+    /// stable iteration order (the order the registry returned, i.e.
+    /// dashmap-undefined). For production traffic the ties are rare; tests
+    /// pin the load skew.
+    fn pick_min_load(workers: &[Arc<Worker>], loads: &WorkerLoads) -> Option<Arc<Worker>> {
         workers
             .iter()
-            .min_by_key(|w| w.active_load())
+            .min_by_key(|w| loads.load_of(w))
             .map(Arc::clone)
     }
 
-    /// Detect load imbalance. Returns `true` when the spread between max
+    /// Detect load imbalance. Returns the min/max load snapshot together
+    /// with the `imbalanced` verdict — `true` when the spread between max
     /// and min load is large enough that cache-aware routing would dump
-    /// even more on the hot worker.
-    fn is_imbalanced(&self, workers: &[Arc<Worker>]) -> bool {
+    /// even more on the hot worker. The caller logs these numbers so every
+    /// rebalance decision is visible in the logs.
+    fn balance_check(&self, workers: &[Arc<Worker>], loads: &WorkerLoads) -> BalanceCheck {
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(mn, mx), w| {
-            let l = w.active_load();
+            let l = loads.load_of(w);
             (mn.min(l), mx.max(l))
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
         let abs_diff = max_load.saturating_sub(min_load);
         let rel_threshold = (min_load as f32 * self.config.balance_rel_threshold) as usize;
-        abs_diff > self.config.balance_abs_threshold && max_load > rel_threshold
+        let imbalanced = abs_diff > self.config.balance_abs_threshold && max_load > rel_threshold;
+        BalanceCheck {
+            min_load,
+            max_load,
+            abs_diff,
+            imbalanced,
+        }
     }
 }
 
@@ -138,10 +207,47 @@ impl Policy for CacheAwareZmqPolicy {
             return None;
         }
 
+        // Per-selection load lookup: engine-reported queue depth where fresh,
+        // else the router-side in-flight counter. One snapshot pass serves
+        // every comparison below (imbalance check, min-load fallback,
+        // matched-set tiebreak).
+        let loads = WorkerLoads::from_engine(&self.engine_load, Instant::now());
+
         // 1. Load-imbalance fast-path: even the best cache hit gets
-        //    dropped in favour of evening out load.
-        if self.is_imbalanced(workers) {
-            return Self::pick_min_load(workers);
+        //    dropped in favour of evening out load. Logged on every
+        //    request (debug) so the input to the decision is auditable;
+        //    the actual rebalance is logged at info when it fires.
+        let balance = self.balance_check(workers, &loads);
+        tracing::debug!(
+            model = %ctx.model(),
+            min_load = balance.min_load,
+            max_load = balance.max_load,
+            abs_diff = balance.abs_diff,
+            balance_abs_threshold = self.config.balance_abs_threshold,
+            balance_rel_threshold = self.config.balance_rel_threshold,
+            imbalanced = balance.imbalanced,
+            engine_load_workers = loads.engine_worker_count(),
+            engine_load_expected = self.engine_load.expected_count(),
+            "cache-aware-zmq: load-balance check considered",
+        );
+        if balance.imbalanced {
+            let chosen = Self::pick_min_load(workers, &loads);
+            if let Some(w) = &chosen {
+                tracing::info!(
+                    model = %ctx.model(),
+                    worker = %w.url,
+                    worker_load = loads.load_of(w),
+                    min_load = balance.min_load,
+                    max_load = balance.max_load,
+                    abs_diff = balance.abs_diff,
+                    balance_abs_threshold = self.config.balance_abs_threshold,
+                    balance_rel_threshold = self.config.balance_rel_threshold,
+                    engine_load_workers = loads.engine_worker_count(),
+                    engine_load_expected = self.engine_load.expected_count(),
+                    "cache-aware-zmq: load imbalance detected — bypassing cache, routing to min-load worker",
+                );
+            }
+            return chosen;
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -154,13 +260,13 @@ impl Policy for CacheAwareZmqPolicy {
             _ => {
                 let body = match ctx.request_body() {
                     Some(b) if !b.is_empty() => b,
-                    _ => return Self::pick_min_load(workers),
+                    _ => return Self::pick_min_load(workers, &loads),
                 };
                 let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(workers, &loads);
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(workers, &loads);
                 };
                 fallback_ids = rt.ids;
                 &fallback_ids
@@ -177,7 +283,7 @@ impl Policy for CacheAwareZmqPolicy {
                 model = %ctx.model(),
                 "cache-aware-zmq: block size unknown (no worker page_size yet), falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, &loads);
         };
         // EAGLE-family workers hash KV blocks over token bigrams; the query
         // hashes must match the worker's stored hashes or the tree lookup
@@ -190,7 +296,7 @@ impl Policy for CacheAwareZmqPolicy {
             compute_block_hashes(tokens, block_size as usize)
         };
         if block_hashes.is_empty() {
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, &loads);
         }
         let matched = self.tree.match_prefix(None, &block_hashes);
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
@@ -218,7 +324,7 @@ impl Policy for CacheAwareZmqPolicy {
                 cache_threshold = self.config.cache_threshold,
                 "cache-aware-zmq: overlap below threshold, falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, &loads);
         }
         // Among workers in the matched set, pick the lowest-load one.
         let matched_urls: std::collections::HashSet<&str> =
@@ -226,9 +332,9 @@ impl Policy for CacheAwareZmqPolicy {
         let best_matched: Option<Arc<Worker>> = workers
             .iter()
             .filter(|w| matched_urls.contains(w.url.as_str()))
-            .min_by_key(|w| w.active_load())
+            .min_by_key(|w| loads.load_of(w))
             .map(Arc::clone);
-        let chosen = best_matched.or_else(|| Self::pick_min_load(workers));
+        let chosen = best_matched.or_else(|| Self::pick_min_load(workers, &loads));
         if let Some(w) = &chosen {
             tracing::debug!(
                 model = %ctx.model(),
@@ -254,9 +360,11 @@ mod tests {
     use super::*;
     use crate::config::CacheAwareConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::engine_load::LoadStat;
     use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
     use crate::tokenizer::adapter;
+    use std::time::Duration;
 
     fn cfg_default() -> CacheAwareConfig {
         CacheAwareConfig {
@@ -284,6 +392,39 @@ mod tests {
             model_ids: vec![ModelId(model_id.into())],
             bootstrap_port: None,
         }))
+    }
+
+    /// Build a policy with a fresh (empty) engine-load table, so selection
+    /// reads the router-side `active_load` counter — matching the
+    /// pre-load-aware behaviour these tests assert.
+    fn new_policy(
+        config: CacheAwareConfig,
+        tree: Arc<HashTree>,
+        tokenizers: Arc<TokenizerRegistry>,
+        oracle: Arc<BlockSizeOracle>,
+    ) -> CacheAwareZmqPolicy {
+        CacheAwareZmqPolicy::new(config, tree, tokenizers, oracle, EngineLoadTable::new())
+    }
+
+    /// Build a policy with an explicit engine-load table, for tests that
+    /// exercise engine-reported load overriding the router-side counter.
+    fn new_policy_with_load(
+        config: CacheAwareConfig,
+        tree: Arc<HashTree>,
+        tokenizers: Arc<TokenizerRegistry>,
+        oracle: Arc<BlockSizeOracle>,
+        engine_load: Arc<EngineLoadTable>,
+    ) -> CacheAwareZmqPolicy {
+        CacheAwareZmqPolicy::new(config, tree, tokenizers, oracle, engine_load)
+    }
+
+    fn load_stat(running: u64, waiting: u64) -> LoadStat {
+        LoadStat {
+            num_running_reqs: running,
+            num_waiting_reqs: waiting,
+            num_tokens: 0,
+            max_total_num_tokens: 0,
+        }
     }
 
     fn tokenizer_registry_with_tiny() -> Arc<TokenizerRegistry> {
@@ -317,7 +458,7 @@ mod tests {
     #[test]
     fn empty_workers_returns_none() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             cfg_default(),
             tree,
             tokenizer_registry_with_tiny(),
@@ -332,7 +473,7 @@ mod tests {
     #[test]
     fn empty_tree_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             cfg_default(),
             tree,
             tokenizer_registry_with_tiny(),
@@ -373,7 +514,7 @@ mod tests {
         );
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0, // any match counts
                 balance_abs_threshold: 32,
@@ -410,7 +551,7 @@ mod tests {
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
         let metrics = MetricsRegistry::new();
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
@@ -455,7 +596,7 @@ mod tests {
         assert!(!hashes.is_empty());
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
@@ -506,7 +647,7 @@ mod tests {
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
         let metrics = MetricsRegistry::new();
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 1.0, // match_rate <= 1.0 always -> always fall back
                 balance_abs_threshold: 32,
@@ -589,7 +730,7 @@ mod tests {
             oracle.try_set(block_size).unwrap();
             oracle.set_bigram(true);
             let metrics = MetricsRegistry::new();
-            let policy = CacheAwareZmqPolicy::new(
+            let policy = new_policy(
                 CacheAwareConfig {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
@@ -628,7 +769,7 @@ mod tests {
             let oracle = BlockSizeOracle::new();
             oracle.try_set(block_size).unwrap();
             let metrics = MetricsRegistry::new();
-            let policy = CacheAwareZmqPolicy::new(
+            let policy = new_policy(
                 CacheAwareConfig {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
@@ -686,7 +827,7 @@ mod tests {
             &templated_hashes,
         );
 
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
@@ -758,7 +899,7 @@ mod tests {
 
         let tree = Arc::new(HashTree::new());
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
@@ -796,7 +937,7 @@ mod tests {
         );
         let tree = Arc::new(HashTree::new());
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
@@ -899,7 +1040,7 @@ mod tests {
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
         tree.insert(&KvWorkerId::new("http://w1:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
@@ -934,7 +1075,7 @@ mod tests {
         let hashes = compute_block_hashes(&ids, block_size as usize);
         tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0, // would normally always match
                 balance_abs_threshold: 5,
@@ -959,14 +1100,151 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000", "imbalance must dominate");
     }
 
+    /// Fresh engine-reported load drives the imbalance + min-load decision
+    /// instead of the router-side in-flight counter. Both workers hold the
+    /// prefix and have zero router-side load, so without engine load the
+    /// tiebreak would pick w0 (stable order). Engine load says w0 is hot
+    /// (50) and w1 is light (1) → the imbalance branch routes to w1.
+    #[test]
+    fn engine_load_overrides_active_load() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        tree.insert(&KvWorkerId::new("http://w1:30000".into(), 0), None, &hashes);
+
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(50, 0), now);
+        engine_load.set("http://w1:30000", 0, load_stat(1, 0), now);
+
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 5,
+                balance_rel_threshold: 2.0,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        // Router-side counters are both 0 — only engine load is skewed.
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "engine-reported load must drive selection",
+        );
+    }
+
+    /// When load is balanced enough that the imbalance branch does NOT fire,
+    /// the matched-set tiebreak still uses engine load: both workers hold the
+    /// prefix, engine load says w1 is lighter → w1 wins. (Guards against a
+    /// regression that reverted the tiebreak to `active_load()`.)
+    #[test]
+    fn matched_set_tiebreak_uses_engine_load() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        tree.insert(&KvWorkerId::new("http://w1:30000".into(), 0), None, &hashes);
+
+        let engine_load = EngineLoadTable::new();
+        let now = Instant::now();
+        engine_load.set("http://w0:30000", 0, load_stat(10, 0), now);
+        engine_load.set("http://w1:30000", 0, load_stat(2, 0), now);
+
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                // High thresholds so the imbalance fast-path never fires (10 vs
+                // 2) and selection reaches the matched-set tiebreak.
+                balance_abs_threshold: 100,
+                balance_rel_threshold: 100.0,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "matched-set tiebreak must use engine load",
+        );
+    }
+
+    /// A stale engine snapshot is ignored: selection falls back to the
+    /// router-side `active_load` counter. w0's (stale) engine load is high,
+    /// but w1 carries a router-side guard, so fallback picks w0.
+    #[test]
+    fn stale_engine_load_falls_back_to_active_load() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        tree.insert(&KvWorkerId::new("http://w1:30000".into(), 0), None, &hashes);
+
+        // Past the default freshness window; an hour ago is comfortably stale.
+        let engine_load = EngineLoadTable::new();
+        let stale = Instant::now() - Duration::from_secs(3600);
+        engine_load.set("http://w0:30000", 0, load_stat(50, 0), stale);
+
+        let policy = new_policy_with_load(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+            engine_load,
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // Router-side: w1 has one in-flight request, w0 has none. With the
+        // stale engine load ignored, the tiebreak picks w0 (load 0 < 1).
+        let _g = w1.load_guard();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let ctx = SelectionContext::new(&model, Some(&body));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "stale engine load must be ignored in favour of active_load",
+        );
+    }
+
     /// Tokenizer is missing for the requested model → fall back to
     /// min-load (no panic, no error).
     #[test]
     fn missing_tokenizer_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
         let empty_registry = Arc::new(TokenizerRegistry::default());
-        let policy =
-            CacheAwareZmqPolicy::new(cfg_default(), tree, empty_registry, oracle_for_tests(4));
+        let policy = new_policy(cfg_default(), tree, empty_registry, oracle_for_tests(4));
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         let _g = w0.load_guard();
@@ -983,7 +1261,7 @@ mod tests {
     #[test]
     fn missing_request_body_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             cfg_default(),
             tree,
             tokenizer_registry_with_tiny(),
@@ -1004,7 +1282,7 @@ mod tests {
     #[test]
     fn body_without_prompt_field_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             cfg_default(),
             tree,
             tokenizer_registry_with_tiny(),
@@ -1028,7 +1306,7 @@ mod tests {
     #[test]
     fn empty_text_falls_back_to_min_load() {
         let tree = Arc::new(HashTree::new());
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             cfg_default(),
             tree,
             tokenizer_registry_with_tiny(),
@@ -1059,7 +1337,7 @@ mod tests {
             &[999, 998, 997],
         );
 
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.99,
                 balance_abs_threshold: 32,
@@ -1142,7 +1420,7 @@ mod tests {
         let kw0 = KvWorkerId::new("http://w0:30000".into(), 0);
         tree.insert(&kw0, None, &hashes);
 
-        let policy = CacheAwareZmqPolicy::new(
+        let policy = new_policy(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
@@ -1248,6 +1526,7 @@ mod tests {
             tree,
             registry,
             oracle_for_tests(4),
+            EngineLoadTable::new(),
         );
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");

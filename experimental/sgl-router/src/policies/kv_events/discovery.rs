@@ -39,6 +39,11 @@ pub struct EventConfig {
     pub port_base: u16,
     /// ZMQ topic prefix the gateway should SUBSCRIBE to.
     pub topic: String,
+    /// Base port of the worker's dedicated load-snapshot socket range
+    /// (per-rank load port = `load_port_base + dp_rank`). `None` when the
+    /// worker predates load publishing — the load subscriber is then skipped
+    /// and selection falls back to the router-side in-flight counter.
+    pub load_port_base: Option<u16>,
     /// Worker-reported `page_size`. Callers MUST compare against their
     /// own configured `block_size`; a mismatch produces silent
     /// miscompute since [`super::hash::compute_block_hashes`] is keyed
@@ -127,6 +132,7 @@ pub async fn fetch_event_config(
         host,
         port_base: block.endpoint_port_base,
         topic: block.topic,
+        load_port_base: block.load_endpoint_port_base,
         block_size: block.block_size,
         dp_size: block.dp_size,
         is_bigram,
@@ -252,6 +258,10 @@ struct KvEventsBlock {
     endpoint_port_base: u16,
     #[serde(default)]
     topic: String,
+    /// Base port of the dedicated load-snapshot socket range. Absent on
+    /// workers that predate load publishing (`None` ⇒ no load subscriber).
+    #[serde(default)]
+    load_endpoint_port_base: Option<u16>,
     block_size: u32,
     dp_size: u32,
 }
@@ -306,6 +316,7 @@ mod tests {
                 "endpoint_host": "*",
                 "endpoint_port_base": 5557,
                 "topic": "kv",
+                "load_endpoint_port_base": 5559,
                 "block_size": 64,
                 "dp_size": 2,
             }
@@ -318,6 +329,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port_base: 5557,
                 topic: "kv".to_string(),
+                load_port_base: Some(5559),
                 block_size: 64,
                 dp_size: 2,
                 is_bigram: false,

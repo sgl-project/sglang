@@ -1,13 +1,13 @@
 //! Wire-format types for SGLang's KV cache event stream.
 //!
 //! SGLang's `ZmqEventPublisher` (Python:
-//! `python/sglang/srt/disaggregation/kv_events.py`) encodes batches with
+//! `python/sglang/srt/utils/event_publisher.py`) encodes batches with
 //! `msgspec.msgpack`. Two struct families are involved:
 //!
-//! * `EventBatch` (the outer payload) — declared with
-//!   `array_like=True, omit_defaults=True, gc=False` (no tag).
-//! * `KVCacheEvent` (each inner event variant) — additionally declared
-//!   with `tag=True`.
+//! * `EventBatch` (the outer payload, in `utils/event_publisher.py`) —
+//!   declared with `array_like=True, omit_defaults=True, gc=False` (no tag).
+//! * `KVCacheEvent` (each inner event variant, in
+//!   `disaggregation/kv_events.py`) — additionally declared with `tag=True`.
 //!
 //! The combined effect on the wire:
 //!

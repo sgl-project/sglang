@@ -5,6 +5,7 @@ use crate::config::{Config, ModelConfig, PolicyKind};
 use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware_zmq::CacheAwareZmqPolicy,
+    engine_load::EngineLoadTable,
     kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
@@ -58,6 +59,7 @@ pub fn build_policy(
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    engine_load: Arc<EngineLoadTable>,
 ) -> Arc<dyn Policy> {
     match model.policy {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -71,6 +73,7 @@ pub fn build_policy(
                 tree,
                 tokenizers,
                 block_size_oracle,
+                engine_load,
             ))
         }
         PolicyKind::Sticky => build_sticky(model),
@@ -98,6 +101,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
                 Arc::new(HashTree::new()),
                 Arc::new(TokenizerRegistry::default()),
                 BlockSizeOracle::new(),
+                EngineLoadTable::new(),
             ))
         }
         PolicyKind::Sticky => {
@@ -116,6 +120,7 @@ pub fn build_registry(
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    engine_load: Arc<EngineLoadTable>,
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     let m = &cfg.model;
@@ -126,6 +131,7 @@ pub fn build_registry(
             Arc::clone(&tree),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            Arc::clone(&engine_load),
         ),
     );
     Ok(reg)
@@ -145,6 +151,7 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
         Arc::new(HashTree::new()),
         Arc::new(TokenizerRegistry::default()),
         BlockSizeOracle::new(),
+        EngineLoadTable::new(),
     )
 }
 
@@ -198,7 +205,14 @@ mod tests {
         let cfg = cfg_with_model("qwen", PolicyKind::RoundRobin);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            EngineLoadTable::new(),
+        )
+        .unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
     }
@@ -208,7 +222,14 @@ mod tests {
         let cfg = cfg_with_model("modelA", PolicyKind::CacheAwareZmq);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            EngineLoadTable::new(),
+        )
+        .unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         // Down-cast probe via Debug — cheaper than carrying a type-tag
         // on the trait. Pinning the debug repr is fine because the field
@@ -225,7 +246,14 @@ mod tests {
         let cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            EngineLoadTable::new(),
+        )
+        .unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(
@@ -239,7 +267,14 @@ mod tests {
         let cfg = cfg_with_model("modelA", PolicyKind::Sticky);
         let tree = Arc::new(HashTree::new());
         let tokenizers = Arc::new(TokenizerRegistry::default());
-        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let reg = build_registry(
+            &cfg,
+            tree,
+            tokenizers,
+            BlockSizeOracle::new(),
+            EngineLoadTable::new(),
+        )
+        .unwrap();
         let p = reg.get(&ModelId("modelA".into())).unwrap();
         let dbg = format!("{p:?}");
         assert!(

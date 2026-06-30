@@ -7,10 +7,11 @@
 //! always operate together in production:
 //!
 //! - [`HashTree`] — the cache-aware routing index keyed by SGLang block hash.
-//! - [`KvEventSubscriberRegistry`] — one ZMQ SUB connection per `(worker_url,
-//!   dp_rank)`.
-//! - A pump task that drains [`WorkerEvent`]s from the subscriber and applies
-//!   them to the tree.
+//! - [`EngineLoadTable`] — engine-reported per-worker load.
+//! - Two [`KvEventSubscriberRegistry`]s — one per `(worker_url, dp_rank)` on
+//!   the cache topic, one on the load topic.
+//! - A pump task that drains [`WorkerEvent`]s and applies KV batches to the
+//!   tree and `Load` snapshots to the engine-load table.
 //!
 //! `add_worker` / `remove_worker` are driven from the worker manager on every
 //! `DiscoveryEvent::Added` / `DiscoveryEvent::Removed`.
@@ -26,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -36,9 +37,10 @@ use tracing::{debug, info, warn};
 
 use super::block_size_oracle::BlockSizeOracle;
 use super::discovery::{fetch_event_config, EventConfig};
-use super::subscriber::{KvEventSubscriberRegistry, WorkerEvent};
+use super::subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 use super::tree::{HashTree, KvWorkerId};
 use super::wire::KvCacheEvent;
+use crate::policies::engine_load::EngineLoadTable;
 
 /// Channel buffer between the subscriber registry and the pump task.
 ///
@@ -66,6 +68,14 @@ struct WorkerEntry {
 pub struct KvEventIndex {
     tree: Arc<HashTree>,
     subscribers: Arc<KvEventSubscriberRegistry>,
+    /// Second registry subscribing to the load topic (one per worker rank),
+    /// feeding `LoadStat` snapshots into `engine_load`. Shares the pump
+    /// channel with `subscribers`; keyed independently so KV and load
+    /// subscribers for the same worker don't collide.
+    load_subscribers: Arc<KvEventSubscriberRegistry>,
+    /// Engine-reported per-worker load, written by the pump from
+    /// `WorkerEvent::Load` and read by the cache-aware-zmq policy.
+    engine_load: Arc<EngineLoadTable>,
     pump: Mutex<Option<JoinHandle<()>>>,
     pump_cancel: CancellationToken,
     workers: Mutex<HashMap<String, WorkerEntry>>,
@@ -117,12 +127,15 @@ impl KvEventIndex {
     ) -> Arc<Self> {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
-        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx));
+        let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx.clone()));
+        let load_subscribers = Arc::new(KvEventSubscriberRegistry::with_kind(tx, SubKind::Load));
+        let engine_load = EngineLoadTable::new();
         let cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>> = Arc::new(Mutex::new(HashMap::new()));
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
+            engine_load.clone(),
             cursors.clone(),
             live_workers.clone(),
             pump_cancel.clone(),
@@ -131,6 +144,8 @@ impl KvEventIndex {
         Arc::new(Self {
             tree,
             subscribers,
+            load_subscribers,
+            engine_load,
             pump: Mutex::new(Some(pump)),
             pump_cancel,
             workers: Mutex::new(HashMap::new()),
@@ -154,6 +169,15 @@ impl KvEventIndex {
     /// returned handle as read-only.
     pub fn tree(&self) -> Arc<HashTree> {
         self.tree.clone()
+    }
+
+    /// Shared accessor for the engine-load table. The `CacheAwareZmqPolicy`
+    /// (via [`crate::policies::factory`]) holds the same `Arc` and only reads
+    /// it at selection time. Load *values* are written solely by the pump
+    /// (from `LoadStat` events); `add_worker` / `remove_worker` here manage
+    /// the expected set and per-worker eviction.
+    pub fn engine_load(&self) -> Arc<EngineLoadTable> {
+        Arc::clone(&self.engine_load)
     }
 
     /// Register a worker. If `preresolved` is `Some`, the caller has
@@ -250,6 +274,14 @@ impl KvEventIndex {
             },
         );
         self.subscribers.add_worker(worker_url, &cfg).await;
+        // Load subscribers (one per rank on the dedicated load port). A no-op
+        // when the worker advertises no load port (older engine). Workers that
+        // do advertise one are marked expected, so the router can tell a dead
+        // load publisher apart from one that was never configured.
+        if cfg.load_port_base.is_some() {
+            self.engine_load.mark_expected(worker_url);
+        }
+        self.load_subscribers.add_worker(worker_url, &cfg).await;
     }
 
     /// Tear down a worker's subscribers and clear it from the tree.
@@ -278,12 +310,14 @@ impl KvEventIndex {
                 live.remove(id);
             }
         }
-        // 2. Cancel and join the per-rank subscriber tasks. No further
-        //    events for these ranks will be queued after this returns.
+        // 2. Cancel and join the per-rank subscriber tasks (KV + load). No
+        //    further events for these ranks will be queued after this returns.
         self.subscribers.remove_worker(worker_url).await;
-        // 3. Drop each rank's tree state and cursor. Any event already in
-        //    the mpsc buffer at this point will be filtered by the
-        //    live-set check inside the pump.
+        self.load_subscribers.remove_worker(worker_url).await;
+        // 3. Drop each rank's tree state and cursor, and the worker's engine
+        //    load. Any event already in the mpsc buffer at this point will be
+        //    filtered by the live-set check inside the pump.
+        self.engine_load.forget_worker(worker_url);
         let mut cursors = self.cursors.lock();
         for id in &ids {
             self.tree.clear_worker(id);
@@ -305,6 +339,7 @@ impl KvEventIndex {
     /// events are discarded and the task exits promptly.
     pub async fn shutdown(&self) {
         self.subscribers.shutdown().await;
+        self.load_subscribers.shutdown().await;
         self.pump_cancel.cancel();
         let handle = self.pump.lock().take();
         if let Some(h) = handle {
@@ -320,12 +355,14 @@ impl KvEventIndex {
     }
 }
 
-/// Drain `WorkerEvent`s and apply each batch to the tree. Out-of-order
-/// (seq ≤ last_applied) and stale (worker not in `live_workers`) batches
-/// are skipped. `PublisherReset` events clear the cursor so a publisher
+/// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
+/// to the engine-load table. Out-of-order (seq ≤ last_applied) and stale
+/// (worker not in `live_workers`) KV batches are skipped; `Load` is a gauge
+/// with no seq. `PublisherReset` events clear the cursor so a publisher
 /// restarting from seq=1 (after sending END_SEQ) is not filtered.
 async fn pump_loop(
     tree: Arc<HashTree>,
+    engine_load: Arc<EngineLoadTable>,
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     cancel: CancellationToken,
@@ -361,6 +398,11 @@ async fn pump_loop(
         }
 
         match ev {
+            WorkerEvent::Load { worker, load } => {
+                // Gauge: last value wins, no sequence/dedup. The live-worker
+                // filter above already dropped load from detached workers.
+                engine_load.set(&worker.url, worker.dp_rank, load, Instant::now());
+            }
             WorkerEvent::PublisherReset { worker } => {
                 if cursors.lock().remove(&worker).is_some() {
                     info!(
@@ -404,6 +446,7 @@ async fn pump_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policies::engine_load::LoadStat;
     use crate::policies::kv_events::wire::{BlockRemoved, BlockStored, KvEventBatch};
 
     fn worker_id(url: &str, rank: u32) -> KvWorkerId {
@@ -425,6 +468,7 @@ mod tests {
     /// can destructure just the bits they need.
     struct PumpHarness {
         tree: Arc<HashTree>,
+        engine_load: Arc<EngineLoadTable>,
         cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
         #[allow(dead_code)]
         live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
@@ -438,6 +482,7 @@ mod tests {
     /// the given workers pre-marked live.
     fn spawn_pump(live: &[KvWorkerId]) -> PumpHarness {
         let tree = Arc::new(HashTree::new());
+        let engine_load = EngineLoadTable::new();
         let cursors = Arc::new(Mutex::new(HashMap::new()));
         let live_set: Arc<Mutex<HashSet<KvWorkerId>>> =
             Arc::new(Mutex::new(live.iter().cloned().collect()));
@@ -445,6 +490,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         let pump = tokio::spawn(pump_loop(
             tree.clone(),
+            engine_load.clone(),
             cursors.clone(),
             live_set.clone(),
             cancel.clone(),
@@ -452,6 +498,7 @@ mod tests {
         ));
         PumpHarness {
             tree,
+            engine_load,
             cursors,
             live_set,
             cancel,
@@ -490,6 +537,34 @@ mod tests {
         let m = tree.match_prefix(None, &[10, 20, 30]);
         assert_eq!(m.matched_blocks, 3);
         assert!(m.workers.contains(&id), "tree must hold the worker");
+    }
+
+    /// A `WorkerEvent::Load` lands in the engine-load table (gauge, no
+    /// cursor) keyed by the worker URL, and does not touch the tree.
+    #[tokio::test]
+    async fn pump_applies_load_to_engine_load_table() {
+        let id = worker_id("http://w1", 0);
+        let h = spawn_pump(std::slice::from_ref(&id));
+        let (tree, engine_load, tx, pump) = (h.tree, h.engine_load, h.tx, h.pump);
+
+        tx.send(WorkerEvent::Load {
+            worker: id.clone(),
+            load: LoadStat {
+                num_running_reqs: 8,
+                num_waiting_reqs: 4,
+                num_tokens: 0,
+                max_total_num_tokens: 0,
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        pump.await.unwrap();
+
+        let fresh = engine_load.snapshot_fresh(Instant::now());
+        assert_eq!(fresh.get("http://w1").copied(), Some(12)); // 8 + 4
+                                                               // Load events must not pollute the cache tree.
+        assert_eq!(tree.node_count(), 0);
     }
 
     /// Out-of-order seq is filtered: a batch with seq <= last_applied is
@@ -649,6 +724,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port_base: 30100,
             topic: String::new(),
+            load_port_base: None,
             block_size: 128,
             dp_size: 1,
             is_bigram: false,
@@ -678,6 +754,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port_base: 30200,
             topic: String::new(),
+            load_port_base: None,
             block_size: 64,
             dp_size: 0,
             is_bigram: false,
@@ -699,6 +776,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port_base: 30300,
             topic: String::new(),
+            load_port_base: None,
             block_size: 64,
             dp_size: 0,
             is_bigram: true,
@@ -708,6 +786,53 @@ mod tests {
             index.block_size_oracle().is_bigram(),
             "add_worker must seed the bigram flag from EventConfig"
         );
+        index.shutdown().await;
+    }
+
+    /// `remove_worker` clears the worker's engine load and its expected mark,
+    /// so a re-added worker does not inherit stale load. The worker advertises
+    /// a load port (no publisher there; the subscriber just retries in the
+    /// background and is cancelled on remove).
+    #[tokio::test]
+    async fn remove_worker_clears_engine_load() {
+        let index = KvEventIndex::new();
+        let url = "http://127.0.0.1:59123";
+        let cfg = EventConfig {
+            host: "127.0.0.1".into(),
+            port_base: 59123,
+            topic: String::new(),
+            load_port_base: Some(59223),
+            block_size: 64,
+            dp_size: 1,
+            is_bigram: false,
+        };
+        index.add_worker(url, Some(cfg)).await;
+        assert_eq!(index.engine_load().expected_count(), 1);
+
+        let now = Instant::now();
+        index.engine_load().set(
+            url,
+            0,
+            LoadStat {
+                num_running_reqs: 3,
+                num_waiting_reqs: 1,
+                num_tokens: 0,
+                max_total_num_tokens: 0,
+            },
+            now,
+        );
+        assert!(index.engine_load().snapshot_fresh(now).contains_key(url));
+
+        index.remove_worker(url).await;
+        assert!(
+            index
+                .engine_load()
+                .snapshot_fresh(Instant::now())
+                .get(url)
+                .is_none(),
+            "remove_worker must clear engine load"
+        );
+        assert_eq!(index.engine_load().expected_count(), 0);
         index.shutdown().await;
     }
 }
