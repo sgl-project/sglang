@@ -1,6 +1,6 @@
 import logging
 from copy import deepcopy
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +18,6 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
     compute_position,
 )
@@ -29,10 +28,17 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
-from sglang.srt.speculative.dspark_info import DSparkDraftInputV2, DSparkVerifyInput
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.dspark_info import (
+    DSparkDraftBlockInput,
+    DSparkDraftInputV2,
+    DSparkVerifyInput,
+)
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
+from sglang.srt.speculative.triton_ops.dspark import (
+    _compute_dspark_accept_bonus_triton_unchecked,
+)
+from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import empty_context
 
 logger = logging.getLogger(__name__)
@@ -124,6 +130,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        self._use_triton_accept_bonus = is_cuda() or is_hip()
+        self._accept_bonus_buffer_cap: int = 0
+        self._accept_bonus_buffer_slot: int = 0
+        self._commit_lens_bufs: List[torch.Tensor] = []
+        self._bonus_id_bufs: List[torch.Tensor] = []
+        self._out_tokens_bufs: List[torch.Tensor] = []
+        self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._markov_refine_buffer_cap: int = 0
+        self._markov_candidates_buf: Optional[torch.Tensor] = None
+        self._markov_embeds_buf: Optional[torch.Tensor] = None
 
         if self.tp_rank == 0:
             logger.info(
@@ -245,56 +261,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         block_ids: torch.Tensor,
         positions: torch.Tensor,
         verify_out_cache_loc: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
         dp_decode_global_num_tokens: Optional[list[int]] = None,
     ) -> torch.Tensor:
-        device = self.device
-        seq_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
-        draft_block_spec_info = DSparkVerifyInput(
+        draft_block_spec_info = DSparkDraftBlockInput(
             draft_token=block_ids.reshape(-1),
             positions=positions,
             draft_token_num=int(self.block_size),
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        draft_forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=bs,
-            input_ids=block_ids.reshape(-1),
-            req_pool_indices=req_pool_indices,
-            seq_lens=prefix_lens,
+        draft_forward_batch = draft_block_spec_info.prepare_for_draft_block(
+            batch=batch,
+            draft_model_runner=self.draft_model_runner,
             out_cache_loc=verify_out_cache_loc,
-            seq_lens_sum=int(seq_lens_cpu.sum().item()),
-            seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
-            spec_algorithm=SpeculativeAlgorithm.DSPARK,
-            spec_info=draft_block_spec_info,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            lora_ids=[None] * bs,
+            dp_decode_global_num_tokens=dp_decode_global_num_tokens,
         )
-        if dp_decode_global_num_tokens is None:
-            dp_decode_global_num_tokens = batch.global_num_tokens
-        if (
-            self.server_args.enable_dp_attention
-            and dp_decode_global_num_tokens is not None
-        ):
-            draft_global_num_tokens = [
-                int(x) * int(self.block_size) for x in dp_decode_global_num_tokens
-            ]
-            draft_forward_batch.original_global_num_tokens_cpu = (
-                batch.global_num_tokens
-            )
-            draft_forward_batch.global_num_tokens_cpu = draft_global_num_tokens
-            draft_forward_batch.global_num_tokens_gpu = torch.tensor(
-                draft_global_num_tokens, dtype=torch.int64, device=device
-            )
-            draft_forward_batch.global_num_tokens_for_logprob_cpu = (
-                draft_global_num_tokens
-            )
-            draft_forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-                draft_global_num_tokens, dtype=torch.int64, device=device
-            )
 
         from sglang.srt.layers.attention import deepseek_v4_backend as _dsv4_be
 
@@ -323,6 +304,34 @@ class DSparkWorkerV2(BaseSpecWorker):
             reshape_bs, int(self.block_size), block_hidden.shape[-1]
         )
 
+    def _ensure_markov_refine_buffers(self, bs: int, device: torch.device) -> None:
+        cap = self._markov_refine_buffer_cap
+        if (
+            cap >= int(bs)
+            and self._markov_candidates_buf is not None
+            and self._markov_embeds_buf is not None
+            and self._markov_candidates_buf.device == device
+            and self._markov_embeds_buf.device == device
+        ):
+            return
+
+        new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
+        markov_weight = getattr(self._draft_inner.markov_head.markov_w1, "weight", None)
+        markov_dtype = (
+            markov_weight.dtype
+            if markov_weight is not None
+            else self.draft_model.lm_head.weight.dtype
+        )
+        self._markov_candidates_buf = torch.empty(
+            (new_cap, int(self.block_size)), dtype=torch.int64, device=device
+        )
+        self._markov_embeds_buf = torch.empty(
+            (new_cap, int(self.block_size), int(self.markov_rank)),
+            dtype=markov_dtype,
+            device=device,
+        )
+        self._markov_refine_buffer_cap = new_cap
+
     def _refine_block_markov(
         self,
         *,
@@ -342,6 +351,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             return empty_tokens, empty_confidence
 
+        self._ensure_markov_refine_buffers(bs, block_hidden.device)
+        assert self._markov_candidates_buf is not None
+        assert self._markov_embeds_buf is not None
+        candidates = self._markov_candidates_buf[:bs]
+        markov_embeds = self._markov_embeds_buf[:bs]
+
         markov_head = self._draft_inner.markov_head
         confidence_head = self._draft_inner.confidence_head
         lm_head = self.draft_model.lm_head
@@ -358,38 +373,111 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ..., :vocab_size
             ]
 
-        out_tokens = torch.empty(
-            (bs, block_size + 1), dtype=torch.int64, device=block_hidden.device
-        )
         if bonus_tokens.numel() == bs:
             first_tokens = bonus_tokens.view(-1).to(torch.int64)
         else:
             first_tokens = torch.full(
                 (bs,), self.noise_token_id, dtype=torch.int64, device=block_hidden.device
             )
-        out_tokens[:, 0] = first_tokens
-        markov_embeds = None
+        candidates[:, 0].copy_(first_tokens)
+
         with torch.inference_mode():
             base_logits = _gather_full_vocab(F.linear(block_hidden, lm_head.weight))
+            prev_tokens = candidates[:, 0]
             for i in range(block_size):
-                prev_embed = markov_head.get_prev_embeddings(out_tokens[:, i])
-                if markov_embeds is None:
-                    markov_embeds = prev_embed.new_empty(
-                        (bs, block_size, prev_embed.shape[-1])
-                    )
+                prev_embed = markov_head.get_prev_embeddings(prev_tokens)
                 markov_embeds[:, i].copy_(prev_embed)
                 bias = _gather_full_vocab(markov_head.project_bias(prev_embed))
-                refined = base_logits[:, i] + bias
-                out_tokens[:, i + 1] = torch.argmax(refined, dim=-1)
+                bias.add_(base_logits[:, i])
+                next_tokens = torch.argmax(bias, dim=-1)
+                if i + 1 < block_size:
+                    candidates[:, i + 1].copy_(next_tokens)
+                prev_tokens = next_tokens
 
             confidence = confidence_head(block_hidden, markov_embeds)
 
-        candidates = out_tokens[:, :block_size].contiguous()
         return candidates[:output_bs], confidence[:output_bs]
 
     def _confident_prefix(self, confidence: torch.Tensor) -> torch.Tensor:
         keep = torch.sigmoid(confidence) >= self.confidence_threshold
         return keep.to(torch.int32).cumprod(dim=1).sum(dim=1)
+
+    def _ensure_accept_bonus_buffers(self, bs: int) -> None:
+        if self._accept_bonus_buffer_cap >= int(bs):
+            return
+
+        new_cap = max(
+            int(bs),
+            (
+                self._accept_bonus_buffer_cap * 2
+                if self._accept_bonus_buffer_cap > 0
+                else int(bs)
+            ),
+        )
+        device = self.device
+        block_size = int(self.block_size)
+        self._commit_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
+        ]
+        self._bonus_id_bufs = [
+            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self._out_tokens_bufs = [
+            torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
+            for _ in range(2)
+        ]
+        self._new_seq_lens_bufs = [
+            torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
+        ]
+        self._accept_bonus_buffer_cap = new_cap
+
+    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        self._ensure_accept_bonus_buffers(bs)
+        slot = self._accept_bonus_buffer_slot
+        self._accept_bonus_buffer_slot = (slot + 1) % 2
+        return (
+            self._commit_lens_bufs[slot][:bs],
+            self._bonus_id_bufs[slot][:bs],
+            self._out_tokens_bufs[slot][:bs],
+            self._new_seq_lens_bufs[slot][:bs],
+        )
+
+    def _compute_accept_bonus_eager(
+        self,
+        *,
+        candidates: torch.Tensor,
+        target_predict: torch.Tensor,
+        confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bs, block_size = candidates.shape
+        correct_len, _ = compute_dflash_correct_drafts_and_bonus(
+            candidates=candidates,
+            target_predict=target_predict,
+        )
+        confident_prefix = self._confident_prefix(confidence)
+        correct_len = torch.minimum(
+            correct_len.to(torch.int64), confident_prefix.to(torch.int64)
+        )
+        bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(1)
+        commit_lens = correct_len.to(torch.int32) + 1
+
+        out_tokens = torch.empty(
+            (bs, block_size), dtype=torch.int64, device=candidates.device
+        )
+        if block_size > 1:
+            out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+        out_tokens[:, block_size - 1].fill_(0)
+        out_tokens.scatter_(
+            1,
+            correct_len.unsqueeze(1),
+            bonus_tokens.unsqueeze(1).to(torch.int64),
+        )
+        return commit_lens, bonus_tokens, out_tokens
 
     def _make_next_draft_input_prefill(
         self,
@@ -572,8 +660,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 block_ids=block_ids,
                 positions=positions,
                 verify_out_cache_loc=verify_out_cache_loc,
-                prefix_lens=prefix_lens,
-                req_pool_indices=req_pool_indices,
                 dp_decode_global_num_tokens=dp_decode_global_num_tokens,
             )
 
@@ -624,33 +710,50 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs, block_size
         )
 
+        new_seq_lens = None
         if bs == 0:
-            correct_len = torch.empty((0,), dtype=torch.int64, device=device)
             bonus_tokens = torch.empty((0,), dtype=torch.int64, device=device)
             commit_lens = torch.empty((0,), dtype=torch.int32, device=device)
+            out_tokens = torch.empty((0, block_size), dtype=torch.int64, device=device)
+        elif self._use_triton_accept_bonus:
+            try:
+                (
+                    commit_lens,
+                    bonus_tokens,
+                    out_tokens,
+                    new_seq_lens,
+                ) = self._next_accept_bonus_buffers(bs)
+                _compute_dspark_accept_bonus_triton_unchecked(
+                    candidates=candidates,
+                    target_top1=target_predict,
+                    confidence=confidence,
+                    commit_lens_out=commit_lens,
+                    bonus_ids_out=bonus_tokens,
+                    out_tokens_out=out_tokens,
+                    prefix_lens=prefix_lens,
+                    new_seq_lens_out=new_seq_lens,
+                    confidence_threshold=self.confidence_threshold,
+                )
+            except Exception as e:
+                self._use_triton_accept_bonus = False
+                logger.warning(
+                    "DSPARK Triton accept/bonus failed; falling back to eager path: %s",
+                    e,
+                )
+                commit_lens, bonus_tokens, out_tokens = self._compute_accept_bonus_eager(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    confidence=confidence,
+                )
         else:
-            correct_len, _ = compute_dflash_correct_drafts_and_bonus(
+            commit_lens, bonus_tokens, out_tokens = self._compute_accept_bonus_eager(
                 candidates=candidates,
                 target_predict=target_predict,
+                confidence=confidence,
             )
-            confident_prefix = self._confident_prefix(confidence)
-            correct_len = torch.minimum(
-                correct_len.to(torch.int64), confident_prefix.to(torch.int64)
-            )
-            bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(
-                1
-            )
-            commit_lens = correct_len.to(torch.int32) + 1
 
-        out_tokens = torch.empty((bs, block_size), dtype=torch.int64, device=device)
-        if block_size > 1:
-            out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
-        out_tokens[:, block_size - 1].fill_(0)
-        out_tokens.scatter_(
-            1, correct_len.unsqueeze(1), bonus_tokens.unsqueeze(1).to(torch.int64)
-        )
-
-        new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+        if new_seq_lens is None:
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
@@ -678,6 +781,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             cur_allocated_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
         )
+        next_draft_input.carry_prepare_buffers_from(draft_input)
         verify_done = torch.get_device_module(device).Event()
         verify_done.record()
         next_draft_input.verify_done = verify_done

@@ -18,15 +18,21 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_info import (
+    SpecInput,
+    SpecInputType,
+    SpeculativeAlgorithm,
+)
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.managers.tp_worker import TpModelWorker
 
 
 @dataclass
-class DSparkVerifyInput(SpecInput):
+class _DSparkBlockInputBase(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
@@ -36,8 +42,8 @@ class DSparkVerifyInput(SpecInput):
     num_tokens_per_batch: int = -1
     num_tokens_per_req: int = -1
 
-    def __post_init__(self):
-        super().__init__(spec_input_type=SpecInputType.DSPARK_VERIFY)
+    def _init_spec_input(self, spec_input_type: SpecInputType):
+        SpecInput.__init__(self, spec_input_type=spec_input_type)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
         if self.num_tokens_per_req == -1:
@@ -45,39 +51,6 @@ class DSparkVerifyInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
-
-    def prepare_for_verify(
-        self,
-        batch: ScheduleBatch,
-        target_worker: TpModelWorker,
-    ) -> tuple[ForwardBatch, bool]:
-        batch.input_ids = self.draft_token
-        batch.spec_info = self
-        batch.forward_mode = (
-            ForwardMode.IDLE
-            if batch.forward_mode.is_idle()
-            else ForwardMode.TARGET_VERIFY
-        )
-        batch.capture_hidden_mode = self.capture_hidden_mode
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
-
-        server_args = get_global_server_args()
-        can_run_cuda_graph = bool(
-            not server_args.enable_dp_attention
-            and target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-                verify_forward_batch
-            )
-        )
-        if can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-                verify_forward_batch
-            )
-            verify_forward_batch.mark_forward_metadata_ready()
-        # Non-cuda-graph: defer metadata init to the forward path so DP attention
-        # padding in prepare_mlp_sync_batch is reflected in the backend plan.
-
-        return verify_forward_batch, can_run_cuda_graph
 
     def generate_attn_arg_prefill(
         self,
@@ -140,6 +113,91 @@ class DSparkVerifyInput(SpecInput):
 
 
 @dataclass
+class DSparkDraftBlockInput(_DSparkBlockInputBase):
+    def __post_init__(self):
+        self._init_spec_input(SpecInputType.DSPARK_DRAFT_BLOCK)
+
+    def prepare_for_draft_block(
+        self,
+        batch: ScheduleBatch,
+        draft_model_runner: ModelRunner,
+        out_cache_loc: torch.Tensor,
+        dp_decode_global_num_tokens: Optional[list[int]] = None,
+    ) -> ForwardBatch:
+        batch.input_ids = self.draft_token
+        batch.out_cache_loc = out_cache_loc
+        batch.spec_info = self
+        batch.spec_algorithm = SpeculativeAlgorithm.DSPARK
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.capture_hidden_mode = self.capture_hidden_mode
+
+        draft_forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
+        draft_forward_batch.lora_ids = [None] * draft_forward_batch.batch_size
+
+        server_args = get_global_server_args()
+        if (
+            server_args.enable_dp_attention
+            and dp_decode_global_num_tokens is not None
+        ):
+            draft_global_num_tokens = [
+                int(x) * int(self.draft_token_num) for x in dp_decode_global_num_tokens
+            ]
+            draft_forward_batch.global_num_tokens_cpu = draft_global_num_tokens
+            draft_forward_batch.global_num_tokens_gpu = torch.tensor(
+                draft_global_num_tokens,
+                dtype=torch.int64,
+                device=draft_model_runner.device,
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_cpu = (
+                draft_global_num_tokens
+            )
+            draft_forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+                draft_global_num_tokens,
+                dtype=torch.int64,
+                device=draft_model_runner.device,
+            )
+
+        return draft_forward_batch
+
+
+@dataclass
+class DSparkVerifyInput(_DSparkBlockInputBase):
+    def __post_init__(self):
+        self._init_spec_input(SpecInputType.DSPARK_VERIFY)
+
+    def prepare_for_verify(
+        self,
+        batch: ScheduleBatch,
+        target_worker: TpModelWorker,
+    ) -> tuple[ForwardBatch, bool]:
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+
+        can_run_cuda_graph = bool(
+            target_worker.model_runner.decode_cuda_graph_runner
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
+                verify_forward_batch
+            )
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
+                verify_forward_batch
+            )
+            verify_forward_batch.mark_forward_metadata_ready()
+        # Non-cuda-graph: defer metadata init to the forward path so DP attention
+        # padding in prepare_mlp_sync_batch is reflected in the backend plan.
+
+        return verify_forward_batch, can_run_cuda_graph
+
+
+@dataclass
 class DSparkDraftInputV2(SpecInput):
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
@@ -160,12 +218,60 @@ class DSparkDraftInputV2(SpecInput):
     )
     direct_carry_valid: bool = True
     future_indices: Optional[torch.Tensor] = None
+    _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_cur_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_nxt_kv_lens_cpu_buf: Optional[torch.Tensor] = None
+    _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
+    _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DSPARK_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return 1, 1
+
+    def carry_prepare_buffers_from(self, other: DSparkDraftInputV2) -> None:
+        self._prepare_batch_seq_lens_cpu_buf = other._prepare_batch_seq_lens_cpu_buf
+        self._prepare_cur_kv_lens_cpu_buf = other._prepare_cur_kv_lens_cpu_buf
+        self._prepare_nxt_kv_lens_cpu_buf = other._prepare_nxt_kv_lens_cpu_buf
+        self._prepare_cur_kv_lens_gpu_buf = other._prepare_cur_kv_lens_gpu_buf
+        self._prepare_nxt_kv_lens_gpu_buf = other._prepare_nxt_kv_lens_gpu_buf
+
+    def _ensure_prepare_length_buffers(
+        self, bs: int, device: torch.device | str, need_gpu: bool = False
+    ) -> None:
+        pin_memory = is_pin_memory_available(device)
+
+        def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
+            return buf is None or buf.numel() < bs
+
+        def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
+            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
+
+        def grown_capacity(buf: Optional[torch.Tensor]) -> int:
+            current = 0 if buf is None else int(buf.numel())
+            return max(bs, 32, current * 2 if current > 0 else 0)
+
+        if needs_cpu_alloc(self._prepare_batch_seq_lens_cpu_buf):
+            capacity = grown_capacity(self._prepare_batch_seq_lens_cpu_buf)
+            self._prepare_batch_seq_lens_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int64, device="cpu"
+            )
+            self._prepare_cur_kv_lens_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            )
+            self._prepare_nxt_kv_lens_cpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
+            )
+
+        if need_gpu and needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
+            capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
+            self._prepare_cur_kv_lens_gpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device=device
+            )
+            self._prepare_nxt_kv_lens_gpu_buf = torch.empty(
+                (capacity,), dtype=torch.int32, device=device
+            )
 
     @classmethod
     def create_idle_input(cls, device: torch.device) -> DSparkDraftInputV2:
@@ -180,7 +286,9 @@ class DSparkDraftInputV2(SpecInput):
 
     def prepare_for_decode(self, batch: ScheduleBatch):
         if self.verify_done is not None:
-            self.verify_done.synchronize()
+            torch.get_device_module(batch.device).current_stream().wait_event(
+                self.verify_done
+            )
 
         bs = batch.batch_size()
         if bs == 0:
@@ -196,9 +304,13 @@ class DSparkDraftInputV2(SpecInput):
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_alloc = self.cur_allocated_seq_lens_cpu
 
-        cur_kv_lens_cpu = torch.empty((bs,), dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.empty((bs,), dtype=torch.int32, device="cpu")
-        committed_cpu = torch.empty((bs,), dtype=torch.int64, device="cpu")
+        self._ensure_prepare_length_buffers(bs, device, need_gpu=False)
+        assert self._prepare_batch_seq_lens_cpu_buf is not None
+        assert self._prepare_cur_kv_lens_cpu_buf is not None
+        assert self._prepare_nxt_kv_lens_cpu_buf is not None
+        committed_cpu = self._prepare_batch_seq_lens_cpu_buf[:bs]
+        cur_kv_lens_cpu = self._prepare_cur_kv_lens_cpu_buf[:bs]
+        nxt_kv_lens_cpu = self._prepare_nxt_kv_lens_cpu_buf[:bs]
         committed_sum = 0
         reserved_sum = 0
         num_needed_tokens = 0
@@ -216,10 +328,15 @@ class DSparkDraftInputV2(SpecInput):
             reserved_sum += reserved_len
             num_needed_tokens += reserved_len - cur_alloc_len
 
-        cur_kv_lens = cur_kv_lens_cpu.to(device, non_blocking=True)
-        nxt_kv_lens = nxt_kv_lens_cpu.to(device, non_blocking=True)
-
         if num_needed_tokens > 0:
+            self._ensure_prepare_length_buffers(bs, device, need_gpu=True)
+            assert self._prepare_cur_kv_lens_gpu_buf is not None
+            assert self._prepare_nxt_kv_lens_gpu_buf is not None
+            cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
+            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
+            cur_kv_lens.copy_(cur_kv_lens_cpu, non_blocking=True)
+            nxt_kv_lens.copy_(nxt_kv_lens_cpu, non_blocking=True)
+
             if page_size == 1:
                 out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
             else:

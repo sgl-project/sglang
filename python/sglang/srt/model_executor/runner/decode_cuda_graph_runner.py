@@ -987,7 +987,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, torch.Tensor]:
         timer_ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={"category": forward_batch.forward_mode.name.lower()}
@@ -1035,6 +1035,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 customized_info=output.customized_info,
             )
+        elif isinstance(output, torch.Tensor):
+            return output[: self.raw_num_token]
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
@@ -1105,14 +1107,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         elif self.model_runner.spec_algorithm.is_dspark():
-            from sglang.srt.speculative.dspark_info import DSparkVerifyInput
+            from sglang.srt.speculative.dspark_info import (
+                DSparkDraftBlockInput,
+                DSparkVerifyInput,
+            )
 
-            spec_info = DSparkVerifyInput(
+            dspark_spec_input_cls = (
+                DSparkDraftBlockInput
+                if self.model_runner.is_draft_worker
+                else DSparkVerifyInput
+            )
+            spec_info = dspark_spec_input_cls(
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                 custom_mask=None,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
             )
 
         elif self.model_runner.spec_algorithm.is_ngram():

@@ -1720,6 +1720,7 @@ class FlashInferIndicesUpdaterPrefill:
             assert isinstance(spec_info, SpecInput)
             if spec_info.spec_input_type in (
                 SpecInputType.DFLASH_VERIFY,
+                SpecInputType.DSPARK_DRAFT_BLOCK,
                 SpecInputType.DSPARK_VERIFY,
             ):
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (

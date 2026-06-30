@@ -63,8 +63,11 @@ class DSparkConfidenceHead(nn.Module):
         self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
 
     def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
-        features = torch.cat([hidden, markov_embed], dim=-1)
-        return self.proj(features.float()).squeeze(-1)
+        hidden_dim = hidden.shape[-1]
+        weight = self.proj.weight
+        hidden_score = F.linear(hidden.float(), weight[:, :hidden_dim])
+        markov_score = F.linear(markov_embed.float(), weight[:, hidden_dim:])
+        return (hidden_score + markov_score).squeeze(-1)
 
 
 class DeepseekV4DSparkModel(nn.Module):
