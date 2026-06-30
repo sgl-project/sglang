@@ -9,7 +9,7 @@ from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
 from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=37, suite="base-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
 
 HIDDEN_DIMS = [1024, 4096, 5120, 6144, 7168]
