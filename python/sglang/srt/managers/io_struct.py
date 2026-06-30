@@ -219,9 +219,6 @@ class GenerateReqInput:
     # prefill HTTP URL so a decode worker can ask the same prefill worker to
     # recompute stale KV after pause_generation(mode="retract") and cache flush.
     pd_rebootstrap_prefill_url: Optional[Union[List[str], str]] = None
-    # Internal prefill-only override used by decode rebootstrap to replay the
-    # last already-emitted token while recomputing KV under newer weights.
-    pd_rebootstrap_forced_output_id: Optional[int] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -740,7 +737,6 @@ class GenerateReqInput:
                 if self.pd_rebootstrap_prefill_url is not None
                 else None
             ),
-            pd_rebootstrap_forced_output_id=self.pd_rebootstrap_forced_output_id,
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
@@ -817,7 +813,6 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
     pd_rebootstrap_prefill_url: Optional[str] = None
-    pd_rebootstrap_forced_output_id: Optional[int] = None
 
     # For DP routing
     routed_dp_rank: Optional[int] = None

@@ -239,7 +239,6 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             bootstrap_port=30000,
             bootstrap_room=7,
             pd_rebootstrap_prefill_url="http://prefill",
-            pd_rebootstrap_forced_output_id=5,
             priority=10,
             extra_key=None,
             routing_key=None,
@@ -258,8 +257,10 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["pd_rebootstrap_prefill_url"], "http://prefill")
-        self.assertEqual(payload["pd_rebootstrap_forced_output_id"], 5)
         self.assertEqual(payload["bootstrap_room"], 7)
+        # The boundary token is replayed/overridden on the decode side, not sent
+        # to the prefill, so it must not be in the payload.
+        self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
         json.dumps(payload)
 

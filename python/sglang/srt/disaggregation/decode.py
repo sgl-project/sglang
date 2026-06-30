@@ -1610,7 +1610,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
-        decode_req.req.output_ids.append(output_id[0].item())
+        # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
+        # under the current weights and sampled a fresh handoff token, but when
+        # there is a remembered boundary token we are *replaying* an
+        # already-emitted token. Override the handoff with it, and skip
+        # re-committing a logprob for it -- it keeps its original behavior
+        # logprob from before the retract (we never re-score generated tokens
+        # under the new policy). A rebootstrap with no boundary token (retracted
+        # before emitting any output) falls through to the normal path so its
+        # first token and logprob are committed as usual.
+        replayed_boundary = (
+            decode_req.is_rebootstrap
+            and decode_req.req.pd_rebootstrap_forced_output_id is not None
+        )
+        if replayed_boundary:
+            committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
+            decode_req.req.pd_rebootstrap_forced_output_id = None
+        else:
+            committed_output_id = output_id[0].item()
+        decode_req.req.output_ids.append(committed_output_id)
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -1632,7 +1650,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
 
-        if decode_req.req.return_logprob:
+        if decode_req.req.return_logprob and not replayed_boundary:
             decode_req.req.logprob.output_token_logprobs_val.append(
                 output_token_logprobs_val[0].item()
             )

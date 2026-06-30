@@ -630,15 +630,6 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                # PD retract rebootstrap: replay the already-emitted token under
-                # the recomputed KV. Apply only here, once we are committing the
-                # final-chunk token after optimistic bootstrap has succeeded, so
-                # that middle chunks and deferred optimistic retries never drop
-                # the forced id.
-                if req.pd_rebootstrap_forced_output_id is not None:
-                    next_token_id = req.pd_rebootstrap_forced_output_id
-                    req.pd_rebootstrap_forced_output_id = None
-
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)

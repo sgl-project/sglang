@@ -2080,7 +2080,6 @@ class Scheduler(
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
                 pd_rebootstrap_prefill_url=recv_req.pd_rebootstrap_prefill_url,
-                pd_rebootstrap_forced_output_id=recv_req.pd_rebootstrap_forced_output_id,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
