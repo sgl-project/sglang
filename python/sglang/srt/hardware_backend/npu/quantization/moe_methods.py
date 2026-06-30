@@ -424,32 +424,28 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
         quant_info: "AscendQuantInfo",
         hidden_states: torch.Tensor,
         expert_tokens: torch.Tensor,
-        pertoken_scale: Optional[torch.Tensor],   # None => compute dynamically
+        pertoken_scale: Optional[torch.Tensor],
         output_dtype: torch.dtype,
         weight_prefix: str,
         group_list_type,
     ) -> torch.Tensor:
-        # Fetch the pre-processed weight scale (already in [E, groups//2, N, 2])
         weight_scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
-
-        # Dynamic MX quantization of activations
+    
         if pertoken_scale is None:
             hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-            # per‑token scale is [tokens, 1] – squeeze to [tokens]
-            pertoken_scale = pertoken_scale.squeeze(-1)
-
+            # pertoken_scale is [tokens, ceil(K/64), 2] – no squeeze!
+    
         scale_args: Dict[str, Any] = {
             "scale": [weight_scale],
             "per_token_scale": [pertoken_scale],
             "scale_dtype": torch.float8_e8m0fnu,
             "pertoken_scale_dtype": torch.float8_e8m0fnu,
-            "group_sizes": [1, 1, self.group_size],
         }
-
+    
         return self.matmul.forward(
             quant_info,
             weight_prefix,
-            hidden_states,          # now float8_e4m3fn
+            hidden_states,          # float8_e4m3fn
             expert_tokens,
             output_dtype,
             group_list_type=group_list_type,
