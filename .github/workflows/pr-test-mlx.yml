@@ -23,12 +23,15 @@ jobs:
     # Apple Silicon runner and is intentionally excluded here).
     if: |
       github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'mlx')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'mlx')
+      contains(github.event.pull_request.labels.*.name, 'mlx')
     runs-on: macos-14
     timeout-minutes: 60
     env:
       SGLANG_IS_IN_CI: true
+      # use_mlx() gates the MLX backend on this var AND mlx importing. Without it
+      # the profiler patch path takes the MPS branch, so the MLX capture-selection
+      # branch (profiler.py: if use_mlx()) is never exercised by this lane.
+      SGLANG_USE_MLX: 1
       # Hosted runner has no model cache; the selected tests are model-free, so
       # forbid any HF download to keep that guarantee enforced rather than assumed.
       HF_HUB_OFFLINE: 1
@@ -75,13 +78,10 @@ jobs:
           # contract checks, mocked Metal capture, dummy ServerArgs + patch logic,
           # and pure quantization-config dict logic.
           #
-          # Four cases are excluded by name (-k): they are stale against current
-          # upstream/main (they poke internal APIs that were refactored after the
-          # tests landed, and only ever skipped on the ubuntu base-a-test-cpu run,
-          # so the drift went unnoticed). They are model-free but currently red and
-          # need a code fix, tracked separately:
-          #   - test_start_profile_success_with_mock_capture
-          #       (_start_profile returns success=False under mocked capture)
+          # Three cases are excluded by name (-k): stale against current upstream/main
+          # (they poke internal APIs refactored after the tests landed; only ever
+          # skipped on ubuntu base-a-test-cpu, so the drift went unnoticed). Model-free
+          # but red, tracked separately:
           #   - test_decode_finalize_does_not_snapshot_auxiliary_state
           #       (MlxModelRunner._clear_steps now set in __init__, fake runner omits it)
           #   - test_mlx_scheduler_init_overlap_keeps_future_map_relay
@@ -90,8 +90,7 @@ jobs:
           #       (_handle_finished_req renamed to _handle_finish_state_updated_req)
           # -k matches on test-name keywords, so it is robust to the test/pytest.ini
           # rootdir (which shifts nodeids and silently breaks path-based --deselect).
-          EXCLUDE="test_start_profile_success_with_mock_capture \
-            or test_decode_finalize_does_not_snapshot_auxiliary_state \
+          EXCLUDE="test_decode_finalize_does_not_snapshot_auxiliary_state \
             or test_mlx_scheduler_init_overlap_keeps_future_map_relay \
             or test_finished_request_snapshots_before_release"
           python3 -m pytest -v \
