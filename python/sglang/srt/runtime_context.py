@@ -70,6 +70,9 @@ _PARALLEL_FIELDS = frozenset(
         "moe_tp_group",
         "attn_tp_group",
         "attn_cp_group",
+        "dwdp_size",
+        "dwdp_rank",
+        "dwdp_group",
     }
 )
 
@@ -203,6 +206,18 @@ class ParallelContext:
     @property
     def attn_cp_group(self) -> Any:
         return self._v("attn_cp_group", _ps().get_attn_cp_group)
+
+    @property
+    def dwdp_size(self) -> int:
+        return self._v("dwdp_size", _ps().get_dwdp_world_size)
+
+    @property
+    def dwdp_rank(self) -> int:
+        return self._v("dwdp_rank", _ps().get_dwdp_rank)
+
+    @property
+    def dwdp_group(self) -> Any:
+        return self._v("dwdp_group", _ps().get_dwdp_group)
 
 
 class RuntimeContext:

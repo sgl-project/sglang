@@ -911,6 +911,22 @@ class ServerArgs:
             aliases=["--moe-data-parallel-size"],
         ),
     ] = 1
+    dwdp_size: A[
+        int,
+        Arg(
+            help="DWDP (Distributed Weight Data Parallelism) group size. "
+            "When > 1, MoE prefill uses weight prefetch instead of token all-to-all. "
+            "Must equal tp_size. Requires --disaggregation-mode prefill.",
+        ),
+    ] = 1
+    dwdp_num_experts_per_worker: A[
+        Optional[int],
+        Arg(
+            help="Number of experts stored locally per DWDP rank. "
+            "Default: num_routed_experts // dwdp_size. "
+            "Set higher for overlapping allocation (reduces NVLink traffic at cost of memory).",
+        ),
+    ] = None
     enable_prefill_cp: A[
         bool,
         "Enable context parallelism for the prefill phase. Select the layout with --cp-strategy.",
@@ -2626,6 +2642,9 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Handle DWDP (must run before _handle_data_parallelism).
+        self._handle_dwdp()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -5143,6 +5162,47 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _handle_dwdp(self):
+        """Handle DWDP configuration. Must run before _handle_data_parallelism()."""
+        if self.dwdp_size <= 1:
+            return
+
+        assert (
+            self.dwdp_size >= 2
+        ), f"dwdp_size must be >= 2 when enabled, got {self.dwdp_size}"
+        assert (
+            self.dwdp_size == self.tp_size
+        ), f"dwdp_size ({self.dwdp_size}) must equal tp_size ({self.tp_size})"
+        assert self.disaggregation_mode in (
+            "null",
+            "prefill",
+        ), "DWDP requires --disaggregation-mode null or prefill"
+        assert (
+            not self.enable_eplb
+        ), "EPLB dynamic migration conflicts with static DWDP partitioning"
+
+        # Auto-force flags for full data-parallel independence
+        self.dp_size = self.dwdp_size
+        self.enable_dp_attention = True
+        self.enable_dp_attention_local_control_broadcast = True
+        self.enable_dp_lm_head = True
+        self.moe_dense_tp_size = 1
+        self.ep_size = self.dwdp_size
+        self.moe_ep_size = self.dwdp_size
+        self.moe_dp_size = 1
+        self.moe_a2a_backend = "none"
+
+        # Skip scheduler allgather across DP ranks (each rank runs independently)
+        envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.set(True)
+
+        logger.info(
+            f"DWDP enabled: dwdp_size={self.dwdp_size}, "
+            f"auto-forced dp_size={self.dp_size}, moe_ep_size={self.moe_ep_size}, "
+            f"moe_dense_tp_size=1, moe_a2a_backend=none, "
+            f"dp_attention_local_control_broadcast=True, "
+            f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True"
+        )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:

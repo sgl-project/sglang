@@ -1643,6 +1643,34 @@ def get_moe_tp_group() -> GroupCoordinator:
     return _MOE_TP
 
 
+def get_dwdp_world_size() -> int:
+    """DWDP world size. Returns 1 if DWDP is disabled."""
+    from sglang.srt.server_args import get_global_server_args
+
+    sa = get_global_server_args()
+    return sa.dwdp_size if sa is not None else 1
+
+
+def get_dwdp_rank() -> int:
+    """DWDP rank. Same as TP rank since dwdp_size == tp_size."""
+    from sglang.srt.server_args import get_global_server_args
+
+    sa = get_global_server_args()
+    if sa is not None and sa.dwdp_size > 1:
+        return get_tensor_model_parallel_rank()
+    return 0
+
+
+def get_dwdp_group():
+    """DWDP group. Reuses TP group since dwdp_size == tp_size."""
+    from sglang.srt.server_args import get_global_server_args
+
+    sa = get_global_server_args()
+    if sa is not None and sa.dwdp_size > 1:
+        return get_tp_group()
+    return None
+
+
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
@@ -2406,6 +2434,17 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    # Clean up DWDP resources before destroying groups
+    from sglang.srt.layers.moe.dwdp import (
+        get_global_dwdp_manager,
+        set_global_dwdp_manager,
+    )
+
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        dwdp_mgr.cleanup()
+        set_global_dwdp_manager(None)
+
     global _TP
     if _TP:
         _TP.destroy()
