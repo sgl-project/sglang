@@ -199,6 +199,10 @@ class Req:
     # stage logging
     metrics: Optional[RequestMetrics] = None
 
+    # scheduler-owned hint; async output save only helps when file finalization
+    # can overlap with follow-up work
+    allow_async_output_save: bool = False
+
     # tracing context (TraceReqContext or TraceNullContext)
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
         default_factory=TraceNullContext

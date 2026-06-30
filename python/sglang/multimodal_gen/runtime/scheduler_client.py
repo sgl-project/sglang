@@ -6,11 +6,32 @@ import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    Req,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _set_async_output_save_hint_for_batch(batch: Any, allow_async: bool) -> None:
+    if isinstance(batch, Req):
+        batch.allow_async_output_save = allow_async
+        return
+
+    if isinstance(batch, list):
+        for item in batch:
+            _set_async_output_save_hint_for_batch(item, allow_async)
+
+
+def _generation_req_count_in_batch(batch: Any) -> int:
+    if isinstance(batch, Req):
+        return 1
+    if isinstance(batch, list):
+        return sum(_generation_req_count_in_batch(item) for item in batch)
+    return 0
 
 
 async def run_zeromq_broker(server_args: ServerArgs):
@@ -142,6 +163,7 @@ class AsyncSchedulerClient:
     def __init__(self):
         self.context = None
         self.server_args = None
+        self._active_forward_batches: list[Any] = []
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -152,7 +174,19 @@ class AsyncSchedulerClient:
 
         self.server_args = server_args
         self.context = zmq.asyncio.Context()
+        self._active_forward_batches = []
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
+
+    def _mark_active_forward_batches_for_async_output_save(self) -> None:
+        active_generation_reqs = sum(
+            _generation_req_count_in_batch(batch)
+            for batch in self._active_forward_batches
+        )
+        if active_generation_reqs <= 1:
+            return
+
+        for batch in self._active_forward_batches:
+            _set_async_output_save_hint_for_batch(batch, True)
 
     async def forward(self, batch: Any) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
@@ -161,16 +195,20 @@ class AsyncSchedulerClient:
                 "AsyncSchedulerClient is not initialized. Call initialize() first."
             )
 
-        # Create a temporary REQ socket for this request to allow concurrency
-        socket = self.context.socket(zmq.REQ)
-        socket.setsockopt(zmq.LINGER, 0)
-        # 100 minute timeout
-        socket.setsockopt(zmq.RCVTIMEO, 6000000)
-
-        endpoint = self.server_args.scheduler_endpoint
-        socket.connect(endpoint)
-
+        self._active_forward_batches.append(batch)
+        socket = None
         try:
+            self._mark_active_forward_batches_for_async_output_save()
+
+            # Create a temporary REQ socket for this request to allow concurrency
+            socket = self.context.socket(zmq.REQ)
+            socket.setsockopt(zmq.LINGER, 0)
+            # 100 minute timeout
+            socket.setsockopt(zmq.RCVTIMEO, 6000000)
+
+            endpoint = self.server_args.scheduler_endpoint
+            socket.connect(endpoint)
+
             await socket.send(pickle.dumps(batch))
             payload = await socket.recv()
             output_batch = pickle.loads(payload)
@@ -180,7 +218,13 @@ class AsyncSchedulerClient:
             logger.error("Timeout waiting for response from scheduler.")
             raise TimeoutError("Scheduler did not respond in time.")
         finally:
-            socket.close()
+            if socket is not None:
+                socket.close()
+            self._active_forward_batches = [
+                active_batch
+                for active_batch in self._active_forward_batches
+                if active_batch is not batch
+            ]
 
     async def ping(self) -> bool:
         """
@@ -211,6 +255,7 @@ class AsyncSchedulerClient:
         if self.context:
             self.context.term()
             self.context = None
+        self._active_forward_batches = []
 
 
 # Singleton instances for easy access

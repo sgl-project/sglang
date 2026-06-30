@@ -582,7 +582,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _can_async_save_output_paths(self, req: Req) -> bool:
         return (
-            self.server_args.disagg_role == RoleType.MONOLITHIC
+            req.allow_async_output_save
+            and self.server_args.disagg_role == RoleType.MONOLITHIC
             and not current_platform.is_cpu()
             and req.save_output
             and req.return_file_paths_only
@@ -692,7 +693,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_paths = [
             build_output_path(idx) for idx in range(len(output_batch.output))
         ]
-        if self._can_async_save_output_paths(req):
+        if req.allow_async_output_save and self._can_async_save_output_paths(req):
             self._submit_async_output_save(output_batch, req, output_paths)
             return
 
@@ -728,7 +729,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         first_req = reqs[0]
         output_paths = [req.output_file_path(1, 0) for req in reqs]
-        if self._can_async_save_output_paths(first_req):
+        if first_req.allow_async_output_save and self._can_async_save_output_paths(
+            first_req
+        ):
             self._submit_async_output_save(output_batch, first_req, output_paths)
             return
 

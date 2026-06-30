@@ -236,6 +236,41 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return reqs[0]
         return reqs
 
+    @staticmethod
+    def _set_async_output_save_hint(req_or_group: Any, allow_async: bool) -> None:
+        if isinstance(req_or_group, Req):
+            req_or_group.allow_async_output_save = allow_async
+            return
+
+        if isinstance(req_or_group, list):
+            for req in req_or_group:
+                if isinstance(req, Req):
+                    req.allow_async_output_save = allow_async
+
+    @staticmethod
+    def _generation_req_count(req_or_group: Any) -> int:
+        if isinstance(req_or_group, Req):
+            return 1
+        if isinstance(req_or_group, list):
+            return sum(1 for req in req_or_group if isinstance(req, Req))
+        return 0
+
+    def _enable_async_output_save_for_queued_burst(self) -> None:
+        if not self.waiting_queue:
+            return
+        if len(self.waiting_queue) == 1 and isinstance(self.waiting_queue[0][1], Req):
+            return
+
+        generation_req_count = sum(
+            self._generation_req_count(req_or_group)
+            for _, req_or_group, _ in self.waiting_queue
+        )
+        if generation_req_count <= 1:
+            return
+
+        for _, req_or_group, _ in self.waiting_queue:
+            self._set_async_output_save_hint(req_or_group, True)
+
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
         if isinstance(req_or_group, list):
             if not all(isinstance(req, Req) for req in req_or_group):
@@ -1035,6 +1070,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
                 )
+                if len(self.waiting_queue) > 1 or any(
+                    isinstance(req, list) for _, req in new_reqs
+                ):
+                    self._enable_async_output_save_for_queued_burst()
                 # Reset error count on success
                 self._consecutive_error_count = 0
             except Exception as e:
