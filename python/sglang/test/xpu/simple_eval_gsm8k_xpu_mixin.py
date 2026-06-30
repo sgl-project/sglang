@@ -5,10 +5,6 @@ Mirrors the AMD/NVIDIA nightly flow (``test_gsm8k_eval_amd.py`` /
 flags, then call ``sglang.test.run_eval`` with ``eval_name="gsm8k"`` so
 the same ``simple_eval_gsm8k.GSM8KEval`` evaluator scores every backend.
 
-Replaces the deprecated SGL-frontend ``few_shot_gsm8k`` path used by
-``GSM8KXPUMixin`` (which had a data-leakage bug and a regex that dropped
-signs and decimals).
-
 Subclasses set ``model``, ``tp_size``, ``accuracy``, and may override
 ``other_args`` / ``env`` / ``num_examples`` / ``num_threads``.
 """
