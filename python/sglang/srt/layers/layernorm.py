@@ -383,9 +383,9 @@ def _forward_with_allreduce_fusion_quant_per_token(
 
     This is the per-token counterpart of
     ``_forward_with_allreduce_fusion_quant_per_group``. It targets FP8 GEMM
-    consumers that expect per-token (1xK) activation scales — e.g. attention
+    consumers that expect per-token (1xK) activation scales - e.g. attention
     ``qkv_proj`` / GDN ``in_proj_qkvz`` prepared with
-    ``SGLANG_USE_AITER_FP8_PER_TOKEN`` — for which the per-1x128 group scales
+    ``SGLANG_USE_AITER_FP8_PER_TOKEN`` - for which the per-1x128 group scales
     produced by the per-group path would be the wrong layout.
 
     Returns one of:

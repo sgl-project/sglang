@@ -101,7 +101,7 @@ def _standalone_quant(normed: torch.Tensor, quant: str):
     """Reference standalone quant used by the split-3k / fused-2k baselines.
 
     Returns ``(q, scale)`` or ``None`` when the variant's standalone quant is not
-    available in this aiter build (only happens for mxfp4 on older builds — the
+    available in this aiter build (only happens for mxfp4 on older builds - the
     fused mxfp4 kernel and its bf16-domain correctness check still run)."""
     import aiter
 
@@ -162,6 +162,7 @@ def _all_true_across_ranks(val: bool, device: torch.device) -> bool:
     return bool(int(t.item()))
 
 
+@torch.no_grad()
 def _measure_us(
     fn, warmup: int, iters: int, repeats: int, device: torch.device
 ) -> float:
@@ -349,7 +350,9 @@ def bench_shape(
     # --- Split 3-kernel baseline (AR -> RMSNorm -> standalone quant) ---
     # The standalone quant may be unavailable for mxfp4 on older aiter builds;
     # the fused kernel + bf16-domain correctness still run in that case.
-    split_available = _split_3_reference(x, residual, weight, eps, group_size, quant) is not None
+    split_available = (
+        _split_3_reference(x, residual, weight, eps, group_size, quant) is not None
+    )
     split_us: Optional[float] = None
     if split_available:
         split_fn = _graphed(
@@ -359,16 +362,19 @@ def bench_shape(
 
     # --- Fused AR+RMSNorm + separate quant (2 kernels) ---
     fused2_available = (
-        _fused_ar_rms_then_quant(x, residual, weight, eps, group_size, quant) is not None
+        _fused_ar_rms_then_quant(x, residual, weight, eps, group_size, quant)
+        is not None
     )
     fused2_us: Optional[float] = None
     if fused2_available:
         fused2_fn = _graphed(
-            lambda: _fused_ar_rms_then_quant(x, residual, weight, eps, group_size, quant)
+            lambda: _fused_ar_rms_then_quant(
+                x, residual, weight, eps, group_size, quant
+            )
         )
         fused2_us = _measure_us(fused2_fn, warmup, iters, repeats, device)
 
-    # --- Fully fused, quant-pair only (1 kernel) — std-attention path ---
+    # --- Fully fused, quant-pair only (1 kernel) - std-attention path ---
     fused1_available = (
         _fully_fused(x, residual, weight, eps, group_size, quant) is not None
     )
@@ -379,7 +385,7 @@ def bench_shape(
         )
         fused1_us = _measure_us(fused1_fn, warmup, iters, repeats, device)
 
-    # --- Fully fused + bf16 sidecar (1 kernel) — GDN keep_bf16=True path ---
+    # --- Fully fused + bf16 sidecar (1 kernel) - GDN keep_bf16=True path ---
     probe1b = _fully_fused_with_bf16(x, residual, weight, eps, group_size, quant)
     fused1bf16_available = (
         probe1b is not None and isinstance(probe1b, tuple) and len(probe1b) == 4
@@ -407,7 +413,9 @@ def bench_shape(
             denom = ref_bf16.float().abs().max().item() + 1e-6
             rel = diff / denom
             correctness_bf16 = (
-                f"PASS(bf16_rel={rel:.4f})" if rel < 0.02 else f"FAIL(bf16_rel={rel:.4f})"
+                f"PASS(bf16_rel={rel:.4f})"
+                if rel < 0.02
+                else f"FAIL(bf16_rel={rel:.4f})"
             )
         if fused1_available:
             res1 = _fully_fused(x, residual, weight, eps, group_size, quant)

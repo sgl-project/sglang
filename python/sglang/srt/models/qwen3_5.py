@@ -812,7 +812,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # GDN has two parallel input projections. We opt into the fused
         # AR+RMSNorm+MXFP4 quant epilogue only when ``in_proj_qkvz`` is MXFP4
         # (it dominates the bytes). The bf16 sidecar is requested *only* when
-        # ``in_proj_ba`` is NOT MXFP4 — otherwise we'd write the sidecar to
+        # ``in_proj_ba`` is NOT MXFP4 - otherwise we'd write the sidecar to
         # HBM just to have ``in_proj_ba`` re-quantize it back, which is a
         # net regression. Some MXFP4 checkpoints quantize ``in_proj_ba``
         # too; in that case we feed the same ``(fp4, scale)`` pair to both
