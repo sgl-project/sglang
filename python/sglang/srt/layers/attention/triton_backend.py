@@ -157,34 +157,13 @@ class TritonAttnBackend(AttentionBackend):
         # When the shared KV pool is enabled, req_to_token holds *virtual*
         # slot ids; the attention kernels need *physical* slot ids. This is the
         # virtual->physical translation hook (None — a no-op — otherwise).
+        # Used eagerly in `init_forward_metadata` (eager path) AND
+        # `init_forward_metadata_out_graph` (cuda-graph capture + replay-prep),
+        # so the captured graph contains ZERO translate nodes. `is not None`
+        # doubles as the shared-pool gate (Invariant 2: a non-shared graph
+        # records no translate work).
         self._translate_kv_loc = getattr(
             self.token_to_kv_pool_allocator, "translate_kv_loc", None
-        )
-        # GPU-bounded, capture-friendly in-place
-        # translate variants. Present only on the shared-pool composites, so
-        # `_translate_kv_loc_bounded is not None` doubles as the Invariant-2
-        # capture gate (no translate node recorded for non-shared graphs).
-        self._translate_kv_loc_bounded = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc_bounded", None
-        )
-        self._translate_loc_from_full_to_swa_bounded = getattr(
-            self.token_to_kv_pool_allocator,
-            "translate_loc_from_full_to_swa_bounded",
-            None,
-        )
-        # Removed the eager full-attn translate from the cuda-graph
-        # capture/replay path unconditionally; the captured hook
-        # (`init_forward_metadata_in_graph`, gated on `_translate_kv_loc_bounded`)
-        # must re-add it whenever a translate is needed. So the two gates MUST
-        # agree — otherwise the cuda-graph path would feed VIRTUAL ids to
-        # attention. Guaranteed by construction (both methods live on the same
-        # shared-pool composites); asserted here to catch future divergence.
-        assert (self._translate_kv_loc is None) == (
-            self._translate_kv_loc_bounded is None
-        ), (
-            "shared-pool allocator must expose both `translate_kv_loc` and "
-            "`translate_kv_loc_bounded` (or neither); the cuda-graph read-path "
-            "capture depends on this invariant."
         )
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
@@ -472,22 +451,18 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
             )
-            # The full-attn virtual->physical translate is NOT done eagerly here.
-            # `_fill_kv_indptr_and_indices` wrote VIRTUAL ids into
-            # `self.cuda_graph_kv_indices`; the captured decode graph translates
-            # them in place at replay via `init_forward_metadata_in_graph` (called from
-            # `cuda_graph_runner.run_once`), reading the LIVE v2p and bounded
-            # GPU-side by `kv_indptr[bs]` (no `.item()` sync). Doing it eagerly here
-            # would read a stale v2p at replay-prep time and double-translate.
-            # No-op for non-shared pools (the graph then has zero translate nodes).
+            # Shared pool: `_fill_kv_indptr_and_indices` wrote VIRTUAL ids into
+            # `self.cuda_graph_kv_indices`. They are translated to PHYSICAL in
+            # `init_forward_metadata_out_graph` (eager, at replay-prep, reading
+            # the LIVE post-compaction v2p), so the captured graph carries zero
+            # translate nodes. No-op for non-shared pools.
             num_kv_splits_lens = seq_lens
         window_kv_indptr = self.window_kv_indptr
         window_kv_lens = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            # Shared pool: leave the window VIRTUAL — its full->swa translate is
-            # likewise captured in-graph (`init_forward_metadata_in_graph`). The
-            # bounded swa variant existing is the shared-pool discriminator;
-            # baseline SWA (no bounded variant) keeps the eager window translate.
+            # Shared pool: leave the window VIRTUAL too — translated alongside the
+            # full kv_indices in `init_forward_metadata_out_graph`. Baseline SWA
+            # (no shared translate) keeps the eager build-time window translate.
             window_kv_indptr, _, window_kv_lens, _ = update_sliding_window_buffer(
                 self.window_kv_indptr,
                 self.req_to_token,
@@ -497,9 +472,7 @@ class TritonAttnBackend(AttentionBackend):
                 bs,
                 token_to_kv_pool=self.token_to_kv_pool,
                 window_kv_indices=self.cuda_graph_window_kv_indices,
-                skip_full_to_swa_translation=(
-                    self._translate_loc_from_full_to_swa_bounded is not None
-                ),
+                skip_full_to_swa_translation=(self._translate_kv_loc is not None),
             )
         return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
 
@@ -662,6 +635,9 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
+            # Shared pool: eager v2p translate of the read/write loc buffers
+            # (full kv_indices, SWA window, out_cache_loc) — see method docstring.
+            self._translate_cuda_graph_shared_pool_locs(forward_batch, bs)
             swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
                 bs, forward_mode, spec_info, swa_out_cache_loc
@@ -674,7 +650,8 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
-            # Metadata view is reused from capture; just refill the buffer.
+            # Metadata view is reused from capture; just refill the buffers.
+            self._translate_cuda_graph_shared_pool_locs(forward_batch, bs)
             self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
 
     def _fill_cuda_graph_swa_out_cache_loc(
@@ -697,6 +674,58 @@ class TritonAttnBackend(AttentionBackend):
             self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
         )
         return self.cuda_graph_swa_out_cache_loc[:n]
+
+    def _translate_cuda_graph_shared_pool_locs(
+        self, forward_batch: ForwardBatch, bs: int
+    ) -> None:
+        """Shared KV pool: eager virtual->physical translate of the cuda-graph
+        read + write LOC buffers, run in `init_forward_metadata_out_graph`
+        (capture AND replay-prep, i.e. BEFORE ``graph.replay()``), reading the
+        LIVE post-compaction v2p. The captured graph then carries ZERO translate
+        nodes (Invariant 2) and reads already-physical locs — mirroring
+        `_fill_cuda_graph_swa_out_cache_loc`. No-op for non-shared pools.
+
+        The build (`_update_*_kv_buffers`) left these buffers VIRTUAL:
+        - full-attention read: ``cuda_graph_kv_indices[:kv_indptr[bs]]``
+        - SWA window read: ``cuda_graph_window_kv_indices[:window_kv_indptr[bs]]``
+        - full-attention write: ``out_cache_loc`` -> the backend-owned
+          ``cuda_graph_out_cache_loc_full_physical`` buffer, surfaced on
+          ``forward_batch.out_cache_loc_full_physical`` (-> ``KVWriteLoc.full_loc``).
+
+        Eager ``.item()`` bounds are fine here (runs out-of-graph), which is why
+        no GPU-bounded in-graph translate variant is needed.
+        """
+        if self._translate_kv_loc is None:
+            return
+        # Full-attention read path.
+        n_kv = int(self.kv_indptr[bs].item())
+        if n_kv > 0:
+            self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
+                self.cuda_graph_kv_indices[:n_kv]
+            )
+        # SWA window read path (hybrid-SWA shared pools only).
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            n_win = int(self.window_kv_indptr[bs].item())
+            if n_win > 0:
+                self.cuda_graph_window_kv_indices[:n_win] = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        self.cuda_graph_window_kv_indices[:n_win]
+                    )
+                )
+        # Full-attention write path.
+        out_cache_loc = forward_batch.out_cache_loc
+        if (
+            out_cache_loc is not None
+            and out_cache_loc.shape[0]
+            <= self.cuda_graph_out_cache_loc_full_physical.shape[0]
+        ):
+            n = out_cache_loc.shape[0]
+            self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
+                self._translate_kv_loc(out_cache_loc)
+            )
+            forward_batch.out_cache_loc_full_physical = (
+                self.cuda_graph_out_cache_loc_full_physical[:n]
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -1038,6 +1067,17 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self._translate_kv_loc is not None:
+            # Shared pool: full-attention write-target buffer, refilled at replay
+            # from out_cache_loc by `_translate_cuda_graph_shared_pool_locs`
+            # (-> forward_batch.out_cache_loc_full_physical -> KVWriteLoc.full_loc).
+            # Backend-owned + capture-stable, mirroring cuda_graph_swa_out_cache_loc.
+            self.cuda_graph_out_cache_loc_full_physical = torch.zeros(
+                (max_num_tokens,),
+                dtype=torch.int64,
+                device=self.device,
+            )
+
     def _build_cuda_graph_forward_metadata(
         self,
         bs: int,
@@ -1127,60 +1167,6 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        """Shared-pool read-path v2p translate, recorded as cuda-graph node(s)
-        at the FRONT of the captured decode graph.
-
-        This is the Triton override of the upstream #27091
-        ``AttentionBackend.init_forward_metadata_in_graph`` hook (base no-op),
-        run inside ``with graph.capture():`` from ``cuda_graph_runner.run_once``
-        before the model forward reads the metadata; the recorded GPU ops
-        re-execute at every ``graph.replay()``. It obeys the hook's lint
-        contract (no ``.item()`` / ``.cpu()`` / dynamic-shape ops).
-
-        The eager replay-prep build wrote VIRTUAL ids into
-        ``cuda_graph_kv_indices``; this rewrites them in place to PHYSICAL ids,
-        reading the live ``virtual_to_physical`` table at replay (late-read
-        invariant) and bounding the work GPU-side by ``kv_indptr[bs]`` (no
-        ``.item()`` sync). No-op for non-shared pools — Invariant 2: a baseline
-        decode graph then contains zero translate nodes.
-        """
-        bs = forward_batch.batch_size
-        if self._translate_kv_loc_bounded is None:
-            return  # non-shared → translate-free graph (Invariant 2)
-        # Full-attention WRITE path: translate the virtual `out_cache_loc` graph
-        # buffer -> physical IN PLACE into the capture-stable
-        # `out_cache_loc_full_physical` buffer (the runner points
-        # `forward_batch.out_cache_loc_full_physical` at it; `KVWriteLoc.full_loc`
-        # reads it). Recorded here so replay re-runs it on the LIVE v2p — the
-        # write-path companion to the read-path translate below, mirroring the
-        # eager `init_forward_metadata`. The runner still owns the buffer; only
-        # the translate lives in the backend.
-        if forward_batch.out_cache_loc_full_physical is not None:
-            self._translate_kv_loc(
-                forward_batch.out_cache_loc,
-                out=forward_batch.out_cache_loc_full_physical,
-            )
-        # Full-attention read path: cuda_graph_kv_indices[0:kv_indptr[bs]].
-        # Translate VIRTUAL -> PHYSICAL in place at replay (reads the LIVE v2p).
-        self._translate_kv_loc_bounded(self.cuda_graph_kv_indices, self.kv_indptr, bs)
-        # SWA window read path (Phase 2c): window_kv_indices[0:window_kv_indptr[bs]],
-        # virtual full-token -> swa-physical, in place, against the swa sub-pool's
-        # v2p. Only for hybrid-SWA shared pools (the bounded swa variant exists).
-        # The eager translate in `update_sliding_window_buffer_cuda_graph` is
-        # skipped for the shared pool (it left these VIRTUAL); this rewrites them
-        # at replay, GPU-bounded by window_kv_indptr[bs] (no `.item()`).
-        if (
-            self._translate_loc_from_full_to_swa_bounded is not None
-            and self.sliding_window_size is not None
-            and self.sliding_window_size > 0
-        ):
-            self._translate_loc_from_full_to_swa_bounded(
-                self.cuda_graph_window_kv_indices,
-                self.window_kv_indptr,
-                bs,
-            )
 
     def _apply_cuda_graph_metadata(
         self,

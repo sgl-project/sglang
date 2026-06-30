@@ -329,11 +329,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
-            # When shared pool is enabled, allocate a capture-stable int64
-            # buffer for `out_cache_loc_full_physical`; capture points the
-            # forward_batch's `out_cache_loc_full_physical` at it so it flows
-            # into `KVWriteLoc.full_loc` (see `capture_one_batch_size` below).
-            enable_shared_kv_pool=model_runner.enable_shared_kv_pool,
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -794,32 +789,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Graph-recordable metadata prep — the upstream #27091
-                # `init_forward_metadata_in_graph` hook. For the shared pool,
-                # TritonAttnBackend.init_forward_metadata_in_graph records BOTH
-                # the full-attention WRITE-path translate (virtual `out_cache_loc`
-                # -> the capture-stable `out_cache_loc_full_physical` buffer the
-                # runner points `forward_batch.out_cache_loc_full_physical` at,
-                # consumed via `KVWriteLoc.full_loc`) AND the kv_indices READ-path
-                # translate (in place, GPU-bounded by kv_indptr[bs], no .item())
-                # at the front of the graph; base no-op otherwise (Invariant 2: a
-                # baseline graph has zero translate nodes). Must run inside the
-                # capture block: warmup mutations here are undone by
-                # on_after_cuda_graph_warmup so capture starts clean. (The SWA
-                # write loc rides the backend `swa_out_cache_loc` rail.)
+                # Graph-recordable metadata-prep hook (upstream #27091). The
+                # shared pool records ZERO translate nodes here: its full +
+                # SWA-window read translates and the out_cache_loc write translate
+                # all run EAGERLY in `init_forward_metadata_out_graph` (replay-prep,
+                # before graph.replay(), reading the LIVE v2p), so the captured
+                # graph reads already-physical locs. This is a base no-op for the
+                # triton backend; other backends (e.g. multi-step draft) may still
+                # override it.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
 
                 # NB: the old warmup `token_to_kv_pool.invalidate_loc_cache()`
                 # call is intentionally gone. It targeted upstream SWAKVPool's
                 # per-batch loc-translation cache (added by #25824), which
                 # upstream #27091 REMOVED (06-03, "drop pool caches" — unified
-                # the full->SWA translate into init_forward_metadata). The
-                # phase-4 base (06-08) includes #27091, so the method no longer
-                # exists on baseline SWAKVPool or (by inheritance) the shared
-                # SWA pool. The shared pool's capture instead records the
-                # write + read translates via `init_forward_metadata_in_graph`
-                # above, so no cache invalidation is needed. Matches rebase-orig
-                # (which dropped this call too).
+                # the full->SWA translate into the metadata init). The phase-4
+                # base (06-08) includes #27091, so the method no longer exists on
+                # baseline SWAKVPool or (by inheritance) the shared SWA pool. The
+                # shared pool translates its locs in `init_forward_metadata_out_graph`
+                # instead, so no cache invalidation is needed.
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -876,17 +864,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            # Full-physical write loc lives in the attention metadata: point the
-            # capture forward_batch's `out_cache_loc_full_physical` at the
-            # capture-stable graph buffer (filled IN-graph by the backend's
-            # `init_forward_metadata_in_graph`) so it flows into
-            # `KVWriteLoc.full_loc` and the captured `set_kv_buffer` reads it —
-            # no pool-side pin. (The SWA write loc rides the backend
+            # Full-physical write loc lives in the attention metadata and is
+            # filled by the backend's `init_forward_metadata_out_graph` (which
+            # points `forward_batch.out_cache_loc_full_physical` at its own
+            # capture-stable buffer -> `KVWriteLoc.full_loc`), so the runner does
+            # NOT wire a buffer here. (The SWA write loc rides the backend
             # `swa_out_cache_loc` rail, consumed in `SharedSWAKVPool.set_kv_buffer`.)
-            if self.buffers.out_cache_loc_full_physical is not None:
-                forward_batch.out_cache_loc_full_physical = (
-                    self.buffers.out_cache_loc_full_physical[:num_tokens]
-                )
 
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)

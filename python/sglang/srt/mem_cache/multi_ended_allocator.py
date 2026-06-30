@@ -54,10 +54,7 @@ from sglang.srt.mem_cache.allocator.paged import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.shared_kv_pool import SharedKVPool
-from sglang.srt.mem_cache.triton_ops.virtual_slot import (
-    alloc_bind_inplace,
-    translate_kv_indices_inplace,
-)
+from sglang.srt.mem_cache.triton_ops.virtual_slot import alloc_bind_inplace
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -2752,33 +2749,6 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
 
-    def translate_kv_loc_bounded(
-        self,
-        kv_indices: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        bs: int,
-        *,
-        src: Optional[torch.Tensor] = None,
-    ) -> None:
-        """GPU-bounded virtual->physical translate of
-        ``kv_indices[0:kv_indptr[bs]]``, for CAPTURE into the decode cuda-graph.
-
-        Unlike ``translate_kv_loc`` (which translates a Python-sliced prefix
-        via `.item()` and allocates a transient), this reads the valid extent
-        on-device from ``kv_indptr[bs]`` — no `.item()` sync, no transient,
-        capturable. Reads the full sub-pool's live ``virtual_to_physical`` at
-        replay (late-read invariant).
-
-        ``src`` (default None -> ``kv_indices``, legacy in-place). When the
-        out-of-place fix is on, ``src`` is the dedicated VIRTUAL buffer and
-        ``kv_indices`` is the PHYSICAL graph buffer the attention reads
-        (idempotent under replay: the src is never overwritten here).
-        """
-        fa = self.full_attn_allocator
-        translate_kv_indices_inplace(
-            kv_indices, fa.virtual_to_physical, kv_indptr, bs, fa.page_size, src=src
-        )
-
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
 
@@ -3286,55 +3256,6 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             out.copy_(result)
             return out
         return result
-
-    def translate_kv_loc_bounded(
-        self,
-        kv_indices: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        bs: int,
-        *,
-        src: Optional[torch.Tensor] = None,
-    ) -> None:
-        """GPU-bounded virtual->full-physical translate of the full-attention
-        ``kv_indices[0:kv_indptr[bs]]``, for CAPTURE into the decode cuda-graph.
-        See ``SharedMambaTokenToKVPoolAllocator.translate_kv_loc_bounded``.
-
-        ``src`` (default None -> in place); when the out-of-place fix is on it is
-        the dedicated VIRTUAL source and ``kv_indices`` is the PHYSICAL graph
-        buffer the attention reads (idempotent under replay).
-        """
-        fa = self.full_attn_allocator
-        translate_kv_indices_inplace(
-            kv_indices, fa.virtual_to_physical, kv_indptr, bs, fa.page_size, src=src
-        )
-
-    def translate_loc_from_full_to_swa_bounded(
-        self,
-        window_kv_indices: torch.Tensor,
-        window_kv_indptr: torch.Tensor,
-        bs: int,
-        *,
-        src: Optional[torch.Tensor] = None,
-    ) -> None:
-        """In-place, GPU-bounded virtual->swa-physical translate of
-        ``window_kv_indices[0:window_kv_indptr[bs]]``,
-        for CAPTURE into the decode cuda-graph.
-
-        Writes int64 directly into the int64 ``cuda_graph_window_kv_indices``
-        buffer (the eager `translate_loc_from_full_to_swa` returned int32 only
-        to assign into that int64 buffer; the swa attention kernel reads it as
-        int64 either way). Reads the swa sub-pool's live ``virtual_to_physical``
-        at replay (late-read invariant). Tombstone-clamped in the kernel.
-        """
-        sa = self.swa_attn_allocator
-        translate_kv_indices_inplace(
-            window_kv_indices,
-            sa.virtual_to_physical,
-            window_kv_indptr,
-            bs,
-            sa.page_size,
-            src=src,
-        )
 
     # -- alloc --
 
