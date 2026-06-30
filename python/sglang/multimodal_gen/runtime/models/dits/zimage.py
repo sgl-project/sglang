@@ -1053,7 +1053,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         if all(length == target_len for length in lengths):
             return None, None
         positions = torch.arange(target_len, device=device).unsqueeze(0)
-        length_tensor = torch.tensor(lengths, device=device).unsqueeze(1)
+        length_tensor = torch.as_tensor(lengths, device=device).unsqueeze(1)
         mask = positions < length_tensor
         return mask, build_varlen_mask_meta(mask)
 
@@ -1072,8 +1072,8 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         image_pos = torch.arange(image_target_len, device=device).unsqueeze(0)
         cap_pos = torch.arange(cap_target_len, device=device).unsqueeze(0)
-        image_len = torch.tensor(image_lengths, device=device).unsqueeze(1)
-        cap_len = torch.tensor(cap_lengths, device=device).unsqueeze(1)
+        image_len = torch.as_tensor(image_lengths, device=device).unsqueeze(1)
+        cap_len = torch.as_tensor(cap_lengths, device=device).unsqueeze(1)
         mask = torch.cat([image_pos < image_len, cap_pos < cap_len], dim=1)
         return mask, build_varlen_mask_meta(mask)
 
