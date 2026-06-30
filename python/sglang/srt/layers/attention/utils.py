@@ -43,7 +43,6 @@ from sglang.srt.layers.attention.triton_ops.pad import (
 from sglang.srt.layers.attention.triton_ops.rope_cache import (
     fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -135,7 +134,7 @@ def mla_quantize_and_rope_for_fp8(
     q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
 
     if k_pos_ids is not None:
-        return _mla_quantize_and_rope_for_fp8_torch(
+        return _mla_quantize_and_rope_for_fp8_triton(
             q_nope,
             q_rope,
             k_nope,
@@ -199,7 +198,216 @@ def mla_quantize_and_rope_for_fp8(
     return q_out, k_nope_out, k_rope_out
 
 
-def _mla_quantize_and_rope_for_fp8_torch(
+@triton.jit
+def _copy_fp8_strided_kernel(
+    src,
+    dst,
+    n_elements,
+    src_stride_t: tl.constexpr,
+    src_stride_h: tl.constexpr,
+    src_stride_d: tl.constexpr,
+    dst_stride_t: tl.constexpr,
+    dst_stride_h: tl.constexpr,
+    dst_stride_d: tl.constexpr,
+    dst_dim_offset: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    dim = offsets % HEAD_DIM
+    head = (offsets // HEAD_DIM) % NUM_HEADS
+    token = offsets // (HEAD_DIM * NUM_HEADS)
+
+    values = tl.load(
+        src + token * src_stride_t + head * src_stride_h + dim * src_stride_d,
+        mask=mask,
+    )
+    tl.store(
+        dst
+        + token * dst_stride_t
+        + head * dst_stride_h
+        + (dst_dim_offset + dim) * dst_stride_d,
+        values,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _rope_fp8_strided_kernel(
+    src,
+    dst,
+    pos_ids,
+    cos_sin_cache,
+    n_elements,
+    src_stride_t: tl.constexpr,
+    src_stride_h: tl.constexpr,
+    src_stride_d: tl.constexpr,
+    dst_stride_t: tl.constexpr,
+    dst_stride_h: tl.constexpr,
+    dst_stride_d: tl.constexpr,
+    dst_dim_offset: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HALF_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    rot_dim = offsets % HALF_DIM
+    head = (offsets // HALF_DIM) % NUM_HEADS
+    token = offsets // (HALF_DIM * NUM_HEADS)
+
+    pos = tl.load(pos_ids + token, mask=mask, other=0).to(tl.int64)
+    cos = tl.load(cos_sin_cache + pos * ROPE_DIM + rot_dim, mask=mask, other=1.0)
+    sin = tl.load(
+        cos_sin_cache + pos * ROPE_DIM + HALF_DIM + rot_dim,
+        mask=mask,
+        other=0.0,
+    )
+
+    if IS_NEOX:
+        dim_0 = rot_dim
+        dim_1 = rot_dim + HALF_DIM
+    else:
+        dim_0 = rot_dim * 2
+        dim_1 = dim_0 + 1
+
+    src_base = src + token * src_stride_t + head * src_stride_h
+    x_0 = tl.load(src_base + dim_0 * src_stride_d, mask=mask).to(tl.bfloat16)
+    x_1 = tl.load(src_base + dim_1 * src_stride_d, mask=mask).to(tl.bfloat16)
+    cos = cos.to(tl.bfloat16)
+    sin = sin.to(tl.bfloat16)
+
+    out_0 = ((x_0 * cos).to(tl.bfloat16) - (x_1 * sin).to(tl.bfloat16)).to(tl.bfloat16)
+    out_1 = ((x_1 * cos).to(tl.bfloat16) + (x_0 * sin).to(tl.bfloat16)).to(tl.bfloat16)
+
+    dst_base = (
+        dst + token * dst_stride_t + head * dst_stride_h + dst_dim_offset * dst_stride_d
+    )
+    tl.store(dst_base + dim_0 * dst_stride_d, out_0, mask=mask)
+    tl.store(dst_base + dim_1 * dst_stride_d, out_1, mask=mask)
+
+
+def _get_3d_strides(tensor: torch.Tensor) -> tuple[int, int, int, int, int]:
+    if tensor.dim() == 2:
+        return tensor.shape[0], 1, tensor.stride(0), 0, tensor.stride(1)
+    if tensor.dim() == 3:
+        return tensor.shape[0], tensor.shape[1], *tensor.stride()
+    raise ValueError(f"Expected a 2D or 3D tensor, got shape {tuple(tensor.shape)}")
+
+
+def _copy_fp8_strided(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    head_dim: int,
+    dst_dim_offset: int = 0,
+) -> None:
+    num_tokens, num_heads, src_stride_t, src_stride_h, src_stride_d = _get_3d_strides(
+        src
+    )
+    _, dst_num_heads, dst_stride_t, dst_stride_h, dst_stride_d = _get_3d_strides(dst)
+    if dst_num_heads != num_heads:
+        raise ValueError(
+            f"Source and destination head counts must match: {num_heads} vs {dst_num_heads}"
+        )
+    if src.shape[-1] < head_dim or dst.shape[-1] < dst_dim_offset + head_dim:
+        raise ValueError(
+            "FP8 copy dimensions exceed source or destination shape: "
+            f"src={tuple(src.shape)}, dst={tuple(dst.shape)}, head_dim={head_dim}, "
+            f"dst_dim_offset={dst_dim_offset}"
+        )
+
+    n_elements = num_tokens * num_heads * head_dim
+    if n_elements == 0:
+        return
+    block_size = 1024
+    _copy_fp8_strided_kernel[(triton.cdiv(n_elements, block_size),)](
+        src,
+        dst,
+        n_elements,
+        src_stride_t,
+        src_stride_h,
+        src_stride_d,
+        dst_stride_t,
+        dst_stride_h,
+        dst_stride_d,
+        dst_dim_offset,
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=block_size,
+    )
+
+
+def _rope_fp8_strided(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    qk_rope_head_dim: int,
+    dst_dim_offset: int = 0,
+) -> None:
+    pos_ids = pos_ids.flatten()
+    if pos_ids.device != src.device:
+        pos_ids = pos_ids.to(device=src.device)
+    if pos_ids.shape[0] != src.shape[0]:
+        raise ValueError(
+            "RoPE position count must match token count, got "
+            f"{pos_ids.shape[0]} positions for {src.shape[0]} tokens"
+        )
+    if qk_rope_head_dim % 2 != 0:
+        raise ValueError(f"RoPE dimension must be even, got {qk_rope_head_dim}")
+
+    num_tokens, num_heads, src_stride_t, src_stride_h, src_stride_d = _get_3d_strides(
+        src
+    )
+    _, dst_num_heads, dst_stride_t, dst_stride_h, dst_stride_d = _get_3d_strides(dst)
+    if dst_num_heads != num_heads:
+        raise ValueError(
+            f"Source and destination head counts must match: {num_heads} vs {dst_num_heads}"
+        )
+    if (
+        src.shape[-1] < qk_rope_head_dim
+        or dst.shape[-1] < dst_dim_offset + qk_rope_head_dim
+    ):
+        raise ValueError(
+            "RoPE dimensions exceed source or destination shape: "
+            f"src={tuple(src.shape)}, dst={tuple(dst.shape)}, "
+            f"qk_rope_head_dim={qk_rope_head_dim}, dst_dim_offset={dst_dim_offset}"
+        )
+
+    half_dim = qk_rope_head_dim // 2
+    n_elements = num_tokens * num_heads * half_dim
+    if n_elements == 0:
+        return
+    block_size = 256
+    _rope_fp8_strided_kernel[(triton.cdiv(n_elements, block_size),)](
+        src,
+        dst,
+        pos_ids,
+        cos_sin_cache,
+        n_elements,
+        src_stride_t,
+        src_stride_h,
+        src_stride_d,
+        dst_stride_t,
+        dst_stride_h,
+        dst_stride_d,
+        dst_dim_offset,
+        NUM_HEADS=num_heads,
+        HALF_DIM=half_dim,
+        ROPE_DIM=qk_rope_head_dim,
+        IS_NEOX=is_neox,
+        BLOCK_SIZE=block_size,
+    )
+
+
+def _mla_quantize_and_rope_for_fp8_triton(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     k_nope: torch.Tensor,
@@ -220,36 +428,29 @@ def _mla_quantize_and_rope_for_fp8_torch(
         dtype=attn_dtype,
     )
 
-    q_out[..., :kv_lora_rank] = q_nope.to(attn_dtype)
-    q_out[..., kv_lora_rank:] = _apply_rope_for_fp8_quantize(
-        q_rope, q_pos_ids, cos_sin_cache, is_neox
-    ).to(attn_dtype)
-    k_nope_out = k_nope.to(attn_dtype)
-    k_rope_out = _apply_rope_for_fp8_quantize(
-        k_rope, k_pos_ids, cos_sin_cache, is_neox
-    ).to(attn_dtype)
+    k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
+    k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
+
+    _copy_fp8_strided(q_nope, q_out, kv_lora_rank)
+    _copy_fp8_strided(k_nope, k_nope_out, kv_lora_rank)
+    _rope_fp8_strided(
+        q_rope,
+        q_out,
+        q_pos_ids,
+        cos_sin_cache,
+        is_neox,
+        qk_rope_head_dim,
+        dst_dim_offset=kv_lora_rank,
+    )
+    _rope_fp8_strided(
+        k_rope,
+        k_rope_out,
+        k_pos_ids,
+        cos_sin_cache,
+        is_neox,
+        qk_rope_head_dim,
+    )
     return q_out, k_nope_out, k_rope_out
-
-
-def _apply_rope_for_fp8_quantize(
-    rope: torch.Tensor,
-    pos_ids: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-) -> torch.Tensor:
-    pos_ids = pos_ids.flatten()
-    if pos_ids.shape[0] != rope.shape[0]:
-        raise ValueError(
-            "RoPE position count must match token count, got "
-            f"{pos_ids.shape[0]} positions for {rope.shape[0]} tokens"
-        )
-    if pos_ids.device != cos_sin_cache.device or pos_ids.dtype != torch.int64:
-        pos_ids = pos_ids.to(device=cos_sin_cache.device, dtype=torch.int64)
-    cos_sin = cos_sin_cache.index_select(0, pos_ids)
-    cos, sin = cos_sin.chunk(2, dim=-1)
-    if rope.dim() == 2:
-        return apply_rotary_emb(rope.unsqueeze(1), cos, sin, is_neox).squeeze(1)
-    return apply_rotary_emb(rope, cos, sin, is_neox)
 
 
 def concat_mla_absorb_q_general(q_nope, q_rope):

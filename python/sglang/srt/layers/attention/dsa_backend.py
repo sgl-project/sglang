@@ -52,8 +52,8 @@ from sglang.srt.layers.attention.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
-    compute_position_torch,
 )
+from sglang.srt.model_executor.triton_ops.position import compute_position_triton
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -118,9 +118,16 @@ def _get_cp_gathered_k_pos_ids(
     ):
         return None
 
-    k_pos_ids, _ = compute_position_torch(
+    extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    extend_seq_lens_sum = (
+        sum(extend_seq_lens_cpu)
+        if extend_seq_lens_cpu is not None
+        else int(forward_batch.extend_seq_lens.sum().item())
+    )
+    k_pos_ids, _ = compute_position_triton(
         forward_batch.extend_prefix_lens,
         forward_batch.extend_seq_lens,
+        extend_seq_lens_sum,
     )
     if k_pos_ids.shape[0] != k_len:
         raise ValueError(
@@ -128,6 +135,24 @@ def _get_cp_gathered_k_pos_ids(
             f"{k_len} positions, got {k_pos_ids.shape[0]}"
         )
     return k_pos_ids
+
+
+def _get_cp_local_q_pos_ids(
+    forward_batch: ForwardBatch, q_pos_ids: Optional[torch.Tensor], q_len: int
+) -> Optional[torch.Tensor]:
+    if q_pos_ids is None:
+        q_pos_ids = getattr(forward_batch, "positions", None)
+    if q_pos_ids is None or q_pos_ids.numel() == q_len:
+        return q_pos_ids
+    if can_dsa_prefill_cp_round_robin_split(forward_batch):
+        local_q_pos_ids = dsa_cp_round_robin_split_data(q_pos_ids)
+        if local_q_pos_ids.numel() == q_len:
+            return local_q_pos_ids
+
+    raise ValueError(
+        "Unable to build local Q RoPE positions for FP8 MLA: expected "
+        f"{q_len} positions, got {q_pos_ids.numel()}"
+    )
 
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -2528,8 +2553,9 @@ class DeepseekSparseAttnBackend(
             k_pos_ids = _get_cp_gathered_k_pos_ids(
                 forward_batch, q_rope.shape[0], k_rope.shape[0]
             )
-            if q_pos_ids is None:
-                q_pos_ids = forward_batch.positions
+            q_pos_ids = _get_cp_local_q_pos_ids(
+                forward_batch, q_pos_ids, q_rope.shape[0]
+            )
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,

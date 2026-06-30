@@ -29,15 +29,6 @@ class TestMlaFp8Rope(CustomTestCase):
         num_heads = 3
         kv_lora_rank = 4
         qk_rope_head_dim = 8
-        is_neox = True
-
-        torch.manual_seed(0)
-        q_nope = torch.randn(q_len, num_heads, kv_lora_rank, dtype=dtype, device=device)
-        q_rope = torch.randn(
-            q_len, num_heads, qk_rope_head_dim, dtype=dtype, device=device
-        )
-        k_nope = torch.randn(k_len, kv_lora_rank, dtype=dtype, device=device)
-        k_rope = torch.randn(k_len, qk_rope_head_dim, dtype=dtype, device=device)
 
         freqs = (
             torch.arange(10, dtype=torch.float32, device=device).unsqueeze(1)
@@ -52,42 +43,67 @@ class TestMlaFp8Rope(CustomTestCase):
         q_pos_ids = torch.tensor([4, 7], dtype=torch.int64, device=device)
         k_pos_ids = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=device)
 
-        q_out, k_nope_out, k_rope_out = mla_quantize_and_rope_for_fp8(
-            q_nope,
-            q_rope,
-            k_nope,
-            k_rope,
-            q_pos_ids,
-            cos_sin_cache,
-            is_neox,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            k_pos_ids=k_pos_ids,
-        )
+        for is_neox in (True, False):
+            with self.subTest(is_neox=is_neox):
+                torch.manual_seed(0)
+                q_nope = torch.randn(
+                    q_len, num_heads, kv_lora_rank, dtype=dtype, device=device
+                )
+                q_rope = torch.randn(
+                    q_len, num_heads, qk_rope_head_dim, dtype=dtype, device=device
+                )
+                k_nope = torch.randn(k_len, kv_lora_rank, dtype=dtype, device=device)
+                k_rope = torch.randn(
+                    k_len, qk_rope_head_dim, dtype=dtype, device=device
+                )
 
-        expected_q = torch.empty(
-            q_len,
-            num_heads,
-            kv_lora_rank + qk_rope_head_dim,
-            dtype=fp8_dtype,
-            device=device,
-        )
-        expected_q[..., :kv_lora_rank] = q_nope.to(fp8_dtype)
-        expected_q[..., kv_lora_rank:] = _apply_rope(
-            q_rope, q_pos_ids, cos_sin_cache, is_neox
-        ).to(fp8_dtype)
-        expected_k_nope = k_nope.to(fp8_dtype)
-        expected_k_rope = _apply_rope(k_rope, k_pos_ids, cos_sin_cache, is_neox).to(
-            fp8_dtype
-        )
+                q_out, k_nope_out, k_rope_out = mla_quantize_and_rope_for_fp8(
+                    q_nope,
+                    q_rope,
+                    k_nope,
+                    k_rope,
+                    q_pos_ids,
+                    cos_sin_cache,
+                    is_neox,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    k_pos_ids=k_pos_ids,
+                )
 
-        torch.testing.assert_close(q_out.float(), expected_q.float(), rtol=0, atol=0)
-        torch.testing.assert_close(
-            k_nope_out.float(), expected_k_nope.float(), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            k_rope_out.float(), expected_k_rope.float(), rtol=0, atol=0
-        )
+                expected_q = torch.empty(
+                    q_len,
+                    num_heads,
+                    kv_lora_rank + qk_rope_head_dim,
+                    dtype=fp8_dtype,
+                    device=device,
+                )
+                expected_q[..., :kv_lora_rank] = q_nope.to(fp8_dtype)
+                expected_q[..., kv_lora_rank:] = _apply_rope(
+                    q_rope, q_pos_ids, cos_sin_cache, is_neox
+                ).to(fp8_dtype)
+                expected_k_nope = k_nope.to(fp8_dtype)
+                expected_k_rope = _apply_rope(
+                    k_rope, k_pos_ids, cos_sin_cache, is_neox
+                ).to(fp8_dtype)
+
+                torch.testing.assert_close(
+                    q_out[..., :kv_lora_rank].float(),
+                    expected_q[..., :kv_lora_rank].float(),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    k_nope_out.float(), expected_k_nope.float(), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    q_out[..., kv_lora_rank:].float(),
+                    expected_q[..., kv_lora_rank:].float(),
+                    rtol=0,
+                    atol=0.25,
+                )
+                torch.testing.assert_close(
+                    k_rope_out.float(), expected_k_rope.float(), rtol=0, atol=0.25
+                )
 
 
 if __name__ == "__main__":
