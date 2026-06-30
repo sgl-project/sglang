@@ -1558,21 +1558,20 @@ def biased_grouped_topk_gpu(
             and num_experts <= 512
             and topk <= 8
         ):
-            from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
+            # Ungrouped sigmoid (num_expert_group == 1): use the unified Triton
+            # router, which subsumes the jit grouped_topk.cuh kernel here.
+            from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_gate
 
-            scaling = (
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            )
-            if not apply_routed_scaling_factor_on_output:
-                scaling = 1.0
-            return jit_grouped_topk(
-                gating_output.to(dtype=torch.float32),
-                correction_bias.to(dtype=torch.float32),
-                num_expert_group,
-                topk_group,
+            return jit_gate(
+                gating_output,
+                correction_bias.to(torch.float32),
                 topk,
-                renormalize,
-                scaling,
+                scoring_func="sigmoid",
+                renormalize=renormalize,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         elif (
             _is_xpu
