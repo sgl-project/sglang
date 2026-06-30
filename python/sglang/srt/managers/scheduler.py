@@ -1586,10 +1586,9 @@ class Scheduler(
                 # truly idle, so the conservative non-urgent guard inside
                 # `_flush` finds `event.query()` True and compacts freely.
                 # Sync-free; best-effort.
-                allocator = self.token_to_kv_pool_allocator
-                if allocator is not None and hasattr(allocator, "flush_opportunistic"):
+                if self.server_args.enable_unified_memory_pool:
                     try:
-                        allocator.flush_opportunistic()
+                        self.token_to_kv_pool_allocator.flush_opportunistic()
                     except Exception:
                         pass
 
@@ -3519,10 +3518,9 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
-        allocator = self.token_to_kv_pool_allocator
-        if allocator is not None and hasattr(allocator, "flush_opportunistic"):
+        if self.server_args.enable_unified_memory_pool:
             try:
-                allocator.flush_opportunistic()
+                self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:
                 pass
 

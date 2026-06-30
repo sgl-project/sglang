@@ -52,6 +52,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 
@@ -493,28 +496,29 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
-        # SHARED-pool joint budget: a new mamba state consumes shared-gap bytes
+        # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
         # that `rem_total_tokens` (full KV) otherwise counts as free. Reserve
         # that gap per new mamba slot so admission can't over-commit (the
-        # chunk-normal over-admit). Cost is 0 for the non-shared allocator
+        # chunk-normal over-admit). Cost stays 0 for the non-unified allocator
         # (separate pools — a mamba slot costs no full-KV bytes), keeping the
-        # baseline path byte-identical: the method exists ONLY on the shared
-        # composite, so `getattr(..., None)` yields a no-op.
+        # baseline path byte-identical.
         #
-        # Gate on the ALLOCATOR (shared Mamba composite), NOT on
-        # `is_hybrid_ssm_cache` (= `tree_cache.supports_mamba()`): the latter is
-        # False for `ChunkCache` (only `MambaRadixCache` returns True), which
+        # Gate on the ALLOCATOR being the unified Mamba composite
+        # (UnifiedMambaTokenToKVPoolAllocator — the only allocator with this gap),
+        # NOT on `is_hybrid_ssm_cache` (= `tree_cache.supports_mamba()`): the latter
+        # is False for `ChunkCache` (only `MambaRadixCache` returns True), which
         # would silently skip the reservation on the chunk-cache path and let
         # prefill over-admit the shared gap → "Prefill out of memory" at the
         # mfs0.30 corner. The gap coupling is a property of the byte buffer, not
         # of whether the prefix cache caches mamba states, so both chunk and
-        # radix shared-Mamba pools must reserve.
+        # radix unified Mamba pools must reserve.
         self._mamba_slot_cost = 0
-        _cost_fn = getattr(
-            self.token_to_kv_pool_allocator, "mamba_slot_full_token_cost", None
-        )
-        if _cost_fn is not None:
-            self._mamba_slot_cost = _cost_fn()
+        if isinstance(
+            self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+        ):
+            self._mamba_slot_cost = (
+                self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
+            )
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
