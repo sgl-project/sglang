@@ -312,7 +312,15 @@ class TestPDFlipExperimentScript(unittest.TestCase):
         self.assertIn("cloud-099", windows_runner)
         self.assertIn("cloud-102", windows_runner)
         self.assertIn("start-monitor", windows_runner)
+        self.assertIn("write-env", windows_runner)
         self.assertIn("sync-env", windows_runner)
+        self.assertIn("sync-code", windows_runner)
+        self.assertIn('"clone"', windows_runner)
+        self.assertIn('"/root/sglang"', windows_runner)
+        self.assertIn("sglang-pd-switch:tianciJ", windows_runner)
+        self.assertIn("/models/deepseek_v3.1_terminus", windows_runner)
+        self.assertIn("nohup bash -lc", windows_runner)
+        self.assertIn(".pid", windows_runner)
 
     def _read_docker_env(self):
         values = {}

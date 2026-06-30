@@ -52,12 +52,16 @@ cd scripts\playground\disaggregation\pd_flip_docker
 copy env.example env.local
 notepad env.local
 .\windows_four_node.ps1 -Action preflight
+.\windows_four_node.ps1 -Action clone
 .\windows_four_node.ps1 -Action sync-env
 .\windows_four_node.ps1 -Action pull
 ```
 
-If the changes are not pushed to a git remote yet, export/apply a patch into the
-Windows checkout first, then use the same script to drive the cloud nodes.
+By default the remote checkout path is `/root/sglang`, matching the root SSH
+login on the four cloud nodes. Override it with `-RemoteRepo <path>` if the repo
+is somewhere else. If the changes are not pushed to a git remote yet,
+export/apply a patch into the Windows checkout first, then use the same script to
+drive the cloud nodes.
 
 ## Launch Order
 

@@ -247,6 +247,20 @@ class TestPDFlipController(unittest.TestCase):
             ],
         )
 
+    def test_http_client_post_json_parses_response(self):
+        client = self.script.HttpClient()
+        bodies = []
+        client._open_text = lambda req: bodies.pop(0)
+
+        bodies.append('{"success": true, "value": 7}')
+        self.assertEqual(
+            client.post_json("http://router", "/pd_flip/router/worker/drain", {}),
+            {"success": True, "value": 7},
+        )
+
+        bodies.append("")
+        self.assertEqual(client.post_json("http://router", "/empty", {}), {})
+
     def test_collect_metrics_merges_router_role_status_and_loads(self):
         controller = self.script.PDFlipController(self.config, self.client)
 

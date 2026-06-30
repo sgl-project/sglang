@@ -89,6 +89,10 @@ class HttpClient:
         except error.URLError as exc:
             raise RuntimeError(f"failed to connect to {req.full_url}: {exc}") from exc
 
+    def _open_json(self, req: request.Request) -> Any:
+        body = self._open_text(req)
+        return json.loads(body) if body else {}
+
 
 @dataclass(frozen=True)
 class PDNode:

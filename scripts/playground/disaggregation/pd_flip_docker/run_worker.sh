@@ -20,9 +20,7 @@ if [[ -d /dev/infiniband ]]; then
   mounts+=(-v /dev/infiniband:/dev/infiniband)
 fi
 
-cmd=(
-  cd /sgl-workspace/sglang '&&'
-  PYTHONPATH=python
+server_args=(
   python3 -m sglang.launch_server
   --model-path "${MODEL_PATH}"
   --host "${LOCAL_IP}"
@@ -42,10 +40,11 @@ cmd=(
 if [[ -n "${EXTRA_SGLANG_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
   extra_args=(${EXTRA_SGLANG_ARGS})
-  cmd+=("${extra_args[@]}")
+  server_args+=("${extra_args[@]}")
 fi
 
-printf -v launch_cmd '%q ' "${cmd[@]}"
+printf -v server_cmd '%q ' "${server_args[@]}"
+launch_cmd="cd /sgl-workspace/sglang && PYTHONPATH=python exec ${server_cmd}"
 
 # shellcheck disable=SC2206
 extra_docker_args=(${EXTRA_DOCKER_ARGS:-})
