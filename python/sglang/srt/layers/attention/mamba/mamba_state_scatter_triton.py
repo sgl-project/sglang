@@ -23,6 +23,7 @@ def track_mamba_state_if_needed_kernel(
     conv_state_numel_per_row: tl.constexpr,  # total elements per row
     ssm_state_numel_per_row: tl.constexpr,  # total elements per row
     BLOCK_SIZE: tl.constexpr,
+    check_freed_slots: tl.constexpr,  # only the shared/unified KV pool emits -1
 ):
     """
     Track conv_states and ssm_states rows based on track mask.
@@ -52,9 +53,12 @@ def track_mamba_state_if_needed_kernel(
     dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
 
     # Skip freed/unallocated slots: a freed slot maps to -1, and
-    # `state_ptr + (-1) * stride` would fault before the buffer.
-    if src_idx < 0 or dst_idx < 0:
-        return
+    # `state_ptr + (-1) * stride` would fault before the buffer. Only the
+    # shared/unified KV pool emits -1 (freed-slot tombstones from the
+    # virtual->physical translate); for the static pool this is compiled out.
+    if check_freed_slots:
+        if src_idx < 0 or dst_idx < 0:
+            return
 
     # Copy conv_states
     # Each thread handles BLOCK_SIZE elements
@@ -87,6 +91,7 @@ def track_mamba_states_if_needed(
     mamba_track_mask: torch.Tensor,
     mamba_track_indices: torch.Tensor,
     batch_size: int,
+    check_freed_slots: bool = False,
 ):
     """
     Track mamba states using Triton kernel for better performance.
@@ -118,6 +123,7 @@ def track_mamba_states_if_needed(
         conv_state_numel_per_row,
         ssm_state_numel_per_row,
         BLOCK_SIZE,
+        check_freed_slots,
     )
 
 

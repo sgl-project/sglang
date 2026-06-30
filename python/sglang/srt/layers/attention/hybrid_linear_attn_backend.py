@@ -35,6 +35,10 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        # Only the shared/unified KV pool's virtual->physical translate emits -1
+        # (freed-slot tombstones), so the state-scatter kernel only needs its
+        # freed-slot guard there; compiled out for the static pool.
+        self.enable_shared_kv_pool = model_runner.enable_shared_kv_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # GDN ReplaySSM (slice 1b): per-bs STATIC per-row write-cursor buffers
@@ -846,6 +850,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_mask,
                 forward_batch.mamba_track_indices,
                 forward_batch.batch_size,
+                check_freed_slots=self.enable_shared_kv_pool,
             )
 
     def _track_mamba_state_extend(
@@ -1034,6 +1039,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     forward_batch.mamba_track_mask[-num_decodes:],
                     forward_batch.mamba_track_indices[-num_decodes:],
                     num_decodes,
+                    check_freed_slots=self.enable_shared_kv_pool,
                 )
 
         return mixer_out
