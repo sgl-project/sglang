@@ -10,12 +10,61 @@ import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.mem_cache.pool_host.common import get_allocator_from_storage
+from sglang.srt.mem_cache.pool_host.common import (
+    _cuda_host_unregister,
+    get_allocator_from_storage,
+)
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+
+
+def sync_fixed_hicache_size(size: int, host_size: int) -> int:
+    """Sync fixed-size HiCache token capacity across PP ranks.
+
+    A fixed --hicache-size is specified in GB, but each PP stage may have a
+    different bytes/token because it owns different layers. Use the global
+    minimum token capacity within the PP group so all stages expose the same
+    host-cache capacity.
+    Ratio-based sizing already derives from the synced device pool size.
+    """
+    if host_size <= 0 or not torch.distributed.is_available():
+        return size
+
+    if not torch.distributed.is_initialized():
+        return size
+
+    try:
+        from sglang.srt.distributed.parallel_state import get_pp_group
+
+        pp_group = get_pp_group()
+    except AssertionError:
+        return size
+
+    if pp_group.world_size <= 1:
+        return size
+
+    tensor = torch.tensor(size, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        tensor,
+        op=torch.distributed.ReduceOp.MIN,
+        group=pp_group.cpu_group,
+    )
+    synced_size = int(tensor.item())
+
+    if synced_size != size:
+        logger.info(
+            "Sync fixed-size HiCache host token capacity from %d to %d.",
+            size,
+            synced_size,
+        )
+    return synced_size
 
 
 def synchronized(func):
@@ -51,7 +100,9 @@ class HostKVCache(abc.ABC):
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // self.size_per_token)
+            self.size = sync_fixed_hicache_size(
+                int(host_size * 1e9 // self.size_per_token), host_size
+            )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
@@ -60,9 +111,14 @@ class HostKVCache(abc.ABC):
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.size <= device_pool.size:
+            logger.warning(
+                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "L2 cache effectiveness is reduced."
+                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                self.size,
+                device_pool.size,
+            )
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -85,6 +141,26 @@ class HostKVCache(abc.ABC):
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def destroy(self):
+        """Unregister pinned host buffers in userspace before process exit.
+
+        Large cudaHostRegister'd buffers are otherwise unpinned by the kernel
+        during SIGKILL reclaim, which can stall teardown in uninterruptible
+        sleep for tens of seconds. Idempotent. (Only the host_register path
+        needs this; npu/musa pin_memory buffers are freed by torch.)
+        """
+        if getattr(self, "_destroyed", False):
+            return
+        self._destroyed = True
+        buffers = getattr(self, "kv_buffer", None)
+        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
+            if not isinstance(buffers, (list, tuple)):
+                buffers = [buffers]
+            for buf in buffers:
+                if buf is not None:
+                    _cuda_host_unregister(buf)
+        self.kv_buffer = None
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -154,6 +230,9 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Per-slot flag used to detect double-free.
+        # slot_used[k] is true if slot k is allocated.
+        self.slot_used = torch.zeros(self.size, dtype=torch.bool)
 
     def available_size(self):
         return len(self.free_slots)
@@ -169,9 +248,21 @@ class HostKVCache(abc.ABC):
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
+        assert not self.slot_used[select_index].any(), (
+            f"Double-alloc detected: slots already allocated: "
+            f"{select_index[self.slot_used[select_index]].tolist()}."
+        )
+        self.slot_used[select_index] = True
+
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        indices_cpu = indices.cpu()
+        assert self.slot_used[indices_cpu].all(), (
+            f"Double-free detected: slots not currently allocated: "
+            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
+        )
+        self.slot_used[indices_cpu] = False
+        self.free_slots = torch.cat([self.free_slots, indices_cpu])
         return len(indices)
