@@ -1,5 +1,6 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -169,23 +170,25 @@ void moe_align_block_size(
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
 
-  auto N = SymbolicSize{"numel"};
-  TensorMatcher({N})
-      .with_dtype<int32_t>()
-      .with_device(device)
-      .verify(topk_ids);
+  if (topk_ids.ndim() == 1) {
+    TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  } else if (topk_ids.ndim() == 2) {
+    TensorMatcher({-1, -1}).with_dtype<int32_t>().with_device(device).verify(topk_ids);
+  } else {
+    RuntimeCheck(false, "moe_align_block_size: topk_ids must be 1D or 2D, got ndim=", topk_ids.ndim());
+  }
 
-  const auto numel = static_cast<int64_t>(N.unwrap());
+  const auto numel = static_cast<int64_t>(topk_ids.numel());
   const auto dev = device.unwrap();
 
   const int32_t scan_size = static_cast<int32_t>(next_pow2(static_cast<uint32_t>(num_experts)));
 
   constexpr int kThreads = 1024;
 
-  RuntimeCheck(scan_size <= kThreads, "moe_align_block_size: num_experts too large for single-pass scan, got ", num_experts);
+  RuntimeCheck(
+      scan_size <= kThreads, "moe_align_block_size: num_experts too large for single-pass scan, got ", num_experts);
 
-  const size_t shared_mem_size =
-      (num_experts + (num_experts + 1) + scan_size + kWarpSize) * sizeof(int32_t);
+  const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + kWarpSize) * sizeof(int32_t);
 
   LaunchKernel(dim3(2), dim3(kThreads), dev, shared_mem_size)(
       moe_align_block_size_kernel<int32_t>,

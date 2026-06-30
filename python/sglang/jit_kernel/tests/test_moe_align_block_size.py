@@ -34,7 +34,11 @@ def moe_align_block_size_ref(
     else:
         max_num_tokens_padded = numel + num_experts * (block_size - 1)
 
-    sorted_token_ids = [numel] * max_num_tokens_padded if pad_sorted_token_ids else [0] * max_num_tokens_padded
+    sorted_token_ids = (
+        [numel] * max_num_tokens_padded
+        if pad_sorted_token_ids
+        else [0] * max_num_tokens_padded
+    )
 
     cumsum_copy = list(cumsum)
     for i, eid in enumerate(topk_ids_cpu):
@@ -82,7 +86,9 @@ def test_moe_align_block_size(m, topk, num_experts, block_size):
     device = "cuda"
     numel = m * topk
 
-    topk_ids = torch.randint(0, num_experts, (numel,), dtype=torch.int32, device=device)
+    topk_ids = torch.randint(
+        0, num_experts, (m, topk), dtype=torch.int32, device=device
+    )
 
     ne_param = num_experts + 1
 
@@ -98,26 +104,34 @@ def test_moe_align_block_size(m, topk, num_experts, block_size):
     cumsum_buffer = torch.empty((ne_param + 1,), dtype=torch.int32, device=device)
 
     moe_align_block_size(
-        topk_ids, ne_param, block_size,
-        sorted_ids, expert_ids, num_tokens_post_pad,
-        cumsum_buffer, True,
+        topk_ids,
+        ne_param,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        True,
     )
     torch.cuda.synchronize()
 
     ref_sorted, ref_expert_ids, ref_total, ref_cumsum = moe_align_block_size_ref(
-        topk_ids, ne_param, block_size, pad_sorted_token_ids=True,
+        topk_ids,
+        ne_param,
+        block_size,
+        pad_sorted_token_ids=True,
     )
 
     total_jit = num_tokens_post_pad.item()
-    assert total_jit == ref_total, (
-        f"total_tokens_post_pad mismatch: JIT={total_jit}, ref={ref_total}"
-    )
+    assert (
+        total_jit == ref_total
+    ), f"total_tokens_post_pad mismatch: JIT={total_jit}, ref={ref_total}"
 
     num_blocks = ref_total // block_size
     expert_ids_jit = expert_ids[:num_blocks].cpu().tolist()
-    assert expert_ids_jit == ref_expert_ids, (
-        f"expert_ids mismatch:\nJIT={expert_ids_jit}\nref={ref_expert_ids}"
-    )
+    assert (
+        expert_ids_jit == ref_expert_ids
+    ), f"expert_ids mismatch:\nJIT={expert_ids_jit}\nref={ref_expert_ids}"
 
     # Token order within each expert range may differ due to atomicAdd,
     # so compare as sets per expert slot.
@@ -151,7 +165,9 @@ def test_filtered_experts(num_experts):
     block_size = 32
     ne_param = num_experts + 1
 
-    topk_ids = torch.randint(-1, num_experts, (numel,), dtype=torch.int32, device=device)
+    topk_ids = torch.randint(
+        -1, num_experts, (numel,), dtype=torch.int32, device=device
+    )
 
     if numel < ne_param + 1:
         max_num_tokens_padded = numel * block_size
@@ -165,14 +181,22 @@ def test_filtered_experts(num_experts):
     cumsum_buffer = torch.empty((ne_param + 1,), dtype=torch.int32, device=device)
 
     moe_align_block_size(
-        topk_ids, ne_param, block_size,
-        sorted_ids, expert_ids, num_tokens_post_pad,
-        cumsum_buffer, True,
+        topk_ids,
+        ne_param,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        True,
     )
     torch.cuda.synchronize()
 
     ref_sorted, ref_expert_ids, ref_total, ref_cumsum = moe_align_block_size_ref(
-        topk_ids, ne_param, block_size, pad_sorted_token_ids=True,
+        topk_ids,
+        ne_param,
+        block_size,
+        pad_sorted_token_ids=True,
     )
 
     total_jit = num_tokens_post_pad.item()
