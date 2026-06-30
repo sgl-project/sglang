@@ -225,7 +225,11 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    PlannerRefused,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -2983,7 +2987,9 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        if not new_batch.prepare_for_extend():
+        try:
+            new_batch.prepare_for_extend()
+        except PlannerRefused:
             # Planner refused to admit the batch (shared-pool
             # byte-coordinated mamba shortfall with no evict path —
             # see `common.alloc_req_slots`). No KV/req-pool mutations

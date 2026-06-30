@@ -410,28 +410,29 @@ def alloc_paged_token_slots_extend(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+class PlannerRefused(Exception):
+    """Raised by ``alloc_req_slots`` when the planner cannot honor a prefill
+    batch (the shared KV pool's byte-coordinated availability dropped below what
+    the reqs need). Caught once at the scheduler's batch-prep boundary, which
+    unwinds the admission state and re-queues the reqs to retry next iter —
+    instead of crashing mid-batch-prep on the per-req ``HybridReqToTokenPool.alloc``
+    assert. Propagates cleanly through ``alloc_for_extend`` / ``prepare_for_extend``
+    so neither needs Optional/bool refusal threading."""
+
+
 def alloc_req_slots(
     req_to_token_pool: ReqToTokenPool,
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
-) -> Optional[list[int]]:
+) -> list[int]:
     """Allocate request slots from the pool.
 
-    Returns:
-        The list of req_pool_idx slots, or ``None`` when the planner
-        detects that the requested batch cannot be honored — in which
-        case the caller should treat the prefill batch as not-ready and
-        re-queue the reqs for a subsequent scheduler iteration.
-
-    Why ``None`` instead of raising: under the shared KV pool, the
-    byte-coordinated mamba availability can drop below the
-    slot-conservation view at any moment when the peer (full) sub-pool
-    consumes bytes. The shared pool correctly implements the contract
-    "``schedulable_available_size() >= N`` ⇒ ``alloc(N)`` succeeds"; the
-    planner must respect that contract. Without this guard the per-req
-    loop in ``HybridReqToTokenPool.alloc`` would assert-fail when its
-    inner byte-coordinated ``mamba_pool.alloc(1)`` returned ``None``
-    mid-loop.
+    Raises ``PlannerRefused`` when the batch cannot be honored: under the shared
+    KV pool the byte-coordinated mamba availability can drop below the
+    slot-conservation view when the peer (full) sub-pool consumes bytes. The
+    shared pool implements "``schedulable_available_size() >= N`` ⇒ ``alloc(N)``
+    succeeds", so the planner refuses up front rather than letting the per-req
+    ``HybridReqToTokenPool.alloc`` loop assert-fail mid-loop.
     """
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
@@ -486,14 +487,18 @@ def alloc_req_slots(
             # hint to the tree cache; missing that target is fine as
             # long as the strict minimum is met.
             if mamba_available_size < min_required:
-                return None
+                raise PlannerRefused(
+                    f"shared mamba pool cannot honor {min_required} slot(s): "
+                    f"only {mamba_available_size} schedulable after eviction"
+                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
-
     if req_pool_indices is None:
-        # Same intent as the mamba branch above: the alloc could not be
-        # honored — let the caller back off and retry next iter rather
-        # than crash with a hard error in the middle of batch prep.
-        return None
+        # alloc could not be honored — refuse so the caller backs off and
+        # retries next iter rather than crashing mid-batch-prep.
+        raise PlannerRefused(
+            f"req_to_token_pool.alloc failed for {num_reqs} req(s) "
+            f"(available_size={req_to_token_pool.available_size()})"
+        )
     return req_pool_indices
 
 
@@ -511,16 +516,14 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
 
 def alloc_for_extend(
     batch: ScheduleBatch,
-) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
-    Returns:
-        ``None`` if ``alloc_req_slots`` could not satisfy the request
-        (planner contract — caller should treat the batch as not-ready
-        and re-queue). Otherwise a 3-tuple ``(out_cache_loc,
-        req_pool_indices_device, req_pool_indices_cpu)`` where the last is
-        the host (CPU) mirror of the request pool indices.
+    Raises ``PlannerRefused`` (from ``alloc_req_slots``) when the batch cannot be
+    honored — the scheduler catches it and re-queues. Otherwise returns
+    ``(out_cache_loc, req_pool_indices_device, req_pool_indices_cpu)`` (the last
+    is the host/CPU mirror of the request pool indices).
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
@@ -533,15 +536,11 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots
+    # Allocate req slots (raises PlannerRefused if the batch can't be honored,
+    # before any KV/req-pool mutations are committed)
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
-    if req_pool_indices is None:
-        # Planner refused to over-promise — propagate so the scheduler
-        # can re-queue the reqs and retry next iter. No KV/req-pool
-        # mutations have been committed yet at this point.
-        return None
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 

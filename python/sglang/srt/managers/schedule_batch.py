@@ -2008,13 +2008,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    def prepare_for_extend(self) -> bool:
+    def prepare_for_extend(self) -> None:
         """Build extend tensors and allocate KV / req slots.
 
-        Returns ``True`` on success, ``False`` when the allocator
-        planner refused to admit the batch (no KV/req-pool mutations
-        have been committed yet at the failure point — the scheduler
-        should re-queue the reqs and try again next iter).
+        Raises ``PlannerRefused`` (from ``alloc_for_extend``) when the planner
+        cannot admit the batch — no KV/req-pool mutations have been committed at
+        the failure point, so the scheduler catches it and re-queues the reqs.
         """
         self.forward_mode = ForwardMode.EXTEND
 
@@ -2059,14 +2058,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory. ``alloc_for_extend`` returns ``None`` when the
-        # allocator planner refused (shared-pool byte-coordinated
-        # availability shortfall with no evict path). Propagate so the
-        # scheduler can re-queue the reqs.
-        result = alloc_for_extend(self)
-        if result is None:
-            return False
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = result
+        # Allocate memory. ``alloc_for_extend`` raises ``PlannerRefused`` when
+        # the planner cannot honor the batch (shared-pool byte-coordinated
+        # availability shortfall); the scheduler catches it and re-queues.
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
+            self
+        )
 
         # Set fields
         input_embeds = []
@@ -2288,7 +2285,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
-        return True
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -2397,16 +2393,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
 
-    def prepare_for_split_prefill(self) -> bool:
-        """Propagates the boolean from `prepare_for_extend`. Returns
-        ``False`` when the planner refused the batch (caller should
-        re-queue).
-        """
-        if not self.prepare_for_extend():
-            return False
+    def prepare_for_split_prefill(self) -> None:
+        """Build extend tensors then switch to SPLIT_PREFILL mode.
+        ``prepare_for_extend`` raises ``PlannerRefused`` if the planner cannot
+        admit the batch."""
+        self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
-        return True
 
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
