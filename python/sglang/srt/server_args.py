@@ -2547,6 +2547,13 @@ class ServerArgs:
         # Validate transcription/ASR-specific server args (model-independent).
         self._handle_asr_validation()
 
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
+
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
             handle_pd_disaggregation,
