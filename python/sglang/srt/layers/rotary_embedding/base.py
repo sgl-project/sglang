@@ -208,6 +208,42 @@ class RotaryEmbedding(MultiPlatformOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
 
+    def forward_native_keys_batch(
+        self,
+        positions: torch.Tensor,
+        key: torch.Tensor,
+    ):
+        positions = positions.flatten()
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        cos = cos[:, None, None, :].to(key.dtype)
+        sin = sin[:, None, None, :].to(key.dtype)
+        x1, x2 = torch.chunk(key, 2, dim=-1)
+
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+
+        return torch.cat((o1, o2), dim=-1)
+
+    def invert_native_keys_batch(
+        self,
+        positions: torch.Tensor,
+        key: torch.Tensor,
+    ):
+        positions = positions.flatten()
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        cos = cos[:, None, None, :].to(key.dtype)
+        sin = -sin[:, None, None, :].to(key.dtype)
+        x1, x2 = torch.chunk(key, 2, dim=-1)
+
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+
+        return torch.cat((o1, o2), dim=-1)
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -233,14 +269,54 @@ class RotaryEmbedding(MultiPlatformOp):
             cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = self._apply_rotary_emb_wrapped(
-            query_rot, cos, sin, self.is_neox_style
-        )
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+        if query is not None:
+            query_shape = query.shape
+            query = query.view(num_tokens, -1, self.head_size)
+            query_rot = query[..., : self.rotary_dim]
+            query_pass = query[..., self.rotary_dim :]
+            query_rot = self._apply_rotary_emb_wrapped(
+                query_rot, cos, sin, self.is_neox_style
+            )
+            query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
+
+    def invert_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-native implementation of forward()."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        sin = -sin
+
+        if query is not None:
+            query_shape = query.shape
+            query = query.view(num_tokens, -1, self.head_size)
+            query_rot = query[..., : self.rotary_dim]
+            query_pass = query[..., self.rotary_dim :]
+            query_rot = self._apply_rotary_emb_wrapped(
+                query_rot, cos, sin, self.is_neox_style
+            )
+            query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
