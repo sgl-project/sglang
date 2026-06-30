@@ -20,9 +20,10 @@ use bytes::Bytes;
 
 use crate::error::Error;
 use crate::fsm::{Event, ValidationOutcome};
+use crate::ids::RequestId;
 use crate::message::{
     EgressItem, GenerateRequest, IngressMsg, Request, RequestKind, TokenizedReqPayload,
-    control_req_msgpack,
+    abort_req_msgpack, control_req_msgpack,
 };
 use crate::runtime::Runnable;
 use crate::runtime::channels::{DetokMsg, Senders, TmEvent};
@@ -61,6 +62,7 @@ impl Runnable for Ingress {
             match ev {
                 TmEvent::Ingress(req) => self.on_ingress(req),
                 TmEvent::Tokenized(req) => self.on_tokenized(req),
+                TmEvent::Abort(id) => self.on_abort(id),
             }
         }
     }
@@ -174,6 +176,24 @@ impl Ingress {
             ids: Bytes::new(),
         }) {
             fail(&mut req, Error::QueueFull);
+        }
+    }
+
+    /// Client disconnected: push an `AbortReq(rid)` onto the ingress ring so the
+    /// scheduler stops generating. Fire-and-forget — there's no sink left (the
+    /// client is gone); a full ring just drops the abort (the request will still
+    /// finish at EOS, only later).
+    fn on_abort(&self, id: RequestId) {
+        match abort_req_msgpack(&id.0.to_string()) {
+            Ok(header) => {
+                if !self.ingress.try_push(IngressMsg {
+                    header,
+                    ids: Bytes::new(),
+                }) {
+                    tracing::warn!(rid = id.0, "abort dropped: ingress ring full");
+                }
+            }
+            Err(e) => tracing::warn!(rid = id.0, error = %e, "abort encode failed"),
         }
     }
 

@@ -199,6 +199,20 @@ impl NetClient {
         // Ok as long as at least one rank received the request.
         if delivered { Ok(rx) } else { Err(()) }
     }
+
+    /// Fire an abort for `rid` to every rank, best-effort and **non-blocking**.
+    /// Called from a `Drop` guard when the HTTP client disconnects, so it must
+    /// not await: `try_send` on one ingress connection per rank (there's no
+    /// rid→rank map, so broadcast; the rank serving `rid` aborts, the rest
+    /// no-op). A full/closed queue just drops it — the request then still
+    /// finishes at EOS, only later.
+    pub fn try_abort_broadcast(&self, rid: u64) {
+        let frame = Frame::Abort { rid };
+        for rank in &self.ranks {
+            let conn = rank.ingress_rr.fetch_add(1, Ordering::Relaxed) % rank.ingress.len();
+            let _ = rank.ingress[conn].try_send((frame.clone(), Vec::new()));
+        }
+    }
 }
 
 /// Readiness wrapper for the standalone api-server (Mode A registration).

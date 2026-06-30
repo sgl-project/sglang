@@ -155,6 +155,20 @@ async fn ingress_loop(mut read: OwnedReadHalf, senders: Senders, egress_txs: Arc
                     continue;
                 }
             },
+            // Client disconnected on the api-server: forward the abort straight to
+            // the pipeline (no req to build, no egress sink) and keep reading.
+            Frame::Abort { rid } => {
+                if senders
+                    .tm
+                    .send_async(TmEvent::Abort(RequestId(rid)))
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("headless: tm inbox closed");
+                    break;
+                }
+                continue;
+            }
             _ => {
                 tracing::warn!("headless: unexpected frame on ingress connection");
                 continue;

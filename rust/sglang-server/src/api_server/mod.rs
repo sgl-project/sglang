@@ -30,7 +30,7 @@ use std::convert::Infallible;
 use tokio::sync::mpsc;
 
 use crate::fsm::RequestState;
-use crate::ids::RequestIdGen;
+use crate::ids::{RequestId, RequestIdGen};
 use dynamo_renderer::PromptFormatter;
 
 use crate::message::{
@@ -149,7 +149,10 @@ async fn register(State(state): State<AppState>, Json(body): Json<RegisterBody>)
 /// Submit a request into the ingress pipeline. Returns the per-request egress
 /// receiver to read the result(s) from. The `kind` carries the variant body
 /// (generate payload / control tag), so this stays generic over both.
-async fn submit(state: &AppState, kind: RequestKind) -> Result<mpsc::Receiver<EgressItem>, ()> {
+async fn submit(
+    state: &AppState,
+    kind: RequestKind,
+) -> Result<(RequestId, mpsc::Receiver<EgressItem>), ()> {
     let id = state.id_gen.next();
     match &state.transport {
         // Embedded: move the request into the in-process pipeline. Async-aware
@@ -164,7 +167,7 @@ async fn submit(state: &AppState, kind: RequestKind) -> Result<mpsc::Receiver<Eg
                 kind,
             };
             match senders.tm.send_async(TmEvent::Ingress(req)).await {
-                Ok(()) => Ok(rx),
+                Ok(()) => Ok((id, rx)),
                 Err(_) => {
                     tracing::error!("tm inbox closed; request dropped");
                     Err(())
@@ -178,14 +181,73 @@ async fn submit(state: &AppState, kind: RequestKind) -> Result<mpsc::Receiver<Eg
         // they're broadcast to all and the first response wins — round-robin
         // could pick a rank whose answer never returns, hanging the caller.
         Transport::Net(ready) => match ready.client() {
-            Some(client) => match kind {
-                RequestKind::Control(_) => {
-                    client.submit_broadcast(id, kind, state.egress_buf).await
-                }
-                RequestKind::Generate(_) => client.submit(id, kind, state.egress_buf).await,
-            },
+            Some(client) => {
+                let rx = match kind {
+                    RequestKind::Control(_) => {
+                        client.submit_broadcast(id, kind, state.egress_buf).await?
+                    }
+                    RequestKind::Generate(_) => client.submit(id, kind, state.egress_buf).await?,
+                };
+                Ok((id, rx))
+            }
             None => Err(()),
         },
+    }
+}
+
+impl Transport {
+    /// Best-effort, **non-blocking** abort of `rid` — the HTTP client
+    /// disconnected. Safe to call from `Drop`: never awaits. Local routes a
+    /// `TmEvent::Abort` to the ingress loop; Net broadcasts a `Frame::Abort` to
+    /// every rank. A full/closed channel just drops it (the request then finishes
+    /// at EOS, only later).
+    fn try_abort(&self, rid: RequestId) {
+        match self {
+            Transport::Local(senders) => {
+                let _ = senders.tm.try_send(TmEvent::Abort(rid));
+            }
+            Transport::Net(ready) => {
+                if let Some(client) = ready.client() {
+                    client.try_abort_broadcast(rid.0);
+                }
+            }
+        }
+    }
+}
+
+/// Aborts any still-in-flight request when dropped before normal completion —
+/// i.e. axum dropped the handler future / SSE stream because the HTTP client
+/// disconnected. Mirrors the Python `TokenizerManager` aborting on
+/// `request.is_disconnected()`. Each rid is disarmed once it finishes naturally;
+/// whatever is left when the guard drops gets an abort.
+struct AbortGuard {
+    transport: Transport,
+    rids: Vec<RequestId>,
+}
+
+impl AbortGuard {
+    fn new(transport: Transport, rid: RequestId) -> Self {
+        Self {
+            transport,
+            rids: vec![rid],
+        }
+    }
+
+    fn with_rids(transport: Transport, rids: Vec<RequestId>) -> Self {
+        Self { transport, rids }
+    }
+
+    /// Request `rid` finished naturally — don't abort it on drop.
+    fn disarm(&mut self, rid: RequestId) {
+        self.rids.retain(|r| *r != rid);
+    }
+}
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        for &rid in &self.rids {
+            self.transport.try_abort(rid);
+        }
     }
 }
 
@@ -197,7 +259,7 @@ async fn await_control_result(
     state: &AppState,
     tag: &'static str,
 ) -> Result<bytes::Bytes, Response> {
-    let mut rx = submit(state, RequestKind::Control(ControlRequest { tag }))
+    let (_id, mut rx) = submit(state, RequestKind::Control(ControlRequest { tag }))
         .await
         .map_err(|()| (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response())?;
     match rx.recv().await {
@@ -370,12 +432,16 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
         input_ids: None,
         stream,
     });
-    let mut rx = match submit(&state, kind).await {
-        Ok(rx) => rx,
+    let (rid, mut rx) = match submit(&state, kind).await {
+        Ok(v) => v,
         Err(()) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
         }
     };
+    // Abort the request if the client disconnects: the guard fires `try_abort`
+    // when dropped before the request finishes — i.e. axum drops this handler /
+    // SSE stream because the connection closed. Disarmed on a natural terminal.
+    let mut guard = AbortGuard::new(state.transport.clone(), rid);
 
     if stream {
         // SSE: the SGLang `/generate` protocol carries **cumulative** text per
@@ -406,6 +472,9 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                     EgressItem::Control(_) => break,
                 }
             }
+            // Reached only on a terminal / closed channel (not a disconnect, which
+            // drops the suspended generator before here) — so the request is done.
+            guard.disarm(rid);
             yield Ok(Event::default().data("[DONE]"));
         };
         Sse::new(s).into_response()
@@ -417,6 +486,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                 EgressItem::Frame(out) => acc.fold(&out),
                 EgressItem::Done(out) => {
                     acc.fold(&out);
+                    guard.disarm(rid);
                     return (
                         StatusCode::OK,
                         [("content-type", "application/json")],
@@ -425,6 +495,7 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                         .into_response();
                 }
                 EgressItem::Error(e) => {
+                    guard.disarm(rid);
                     let code = StatusCode::from_u16(e.http_status())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     let body = serde_json::json!({
@@ -435,7 +506,8 @@ async fn generate(State(state): State<AppState>, Json(payload): Json<GeneratePay
                 EgressItem::Control(_) => continue, // never on `/generate`
             }
         }
-        // Sender dropped without a terminal item → treated as aborted.
+        // Sender dropped without a terminal item → request already gone.
+        guard.disarm(rid);
         (StatusCode::from_u16(499).unwrap(), "request aborted").into_response()
     }
 }

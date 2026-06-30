@@ -80,6 +80,10 @@ pub enum Frame {
     },
     /// A control request (e.g. `/server_info`); routed without tokenization.
     Control { rid: u64, tag: String },
+    /// Abort an in-flight request (the api-server's HTTP client disconnected).
+    /// Broadcast to every rank (no rid→rank map); the rank serving `rid` aborts
+    /// it, the rest no-op. Fire-and-forget — no egress reply.
+    Abort { rid: u64 },
 
     // --- rank → api-server (egress connection) ---
     /// One generation/control/error frame for a request, keyed by `rid`.

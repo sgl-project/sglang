@@ -17,6 +17,10 @@ pub enum TmEvent {
     Ingress(Request),
     /// A request returned from the Tokenizer pool with `input_ids` filled in.
     Tokenized(Request),
+    /// Abort an in-flight request (the HTTP client disconnected). The ingress
+    /// loop forwards it to the scheduler as an `AbortReq` so generation stops
+    /// instead of running to EOS for a client that's gone.
+    Abort(RequestId),
 }
 
 /// Messages to a Detokenizer shard. Registration carries the per-request sink

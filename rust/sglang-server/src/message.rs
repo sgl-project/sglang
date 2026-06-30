@@ -145,6 +145,26 @@ pub fn control_req_msgpack(tag: &str, rid: &str) -> Result<Bytes, Error> {
     Ok(Bytes::from(buf))
 }
 
+/// Encode an `AbortReq(rid)` as its msgspec tagged array. `AbortReq` extends
+/// `BaseReq` (`rid`, `http_worker_ipc`) with `abort_all`, `finished_reason`,
+/// `abort_message`, so the array is `["AbortReq", rid, nil, false, nil, nil]`.
+/// The scheduler decodes it off the ingress ring and dispatches to its
+/// `abort_request`, stopping generation for `rid`.
+pub fn abort_req_msgpack(rid: &str) -> Result<Bytes, Error> {
+    use rmpv::Value;
+    let arr = Value::Array(vec![
+        Value::from("AbortReq"), // struct tag
+        Value::from(rid),        // rid
+        Value::Nil,              // http_worker_ipc
+        Value::from(false),      // abort_all
+        Value::Nil,              // finished_reason
+        Value::Nil,              // abort_message
+    ]);
+    let mut buf = Vec::new();
+    rmpv::encode::write_value(&mut buf, &arr).map_err(|e| Error::Codec(e.to_string()))?;
+    Ok(Bytes::from(buf))
+}
+
 /// Minimal decoded view of an incoming `/generate` body. Core fields are typed;
 /// everything else round-trips through `extra` so we stay faithful to the full
 /// Python schema (and the in-flight msgpack-migration) without enumerating it.
@@ -305,4 +325,27 @@ pub struct ChunkEvent {
     /// `#[serde(default)]` keeps the wire backward-compatible with 4-field frames.
     #[serde(default)]
     pub prompt_tokens: u32,
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+
+    #[test]
+    fn abort_req_msgpack_shape() {
+        let b = abort_req_msgpack("12345").unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            6,
+            "AbortReq = [tag, rid, http_ipc, abort_all, finished_reason, abort_message]"
+        );
+        assert_eq!(arr[0].as_str(), Some("AbortReq"));
+        assert_eq!(arr[1].as_str(), Some("12345"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_bool(), Some(false));
+        assert!(arr[4].is_nil());
+        assert!(arr[5].is_nil());
+    }
 }

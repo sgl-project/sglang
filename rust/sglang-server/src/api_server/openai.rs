@@ -29,7 +29,7 @@ use dynamo_protocols::types::{
 };
 use dynamo_renderer::{ChatTemplate, ContextMixins, PromptContextMixin, PromptFormatter};
 
-use super::{AppState, OutputAccumulator, submit};
+use super::{AbortGuard, AppState, OutputAccumulator, submit};
 use crate::message::{EgressItem, GeneratePayload, GenerateRequest, RequestKind};
 use crate::runtime::ServerArgs;
 
@@ -125,12 +125,14 @@ pub(super) async fn openai_completions(
             input_ids: None,
             stream,
         });
-        let mut rx = match submit(&state, kind).await {
-            Ok(rx) => rx,
+        let (rid, mut rx) = match submit(&state, kind).await {
+            Ok(v) => v,
             Err(()) => {
                 return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
             }
         };
+        // Abort the request if the client disconnects (drops the SSE stream).
+        let mut guard = AbortGuard::new(state.transport.clone(), rid);
         // SSE: the detok already emits per-chunk text deltas, so each frame's
         // `text` is forwarded straight as the OpenAI delta; the final chunk
         // carries the finish_reason; then `data: [DONE]`.
@@ -159,6 +161,7 @@ pub(super) async fn openai_completions(
                     EgressItem::Control(_) => break, // never on a generate request
                 }
             }
+            guard.disarm(rid); // terminal reached → request finished, don't abort
             yield Ok(Event::default().data("[DONE]"));
         };
         Sse::new(s).into_response()
@@ -168,6 +171,7 @@ pub(super) async fn openai_completions(
         // request order. Non-streaming requests emit a single `Done` each, so
         // draining the receivers sequentially can't deadlock on egress buffers.
         let mut rxs = Vec::with_capacity(prompts.len());
+        let mut rids = Vec::with_capacity(prompts.len());
         for (text, input_ids) in prompts {
             let payload = GeneratePayload {
                 text,
@@ -182,13 +186,19 @@ pub(super) async fn openai_completions(
                 stream: false,
             });
             match submit(&state, kind).await {
-                Ok(rx) => rxs.push(rx),
+                Ok((rid, rx)) => {
+                    rids.push(rid);
+                    rxs.push(rx);
+                }
                 Err(()) => {
                     return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable")
                         .into_response();
                 }
             }
         }
+        // One guard for the whole batch: if the client disconnects mid-collect,
+        // every still-outstanding prompt is aborted. Disarm each as it completes.
+        let mut guard = AbortGuard::with_rids(state.transport.clone(), rids.clone());
 
         let mut choices = Vec::with_capacity(rxs.len());
         let mut prompt_tokens = 0u32;
@@ -201,6 +211,7 @@ pub(super) async fn openai_completions(
                     Some(EgressItem::Done(out)) => {
                         acc.fold(&out);
                         let out = acc.into_output(out.rid);
+                        guard.disarm(rids[i]);
                         prompt_tokens += out.prompt_tokens;
                         completion_tokens += out.completion_tokens as u32;
                         choices.push(Choice {
@@ -212,6 +223,7 @@ pub(super) async fn openai_completions(
                         break;
                     }
                     Some(EgressItem::Error(e)) => {
+                        guard.disarm(rids[i]);
                         let code = StatusCode::from_u16(e.http_status())
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                         let body = serde_json::json!({
@@ -221,6 +233,7 @@ pub(super) async fn openai_completions(
                     }
                     Some(EgressItem::Control(_)) => continue,
                     None => {
+                        guard.disarm(rids[i]);
                         return (StatusCode::from_u16(499).unwrap(), "request aborted")
                             .into_response();
                     }
@@ -426,10 +439,12 @@ pub(super) async fn openai_chat_completions(
         input_ids: None,
         stream,
     });
-    let mut rx = match submit(&state, kind).await {
-        Ok(rx) => rx,
+    let (rid, mut rx) = match submit(&state, kind).await {
+        Ok(v) => v,
         Err(()) => return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response(),
     };
+    // Abort the request if the client disconnects (drops the SSE stream / handler).
+    let mut guard = AbortGuard::new(state.transport.clone(), rid);
 
     let id = format!("chatcmpl-{}", state.id_gen.next().0);
     let created = unix_secs();
@@ -522,6 +537,7 @@ pub(super) async fn openai_chat_completions(
                     EgressItem::Control(_) => break,
                 }
             }
+            guard.disarm(rid); // terminal reached → request finished, don't abort
             yield Ok(Event::default().data("[DONE]"));
         };
         Sse::new(s).into_response()
@@ -532,6 +548,7 @@ pub(super) async fn openai_chat_completions(
                 EgressItem::Frame(out) => acc.fold(&out),
                 EgressItem::Done(out) => {
                     acc.fold(&out);
+                    guard.disarm(rid);
                     // Non-streaming: split the full (reassembled) text in one pass.
                     let out = acc.into_output(out.rid);
                     let (content, reason) = match &reasoning {
@@ -569,6 +586,7 @@ pub(super) async fn openai_chat_completions(
                         .into_response();
                 }
                 EgressItem::Error(e) => {
+                    guard.disarm(rid);
                     let code = StatusCode::from_u16(e.http_status())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     let body = serde_json::json!({
@@ -579,6 +597,7 @@ pub(super) async fn openai_chat_completions(
                 EgressItem::Control(_) => continue,
             }
         }
+        guard.disarm(rid);
         (StatusCode::from_u16(499).unwrap(), "request aborted").into_response()
     }
 }
