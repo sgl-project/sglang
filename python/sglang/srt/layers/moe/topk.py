@@ -30,6 +30,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.runtime_context import get_parallel
 
@@ -344,6 +346,79 @@ def _make_round_robin_expert_ids(
     offsets = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(1)
     steps = torch.arange(topk, device=device, dtype=dtype).unsqueeze(0) * step
     return (offsets + layer_offset + steps) % num_experts
+
+
+@triton.jit
+def _simulate_balanced_routing_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    num_experts,
+    step,
+    inv_k,
+    seed,
+    layer_offset,
+    stride_im,
+    stride_ik,
+    stride_wm,
+    stride_wk,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    RANDOM: tl.constexpr,
+):
+    """One program per token: overwrite its top-k row with a balanced expert
+    assignment and uniform ``1/k`` weights in a single launch (fused benchmark
+    override)."""
+    t = tl.program_id(0)
+    j = tl.arange(0, BLOCK_K)
+    mask = j < K
+    if RANDOM:
+        base = (tl.rand(seed, t) * num_experts).to(tl.int32)
+    else:
+        base = t + layer_offset
+    gid = (base + j * step) % num_experts
+    tl.store(topk_ids_ptr + t * stride_im + j * stride_ik, gid, mask=mask)
+    tl.store(
+        topk_weights_ptr + t * stride_wm + j * stride_wk,
+        tl.full((BLOCK_K,), inv_k, tl.float32),
+        mask=mask,
+    )
+
+
+_simulate_uniform_seed = 0
+
+
+def _simulate_balanced_routing(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    *,
+    random: bool,
+    layer_id: Optional[int] = None,
+) -> None:
+    global _simulate_uniform_seed
+    num_tokens, k = topk_ids.shape
+    if num_tokens == 0 or k == 0:
+        return
+    seed = 0
+    if random:
+        seed = _simulate_uniform_seed
+        _simulate_uniform_seed += 1
+    _simulate_balanced_routing_kernel[(num_tokens,)](
+        topk_ids,
+        topk_weights,
+        num_experts,
+        max(num_experts // k, 1),
+        1.0 / k,
+        seed,
+        0 if layer_id is None else layer_id,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        K=k,
+        BLOCK_K=triton.next_power_of_2(k),
+        RANDOM=random,
+    )
 
 
 # -------------------------------- TopK ---------------------------------------
@@ -1830,34 +1905,15 @@ def select_experts(
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
         )
 
-    if simulate_uniform_experts:
-        # Benchmark-only: override gating with random-offset uniform expert assignment
-        # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
-        num_tokens, k = topk_ids.shape
-        num_experts = router_logits.shape[1]
-        if k > 0:
-            offsets = torch.randint(
-                0, num_experts, (num_tokens, 1), device=topk_ids.device
-            )
-            steps = torch.arange(k, device=topk_ids.device).unsqueeze(0)
-            step = max(num_experts // k, 1)
-            topk_ids = ((offsets + steps * step) % num_experts).to(topk_ids.dtype)
-            topk_weights = torch.ones_like(topk_weights) / k
-    elif simulate_round_robin_experts:
-        # Benchmark-only: override gating with deterministic expert assignment
-        # to avoid routing noise from dummy/random weights. Do NOT use in production.
-        num_tokens, k = topk_ids.shape
-        num_experts = router_logits.shape[1]
-        topk_ids = _make_round_robin_expert_ids(
-            num_tokens,
-            k,
-            num_experts,
-            device=topk_ids.device,
-            dtype=topk_ids.dtype,
+    if simulate_uniform_experts or simulate_round_robin_experts:
+        # Benchmark-only: fused single-kernel balanced override (see main commit).
+        _simulate_balanced_routing(
+            topk_ids,
+            topk_weights,
+            router_logits.shape[1],
+            random=simulate_uniform_experts,
             layer_id=layer_id,
         )
-        if k > 0:
-            topk_weights = torch.full_like(topk_weights, 1.0 / k)
 
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
