@@ -98,10 +98,8 @@ class ForwardMetadata:
     swa_attn_logits: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
-    # full-attention PHYSICAL out_cache_loc (unified-memory-pool write target). Mirror of
-    # swa_out_cache_loc for the full-attn KV store: eager carries the translated
-    # tensor; cuda-graph carries the capture-stable backend buffer view. None for
-    # non-unified memory pools (the pool then falls back to its per-call translate).
+    # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
+    # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
 
 
@@ -137,51 +135,31 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
-        # Split-KV EAGLE-verify kernel (ROCm/Triton). Registered here; enabled
-        # below once topk is known (the path is only valid at topk == 1).
+        # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
 
         # Parse args
         self.skip_prefill = skip_prefill
         max_bs = model_runner.req_to_token_pool.size
         self.sliding_window_size = model_runner.sliding_window_size
-        # Pool refs — captured at construction so they survive deletion of the
-        # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
-        # Pass-through to the Triton wrappers so they can extract 4-D KV
-        # view strides + specialize on PAGE_SIZE constexpr. At page_size=1
-        # the kernel branch is byte-identical to slot-based envelope.
-        # `model_runner.page_size` is set in ModelRunner.__init__ (defaults
-        # to 1 if `server_args.page_size` is None); using it here avoids
-        # the Optional[None] case on server_args.
+        # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
+        # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
-        # When the unified memory pool is enabled, req_to_token holds *virtual*
-        # slot ids; the attention kernels need *physical* slot ids. This is the
-        # virtual->physical translation hook (None — a no-op — otherwise).
-        # Used eagerly in `init_forward_metadata` (eager path) AND
-        # `init_forward_metadata_out_graph` (cuda-graph capture + replay-prep),
-        # so the captured graph contains ZERO translate nodes. `is not None`
-        # doubles as the unified-memory-pool gate (Invariant 2: a non-shared graph
-        # records no translate work).
+        # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
+        # kernels need PHYSICAL. Applied eagerly so the captured graph has no translate.
         self._translate_kv_loc = getattr(
             self.token_to_kv_pool_allocator, "translate_kv_loc", None
         )
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
-        # Split-KV verify matches extend_attention_fwd only when the EAGLE tree
-        # reduces to a pure-causal chain, i.e. topk == 1 (the same condition the
-        # aiter backend's unified-verify uses). For topk > 1 the tree custom_mask
-        # is not causal, so leave the path off and fall back to the baseline.
-        # gfx95-only (MI350X/CDNA4): the kernel uses ROCm/CDNA Triton launch hints
-        # (waves_per_eu, matrix_instr_nonkdim) and its block config is tuned and
-        # validated only on gfx950. NVIDIA's Triton rejects those kwargs, and the
-        # path is unvalidated on NV and on other AMD archs, so restrict it to gfx95
-        # and fall back to extend_attention_fwd everywhere else.
+        # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
+        # and is gfx95-only; else fall back to extend_attention_fwd.
         self.use_verify_splitkv = (
             is_gfx95_supported()
             and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
@@ -196,12 +174,9 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
         )
-        # The decode triton kernel derives attn_lse offsets from attn_logits
-        # strides via integer division by v_head_dim (the "// Lv" trick in
-        # _fwd_kernel_stage1/stage2), so attn_logits.shape[-1] must exactly
-        # match the layer's v_head_dim. For hybrid SWA models where SWA and
-        # full-attention layers use different v_head_dim (e.g. Gemma 4:
-        # swa=256, full=512), we allocate a second buffer for SWA layers.
+        # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
+        # to exactly match the layer's v_head_dim, so hybrid SWA models with
+        # differing SWA/full v_head_dim need a second buffer for SWA layers.
         full_v_head_dim = model_runner.model_config.v_head_dim
         swa_v_head_dim = model_runner.model_config.swa_v_head_dim
         if self.sliding_window_size is not None and swa_v_head_dim != full_v_head_dim:
@@ -234,13 +209,9 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len,
             )
             if _is_gfx942:
-                # gfx942 (MI300X / MI325X) has 304 CUs, so #20479's next_power_of_2(sm_count)
-                # rounds up to 512 — twice MI355X's natural cap of 256 — and the persistent
-                # cuda_graph_attn_logits fp32 buffer hits ~4 GiB on Kimi-K2.6 (v_head_dim=512),
-                # faulting in ROCm CUDA graph replay
-                # (https://github.com/sgl-project/sglang/actions/runs/25513282022/job/74877480809).
-                # Pin the cap at 256 so gfx942 matches the gfx950 (MI355X) behavior that we
-                # already validated end-to-end.
+                # gfx942's 304 CUs round up to 512 splits, doubling the persistent
+                # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
+                # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
                 self.max_kv_splits = min(self.max_kv_splits, 256)
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
@@ -252,18 +223,15 @@ class TritonAttnBackend(AttentionBackend):
             and model_runner.server_args.chunked_prefill_size == -1
         )
 
-        # Decide whether enable deterministic inference with batch-invariant operations
         self.enable_deterministic = (
             model_runner.server_args.enable_deterministic_inference
         )
 
-        # Configure deterministic inference settings
         if self.enable_deterministic:
-            # Use fixed split tile size for batch invariance
+            # Fixed split tile size for batch invariance
             self.split_tile_size = get_int_env_var(
                 "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
             )
-            # Set static_kv_splits to False to use deterministic logic instead
             self.static_kv_splits = False
         else:
             self.split_tile_size = (
@@ -275,14 +243,12 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
-        # Check arguments
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
         ), "Sliding window and cross attention are not supported together"
 
-        # Initialize buffers
-        # TODO(Jianan Ji): Make sure it behaves as expected when kv_indptr_buf is provided and sliding window is enabled
+        # TODO(Jianan Ji): verify behavior when kv_indptr_buf is provided and sliding window is enabled
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -290,8 +256,7 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.kv_indptr = kv_indptr_buf
 
-        # If sliding window is enabled, we might need two sets of buffers
-        # because of interleaved attention types (e.g. for Gemma3)
+        # Sliding window may need a second buffer for interleaved attention types
         self.window_kv_indptr = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indptr_buf is None:
@@ -299,7 +264,6 @@ class TritonAttnBackend(AttentionBackend):
                     (max_bs + 1,), dtype=torch.int32, device=model_runner.device
                 )
             else:
-                # When provided a buffer, create a clone for the second buffer
                 self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
 
         if not self.skip_prefill:
@@ -311,7 +275,6 @@ class TritonAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
-        # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
 
         self.cuda_graph_custom_mask = None
@@ -331,16 +294,13 @@ class TritonAttnBackend(AttentionBackend):
             num_group * num_seq == num_token
         ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
 
-        # Legacy dynamic splitting logic (non-deterministic)
         if (
             self.static_kv_splits or self.device_core_count <= 0
         ) and not self.enable_deterministic:
             num_kv_splits.fill_(self.max_kv_splits)
             return
 
-        # deterministic
         if self.split_tile_size is not None and self.enable_deterministic:
-            # expand seq_lens to match num_token
             if num_group > 1:
                 expanded_seq_lens = seq_lens.repeat_interleave(num_group)
             else:
@@ -379,9 +339,8 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices: Optional[torch.Tensor] = None,
         kv_start_idx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Build per-DCP-rank sharded KV indptr/indices. eager passes
-        # kv_indices=None (allocate a fresh tensor); the cuda-graph path passes
-        # a fixed address-stable buffer to fill in place.
+        # Build per-DCP-rank sharded KV indptr/indices. eager passes kv_indices=None
+        # (fresh tensor); cuda-graph passes an address-stable buffer to fill in place.
         dcp_lens = self._dcp_lens(lens, kv_start_idx)
         kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
         kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
@@ -439,10 +398,8 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
         if self.dcp_size > 1:
-            # DCP: kv_indptr cumsum and kv_indices are per-rank sharded. Write
-            # them into the same cuda-graph buffers that
-            # _build_cuda_graph_forward_metadata reads back
-            # (self.kv_indptr / self.cuda_graph_kv_indices).
+            # DCP: per-rank sharded; write into the same cuda-graph buffers
+            # _build_cuda_graph_forward_metadata reads back.
             _, _, dcp_seq_lens = self._dcp_kv_indices(
                 req_pool_indices,
                 seq_lens,
@@ -456,18 +413,15 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
             )
-            # Unified memory pool: `_fill_kv_indptr_and_indices` wrote VIRTUAL ids into
-            # `self.cuda_graph_kv_indices`. They are translated to PHYSICAL in
-            # `init_forward_metadata_out_graph` (eager, at replay-prep, reading
-            # the LIVE post-compaction v2p), so the captured graph carries zero
-            # translate nodes. No-op for non-unified memory pools.
+            # Unified pool: VIRTUAL ids written here are translated to PHYSICAL in
+            # init_forward_metadata_out_graph (replay-prep) so the captured graph
+            # carries zero translate nodes.
             num_kv_splits_lens = seq_lens
         window_kv_indptr = self.window_kv_indptr
         window_kv_lens = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            # Unified memory pool: leave the window VIRTUAL too — translated alongside the
-            # full kv_indices in `init_forward_metadata_out_graph`. Baseline SWA
-            # (no shared translate) keeps the eager build-time window translate.
+            # Unified pool: leave the window VIRTUAL too (translated alongside the
+            # full kv_indices later); baseline SWA keeps the eager window translate.
             window_kv_indptr, _, window_kv_lens, _ = update_sliding_window_buffer(
                 self.window_kv_indptr,
                 self.req_to_token,
@@ -488,12 +442,7 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         spec_info,
     ):
-        """Fill all cuda-graph buffers for target_verify mode.
-
-        Returns the ForwardMetadata components:
-        ``(qo_indptr, kv_indptr, custom_mask, mask_indptr,
-          window_kv_indptr, window_kv_indices, window_num_kv_splits, window_kv_offsets)``
-        """
+        """Fill all cuda-graph buffers for target_verify mode."""
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
             0,
@@ -555,13 +504,10 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        """Fill QO + KV cuda-graph buffers for draft_extend mode.
-
-        Returns (qo_indptr, kv_indptr, num_tokens_per_bs).
-        """
+        """Fill QO + KV cuda-graph buffers for draft_extend mode."""
         seq_lens = seq_lens[:bs]
-        # V2 draft-extend fills num_draft_tokens per req (the cuda-graph runner's
-        # token layout); num_steps+1 only equals that when topk == 1.
+        # V2 draft-extend fills num_draft_tokens per req; num_steps+1 only equals
+        # that when topk == 1.
         num_tokens_per_bs = (
             self.num_draft_tokens
             if forward_mode.is_draft_extend_v2()
@@ -575,17 +521,9 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        # DRAFT_EXTEND_V2: seq_lens = prefix + extend (bumped on the draft-extend path).
-        # Triton extend kernel receives extend K/V as separate tensors, so
-        # kv_indptr/kv_indices must cover only the prefix portion.
-        # extend_seq_lens_tensor is only attached to spec_info at real
-        # replay (eagle_draft_extend_cuda_graph_runner.replay); during the
-        # capture-time warmup it's absent, so fall back to zeros (matches
-        # the pre-unification capture path in #26651). Clamp at 0 because
-        # padded rows (raw_bs..bs) leave seq_lens at the fill value (1)
-        # while extend_seq_lens stays at num_tokens_per_bs, which would
-        # otherwise produce negative kv_lens; padded rows reference
-        # reserved req-pool slot 0 and their output is discarded.
+        # DRAFT_EXTEND_V2: kv_indptr/kv_indices cover only the prefix (extend K/V go
+        # separately). Capture warmup lacks extend_seq_lens_tensor -> fall back to
+        # zeros; clamp at 0 so padded rows (seq_lens==fill 1) don't go negative.
         if (
             spec_info is not None
             and getattr(spec_info, "extend_seq_lens_tensor", None) is not None
@@ -612,8 +550,8 @@ class TritonAttnBackend(AttentionBackend):
 
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
-            # Multi-step speculative decode: kv buffers come from spec_info
-            # rather than the cuda-graph pool, so replay is not involved.
+            # Multi-step spec decode: kv buffers come from spec_info, not the
+            # cuda-graph pool, so replay is not involved.
             if forward_mode.is_decode_or_idle() and spec_info is not None:
                 self.forward_metadata = ForwardMetadata(
                     attn_logits=self.cuda_graph_attn_logits,
@@ -640,8 +578,6 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
-            # Unified memory pool: eager v2p translate of the read/write loc buffers
-            # (full kv_indices, SWA window, out_cache_loc) — see method docstring.
             out_cache_loc_full_physical = self._translate_cuda_graph_shared_pool_locs(
                 forward_batch, bs
             )
@@ -668,9 +604,9 @@ class TritonAttnBackend(AttentionBackend):
     def _fill_cuda_graph_swa_out_cache_loc(
         self, forward_batch: ForwardBatch
     ) -> Optional[torch.Tensor]:
-        """Refill the SWA write-target buffer from the live out_cache_loc and
-        return the [:n] view (None for non-SWA / multi-step draft), so the
-        captured store reads fresh slots on replay."""
+        """Refill the SWA write-target buffer from live out_cache_loc, returning the
+        [:n] view (None for non-SWA / multi-step draft) so the captured store reads
+        fresh slots on replay."""
         if not self.use_sliding_window_kv_pool:
             return None
         out_cache_loc = forward_batch.out_cache_loc
@@ -689,26 +625,14 @@ class TritonAttnBackend(AttentionBackend):
     def _translate_cuda_graph_shared_pool_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
-        """Unified memory pool: eager virtual->physical translate of the cuda-graph
-        read + write LOC buffers, run in `init_forward_metadata_out_graph`
-        (capture AND replay-prep, i.e. BEFORE ``graph.replay()``), reading the
-        LIVE post-compaction v2p. The captured graph then carries ZERO translate
-        nodes (Invariant 2) and reads already-physical locs — mirroring
-        `_fill_cuda_graph_swa_out_cache_loc`. No-op for non-unified memory pools.
+        """Unified pool: eager v2p translate of the cuda-graph read+write LOC buffers,
+        run BEFORE graph.replay() reading the live post-compaction v2p, so the
+        captured graph carries zero translate nodes. No-op for non-unified pools.
 
-        The read buffers are translated IN PLACE (the metadata already points at
-        them):
-        - full-attention read: ``cuda_graph_kv_indices[:kv_indptr[bs]]``
-        - SWA window read: ``cuda_graph_window_kv_indices[:window_kv_indptr[bs]]``
-
-        The full-attention WRITE loc is RETURNED (like
-        `_fill_cuda_graph_swa_out_cache_loc`): ``out_cache_loc`` -> the
-        backend-owned ``cuda_graph_out_cache_loc_full_physical`` buffer; the caller
-        stores the ``[:n]`` view in ``ForwardMetadata.out_cache_loc_full_physical``
-        (-> ``KVWriteLoc.full_loc``). Returns None for non-unified memory pools.
-
-        Eager ``.item()`` bounds are fine here (runs out-of-graph), which is why
-        no GPU-bounded in-graph translate variant is needed.
+        Read buffers (full kv_indices, SWA window) are translated IN PLACE; the
+        full-attn WRITE loc is RETURNED as the [:n] view of the backend-owned
+        out_cache_loc_full_physical buffer. Eager .item() bounds are fine here
+        (out-of-graph), so no in-graph translate variant is needed.
         """
         if self._translate_kv_loc is None:
             return None
@@ -718,7 +642,7 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
                 self.cuda_graph_kv_indices[:n_kv]
             )
-        # SWA window read path (hybrid-SWA unified memory pools only).
+        # SWA window read path (hybrid-SWA unified pools only).
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             n_win = int(self.window_kv_indptr[bs].item())
             if n_win > 0:
@@ -728,15 +652,11 @@ class TritonAttnBackend(AttentionBackend):
                     )
                 )
         # Full-attention write path: translate out_cache_loc -> physical into the
-        # capture-stable buffer and RETURN the [:n] view (the decode cuda-graph
-        # out_cache_loc is always present and bs <= max_bs, so no guard needed).
+        # capture-stable buffer and RETURN the [:n] view.
         out_cache_loc = forward_batch.out_cache_loc
         n = out_cache_loc.shape[0]
-        # Zero the padded tail before refilling the head (mirrors
-        # _fill_cuda_graph_swa_out_cache_loc): a replay batch smaller than the
-        # captured bucket leaves [n:] holding stale physical ids, and the captured
-        # full-layer KV store writes those padded rows — send them to slot 0 (the
-        # reserved sink) instead of a stale live slot.
+        # Zero the padded tail first: a smaller replay batch leaves [n:] holding
+        # stale ids that the captured store would write; send them to slot 0 (sink).
         self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
         self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
             self._translate_kv_loc(out_cache_loc)
@@ -756,20 +676,17 @@ class TritonAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or spec_info.kv_indptr is None:
-                # kv_indptr is None for draft-extend's idle batch (no tree
-                # indices); build plain metadata from seq_lens.
+                # kv_indptr is None for draft-extend's idle batch; build from seq_lens.
                 if self.dcp_size > 1:
-                    # DCP: per-rank sharded KV indices (shares _dcp_kv_indices
-                    # with the cuda-graph path). Building full contiguous
-                    # indices here would make each rank read the whole KV
-                    # instead of its owner shard.
+                    # DCP: per-rank sharded KV indices, else each rank reads the
+                    # whole KV instead of its owner shard.
                     kv_indptr, kv_indices, _ = self._dcp_kv_indices(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
                         self.kv_indptr,
                     )
                 else:
-                    # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+                    # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
                     seq_lens_sum = forward_batch.seq_lens_sum
                     if seq_lens_sum is None:
                         seq_lens_sum = bs * self.max_context_len
@@ -784,7 +701,6 @@ class TritonAttnBackend(AttentionBackend):
                     )
                     if self._translate_kv_loc is not None:
                         kv_indices = self._translate_kv_loc(kv_indices)
-                # Sliding window
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
@@ -850,8 +766,7 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # Different with flashinfer kv_indptr and kv_indices construction.
-            # gpu_only: seq_lens_sum may be None; ub-allocate is safe (ragged write).
+            # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
                 seq_lens_sum = bs * self.max_context_len
@@ -866,7 +781,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                # window_kv_offsets is used to calculate the start position in custom mask
+                # window_kv_offsets gives the start position in custom mask
                 (
                     window_kv_indptr,
                     window_kv_indices,
@@ -903,8 +818,7 @@ class TritonAttnBackend(AttentionBackend):
                     self.kv_indptr,
                 )
             else:
-                # gpu_only leaves _cpu unset; ub-allocate is safe (ragged write
-                # from GPU tensor, extra tail unused).
+                # gpu_only leaves _cpu unset; over-allocate is safe (ragged write).
                 if forward_batch.extend_prefix_lens_cpu is not None:
                     kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
                 else:
@@ -922,7 +836,6 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 if self._translate_kv_loc is not None:
                     kv_indices = self._translate_kv_loc(kv_indices)
-            # Sliding window
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 (
                     window_kv_indptr,
@@ -947,8 +860,7 @@ class TritonAttnBackend(AttentionBackend):
             mask_indptr = None
             attn_logits = None
             attn_lse = None
-            # Caller usually supplies extend_seq_lens_cpu (eagle_info gpu_only
-            # sets host-constant mirror); defensive GPU-max fallback if not.
+            # Defensive GPU-max fallback when extend_seq_lens_cpu is absent.
             if forward_batch.extend_seq_lens_cpu is not None:
                 max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             else:
@@ -961,10 +873,8 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc
             )
 
-        # Unified memory pool: full-attention WRITE location (virtual out_cache_loc ->
-        # physical), the write-path companion of the read-path translate. Carried
-        # in the metadata (-> KVWriteLoc.full_loc); the pool never translates.
-        # None for non-unified memory pools (_translate_kv_loc is None).
+        # Unified pool full-attention WRITE loc (virtual out_cache_loc -> physical),
+        # carried in the metadata (-> KVWriteLoc.full_loc). None for non-unified pools.
         out_cache_loc_full_physical = None
         if (
             self._translate_kv_loc is not None
@@ -1082,10 +992,8 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         if self._translate_kv_loc is not None:
-            # Unified memory pool: full-attention write-target buffer, refilled at replay
-            # from out_cache_loc by `_translate_cuda_graph_shared_pool_locs`
-            # (-> ForwardMetadata.out_cache_loc_full_physical -> KVWriteLoc.full_loc).
-            # Backend-owned + capture-stable, mirroring cuda_graph_swa_out_cache_loc.
+            # Unified pool full-attention write-target buffer, refilled at replay
+            # (-> KVWriteLoc.full_loc). Capture-stable, mirrors cuda_graph_swa_out_cache_loc.
             self.cuda_graph_out_cache_loc_full_physical = torch.zeros(
                 (max_num_tokens,),
                 dtype=torch.int64,

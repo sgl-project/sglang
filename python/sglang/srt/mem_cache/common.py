@@ -87,11 +87,8 @@ def free_swa_out_of_window_slots(
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
 
     # Subtract an extra page_size so the eviction frontier never reaches the
-    # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
-    # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
-    # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
-    # may become tombstoned, causing SWA memory leak.
-    # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
+    # radix tree insert boundary, keeping >=1 page of non-evicted SWA KV for the
+    # tree to store as a non-tombstone node (else leaf nodes tombstone -> SWA leak).
     if drop_page_margin or envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
         evict_threshold = pre_len - sliding_window_size
     else:
@@ -220,9 +217,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if server_args.speculative_algorithm is None:
         return 1
 
-    # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per
-    # decode step (draft chain and verify block share the reservation).
-
+    # Spec decoding allocates max(topk * num_steps, num_draft_tokens) per decode step.
     spec_steps = server_args.speculative_num_steps or 1
     spec_topk = server_args.speculative_eagle_topk or 1
     spec_tokens = server_args.max_speculative_num_draft_tokens
@@ -234,10 +229,9 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if page_size == 1 or spec_topk == 1 or not spec_algo.has_draft_kv():
         return max(spec_steps * spec_topk, spec_tokens)
     else:
-        # page_size > 1 + topk > 1 (spec v2 tree): worst-case page-aligned tree
-        # footprint. Per topk branch needs ceil((last_page_len + num_steps) / page)
-        # pages; the partial tail page can be up to page_size - 1, and each branch
-        # gets its own (duplicated) copy -- so reserve for all topk branches.
+        # spec v2 tree (page>1, topk>1): worst-case page-aligned footprint per
+        # topk branch is ceil((page_size-1 + num_steps) / page) pages, each branch
+        # duplicated -- reserve for all topk branches.
         num_new_pages_per_topk = (
             (page_size - 1) + spec_steps + page_size - 1
         ) // page_size
@@ -256,12 +250,10 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
 def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     """req_to_token row headroom beyond the model context length.
 
-    Sized to hold the decode over-allocation (kv_committed_len +
-    get_alloc_reserve_per_decode). The spec v2 page>1 topk>1 holey draft footprint
-    can outgrow the default num_draft_tokens headroom (PR #26972).
+    Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
+    draft footprint can outgrow the default num_draft_tokens headroom.
     """
-    # FIXME(lsyin): this is the temporary fix for the context length issue when
-    # using speculative decoding
+    # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
     if (
         server_args.speculative_algorithm is not None
@@ -327,13 +319,8 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
 
 def _compute_dsv4_state_lens(batch, *, is_decode: bool):
-    """Per-req c{4,128}_state pool alloc lens (a ``DSV4StateLens``) for this
-    alloc step. The DSV4-NPU allocator owns the computation (it also mutates the
-    per-req cumulative state on each ``Req``); we just trigger it here, right
-    before the paged alloc that consumes the result.
-
-    None on CUDA / non-V4 paths (allocator has no ``compute_dsv4_state_lens_*``)
-    so the ``alloc_paged_token_slots_*`` forwarding stays a no-op.
+    """Per-req c{4,128}_state pool alloc lens (``DSV4StateLens``) for this step.
+    None on CUDA / non-V4 paths (allocator has no ``compute_dsv4_state_lens_*``).
     """
     allocator = batch.token_to_kv_pool_allocator
     if not hasattr(allocator, "compute_dsv4_state_lens_extend"):
@@ -371,8 +358,7 @@ def alloc_paged_token_slots_extend(
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Pass the per-req tables in per call for the c-pool / state last_loc
-        # lookup; the allocator holds no reference to the pool.
+        # Per-call per-req tables for the c-pool / state last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
         if dsv4_state_lens is not None:
@@ -417,24 +403,18 @@ def alloc_req_slots(
 ) -> list[int]:
     """Allocate request slots from the pool.
 
-    Fail-loud: raises ``RuntimeError`` if the pool can't satisfy the batch. The
-    scheduler's admission (``PrefillAdder``) is responsible for collecting the
-    correct available size so it never over-admits; an alloc failure here means
-    the admission budget was wrong (see the FIXME in
-    ``schedule_policy.PrefillAdder``) and should surface rather than be masked.
+    Fail-loud: raises ``RuntimeError`` if the pool can't satisfy the batch. An
+    alloc failure here means the admission budget (``PrefillAdder``) was wrong
+    and should surface rather than be masked.
     """
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        # Byte-coordinated availability: the shared `UnifiedMambaSlotAllocator`'s
-        # `schedulable_available_size` accounts for the peer (full) sub-pool's
-        # byte usage; the non-shared `MambaSlotAllocator` returns its plain slot
-        # free count (the two views coincide there).
+        # Byte-coordinated for the shared allocator (accounts for the peer full
+        # sub-pool's bytes); plain slot free count for the non-shared one.
         mamba_available_size = (
             req_to_token_pool.mamba_allocator.schedulable_available_size()
         )
-        # Best-effort eviction headroom asked of the tree cache: 3× (or the
-        # lazy-extra-buffer variant) for radix to leave room for COW, 1× for
-        # chunk.
+        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
         if tree_cache.supports_mamba():
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
@@ -459,12 +439,9 @@ def alloc_req_slots(
 
 
 def _alloc_page_size(batch: ScheduleBatch) -> int:
-    # DCP (HIP & CUDA only) swaps in a PagedTokenToKVPoolAllocator whose
-    # page_size is server_args.page_size * dcp_size, so it can be > 1 even when
-    # tree_cache.page_size (== server_args.page_size) is 1. Only on the HIP DCP
-    # path do we branch on the real allocator's page_size so the paged path is
-    # taken; everywhere else tree_cache.page_size is authoritative and the two
-    # are equal (dcp_size == 1), so behavior is unchanged.
+    # DCP swaps in an allocator whose page_size is server_args.page_size *
+    # dcp_size, so it can be > 1 even when tree_cache.page_size is 1; branch on
+    # the real allocator's page_size there. Elsewhere the two are equal.
     if (_is_hip or _is_cuda) and get_global_server_args().dcp_size > 1:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
@@ -502,8 +479,6 @@ def alloc_for_extend(
     if _alloc_page_size(batch) == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
-        # Since tree_cache.page_size is (page_size * dcp_world_size), for dcp
-        # on cuda platform, always use alloc_paged_token_slots_extend
         # Paged allocation - build last_loc
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
@@ -537,8 +512,7 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    # DSV4-NPU hook: write c4/c128/swa per-req tables from the stashed bundle.
-    # No-op on non-DSV4 paths (out_cache_loc_dsv4 stays None there).
+    # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
         maybe_write_dsv4_extend(
             batch,
@@ -572,8 +546,7 @@ def alloc_paged_token_slots_decode(
     extra_alloc_kwargs = {}
     if is_dsv4:
         extra_alloc_kwargs["req_pool_indices"] = req_pool_indices
-        # Per-call per-req tables for the last_loc lookup; the allocator holds
-        # no reference to the pool.
+        # Per-call per-req tables for the last_loc lookup.
         if batch is not None:
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
         if dsv4_state_lens is not None:
@@ -646,8 +619,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
-    # DSV4-NPU hook: post-decode write of c4/c128/swa per-req tables from the
-    # stashed bundle. No-op on non-DSV4 paths (out_cache_loc_dsv4 stays None).
+    # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
         maybe_write_dsv4_decode(
             batch,
@@ -711,8 +683,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
-    # The DSV4-NPU ReqToTokenPool subclass's free() additionally releases the
-    # c4/c128 state pages; other ReqToTokenPool subclasses are a no-op here.
+    # DSV4-NPU's free() also releases c4/c128 state pages; no-op for others.
     tree_cache.req_to_token_pool.free(req)
 
 

@@ -156,14 +156,10 @@ def build_replay_fb_view(
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-        # Expose the captured mamba-track registry slot (already filled with the
-        # runtime VIRTUAL ids by `buffer_registry.fill_from` above) as the
-        # virtual->physical translate SOURCE for the backend's
-        # `init_forward_metadata_out_graph` (the shared-KV-pool OPEN-6 fix). The
-        # backend copies the translated result into its own static buffer
-        # (ForwardMetadata.mamba_track_indices) and reads THAT in the decode
-        # track-save — this slot is never mutated. None when mamba-track is
-        # disabled; the backend guards on it.
+        # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
+        # for the backend, which copies the result into its own static buffer and
+        # reads THAT in the decode track-save — this slot is never mutated. None
+        # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
     )
@@ -713,10 +709,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
-        # No pool-side pin to clear: the captured full-physical write loc is
-        # bound via the backend's `ForwardMetadata.out_cache_loc_full_physical`
-        # (-> `KVWriteLoc.full_loc`); the eager path carries the same metadata
-        # field per batch.
+        # No pool-side pin to clear: the captured full-physical write loc rides the
+        # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
@@ -788,25 +782,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Graph-recordable metadata-prep hook (upstream #27091). The
-                # unified memory pool records ZERO translate nodes here: its full +
-                # SWA-window read translates and the out_cache_loc write translate
-                # all run EAGERLY in `init_forward_metadata_out_graph` (replay-prep,
-                # before graph.replay(), reading the LIVE v2p), so the captured
-                # graph reads already-physical locs. This is a base no-op for the
-                # triton backend; other backends (e.g. multi-step draft) may still
-                # override it.
+                # Graph-recordable metadata-prep hook. The unified memory pool
+                # records ZERO translate nodes here: all its read/write translates
+                # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
+                # the captured graph reads already-physical locs. Base no-op for triton.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
 
-                # NB: the old warmup `token_to_kv_pool.invalidate_loc_cache()`
-                # call is intentionally gone. It targeted upstream SWAKVPool's
-                # per-batch loc-translation cache (added by #25824), which
-                # upstream #27091 REMOVED (06-03, "drop pool caches" — unified
-                # the full->SWA translate into the metadata init). The phase-4
-                # base (06-08) includes #27091, so the method no longer exists on
-                # baseline SWAKVPool or (by inheritance) the shared SWA pool. The
-                # unified memory pool translates its locs in `init_forward_metadata_out_graph`
-                # instead, so no cache invalidation is needed.
+                # No invalidate_loc_cache() here: the unified pool translates its
+                # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -863,12 +846,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
-            # Full-physical write loc lives in the attention metadata and is
-            # filled by the backend's `init_forward_metadata_out_graph` (which
-            # stores `ForwardMetadata.out_cache_loc_full_physical`, its own
-            # capture-stable buffer -> `KVWriteLoc.full_loc`), so the runner does
-            # NOT wire a buffer here. (The SWA write loc rides the backend
-            # `swa_out_cache_loc` rail, consumed in `UnifiedSWAKVPool.set_kv_buffer`.)
+            # Full-physical write loc lives in the attention metadata (the backend's
+            # `out_cache_loc_full_physical` -> KVWriteLoc.full_loc), so the runner
+            # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)

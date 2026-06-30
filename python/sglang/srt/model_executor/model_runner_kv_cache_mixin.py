@@ -404,16 +404,11 @@ class ModelRunnerKVCacheMixin:
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
             mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
-            # Pass the model forward stream so the allocator's `free` can
-            # drop a `schedule_stream.wait_stream(forward_stream)` barrier
-            # at its top — required for correctness in overlap mode, where
-            # `pop_and_process` calls free while the in-flight forward is
-            # still reading v2p / reading+writing K/V slots that the eager
-            # compaction is about to relocate. A near-no-op in normal mode
-            # (sampling's CPU sync already drained forward_stream).
+            # Overlap mode: the allocator's `free` drops a wait_stream(forward_stream)
+            # barrier so eager compaction serializes after the in-flight forward's
+            # v2p/KV reads. Near-no-op in normal mode.
             forward_stream=self.forward_stream,
-            # Lazy compaction: default ON, with env var
-            # escape hatch for rollback / A/B.
+            # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
         )
         self.req_to_token_pool = bundle.req_to_token_pool
@@ -423,17 +418,13 @@ class ModelRunnerKVCacheMixin:
         self._unified_memory_pool = bundle.unified_memory_pool
 
     def _init_unified_swa_pools(self: ModelRunner, max_num_reqs: int):
-        """Build the shared-KV-pool stack for a hybrid-SWA model
-        (Triton backend): one byte buffer split between the full-attention
-        KV pool and the SWA-attention KV pool, with virtual slot ids above
-        the allocator."""
+        """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
+        buffer split between the full-attention and SWA KV pools."""
         from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 
         assert self.is_hybrid_swa, "_init_unified_swa_pools called on a non-SWA model"
-        # Both sub-pools are page-aware; the SWA composite runs
-        # `alloc_extend_kernel` once in virtual space and binds the new
-        # virtual pages on both sub-allocators (see
-        # UnifiedSWATokenToKVPoolAllocator.alloc_extend).
+        # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
+        # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         assert (
             not self.use_mla_backend
@@ -498,9 +489,8 @@ class ModelRunnerKVCacheMixin:
             swa_max_total_num_tokens=self.swa_max_total_num_tokens,
             enable_memory_saver=self.server_args.enable_memory_saver,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
-            # Same overlap-mode rationale as `_init_unified_mamba_pools`
-            # — the allocator's `free` drops a wait_stream(forward_stream) so
-            # eager compaction serializes after the in-flight forward kernels.
+            # Overlap mode: same wait_stream(forward_stream) rationale as
+            # `_init_unified_mamba_pools`.
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
@@ -514,13 +504,9 @@ class ModelRunnerKVCacheMixin:
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
-        # Shared-KV-pool fast path. Builds req_to_token_pool +
-        # token_to_kv_pool + token_to_kv_pool_allocator together from one
-        # shared byte buffer, then returns. Gated to the target worker
-        # (`req_to_token_pool is None` ⇒ not a draft worker sharing it);
-        # spec/disagg are asserted off for this feature in server_args.
-        # Supports hybrid Mamba (mambaish_config is not None) and hybrid SWA
-        # (is_hybrid_swa is True and not DSV4).
+        # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
+        # from one byte buffer, then return. Gated to the target worker
+        # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if (
             self.server_args.enable_unified_memory_pool
             and self.server_args.disaggregation_mode == "null"
@@ -532,10 +518,8 @@ class ModelRunnerKVCacheMixin:
             if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 self._init_unified_swa_pools(max_num_reqs)
                 return
-            # Fail loud instead of silently falling through to the normal pools
-            # (which would leave --enable-unified-memory-pool a no-op while only
-            # enable_page_major_kv_layout was forced). The feature replaces the
-            # statically-partitioned HYBRID pools only.
+            # Fail loud, not silently fall through to the normal pools (which would
+            # leave the flag a no-op). The feature replaces the HYBRID pools only.
             raise ValueError(
                 "--enable-unified-memory-pool only supports hybrid Mamba and "
                 "hybrid sliding-window-attention models (DeepSeek-V4 excluded); "

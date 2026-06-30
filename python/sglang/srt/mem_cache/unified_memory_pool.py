@@ -1,22 +1,11 @@
-"""UnifiedKVPool — one physical byte buffer shared by ≥2 sub-pools.
+"""UnifiedKVPool — one physical `uint8` byte buffer shared by 2 sub-pools.
 
-In short:
-
-* One `uint8` buffer (`UnifiedKVPool._raw`) is split dynamically between
-  sub-pools by `MultiEndedAllocator`s growing from opposite ends; `free` does
-  eager compaction so each pool's allocated byte range stays hole-free.
-* Per-slot layout is **slot/envelope-major** — a slot holds its data for all of
-  that pool's layers in one contiguous byte envelope — so freeing a slot vacates
-  a contiguous region the peer can grow into.
-* Everything above the allocator stores **virtual** slot IDs (immutable for the
-  slot's lifetime); the allocator keeps per-sub-pool `virtual_to_physical` /
-  `physical_to_virtual` tables. On compaction `p_src → p_dst` only those two
-  tables change — no reference rewriting. There is **no** `relocation_log` /
-  `SlotBacktrack` / binder machinery.
-
-Wires up the hybrid-Mamba family (`init_unified_mamba_pools`) and hybrid-SWA
-family (`UnifiedSWAKVPool` / `init_unified_swa_pools`). N>2 sub-pools / DSV4 and
-the disagg/spec bits are not implemented here yet.
+Two `MultiEndedAllocator`s grow from opposite ends; eager-compacting `free`
+keeps each pool's byte range hole-free. Layout is envelope-major (a slot's data
+for all its layers in one contiguous byte envelope) so a freed slot vacates a
+region the peer can grow into. Everything above the allocator stores virtual
+slot IDs; the allocator owns the per-sub-pool virtual<->physical tables and
+compaction only mutates those (no reference rewriting).
 """
 
 from __future__ import annotations
@@ -64,18 +53,13 @@ def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
     return kv_cache_dtype
 
 
-# ---------------------------------------------------------------------------
-# Sub-pool specs (pure per-slot layout math; no allocator/binder state)
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, kw_only=True)
 class SubPoolSpec(ABC):
     """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`."""
 
     name: str
     layer_num: int
-    grow_direction: str  # "up" or "down"
+    grow_direction: str  # "up" | "down"
 
     def __post_init__(self):
         assert self.grow_direction in (
@@ -86,28 +70,18 @@ class SubPoolSpec(ABC):
 
     @abstractmethod
     def entry_bytes(self) -> int:
-        """Bytes consumed by one slot across all `layer_num` layers of this pool."""
+        """Bytes for one slot across all `layer_num` layers."""
         raise NotImplementedError
 
     @abstractmethod
     def get_dtype(self) -> torch.dtype:
-        """The storage dtype of this sub-pool's KV data.
-
-        Used by ``MultiEndedAllocator`` to pass to its base init's
-        ``dtype`` field (informational; matches the upstream allocator's
-        ``self.dtype`` attribute). Subclasses with a single dtype return
-        it directly; subclasses with multiple dtypes (e.g., Mamba's
-        ``conv_dtype`` and ``temporal_dtype``) return the most
-        representative one — by convention the dtype of the dominant
-        state buffer (conv for Mamba) — and document the choice.
-        """
+        """Storage dtype (informational). Multi-dtype subclasses return the dominant buffer's."""
         raise NotImplementedError
 
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` may differ from
-    `head_dim` (matches `MHATokenToKVPool`); falls back to `head_dim` if None."""
+    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`."""
 
     head_num: int
     head_dim: int
@@ -133,48 +107,28 @@ class MHASubPoolSpec(SubPoolSpec):
     def entry_bytes(self) -> int:
         return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
 
-    # Page-major layer-major byte math.
-    # Within each page's ``page_size * entry_bytes`` block, K and V for each
-    # layer are grouped: page bytes =
-    #   [L0_K * page_size | L0_V * page_size | L1_K * page_size | ...].
-    # Across pages the layout stays envelope (page_bytes per page, preserving
-    # byte-frontier coordination between sub-pools).
-    #
-    # At ``page_size == 1`` this collapses to today's slot-major envelope —
-    # one page is one slot and the within-page block IS the per-slot
-    # ``[L0_K | L0_V | L1_K | L1_V | ...]`` envelope. Byte addresses are
-    # therefore byte-identical to slot-based envelope at ps=1.
+    # Page-major byte math: within a page block K/V group per layer
+    # [L0_K*ps | L0_V*ps | L1_K*ps | ...]; at ps==1 this collapses to the per-slot envelope.
 
     def page_bytes(self, page_size: int) -> int:
-        """Bytes per page (``page_size`` slots)."""
         return page_size * self.entry_bytes()
 
     def layer_k_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        """Byte offset (within one page) of layer ``layer_id``'s K block.
-
-        Layer L's K block starts at ``L * page_size * (k_row + v_row)``. At
-        ps=1 this is ``L * (k_row + v_row)`` — same as today's envelope.
-        """
         return layer_id * page_size * (self.k_row_bytes() + self.v_row_bytes())
 
     def layer_v_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        """Byte offset (within one page) of layer ``layer_id``'s V block.
-        Immediately after that layer's K block."""
         return (
             self.layer_k_offset_in_page(layer_id, page_size)
             + page_size * self.k_row_bytes()
         )
 
     def get_dtype(self) -> torch.dtype:
-        """Storage dtype of the MHA K/V buffers — single dtype shared by
-        both K and V (matches ``MHATokenToKVPool``'s contract)."""
         return self.store_dtype
 
 
 @dataclass(frozen=True, kw_only=True)
 class MambaSubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one Mamba-shaped sub-pool. `layer_num` = number of
-    Mamba layers whose state is held (≡ `MambaPool` `num_mamba_layers`)."""
+    """Per-slot layout of one Mamba-shaped sub-pool."""
 
     conv_state_shapes: Tuple[Tuple[int, ...], ...]  # one shape per conv tensor
     conv_dtype: torch.dtype
@@ -199,15 +153,7 @@ class MambaSubPoolSpec(SubPoolSpec):
         return total
 
     def get_dtype(self) -> torch.dtype:
-        """Mamba has two distinct dtypes: ``conv_dtype`` for conv state
-        buffers and ``temporal_dtype`` for the SSM temporal state. We
-        return ``conv_dtype`` as the representative — it's the dominant
-        state (one tensor per ``conv_state_shapes`` entry; temporal is
-        single) and matches the convention of ``MambaPool.dtype`` in
-        upstream. The temporal dtype is separately accessible via
-        ``temporal_dtype`` for callers that need it.
-        """
-        return self.conv_dtype
+        return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +162,8 @@ class MambaSubPoolSpec(SubPoolSpec):
 
 
 class UnifiedKVPool:
-    """One physical `uint8` byte buffer shared by 2 (eventually ≥2) sub-pools.
-
-    Each sub-pool exposes its per-layer K/V or conv/temporal tensors as strided
-    views into the raw buffer (envelope layout, anchored at byte 0). Allocators
-    coordinate to keep their byte ranges disjoint; this class does not track usage.
+    """One physical `uint8` byte buffer shared by 2 sub-pools, each exposing
+    strided per-layer views. Allocators keep byte ranges disjoint; no usage tracking here.
     """
 
     def __init__(
@@ -248,7 +191,7 @@ class UnifiedKVPool:
         self.device = device
         self.total_bytes = total_bytes
         self.sub_pool_specs = sub_pool_specs
-        self._page_size = page_size  # feeds _build_mha_views stride math
+        self._page_size = page_size
         self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
         }
@@ -258,18 +201,17 @@ class UnifiedKVPool:
         )
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self._raw = torch.empty(total_bytes, dtype=torch.uint8, device=device)
-        self._raw.zero_()  # unset slots read as zeros (matches non-shared behavior)
+        self._raw.zero_()  # unset slots must read as zeros (matches non-shared)
 
         self._max_slots: Dict[str, int] = {}
         self._anchor_bytes: Dict[str, int] = {}
         self._min_slot_index: Dict[str, int] = {}
-        # MHA views: (k_buffer, v_buffer); Mamba views: (conv_state_list, temporal_state)
+        # MHA: (k_buffer, v_buffer); Mamba: (conv_state_list, temporal_state)
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
 
-        # Slot-0 padding-write safety: every pool's slot-0 dummy writes land in
-        # raw bytes [0, entry_i). Their union is [0, entry_max). Each pool's first
-        # allocatable slot index is chosen so its real data starts at ≥ entry_max.
+        # Slot-0 dummy writes for both pools land in [0, entry_max); each pool's
+        # first allocatable slot is chosen so real data starts at >= entry_max.
         entry_max = max(s.entry_bytes() for s in sub_pool_specs)
 
         for spec in sub_pool_specs:
@@ -282,7 +224,7 @@ class UnifiedKVPool:
                     f"slots in {total_bytes} bytes, but min_slot_index={min_slot_index} "
                     f"leaves no room for real data. Increase total_bytes."
                 )
-            anchor = 0  # all anchors are 0 (uniform view construction)
+            anchor = 0
             self._max_slots[spec.name] = max_slots
             self._anchor_bytes[spec.name] = anchor
             self._min_slot_index[spec.name] = min_slot_index
@@ -357,8 +299,6 @@ class UnifiedKVPool:
     def mamba_views_for(self, name: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
         return self._mamba_views[name]
 
-    # -- view construction (envelope layout) --
-
     def _build_mha_views(
         self,
         spec: MHASubPoolSpec,
@@ -366,9 +306,6 @@ class UnifiedKVPool:
         max_slots: int,
         page_size: int,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Per-layer K/V views over the unified buffer in the page-major envelope
-        layout. The strided-view math lives in the layout module; the sub-pool's
-        ``anchor_bytes`` places its region inside the unified buffer."""
         return build_page_major_mha_views(
             self._raw,
             layer_num=spec.layer_num,
@@ -384,11 +321,6 @@ class UnifiedKVPool:
     def _build_mamba_views(
         self, spec: MambaSubPoolSpec, anchor_bytes: int, max_slots: int
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
-        """Per-slot envelope: [conv[0] rows × layers][conv[1] rows × layers]...
-        [temporal rows × layers]. Each returned view has shape
-        (num_layers, max_slots, *inner_shape) — matches `MambaPool.State.conv[i]`
-        / `.temporal` conventions.
-        """
         return build_page_major_mamba_views(
             self._raw,
             layer_num=spec.layer_num,
@@ -401,20 +333,11 @@ class UnifiedKVPool:
         )
 
 
-# ---------------------------------------------------------------------------
-# UnifiedMHATokenToKVPool — MHA pool whose buffers are views into a UnifiedKVPool
-# ---------------------------------------------------------------------------
-
-
 class UnifiedMHATokenToKVPool(MHATokenToKVPool):
-    """MHA KV pool whose `k_buffer` / `v_buffer` are strided views into a
-    `UnifiedKVPool`. Buffer lifetime is owned by the UnifiedKVPool;
-    relocation uses the native move (strided views break the tiled Triton kernel
-    that assumes stride == row bytes).
+    """MHA KV pool whose `k_buffer`/`v_buffer` are strided views into a `UnifiedKVPool`.
 
-    `set_kv_buffer` receives PHYSICAL slot ids (the full-physical
-    `KVWriteLoc.full_loc` / swa-physical `swa_out_cache_loc` resolved in the
-    attention metadata) and writes them directly — the pool never translates.
+    Relocation uses the native move (strided views break the tiled Triton kernel that
+    assumes stride == row bytes). `set_kv_buffer` gets PHYSICAL slot ids; never translates.
     """
 
     def __init__(
@@ -435,8 +358,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         self._sub_pool_name = sub_pool_name
         self._k_views = k_buffer
         self._v_views = v_buffer
-        # page_size for the 4-D view stride math in `_create_buffers` /
-        # `move_kv_cache` (the K/V strided views are TOKEN-granular).
         self._page_size = page_size
 
         super().__init__(
@@ -455,13 +376,10 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             enable_kv_cache_copy=False,  # strided views — force native move
         )
 
-    # -- buffer lifecycle overrides --
-
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
-        # data_ptrs / data_strides are populated for any external code that
-        # inspects them; we force the native move path so they are not consumed.
+        # For external inspectors only; the native move path doesn't consume them.
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -483,13 +401,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         pass
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # tgt_loc / src_loc are PHYSICAL slot ids (passed by the allocator's
-        # _compact_pending). Force the native move (strided views).
+        # tgt_loc/src_loc are PHYSICAL slot ids; native move only (strided views).
         if tgt_loc.numel() == 0:
             return
-        # Pass page_size so move_kv_cache_native takes the 4-D
-        # branch and splits token ids into (page_id, tok_in_page) when
-        # operating on layer-major views.
         with record_function("UnifiedMHA.move_kv_cache"):
             move_kv_cache_native(
                 self.k_buffer,
@@ -500,9 +414,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             )
 
     def get_kv_size_bytes(self):
-        # The unified buffer's total size is logged by UnifiedKVPool once;
-        # per-sub-pool accounting would double-count.
-        return 0, 0
+        return 0, 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
     def set_kv_buffer(
         self,
@@ -515,40 +427,15 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        # `dcp_kv_mask` is forwarded unconditionally by the parent
-        # `HybridLinearKVPool.set_kv_buffer` (default None). Decode context
-        # parallelism is not supported under the unified memory pool yet, so fail
-        # loud rather than silently ignore a real mask (which would write
-        # tokens this rank does not own).
+        # Decode context parallel (dcp_kv_mask) unsupported; fail loud.
         assert dcp_kv_mask is None, (
             "UnifiedMHATokenToKVPool.set_kv_buffer: decode context parallel "
             "(dcp_kv_mask) is not supported with --enable-unified-memory-pool."
         )
-        # Collapsed wrapper chain: this method does all the work in ONE
-        # frame and calls `store_cache_4d_kernel` directly, bypassing the
-        # Python launcher for the hot path. The standalone `store_cache_4d`
-        # wrapper in `utils.py` stays for any non-unified-memory-pool callers (and
-        # as a validated reference impl) — it is deliberately bypassed here
-        # for latency, since the contract is guaranteed by `_build_mha_views`.
-        #
-        # Always-bypass-super() write path.
-        # Why bypass `super().set_kv_buffer(...)`? The parent
-        # `MHATokenToKVPool.set_kv_buffer` routes through
-        # `_set_kv_buffer_impl` which calls `k_cache.view(-1, row_dim)`
-        # before invoking the `store_cache` Triton kernel. PyTorch's
-        # `view()` requires `stride[i] == shape[i+1] * stride[i+1]` for the
-        # dimensions being merged. Our 4-D layer-major view
-        # `(num_pages, page_size, head_num, head_dim)` has
-        # `stride[0] = page_bytes/itemsize` which doesn't satisfy that
-        # merge rule at page_size > 1; we use the same code path at
-        # page_size == 1 for consistency.
+        # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't
+        # merge our 4-D layer-major view (stride[0]=page_bytes) at page_size>1. Call
+        # store_cache_4d_kernel directly. `loc` is PHYSICAL token ids — no v2p translate.
         with record_function("UnifiedMHA.set_kv_buffer"):
-            # `loc` is PHYSICAL token ids: the write location is fully resolved in
-            # the attention metadata (`KVWriteLoc.full_loc` / the SWA pool's
-            # `swa_out_cache_loc`) before reaching here, so the pool does NO v2p
-            # translate and holds no allocator / location state.
-
-            # Step 1: replicate the parent's dtype-cast logic inline.
             if cache_k.dtype != self.dtype:
                 if k_scale is not None:
                     cache_k.div_(k_scale)
@@ -560,21 +447,12 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 cache_k = cache_k.view(self.store_dtype)
                 cache_v = cache_v.view(self.store_dtype)
 
-            # Step 3: write into the 4-D layer-major view via a single-launch
-            # Triton `store_cache_4d_kernel` (called directly; the Python
-            # wrapper `store_cache_4d` in `utils.py` is bypassed for latency
-            # since its validation asserts are guaranteed by `_build_mha_views`).
             layer_id = (
                 layer.layer_id if layer_id_override is None else layer_id_override
             ) - self.start_layer
             k_view = self.k_buffer[layer_id]
             v_view = self.v_buffer[layer_id]
             ps = self._page_size
-            # Inline store_cache_4d's body (kernel launch only). The contract —
-            # 4-D K/V views with stride(-1)==1 and stride(-2)==head_dim, 3-D
-            # cache_k/cache_v with matching batch dim — is guaranteed by
-            # `_build_mha_views` (K/V) and the model forward (cache_k/cache_v).
-            # Skipping the wrapper's validation asserts saves ~10-30 µs/call.
             N = loc.numel()
             if N == 0:
                 return
@@ -605,31 +483,12 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             )
 
 
-# ---------------------------------------------------------------------------
-# UnifiedMambaPool — Mamba state pool whose buffers are views into a UnifiedKVPool
-# ---------------------------------------------------------------------------
-
-
 class UnifiedMambaPool(MambaPool):
-    """Mamba state pool for the unified buffer — the VIRTUAL view.
+    """Mamba state pool whose conv/temporal state are strided views into a `UnifiedKVPool`.
 
-    `conv_state` / `temporal_state` are strided views into a `UnifiedKVPool`,
-    but this pool's public surface is virtual: every index-bearing method
-    (`clear_slots`, `copy_from`, `get_cpu_copy`, `load_cpu_copy`) receives
-    **virtual** slot ids (the upstream `req.mamba_pool_idx` contract). It does not
-    own slot lifecycle and does not know the virtual<->physical mapping — it
-    borrows the allocator's `translate` to resolve a virtual id the moment before
-    touching the buffer, holding no v2p logic of its own.
-
-    The PHYSICAL view — real slot alloc/free, the free-list/sizing, and the
-    bidirectional virtual<->physical mapping — lives in the attached
-    `UnifiedMambaSlotAllocator`. Mirrors upstream's `MambaPool` (state) /
-    `MambaSlotAllocator` (slots) split, and the unified memory pool/allocator split
-    where the allocator owns `translate_kv_loc`.
-
-    Does NOT call `super().__init__()` (that allocates fresh tensors). Replicates
-    the minimal `MambaPool` state against the unified buffer so inherited methods
-    work.
+    Pure PHYSICAL store: slot lifecycle and the v<->p mapping live in the attached
+    `UnifiedMambaSlotAllocator`. Does NOT call `super().__init__()` — replicates the
+    minimal `MambaPool` state against the unified buffer so inherited methods work.
     """
 
     def __init__(
@@ -660,13 +519,8 @@ class UnifiedMambaPool(MambaPool):
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
         self.num_mamba_layers = spec.layer_num
-        # Note: layer_transfer_counter is owned by HybridReqToTokenPool / MHA pools,
-        # NOT MambaPool — don't add it here.
-        # GDN/KDA ReplaySSM is not supported under the unified memory pool. Replicate
-        # the parent `MambaPool`'s disabled-state attributes so inherited code
-        # paths that read them unconditionally (e.g. `HybridReqToTokenPool.alloc`
-        # and `MambaRadixCache`, both guarded by `replayssm_write_pos is not
-        # None`) see a well-defined "disabled" pool instead of an AttributeError.
+        # GDN/KDA ReplaySSM unsupported; replicate parent's disabled-state attrs so
+        # paths guarded by `replayssm_write_pos is not None` don't AttributeError.
         self.enable_linear_replayssm = False
         self.linear_replayssm_cache_len = 16
         self.replayssm_write_pos = None
@@ -679,8 +533,8 @@ class UnifiedMambaPool(MambaPool):
             conv_views[0].shape[1] == self._max_size + 1
         ), f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
 
-        # Optional per-draft-token intermediate buffers — different outer size
-        # (spec_state_size+1), so NOT in the shared byte buffer; allocate locally.
+        # Per-draft-token intermediate buffers have a different outer size
+        # (spec_state_size+1), so they're NOT in the shared buffer; allocate locally.
         temporal_state_shape = spec.temporal_state_shape
         conv_state_shape = spec.conv_state_shapes
         conv_dtype = spec.conv_dtype
@@ -731,90 +585,57 @@ class UnifiedMambaPool(MambaPool):
             self.num_mamba_layers,
         )
 
-    # Pure PHYSICAL store: this pool holds no v<->physical mapping. The public
-    # state ops (copy_from / clear_slots / get_cpu_copy / load_cpu_copy) are
-    # inherited from MambaPool and operate on PHYSICAL slot ids. Callers resolve
-    # virtual->physical via the slot allocator before calling — the
-    # scheduler/backend/radix/compaction paths via
-    # `UnifiedHybridReqToTokenPool.translate_mamba_indices`, the HiCache offload
-    # path via `HybridLinearKVPool` (which threads the same translate).
+    # Inherited MambaPool state ops (copy_from/clear_slots/get_cpu_copy/load_cpu_copy)
+    # take PHYSICAL slot ids; callers translate via the slot allocator first.
 
     def _copy_from_physical(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        """Physical-slot copy — used by the allocator's `_compact_pending`
-        (which already holds physical ids)."""
+        # Physical-slot copy used by the allocator's `_compact_pending`.
         MambaPool.copy_from(self, src_index, dst_index)
 
 
-# ---------------------------------------------------------------------------
-# UnifiedMambaSlotAllocator — the PHYSICAL view (slot lifecycle + v<->p mapping)
-# ---------------------------------------------------------------------------
-
-
 class UnifiedMambaSlotAllocator:
-    """Mamba slot allocator for the unified memory pool — the PHYSICAL view.
+    """Mamba slot allocator (PHYSICAL view) for the unified memory pool.
 
-    Owns the physical side: real slot alloc/free, the free-list/sizing, and the
-    bidirectional virtual<->physical mapping (the ``translate``). Presents the
-    upstream ``MambaSlotAllocator`` interface that ``HybridReqToTokenPool``
-    (``alloc``/``free``/``clear``/``available_size``/``alloc_group_*``) and the
-    scheduler's invariant checker (``free_slots``/``size``) drive, backed by the
-    ``MultiEndedAllocator`` that id-owns the shared mamba sub-pool's slot space.
-    Because it owns ``translate`` (mirroring the KV allocator's
-    ``translate_kv_loc``), ``UnifiedMambaPool`` (the VIRTUAL view) needs no v2p
-    logic and just borrows it. Same pool(state)/allocator(slots) split upstream
-    made when it separated ``MambaPool`` from ``MambaSlotAllocator``.
-
-    ``alloc()`` returns VIRTUAL ids and does NOT clear state: clearing is
-    deferred to ``UnifiedMambaPool.clear_slots`` via the upstream
-    ``req.mamba_needs_clear`` path (``_execute_deferred_mamba_cow_and_clear``),
-    exactly as the non-shared ``MambaSlotAllocator`` + ``MambaPool.clear_slots``
-    pair works.
+    Owns slot alloc/free, sizing, and the v<->p mapping (``translate``), presenting the
+    upstream ``MambaSlotAllocator`` interface. ``alloc()`` returns VIRTUAL ids and does
+    NOT clear state — clearing is deferred to ``UnifiedMambaPool.clear_slots``.
     """
 
     def __init__(self, mea, max_size: int, device: str):
-        self._multi_ended_allocator = mea  # MultiEndedAllocator — id-owner + v2p table
-        self._max_size = max_size  # slot capacity (excludes reserved slot 0)
+        self._multi_ended_allocator = mea
+        self._max_size = max_size  # excludes reserved slot 0
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
 
-    # -- translation (owns the v<->p mapping; mirror of allocator.translate_kv_loc) --
+    # -- translation (owns the v<->p mapping) --
 
     def translate(self, virtual_ids: torch.Tensor) -> torch.Tensor:
-        """VIRTUAL mamba slot ids -> PHYSICAL slot ids. The mamba sub-allocator
-        is page_size==1 (1 slot == 1 page == 1 token), so this is a direct v2p
-        gather (no page math)."""
+        # VIRTUAL -> PHYSICAL slot ids; page_size==1, so a direct v2p gather.
         return self._multi_ended_allocator.virtual_to_physical[virtual_ids]
 
     @property
     def virtual_to_physical(self) -> torch.Tensor:
         return self._multi_ended_allocator.virtual_to_physical
 
-    # -- sizing / free-list (leak/invariant checker + alloc planner) --
+    # -- sizing / free-list --
 
     @property
     def size(self) -> int:
         return self._max_size
 
     def available_size(self) -> int:
-        """Slot-conservation free count (``max - allocated``) — the leak-check
-        view (``available + evictable + protected + session_held == size``).
-        NOT the planner value; use ``schedulable_available_size`` for that."""
+        # Slot-conservation count (max - allocated): the leak-check view, NOT the
+        # planner value (use schedulable_available_size for that).
         return self._max_size - self._multi_ended_allocator.allocated_count()
 
     def schedulable_available_size(self) -> int:
-        """Byte-coordinated free count — the ``>= N => alloc(N) succeeds``
-        contract used by ``common.alloc_req_slots``. Uses the MEA's
-        realizable-with-compaction view (peer drainable holes credited), so a
-        mamba-state admission is not starved when the shared gap is choked by
-        the full peer's uncompacted holes — ``alloc`` flushes the peer before
-        extending, so the credited capacity is obtainable."""
+        # Byte-coordinated count (>= N => alloc(N) succeeds); credits the peer's
+        # drainable holes since alloc flushes the peer before extending.
         return self._multi_ended_allocator.schedulable_available_size()
 
     @property
     def free_slots(self) -> torch.Tensor:
-        """Physical free-list (watermark-derived) read by the scheduler's
-        invariant checker. Mamba sub-allocator is page_size==1, so pages==slots;
-        assert it so a future paged-mamba change is caught, not silently wrong."""
+        # Watermark-derived physical free-list for the invariant checker.
         a = self._multi_ended_allocator
         assert a.page_size == 1, (
             "UnifiedMambaSlotAllocator.free_slots assumes page_size==1; got "
@@ -836,9 +657,7 @@ class UnifiedMambaSlotAllocator:
             slot = next(self._alloc_iter, None)
             if slot is not None:
                 return slot
-        return self._multi_ended_allocator.alloc(
-            need_size
-        )  # VIRTUAL ids; clearing deferred
+        return self._multi_ended_allocator.alloc(need_size)  # VIRTUAL ids
 
     def free(self, free_index: torch.Tensor):
         return self._multi_ended_allocator.free(free_index)
@@ -848,8 +667,7 @@ class UnifiedMambaSlotAllocator:
         return self._multi_ended_allocator.clear()
 
     def alloc_group_begin(self, num_reqs: int):
-        """Pre-allocate a batch (match_prefix amortization); ``alloc(1)`` then
-        draws from it. Mirror of ``MambaSlotAllocator.alloc_group_begin``."""
+        """Pre-allocate a batch that ``alloc(1)`` then draws from."""
         self._alloc_iter = None
         if num_reqs > 0:
             result = self._multi_ended_allocator.alloc(num_reqs)
@@ -871,19 +689,9 @@ class UnifiedMambaSlotAllocator:
         return self._multi_ended_allocator.allocator_state_str()
 
 
-# ---------------------------------------------------------------------------
-# UnifiedHybridReqToTokenPool — HybridReqToTokenPool whose MambaPool is shared
-# ---------------------------------------------------------------------------
-
-
 class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
-    """`HybridReqToTokenPool` whose `mamba_pool` is a `UnifiedMambaPool` aliasing a
-    shared byte buffer. Everything else (alloc/get_mamba_indices/free_mamba_cache/
-    ping-pong) is inherited unchanged — `req.mamba_pool_idx`,
-    `req_index_to_mamba_index_mapping` and `TreeNode.mamba_value` now hold VIRTUAL
-    mamba ids, which is exactly what they should hold. Adds `translate_mamba_indices`
-    for the attention backend's per-batch virtual->physical translation.
-    """
+    """`HybridReqToTokenPool` whose `mamba_pool` is a `UnifiedMambaPool`. The inherited
+    mamba-id state now holds VIRTUAL ids; adds `translate_mamba_indices` for v->p."""
 
     def __init__(
         self,
@@ -904,8 +712,9 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
     ):
         self._unified_buffer = unified_buffer
         self._mamba_sub_pool_name = mamba_sub_pool_name
-        # mamba_size matches UnifiedKVPool.max_slots - 1 (reserve slot 0).
-        self._shared_mamba_size = unified_buffer.max_slots(mamba_sub_pool_name) - 1
+        self._shared_mamba_size = (
+            unified_buffer.max_slots(mamba_sub_pool_name) - 1
+        )  # reserve slot 0
         super().__init__(
             size=size,
             mamba_size=self._shared_mamba_size,
@@ -935,39 +744,18 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
     ):
-        # `mamba_envelope_layout`, `speculative_eagle_topk`,
-        # `enable_linear_replayssm`, and `linear_replayssm_cache_len` are
-        # accepted to
-        # match the parent `HybridReqToTokenPool._init_mamba_pool` signature but
-        # NOT forwarded to `UnifiedMambaPool`. The unified memory pool's Mamba conv/
-        # temporal state are always envelope-strided VIEWS into the shared
-        # buffer (built in `init_unified_mamba_pools`), so the standalone-pool
-        # envelope flag does not apply. `speculative_eagle_topk`: in the base
-        # `MambaPool` it only sizes the conv-state
-        # ALLOCATION (the linear-vs-tree draft-chain shape), whereas the shared
-        # pool's conv/temporal state are VIEWS into the unified buffer whose shape
-        # is fixed by the `MambaSubPoolSpec` (built in `init_unified_mamba_pools`).
-        # So there is nothing to allocate here. (A future unified-memory-pool + eagle
-        # spec-decode config would thread it through the sub-pool spec instead.)
-        # Parent's contract: `mamba_size` is the source of truth for the mamba
-        # pool's slot count. Under the unified memory pool that source of truth is
-        # `UnifiedKVPool.max_slots("mamba") - 1` (= self._shared_mamba_size,
-        # which __init__ passed as `mamba_size`). Re-assert the equality so a
-        # future signature drift in the parent surfaces here, not later.
+        # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
+        # linear_replayssm_cache_len: accepted to match the parent signature but NOT
+        # forwarded — the shared pool's conv/temporal state are fixed-shape views.
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
             f"= {self._shared_mamba_size}"
         )
-        # `cache_params` is consumed indirectly via the UnifiedKVPool's
-        # MambaSubPoolSpec (built by init_unified_mamba_pools from the same
-        # cache_params). Sanity-check the layer count matches.
         assert len(cache_params.layers) >= len(mamba_layer_ids), (
             f"cache_params.layers ({len(cache_params.layers)}) cannot supply "
             f"{len(mamba_layer_ids)} mamba layer ids"
         )
-        # UnifiedMambaPool reads conv/temporal shapes from its sub-pool spec
-        # (unified_buffer.mamba_spec(mamba_sub_pool_name)).
         self.mamba_pool = UnifiedMambaPool(
             unified_buffer=self._unified_buffer,
             sub_pool_name=self._mamba_sub_pool_name,
@@ -976,32 +764,13 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
-        # `mamba_allocator` (the PHYSICAL view — a `UnifiedMambaSlotAllocator`
-        # wrapping the mamba `MultiEndedAllocator`) is wired in by the factory
-        # `init_unified_mamba_pools` AFTER the composite allocator has created and
-        # bound that MultiEndedAllocator (it does not exist yet at pool-init
-        # time). Set to None here so the attribute exists; nothing reads it
-        # before the factory wiring completes.
+        # Wired in by init_unified_mamba_pools once the mamba allocator exists.
         self.mamba_allocator = None
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
-        # `mamba_ckpt_pool` (phase-6 upstream addition): an OPTIONAL int8 mamba
-        # checkpoint pool the radix cache uses to hold cached prefix states in
-        # int8 instead of the active bf16 pool. The parent sets it via
-        # `maybe_init_int8_mamba_checkpoint_pool` (returns None unless the int8
-        # checkpoint server-arg is on). The unified memory pool keeps its mamba states in
-        # the shared byte buffer and does NOT use a separate int8 checkpoint pool,
-        # so set None — the parent's reset path guards on `is not None`
-        # (memory_pool.py: `if self.mamba_ckpt_pool is not None`), so None is the
-        # "feature off" state and the radix cache falls back to the normal path.
-        # (Enabling int8 checkpoint WITH the unified memory pool would be a separate
-        # feature to thread through `init_unified_mamba_pools`.)
-        self.mamba_ckpt_pool = None
+        self.mamba_ckpt_pool = None  # int8 ckpt pool unused; None = feature off
         self.device = device
-        # Mirror the parent's sizing: indexed by req_pool_idx, so by the
-        # req_to_token buffer's first dim — which is `self.size + 1`, NOT
-        # `self.size` (ReqToTokenPool reserves index 0 as the padding row;
-        # see ReqToTokenPool.__init__'s `_alloc_size = size + 1`). Using
-        # `self.size` directly here would under-size the mapping by one row.
+        # Sized by req_to_token's first dim (size + 1; row 0 is padding); self.size
+        # would under-size by one row.
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
@@ -1010,22 +779,15 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (req_pool_size, self.mamba_ping_pong_track_buffer_size),
-                    # int64 to match the parent: the alloc-path `index_put` source
-                    # `torch.stack(mamba_ping_pong_track_buffers)` is int64 and is
-                    # NOT cast (unlike `mamba_index_tensor`, which is cast to
-                    # int32), so an int32 destination raises
-                    # "Index put requires the source and destination dtypes match"
-                    # on the first radix prefill (enable_mamba_extra_buffer is set
-                    # by the radix cache, not chunk — hence radix-only).
+                    # int64 to match the parent's uncast index_put source (int32 dest
+                    # would dtype-mismatch on the first radix prefill).
                     dtype=torch.int64,
                     device=self.device,
                 )
             )
 
     def translate_mamba_indices(self, virtual_ids: torch.Tensor) -> torch.Tensor:
-        """Virtual per-request mamba ids -> physical slot ids. Called once per
-        batch by the linear-attention backend's metadata build. The v<->p mapping
-        lives in the allocator (the physical view) — delegate to it."""
+        """Virtual mamba ids -> physical slot ids."""
         return self.mamba_allocator.translate(virtual_ids).to(torch.int32)
 
 
@@ -1069,10 +831,7 @@ def init_unified_mamba_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
 ) -> UnifiedPoolBundle:
-    """Build the Mamba-hybrid unified-memory-pool stack: `UnifiedKVPool` (full + mamba
-    sub-pools), `UnifiedHybridReqToTokenPool` (with its `UnifiedMambaPool`),
-    `UnifiedMHATokenToKVPool` injected into a `HybridLinearKVPool`, and the
-    `UnifiedMambaTokenToKVPoolAllocator`."""
+    """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
     from sglang.srt.mem_cache.multi_ended_allocator import (
         UnifiedMambaTokenToKVPoolAllocator,
@@ -1081,18 +840,11 @@ def init_unified_mamba_pools(
     assert (
         not use_mla_backend
     ), "unified memory pool does not support MLA-hybrid-Mamba yet"
-    # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
-    # the mamba sub-pool stays page=1 because the Mamba state is per-request,
-    # orthogonal to per-token paging.
+    # Full sub-pool is page-aware; mamba stays page=1 (state is per-request).
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
-    # Layout convention: the full-attn KV sub-pool sits at the HIGH-byte end
-    # (grow-down, watermark retreats toward the gap) and the peer (mamba)
-    # sits at the LOW-byte end (grow-up, just above the slot-0 dummy sink).
-    # The two pools grow toward each other through the shared middle gap. All
-    # frontier/available_size math is direction-agnostic, so the assignment is
-    # a convention, not a correctness constraint (see MultiEndedAllocator).
+    # full-attn at the high-byte end (grow-down), mamba at the low-byte end (grow-up).
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),
@@ -1126,11 +878,7 @@ def init_unified_mamba_pools(
         unified_buffer=shared_pool,
         mamba_sub_pool_name="mamba",
         size=max_num_reqs,
-        # Mirror model_runner_kv_cache_mixin._init_pools: the parent's
-        # `mamba_spec_state_size` is `max_num_reqs` — it sizes the spec-decode
-        # intermediate-state buffers' outer dimension (one slot per concurrent
-        # request).
-        mamba_spec_state_size=max_num_reqs,
+        mamba_spec_state_size=max_num_reqs,  # outer dim of spec-decode intermediates
         max_context_len=model_context_len + extra_max_context_len,
         device=device,
         enable_memory_saver=enable_memory_saver,
@@ -1175,26 +923,13 @@ def init_unified_mamba_pools(
         lazy_compaction=lazy_compaction,
     )
 
-    # Build the mamba slot allocator (PHYSICAL view). The composite above created
-    # the mamba `MultiEndedAllocator` (`allocator.mamba_allocator`); it drives
-    # compaction directly via the pool's `_copy_from_physical` (a kvcache ref).
-    # Wrap that MEA in a `UnifiedMambaSlotAllocator` that presents the
-    # `MambaSlotAllocator` interface (alloc/free/clear/sizing/group) the inherited
-    # `HybridReqToTokenPool` + scheduler drive, and owns the virtual->physical
-    # `translate`. `_shared_mamba_size` excludes the reserved slot 0.
+    # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
     mamba_slot_allocator = UnifiedMambaSlotAllocator(
         allocator.mamba_allocator,
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
-    # The mamba pool is a pure PHYSICAL store: it holds no v<->physical mapping.
-    # `translate` lives ONLY here, and callers resolve virtual->physical before
-    # touching the pool — the scheduler/backend/radix/compaction paths via
-    # `req_to_token_pool.translate_mamba_indices` (which delegates to this
-    # allocator). The `_mamba_translate` hook wired below feeds the HiCache
-    # offload (`get_cpu_copy`) path, which is currently GATED OFF for the unified
-    # memory pool (ServerArgs._handle_unified_memory_pool asserts no
-    # hierarchical/lmcache), so the hook is wired for completeness but inert.
+    # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
 
@@ -1248,23 +983,10 @@ def init_unified_mamba_pools(
 class UnifiedSWAKVPool(SWAKVPool):
     """Shared-buffer replacement for `SWAKVPool`.
 
-    Composes two `UnifiedMHATokenToKVPool` instances (full + swa) that alias
-    the same physical byte buffer. Exposes the same interface as `SWAKVPool`
-    so downstream attention/kernel code is unchanged.
-
-    Inherits from `SWAKVPool` purely for the typing/contract relationship —
-    `isinstance(kvcache, SWAKVPool)` (and `BaseSWAKVPool`) is checked across
-    attention backends, disagg, models/utils. We do NOT call the parent
-    `__init__`: it would build static-partition `MHATokenToKVPool` instances,
-    which is exactly what the unified memory pool replaces. The attribute layout the
-    parent sets is replicated here against the unified buffer.
-
-    Rather than maintaining an explicit `full_to_swa_index_mapping` tensor,
-    this architecture exposes `translate_loc_from_full_to_swa` directly
-    through the swa sub-allocator's
-    `virtual_to_physical` table — the per-sub-pool v2p IS the mapping.
-    `register_mapping(...)` becomes a no-op (the API surface is kept for
-    `BaseSWAKVPool` ABC compatibility).
+    Composes two `UnifiedMHATokenToKVPool` instances (full + swa) aliasing the same
+    byte buffer. Inherits from `SWAKVPool` only for `isinstance`; does NOT call the
+    parent `__init__` (it would build static-partition pools). The per-sub-pool v2p
+    table IS the full->swa mapping, so `register_mapping` is a no-op.
     """
 
     def __init__(
@@ -1278,31 +1000,20 @@ class UnifiedSWAKVPool(SWAKVPool):
         end_layer: Optional[int] = None,
         enable_memory_saver: bool = False,
     ):
-        # NOTE: do NOT call `super().__init__(...)`. The SWAKVPool body would
-        # allocate two static-partition MHA pools; we replace those with views
-        # into the unified buffer here.
+        # Do NOT call super().__init__ — it would allocate static-partition pools.
         self.unified_buffer = unified_buffer
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = start_layer if start_layer is not None else 0
-        # Propagate page_size through to the inner UnifiedMHATokenToKVPool
-        # views (which translate virtual TOKEN ids → physical TOKEN ids via
-        # page math when page_size > 1).
         self.page_size = page_size
         self.layer_transfer_counter = None
 
-        # The parent class exposes `size` / `size_swa` as plain attributes
-        # (set in its __init__). Match that contract — these values are
-        # constants of the UnifiedKVPool, fixed at allocation time.
         self.size = unified_buffer.max_slots("full") - 1
         self.size_swa = unified_buffer.max_slots("swa") - 1
 
         full_spec = unified_buffer.mha_spec("full")
         swa_spec = unified_buffer.mha_spec("swa")
-        # `dtype` is read from MHASubPoolSpec.store_dtype; both sub-pools share
-        # the same store_dtype in the standard configurations we support
-        # (asymmetric store_dtype across full/swa is not a supported case).
         assert full_spec.store_dtype == swa_spec.store_dtype, (
             "UnifiedSWAKVPool: full and swa sub-pools must share store_dtype; got "
             f"full={full_spec.store_dtype}, swa={swa_spec.store_dtype}"
@@ -1327,8 +1038,7 @@ class UnifiedSWAKVPool(SWAKVPool):
             end_layer=end_layer,
         )
 
-        # for disagg with nvlink — currently disabled in unified-memory-pool, but keep
-        # the attributes present so any caller reading them doesn't AttributeError.
+        # disagg/nvlink disabled; keep attrs present to avoid AttributeError.
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
 
@@ -1339,19 +1049,12 @@ class UnifiedSWAKVPool(SWAKVPool):
         for idx, gid in enumerate(swa_attention_layer_ids):
             self.layers_mapping[gid] = (idx, True)
 
-        # `full_to_swa_index_mapping` is the "is the non-shared SWA mapping
-        # registered?" signal in `SWAKVPool.set_kv_buffer` /
-        # `translate_loc_from_full_to_swa`. Under shared mode we leave it
-        # `None` and provide our own overrides that consult the swa
-        # sub-allocator's v2p table instead.
+        # None so dispatch routes through our v2p-table overrides, not a registered mapping.
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
 
-        # The unified buffer's total size is logged by UnifiedKVPool — set a
-        # cosmetic 0 here to avoid double-counting in any aggregator.
-        self.mem_usage = 0.0
+        self.mem_usage = 0.0  # cosmetic; UnifiedKVPool logs the real size
 
-        # Allocator handles wired in via `attach_allocators` from the composite
-        # allocator's __init__.
+        # Wired in via attach_allocators.
         self._full_allocator = None
         self._swa_allocator = None
 
@@ -1370,36 +1073,17 @@ class UnifiedSWAKVPool(SWAKVPool):
     # -- allocator wiring --
 
     def attach_allocators(self, *, full_allocator, swa_allocator) -> None:
-        """Wire the two `MultiEndedAllocator`s whose `virtual_to_physical`
-        tables this pool uses to translate slot ids."""
+        """Wire the two `MultiEndedAllocator`s whose v2p tables translate slot ids."""
         self._full_allocator = full_allocator
         self._swa_allocator = swa_allocator
 
     # -- BaseSWAKVPool ABC surface --
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
-        # No-op in shared mode (allocator's swa-side v2p IS the mapping). Keep
-        # `full_to_swa_index_mapping` None so the parent's `set_kv_buffer`
-        # dispatch routes through our overrides.
-        return
+        return  # no-op in shared mode (the swa-side v2p IS the mapping)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa-physical token ids (int32).
-
-        Differs from non-shared ``SWAKVPool.translate_loc_from_full_to_swa``
-        in INPUT semantics (virtual, not full-physical), but the OUTPUT is
-        the same swa-physical-token-id int32 contract the downstream
-        consumers expect.
-
-        For ``page_size == 1``: direct v2p lookup (the v2p table is
-        slot-granular == token-granular).
-        For ``page_size > 1``: page math —
-        ``virt_pages = kv_indices // page_size``,
-        ``offsets = kv_indices % page_size``,
-        ``swa_phys_pages = swa.v2p_page[virt_pages]``,
-        result ``= swa_phys_pages * page_size + offsets``.
-        Mirrors ``UnifiedSWATokenToKVPoolAllocator.translate_loc_from_full_to_swa``.
-        """
+        """Virtual token ids -> swa-physical token ids (int32)."""
         assert self._swa_allocator is not None, (
             "UnifiedSWAKVPool.translate_loc_from_full_to_swa called before "
             "attach_allocators"
@@ -1418,16 +1102,12 @@ class UnifiedSWAKVPool(SWAKVPool):
     # -- size/info --
 
     def get_kv_size_bytes(self):
-        # The unified buffer's bytes are logged by UnifiedKVPool; don't
-        # double-count by returning per-side sizes here.
-        return 0, 0
+        return 0, 0  # UnifiedKVPool logs the total; per-side would double-count
 
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
 
-    # -- buffer accessors (verbatim from SWAKVPool, but without _wait_for_layer
-    # double-counting — counter wait is delegated to the inner UnifiedMHATokenToKVPool
-    # via register_layer_transfer_counter) --
+    # -- buffer accessors --
 
     def get_key_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
@@ -1458,24 +1138,15 @@ class UnifiedSWAKVPool(SWAKVPool):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
-        """Route to the right sub-pool, mirroring `SWAKVPool.set_kv_buffer`.
-
-        `loc_info` bundles the full (virtual) write loc and the pre-translated
-        SWA write loc (`forward_metadata.swa_out_cache_loc`), produced once per
-        forward by the attention backend — eager via `init_forward_metadata`,
-        cuda graph via `cuda_graph_swa_out_cache_loc` (refilled at replay). SWA
-        layers write the already-swa-physical `swa_loc` directly; full layers
-        write the full-physical `full_loc` carried in the write metadata. Both
-        are PHYSICAL — the pool never translates."""
+        """Route to the right sub-pool. Both `swa_loc` and `full_loc` are PHYSICAL
+        (pre-translated once per forward by the attention backend); never translates here.
+        """
         _, swa_loc, full_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
-            # `swa_loc` is ALREADY swa-physical (the backend's `swa_out_cache_loc`
-            # rail); the pool writes physical locs directly. Routed through the
-            # UnifiedMHATokenToKVPool override (NOT the grandparent
-            # `MHATokenToKVPool`) because its 4-D LAYER_MAJOR view can't take the
-            # parent's `k_cache.view(-1, row_dim)`.
+            # swa_loc is ALREADY swa-physical. Routed through the UnifiedMHATokenToKVPool
+            # override (its 4-D layer-major view can't take the parent's view(-1, row_dim)).
             assert swa_loc is not None, (
                 "UnifiedSWAKVPool.set_kv_buffer: SWA layer received no swa_loc; the "
                 "attention backend must bundle forward_metadata.swa_out_cache_loc."
@@ -1490,11 +1161,7 @@ class UnifiedSWAKVPool(SWAKVPool):
                 layer_id_override=pool_layer_id,
             )
             return
-        # Full layer. The full-PHYSICAL write loc is carried in the write metadata
-        # (`KVWriteLoc.full_loc`, from the attention backend's
-        # `ForwardMetadata.out_cache_loc_full_physical` — translated once per
-        # forward and tombstone-clamped by `translate_kv_loc`). The unified memory pool
-        # always precomputes it (eager + cuda-graph capture), so it must be present.
+        # Full layer: full_loc is full-physical, always precomputed (eager + cuda-graph).
         assert full_loc is not None, (
             "UnifiedSWAKVPool.set_kv_buffer: full layer received no full_loc; "
             "ForwardMetadata.out_cache_loc_full_physical must be precomputed for "
@@ -1511,11 +1178,8 @@ class UnifiedSWAKVPool(SWAKVPool):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Should never be called on the composite — compaction operates
-        # per-sub-pool via `UnifiedMHATokenToKVPool.move_kv_cache` directly
-        # (each `MultiEndedAllocator._compact_pending` calls
-        # `getattr(self._kvcache, "move_kv_cache", None)` where
-        # `self._kvcache` is the per-sub-pool view, not this composite).
+        # Never called on the composite — compaction runs per-sub-pool via
+        # UnifiedMHATokenToKVPool.move_kv_cache.
         raise NotImplementedError(
             "UnifiedSWAKVPool.move_kv_cache should not be called; compaction "
             "operates per-sub-pool via UnifiedMHATokenToKVPool.move_kv_cache."
@@ -1527,15 +1191,8 @@ class UnifiedSWAKVPool(SWAKVPool):
     def _virt_tokens_to_phys_tokens(
         virt_tokens: torch.Tensor, allocator
     ) -> torch.Tensor:
-        """Translate virtual TOKEN ids → physical TOKEN ids on the given
-        sub-allocator. Page-aware: when ``allocator.page_size > 1``, applies
-        the `virt_page * page_size + offset` math.
-
-        Returns ``-1`` for any input whose virtual page is unbound (i.e.
-        ``v2p_page[virt_page] == -1``) — propagated as ``-1 * page_size +
-        offset``, but callers (HiCache) filter out negatives via
-        ``swa_phys >= 0`` so this is safe.
-        """
+        """Virtual TOKEN ids -> physical TOKEN ids (page-aware). Unbound pages yield
+        negatives; callers filter via `swa_phys >= 0`."""
         ps = allocator.page_size
         if ps == 1:
             return allocator.virtual_to_physical[virt_tokens]
@@ -1547,9 +1204,7 @@ class UnifiedSWAKVPool(SWAKVPool):
     def get_cpu_copy(self, indices, mamba_indices=None):
         assert self._full_allocator is not None
         assert self._swa_allocator is not None
-        # `indices` are virtual TOKEN ids; translate per sub-pool with the
-        # same page math as `translate_loc_from_full_to_swa` so the produced
-        # physical token ids are correct at any page_size.
+        # `indices` are virtual TOKEN ids; translate per sub-pool.
         full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
         swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
         full_cpu = self.full_kv_pool.get_cpu_copy(full_phys)
@@ -1567,11 +1222,6 @@ class UnifiedSWAKVPool(SWAKVPool):
             assert self._swa_allocator is not None
             swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
             self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
-
-
-# ---------------------------------------------------------------------------
-# Factory — SWA bundle
-# ---------------------------------------------------------------------------
 
 
 class UnifiedSWAPoolBundle(NamedTuple):
@@ -1602,19 +1252,13 @@ def init_unified_swa_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
 ) -> UnifiedSWAPoolBundle:
-    """Build the SWA-hybrid unified-memory-pool stack: `UnifiedKVPool` (full + swa
-    sub-pools), `UnifiedSWAKVPool` (composite KV cache), and
-    `UnifiedSWATokenToKVPoolAllocator`."""
+    """Build the SWA-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
         UnifiedSWATokenToKVPoolAllocator,
     )
 
-    # Both sub-allocators are page-aware (one virtual ID space at PAGE
-    # granularity, two physical-holding sub-pools that compact pages
-    # independently). The
-    # kernel-once-in-virtual-space discipline in
-    # `UnifiedSWATokenToKVPoolAllocator.alloc_extend` preserves the upstream
-    # tail-page-reuse contract across both sub-pools.
+    # Both sub-allocators are page-aware: one virtual ID space at PAGE granularity,
+    # two physical sub-pools compacting pages independently.
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
     assert (
         len(full_attention_layer_ids) > 0
@@ -1624,9 +1268,7 @@ def init_unified_swa_pools(
     ), "SWA-hybrid with zero SWA-attention layers is degenerate"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
-    # Layout convention (mirrors the mamba builder): full-attn KV at the
-    # HIGH-byte end (grow-down), the SWA peer at the LOW-byte end (grow-up).
-    # Both grow toward the shared middle gap; the math is direction-agnostic.
+    # full-attn at the high-byte end (grow-down), swa at the low-byte end (grow-up).
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),

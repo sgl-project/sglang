@@ -497,21 +497,11 @@ class PrefillAdder:
         self.rem_swa_token_offset = 0
 
         # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
-        # that `rem_total_tokens` (full KV) otherwise counts as free. Reserve
-        # that gap per new mamba slot so admission can't over-commit (the
-        # chunk-normal over-admit). Cost stays 0 for the non-unified allocator
-        # (separate pools — a mamba slot costs no full-KV bytes), keeping the
-        # baseline path byte-identical.
-        #
-        # Gate on the ALLOCATOR being the unified Mamba composite
-        # (UnifiedMambaTokenToKVPoolAllocator — the only allocator with this gap),
-        # NOT on `is_hybrid_ssm_cache` (= `tree_cache.supports_mamba()`): the latter
-        # is False for `ChunkCache` (only `MambaRadixCache` returns True), which
-        # would silently skip the reservation on the chunk-cache path and let
-        # prefill over-admit the shared gap → "Prefill out of memory" at the
-        # mfs0.30 corner. The gap coupling is a property of the byte buffer, not
-        # of whether the prefix cache caches mamba states, so both chunk and
-        # radix unified Mamba pools must reserve.
+        # that `rem_total_tokens` (full KV) otherwise counts as free, so reserve
+        # the gap per new mamba slot or admission over-commits. Gate on the
+        # ALLOCATOR being the unified Mamba composite, NOT on `is_hybrid_ssm_cache`
+        # (False for `ChunkCache`, which would skip the reservation on the
+        # chunk-cache path): the gap coupling is a property of the byte buffer.
         self._mamba_slot_cost = 0
         if isinstance(
             self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
@@ -520,16 +510,12 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
             )
 
-        # The `mamba_gap_reserve` above is charged to `rem_total_tokens`, which
-        # INCLUDES `full_evictable_size()` — so admission could let full-attn
-        # evictable bytes "cover" a new mamba slot. But `alloc_req_slots` can only
-        # recover MAMBA-side bytes for a mamba slot: the shared gap + peer-
-        # compaction holes (`mamba_allocator.schedulable_available_size()`) plus
-        # mamba-evictable radix entries (`tree_cache.mamba_evictable_size()`) — NOT
-        # full evictable bytes (its eviction asks only for `mamba_num`). So gate
-        # new mamba slots on this mamba-recoverable budget too; otherwise an
-        # over-admit hits the fail-loud `RuntimeError` in `alloc_req_slots`. `None`
-        # (no extra gate) outside the unified Mamba pool.
+        # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
+        # `full_evictable_size()` — but `alloc_req_slots` can only recover
+        # MAMBA-recoverable bytes for a mamba slot (shared gap + peer holes +
+        # mamba-evictable radix), NOT full-evictable. Gate new mamba slots on
+        # that mamba-recoverable budget separately or an over-admit hits the
+        # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
             self.rem_mamba_slots = (
@@ -646,26 +632,16 @@ class PrefillAdder:
         return budget
 
     def _mamba_gap_budget_for_req(self, req: Req) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's
-        mamba state. Only the SHARED Mamba pool couples mamba into the full gap
-        (`self._mamba_slot_cost > 0`); a new state is needed only when the req
-        has none yet (`mamba_pool_idx is None` — mirrors
-        `HybridReqToTokenPool.alloc`, so a chunked-prefill continuation or a
-        radix state-reuse that won't allocate is not charged). 0 otherwise,
-        which keeps the baseline / SWA / non-Mamba paths unchanged.
+        """Shared-gap reservation (full-token-equivalents) for a request's new
+        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
+        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
+        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
 
-        NOTE(unified-memory-pool): this is a CONSERVATIVE (not exact) estimate, by
-        design. `_mamba_slot_cost` (`mamba_slot_full_token_cost`) rounds the
-        per-slot byte cost UP, so each new-mamba req over-reserves slightly rather
-        than under-reserve — keeping admission within the joint gap for the
-        baseline `alloc(1)` per req. It does NOT separately reserve the radix COW
-        headroom (1-2 extra slots for branching reqs) or model locked-but-
-        evictable bytes / compaction timing; that residual is backstopped by the
-        fail-loud RuntimeError in `alloc_req_slots`. FIXME: if over-admission
-        crashes are observed under pressure, make this MORE conservative (e.g.
-        multiply by the eviction factor `MAMBA_STATE_PER_REQ_PREFIX_CACHE`),
-        trading some concurrency for headroom — a conservative over-estimate is
-        sufficient; an exact estimate is not required."""
+        Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
+        radix COW headroom or locked-but-evictable bytes — that residual is
+        backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
+        over-admission crashes under pressure, make this more conservative (e.g.
+        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
         if self._mamba_slot_cost and req.mamba_pool_idx is None:
             return self._mamba_slot_cost
         return 0
@@ -677,10 +653,8 @@ class PrefillAdder:
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
-        # A new mamba slot needs mamba-recoverable bytes (shared gap + peer holes +
-        # mamba-evictable), which EXCLUDE full_evictable — gate it separately so
-        # rem_total_tokens' full_evictable can't admit a mamba slot the alloc
-        # can't realize (see __init__).
+        # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
+        # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
         if not no_token and self.rem_mamba_slots is not None:
             no_token = self.rem_mamba_slots <= 0
         if no_token:
@@ -711,21 +685,18 @@ class PrefillAdder:
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
-        # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the
-        # new mamba state's shared-gap cost to BOTH full budgets so admission
-        # stays within the joint budget — the slot is allocated immediately
-        # (`alloc_req_slots`), so it consumes `cur_rem` too, and held for the
-        # request lifetime, so it counts against `rem_total`. See
-        # `_mamba_gap_budget_for_req`.
+        # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
+        # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
+        # immediately (counts against `cur_rem`) and held for the request lifetime
+        # (counts against `rem_total`). See `_mamba_gap_budget_for_req`.
         self.rem_total_token_offset += (
             extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
         )
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
         )
-        # A new mamba slot (`mamba_gap_reserve > 0`) consumes one mamba-recoverable
-        # slot — gated separately from rem_total_tokens so full_evictable can't
-        # cover it (see __init__).
+        # The new mamba slot also consumes one mamba-recoverable slot (gated
+        # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
             self.rem_mamba_slots -= 1
         self.rem_input_tokens -= extend_input_len
@@ -883,9 +854,8 @@ class PrefillAdder:
             req.prefix_indices
         )
         paged_input = self.ceil_paged_tokens(cand_extend_input_len)
-        # Shared Mamba pool: the request's new mamba state also draws on the
-        # shared gap (full-token-equivalents); fold it into the budget gate so
-        # admission can't over-commit (0 for baseline / non-Mamba).
+        # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
+        # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
@@ -1018,11 +988,9 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Reserve page_size for page-alignment overhead. The paged allocator
-        # may consume up to one extra page per request (see alloc_extend), and
-        # _update_prefill_budget already accounts for this in the deduction.
-        # Without this, admission is more optimistic than the actual budget
-        # deduction, allowing over-admission when the pool is nearly full.
+        # Reserve page_size for page-alignment overhead: the paged allocator may
+        # consume one extra page per request (see alloc_extend), which
+        # _update_prefill_budget also deducts.
         max_new = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
@@ -1031,10 +999,8 @@ class PrefillAdder:
             req.prefix_indices
         )
         total_tokens = cand_extend_input_len + max_new + self.page_size
-        # Shared Mamba pool: the request's new mamba state also draws on the
-        # shared gap (full-token-equivalents); fold it into `total_tokens` so
-        # BOTH `rem_total_tokens` gates below reflect the joint budget. 0 for
-        # baseline / non-Mamba, so those paths are unchanged.
+        # Shared Mamba pool: fold the new mamba state's shared-gap cost into
+        # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
 
         # adjusting the input_tokens based on host_hit_length and page_size
