@@ -93,6 +93,7 @@ from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_strea
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -160,6 +161,46 @@ def build_replay_fb_view(
     )
 
 
+DS_OVERFLOW_FULL_FALLBACK = "full_fallback"
+DS_OVERFLOW_FAIL_CLOSED = "fail_closed"
+
+
+def compute_ds_selector_widths(buckets, full_width: int, policy: str):
+    """The Double Sparsity selector-width CUDA-graph capture ladder, ascending.
+
+    full_fallback (default): compact buckets below the full req_to_token width,
+      plus the full width itself as the overflow fallback.
+    fail_closed: compact buckets below the full width ONLY (no full-width graph);
+      a live sequence beyond the largest compact width fails closed at replay.
+    The DS selector scores only ``width`` columns under the captured graph, so a
+    compact width recovers the decode cost of full-width selection.
+    """
+    compact = sorted({int(w) for w in (buckets or []) if 0 < int(w) < full_width})
+    if policy == DS_OVERFLOW_FAIL_CLOSED:
+        if not compact:
+            raise ValueError(
+                "DS selector_width_overflow_policy='fail_closed' requires at least "
+                f"one selector_width_bucket below the full req_to_token width "
+                f"({full_width}); got buckets={list(buckets or [])}."
+            )
+        return compact
+    return sorted(set(compact) | {full_width})
+
+
+def ds_covering_width(widths, seq_len: int, policy: str) -> int:
+    """Smallest captured width >= seq_len (widths sorted ascending)."""
+    for w in widths:
+        if w >= seq_len:
+            return w
+    if policy == DS_OVERFLOW_FAIL_CLOSED:
+        raise RuntimeError(
+            "DS selector width fail-closed: live sequence length "
+            f"{seq_len} exceeds the largest captured selector width {widths[-1]}. "
+            "Raise selector_width_buckets or switch to 'full_fallback'."
+        )
+    return widths[-1]
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -167,6 +208,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     attention backend, two-batch-overlap plugin, DeepEP adapter, and the
     pluggable self.backend that handles the actual capture/replay.
     """
+
+    # Class default so subclasses that skip this __init__ (e.g. the EAGLE draft
+    # runner) still have the Double Sparsity selector-width keying inert rather
+    # than hitting AttributeError in the shared capture/replay path. The Decode
+    # __init__ below recomputes the real value per instance.
+    use_ds_selector_width_keys = False
 
     def __init__(
         self,
@@ -254,6 +301,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+
+        # Double Sparsity selector-width graph variants (DS-on normal decode
+        # only). Each captured width caps the per-step selection score to that
+        # many columns; without this the captured graph scores the full
+        # req_to_token width every decode step (a real decode-throughput cost).
+        self.ds_selector_widths = None
+        self.ds_selector_width_overflow_policy = DS_OVERFLOW_FULL_FALLBACK
+        self.use_ds_selector_width_keys = (
+            self.capture_forward_mode == ForwardMode.DECODE
+            and not self.enable_pdmux
+            and not self.is_encoder_decoder
+            and bool(getattr(self.attn_backend, "enable_double_sparsity", False))
+        )
+        if self.use_ds_selector_width_keys:
+            full_width = int(self.attn_backend.req_to_token.shape[1])
+            buckets = getattr(self.attn_backend, "ds_selector_width_buckets", None)
+            self.ds_selector_width_overflow_policy = getattr(
+                self.attn_backend,
+                "ds_selector_width_overflow_policy",
+                DS_OVERFLOW_FULL_FALLBACK,
+            )
+            self.ds_selector_widths = compute_ds_selector_widths(
+                buckets, full_width, self.ds_selector_width_overflow_policy
+            )
+            log_info_on_rank0(
+                logger,
+                f"DS selector-width graph variants "
+                f"({self.ds_selector_width_overflow_policy}): {self.ds_selector_widths}",
+            )
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -396,6 +472,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return "lora"
         return "nolora"
+
+    def _ds_variant_label(self, lora_label, width):
+        """Width-encoded graph variant label so each DS selector width gets its
+        own captured graph (kept distinct from, and composable with, the LoRA
+        variant label)."""
+        return f"dsw{width}" if lora_label is None else f"{lora_label}__dsw{width}"
+
+    def _ds_capture_variants(self, lora_label):
+        """(label, width) pairs to capture for this LoRA variant: one per DS
+        selector width when DS width-keying is on, else the LoRA variant alone."""
+        if not self.use_ds_selector_width_keys:
+            return [(lora_label, None)]
+        return [
+            (self._ds_variant_label(lora_label, w), w) for w in self.ds_selector_widths
+        ]
+
+    def _ds_selector_width_for_replay(self, forward_batch, raw_bs):
+        """Smallest captured DS selector width covering every LIVE row (real
+        rows of seq_lens_cpu only, never padded buffer rows)."""
+        widths = self.ds_selector_widths
+        policy = self.ds_selector_width_overflow_policy
+        if len(widths) == 1 and policy != DS_OVERFLOW_FAIL_CLOSED:
+            return widths[0]
+        max_real_seq_len = int(forward_batch.seq_lens_cpu[:raw_bs].max().item())
+        return ds_covering_width(widths, max_real_seq_len, policy)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
@@ -734,13 +835,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
-                with torch_compile_decoration.patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                # One whole-model capture per DS selector width (widest first,
+                # matching the largest-first pool-reuse rule). The width is
+                # stamped on the DSA backend so its decode metadata + graph
+                # state are keyed/sized to it; the graph itself is keyed by a
+                # width-encoded variant_label. Non-DS runners keep one capture.
+                for ds_label, ds_width in self._ds_capture_variants(variant_label):
+                    if ds_width is not None:
+                        self.attn_backend._ds_graph_variant_key = (bs, ds_width)
+                    try:
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            self.capture_one_shape(bs, forward, stream_idx, ds_label)
+                    finally:
+                        if ds_width is not None:
+                            self.attn_backend._ds_graph_variant_key = None
 
     def capture_one_shape(
         self,
@@ -965,7 +1078,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        # Stamp the DS selector width covering the live rows so the backend
+        # selects the matching captured decode metadata + graph state, and key
+        # the graph by the same width (encoded in variant_label).
+        ds_width = (
+            self._ds_selector_width_for_replay(forward_batch, raw_bs)
+            if self.use_ds_selector_width_keys
+            else None
+        )
+        if ds_width is not None:
+            attn_backend._ds_graph_variant_key = (bs, ds_width)
+        try:
+            attn_backend.init_forward_metadata_out_graph(fb_view)
+        finally:
+            if ds_width is not None:
+                attn_backend._ds_graph_variant_key = None
 
         # Store fields
         self.raw_bs = raw_bs
@@ -976,6 +1103,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
         variant_label = self._resolve_lora_variant(forward_batch)
+        if ds_width is not None:
+            variant_label = self._ds_variant_label(variant_label, ds_width)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             self.bs, stream_idx, variant_label

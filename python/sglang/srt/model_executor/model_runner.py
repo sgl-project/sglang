@@ -836,6 +836,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
+        # Bind DS attention selectors now that the KV pool is sized: the
+        # deferred bind computes max_tokens from the real req_to_token_pool
+        # instead of the provisional device buffer. Idempotent + DS-gated.
+        if getattr(self.server_args, "enable_double_sparsity", False):
+            for module in self.model.modules():
+                if hasattr(module, "finalize_double_sparsity_bind"):
+                    module.finalize_double_sparsity_bind()
+
         if self.enable_hisparse:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config

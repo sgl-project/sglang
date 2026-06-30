@@ -141,14 +141,22 @@ class CustomAllReduceV2:
             return False
         return inp_size <= self.max_size
 
-    def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
+    def custom_all_reduce(
+        self,
+        input: torch.Tensor,
+        override_algo: Optional[AllReduceAlgo] = None,
+    ) -> torch.Tensor:
+        """All-reduce ``input``. ``override_algo`` pins the algorithm for THIS
+        call only (no persistent communicator state) — callers whose numeric
+        contract depends on a fixed floating-point summation order use it to
+        keep the algorithm independent of the size-based selection."""
         if is_in_tc_piecewise_cuda_graph():  # disable inplace optimization
             try:
                 self.obj.set_cuda_graph_capture(False)
-                return self._all_reduce(input)
+                return self._all_reduce(input, override_algo)
             finally:
                 self.obj.set_cuda_graph_capture(True)
-        return self._all_reduce(input)
+        return self._all_reduce(input, override_algo)
 
     def close(self):
         if not self.disabled and hasattr(self, "obj"):
@@ -156,9 +164,15 @@ class CustomAllReduceV2:
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
 
-    def _all_reduce(self, input: torch.Tensor) -> torch.Tensor:
+    def _all_reduce(
+        self,
+        input: torch.Tensor,
+        override_algo: Optional[AllReduceAlgo] = None,
+    ) -> torch.Tensor:
         """Perform the actual all-reduce via JIT kernel."""
-        algo = self._determine_algo(input)
+        algo = (
+            override_algo if override_algo is not None else self._determine_algo(input)
+        )
         return torch.from_dlpack(self.obj.all_reduce(input, algo))
 
     def _determine_algo(self, input: torch.Tensor) -> AllReduceAlgo:
