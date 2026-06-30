@@ -2749,9 +2749,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             elif hasattr(layer, "mixer"):
                 if hasattr(layer.mixer, "attn"):
                     attn_layer = layer.mixer.attn
-                elif hasattr(layer, "_forward_mamba"):
-                    # Mamba layer with split op support - store the layer itself
-                    attn_layer = layer
 
             if attn_layer is not None:
                 self.attention_layers.append(attn_layer)
