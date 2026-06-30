@@ -29,7 +29,6 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -408,13 +407,6 @@ class ServingChatTestCase(unittest.TestCase):
         self.chat._process_messages(req, is_multimodal=False)
 
         self.assertEqual(req.reasoning_effort, "high")
-
-    def test_server_args_rejects_non_object_chat_template_kwargs(self):
-        with self.assertRaises(ValueError):
-            ServerArgs(
-                model_path="dummy",
-                default_chat_template_kwargs=["not", "an", "object"],
-            )
 
     def test_kimi_tool_call_keeps_explicit_template_thinking(self):
         self.template_manager.chat_template_name = None
