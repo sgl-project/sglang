@@ -2811,6 +2811,13 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            # Only the decoupled drafter needs this: its private mirror requests
+            # use max_new_tokens=1<<30 (it never self-terminates; only the
+            # verifier's DraftClose ends it), so the normal decode-budget
+            # reservation is astronomical and it could never be admitted. The
+            # verifier runs real user requests with real max_new_tokens and
+            # admits normally, so it does not set this flag.
+            ignore_decode_budget=(self.server_args.decoupled_spec_role == "drafter"),
         )
 
         if self.chunked_req is not None:
