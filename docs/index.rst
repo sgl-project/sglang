@@ -56,6 +56,7 @@ Its core features include:
    advanced_features/dp_dpa_smg_guide.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
+   advanced_features/disagg_layer_pipeline.md
    advanced_features/epd_disaggregation.md
    advanced_features/pipeline_parallelism.md
    advanced_features/hicache.rst
