@@ -13,15 +13,15 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-h200")
 
-GLM5_FP8_MODEL = "zai-org/GLM-5-FP8"
+GLM52_FP8_MODEL = "zai-org/GLM-5.2-FP8"
 
 
-class TestBCGGlm5Fp8TP8(CustomTestCase):
-    """Breakable CUDA graph prefill on GLM-5-FP8 (DSA model, TP=8, H200)."""
+class TestBCGGlm52Fp8TP8(CustomTestCase):
+    """Breakable CUDA graph prefill on GLM-5.2-FP8 (DSA model, TP=8, H200)."""
 
     @classmethod
     def setUpClass(cls):
-        cls.model = GLM5_FP8_MODEL
+        cls.model = GLM52_FP8_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
