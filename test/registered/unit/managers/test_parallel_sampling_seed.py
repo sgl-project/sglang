@@ -21,6 +21,11 @@ class TestSeedForParallelSample(unittest.TestCase):
         # The base params must not be mutated.
         self.assertEqual(base.sampling_seed, 42)
 
+    def test_large_seed_wraps_to_uint64(self):
+        base = SamplingParams(sampling_seed=2**64 - 1)
+        seeds = [_seed_for_parallel_sample(base, j).sampling_seed for j in range(2)]
+        self.assertEqual(seeds, [2**64 - 1, 0])
+
     def test_unseeded_sample_is_returned_unchanged(self):
         base = SamplingParams(sampling_seed=None)
         self.assertIs(_seed_for_parallel_sample(base, 3), base)
