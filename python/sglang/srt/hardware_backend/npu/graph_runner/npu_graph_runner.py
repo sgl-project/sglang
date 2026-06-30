@@ -206,13 +206,13 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         # for NPU, profile data will be saved to disk for further analysis.
         pass
 
-    def replay(
+    def execute(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if forward_batch.needs_forward_metadata_init():
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+            self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
