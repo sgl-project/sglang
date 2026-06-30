@@ -129,7 +129,7 @@ def build_replay_fb_view(
     fields like spec_info, out_cache_loc, and the runtime
     actual_forward_mode) with the padded capture-time buffers from
     buffers (for req_pool_indices, seq_lens, seq_lens_cpu,
-    encoder_lens).
+    positions, encoder_lens).
 
     forward_mode is the capture-time mode (used by backends for
     bucket / dispatch decisions); actual_forward_mode is the
@@ -144,6 +144,7 @@ def build_replay_fb_view(
         forward_mode=capture_forward_mode,
         actual_forward_mode=forward_batch.forward_mode,
         input_ids=buffers.input_ids[:num_tokens],
+        positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
         seq_lens=buffers.seq_lens[:bs],
         seq_lens_sum=(
