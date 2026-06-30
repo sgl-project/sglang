@@ -612,7 +612,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         scores = None
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -688,7 +688,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.positions.add_(1)
 
         if self.index_share_for_mtp_iteration:
-            forward_batch.topk_indices = None
+            spec_info.mtp_topk_indices = None
             forward_batch.reuse_mtp_topk_indices = False
 
         # Organize the results

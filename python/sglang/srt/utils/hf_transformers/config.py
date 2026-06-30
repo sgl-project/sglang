@@ -51,44 +51,6 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
-def _is_legacy_glm_moe_dsa_layer_types_error(error: Exception) -> bool:
-    error_msg = str(error)
-    return (
-        "validate_layer_type" in error_msg and "deepseek_sparse_attention" in error_msg
-    )
-
-
-def _load_glm_moe_dsa_config_without_legacy_layer_types(
-    model,
-    revision: Optional[str] = None,
-    **kwargs,
-):
-    from transformers import PretrainedConfig
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-    raw_config, unused_kwargs = PretrainedConfig.get_config_dict(
-        model, revision=revision, **kwargs
-    )
-    if raw_config.get("model_type") != "glm_moe_dsa" or raw_config.get(
-        "architectures"
-    ) != ["GlmMoeDsaForCausalLM"]:
-        return None
-
-    layer_types = raw_config.get("layer_types")
-    if not isinstance(layer_types, list) or any(
-        layer_type != "deepseek_sparse_attention" for layer_type in layer_types
-    ):
-        return None
-
-    raw_config = dict(raw_config)
-    raw_config.pop("layer_types", None)
-    config = CONFIG_MAPPING[raw_config["model_type"]].from_dict(
-        raw_config, **unused_kwargs
-    )
-    config._name_or_path = model
-    return config
-
-
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -98,43 +60,12 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        try:
-            config = AutoConfig.from_pretrained(
-                model,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
-        except Exception as e:
-            config = (
-                _load_glm_moe_dsa_config_without_legacy_layer_types(
-                    model, revision, **kwargs
-                )
-                if _is_legacy_glm_moe_dsa_layer_types_error(e)
-                else None
-            )
-            if config is None:
-                raise
-
-        if (
-            config.architectures is not None
-            and config.architectures[0] == "GlmMoeDsaForCausalLM"
-        ):
-            # GlmMoeDsaConfig drops/clobbers raw checkpoint fields the DSA path
-            # needs, so re-read them from config.json and restore. Fixed upstream
-            # by https://github.com/huggingface/transformers/pull/46338; remove
-            # this block once SGLang requires transformers >= 5.10.
-            from transformers import PretrainedConfig
-
-            raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision)
-            for key in (
-                "qk_rope_head_dim",
-                "index_topk_freq",
-            ):
-                if key in raw_config:
-                    setattr(config, key, raw_config[key])
-            if hasattr(config, "qk_head_dim") and hasattr(config, "qk_nope_head_dim"):
-                config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        config = AutoConfig.from_pretrained(
+            model,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
 
         if (
             config.architectures is not None
