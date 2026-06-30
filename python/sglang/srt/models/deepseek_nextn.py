@@ -237,13 +237,13 @@ class DeepseekModelNextN(nn.Module):
                     residual,
                     zero_allocator,
                     prev_topk_indices=(
-                        forward_batch.topk_indices
+                        forward_batch.spec_info.mtp_topk_indices
                         if forward_batch.reuse_mtp_topk_indices
                         else None
                     ),
                 )
                 if forward_batch.reuse_mtp_topk_indices:
-                    forward_batch.topk_indices = topk_indices
+                    forward_batch.spec_info.mtp_topk_indices = topk_indices
 
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
