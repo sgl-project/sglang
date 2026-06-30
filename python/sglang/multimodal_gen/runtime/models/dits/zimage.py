@@ -20,9 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
-    RMSNorm,
     apply_qk_norm_with_optional_rope,
-    apply_rmsnorm_tanh_mul_add,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -58,6 +56,38 @@ _is_cuda = current_platform.is_cuda()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
+
+
+class ZImageRMSNorm(nn.Module):
+    """RMSNorm matching the official Z-Image PyTorch implementation.
+
+    The shared SGLang RMSNorm normalizes through an fp32 path. Official Z-Image
+    keeps the operation in the input dtype, and the low-step turbo sampler is
+    sensitive to that difference.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.variance_epsilon = eps
+        self.hidden_size = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        output = x * torch.rsqrt(
+            x.pow(2).mean(dim=-1, keepdim=True) + self.variance_epsilon
+        )
+        output = output * self.weight.to(device=x.device, dtype=x.dtype)
+        return output.to(orig_dtype)
+
+
+def zimage_rmsnorm_tanh_mul_add(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    norm: ZImageRMSNorm,
+) -> torch.Tensor:
+    return residual + torch.tanh(gate) * norm(x)
 
 
 class SelectFirstElement(nn.Module):
@@ -217,8 +247,8 @@ class ZImageAttention(nn.Module):
             )
 
         if self.qk_norm:
-            self.norm_q = RMSNorm(self.head_dim, eps=eps)
-            self.norm_k = RMSNorm(self.head_dim, eps=eps)
+            self.norm_q = ZImageRMSNorm(self.head_dim, eps=eps)
+            self.norm_k = ZImageRMSNorm(self.head_dim, eps=eps)
         else:
             self.norm_q = None
             self.norm_k = None
@@ -300,7 +330,7 @@ class ZImageAttention(nn.Module):
                         head_dim=self.head_dim,
                         cos_sin_cache=cos_sin_cache,
                         is_neox=False,
-                        allow_inplace=True,
+                        allow_inplace=False,
                     )
                 else:
                     q, k = apply_flashinfer_rope_qk_inplace(
@@ -314,7 +344,7 @@ class ZImageAttention(nn.Module):
                         q_norm=self.norm_q,
                         k_norm=self.norm_k,
                         head_dim=self.head_dim,
-                        allow_inplace=True,
+                        allow_inplace=False,
                     )
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
@@ -325,7 +355,7 @@ class ZImageAttention(nn.Module):
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
-                allow_inplace=True,
+                allow_inplace=False,
             )
 
         if (
@@ -438,11 +468,11 @@ class ZImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.feed_forward",
             )
 
-        self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.ffn_norm1 = ZImageRMSNorm(dim, eps=norm_eps)
 
-        self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
-        self.ffn_norm2 = RMSNorm(dim, eps=norm_eps)
+        self.attention_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
+        self.ffn_norm2 = ZImageRMSNorm(dim, eps=norm_eps)
 
         if modulation:
             self.adaLN_modulation = nn.Sequential(
@@ -474,39 +504,12 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
-            if (
-                _is_cuda
-                and attn_out.is_cuda
-                and attn_out.shape[-1] % 256 == 0
-                and attn_out.shape[-1] <= 8192
-                and self.attention_norm2.variance_epsilon
-                == self.ffn_norm1.variance_epsilon
-            ):
-                from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
-                    fused_norm_tanh_mul_add_norm_scale,
-                )
-
-                x, ffn_in = fused_norm_tanh_mul_add_norm_scale(
-                    attn_out.contiguous(),
-                    self.attention_norm2.weight.data.contiguous(),
-                    None,
-                    gate_msa.contiguous(),
-                    x.contiguous(),
-                    self.ffn_norm1.weight.data.contiguous(),
-                    None,
-                    scale_mlp.contiguous(),
-                    "rms",
-                    self.attention_norm2.variance_epsilon,
-                )
-            else:
-                x = apply_rmsnorm_tanh_mul_add(
-                    attn_out, gate_msa, x, self.attention_norm2
-                )
-                ffn_in = self.ffn_norm1(x) * (1.0 + scale_mlp)
+            x = zimage_rmsnorm_tanh_mul_add(attn_out, gate_msa, x, self.attention_norm2)
+            ffn_in = self.ffn_norm1(x) * (1.0 + scale_mlp)
 
             # FFN block
             ffn_out = self.feed_forward(ffn_in)
-            x = apply_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
+            x = zimage_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
         else:
             # Attention block
             attn_input = self.attention_norm1(x)
@@ -741,7 +744,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.cap_embedder = nn.Sequential(
-            RMSNorm(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
+            ZImageRMSNorm(arch_config.cap_feat_dim, eps=arch_config.norm_eps),
             ReplicatedLinear(arch_config.cap_feat_dim, self.dim, bias=True),
         )
 
@@ -905,6 +908,46 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             cap_valid_lens_out,
         )
 
+    def _build_single_sample_freqs_cis(
+        self,
+        image: torch.Tensor,
+        cap_feat: torch.Tensor,
+        patch_size: int,
+        f_patch_size: int,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        device = image.device
+        cap_ori_len = int(cap_feat.size(0))
+        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+        cap_pos_ids = self.create_coordinate_grid(
+            size=(cap_ori_len + cap_padding_len, 1, 1),
+            start=(1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+
+        _, F, H, W = image.size()
+        pH = pW = patch_size
+        pF = f_patch_size
+        F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
+        image_ori_len = F_tokens * H_tokens * W_tokens
+        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        image_ori_pos_ids = self.create_coordinate_grid(
+            size=(F_tokens, H_tokens, W_tokens),
+            start=(cap_ori_len + cap_padding_len + 1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+        image_padding_pos_ids = (
+            self.create_coordinate_grid(
+                size=(1, 1, 1),
+                start=(0, 0, 0),
+                device=device,
+            )
+            .flatten(0, 2)
+            .repeat(image_padding_len, 1)
+        )
+        image_pos_ids = torch.cat([image_ori_pos_ids, image_padding_pos_ids], dim=0)
+
+        return self.rotary_emb(cap_pos_ids), self.rotary_emb(image_pos_ids)
+
     @staticmethod
     def _as_image_list(hidden_states) -> list[torch.Tensor]:
         """Normalize 4D/5D image latents into per-sample tensors."""
@@ -969,6 +1012,33 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         x = self._as_image_list(hidden_states)
         cap_feats = self._as_caption_list(encoder_hidden_states)
+        if (
+            len(x) > 1
+            and get_sp_world_size() == 1
+            and len({int(cap_feat.size(0)) for cap_feat in cap_feats}) > 1
+        ):
+            outputs = []
+            for image, cap_feat, sample_timestep in zip(x, cap_feats, timestep):
+                sample_freqs_cis = self._build_single_sample_freqs_cis(
+                    image,
+                    cap_feat,
+                    patch_size,
+                    f_patch_size,
+                )
+                sample_output = self.forward(
+                    hidden_states=[image],
+                    encoder_hidden_states=[cap_feat],
+                    timestep=sample_timestep.unsqueeze(0),
+                    guidance=guidance,
+                    patch_size=patch_size,
+                    f_patch_size=f_patch_size,
+                    freqs_cis=sample_freqs_cis,
+                    image_seq_len_target=image_seq_len_target,
+                    **kwargs,
+                )
+                outputs.append(sample_output[0])
+            return torch.stack(outputs, dim=0)
+
         timestep = 1000.0 - timestep
         t = timestep
         t = self.t_embedder(t)
