@@ -78,6 +78,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def maybe_init_reasoning(self, reasoning: bool):
         if reasoning:
             self.tokens_in_think = 0
+            self.tokens_after_end = -1
         else:
             self.tokens_in_think = -1
             self.tokens_after_end = 0
@@ -108,6 +109,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 self.tokens_after_end -= 1
 
     def accept_token(self, token: int):
+        # Track the last accepted token on the wrapper itself (mirroring
+        # XGrammarGrammar.accept_token). Disaggregation's process_prebuilt uses
+        # `grammar.current_token is None` to detect a retracted request whose
+        # token was already accepted and must not be re-accepted. Without this,
+        # a ReasonerGrammarObject's current_token stays None forever (the inner
+        # grammar's is updated, not the wrapper's), so the guard never fires and
+        # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
+        self.current_token = token
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
         self.transfer_state(token)

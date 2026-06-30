@@ -39,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 
 
 def dsa_enable_prefill_cp():
@@ -46,6 +47,30 @@ def dsa_enable_prefill_cp():
     # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
     # no longer require additional communication for reduce, scatter, etc.
     return is_dsa_enable_prefill_cp()
+
+
+def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
+    assert attn_dp_size == 1 and attn_tp_size == 1
+    hidden_states, local_hidden_states = (
+        get_local_dp_buffer(get_attention_cp_group()),
+        hidden_states,
+    )
+    attn_cp_all_gather_into_tensor(hidden_states, local_hidden_states)
+    return hidden_states
+
+
+def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
+    attn_dp_size = get_parallel().attn_dp_size
+    attn_tp_size = get_parallel().attn_tp_size
+    assert attn_dp_size == 1 and attn_tp_size == 1
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
+    input_hidden_states = hidden_states
+    hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+    attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+    return hidden_states
 
 
 class DSACPLayerCommunicator(LayerCommunicator):
@@ -154,15 +179,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            assert context.attn_dp_size == 1
-            hidden_states, local_hidden_states = (
-                get_local_dp_buffer(get_attention_cp_group()),
-                hidden_states,
-            )
-            attn_cp_all_gather_into_tensor(
-                hidden_states,
-                local_hidden_states,
-            )
+            hidden_states = dsa_cp_gather_hidden_states(hidden_states)
         return hidden_states, residual
 
 
@@ -207,10 +224,5 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            assert context.attn_dp_size == 1
-            input_hidden_states = hidden_states
-            hidden_states = hidden_states.tensor_split(context.attn_cp_size)[
-                context.attn_cp_rank
-            ]
-            attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual

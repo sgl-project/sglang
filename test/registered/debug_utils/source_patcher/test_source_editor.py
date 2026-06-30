@@ -6,7 +6,7 @@ from sglang.srt.debug_utils.source_patcher.types import EditSpec, PatchApplicati
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class TestApplyEdits:
@@ -113,6 +113,124 @@ class TestApplyEdits:
         edits = [EditSpec(match="nonexistent_call()", replacement="replaced()")]
         with pytest.raises(PatchApplicationError, match="not found"):
             apply_edits(source=source, edits=edits)
+
+    def test_not_found_diagnostic_reports_source_len(self) -> None:
+        """diagnostic includes total source line count."""
+        source = "line0\nline1\nline2\nline3\nline4\n"
+        edits = [EditSpec(match="absent()", replacement="x")]
+        with pytest.raises(PatchApplicationError) as exc_info:
+            apply_edits(source=source, edits=edits)
+        assert "source_len=5 lines" in str(exc_info.value)
+
+    def test_not_found_diagnostic_when_first_match_line_absent(self) -> None:
+        """diagnostic says 'does NOT appear anywhere' when first line is never present."""
+        source = "def foo():\n    return 1\n"
+        edits = [EditSpec(match="nope_xyz()", replacement="x")]
+        with pytest.raises(PatchApplicationError) as exc_info:
+            apply_edits(source=source, edits=edits)
+        msg = str(exc_info.value)
+        assert "does NOT appear anywhere in source" in msg
+        assert "'nope_xyz()'" in msg
+
+    def test_not_found_diagnostic_single_window_with_marker(self) -> None:
+        """first line is present once but full match doesn't fit: one window with '>' on the match-region line."""
+        source = (
+            "line0\n"
+            "line1\n"
+            "line2\n"
+            "anchor()\n"
+            "wrong_next()\n"
+            "line5\n"
+            "line6\n"
+        )
+        edits = [EditSpec(match="anchor()\nright_next()", replacement="x")]
+        with pytest.raises(PatchApplicationError) as exc_info:
+            apply_edits(source=source, edits=edits)
+        msg = str(exc_info.value)
+        assert "appears 1 time(s)" in msg
+        assert msg.count("--") == 1
+        assert ">    3: anchor()" in msg
+        assert ">    4: wrong_next()" in msg
+        assert "     1: line1" in msg
+        assert "     2: line2" in msg
+        assert "     5: line5" in msg
+        assert "     6: line6" in msg
+
+    def test_not_found_diagnostic_multiple_windows_separated(self) -> None:
+        """when first line appears N (<=8) times, N windows are shown separated by '--'."""
+        source = (
+            "anchor()\n"
+            "tail_a()\n"
+            "filler\n"
+            "anchor()\n"
+            "tail_b()\n"
+            "filler\n"
+            "anchor()\n"
+            "tail_c()\n"
+        )
+        edits = [EditSpec(match="anchor()\nnope()", replacement="x")]
+        with pytest.raises(PatchApplicationError) as exc_info:
+            apply_edits(source=source, edits=edits)
+        msg = str(exc_info.value)
+        assert "appears 3 time(s)" in msg
+        assert msg.count("--") == 3
+        assert ">    0: anchor()" in msg
+        assert ">    3: anchor()" in msg
+        assert ">    6: anchor()" in msg
+
+    def test_not_found_diagnostic_caps_at_8_windows(self) -> None:
+        """when first line appears >8 times, only the first 8 windows are rendered."""
+        source = "\n".join(["anchor()"] * 12) + "\n"
+        edits = [EditSpec(match="anchor()\nnope()", replacement="x")]
+        with pytest.raises(PatchApplicationError) as exc_info:
+            apply_edits(source=source, edits=edits)
+        msg = str(exc_info.value)
+        assert "appears 12 time(s)" in msg
+        assert "up to 8 windows" in msg
+        assert msg.count("--") == 8
+
+    def test_not_found_diagnostic_window_clamps_at_source_boundaries(self) -> None:
+        """window does not include negative indices or indices past the end of source."""
+        source = "anchor()\nfoo\n"
+        edits = [EditSpec(match="anchor()\nbar", replacement="x")]
+        with pytest.raises(PatchApplicationError) as exc_info:
+            apply_edits(source=source, edits=edits)
+        msg = str(exc_info.value)
+        assert ">    0: anchor()" in msg
+        assert ">    1: foo" in msg
+        assert "-1:" not in msg
+        assert "   2:" not in msg
+
+    def test_not_found_diagnostic_multiline_match_marks_full_region(self) -> None:
+        """match spanning N lines: marker '>' covers all N lines of the intended match region."""
+        source = (
+            "filler0\n"
+            "filler1\n"
+            "filler2\n"
+            "filler3\n"
+            "anchor()\n"
+            "middle()\n"
+            "wrong_tail()\n"
+            "filler7\n"
+            "filler8\n"
+            "filler9\n"
+        )
+        edits = [
+            EditSpec(match="anchor()\nmiddle()\nright_tail()", replacement="x"),
+        ]
+        with pytest.raises(PatchApplicationError) as exc_info:
+            apply_edits(source=source, edits=edits)
+        msg = str(exc_info.value)
+        assert ">    4: anchor()" in msg
+        assert ">    5: middle()" in msg
+        assert ">    6: wrong_tail()" in msg
+        assert "     2: filler2" in msg
+        assert "     3: filler3" in msg
+        assert "     7: filler7" in msg
+        assert "     8: filler8" in msg
+        assert "filler0" not in msg
+        assert "filler1" not in msg
+        assert "filler9" not in msg
 
     def test_match_found_multiple_times_raises(self) -> None:
         source = "def foo():\n" "    print(1)\n" "    print(1)\n"
