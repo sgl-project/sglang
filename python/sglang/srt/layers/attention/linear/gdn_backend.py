@@ -81,9 +81,10 @@ def torch_gdn_gating(
     b: torch.Tensor,
     dt_bias: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    A_log_bf16 = A_log.to(torch.bfloat16)
-    dt_bias_bf16 = dt_bias.to(torch.bfloat16)
-    g = -A_log_bf16.exp() * F.softplus(a.float() + dt_bias_bf16)
+    # Compute exp in fp32 to match Megatron's fused (torch.compile) g_and_beta path,
+    # which upcasts A_log.exp() to fp32. Rounding A_log.exp() to bf16 here diverged
+    # gdn_g by ~6e-3 vs Megatron; fp32 is also the higher-precision choice.
+    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
     beta = b.to(torch.bfloat16).sigmoid()
     return g.unsqueeze(0), beta.unsqueeze(0)
 
