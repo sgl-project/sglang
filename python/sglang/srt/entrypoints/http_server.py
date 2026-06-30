@@ -608,6 +608,7 @@ async def health_generate(request: Request) -> Response:
         ):
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
+            gri.skip_radix_cache_insert = True
     else:
         gri = EmbeddingReqInput(
             rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
@@ -2097,6 +2098,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                     for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
+                # Warmup KV is throwaway; keep it out of the radix tree.
+                "skip_radix_cache_insert": True,
             }
             res = requests.post(
                 url + request_name,
