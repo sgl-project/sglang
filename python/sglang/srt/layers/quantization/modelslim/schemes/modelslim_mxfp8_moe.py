@@ -53,25 +53,28 @@ class ModelSlimW8A8Mxfp8MoE(ModelSlimMoEScheme):
         intermediate_size_per_partition: int,
         **extra_weight_attrs,
     ) -> None:
-        """
-        Create weight and scale parameters in MXFP8 format.
-        """
-        # --- fixed shapes per prefix, matching the new MXFP8 reference ---
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+    
+        # Mark the weight scale as group‑wise so the fused loader can shard it correctly.
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+        )
+    
+        # --- fixed shapes per prefix ---
         if self.weight_prefix == "w13":
             out_features = 2 * intermediate_size_per_partition
             in_features = hidden_size
         else:  # w2
             out_features = hidden_size
             in_features = intermediate_size_per_partition
-
+    
         weight_shape = (num_experts, out_features, in_features)
-
-        # Scale shape: group‑wise scaling; if group_size is 0 fall back to per‑channel (scale per out feature)
+    
         if self.group_size > 0:
             scale_shape = (num_experts, out_features, in_features // self.group_size)
         else:
             scale_shape = (num_experts, out_features, 1)
-
+    
         self._create_weight_params(
             layer,
             self.weight_prefix,
