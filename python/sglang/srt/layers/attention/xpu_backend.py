@@ -389,20 +389,12 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.page_table
                 ).to(torch.int32)
             )
-            # For hybrid SWA models (like Gemma4), we must always set swa_out_cache_loc
-            # because some layers need it. If out_cache_loc is None (shouldn't happen
-            # in normal decode), we can't translate it, so raise an error early.
-            if forward_batch.out_cache_loc is None:
-                raise ValueError(
-                    f"out_cache_loc is None for hybrid SWA model in "
-                    f"forward_mode={forward_batch.forward_mode}. This should not happen "
-                    f"during normal decode operations."
+            if forward_batch.out_cache_loc is not None:
+                metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
-            metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
 
         if self.use_mla:
             workspace_size = flash_mla_get_workspace_size(
