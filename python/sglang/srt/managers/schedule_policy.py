@@ -756,6 +756,8 @@ class PrefillAdder:
             _rem_tokens = min(self.rem_chunk_tokens, max(budget, 0))
             if _rem_tokens <= 0 and req_is_high:
                 _rem_tokens = self.rem_chunk_tokens
+            elif _rem_tokens <= 0 and not req_is_high:
+                return req
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:

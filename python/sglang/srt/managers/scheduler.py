@@ -2794,6 +2794,20 @@ class Scheduler(
 
         return ret
 
+    def _try_add_deferred_chunk(self, adder: PrefillAdder, req: Req):
+        self.chunked_req = adder.add_chunked_req(req)
+        if (
+            self.chunked_req is not None
+            and adder.can_run_list
+            and adder.can_run_list[-1] is not req
+        ):
+            # LP chunk was not admitted due to insufficient token budget.
+            # Retract it so the slot is free for high-priority requests.
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            req.reset_for_retract()
+            self._add_request_to_queue(req)
+            self.chunked_req = None
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2946,18 +2960,7 @@ class Scheduler(
             if chunk_deferred and deferred_chunked_req is not None:
                 req_is_high = self.tree_cache.is_high_priority(req.priority or 0)
                 if not req_is_high:
-                    # We've reached the LP boundary; try to add the deferred chunk now
-                    result_chunk = adder.add_chunked_req(deferred_chunked_req)
-                    if result_chunk is not None:
-                        # Budget insufficient: release KV cache and retract
-                        release_kv_cache(
-                            deferred_chunked_req, self.tree_cache, is_insert=False
-                        )
-                        deferred_chunked_req.reset_for_retract()
-                        self._add_request_to_queue(deferred_chunked_req)
-                        self.chunked_req = None
-                    else:
-                        self.chunked_req = None
+                    self._try_add_deferred_chunk(adder, deferred_chunked_req)
                     deferred_chunked_req = None
                     chunk_deferred = False
 
@@ -2998,15 +3001,7 @@ class Scheduler(
 
         # If the queue was exhausted without inserting the deferred chunk, handle it
         if chunk_deferred and deferred_chunked_req is not None:
-            result_chunk = adder.add_chunked_req(deferred_chunked_req)
-            if result_chunk is not None:
-                # Budget insufficient: release KV cache and retract
-                release_kv_cache(deferred_chunked_req, self.tree_cache, is_insert=False)
-                deferred_chunked_req.reset_for_retract()
-                self._add_request_to_queue(deferred_chunked_req)
-                self.chunked_req = None
-            else:
-                self.chunked_req = None
+            self._try_add_deferred_chunk(adder, deferred_chunked_req)
             deferred_chunked_req = None
 
         if mamba_allocator is not None:

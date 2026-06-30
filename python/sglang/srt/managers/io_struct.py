@@ -1393,24 +1393,20 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
-@dataclass
 class ReleaseRefReqInput(BaseReq):
     session_id: str = ""
 
 
-@dataclass
 class ReleaseRefReqOutput(BaseReq):
     success: bool = True
     message: str = ""
 
 
-@dataclass
 class UpdateRefReqInput(BaseReq):
     session_id: str = ""
     new_priority: int = 0
 
 
-@dataclass
 class UpdateRefReqOutput(BaseReq):
     success: bool = True
     message: str = ""
