@@ -60,11 +60,9 @@ SEQ_MULTI_OF = 32
 
 
 class ZImageRMSNorm(nn.Module):
-    """RMSNorm matching the official Z-Image PyTorch implementation.
+    """RMSNorm that preserves Z-Image's native bf16 behavior.
 
-    The shared SGLang RMSNorm normalizes through an fp32 path. Official Z-Image
-    keeps the operation in the input dtype, and the low-step turbo sampler is
-    sensitive to that difference.
+    Z-Image does not upcast hidden states to fp32 for RMSNorm.
     """
 
     def __init__(self, dim: int, eps: float = 1e-5):
