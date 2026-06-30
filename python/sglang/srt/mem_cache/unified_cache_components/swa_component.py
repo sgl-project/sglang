@@ -611,8 +611,8 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # `node` is best_match_node; the SWA validator guarantees every
-            # ancestor within `sliding_window_size` has value or host_value.
+            # `node` is normally best_match_node; storage prefetch may instead
+            # anchor on a loaded FULL node with SWA tombstones in its window.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []

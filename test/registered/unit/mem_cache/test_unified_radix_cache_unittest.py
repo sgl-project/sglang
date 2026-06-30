@@ -3823,8 +3823,8 @@ class UnifiedRadixCacheSuite:
 
         Anchor=X has window_pages of device pages below N, so the SWA
         load_back walker accumulates n_swa >= sliding_window_size and
-        exits before reaching N. Anchor=Y has only 1 page and walks into
-        N's tombstone.
+        exits before reaching N. Anchor=Y collects its host-only page, skips
+        N's FULL-only tombstone, then counts device pages until the window is full.
         """
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
@@ -3872,8 +3872,12 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(xfer.nodes_to_load, [y])
         self.assertEqual(int(xfer.host_indices.numel()), ps)
 
-        with self.assertRaises(AssertionError):
-            swa_comp.build_hicache_transfers(y, CacheTransferPhase.LOAD_BACK)
+        transfers = swa_comp.build_hicache_transfers(y, CacheTransferPhase.LOAD_BACK)
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.name, PoolName.SWA)
+        self.assertEqual(xfer.nodes_to_load, [y])
+        self.assertEqual(int(xfer.host_indices.numel()), ps)
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         tree, _, _, y, x, _ = self._swa_anchor_setup()
