@@ -726,6 +726,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.pp_group = get_pp_group()
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % self.attn_tp_size == 0
         self.num_heads = self.total_num_heads // self.attn_tp_size
