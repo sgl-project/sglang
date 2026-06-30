@@ -728,8 +728,8 @@ class GenerateReqInput:
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=(
-                self.session_params[i]
-                if isinstance(self.session_params, list)
+                self.session_params[i % len(self.session_params)]
+                if isinstance(self.session_params, list) and self.session_params
                 else self.session_params
             ),
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
