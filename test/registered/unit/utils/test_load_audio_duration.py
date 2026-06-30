@@ -11,7 +11,7 @@ import unittest
 import numpy as np
 
 import sglang.srt.utils.common as common_utils
-from sglang.srt.utils.common import load_audio
+from sglang.srt.utils.common import _validate_audio_sample_rate, load_audio
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
@@ -81,6 +81,18 @@ class TestLoadAudioDuration(unittest.TestCase):
                 os.environ.pop(ENV, None)
 
         self._run_both_backends(check)
+
+    def test_nonpositive_requested_sample_rate_rejected(self):
+        with self.assertRaises(ValueError):
+            load_audio(self.short, sr=0)
+        with self.assertRaises(ValueError):
+            load_audio(self.short, sr=-1)
+
+    def test_invalid_header_sample_rate_rejected(self):
+        for sample_rate in (None, 0, -1):
+            with self.subTest(sample_rate=sample_rate):
+                with self.assertRaises(ValueError):
+                    _validate_audio_sample_rate(sample_rate, "Audio file sample rate")
 
 
 if __name__ == "__main__":

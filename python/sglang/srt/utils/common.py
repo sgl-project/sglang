@@ -831,6 +831,12 @@ def _audio_too_long(duration_s: float, max_duration_s: float) -> _AudioTooLongEr
     )
 
 
+def _validate_audio_sample_rate(sample_rate: Optional[int], name: str) -> int:
+    if sample_rate is None or sample_rate <= 0:
+        raise ValueError(f"{name} must be positive, got {sample_rate}.")
+    return sample_rate
+
+
 def load_audio(
     audio_file: str,
     sr: Optional[int] = None,
@@ -839,6 +845,8 @@ def load_audio(
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
+    else:
+        sr = _validate_audio_sample_rate(sr, "Sample rate")
     if max_duration_s is None:
         max_duration_s = envs.SGLANG_MAX_AUDIO_DECODE_DURATION_S.get()
     # A small compressed payload can expand into hours of PCM (decompression
@@ -916,8 +924,10 @@ def load_audio(
 
     audio_input = BytesIO(source) if isinstance(source, bytes) else source
     with sf.SoundFile(audio_input) as f:
-        original_sr = f.samplerate
-        if cap is not None and original_sr:
+        original_sr = _validate_audio_sample_rate(
+            f.samplerate, "Audio file sample rate"
+        )
+        if cap is not None:
             # Bounded read: pull at most cap-worth of frames (+1 to detect
             # overflow), so an over-long or mis-declared file is rejected
             # without reading the whole PCM payload into memory.
