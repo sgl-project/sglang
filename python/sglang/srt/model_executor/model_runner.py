@@ -343,6 +343,14 @@ class ModelRunnerOutput:
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
+    # Safe defaults for attributes set in load_model() that external code reads
+    # unconditionally.  Subclasses that override load_model() (e.g.
+    # MlxModelRunnerStub) inherit these instead of crashing with AttributeError.
+    # load_model() still overrides them to their real values on the normal path.
+    prefill_aware_swa: bool = False
+    sliding_window_size: Optional[int] = None
+    weight_load_mem_usage: float = 0
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -1519,7 +1527,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
         # Parse other args
-        self.sliding_window_size = None
         if hasattr(self.model, "get_attention_sliding_window_size"):
             self.sliding_window_size = self.model.get_attention_sliding_window_size()
         elif (
