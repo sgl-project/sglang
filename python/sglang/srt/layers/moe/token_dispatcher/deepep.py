@@ -531,6 +531,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event,
     ):
         buffer = self._get_buffer()
+
+        # Pad empty inputs to avoid C++ null-ptr assertion in get_dispatch_layout
+        # when DP attention causes some ranks to receive 0 tokens.
+        self._empty_pad = topk_ids.size(0) == 0
+        if self._empty_pad:
+            _nk = topk_ids.size(1) if topk_ids.dim() > 1 else 1
+            topk_ids = topk_ids.new_full((1, _nk), -1)
+            topk_weights = topk_weights.new_zeros((1, _nk))
+            if isinstance(x, tuple):
+                x = tuple(t.new_zeros((1, t.size(1) if t.dim() > 1 else 1)) for t in x)
+            else:
+                x = x.new_zeros((1, x.size(1) if x.dim() > 1 else 1))
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -605,6 +617,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
         self.src2dst = None
+        if getattr(self, "_empty_pad", False):
+            hidden_states = hidden_states[:0]
+            self._empty_pad = False
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
@@ -707,6 +722,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
+        # Pad empty inputs to avoid C++ null-ptr assertion in low_latency_dispatch
+        # when DP attention causes some ranks to receive 0 tokens.
+        self._ll_empty_pad = topk_ids.size(0) == 0
+        if self._ll_empty_pad:
+            _nk = topk_ids.size(1) if topk_ids.dim() > 1 else 1
+            # Use -1 so the fake token is not routed to any real expert
+            topk_ids = topk_ids.new_full((1, _nk), -1)
+            hidden_states = hidden_states.new_zeros(
+                (1, hidden_states.size(1) if hidden_states.dim() > 1 else 1)
+            )
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
@@ -768,6 +793,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
 
+        if getattr(self, "_ll_empty_pad", False):
+            hidden_states = hidden_states[:0]
+            self._ll_empty_pad = False
+
         return hidden_states
 
     def _combine_core(
@@ -777,6 +806,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
+
+        # Pad topk_ids/weights for empty-token ranks before low_latency_combine
+        if self._ll_empty_pad:
+            _nk = topk_ids.size(1) if topk_ids.dim() > 1 else 1
+            topk_ids = topk_ids.new_full((1, _nk), -1)
+            topk_weights = topk_weights.new_zeros((1, _nk))
         overlap_args = self.overlap_args
         meta_overlap_args = self.meta_overlap_args
 
