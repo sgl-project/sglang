@@ -178,6 +178,8 @@ class DeepEPV2Buffer:
             num_topk=router_topk,
             use_fp8_dispatch=use_fp8_dispatch,
             allow_hybrid_mode=allow_hybrid_mode,
+            sl_idx=0,
+            prefer_overlap_with_compute=False,
         )
         cls._buffer_key = key
         logger.info(
@@ -316,12 +318,28 @@ class _DeepEPV2Impl:
         # cap * ep_group_size for the same cross-rank / overflow safety; only
         # expected_m, a per-rank-local GEMM schedule hint, uses the actual batch.)
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
-        do_cpu_sync_val = None
+        # Non-masked (hybrid / direct-extend) path reads exact per-expert recv
+        # counts on the CPU, so it must wait for the GPU to finish writing them
+        # (matches the DeepEP elastic test which passes do_cpu_sync=1). Leaving
+        # it None lets the CPU read zeros on multi-node (scaleup) dispatch. Only
+        # the masked decode path keeps do_cpu_sync=False for graph capturability.
+        do_cpu_sync_val = True
         if use_masked:
             do_cpu_sync_val = False
 
         buffer = self._get_buffer()
         self._destroy_handle()
+        # num_sms/num_qps are NOT auto-resolved by ElasticBuffer when left at 0;
+        # 0 means "0 SMs / 0 QPs". Multi-node RDMA dispatch needs real QPs, so
+        # resolve them from the theoretical helpers (matches the DeepEP elastic
+        # test harness). Single-node NVLink works with 0 QPs, hence the original
+        # default only ever ran on a single node.
+        _num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
+        if _num_sms == 0:
+            _num_sms = buffer.get_theoretical_num_sms(
+                self.num_experts, self.router_topk
+            )
+        _num_qps = buffer.get_theoretical_num_qps(_num_sms)
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
             topk_idx=topk_ids,
@@ -329,7 +347,8 @@ class _DeepEPV2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=self.capability.expert_alignment,
-            num_sms=envs.SGLANG_DEEPEP_V2_NUM_SMS.get(),
+            num_sms=_num_sms,
+            num_qps=_num_qps,
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
@@ -455,10 +474,18 @@ class _DeepEPV2Impl:
         buffer = self._get_buffer()
         # Async: do NOT wait here; combine_b() waits. Lets TBO/SBO overlap the
         # combine communication with another micro-batch's compute.
+        _num_sms = envs.SGLANG_DEEPEP_V2_NUM_SMS.get()
+        if _num_sms == 0:
+            _num_sms = buffer.get_theoretical_num_sms(
+                self.num_experts, self.router_topk
+            )
+        _num_qps = buffer.get_theoretical_num_qps(_num_sms)
         combined_x, _, event = buffer.combine(
             combine_input.hidden_states,
             handle=self._handle,
             topk_weights=combine_input.topk_weights,
+            num_sms=_num_sms,
+            num_qps=_num_qps,
         )
         return combined_x, event
 
