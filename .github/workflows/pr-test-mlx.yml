@@ -69,28 +69,13 @@ jobs:
         run: |
           # Model-free MLX unit tests via pytest, like MUSA's unit-test jobs
           # (its model and server suites use run_suite.py). None load a model:
-          # signature contracts, mocked Metal capture, dummy ServerArgs patch
-          # logic, and quantization-config dict logic.
-          #
-          # Three cases are excluded (-k): model-free but stale against main, only
-          # ever skipped on ubuntu so the drift went unnoticed. Tracked separately:
-          #   - test_decode_finalize_does_not_snapshot_auxiliary_state
-          #       (MlxModelRunner._clear_steps now set in __init__, fake runner omits it)
-          #   - test_mlx_scheduler_init_overlap_keeps_future_map_relay
-          #       (decide_needs_cpu_seq_lens now reads server_args.speculative_algorithm)
-          #   - test_finished_request_snapshots_before_release
-          #       (_handle_finished_req renamed to _handle_finish_state_updated_req)
-          # -k matches test-name keywords, robust to the pytest.ini rootdir that
-          # shifts nodeids and breaks path-based --deselect.
-          EXCLUDE="test_decode_finalize_does_not_snapshot_auxiliary_state \
-            or test_mlx_scheduler_init_overlap_keeps_future_map_relay \
-            or test_finished_request_snapshots_before_release"
+          # signature contracts, mocked Metal capture, dummy ServerArgs patching,
+          # and quant-config dicts.
           python3 -m pytest -v \
             test/registered/unit/hardware_backend/mlx/test_runner_init_contract.py \
             test/registered/unit/hardware_backend/mlx/test_metal_profiler.py \
             test/registered/unit/hardware_backend/mlx/test_attention_patching.py \
-            "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride" \
-            -k "not ($EXCLUDE)"
+            "test/registered/unit/hardware_backend/mlx/test_quantization.py::TestMlxQuantizationOverride"
 
   pr-test-mlx-finish:
     needs: [mlx-unit-test]
