@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import time
 import traceback
@@ -45,16 +44,9 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
-
-
-def _overall_checksum(checksums: Dict[str, str]) -> str:
-    h = hashlib.sha256()
-    for name in sorted(checksums):
-        h.update(name.encode())
-        h.update(checksums[name].encode())
-    return h.hexdigest()
 
 
 def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
@@ -70,7 +62,7 @@ def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
         parallelism_infos.append({"role": role or "target", **p["parallelism_info"]})
     return {
         "checksums": merged,
-        "per_gpu_checksum": _overall_checksum(merged),
+        "per_gpu_checksum": overall_checksum(merged),
         "parallelism_info": parallelism_infos,
     }
 

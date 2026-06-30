@@ -53,11 +53,12 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
 
 
 def _is_skip_weight_check(name, param, skip_tensor_list=None) -> bool:
-    # Excluded from the equality check: tensors the owning layer flagged
-    # _skip_weight_check (kv-cache k_scale/v_scale, placeholders rewritten by
-    # process_weights_after_loading), plus names matching skip_tensor_list.
-    return getattr(param, "_skip_weight_check", False) or any(
-        pat in name for pat in (skip_tensor_list or ())
+    # One skip group shared by reset / compare / checksum; the _skip_weight_check
+    # flag is set on kv-cache k/v_scale and process_weights_after_loading placeholders.
+    return (
+        _is_non_persistent_buffer_name(name)
+        or getattr(param, "_skip_weight_check", False)
+        or any(pat in name for pat in (skip_tensor_list or ()))
     )
 
 
@@ -111,9 +112,7 @@ class WeightChecker:
         for name, param in self._model_state():
             # Skip exactly what compare/checksum skip, so reset only poisons
             # tensors compare will verify.
-            if _is_non_persistent_buffer_name(name) or _is_skip_weight_check(
-                name, param, skip_tensor_list
-            ):
+            if _is_skip_weight_check(name, param, skip_tensor_list):
                 continue
             param.copy_(_random_like(param))
 
@@ -152,11 +151,7 @@ class WeightChecker:
             if should_compare:
                 checksums[name] = _hash_tensor(ref.dequantize().data)
 
-        h = hashlib.sha256()
-        for name in sorted(checksums):
-            h.update(name.encode())
-            h.update(checksums[name].encode())
-        overall = h.hexdigest()
+        overall = overall_checksum(checksums)
 
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
@@ -191,6 +186,14 @@ class WeightChecker:
 
 def _hash_tensor(t: torch.Tensor) -> str:
     return f"{tensor_hash(t):016x}"
+
+
+def overall_checksum(checksums: Dict[str, str]) -> str:
+    h = hashlib.sha256()
+    for name in sorted(checksums):
+        h.update(name.encode())
+        h.update(checksums[name].encode())
+    return h.hexdigest()
 
 
 def _check_tensors(
@@ -299,11 +302,9 @@ def _build_entries(
     for name, tensor in raw.items():
         if name in scale_names:
             continue  # compared via its weight's comparable
+        should_compare = name not in skip_compare_names
         if name in quantized_set:
             comparable_cls, s_name = quantized_set[name]
-            yield name, True, comparable_cls(tensor, raw[s_name])
+            yield name, should_compare, comparable_cls(tensor, raw[s_name])
         else:
-            should_compare = name not in skip_compare_names and (
-                not _is_non_persistent_buffer_name(name)
-            )
             yield name, should_compare, RawComparable(tensor)

@@ -33,6 +33,7 @@ from sglang.srt.utils.weight_checker import (
     _check_tensors,
     _hash_tensor,
     _is_non_persistent_buffer_name,
+    _is_skip_weight_check,
     _random_like,
 )
 from sglang.srt.utils.weight_checker_comparator import (
@@ -232,9 +233,10 @@ class TestPostprocessTensors(CustomTestCase):
             _build_entries(raw, set()), [("x.weight", True, RawComparable(w))]
         )
 
-    # --- non-persistent buffer skip ---
+    # --- skip set is honored (non-persistent buffers now arrive via the skip set,
+    # built by _skip_compare_names / _is_skip_weight_check) ---
 
-    def test_skips_cos_sin_cache_substring(self):
+    def test_skip_set_marks_raw_entry_not_compared(self):
         cache = torch.randn(8)
         plain = torch.randn(4)
         raw = {
@@ -242,33 +244,23 @@ class TestPostprocessTensors(CustomTestCase):
             "model.layers.0.weight": plain,
         }
         _assert_entries_close(
-            _build_entries(raw, set()),
+            _build_entries(raw, {"model.rotary_emb.cos_sin_cache"}),
             [
                 ("model.rotary_emb.cos_sin_cache", False, RawComparable(cache)),
                 ("model.layers.0.weight", True, RawComparable(plain)),
             ],
         )
 
-    def test_skips_inv_freq_substring(self):
-        t = torch.randn(4)
+    def test_skip_set_marks_quantized_entry_not_compared(self):
+        # Regression: the quantized branch must honor the skip set, not hard-code
+        # should_compare=True (so a skip_tensor_list can drop a quantized weight).
+        qweight, sf_fp32, _ = _build_fp8_quant_pair()
+        raw = {"x.weight": qweight, "x.weight_scale_inv": sf_fp32}
+        quantized_set = {"x.weight": (Fp8BlockComparable, "x.weight_scale_inv")}
+        ref = Fp8BlockComparable(qweight, sf_fp32)
         _assert_entries_close(
-            _build_entries({"model.rotary_emb.inv_freq": t}, set()),
-            [("model.rotary_emb.inv_freq", False, RawComparable(t))],
-        )
-
-    def test_skips_weight_fp32_substring(self):
-        t = torch.randn(4)
-        _assert_entries_close(
-            _build_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
-            [("model.layers.0.mlp.gate._weight_fp32", False, RawComparable(t))],
-        )
-
-    def test_substring_match_not_endswith(self):
-        # Pattern can appear anywhere in the name, not just at the end.
-        t = torch.randn(4)
-        _assert_entries_close(
-            _build_entries({"weird.cos_sin_cache.foo.bar": t}, set()),
-            [("weird.cos_sin_cache.foo.bar", False, RawComparable(t))],
+            _build_entries(raw, {"x.weight"}, quantized_set),
+            [("x.weight", False, ref)],
         )
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
@@ -808,6 +800,34 @@ class TestIsNonPersistentBufferName(CustomTestCase):
     def test_does_not_match_normal_param_names(self):
         self.assertFalse(_is_non_persistent_buffer_name("model.layers.0.mlp.weight"))
         self.assertFalse(_is_non_persistent_buffer_name("model.embed_tokens.weight"))
+
+
+# ---------------------------------------------------------------------------
+# _is_skip_weight_check  (the single skip predicate)
+# ---------------------------------------------------------------------------
+
+
+class TestIsSkipWeightCheck(CustomTestCase):
+    """Folds three skip sources into one predicate: non-persistent buffer names,
+    the _skip_weight_check param flag, and skip_tensor_list substrings."""
+
+    def test_non_persistent_buffer_name_is_skipped(self):
+        self.assertTrue(_is_skip_weight_check("model.rotary_emb.inv_freq", torch.zeros(4)))
+
+    def test_skip_weight_check_flag_is_skipped(self):
+        param = torch.zeros(4)
+        param._skip_weight_check = True
+        self.assertTrue(_is_skip_weight_check("model.layers.0.weight", param))
+
+    def test_skip_tensor_list_substring_is_skipped(self):
+        self.assertTrue(
+            _is_skip_weight_check("model.visual.blocks.0.weight", torch.zeros(4), ["visual."])
+        )
+
+    def test_plain_weight_is_not_skipped(self):
+        self.assertFalse(
+            _is_skip_weight_check("model.layers.0.weight", torch.zeros(4), ["visual."])
+        )
 
 
 # ---------------------------------------------------------------------------
