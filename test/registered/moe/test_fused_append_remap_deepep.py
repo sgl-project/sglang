@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels impo
     fused_append_remap_shared_experts_deepep,
     fused_append_shared_experts,
 )
-from sglang.srt.layers.moe.topk import TopKConfig, _remap_topk_for_deepep
+from sglang.srt.layers.moe.topk import TopKConfig, _remap_topk_for_deepep, _use_aiter
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -109,12 +109,13 @@ class TestFusedAppendRemapDeepEP(CustomTestCase):
     def test_equivalence_with_eager_append_then_remap(self):
         """Fused kernel == fused_append_shared_experts() + _remap_topk_for_deepep().
 
-        The eager remap overwrites the shared weight with 1/routed_scaling_factor,
-        so the fused kernel is invoked with that same value to make the two paths
-        bit-identical (ids are identical regardless of the scaling factor).
+        The eager remap overwrites the shared weight: 1.0 on the aiter/HIP path
+        (routed_scaling_factor is pre-folded into the routed topk weights), else
+        1/routed_scaling_factor. The fused kernel is invoked with that same value
+        so the two paths stay bit-identical (ids match regardless of scaling).
         """
         rsf = 2.5
-        scale_factor = 1.0 / rsf
+        scale_factor = 1.0 if _use_aiter else 1.0 / rsf
         for m, k, npr, ep_size, ep_rank, s in self.CASES:
             with self.subTest(m=m, k=k, npr=npr, ep_rank=ep_rank, s=s):
                 shared_id_base, num_local_routed = self._shared_id_base(

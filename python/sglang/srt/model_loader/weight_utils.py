@@ -67,7 +67,7 @@ from sglang.utils import is_in_ci
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
-except ImportError as e:
+except ImportError:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
@@ -814,9 +814,11 @@ def _prefetch_all_checkpoints(
     naturally adapts to any RAM size — even if the full checkpoint does
     not fit in page cache, the prefetch thread stays ahead of the loader.
     """
-    import asyncio
     import threading
     import time
+
+    if num_threads < 1:
+        raise ValueError("weight loader prefetch num_threads must be >= 1")
 
     # Use node-local rank so that each node independently prefetches the
     # full checkpoint into its own page cache. Global rank would split files
@@ -842,40 +844,60 @@ def _prefetch_all_checkpoints(
         num_threads,
     )
 
-    async def _prefetch_all() -> None:
-        semaphore = asyncio.Semaphore(num_threads)
+    def _prefetch_all() -> None:
         completed = 0
         next_log_pct = 10
 
-        async def prefetch_one(path: str) -> None:
+        def record_complete() -> None:
             nonlocal completed, next_log_pct
-            try:
-                async with semaphore:
-                    await asyncio.to_thread(_prefetch_checkpoint_file, path)
-                completed += 1
-                if total_for_rank > 0 and next_log_pct <= 100:
-                    pct = 100 * completed / total_for_rank
-                    if pct >= next_log_pct:
-                        logger.info(
-                            "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
-                            local_rank,
-                            next_log_pct,
-                            completed,
-                            total_for_rank,
-                        )
-                        next_log_pct += 10
-            except Exception:
-                logger.warning(
-                    "Failed to prefetch checkpoint file %r.",
-                    path,
-                    exc_info=True,
-                )
 
-        await asyncio.gather(*(prefetch_one(p) for p in my_files))
+            completed += 1
+            if total_for_rank > 0 and next_log_pct <= 100:
+                pct = 100 * completed / total_for_rank
+                while pct >= next_log_pct and next_log_pct <= 100:
+                    logger.info(
+                        "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
+                        local_rank,
+                        next_log_pct,
+                        completed,
+                        total_for_rank,
+                    )
+                    next_log_pct += 10
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            file_iter = iter(my_files)
+            pending: Dict[concurrent.futures.Future, str] = {}
+
+            for path in itertools.islice(file_iter, num_threads):
+                pending[executor.submit(_prefetch_checkpoint_file, path)] = path
+
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    pending,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    path = pending.pop(future)
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.warning(
+                            "Failed to prefetch checkpoint file %r.",
+                            path,
+                            exc_info=True,
+                        )
+                    finally:
+                        record_complete()
+
+                    next_path = next(file_iter, None)
+                    if next_path is not None:
+                        pending[
+                            executor.submit(_prefetch_checkpoint_file, next_path)
+                        ] = next_path
 
     def _run_prefetch() -> None:
         start = time.perf_counter()
-        asyncio.run(_prefetch_all())
+        _prefetch_all()
         elapsed = time.perf_counter() - start
         logger.info(
             "Rank %d: prefetching checkpoint files into page cache "
@@ -1081,7 +1103,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
 
         # Seed the buffer.
         for st_file in itertools.islice(file_iter, buffer_size):
-            pending.append(executor.submit(_load_file, st_file))
+            pending.append((st_file, executor.submit(_load_file, st_file)))
 
         with tqdm(
             total=len(hf_weights_files),
@@ -1091,18 +1113,22 @@ def buffered_multi_thread_safetensors_weights_iterator(
             position=tqdm._get_free_pos(),
         ) as pbar:
             while pending:
-                future = pending.popleft()
+                st_file, future = pending.popleft()
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
                 # Replenish: submit the next file to keep the buffer full.
                 next_file = next(file_iter, None)
                 if next_file is not None:
-                    pending.append(executor.submit(_load_file, next_file))
+                    pending.append((next_file, executor.submit(_load_file, next_file)))
 
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]
                 del state_dict
+                if drop_cache_after_load:
+                    # DONTNEED reduces page-cache pressure after copying weights,
+                    # but later mmap-backed tensor access may fault pages again.
+                    _drop_file_cache_after_load(st_file)
                 pbar.update(1)
 
 
@@ -1469,7 +1495,10 @@ def initialize_dummy_weights(
         if torch.is_floating_point(param):
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)
-            if torch.finfo(param.data.dtype).bits < 16:
+            # Tensor subclasses such as MXFP8 wrappers expose a low-bit raw
+            # storage dtype through `.data`, but their wrapper `uniform_` also
+            # updates side tensors such as block scales.
+            if torch.finfo(param.dtype).bits < 16:
                 # uniform_ doesn't support < 16-bit datatypes (FP8)
                 dtype = param.data.dtype
                 tmp_param = param.data.to(torch.float16)

@@ -27,7 +27,7 @@ v0.5.13 or a later version.
 | Data Parallelism              | `--dp-size 2`                                                                                 |
 | Expert Parallelism            | `--ep-size 4 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode auto`                     |
 | Quantization                  | `--quantization modelslim`                                                                    |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs`; e.g. `--cuda-graph-bs 2 4 8` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g. `--cuda-graph-bs 2 4 8` |
 | Speculative Decoding          | `--speculative-algorithm NEXTN \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
