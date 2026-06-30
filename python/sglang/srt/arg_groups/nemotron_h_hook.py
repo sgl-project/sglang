@@ -57,11 +57,9 @@ def apply_nemotron_h_defaults(server_args: ServerArgs, model_arch: str) -> None:
         else:
             server_args.moe_runner_backend = "flashinfer_cutlass"
 
-    server_args._handle_mamba_radix_cache(
-        model_arch=model_arch,
-        sm100_default_attention_backend="flashinfer",
-        fallback_attention_backend="flashinfer",
-    )
+    if is_sm100_supported() and server_args.attention_backend is None:
+        server_args.attention_backend = "flashinfer"
+    server_args._handle_mamba_radix_cache(model_arch=model_arch)
     assert server_args.attention_backend != "triton", (
         "NemotronHForCausalLM does not support triton attention backend,"
         "as the first layer might not be an attention layer"
