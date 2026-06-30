@@ -407,11 +407,48 @@ async fn chat_completions_inner(
     });
     let bootstrap_room = bootstrap.as_ref().map(|b| b.room);
 
+    // Request id used to abort the engine if the client disconnects mid-flight.
+    // Scoped to plain (non-PD) mode: PD deliberately detaches its prefill so it
+    // outlives the client (KV-transfer correctness), and aborting only the
+    // decode half mid-transfer is a riskier change left out of scope here — so
+    // PD requests get no rid injection and no abort, preserving today's
+    // behavior exactly.
+    //
+    // Reuse a client-supplied string `rid` (so an external abort-by-rid keeps
+    // working and we don't override intent); otherwise mint one and inject it
+    // into the forwarded body so the engine adopts it. SGLang keeps a provided
+    // `rid` and only generates one when it is absent, and it aborts every rid
+    // that *starts with* the one we send — covering `n>1` expansions.
+    let client_rid = request_value
+        .as_ref()
+        .and_then(|v| v.get("rid"))
+        .and_then(|r| r.as_str());
+    let request_id: Option<String> = if decode_peer.is_none() {
+        Some(
+            client_rid
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("router-{}", uuid::Uuid::new_v4().simple())),
+        )
+    } else {
+        None
+    };
+    // Inject only a router-minted rid; a client-supplied one is already in the
+    // body, and PD mode (`request_id == None`) is never injected.
+    let rid_to_inject: Option<&str> = match (request_id.as_deref(), client_rid) {
+        (Some(rid), None) => Some(rid),
+        _ => None,
+    };
+
     // Build the body forwarded to the engine(s) exactly once — injecting the
-    // `input_ids` and/or bootstrap fields, or forwarding the original bytes
-    // untouched when neither applies.
-    let outgoing_body =
-        build_outgoing_body(&body, request_value, forward_input_ids, bootstrap.as_ref())?;
+    // `rid`, `input_ids`, and/or bootstrap fields, or forwarding the original
+    // bytes untouched when none apply.
+    let outgoing_body = build_outgoing_body(
+        &body,
+        request_value,
+        forward_input_ids,
+        bootstrap.as_ref(),
+        rid_to_inject,
+    )?;
     let at_post_build = start.elapsed();
 
     let result = if let Some(decode_worker) = decode_peer {
@@ -510,6 +547,9 @@ async fn chat_completions_inner(
                 outgoing_body,
                 Some(stream_guards),
                 Some(make_ttft_hook()),
+                // `None` in PD mode (request_id is None): decode abort is out
+                // of scope here — see the request_id comment above.
+                request_id.as_deref(),
             );
             tokio::select! {
                 biased;
@@ -547,6 +587,10 @@ async fn chat_completions_inner(
             outgoing_body,
             Some(stream_guards),
             Some(make_ttft_hook()),
+            // Abort the engine if the client disconnects before the engine
+            // finishes streaming. The SSE pump (which owns the guard) fires
+            // it; here we only supply the rid the engine knows this request by.
+            request_id.as_deref(),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
@@ -567,6 +611,15 @@ async fn chat_completions_inner(
         // future does not need them (it does not return until the
         // body is buffered).
         let _holds = (guard, active_guard);
+        // Abort-on-disconnect: armed for the whole forward, disarmed once a
+        // complete response is in hand. If the client disconnects first the
+        // handler future is dropped mid-await and this guard, still armed,
+        // tells the engine to stop. A stale-request timeout (the cancel arm
+        // below) also leaves it armed — we've given up, so the engine should
+        // too. `None` only in PD mode / on a worker-URL parse failure.
+        let mut abort_guard = request_id
+            .as_deref()
+            .and_then(|rid| ctx.proxy.abort_guard_for(&worker.url, worker.protocol(), rid));
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             worker.protocol(),
@@ -576,10 +629,20 @@ async fn chat_completions_inner(
             outgoing_body,
         );
         // Same `biased` order as the streaming arm.
-        tokio::select! {
+        let r = tokio::select! {
             biased;
             r = fetch => r,
             _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        };
+        // A complete response (any status) means the engine is done with this
+        // request — don't abort it. Only an early drop (client disconnect) or
+        // stale-timeout leaves the guard armed.
+        if r.is_ok() {
+            if let Some(g) = abort_guard.as_mut() {
+                g.disarm();
+            }
+        }
+        r
         }
     };
 
@@ -744,8 +807,9 @@ fn build_outgoing_body(
     value: Option<serde_json::Value>,
     input_ids: Option<&[u32]>,
     bootstrap: Option<&BootstrapFields>,
+    rid: Option<&str>,
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() {
+    if input_ids.is_none() && bootstrap.is_none() && rid.is_none() {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
@@ -765,6 +829,15 @@ fn build_outgoing_body(
             ))
         }
     };
+    if let Some(rid) = rid {
+        // The engine adopts a provided `rid` verbatim (only minting one when
+        // absent), so this is what the router later aborts by if the client
+        // disconnects. Caller passes `Some` only for a router-minted rid.
+        obj.insert(
+            "rid".to_string(),
+            serde_json::Value::String(rid.to_string()),
+        );
+    }
     if let Some(ids) = input_ids {
         obj.insert(
             "input_ids".to_string(),
@@ -996,7 +1069,7 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap)).unwrap();
+        let injected = build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -1017,7 +1090,7 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -1032,10 +1105,30 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, None).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
+        );
+    }
+
+    /// A router-minted `rid` is injected as a top-level string so the engine
+    /// adopts it (and the router can later abort by it). `messages` are
+    /// untouched.
+    #[test]
+    fn build_outgoing_body_injects_rid() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let out = build_outgoing_body(&body, Some(value), None, None, Some("router-abc123")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed.get("rid").and_then(|r| r.as_str()),
+            Some("router-abc123"),
+            "the router-minted rid must be injected as a top-level string",
+        );
+        assert!(
+            parsed.get("messages").is_some(),
+            "messages must be retained alongside the injected rid",
         );
     }
 
@@ -1052,7 +1145,7 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap)).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -1147,7 +1240,7 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap)).unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),

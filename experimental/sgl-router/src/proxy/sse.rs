@@ -398,6 +398,47 @@ where
     .boxed()
 }
 
+/// Wrap a stream so `reached_end` flips to `true` the instant the stream yields
+/// its terminal item — a clean `None` (the engine finished generating) or a
+/// terminal `Err` (the engine failed, or the idle timeout tripped). The SSE
+/// pump only polls through to that terminal when it runs to completion; if the
+/// client disconnects or stalls, the pump breaks early and never observes it, so
+/// the flag stays `false`.
+///
+/// An [`AbortOnDrop`](crate::proxy::AbortOnDrop) packed into the pump's
+/// `stream_guards` reads this flag when it drops: flag still `false` ⇒ the
+/// stream was torn down before the engine was done ⇒ the client is gone and the
+/// engine is told to abort. Keeping the signal in one shared flag avoids
+/// coupling the pump's loop to the abort machinery (the pump never inspects its
+/// opaque guards).
+pub fn mark_terminal<S>(
+    stream: S,
+    reached_end: Arc<std::sync::atomic::AtomicBool>,
+) -> futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+{
+    futures::stream::unfold((stream, reached_end), |(mut s, flag)| async move {
+        match s.next().await {
+            Some(item) => {
+                // A terminal `Err` is the last item the pump reads (it breaks on
+                // error), so the engine is done/failed: mark end now, before the
+                // guard can drop, so a real upstream failure is not mistaken for
+                // a client disconnect.
+                if item.is_err() {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Some((item, (s, flag)))
+            }
+            None => {
+                flag.store(true, Ordering::SeqCst);
+                None
+            }
+        }
+    })
+    .boxed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +957,68 @@ mod tests {
             &bytes[..],
             &big[..],
             "oversized chunk payload must be intact"
+        );
+    }
+
+    /// `mark_terminal` flips the flag the moment the stream is drained to its
+    /// clean end — the engine-finished signal the abort guard reads to decide
+    /// it must NOT abort.
+    #[tokio::test]
+    async fn mark_terminal_sets_flag_on_clean_end() {
+        use std::sync::atomic::AtomicBool;
+        let flag = Arc::new(AtomicBool::new(false));
+        let s = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"a")),
+            Ok(Bytes::from_static(b"b")),
+        ]);
+        let mut wrapped = mark_terminal(s, Arc::clone(&flag));
+        while wrapped.next().await.is_some() {}
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "reaching the clean upstream end must set reached_end (engine done → no abort)",
+        );
+    }
+
+    /// The disconnect signal: a consumer that stops polling before the terminal
+    /// item (exactly what the SSE pump does when the client disconnects) leaves
+    /// the flag false — which is what arms the abort.
+    #[tokio::test]
+    async fn mark_terminal_flag_stays_false_when_consumer_stops_early() {
+        use std::sync::atomic::AtomicBool;
+        let flag = Arc::new(AtomicBool::new(false));
+        let s = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"a")),
+            Ok(Bytes::from_static(b"b")),
+            Ok(Bytes::from_static(b"c")),
+        ]);
+        let mut wrapped = mark_terminal(s, Arc::clone(&flag));
+        // Read one item, then stop — the upstream still has chunks left and was
+        // never driven to its terminal `None`.
+        let _ = wrapped.next().await;
+        drop(wrapped);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "stopping before the terminal item must leave reached_end false (client gone → abort fires)",
+        );
+    }
+
+    /// A terminal upstream error means the engine is done/failed — the flag must
+    /// be set as the error is yielded, so a real upstream failure is never
+    /// mistaken for a client disconnect (which would send a pointless abort).
+    #[tokio::test]
+    async fn mark_terminal_sets_flag_on_terminal_error() {
+        use std::sync::atomic::AtomicBool;
+        let flag = Arc::new(AtomicBool::new(false));
+        let s = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"a")),
+            Err(std::io::Error::other("boom")),
+        ]);
+        let mut wrapped = mark_terminal(s, Arc::clone(&flag));
+        let _ok = wrapped.next().await; // "a"
+        let _err = wrapped.next().await; // Err → flag set as it is yielded
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "a terminal error means the engine is done/failed — no abort",
         );
     }
 }

@@ -14,6 +14,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::{Client, Url};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,6 +86,136 @@ fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
 /// and leaks the per-worker in-flight slot forever.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long an abort POST may take before we give up. The client is already
+/// gone, so this only bounds how long the fire-and-forget task lingers; a slow
+/// abort must never wedge a worker's connection pool.
+const ABORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tell an engine to stop generating a request whose client has disconnected,
+/// by `POST`ing `/abort_request {rid, abort_all:false}`. The engine cancels
+/// every in-flight request whose `rid` *starts with* this one, which also
+/// covers the `n>1` parallel-sampling expansions (`<rid>_0`, `<rid>_1`, …).
+///
+/// Best-effort by construction: the client is already gone, so there is no one
+/// to surface an error to, and a missed abort wastes engine compute but is not
+/// a correctness fault. Failures are logged, not propagated. Not circuit-breaker
+/// gated — an abort is a courtesy to the engine, never counted against a worker.
+async fn send_abort(client: &Client, abort_url: &str, rid: &str) {
+    let body = serde_json::json!({ "rid": rid, "abort_all": false });
+    match client
+        .post(abort_url)
+        .json(&body)
+        .timeout(ABORT_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => tracing::debug!(
+            abort_url,
+            rid,
+            status = %resp.status(),
+            "told engine to abort request after client disconnect",
+        ),
+        Err(e) => tracing::warn!(
+            abort_url,
+            rid,
+            error = %e,
+            "failed to send abort to engine after client disconnect",
+        ),
+    }
+}
+
+/// Drop guard that aborts an in-flight engine request when the client goes
+/// away. Spawns [`send_abort`] from its `Drop` when (and only when) it is still
+/// "armed" at drop time.
+///
+/// Two arming modes, matching the two forwarding paths:
+/// * **Unary** ([`for_unary`](Self::for_unary)): armed until [`disarm`](Self::disarm)
+///   is called. The handler disarms it once a complete response is in hand, so a
+///   drop without disarm means the handler future was cancelled (client
+///   disconnect) or the stale-request janitor fired — both cases where the
+///   engine may still be working and should be told to stop.
+/// * **Streaming** ([`for_stream`](Self::for_stream)): never disarmed; instead it
+///   reads a `reached_end` flag flipped true by [`sse::mark_terminal`] the moment
+///   the upstream stream yields its terminal item. A drop with the flag still
+///   false means the SSE pump was torn down before the engine finished — i.e. the
+///   client disconnected or stalled mid-stream.
+pub(crate) struct AbortOnDrop {
+    client: Client,
+    abort_url: String,
+    rid: String,
+    /// `None` for unary (decided solely by `armed`); `Some` for streaming, where
+    /// the abort fires only if the engine had not reached its terminal item.
+    reached_end: Option<Arc<AtomicBool>>,
+    armed: bool,
+}
+
+impl AbortOnDrop {
+    fn for_unary(client: Client, abort_url: String, rid: String) -> Self {
+        Self {
+            client,
+            abort_url,
+            rid,
+            reached_end: None,
+            armed: true,
+        }
+    }
+
+    fn for_stream(
+        client: Client,
+        abort_url: String,
+        rid: String,
+        reached_end: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            client,
+            abort_url,
+            rid,
+            reached_end: Some(reached_end),
+            armed: true,
+        }
+    }
+
+    /// Mark the request as completed so the guard does NOT abort on drop. Call
+    /// once a full response has been received from the engine (unary path).
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn should_abort(&self) -> bool {
+        self.armed
+            && self
+                .reached_end
+                .as_ref()
+                .map_or(true, |f| !f.load(Ordering::SeqCst))
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if !self.should_abort() {
+            return;
+        }
+        let client = self.client.clone();
+        let abort_url = std::mem::take(&mut self.abort_url);
+        let rid = std::mem::take(&mut self.rid);
+        // `Drop` is sync; the POST is async and fire-and-forget. We need a
+        // runtime handle to spawn it — present on every normal drop (the
+        // handler / SSE pump run on the tokio runtime). It is absent only when
+        // the runtime itself is tearing down, in which case the process is
+        // exiting and there is no point chasing an abort.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { send_abort(&client, &abort_url, &rid).await });
+            }
+            Err(_) => tracing::debug!(
+                %abort_url,
+                %rid,
+                "no tokio runtime at drop (shutdown); skipping engine abort",
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Proxy {
     /// HTTP/1.1 forwarding client. The always-safe default, and also the
@@ -152,6 +283,32 @@ impl Proxy {
     /// no per-worker protocol selection.
     pub fn admin_client(&self) -> &Client {
         &self.http1_client
+    }
+
+    /// Build an [`AbortOnDrop`] guard for a **non-streaming** forward to
+    /// `worker_url`. Hold it across the forward; disarm it once a complete
+    /// response is in hand. If it instead drops while armed — the handler
+    /// future was cancelled by a client disconnect, or the stale-request
+    /// janitor fired — it `POST`s `/abort_request` so the engine stops
+    /// generating a reply no one will read.
+    ///
+    /// `rid` must be the request id the router injected into the forwarded body
+    /// (so the engine's request carries it). Returns `None` only if `worker_url`
+    /// can't be parsed — in which case the forward itself fails the same way and
+    /// the absent guard is moot. Streaming forwards get their guard internally
+    /// via [`forward_streaming_to`](Self::forward_streaming_to)'s `abort_rid`.
+    pub(crate) fn abort_guard_for(
+        &self,
+        worker_url: &str,
+        protocol: WireProtocol,
+        rid: &str,
+    ) -> Option<AbortOnDrop> {
+        let abort_url = Url::parse(worker_url).ok()?.join("/abort_request").ok()?;
+        Some(AbortOnDrop::for_unary(
+            self.client_for(protocol).clone(),
+            abort_url.to_string(),
+            rid.to_string(),
+        ))
     }
 
     /// Classify a reqwest error into the right `ApiError` variant, given an
@@ -273,6 +430,12 @@ impl Proxy {
     /// `active_requests` counter and the per-request active-load entry alive
     /// for the full streaming lifetime — without which a long-running SSE
     /// response would under-report load.
+    ///
+    /// `abort_rid` — when `Some`, the request id the router injected into the
+    /// forwarded body. On a successful stream this arms a client-disconnect
+    /// abort: if the SSE pump is torn down before the engine finishes (client
+    /// disconnect / non-draining stall), the engine is told to stop generating
+    /// this rid. `None` disables it (e.g. callers that don't track a rid).
     // Each parameter is a distinct, required input to a single upstream
     // forward (target, protocol, breaker, path, headers, body, plus the two
     // streaming-lifetime callbacks). Bundling them into a struct purely to
@@ -288,6 +451,7 @@ impl Proxy {
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+        abort_rid: Option<&str>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -371,16 +535,38 @@ impl Proxy {
         // lifetime by packing a pump-phase guard into the stream guards (created
         // post-headers, dropped when the pump task ends).
         let pump_phase = crate::diag::PhaseGuard::pump();
-        let guards: Option<Box<dyn Send + 'static>> = match stream_guards {
-            Some(g) => Some(Box::new((g, pump_phase))),
-            None => Some(Box::new(pump_phase)),
+        // Client-disconnect abort: for a successful stream, wrap the upstream so
+        // a `reached_end` flag flips true when the engine finishes (or fails),
+        // and pack an `AbortOnDrop` reading that flag into the stream guards. If
+        // the SSE pump tears down before the engine is done — client disconnect
+        // or a non-draining stall — the guard drops with the flag still false and
+        // tells the engine to stop. A non-2xx stream is the engine's own error
+        // body (it isn't generating), so it is never abortable.
+        let upstream: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>> =
+            sse::idle_timeout_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT);
+        let (upstream, abort_guard) = match abort_rid {
+            Some(rid) if status.is_success() => match worker_url.join("/abort_request") {
+                Ok(abort_url) => {
+                    let reached_end = Arc::new(AtomicBool::new(false));
+                    let guard = AbortOnDrop::for_stream(
+                        self.client_for(protocol).clone(),
+                        abort_url.to_string(),
+                        rid.to_string(),
+                        Arc::clone(&reached_end),
+                    );
+                    (sse::mark_terminal(upstream, reached_end), Some(guard))
+                }
+                Err(_) => (upstream, None),
+            },
+            _ => (upstream, None),
         };
-        let body = sse::bytes_stream_to_body(
-            sse::idle_timeout_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT),
-            guards,
-            on_complete,
-            first_byte_hook,
-        );
+        let guards: Option<Box<dyn Send + 'static>> = match (stream_guards, abort_guard) {
+            (Some(g), Some(a)) => Some(Box::new((g, pump_phase, a))),
+            (Some(g), None) => Some(Box::new((g, pump_phase))),
+            (None, Some(a)) => Some(Box::new((pump_phase, a))),
+            (None, None) => Some(Box::new(pump_phase)),
+        };
+        let body = sse::bytes_stream_to_body(upstream, guards, on_complete, first_byte_hook);
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(
@@ -473,6 +659,7 @@ mod tests {
             let resp = proxy
                 .forward_json_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &headers,
@@ -511,6 +698,7 @@ mod tests {
             let _ = proxy
                 .forward_json_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &headers,
@@ -551,6 +739,7 @@ mod tests {
         let resp = proxy
             .forward_json_to(
                 &url,
+                WireProtocol::Http1,
                 &breaker,
                 "/v1/chat/completions",
                 &headers,
@@ -584,6 +773,7 @@ mod tests {
             let resp = proxy
                 .forward_json_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &HeaderMap::new(),
@@ -622,10 +812,12 @@ mod tests {
             let resp = proxy
                 .forward_streaming_to(
                     &url,
+                    WireProtocol::Http1,
                     &breaker,
                     "/v1/chat/completions",
                     &headers,
                     Bytes::from_static(b"{}"),
+                    None,
                     None,
                     None,
                 )
