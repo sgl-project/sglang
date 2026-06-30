@@ -2176,19 +2176,27 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
-        # Validate prompt length
+        # Validate prompt length first.
+        # Pass pool capacity so the effective limit reserves decode space when
+        # the KV pool is smaller than the model's context length. We do this
+        # BEFORE init_req_max_new_tokens so that max_new_tokens is computed
+        # against the (possibly truncated) input length and we don't end up
+        # with max_new_tokens=0 for a request whose input was just truncated.
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            max_total_num_tokens=self.max_total_num_tokens,
+            page_size=self.page_size,
         )
         if error_msg:
+            self.init_req_max_new_tokens(req)
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        # initialize after truncation so max_new_tokens uses the final input_len
+        self.init_req_max_new_tokens(req)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -2461,6 +2469,8 @@ class Scheduler(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            max_total_num_tokens=self.max_total_num_tokens,
+            page_size=self.page_size,
         )
         if error_msg:
             self._add_request_to_queue(req)

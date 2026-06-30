@@ -162,36 +162,60 @@ class GenerationBatchResult:
 
 
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    req: Req,
+    max_req_input_len: int,
+    allow_auto_truncate: bool,
+    max_total_num_tokens: Optional[int] = None,
+    page_size: int = 1,
 ) -> Optional[str]:
-    """Validate and potentially truncate input length.
+    """Validate and potentially truncate input length."""
 
-    Args:
-        req: The request containing input_ids to validate
-        max_req_input_len: Maximum allowed input length
-        allow_auto_truncate: Whether to truncate long inputs
+    input_len = len(req.origin_input_ids)
+    requested_new_tokens = req.sampling_params.max_new_tokens
 
-    Returns:
-        Error message if validation fails, None if successful
-    """
-    if len(req.origin_input_ids) >= max_req_input_len:
-        if allow_auto_truncate:
-            logger.warning(
-                "Request length is longer than the KV cache pool size or "
-                "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
-            )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
-            return None
-        else:
-            error_msg = (
-                f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
-                f"Use a shorter input or enable --allow-auto-truncate."
-            )
-            return error_msg
+    # Align the validation limit with PrefillAdder's admission check:
+    # add_one_req() requires:
+    #
+    #   input_len + page_size < max_total_num_tokens
+    #
+    # Otherwise a request may pass validation/truncation but be
+    # permanently rejected with NO_TOKEN during scheduling.
+    if max_total_num_tokens is not None:
+        max_req_input_len = min(
+            max_req_input_len,
+            max(0, max_total_num_tokens - page_size - 1),
+        )
+    if input_len < max_req_input_len:
+        return None
 
-    return None
+    if allow_auto_truncate and max_req_input_len > 0:
+        logger.warning(
+            "Request length is longer than the KV cache pool size or "
+            "the max context length. Truncated. "
+            f"{input_len=}, {max_req_input_len=}, "
+            f"{max_total_num_tokens=}, {requested_new_tokens=}."
+        )
+        req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+        return None
+
+    if max_req_input_len <= 0:
+        return (
+            f"KV cache pool is too small to serve this request: "
+            f"max_total_num_tokens={max_total_num_tokens}, "
+            f"requested max_new_tokens={requested_new_tokens}, "
+            f"page_size={page_size}. Reduce max_new_tokens, or increase "
+            f"--mem-fraction-static / decrease --max-running-requests / "
+            f"--context-length on the server."
+        )
+
+    return (
+        f"Input length ({input_len} tokens) exceeds the effective limit "
+        f"({max_req_input_len} tokens; "
+        f"max_total_num_tokens={max_total_num_tokens}, "
+        f"max_new_tokens={requested_new_tokens}). "
+        f"Use a shorter input, reduce max_new_tokens, or enable "
+        f"--allow-auto-truncate."
+    )
 
 
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
