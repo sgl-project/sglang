@@ -972,8 +972,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
-        (slots are physical); SharedHybridReqToTokenPool overrides it for the
-        shared KV pool, where mamba slot ids are virtual. Callers translate
+        (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
+        unified memory pool, where mamba slot ids are virtual. Callers translate
         before calling the pool's physical-id state ops (copy_from / clear_slots
         / get_cpu_copy / load_cpu_copy)."""
         return mamba_indices
@@ -1144,12 +1144,12 @@ class KVWriteLoc:
 
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (the allocated
-      ``out_cache_loc``). VIRTUAL under the shared KV pool (it indexes the
-      virtual slot space); already physical for a non-shared pool.
+      ``out_cache_loc``). VIRTUAL under the unified memory pool (it indexes the
+      virtual slot space); already physical for a non-unified memory pool.
     - ``swa_loc``: the pre-translated SWA-sub-pool PHYSICAL location for hybrid
       SWA pools (``None`` otherwise).
     - ``full_loc``: the pre-translated full-attention-sub-pool PHYSICAL location
-      for the shared KV pool (``None`` otherwise), computed once per forward in
+      for the unified memory pool (``None`` otherwise), computed once per forward in
       attention metadata (``ForwardMetadata.out_cache_loc_full_physical``). The
       shared full pool writes it directly; the pool never translates (replacing
       the former per-layer v2p gather / ``set_full_loc`` pin).
@@ -2384,12 +2384,12 @@ class HybridLinearKVPool(KVCache):
         self.mamba_pool = mamba_pool
         # virtual->physical mamba-slot translate for the HiCache offload path
         # (get_cpu_copy/load_cpu_copy). Identity for a static pool (slots are
-        # physical); set to the SharedMambaSlotAllocator's `translate` for the
-        # shared KV pool, where mamba_indices arrive virtual.
+        # physical); set to the UnifiedMambaSlotAllocator's `translate` for the
+        # unified memory pool, where mamba_indices arrive virtual.
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
-            # Shared-KV-pool path: the caller built a SharedMHATokenToKVPool
+            # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
             # aliasing the shared byte buffer.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
@@ -2527,7 +2527,7 @@ class HybridLinearKVPool(KVCache):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         # All write-location info lives in the metadata (`KVWriteLoc`); the pool
-        # holds none. `full_loc` is the shared pool's pre-translated full-PHYSICAL
+        # holds none. `full_loc` is the unified memory pool's pre-translated full-PHYSICAL
         # loc; for a static pool it's None and `loc` is already physical. Either
         # way the write loc is PHYSICAL — the pool writes it directly.
         loc, _, full_loc = unwrap_write_loc(loc)
@@ -2559,7 +2559,7 @@ class HybridLinearKVPool(KVCache):
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
         # mamba_pool is a pure store on PHYSICAL ids; translate the (virtual,
-        # for the shared pool) mamba_indices first.
+        # for the unified memory pool) mamba_indices first.
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(self._mamba_translate(mamba_indices))
             if mamba_indices is not None

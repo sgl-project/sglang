@@ -632,7 +632,7 @@ class PrefillAdder:
         radix state-reuse that won't allocate is not charged). 0 otherwise,
         which keeps the baseline / SWA / non-Mamba paths unchanged.
 
-        NOTE(shared-kv-pool): this is a CONSERVATIVE (not exact) estimate, by
+        NOTE(unified-memory-pool): this is a CONSERVATIVE (not exact) estimate, by
         design. `_mamba_slot_cost` (`mamba_slot_full_token_cost`) rounds the
         per-slot byte cost UP, so each new-mamba req over-reserves slightly rather
         than under-reserve — keeping admission within the joint gap for the

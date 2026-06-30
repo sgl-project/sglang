@@ -1,4 +1,4 @@
-"""Routing tests for the composite write paths (`SharedSWAKVPool`,
+"""Routing tests for the composite write paths (`UnifiedSWAKVPool`,
 `HybridLinearKVPool`).
 
 All write-location info travels in the attention metadata (`KVWriteLoc`); the
@@ -7,7 +7,7 @@ always PHYSICAL. Two routing contracts are pinned here:
 
 1. Full-attention. The full-physical loc is carried in `KVWriteLoc.full_loc`
    (from `ForwardBatch.out_cache_loc_full_physical`) and written directly.
-   `SharedSWAKVPool` asserts it's present (the shared pool always precomputes
+   `UnifiedSWAKVPool` asserts it's present (the unified memory pool always precomputes
    it); `HybridLinearKVPool` falls back to `loc` for a static (non-shared) pool,
    where `loc` is itself already physical.
 2. SWA. The swa-physical loc rides the backend `swa_out_cache_loc` rail
@@ -45,16 +45,16 @@ class _RecordingPool:
         self.calls.append((loc, kwargs))
 
 
-class TestSharedSWARouting(unittest.TestCase):
-    """`SharedSWAKVPool.set_kv_buffer` routing: full layers write the full-physical
+class TestUnifiedSWARouting(unittest.TestCase):
+    """`UnifiedSWAKVPool.set_kv_buffer` routing: full layers write the full-physical
     `full_loc`; SWA layers write the swa-physical `swa_loc`. Both come from the
     write metadata; the pool never translates."""
 
     def _make_bare_pool(self):
-        from sglang.srt.mem_cache.shared_kv_pool import SharedSWAKVPool
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
 
         # Bypass the heavy __init__; set only the attributes set_kv_buffer reads.
-        pool = object.__new__(SharedSWAKVPool)
+        pool = object.__new__(UnifiedSWAKVPool)
         pool.full_kv_pool = _RecordingPool()
         pool.swa_kv_pool = _RecordingPool()
         # layer 0 -> full attention; layer 1 -> SWA. (pool_layer_id, is_swa)
@@ -89,7 +89,7 @@ class TestSharedSWARouting(unittest.TestCase):
         swa_phys = torch.tensor([1, 2, 0], dtype=torch.int64)
 
         layer = types.SimpleNamespace(layer_id=0)
-        # No full_loc precomputed -> fail loud (the shared pool must precompute
+        # No full_loc precomputed -> fail loud (the unified memory pool must precompute
         # out_cache_loc_full_physical) rather than write a virtual loc as physical.
         with self.assertRaises(AssertionError):
             pool.set_kv_buffer(
@@ -138,7 +138,7 @@ class TestSharedSWARouting(unittest.TestCase):
 
 class TestHybridLinearFullLocRouting(unittest.TestCase):
     """`HybridLinearKVPool.set_kv_buffer` (non-MLA) writes the full-physical
-    `full_loc` from the write metadata when present (shared pool), else the
+    `full_loc` from the write metadata when present (unified memory pool), else the
     already-physical `loc` (static pool). No translate, no `already_physical`."""
 
     def _make_bare_pool(self):

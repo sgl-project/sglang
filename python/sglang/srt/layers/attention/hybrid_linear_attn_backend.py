@@ -38,7 +38,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # Only the shared/unified KV pool's virtual->physical translate emits -1
         # (freed-slot tombstones), so the state-scatter kernel only needs its
         # freed-slot guard there; compiled out for the static pool.
-        self.enable_shared_kv_pool = model_runner.enable_shared_kv_pool
+        self.enable_unified_memory_pool = model_runner.enable_unified_memory_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         # Radix-prefix-cache mamba track DESTINATION slots. A SINGLE backend-owned
@@ -82,8 +82,8 @@ class MambaAttnBackendBase(AttentionBackend):
             and len(forward_batch.mamba_clear_indices) > 0
         ):
             # mamba_pool is a pure PHYSICAL store; translate the (virtual, for the
-            # shared pool) slot ids before zeroing — else clear_slots would zero
-            # the WRONG physical slots. Identity for the non-shared pool.
+            # unified memory pool) slot ids before zeroing — else clear_slots would zero
+            # the WRONG physical slots. Identity for the non-unified memory pool.
             self.req_to_token_pool.mamba_pool.clear_slots(
                 self._translate_mamba_indices(forward_batch.mamba_clear_indices)
             )
@@ -102,7 +102,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot
-                # ids virtual->physical (identity for the non-shared pool).
+                # ids virtual->physical (identity for the non-unified memory pool).
                 self.req_to_token_pool.mamba_pool.copy_from(
                     self._translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     self._translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
@@ -114,7 +114,7 @@ class MambaAttnBackendBase(AttentionBackend):
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (delegates to
         ``req_to_token_pool.translate_mamba_indices``: identity for the
-        non-shared pool, allocator v2p for the shared pool).
+        non-unified memory pool, allocator v2p for the unified memory pool).
 
         Apply EVERYWHERE mamba ids feed the SSM/conv kernels or the mamba-pool
         state ops (``clear_slots`` / ``copy_from``): the eager
@@ -140,7 +140,7 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
-        # Shared KV pool: get_mamba_indices returns *virtual* per-request ids;
+        # Unified memory pool: get_mamba_indices returns *virtual* per-request ids;
         # translate to *physical* slot ids once per batch (no-op for the
         # non-shared HybridReqToTokenPool). MUST also happen on the cuda-graph
         # capture/replay metadata path — see `_translate_mamba_indices`.
@@ -150,8 +150,8 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         if forward_batch.mamba_track_indices is not None:
             # The *_track_* index derivations below index by mamba slot too
-            # (speculative path; spec is off for the shared pool today). Identity
-            # for the non-shared pool.
+            # (speculative path; spec is off for the unified memory pool today). Identity
+            # for the non-unified memory pool.
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
@@ -616,7 +616,7 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        # Shared pool: virtual -> physical (no-op otherwise). The captured Mamba
+        # Unified memory pool: virtual -> physical (no-op otherwise). The captured Mamba
         # kernels read state_indices_list as PHYSICAL slot ids, so we must
         # translate before copying — same as the eager _forward_metadata path.
         mamba_indices = self._translate_mamba_indices(mamba_indices)
@@ -684,7 +684,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        # Shared pool: virtual -> physical (no-op otherwise), reading the LIVE
+        # Unified memory pool: virtual -> physical (no-op otherwise), reading the LIVE
         # v2p table in replay-prep, BEFORE the padding sentinel below. The
         # captured Mamba kernels read state_indices_list as PHYSICAL slot ids,
         # so this translate is required here.
@@ -699,7 +699,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # registry slot we were handed stays read-only (never mutated). Runs at
         # capture too (records the static pointer + writes valid in-bounds dummy
         # slots) and at replay (live v2p -> physical). The translate is identity
-        # for the non-shared pool, so this is a plain copy there.
+        # for the non-unified memory pool, so this is a plain copy there.
         track_buf = None
         if mamba_track_indices is not None:
             track_buf = self.mamba_track_indices_buf
@@ -882,7 +882,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.mamba_track_mask,
                 self.forward_metadata.mamba_track_indices,
                 forward_batch.batch_size,
-                check_freed_slots=self.enable_shared_kv_pool,
+                check_freed_slots=self.enable_unified_memory_pool,
             )
 
     def _track_mamba_state_extend(
@@ -1027,7 +1027,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     forward_batch.mamba_track_mask[-num_decodes:],
                     self.forward_metadata.mamba_track_indices[-num_decodes:],
                     num_decodes,
-                    check_freed_slots=self.enable_shared_kv_pool,
+                    check_freed_slots=self.enable_unified_memory_pool,
                 )
 
         return mixer_out

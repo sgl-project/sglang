@@ -783,7 +783,7 @@ class ServerArgs:
         "(layer-major) layout. Requires the Triton attention / linear-attn / "
         "Mamba backends.",
     ] = False
-    enable_shared_kv_pool: A[
+    enable_unified_memory_pool: A[
         bool,
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
@@ -2721,7 +2721,7 @@ class ServerArgs:
 
         self._handle_page_major_kv_layout()
 
-        self._handle_shared_kv_pool()
+        self._handle_unified_memory_pool()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -6314,20 +6314,21 @@ class ServerArgs:
                         "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
 
-    def _handle_shared_kv_pool(self):
-        if not self.enable_shared_kv_pool:
+    def _handle_unified_memory_pool(self):
+        if not self.enable_unified_memory_pool:
             return
         assert self.disaggregation_mode == "null", (
-            "--enable-shared-kv-pool is not yet compatible with PD " "disaggregation."
+            "--enable-unified-memory-pool is not yet compatible with PD "
+            "disaggregation."
         )
         assert self.speculative_algorithm is None, (
-            "--enable-shared-kv-pool is not yet compatible with speculative "
+            "--enable-unified-memory-pool is not yet compatible with speculative "
             "decoding."
         )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
-            "--enable-shared-kv-pool is not yet compatible with hierarchical / "
+            "--enable-unified-memory-pool is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
-            "the shared-pool init wires up no host pools, and its device mamba / "
+            "the unified-memory-pool init wires up no host pools, and its device mamba / "
             "full-attention slots are VIRTUAL — the host-offload path does not "
             "translate them to physical."
         )
@@ -6336,24 +6337,24 @@ class ServerArgs:
         _cg_cfg = self.cuda_graph_config
         if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
             raise ValueError(
-                "--enable-shared-kv-pool supports monolithic (decode) "
+                "--enable-unified-memory-pool supports monolithic (decode) "
                 "cuda-graph capture only; disable piecewise prefill capture "
                 "(e.g. --cuda-graph-backend-prefill=disabled)."
             )
         # The Triton-backend requirement for the strided full-attention K/V and
         # the Mamba conv/SSM envelope is enforced via --enable-page-major-kv-layout
-        # (implied by the shared pool in _handle_page_major_kv_layout, which runs
+        # (implied by the unified memory pool in _handle_page_major_kv_layout, which runs
         # first). The model-family gate (hybrid Mamba / hybrid SWA) is enforced at
         # pool-construction time in model_runner_kv_cache_mixin._init_pools.
 
     def _handle_page_major_kv_layout(self):
-        # The shared KV pool stores its full-attention K/V and Mamba conv/SSM
+        # The unified memory pool stores its full-attention K/V and Mamba conv/SSM
         # state in the page-major envelope-strided layout, so enabling it implies
         # --enable-page-major-kv-layout. Setting it here (before the guard below)
-        # routes the shared pool through the single page-major code path and the
+        # routes the unified memory pool through the single page-major code path and the
         # stride-aware Triton-kernel asserts, instead of duplicating that
-        # enforcement in _handle_shared_kv_pool.
-        if self.enable_shared_kv_pool:
+        # enforcement in _handle_unified_memory_pool.
+        if self.enable_unified_memory_pool:
             self.enable_page_major_kv_layout = True
         if not self.enable_page_major_kv_layout:
             return

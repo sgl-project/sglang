@@ -335,7 +335,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The sequence length
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool.
-    # With the shared KV pool enabled these are *virtual* per-token slot ids;
+    # With the unified memory pool enabled these are *virtual* per-token slot ids;
     # the pools translate them to physical slots on write (set_kv_buffer) and the
     # attention backends translate the gathered KV indices on read.
     out_cache_loc: torch.Tensor
@@ -860,7 +860,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Diagnostic: env-gated invariant check. The clamps inside
         # `translate_kv_loc` / `translate_loc_from_full_to_swa` and inside
-        # `SharedMHATokenToKVPool.set_kv_buffer`'s elif route tombstoned
+        # `UnifiedMHATokenToKVPool.set_kv_buffer`'s elif route tombstoned
         # `v2p[live_virtual]` reads/writes to the reserved padding sink so
         # the captured graph cannot crash on `k_buffer[-1]`. The clamps mask
         # any underlying invariant violation (live virtuals should never
@@ -873,7 +873,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # this check catches it before the clamp hides it.
         if (
             envs.SGLANG_DEBUG_CHECK_V2P_TOMBSTONES.get()
-            and model_runner.enable_shared_kv_pool
+            and model_runner.enable_unified_memory_pool
             and ret.out_cache_loc is not None
         ):
             alloc = model_runner.token_to_kv_pool_allocator

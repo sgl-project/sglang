@@ -334,7 +334,7 @@ class MambaComponent(TreeComponent):
             else:
                 mamba_value_donated = self._alloc_mamba_slot()
                 # mamba_pool is a pure PHYSICAL store; translate both slot ids
-                # virtual->physical (identity for the non-shared pool) first.
+                # virtual->physical (identity for the non-unified memory pool) first.
                 translate = self.cache.req_to_token_pool.translate_mamba_indices
                 self.cache.req_to_token_pool.mamba_pool.copy_from(
                     translate(req.mamba_pool_idx.unsqueeze(0)),

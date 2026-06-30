@@ -1494,7 +1494,7 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # The global WAR barrier fences the scheduler's next shared-buffer write
-        # on the previous forward's read of the shared pool.
+        # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)

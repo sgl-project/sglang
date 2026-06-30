@@ -1,4 +1,4 @@
-"""MultiEndedAllocator: one allocator per sub-pool over a `SharedKVPool`.
+"""MultiEndedAllocator: one allocator per sub-pool over a `UnifiedKVPool`.
 
 Key points:
 
@@ -53,8 +53,8 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.shared_kv_pool import SharedKVPool
 from sglang.srt.mem_cache.triton_ops.virtual_slot import alloc_bind_inplace
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -137,13 +137,13 @@ def _install_signal_handlers_once() -> None:
 
 
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
-    """Allocator for one sub-pool over a `SharedKVPool`."""
+    """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
     def __init__(
         self,
         *,
         kvcache,
-        shared_buffer: SharedKVPool,
+        unified_buffer: UnifiedKVPool,
         sub_pool_name: str,
         device: str,
         is_id_owner: bool,
@@ -152,8 +152,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
-        spec = shared_buffer.spec(sub_pool_name)
-        max_slots = shared_buffer.max_slots(sub_pool_name)
+        spec = unified_buffer.spec(sub_pool_name)
+        max_slots = unified_buffer.max_slots(sub_pool_name)
         # `dtype` on the base allocator is informational. Each `SubPoolSpec`
         # subclass implements `get_dtype()` to return its representative
         # storage dtype (MHA: `store_dtype`; Mamba: `conv_dtype` — the
@@ -166,14 +166,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             kvcache=kvcache,
             need_sort=need_sort,
         )
-        self.shared_buffer = shared_buffer
+        self.unified_buffer = unified_buffer
         self.sub_pool_name = sub_pool_name
         self.spec = spec
         self.max_slots = max_slots
         self.grow_direction = spec.grow_direction
         # Per-token (per-slot) entry bytes — unchanged by paging.
         self.entry_bytes = spec.entry_bytes()
-        self.min_slot_index = shared_buffer.min_slot_index(sub_pool_name)
+        self.min_slot_index = unified_buffer.min_slot_index(sub_pool_name)
         self.is_id_owner = is_id_owner
         # Optional handle for the model forward stream. In overlap mode the
         # scheduler runs `pop_and_process` (which triggers `free` →
@@ -389,7 +389,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
         logger.info(
-            "[shared-pool] MultiEndedAllocator(%r) ready: grow=%s, max_slots=%d, "
+            "[unified-memory-pool] MultiEndedAllocator(%r) ready: grow=%s, max_slots=%d, "
             "min_slot_index=%d, page_size=%d, num_pages=%d, min_page_index=%d, "
             "entry_bytes=%d, entry_bytes_per_page=%d, is_id_owner=%s, "
             "initial_watermark_page=%d, allocatable_pages=%d",
@@ -611,7 +611,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             peer_low = (
                 self._peer._byte_low_frontier()
                 if self._peer is not None
-                else self.shared_buffer.total_bytes
+                else self.unified_buffer.total_bytes
             )
             return max(0, peer_low - my_high)
         my_low = self._byte_low_frontier()
@@ -1661,8 +1661,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
                 dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
 
-            # Data copy. MHA (full) -> SharedMHATokenToKVPool.move_kv_cache(dst, src);
-            # Mamba -> SharedMambaPool._copy_from_physical(src, dst) (un-translated —
+            # Data copy. MHA (full) -> UnifiedMHATokenToKVPool.move_kv_cache(dst, src);
+            # Mamba -> UnifiedMambaPool._copy_from_physical(src, dst) (un-translated —
             # the public copy_from translates virtual ids, which we must NOT do here).
             move_fn = getattr(self._kvcache, "move_kv_cache", None)
             if move_fn is not None:
@@ -2517,15 +2517,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.free(merged)
 
 
-class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Composite allocator for the MHA (full-attn) + Mamba hybrid pair over a
-    `SharedKVPool`.
+    `UnifiedKVPool`.
 
     The token-slot surface (the slot allocator the scheduler uses for the
     `out_cache_loc` path) delegates to the full-attn side — `alloc(N)` allocates
     MHA token slots (virtual per-token ids). The Mamba sub-pool's per-request
-    `alloc(1)` is driven by `SharedHybridReqToTokenPool.alloc` ->
-    `mamba_allocator.alloc(1)` (the `SharedMambaSlotAllocator`, which owns slots;
+    `alloc(1)` is driven by `UnifiedHybridReqToTokenPool.alloc` ->
+    `mamba_allocator.alloc(1)` (the `UnifiedMambaSlotAllocator`, which owns slots;
     the `mamba_pool` is storage-only). Both sub-allocators are id-owners of their own
     granularity's virtual-id space (the spaces are independent).
     """
@@ -2533,7 +2533,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         *,
-        shared_buffer: SharedKVPool,
+        unified_buffer: UnifiedKVPool,
         kvcache,  # HybridLinearKVPool
         device: str,
         page_size: int = 1,
@@ -2541,16 +2541,16 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
-        full_max = shared_buffer.max_slots("full")
+        full_max = unified_buffer.max_slots("full")
         super().__init__(
             size=full_max - 1,
             page_size=page_size,
-            dtype=shared_buffer.mha_spec("full").store_dtype,
+            dtype=unified_buffer.mha_spec("full").store_dtype,
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,
         )
-        self.shared_buffer = shared_buffer
+        self.unified_buffer = unified_buffer
         self._kvcache = kvcache
         self.page_size = page_size
         self.lazy_compaction = lazy_compaction
@@ -2560,7 +2560,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # per req), orthogonal to the per-token paging on the full side.
         self.full_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.full_kv_pool,
-            shared_buffer=shared_buffer,
+            unified_buffer=unified_buffer,
             sub_pool_name="full",
             device=device,
             is_id_owner=True,
@@ -2571,7 +2571,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.mamba_allocator = MultiEndedAllocator(
             kvcache=kvcache.mamba_pool,
-            shared_buffer=shared_buffer,
+            unified_buffer=unified_buffer,
             sub_pool_name="mamba",
             device=device,
             is_id_owner=True,
@@ -2584,8 +2584,8 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
 
         # The mamba slot allocator (the PHYSICAL view) is built later, NOT here:
-        # `init_shared_mamba_pools` wraps this very `self.mamba_allocator` in a
-        # `SharedMambaSlotAllocator` once this composite returns. That wrapper owns
+        # `init_unified_mamba_pools` wraps this very `self.mamba_allocator` in a
+        # `UnifiedMambaSlotAllocator` once this composite returns. That wrapper owns
         # the virtual->physical `translate`; the mamba pool itself is a pure
         # PHYSICAL store and never translates — callers resolve v2p first (via
         # `req_to_token_pool.translate_mamba_indices` / the HybridLinearKVPool
@@ -2599,7 +2599,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
         logger.info(
-            "[shared-pool] SharedMambaTokenToKVPoolAllocator ready: "
+            "[unified-memory-pool] UnifiedMambaTokenToKVPoolAllocator ready: "
             "full max_slots=%d (min_slot_index=%d, page_size=%d, "
             "num_pages=%d), mamba max_slots=%d (min_slot_index=%d), "
             "full_available=%d, mamba_available=%d",
@@ -2691,7 +2691,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        with record_function("SharedMambaAlloc.alloc"):
+        with record_function("UnifiedMambaAlloc.alloc"):
             return self.full_attn_allocator.alloc(need_size)
 
     def alloc_extend(
@@ -2707,7 +2707,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Paged extend allocation. Mamba state is per-request and
         does NOT advance on per-token alloc, so the composite only forwards
         to the full sub-allocator."""
-        with record_function("SharedMambaAlloc.alloc_extend"):
+        with record_function("UnifiedMambaAlloc.alloc_extend"):
             return self.full_attn_allocator.alloc_extend(
                 prefix_lens,
                 prefix_lens_cpu,
@@ -2726,7 +2726,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ) -> Optional[torch.Tensor]:
         """Paged decode allocation. Same dispatch logic as
         ``alloc_extend`` — the mamba side stays untouched per-decode."""
-        with record_function("SharedMambaAlloc.alloc_decode"):
+        with record_function("UnifiedMambaAlloc.alloc_decode"):
             return self.full_attn_allocator.alloc_decode(
                 seq_lens, seq_lens_cpu, last_loc
             )
@@ -2758,7 +2758,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_attn_allocator.allocator_state_str()
 
     def free(self, free_index: torch.Tensor) -> None:
-        with record_function("SharedMambaAlloc.free"):
+        with record_function("UnifiedMambaAlloc.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
@@ -2805,7 +2805,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Scheduler-facing: forwards the per-batch `forward_done` event to
         BOTH sub-allocators so each side's `_flush` can gate src reuse on
         the in-flight reader settling. No-op when `lazy_compaction=False`."""
-        with record_function("SharedMambaAlloc.set_latest_forward_done_event"):
+        with record_function("UnifiedMambaAlloc.set_latest_forward_done_event"):
             self.full_attn_allocator.set_latest_forward_done_event(event)
             self.mamba_allocator.set_latest_forward_done_event(event)
 
@@ -2829,7 +2829,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         in-flight tensor is `None` — `_flush` on the Mamba side will
         see "no in-flight write race" and skip the check.
         """
-        with record_function("SharedMambaAlloc.set_inflight_forward"):
+        with record_function("UnifiedMambaAlloc.set_inflight_forward"):
             self.full_attn_allocator.set_inflight_forward(
                 forward_done, out_cache_loc_virtual
             )
@@ -2850,7 +2850,7 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         addition when both are empty — a small but per-scheduler-tick
         saving that compounds with the per-sub-pool gate.
         """
-        with record_function("SharedMambaAlloc.flush_opportunistic"):
+        with record_function("UnifiedMambaAlloc.flush_opportunistic"):
             # Gate refinement matches the per-sub-pool gate:
             # `_inflight_batches` is irrelevant when there is no compaction
             # or drain work to do. Under overlap
@@ -2868,16 +2868,16 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return fa.flush_opportunistic() + ma.flush_opportunistic()
 
 
-class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """Composite allocator for the hybrid SWA pair (full + swa MHA sub-pools)
-    over a `SharedKVPool`.
+    over a `UnifiedKVPool`.
 
     Inherits from `SWATokenToKVPoolAllocator` purely for the typing/contract
     relationship — `isinstance(allocator, SWATokenToKVPoolAllocator)` is
     asserted across SWARadixCache, schedule_batch, chunk_cache, and disagg.
     We do NOT call `SWATokenToKVPoolAllocator.__init__`: it would allocate two
     static-partition sub-pools (`TokenToKVPoolAllocator` over freshly created
-    `MHATokenToKVPool` buffers), which is exactly what shared-pool replaces.
+    `MHATokenToKVPool` buffers), which is exactly what unified-memory-pool replaces.
     Grand-parent `BaseTokenToKVPoolAllocator.__init__` is called directly.
 
     Three views on capacity:
@@ -2917,8 +2917,8 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def __init__(
         self,
         *,
-        shared_buffer: SharedKVPool,
-        kvcache,  # SharedSWAKVPool
+        unified_buffer: UnifiedKVPool,
+        kvcache,  # UnifiedSWAKVPool
         device: str,
         full_max_total_num_tokens: int,
         swa_max_total_num_tokens: int,
@@ -2945,18 +2945,18 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self,
             size=full_max_total_num_tokens,
             page_size=page_size,
-            dtype=shared_buffer.mha_spec("full").store_dtype,
+            dtype=unified_buffer.mha_spec("full").store_dtype,
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,
         )
-        self.shared_buffer = shared_buffer
+        self.unified_buffer = unified_buffer
         self._kvcache = kvcache
         self.lazy_compaction = lazy_compaction
 
         self.full_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.full_kv_pool,
-            shared_buffer=shared_buffer,
+            unified_buffer=unified_buffer,
             sub_pool_name="full",
             device=device,
             is_id_owner=True,
@@ -2967,7 +2967,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         self.swa_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.swa_kv_pool,
-            shared_buffer=shared_buffer,
+            unified_buffer=unified_buffer,
             sub_pool_name="swa",
             device=device,
             is_id_owner=False,  # ← non-owner; consumes virtuals minted by full.
@@ -2994,7 +2994,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
         logger.info(
-            "[shared-pool] SharedSWATokenToKVPoolAllocator ready: "
+            "[unified-memory-pool] UnifiedSWATokenToKVPoolAllocator ready: "
             "full max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
             "swa max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
             "static caps full=%d swa=%d, joint available=%d",
@@ -3164,7 +3164,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # `size_full` / `size_swa` are inherited from `SWATokenToKVPoolAllocator`
     # — they read `_size_full` / `_size_swa`, which we set to the static
     # `full_max_total_num_tokens` / `swa_max_total_num_tokens` in __init__.
-    # We deliberately do NOT report `max_slots - 1` here: under shared pool
+    # We deliberately do NOT report `max_slots - 1` here: under unified memory pool
     # `max_slots("full") ≈ full_max + swa_max`, which would over-promise to
     # any caller treating these as static budgets.
 
@@ -3262,7 +3262,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- alloc --
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        with record_function("SharedSWAAlloc.alloc"):
+        with record_function("UnifiedSWAAlloc.alloc"):
             # Joint pre-check. Both sides of the SWA
             # composite are mutual peers — each side's compaction releases
             # bytes into the shared gap that the OTHER side can extend
@@ -3284,7 +3284,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # internal-state inconsistency — assert rather than silently
             # rollback.
             assert v_tokens is not None, (
-                "SharedSWA.alloc: full.alloc returned None after joint "
+                "UnifiedSWA.alloc: full.alloc returned None after joint "
                 "pre-check passed — internal-state inconsistency"
             )
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
@@ -3315,7 +3315,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         - the cross-sub-pool identity (same virtual page id maps to
           full-physical-page on full side and swa-physical-page on swa side).
         """
-        with record_function("SharedSWAAlloc.alloc_extend"):
+        with record_function("UnifiedSWAAlloc.alloc_extend"):
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
                 page_size=self.page_size,
@@ -3346,7 +3346,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 num_new_pages=num_new_pages,
             )
             assert out_indices is not None, (
-                "SharedSWA.alloc_extend: full.alloc_extend returned None "
+                "UnifiedSWA.alloc_extend: full.alloc_extend returned None "
                 "after joint pre-check passed — internal-state inconsistency"
             )
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
@@ -3363,7 +3363,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         Same one-kernel-in-virtual-space discipline as ``alloc_extend``.
         """
-        with record_function("SharedSWAAlloc.alloc_decode"):
+        with record_function("UnifiedSWAAlloc.alloc_decode"):
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
@@ -3380,7 +3380,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
             out_indices = fa.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
             assert out_indices is not None, (
-                "SharedSWA.alloc_decode: full.alloc_decode returned None "
+                "UnifiedSWA.alloc_decode: full.alloc_decode returned None "
                 "after joint pre-check passed — internal-state inconsistency"
             )
 
@@ -3407,7 +3407,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- free --
 
     def free(self, free_index: torch.Tensor) -> None:
-        with record_function("SharedSWAAlloc.free"):
+        with record_function("UnifiedSWAAlloc.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if not self.is_not_in_free_group:
@@ -3530,7 +3530,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forwards the per-batch `forward_done` event to BOTH sub-
         allocators. No-op when `lazy_compaction=False`."""
-        with record_function("SharedSWAAlloc.set_latest_forward_done_event"):
+        with record_function("UnifiedSWAAlloc.set_latest_forward_done_event"):
             self.full_attn_allocator.set_latest_forward_done_event(event)
             self.swa_attn_allocator.set_latest_forward_done_event(event)
 
@@ -3549,7 +3549,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         for every new token, so both sub-pools have non-empty
         in-flight tensors per batch.
         """
-        with record_function("SharedSWAAlloc.set_inflight_forward"):
+        with record_function("UnifiedSWAAlloc.set_inflight_forward"):
             self.full_attn_allocator.set_inflight_forward(
                 forward_done, out_cache_loc_virtual
             )
@@ -3567,7 +3567,7 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         overhead under `sched=overlap × cg=on` where
         cg_on's ~10× shorter GPU step amplified the CPU bookkeeping cost.
         """
-        with record_function("SharedSWAAlloc.flush_opportunistic"):
+        with record_function("UnifiedSWAAlloc.flush_opportunistic"):
             # Gate refinement: _inflight_batches is irrelevant
             # when there's no compaction or drain work to do.
             fa = self.full_attn_allocator

@@ -46,7 +46,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.mem_cache.multi_ended_allocator import SharedMambaTokenToKVPoolAllocator
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 from sglang.srt.server_args import get_global_server_args
@@ -427,7 +429,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator
             )
             or isinstance(
-                params.token_to_kv_pool_allocator, SharedMambaTokenToKVPoolAllocator
+                params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
             )
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
@@ -702,7 +704,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             mamba_value_donated = self._alloc_mamba_slot()
             # mamba_pool is a pure PHYSICAL store; translate both slot ids
-            # virtual->physical (identity for the non-shared pool) before the copy.
+            # virtual->physical (identity for the non-unified memory pool) before the copy.
             translate = self.req_to_token_pool.translate_mamba_indices
             self.req_to_token_pool.mamba_pool.copy_from(
                 translate(req.mamba_pool_idx.unsqueeze(0)),

@@ -776,7 +776,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             size, stream_idx=stream_idx
         )
         # The virtual out_cache_loc graph buffer (built in capture_prepare and
-        # carried on the dummy FB). run_once's shared-pool write-path translate
+        # carried on the dummy FB). run_once's unified-memory-pool write-path translate
         # closes over it; capture_prepare keeps it as a local, so surface it here.
         out_cache_loc = forward_batch.out_cache_loc
 
@@ -793,7 +793,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             def run_once():
                 # Graph-recordable metadata-prep hook (upstream #27091). The
-                # shared pool records ZERO translate nodes here: its full +
+                # unified memory pool records ZERO translate nodes here: its full +
                 # SWA-window read translates and the out_cache_loc write translate
                 # all run EAGERLY in `init_forward_metadata_out_graph` (replay-prep,
                 # before graph.replay(), reading the LIVE v2p), so the captured
@@ -809,7 +809,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # the full->SWA translate into the metadata init). The phase-4
                 # base (06-08) includes #27091, so the method no longer exists on
                 # baseline SWAKVPool or (by inheritance) the shared SWA pool. The
-                # shared pool translates its locs in `init_forward_metadata_out_graph`
+                # unified memory pool translates its locs in `init_forward_metadata_out_graph`
                 # instead, so no cache invalidation is needed.
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
@@ -872,7 +872,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # stores `ForwardMetadata.out_cache_loc_full_physical`, its own
             # capture-stable buffer -> `KVWriteLoc.full_loc`), so the runner does
             # NOT wire a buffer here. (The SWA write loc rides the backend
-            # `swa_out_cache_loc` rail, consumed in `SharedSWAKVPool.set_kv_buffer`.)
+            # `swa_out_cache_loc` rail, consumed in `UnifiedSWAKVPool.set_kv_buffer`.)
 
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)

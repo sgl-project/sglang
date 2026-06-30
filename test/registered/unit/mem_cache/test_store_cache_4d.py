@@ -24,10 +24,10 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 
 _HAS_CUDA = torch.cuda.is_available()
-# The set_kv_buffer integration test needs SharedMHATokenToKVPool, which only
+# The set_kv_buffer integration test needs UnifiedMHATokenToKVPool, which only
 # exists once the shared-KV-pool feature lands; skip it where absent.
 _HAS_SHARED_POOL = (
-    importlib.util.find_spec("sglang.srt.mem_cache.shared_kv_pool") is not None
+    importlib.util.find_spec("sglang.srt.mem_cache.unified_memory_pool") is not None
 )
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
@@ -72,7 +72,7 @@ class TestStoreCache4D(unittest.TestCase):
         seed: int = 0xC0FFEE,
     ):
         torch.manual_seed(seed)
-        # The shared pool's views are 4-D `(num_pages, page_size, head_num,
+        # The unified memory pool's views are 4-D `(num_pages, page_size, head_num,
         # head_dim)` with the trailing two dims contiguous. We allocate two
         # independent contiguous buffers (one for the kernel-under-test,
         # one as the legacy-path target) so we can compare them.
@@ -316,25 +316,25 @@ class TestStoreCache4DAssertions(unittest.TestCase):
 
 @unittest.skipUnless(
     _HAS_CUDA and _HAS_SHARED_POOL,
-    "Triton kernels require CUDA; SharedMHATokenToKVPool required",
+    "Triton kernels require CUDA; UnifiedMHATokenToKVPool required",
 )
 class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
     """Integration parity test — exercises the kernel through the FULL
-    ``SharedMHATokenToKVPool.set_kv_buffer`` path (the direct PHYSICAL write +
+    ``UnifiedMHATokenToKVPool.set_kv_buffer`` path (the direct PHYSICAL write +
     the dtype cast; the pool no longer translates). Confirms it produces
     bit-identical output to a PyTorch advanced-indexing reference write.
     """
 
     def _build_pool(self, page_size: int):
-        """Build a small SharedMHATokenToKVPool. The pool writes PHYSICAL locs
+        """Build a small UnifiedMHATokenToKVPool. The pool writes PHYSICAL locs
         directly (no allocator / v2p translate), so `set_kv_buffer` receives the
         already-physical write location."""
         import torch as _t
 
-        from sglang.srt.mem_cache.shared_kv_pool import (
+        from sglang.srt.mem_cache.unified_memory_pool import (
             MHASubPoolSpec,
-            SharedKVPool,
-            SharedMHATokenToKVPool,
+            UnifiedKVPool,
+            UnifiedMHATokenToKVPool,
         )
 
         spec = MHASubPoolSpec(
@@ -355,15 +355,15 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
             store_dtype=_t.bfloat16,
             grow_direction="down",
         )
-        pool = SharedKVPool(
+        pool = UnifiedKVPool(
             total_bytes=total + peer.entry_bytes() * 16,
             sub_pool_specs=[spec, peer],
             device="cuda",
             enable_memory_saver=False,
             page_size=page_size,
         )
-        kv_pool = SharedMHATokenToKVPool(
-            shared_buffer=pool,
+        kv_pool = UnifiedMHATokenToKVPool(
+            unified_buffer=pool,
             sub_pool_name="full",
             page_size=page_size,
             start_layer=0,

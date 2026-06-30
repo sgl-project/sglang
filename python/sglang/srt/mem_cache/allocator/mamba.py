@@ -51,7 +51,7 @@ class MambaSlotAllocator:
     def schedulable_available_size(self) -> int:
         """Planner-facing free count. Identity to ``available_size`` for the
         static pool (slot-count and byte-coordinated views coincide); the shared
-        ``SharedMambaSlotAllocator`` overrides it with the byte-coordinated view.
+        ``UnifiedMambaSlotAllocator`` overrides it with the byte-coordinated view.
         Lets ``alloc_req_slots`` call it uniformly without a getattr fallback."""
         return self.available_size()
 

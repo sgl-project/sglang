@@ -425,7 +425,7 @@ def alloc_req_slots(
     """
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        # Byte-coordinated availability: the shared `SharedMambaSlotAllocator`'s
+        # Byte-coordinated availability: the shared `UnifiedMambaSlotAllocator`'s
         # `schedulable_available_size` accounts for the peer (full) sub-pool's
         # byte usage; the non-shared `MambaSlotAllocator` returns its plain slot
         # free count (the two views coincide there).

@@ -25,10 +25,10 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
-from sglang.srt.mem_cache.shared_kv_pool import (
+from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
-    SharedKVPool,
+    UnifiedKVPool,
 )
 
 _DEV = "cpu"
@@ -113,7 +113,7 @@ class TestBuildMHAViews(unittest.TestCase):
         # Pad to ensure max_slots % page_size == 0 in both sub-pools.
         # entry_bytes is fixed per spec; size accordingly.
         total = full.entry_bytes() * n_full_slots + swa.entry_bytes() * n_full_slots
-        pool = SharedKVPool(
+        pool = UnifiedKVPool(
             total_bytes=total,
             sub_pool_specs=[full, swa],
             device=_DEV,
@@ -206,7 +206,7 @@ class TestMoveKVCacheNative4D(unittest.TestCase):
             "swa", "down", layer_num=2, head_num=head_num, head_dim=head_dim
         )
         total = full.entry_bytes() * n_full_slots + swa.entry_bytes() * n_full_slots
-        pool = SharedKVPool(
+        pool = UnifiedKVPool(
             total_bytes=total,
             sub_pool_specs=[full, swa],
             device=_DEV,
@@ -299,7 +299,7 @@ class TestByteIdentityAtPageSize1(unittest.TestCase):
         ps = 1
         # Build pool.
         total = spec.entry_bytes() * 64 + spec.entry_bytes() * 32
-        pool = SharedKVPool(
+        pool = UnifiedKVPool(
             total_bytes=total,
             sub_pool_specs=[
                 spec,

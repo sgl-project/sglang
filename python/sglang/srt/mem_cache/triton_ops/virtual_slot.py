@@ -1,6 +1,6 @@
 """Shared-KV-pool virtual<->physical slot Triton kernels.
 
-Houses the shared pool's slot-management kernels used by
+Houses the unified memory pool's slot-management kernels used by
 ``MultiEndedAllocator``: the GPU-bounded in-place virtual->physical index
 translate, and the fused take-physical-pages + bind alloc fast path. Kept in
 ``triton_ops/`` (next to the upstream allocator kernels) per the upstream

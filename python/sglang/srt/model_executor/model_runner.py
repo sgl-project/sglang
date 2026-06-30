@@ -420,7 +420,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
-        self.enable_shared_kv_pool = server_args.enable_shared_kv_pool
+        self.enable_unified_memory_pool = server_args.enable_unified_memory_pool
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -908,7 +908,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # The eager (no-cuda-graph) phase runner, built AFTER the attention
         # backend so its __init__ can warm up kernels (run-once) and allocate the
         # fixed-max static buffer — both before the cuda-graph runners, so that
-        # buffer is canonical in the shared pool and the cg runners coalesce onto
+        # buffer is canonical in the unified memory pool and the cg runners coalesce onto
         # it. Always built: it serves both the fully-disabled case (decode/prefill
         # runners point at it) and the eager fallback when a cg runner can't run a
         # batch.

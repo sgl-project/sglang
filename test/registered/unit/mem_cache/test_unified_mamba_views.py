@@ -1,9 +1,9 @@
-"""Round-trip correctness of ``SharedKVPool._build_mamba_views`` — the
-envelope-strided conv/temporal (SSM) state views that back ``SharedMambaPool``.
+"""Round-trip correctness of ``UnifiedKVPool._build_mamba_views`` — the
+envelope-strided conv/temporal (SSM) state views that back ``UnifiedMambaPool``.
 
-This isolates the shared-pool Mamba STATE layout from the full model. It guards
+This isolates the unified-memory-pool Mamba STATE layout from the full model. It guards
 against a class of correctness defect where Falcon-H1 greedy decode is garbled
-under the shared pool, isolated to the Mamba conv/temporal state path: a
+under the unified memory pool, isolated to the Mamba conv/temporal state path: a
 stride/offset/alignment bug in the view construction (analogous to the fixed
 `_extract_kv_strides` MHA bug).
 
@@ -51,13 +51,13 @@ def _make_pool(
     want_slots=8,
     device=_DEV,
 ):
-    """Build a minimal 2-sub-pool ``SharedKVPool`` (a small MHA grow-up peer
+    """Build a minimal 2-sub-pool ``UnifiedKVPool`` (a small MHA grow-up peer
     + the Mamba grow-down pool under test) sized to hold >= ``want_slots`` Mamba
     slots, and return ``(pool, mamba_spec)``."""
-    from sglang.srt.mem_cache.shared_kv_pool import (
+    from sglang.srt.mem_cache.unified_memory_pool import (
         MambaSubPoolSpec,
         MHASubPoolSpec,
-        SharedKVPool,
+        UnifiedKVPool,
     )
 
     mamba_spec = MambaSubPoolSpec(
@@ -86,7 +86,7 @@ def _make_pool(
     # headroom, then round up to a multiple of 8 (covers bf16/fp32 .view()).
     total_bytes = want_slots * entry_mamba + 8 * entry_max
     total_bytes = ((total_bytes + 7) // 8) * 8
-    pool = SharedKVPool(
+    pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, mamba_spec],
         device=device,
@@ -96,7 +96,7 @@ def _make_pool(
 
 
 @unittest.skipUnless(_HAS_CUDA, "shared Mamba views back GPU kernels")
-class TestSharedMambaViews(unittest.TestCase):
+class TestUnifiedMambaViews(unittest.TestCase):
     # Falcon-H1-like dims: even conv_dim, bf16 conv, fp32 temporal, several
     # layers. (Mamba2 conv state is (conv_dim, kernel-1); temporal/SSM state is
     # (nheads, head_dim, ssm_state_size).)
