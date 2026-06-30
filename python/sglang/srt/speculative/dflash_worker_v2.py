@@ -177,21 +177,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
-        # If the target stores KV in a quantized dtype (e.g. fp8), the bf16 draft
-        # cannot share it (q/k dtype mismatch); give the draft its own bf16 KV pool.
-        _quantized_kv_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2) + (
-            (torch.float4_e2m1fn_x2,) if hasattr(torch, "float4_e2m1fn_x2") else ()
-        )
+        # The draft runs unquantized in the model's compute dtype, so its KV pool must
+        # use a dtype the draft attention can read. If the target stores KV in a
+        # different dtype (e.g. quantized fp8/fp4 for an NVFP4 target), the draft cannot
+        # share the target pool. Give the draft its own pool -- but only with the compact
+        # draft cache: without it the draft aliases the target's req->token (target index
+        # space), so a private pool would desync from those indices.
+        # Compare resolved torch dtypes so any quantized variant (incl. ROCm fp8 *fnuz*
+        # and fp4) is covered, rather than an allowlist that can miss a dtype.
+        target_kv_dtype = getattr(target_worker.model_runner, "kv_cache_dtype", None)
+        draft_compute_dtype = target_worker.model_runner.dtype
         self._decouple_draft_kv_pool = (
-            getattr(target_worker.model_runner, "kv_cache_dtype", None)
-            in _quantized_kv_dtypes
+            self.use_compact_draft_cache
+            and target_kv_dtype is not None
+            and target_kv_dtype != draft_compute_dtype
         )
         if self._decouple_draft_kv_pool:
+            # bf16 is the dtype of the supported (unquantized) DFlash draft.
             draft_server_args.kv_cache_dtype = "bf16"
             logger.info(
-                "DFLASH: target KV dtype %s is incompatible with the bf16 draft; "
+                "DFLASH: target KV dtype %s differs from the draft compute dtype %s; "
                 "giving the draft its own bf16 KV pool.",
-                target_worker.model_runner.kv_cache_dtype,
+                target_kv_dtype,
+                draft_compute_dtype,
             )
         saved_server_args = get_global_server_args()
         self._draft_worker = TpModelWorker(
