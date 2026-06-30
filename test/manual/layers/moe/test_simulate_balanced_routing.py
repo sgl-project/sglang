@@ -12,6 +12,7 @@ Run:
 """
 
 import unittest
+from typing import Optional, Tuple
 
 import torch
 from parameterized import parameterized
@@ -25,7 +26,9 @@ E = 256  # num_experts
 K = 8  # top-k
 
 
-def _alloc(num_tokens, k, device="cuda"):
+def _alloc(
+    num_tokens: int, k: int, device: str = "cuda"
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # Pre-filled with junk so the test fails if the kernel doesn't overwrite.
     ids = torch.full((num_tokens, k), -7, dtype=torch.int32, device=device)
     weights = torch.full((num_tokens, k), -7.0, dtype=torch.float32, device=device)
@@ -47,7 +50,9 @@ class TestSimulateBalancedRouting(unittest.TestCase):
             ("layer3_k6", 3, 6),
         ]
     )
-    def test_round_robin_matches_reference(self, _name, layer_id, k):
+    def test_round_robin_matches_reference(
+        self, _name: str, layer_id: Optional[int], k: int
+    ) -> None:
         T = 512
         ids, weights = _alloc(T, k)
         _simulate_balanced_routing(ids, weights, E, random=False, layer_id=layer_id)
@@ -57,7 +62,7 @@ class TestSimulateBalancedRouting(unittest.TestCase):
         self.assertTrue(torch.equal(ids, ref))
         torch.testing.assert_close(weights, torch.full_like(weights, 1.0 / k))
 
-    def test_round_robin_perfectly_balanced(self):
+    def test_round_robin_perfectly_balanced(self) -> None:
         T = 512  # multiple of E -> exactly uniform per-expert load
         ids, weights = _alloc(T, K)
         _simulate_balanced_routing(ids, weights, E, random=False, layer_id=0)
@@ -66,7 +71,7 @@ class TestSimulateBalancedRouting(unittest.TestCase):
         for row in ids:
             self.assertEqual(row.unique().numel(), K)
 
-    def test_uniform_structural(self):
+    def test_uniform_structural(self) -> None:
         # uniform: random per-token base, so assert only seed-independent props.
         T = 4096
         ids, weights = _alloc(T, K)
