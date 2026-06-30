@@ -462,7 +462,7 @@ install_extra_deps() {
     # instead of the pinned PyPI package. Gated on aarch64 so x86 runners are
     # untouched. Revert this whole block before merging.
     if [ "$(uname -m)" = "aarch64" ]; then
-        MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/7846815663.zip"
+        MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/7970781200.zip"
         MOONCAKE_WHEEL_DIR="$(mktemp -d)"
         curl -fSL --retry 3 --retry-delay 2 \
             -o "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_ZIP_URL}"
