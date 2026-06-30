@@ -320,22 +320,30 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(scheduler.enable_fpm)
 
     def test_init_fpm_forced_on_for_benchmark_rank(self):
-        scheduler = types.SimpleNamespace()
-        scheduler.server_args = _make_server_args(benchmark_mode="agg")
-        scheduler.ps = _make_ps(attn_tp_rank=1, attn_tp_size=2)
-        scheduler.enable_kv_cache_events = False
+        rank_cases = (
+            {"attn_tp_rank": 1, "attn_tp_size": 2},
+            {"attn_cp_rank": 1, "attn_cp_size": 2},
+        )
+        for rank_overrides in rank_cases:
+            with self.subTest(rank_overrides=rank_overrides):
+                scheduler = types.SimpleNamespace(
+                    server_args=_make_server_args(
+                        benchmark_mode="agg", enable_forward_pass_metrics=True
+                    ),
+                    ps=_make_ps(**rank_overrides),
+                    enable_kv_cache_events=False,
+                )
+                with patch(
+                    "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
+                    _DummyPublisherThread,
+                ):
+                    reporter = _make_reporter(scheduler)
 
-        with patch(
-            "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
-            _DummyPublisherThread,
-        ):
-            reporter = _make_reporter(scheduler)
-
-        self.assertTrue(scheduler.enable_fpm)
-        self.assertFalse(scheduler._fpm_is_real_rank)
-        self.assertTrue(scheduler._fpm_benchmark_forced)
-        reporter.shutdown_benchmark_forced_fpm()
-        self.assertFalse(scheduler._fpm_benchmark_forced)
+                self.assertTrue(scheduler.enable_fpm)
+                self.assertFalse(scheduler._fpm_is_real_rank)
+                self.assertTrue(scheduler._fpm_benchmark_forced)
+                reporter.shutdown_benchmark_forced_fpm()
+                self.assertFalse(scheduler._fpm_benchmark_forced)
 
 
 if __name__ == "__main__":

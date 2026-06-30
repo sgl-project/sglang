@@ -13,22 +13,16 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import numpy as np
-import torch
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.self_benchmark_decode import (
+    SyntheticDecodeBatchBuilder,
+)
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
-from sglang.srt.mem_cache.common import (
-    alloc_paged_token_slots_extend,
-    alloc_req_slots,
-    alloc_token_slots,
-    release_kv_cache,
-)
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
@@ -114,6 +108,12 @@ class SelfBenchmark:
             raise ValueError("--benchmark-mode is not supported with PD multiplexing")
         if scheduler.enable_overlap_mlx:
             raise ValueError("--benchmark-mode is not supported with MLX overlap")
+        if scheduler.dllm_config is not None:
+            raise ValueError("--benchmark-mode is not supported with diffusion LLMs")
+        if hasattr(scheduler.token_to_kv_pool_allocator, "c4_attn_allocator"):
+            raise ValueError(
+                "--benchmark-mode is not supported with DeepSeek V4 on NPU"
+            )
         if not scheduler.is_generation:
             # Non-generation (embedding/reward) models would leak synthetic
             # prefill outputs to the tokenizer (suppress_output is only honored
@@ -193,6 +193,7 @@ class SelfBenchmark:
 
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
+        self._decode_batch_builder = SyntheticDecodeBatchBuilder(scheduler)
         self.config = SelfBenchmarkConfig(
             mode=scheduler.server_args.benchmark_mode,
             prefill_isl_granularity=scheduler.server_args.benchmark_prefill_granularity,
@@ -643,13 +644,13 @@ class SelfBenchmark:
             return 0
 
         try:
-            batch = self._build_synthetic_decode_batch(reqs, context_length)
+            batch = self._decode_batch_builder.build(reqs, context_length)
         except Exception:
             # A rank-local skip would let successful peers publish running_batch
             # and enter model collectives alone. Clean up what we can, then let the
             # scheduler wrapper fail startup and tear down every rank.
             try:
-                self._free_synthetic_decode_reqs(reqs)
+                self._decode_batch_builder.cleanup(reqs)
             except Exception:
                 logger.exception("Failed to clean up a synthetic decode batch")
             raise
@@ -775,97 +776,6 @@ class SelfBenchmark:
             )
             return False
         return True
-
-    def _build_synthetic_decode_batch(
-        self, reqs: list[Req], context_length: int
-    ) -> ScheduleBatch:
-        batch = ScheduleBatch.init_new(
-            reqs=reqs,
-            req_to_token_pool=self.scheduler.req_to_token_pool,
-            token_to_kv_pool_allocator=self.scheduler.token_to_kv_pool_allocator,
-            tree_cache=self.scheduler.tree_cache,
-            model_config=self.scheduler.model_config,
-            enable_overlap=self.scheduler.enable_overlap,
-            spec_algorithm=self.scheduler.spec_algorithm,
-            dllm_config=self.scheduler.dllm_config,
-        )
-        if getattr(self.scheduler, "enable_hisparse", False):
-            batch.hisparse_coordinator = self.scheduler.hisparse_coordinator
-
-        self._place_synthetic_context_cache(batch, context_length)
-        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            batch, self.scheduler.model_config.vocab_size
-        )
-
-        prefill_output_tokens = torch.tensor(
-            [req.output_ids[-1] for req in reqs],
-            dtype=torch.int64,
-            device=batch.device,
-        )
-        # FutureMap.stash expects a RelayPayload, not a raw tensor; non-spec only
-        # fills bonus_tokens (which the synthetic decode batch reads back next iter).
-        self.scheduler.future_map.stash(
-            batch.req_pool_indices,
-            RelayPayload(bonus_tokens=prefill_output_tokens),
-        )
-        batch.input_ids = None
-        return batch
-
-    def _place_synthetic_context_cache(
-        self, batch: ScheduleBatch, context_length: int
-    ) -> None:
-        reqs = batch.reqs
-        req_pool_indices = alloc_req_slots(
-            batch.req_to_token_pool, reqs, batch.tree_cache
-        )
-        req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-        batch.req_pool_indices_cpu = req_pool_indices_cpu
-        batch.req_pool_indices = req_pool_indices_cpu.to(
-            batch.device, non_blocking=True
-        )
-
-        seq_lens_cpu = torch.full((len(reqs),), context_length, dtype=torch.int64)
-        batch.seq_lens_cpu = seq_lens_cpu
-        batch.seq_lens = seq_lens_cpu.to(batch.device, non_blocking=True)
-        batch.orig_seq_lens = torch.full(
-            (len(reqs),), context_length, dtype=torch.int32, device=batch.device
-        )
-        batch.seq_lens_sum = context_length * len(reqs)
-
-        total_context_tokens = context_length * len(reqs)
-        if batch.tree_cache.page_size == 1:
-            context_locs = alloc_token_slots(batch.tree_cache, total_context_tokens)
-        else:
-            prefix_lens_cpu = torch.zeros((len(reqs),), dtype=torch.int64)
-            prefix_lens = prefix_lens_cpu.to(batch.device, non_blocking=True)
-            last_loc = torch.full(
-                (len(reqs),), -1, dtype=torch.int64, device=batch.device
-            )
-            context_locs = alloc_paged_token_slots_extend(
-                tree_cache=batch.tree_cache,
-                prefix_lens=prefix_lens,
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=batch.seq_lens,
-                seq_lens_cpu=batch.seq_lens_cpu,
-                last_loc=last_loc,
-                extend_num_tokens=total_context_tokens,
-            )
-
-        for i, req in enumerate(reqs):
-            start = i * context_length
-            end = start + context_length
-            batch.req_to_token_pool.write(
-                (req.req_pool_idx, slice(0, context_length)),
-                context_locs[start:end].to(torch.int32),
-            )
-            req.synthetic_benchmark_kv_placed = True
-
-    def _free_synthetic_decode_reqs(self, reqs: list[Req]) -> None:
-        for req in reqs:
-            if getattr(req, "synthetic_benchmark_kv_placed", False):
-                release_kv_cache(req, self.scheduler.tree_cache, is_insert=False)
-            elif req.req_pool_idx is not None:
-                self.scheduler.req_to_token_pool.free(req)
 
     def _has_inflight_work(self) -> bool:
         result_queue = getattr(self.scheduler, "result_queue", None)
