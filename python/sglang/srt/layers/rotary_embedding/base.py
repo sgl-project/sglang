@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.platforms import current_platform
@@ -93,8 +94,8 @@ class RotaryEmbedding(MultiPlatformOp):
         self.dtype = dtype
 
         cache = self._compute_cos_sin_cache()
-        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
+        if not (_is_cuda or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
 
         if (
@@ -178,8 +179,6 @@ class RotaryEmbedding(MultiPlatformOp):
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
-        from sglang.srt.environ import envs
-
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
