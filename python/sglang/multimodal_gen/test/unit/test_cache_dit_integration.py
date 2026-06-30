@@ -36,7 +36,10 @@ def _install_cache_dit_stub():
     cache_dit.steps_mask = steps_mask
     cache_dit.BlockAdapter = types.SimpleNamespace
     cache_dit.DBCacheConfig = _FakeDBCacheConfig
-    cache_dit.ForwardPattern = types.SimpleNamespace(Pattern_3="Pattern_3")
+    cache_dit.ForwardPattern = types.SimpleNamespace(
+        Pattern_2="Pattern_2",
+        Pattern_3="Pattern_3",
+    )
     cache_dit.ParamsModifier = object
     cache_dit.TaylorSeerCalibratorConfig = object
 
