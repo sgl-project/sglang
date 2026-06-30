@@ -556,8 +556,13 @@ impl PDRouter {
             };
 
             let sse_data = format!(
-                "data: {{'error': {}}}",
-                serde_json::to_string(&error_payload).unwrap_or_default()
+                "data: {}\n\n",
+                serde_json::to_string(&json!({
+                    "error": error_payload
+                }))
+                .unwrap_or_else(|_| {
+                    r#"{"error":{"message":"Decode server error","status":500}}"#.to_string()
+                })
             );
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
@@ -1300,6 +1305,17 @@ impl PDRouter {
         if connection_close {
             request = request.header("Connection", "close");
         }
+
+        // Inject api_key as Authorization: Bearer header for worker auth,
+        // matching the regular router's behavior in send_typed_request.
+        // This ensures PD mode respects the configured api_key.
+        if let Some(ref key) = self.api_key {
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(key);
+            request = request.header("Authorization", auth_header);
+        }
+
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
                 if header_utils::should_forward_request_header(name.as_str()) {
@@ -1954,5 +1970,102 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    #[test]
+    fn test_sse_error_format_is_valid_json() {
+        // Regression: SSE error chunks must produce valid JSON.
+        // The outer format must use double quotes, not single quotes.
+        let error_payload = json!({
+            "message": json!({"error": {"message": "mock decode error"}}),
+            "status": 500u16
+        });
+
+        let sse_data = format!(
+            "data: {}\n\n",
+            serde_json::to_string(&json!({
+                "error": error_payload
+            }))
+            .unwrap_or_default()
+        );
+
+        // Strip the "data: " prefix and trailing newlines, then parse as JSON
+        let json_str = sse_data
+            .strip_prefix("data: ")
+            .expect("SSE line must start with 'data: '")
+            .trim();
+        let parsed: Value = serde_json::from_str(json_str).expect("SSE data must be valid JSON");
+
+        assert!(
+            parsed.get("error").is_some(),
+            "SSE data must contain 'error' key"
+        );
+        assert_eq!(
+            parsed["error"]["status"], 500,
+            "error.status must be preserved"
+        );
+        assert_eq!(
+            parsed["error"]["message"]["error"]["message"], "mock decode error",
+            "nested error message must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_build_post_with_headers_injects_api_key() {
+        // Verify that api_key is injected as Authorization: Bearer header
+        // when build_post_with_headers is called.
+        let router = PDRouter {
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            policy_registry: Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin)),
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            api_key: Some("test-key-123".to_string()),
+            enable_igw: false,
+        };
+
+        let request = json!({"prompt": "hello"});
+        let builder = router.build_post_with_headers(
+            &router.client,
+            "http://example.com/generate",
+            &request,
+            None,
+            false,
+        );
+
+        let req = builder.build().expect("Failed to build request");
+        let auth = req.headers().get("Authorization");
+        assert!(
+            auth.is_some(),
+            "Authorization header must be present when api_key is set"
+        );
+        assert_eq!(auth.unwrap().to_str().unwrap(), "Bearer test-key-123");
+    }
+
+    #[test]
+    fn test_build_post_with_headers_no_api_key() {
+        // Verify that no Authorization header is added when api_key is None.
+        let router = PDRouter {
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            policy_registry: Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin)),
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            api_key: None,
+            enable_igw: false,
+        };
+
+        let request = json!({"prompt": "hello"});
+        let builder = router.build_post_with_headers(
+            &router.client,
+            "http://example.com/generate",
+            &request,
+            None,
+            false,
+        );
+
+        let req = builder.build().expect("Failed to build request");
+        assert!(
+            req.headers().get("Authorization").is_none(),
+            "Authorization header must NOT be present when api_key is None"
+        );
     }
 }
