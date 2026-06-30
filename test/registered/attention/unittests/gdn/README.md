@@ -2,7 +2,8 @@
 
 The main matrix uses the backend in each row for **full attention** and keeps
 the GDN linear-attention kernel on Triton. A separate focused class covers
-FlashInfer GDN prefill using the pure-PyTorch recurrence as its reference.
+FlashInfer GDN prefill. Its basic output and final-state case uses the
+pure-PyTorch reference; its tracked-state checkpoint case uses Triton as oracle.
 
 ## Coverage Matrix
 
@@ -23,7 +24,7 @@ kernel = `triton` for all rows). Cells use:
 
 `TestFlashInferLinearGDNBackendCorrectness` explicitly selects FlashInfer only
 for GDN prefill and checks a ragged nonzero-prefix case, final recurrent-state
-writeback, and chain/tree target verification.
+writeback, tracked-state checkpoints, and chain/tree target verification.
 
 ## Hybrid dispatch fan-out tests (Triton only, MagicMock-based)
 

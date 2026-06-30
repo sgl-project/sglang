@@ -18,6 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -67,13 +68,19 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     ):
         return
 
+    # With radix caching enabled, only the regular extra-buffer flow is validated.
+    if (
+        args.uses_mamba_radix_cache
+        and args.mamba_radix_cache_strategy != "extra_buffer"
+    ):
+        return
+
     cuda_version = torch.version.cuda
     chunk_size = args.chunked_prefill_size
     config = model_runner.hybrid_gdn_config
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
-        or args.uses_mamba_radix_cache
         or args.enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
@@ -92,6 +99,33 @@ def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     if is_flashinfer_gdn_prefill_available():
         args.linear_attn_prefill_backend = "flashinfer"
         rank0_log("Defaulting SM100 GDN prefill backend to FlashInfer.")
+
+
+def _build_flashinfer_checkpoint_plan(
+    extend_seq_lens: torch.Tensor,
+    mamba_track_mask: torch.Tensor,
+    mamba_track_seqlens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    checkpoint_every_n_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build packed FlashInfer checkpoint offsets and tracked source indices."""
+    extend_seq_lens = extend_seq_lens.to(device="cpu", dtype=torch.int64)
+    track_mask = mamba_track_mask.to(device="cpu", dtype=torch.bool)
+    relative_track_lens = mamba_track_seqlens.to(
+        device="cpu", dtype=torch.int64
+    ) - prefix_lens.to(device="cpu", dtype=torch.int64)
+
+    checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
+    checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
+    checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
+
+    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
+    track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
+        relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
+    )
+    if track_checkpoint_src.numel() and track_checkpoint_src.min() < 0:
+        raise ValueError("Tracked GDN state precedes the first FlashInfer checkpoint.")
+    return checkpoint_cu_starts, track_checkpoint_src
 
 
 class GDNKernelDispatcher:
@@ -188,6 +222,10 @@ class GDNKernelDispatcher:
             f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
+
+    @property
+    def extend_uses_state_checkpoints(self) -> bool:
+        return self.extend_kernel.uses_state_checkpoints
 
     def packed_decode(
         self,
@@ -347,6 +385,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+            if (
+                self.kernel_dispatcher.extend_uses_state_checkpoints
+                and self.forward_metadata.track_ssm_h_src is not None
+                and self.forward_metadata.track_ssm_h_src.numel() > 0
+            ):
+                checkpoint_every_n_tokens = (
+                    get_global_server_args().mamba_cache_chunk_size
+                )
+                checkpoint_cu_starts, track_checkpoint_src = (
+                    _build_flashinfer_checkpoint_plan(
+                        forward_batch.extend_seq_lens,
+                        forward_batch.mamba_track_mask,
+                        forward_batch.mamba_track_seqlens,
+                        forward_batch.extend_prefix_lens,
+                        checkpoint_every_n_tokens,
+                    )
+                )
+                assert (
+                    track_checkpoint_src.numel()
+                    == self.forward_metadata.track_ssm_h_dst.numel()
+                )
+                self.forward_metadata.track_ssm_h_src = track_checkpoint_src.to(
+                    self.device, non_blocking=True
+                )
+                self.forward_metadata.state_checkpoint_cu_starts = (
+                    checkpoint_cu_starts.to(self.device, non_blocking=True)
+                )
+                self.forward_metadata.num_state_checkpoints = int(
+                    checkpoint_cu_starts[-1]
+                )
+                self.forward_metadata.state_checkpoint_every_n_tokens = (
+                    checkpoint_every_n_tokens
+                )
 
     def forward_decode(
         self,
@@ -589,6 +660,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                state_checkpoint_cu_starts=(
+                    forward_metadata.state_checkpoint_cu_starts
+                ),
+                num_state_checkpoints=forward_metadata.num_state_checkpoints,
+                state_checkpoint_every_n_tokens=(
+                    forward_metadata.state_checkpoint_every_n_tokens
+                ),
             )
 
             if is_npu() and last_recurrent_state is not None:
@@ -603,7 +681,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 conv_states[cache_indices] = conv_states_contig
                 ssm_states[cache_indices] = ssm_states_contig
 
-            if h is not None:
+            if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
                     forward_batch, h, ssm_states, forward_metadata
                 )

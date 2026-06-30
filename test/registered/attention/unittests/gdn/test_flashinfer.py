@@ -10,11 +10,15 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
+    build_gdn_attention_fixture,
     make_gdn_cases,
     run_gdn_attention_case,
+    run_gdn_fixture_eager,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_gdn_cuda_graph_decode_case,
@@ -348,6 +352,17 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         prefix_lens=(3, 7),
         extend_lens=(65, 17),
     )
+    CHECKPOINT_CASE = GDNAttentionCase(
+        name="flashinfer_gdn_prefill_state_checkpoints",
+        backend="triton",
+        linear_attn_prefill_backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=2,
+        num_v_heads=4,
+        page_size=16,
+        prefix_lens=(0, 64, 128),
+        extend_lens=(64, 65, 129),
+    )
     EAGLE_VERIFY_CASES = (
         (
             GDNAttentionCase(
@@ -386,6 +401,51 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             head_k_dim=self.HEAD_DIM,
             head_v_dim=self.HEAD_DIM,
             max_context_len=128,
+        )
+
+    def test_prefill_tracked_state_checkpoints(self):
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CHECKPOINT_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=320,
+            runner_batch_size=6,
+        )
+        set_global_server_args_for_scheduler(fixture.runner.server_args)
+        batch = fixture.forward_batch
+        # Simulate the tracking metadata produced by the extra-buffer scheduler.
+        # This test covers checkpoint mapping and state copies, not scheduler setup.
+        batch.mamba_track_mask = torch.ones(3, dtype=torch.bool, device="cuda")
+        batch.mamba_track_indices = torch.tensor(
+            [4, 5, 6], dtype=torch.int64, device="cuda"
+        )
+        batch.mamba_track_seqlens = torch.tensor(
+            # The final entry selects the second checkpoint at absolute S256.
+            [64, 129, 257],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        initial_conv = cache.conv[0].clone()
+        initial_ssm = cache.temporal.clone()
+        flashinfer_output = run_gdn_fixture_eager(fixture)
+        flashinfer_tracked = cache.temporal[batch.mamba_track_indices].clone()
+
+        cache.conv[0].copy_(initial_conv)
+        cache.temporal.copy_(initial_ssm)
+        fixture.backend.linear_attn_backend.kernel_dispatcher.extend_kernel = (
+            TritonGDNKernel()
+        )
+        triton_output = run_gdn_fixture_eager(fixture)
+        triton_tracked = cache.temporal[batch.mamba_track_indices]
+
+        torch.testing.assert_close(
+            flashinfer_output, triton_output, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
         )
 
     def test_verify_chain_and_tree_fallback(self):
