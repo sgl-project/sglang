@@ -7,6 +7,7 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
@@ -1146,6 +1147,17 @@ impl PDRouter {
         AttachedBody::wrap_response(response, guards)
     }
 
+    // OpenAI-style body from prefill/decode is JSON; without this header,
+    // Axum's `(StatusCode, Bytes).into_response()` defaults to `application/octet-stream`.
+    fn non_stream_pd_json_response(status: StatusCode, body: Bytes) -> Response {
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = status;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+    }
+
     // Helper to process non-streaming decode response with logprob merging
     async fn process_non_streaming_response(
         &self,
@@ -1164,11 +1176,11 @@ impl PDRouter {
         };
 
         if !return_logprob {
-            return (status, decode_body).into_response();
+            return Self::non_stream_pd_json_response(status, decode_body);
         }
 
         let Some(prefill_body) = prefill_body else {
-            return (status, decode_body).into_response();
+            return Self::non_stream_pd_json_response(status, decode_body);
         };
 
         // Merge logprobs from prefill and decode
@@ -1177,17 +1189,17 @@ impl PDRouter {
             serde_json::from_slice::<Value>(&decode_body),
         ) else {
             warn!("Failed to parse responses for logprob merging");
-            return (status, decode_body).into_response();
+            return Self::non_stream_pd_json_response(status, decode_body);
         };
 
         Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
-            Ok(body) => (status, body).into_response(),
+            Ok(body) => Self::non_stream_pd_json_response(status, Bytes::from(body)),
             Err(e) => {
                 error!("Failed to serialize merged response: {}", e);
-                (status, decode_body).into_response()
+                Self::non_stream_pd_json_response(status, decode_body)
             }
         }
     }
