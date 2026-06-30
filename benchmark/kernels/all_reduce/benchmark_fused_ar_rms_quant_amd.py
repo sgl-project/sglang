@@ -1,27 +1,43 @@
 """
-Benchmark fused AllReduce + RMSNorm + per-group FP8 quant on AMD with
-correctness checks.
+Benchmark fused AllReduce + RMSNorm + activation-quant on AMD with correctness
+checks.
 
-This script targets the three op paths used by SGLang on ROCm/aiter for
-Qwen3.5-FP8 style models:
+For a chosen ``--quant`` variant this script compares the same three op paths
+used by SGLang on ROCm/aiter for Qwen3.5-style models:
 
     1. Split (3 kernels) - reference:
-         tensor_model_parallel_all_reduce -> RMSNorm -> aiter per-1x128 quant.
-    2. Fused AR+RMSNorm + separate per-group quant (2 kernels):
-         tensor_model_parallel_fused_allreduce_rmsnorm -> aiter per-1x128 quant.
-    3. Fully fused AR+RMSNorm+per-group-quant (1 kernel):
-         tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group.
+         tensor_model_parallel_all_reduce -> RMSNorm -> aiter standalone quant.
+    2. Fused AR+RMSNorm + separate quant (2 kernels):
+         tensor_model_parallel_fused_allreduce_rmsnorm -> aiter standalone quant.
+    3. Fully fused AR+RMSNorm+quant (1 kernel):
+         tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group / _per_token /
+         _mxfp4_quant.
 
-Default shape sets cover the Qwen3.5-397B-A17B-FP8 layout:
+Supported quant variants (``--quant``):
+  * per_group - #24651's per-1x128 FP8 path (default; numeric correctness).
+  * per_token - per-1x1 (per-token) FP8 path (numeric correctness).
+  * mxfp4     - per-1x32 microscaling FP4 path (bf16-domain correctness; the
+                fp4 payload is checked structurally).
+
+Default shape sets cover the Qwen3.5-397B-A17B layout:
   * hidden_size = 4096
   * TP = 8 (launched with torchrun --nproc_per_node=8)
   * Prefill batch sizes up to a few thousand tokens.
   * Decode batch sizes 1-512 covering typical steady-state running_req values.
 
 Usage:
+  # per-group FP8 (original #24651 path)
   torchrun --nproc_per_node=8 \
     benchmark/kernels/all_reduce/benchmark_fused_ar_rms_quant_amd.py \
-    --dtype bf16 --group-size 128
+    --dtype bf16 --quant per_group --group-size 128
+
+  # per-token FP8 / mxfp4 paths added on top of #24651
+  torchrun --nproc_per_node=8 \
+    benchmark/kernels/all_reduce/benchmark_fused_ar_rms_quant_amd.py \
+    --dtype bf16 --quant per_token
+  torchrun --nproc_per_node=8 \
+    benchmark/kernels/all_reduce/benchmark_fused_ar_rms_quant_amd.py \
+    --dtype bf16 --quant mxfp4
 """
 
 import argparse
@@ -37,7 +53,9 @@ import torch.nn.functional as F
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token,
 )
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -50,6 +68,51 @@ from sglang.srt.distributed.parallel_state import (
 
 Shape = Tuple[int, int]
 FP8_DTYPE = torch.float8_e4m3fnuz
+
+# Quant variants this benchmark can target. The default (per_group) is #24651's
+# original per-1x128 FP8 path; per_token and mxfp4 exercise the entry points added
+# on top of #24651 (MXFP4-AttnFP8 / plain-MXFP4 checkpoints).
+QUANT_CHOICES = ("per_group", "per_token", "mxfp4")
+
+
+def _aiter_quant_type(quant: str):
+    """aiter QuantType for the standalone (reference) quant of a given variant."""
+    import aiter
+
+    return {
+        "per_group": aiter.QuantType.per_1x128,
+        "per_token": aiter.QuantType.per_Token,
+        "mxfp4": aiter.QuantType.per_1x32,
+    }[quant]
+
+
+def _aiter_quant_dtype(quant: str):
+    """aiter element dtype produced by the standalone quant of a given variant."""
+    import aiter
+
+    if quant == "mxfp4":
+        # fp4x2-packed (two fp4 per byte) on builds that expose it; the standalone
+        # mxfp4 reference is timing-only (correctness for mxfp4 is bf16-domain).
+        return getattr(aiter.dtypes, "fp4x2", getattr(aiter.dtypes, "fp4", None))
+    return aiter.dtypes.fp8
+
+
+def _standalone_quant(normed: torch.Tensor, quant: str):
+    """Reference standalone quant used by the split-3k / fused-2k baselines.
+
+    Returns ``(q, scale)`` or ``None`` when the variant's standalone quant is not
+    available in this aiter build (only happens for mxfp4 on older builds — the
+    fused mxfp4 kernel and its bf16-domain correctness check still run)."""
+    import aiter
+
+    quant_dtype = _aiter_quant_dtype(quant)
+    if quant_dtype is None:
+        return None
+    try:
+        hip_quant = aiter.get_hip_quant(_aiter_quant_type(quant))
+        return hip_quant(normed, quant_dtype=quant_dtype)
+    except Exception:
+        return None
 
 
 def parse_shapes(raw: str) -> List[Shape]:
@@ -135,21 +198,31 @@ def _make_inputs(
     return x, residual, weight
 
 
+def _ar_rms_bf16(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Reference AR+RMSNorm (bf16) used for the mxfp4 bf16-domain correctness."""
+    return tensor_model_parallel_fused_allreduce_rmsnorm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+
 def _split_3_reference(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     group_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference: plain all_reduce -> RMSNorm -> aiter per-1x128 quant."""
-    import aiter
-
+    quant: str,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Reference: plain all_reduce -> RMSNorm -> aiter standalone quant."""
     ar_out = tensor_model_parallel_all_reduce(x.clone())
     residual_out = ar_out + residual
     normed = F.rms_norm(residual_out, (residual_out.shape[-1],), weight, eps)
-    hip_quant = aiter.get_hip_quant(aiter.QuantType.per_1x128)
-    fp8_out, scale_out = hip_quant(normed, quant_dtype=aiter.dtypes.fp8)
+    q = _standalone_quant(normed, quant)
+    if q is None:
+        return None
+    fp8_out, scale_out = q
     return fp8_out, residual_out, scale_out
 
 
@@ -159,18 +232,19 @@ def _fused_ar_rms_then_quant(
     weight: torch.Tensor,
     eps: float,
     group_size: int,
+    quant: str,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """2-kernel: fused AR+RMSNorm (existing) + separate per-group quant."""
-    import aiter
-
+    """2-kernel: fused AR+RMSNorm (existing) + separate standalone quant."""
     result = tensor_model_parallel_fused_allreduce_rmsnorm(
         x.clone(), residual.clone(), weight, eps
     )
     if result is None:
         return None
     normed, residual_out = result
-    hip_quant = aiter.get_hip_quant(aiter.QuantType.per_1x128)
-    fp8_out, scale_out = hip_quant(normed, quant_dtype=aiter.dtypes.fp8)
+    q = _standalone_quant(normed, quant)
+    if q is None:
+        return None
+    fp8_out, scale_out = q
     return fp8_out, residual_out, scale_out
 
 
@@ -180,10 +254,19 @@ def _fully_fused(
     weight: torch.Tensor,
     eps: float,
     group_size: int,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """1-kernel: fused AR+RMSNorm+per-group-quant (fp8+scale only)."""
-    return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-        x.clone(), residual.clone(), weight, eps, group_size
+    quant: str,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """1-kernel: fused AR+RMSNorm+quant (quant pair only, no bf16 sidecar)."""
+    if quant == "per_group":
+        return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+            x.clone(), residual.clone(), weight, eps, group_size
+        )
+    if quant == "per_token":
+        return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
+            x.clone(), residual.clone(), weight, eps
+        )
+    return tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
+        x.clone(), residual.clone(), weight, eps
     )
 
 
@@ -193,14 +276,22 @@ def _fully_fused_with_bf16(
     weight: torch.Tensor,
     eps: float,
     group_size: int,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """1-kernel: fused AR+RMSNorm+per-group-quant with bf16 side-output
-    (GDN keep_bf16=True path — replaces fused_ar_rms + separate per-group
-    quant with a single kernel that writes BOTH fp8+scale and bf16).
+    quant: str,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """1-kernel fused AR+RMSNorm+quant with a bf16 side-output (4-tuple).
+
+    Supported by the per-group FP8 and MXFP4 kernels (GDN keep_bf16=True path).
+    The per-token kernel has no bf16 sidecar, so this returns ``None`` there.
     """
-    return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-        x.clone(), residual.clone(), weight, eps, group_size, emit_bf16=True
-    )
+    if quant == "per_group":
+        return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+            x.clone(), residual.clone(), weight, eps, group_size, emit_bf16=True
+        )
+    if quant == "mxfp4":
+        return tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
+            x.clone(), residual.clone(), weight, eps, emit_bf16=True
+        )
+    return None
 
 
 def _check_quant_close(
@@ -210,9 +301,20 @@ def _check_quant_close(
     scale_b: torch.Tensor,
     group_size: int,
 ) -> Tuple[bool, str]:
-    """Compare two (fp8, scale) per-group quantized outputs by dequantizing."""
-    dq_a = fp8_a.float() * scale_a.repeat_interleave(group_size, dim=-1)
-    dq_b = fp8_b.float() * scale_b.repeat_interleave(group_size, dim=-1)
+    """Compare two (fp8, scale) quantized outputs by dequantizing.
+
+    Handles both per-group scales (one scale per ``group_size`` cols) and
+    per-token scales (a single ``(M, 1)`` column broadcast across the row)."""
+
+    def _dq(fp8, scale):
+        if scale.shape[-1] == fp8.shape[-1]:
+            return fp8.float() * scale
+        if scale.shape[-1] == 1:
+            return fp8.float() * scale  # per-token: broadcast (M,1) over the row
+        return fp8.float() * scale.repeat_interleave(group_size, dim=-1)
+
+    dq_a = _dq(fp8_a, scale_a)
+    dq_b = _dq(fp8_b, scale_b)
     max_diff = (dq_a - dq_b).abs().max().item()
     denom = dq_a.abs().max().item() + 1e-6
     rel_err = max_diff / denom
@@ -230,110 +332,131 @@ def bench_shape(
     iters: int,
     repeats: int,
     mode: str,
+    quant: str,
 ) -> Dict[str, object]:
     device = x.device
 
-    # --- Split 3-kernel baseline ---
-    split_fn = lambda: _split_3_reference(x, residual, weight, eps, group_size)
-    if mode == "graph":
+    def _graphed(call):
+        """Return a replay-able fn in graph mode, else the eager call itself."""
+        if mode != "graph":
+            return call
         with graph_capture() as gc:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, stream=gc.stream):
-                _split_3_reference(x, residual, weight, eps, group_size)
-        split_fn = g.replay
-    split_us = _measure_us(split_fn, warmup, iters, repeats, device)
+                call()
+        return g.replay
+
+    # --- Split 3-kernel baseline (AR -> RMSNorm -> standalone quant) ---
+    # The standalone quant may be unavailable for mxfp4 on older aiter builds;
+    # the fused kernel + bf16-domain correctness still run in that case.
+    split_available = _split_3_reference(x, residual, weight, eps, group_size, quant) is not None
+    split_us: Optional[float] = None
+    if split_available:
+        split_fn = _graphed(
+            lambda: _split_3_reference(x, residual, weight, eps, group_size, quant)
+        )
+        split_us = _measure_us(split_fn, warmup, iters, repeats, device)
 
     # --- Fused AR+RMSNorm + separate quant (2 kernels) ---
-    probe2 = _fused_ar_rms_then_quant(x, residual, weight, eps, group_size)
-    fused2_available = probe2 is not None
+    fused2_available = (
+        _fused_ar_rms_then_quant(x, residual, weight, eps, group_size, quant) is not None
+    )
     fused2_us: Optional[float] = None
     if fused2_available:
-        fused2_fn = lambda: _fused_ar_rms_then_quant(
-            x, residual, weight, eps, group_size
+        fused2_fn = _graphed(
+            lambda: _fused_ar_rms_then_quant(x, residual, weight, eps, group_size, quant)
         )
-        if mode == "graph":
-            with graph_capture() as gc:
-                g2 = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g2, stream=gc.stream):
-                    _fused_ar_rms_then_quant(x, residual, weight, eps, group_size)
-            fused2_fn = g2.replay
         fused2_us = _measure_us(fused2_fn, warmup, iters, repeats, device)
 
-    # --- Fully fused, fp8-only (1 kernel) — std-attention path ---
-    probe1 = _fully_fused(x, residual, weight, eps, group_size)
-    fused1_available = probe1 is not None
+    # --- Fully fused, quant-pair only (1 kernel) — std-attention path ---
+    fused1_available = (
+        _fully_fused(x, residual, weight, eps, group_size, quant) is not None
+    )
     fused1_us: Optional[float] = None
     if fused1_available:
-        fused1_fn = lambda: _fully_fused(x, residual, weight, eps, group_size)
-        if mode == "graph":
-            with graph_capture() as gc:
-                g1 = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g1, stream=gc.stream):
-                    _fully_fused(x, residual, weight, eps, group_size)
-            fused1_fn = g1.replay
+        fused1_fn = _graphed(
+            lambda: _fully_fused(x, residual, weight, eps, group_size, quant)
+        )
         fused1_us = _measure_us(fused1_fn, warmup, iters, repeats, device)
 
-    # --- Fully fused, fp8+bf16 (1 kernel) — GDN keep_bf16=True path ---
-    probe1b = _fully_fused_with_bf16(x, residual, weight, eps, group_size)
-    # The bf16 side-output is only emitted when the call actually returned
-    # a 4-tuple; a 3-tuple means the aiter build doesn't support it.
+    # --- Fully fused + bf16 sidecar (1 kernel) — GDN keep_bf16=True path ---
+    probe1b = _fully_fused_with_bf16(x, residual, weight, eps, group_size, quant)
     fused1bf16_available = (
         probe1b is not None and isinstance(probe1b, tuple) and len(probe1b) == 4
     )
     fused1bf16_us: Optional[float] = None
     if fused1bf16_available:
-        fused1bf16_fn = lambda: _fully_fused_with_bf16(
-            x, residual, weight, eps, group_size
+        fused1bf16_fn = _graphed(
+            lambda: _fully_fused_with_bf16(x, residual, weight, eps, group_size, quant)
         )
-        if mode == "graph":
-            with graph_capture() as gc:
-                g1b = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g1b, stream=gc.stream):
-                    _fully_fused_with_bf16(x, residual, weight, eps, group_size)
-            fused1bf16_fn = g1b.replay
         fused1bf16_us = _measure_us(fused1bf16_fn, warmup, iters, repeats, device)
 
     # --- Correctness ---
-    # (a) fused1 fp8+scale vs fused2 fp8+scale (both emit fp8 pair)
-    # (b) fused1_bf16 bf16 side-output vs fused2 bf16 (both describe the
-    #     same normed value; fused2 writes bf16 explicitly, fused1_bf16
-    #     writes bf16 AND fp8; comparing bf16 against bf16 is the tightest
-    #     check of the bf16 hook).
     correctness = "N/A"
-    if fused1_available and fused2_available:
-        res1 = _fully_fused(x, residual, weight, eps, group_size)
-        res2 = _fused_ar_rms_then_quant(x, residual, weight, eps, group_size)
-        ok, detail = _check_quant_close(res2[0], res2[2], res1[0], res1[2], group_size)
-        correctness = "PASS" if ok else f"FAIL({detail})"
-
     correctness_bf16 = "N/A"
-    if fused1bf16_available and fused2_available:
-        res1b = _fully_fused_with_bf16(x, residual, weight, eps, group_size)
-        res2 = _fused_ar_rms_then_quant(x, residual, weight, eps, group_size)
-        # res1b = (fp8, res_out, scale, bf16); res2 = (fp8, res_out, scale)
-        # Cross-check: dequant(res1b.fp8) ≈ dequant(res2.fp8) and
-        # res1b.bf16 ≈ dequant(res1b.fp8) within ~one FP8 step.
-        ok_fp8, detail_fp8 = _check_quant_close(
-            res2[0], res2[2], res1b[0], res1b[2], group_size
-        )
-        bf16_vs_fp8 = (
-            (
-                res1b[3].float()
-                - (res1b[0].float() * res1b[2].repeat_interleave(group_size, dim=-1))
+    if quant == "mxfp4":
+        # fp4 (e2m1 + e8m0 block scale) numeric dequant is fragile to hand-roll,
+        # so validate the fused kernel's AR+RMSNorm in the bf16 domain (its
+        # emit_bf16 side-output vs the reference fused AR+RMSNorm) and confirm the
+        # fp4 (packed) + scale payload is structurally present.
+        ref = _ar_rms_bf16(x, residual, weight, eps)
+        if fused1bf16_available and ref is not None:
+            res1b = _fully_fused_with_bf16(x, residual, weight, eps, group_size, quant)
+            ref_bf16, _ = ref
+            diff = (res1b[3].float() - ref_bf16.float()).abs().max().item()
+            denom = ref_bf16.float().abs().max().item() + 1e-6
+            rel = diff / denom
+            correctness_bf16 = (
+                f"PASS(bf16_rel={rel:.4f})" if rel < 0.02 else f"FAIL(bf16_rel={rel:.4f})"
             )
-            .abs()
-            .max()
-            .item()
-        )
-        if not ok_fp8:
-            correctness_bf16 = f"FAIL_fp8({detail_fp8})"
-        elif bf16_vs_fp8 > 1.0:
-            correctness_bf16 = f"FAIL_bf16(diff={bf16_vs_fp8:.4f})"
-        else:
-            correctness_bf16 = f"PASS(bf16_diff={bf16_vs_fp8:.3f})"
+        if fused1_available:
+            res1 = _fully_fused(x, residual, weight, eps, group_size, quant)
+            ok_struct = (
+                isinstance(res1, tuple)
+                and len(res1) >= 3
+                and res1[0] is not None
+                and res1[2] is not None
+            )
+            correctness = "PASS(struct)" if ok_struct else "FAIL(struct)"
+    else:
+        # FP8 per-group / per-token: numeric dequant compare.
+        if fused1_available and fused2_available:
+            res1 = _fully_fused(x, residual, weight, eps, group_size, quant)
+            res2 = _fused_ar_rms_then_quant(x, residual, weight, eps, group_size, quant)
+            ok, detail = _check_quant_close(
+                res2[0], res2[2], res1[0], res1[2], group_size
+            )
+            correctness = "PASS" if ok else f"FAIL({detail})"
+
+        if fused1bf16_available and fused2_available:
+            res1b = _fully_fused_with_bf16(x, residual, weight, eps, group_size, quant)
+            res2 = _fused_ar_rms_then_quant(x, residual, weight, eps, group_size, quant)
+            ok_fp8, detail_fp8 = _check_quant_close(
+                res2[0], res2[2], res1b[0], res1b[2], group_size
+            )
+            # bf16 sidecar (only present for per_group here) vs its own fp8 pair.
+            bf16_vs_fp8 = (
+                (
+                    res1b[3].float()
+                    - (
+                        res1b[0].float()
+                        * res1b[2].repeat_interleave(group_size, dim=-1)
+                    )
+                )
+                .abs()
+                .max()
+                .item()
+            )
+            if not ok_fp8:
+                correctness_bf16 = f"FAIL_fp8({detail_fp8})"
+            elif bf16_vs_fp8 > 1.0:
+                correctness_bf16 = f"FAIL_bf16(diff={bf16_vs_fp8:.4f})"
+            else:
+                correctness_bf16 = f"PASS(bf16_diff={bf16_vs_fp8:.3f})"
 
     return {
         "split_us": split_us,
+        "split_available": split_available,
         "fused2_available": fused2_available,
         "fused2_us": fused2_us,
         "fused1_available": fused1_available,
@@ -359,7 +482,8 @@ _DEFAULT_DECODE_SHAPES = (
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark fused AR+RMSNorm+per-group-quant for Qwen3.5-FP8 shapes."
+            "Benchmark fused AR+RMSNorm+quant (per_group / per_token / mxfp4) "
+            "for Qwen3.5 shapes."
         )
     )
     parser.add_argument(
@@ -371,6 +495,17 @@ def main() -> None:
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument(
+        "--quant",
+        type=str,
+        default="per_group",
+        choices=QUANT_CHOICES,
+        help=(
+            "Quant variant of the fused AR+RMSNorm+quant kernel to benchmark: "
+            "per_group (#24651 per-1x128 FP8), per_token (per-1x1 FP8), or "
+            "mxfp4 (per-1x32 microscaling). group_size only applies to per_group."
+        ),
+    )
     parser.add_argument("--prefill-shapes", type=str, default=_DEFAULT_PREFILL_SHAPES)
     parser.add_argument("--decode-shapes", type=str, default=_DEFAULT_DECODE_SHAPES)
     parser.add_argument("--warmup", type=int, default=10)
@@ -403,9 +538,10 @@ def main() -> None:
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     if rank == 0:
+        gs_note = args.group_size if args.quant == "per_group" else "n/a"
         print(
             f"Config: world_size={world_size}, dtype={dtype}, "
-            f"group_size={args.group_size}"
+            f"quant={args.quant}, group_size={gs_note}"
         )
         print(
             f"  1-stage boundary: total_bytes <= 128KB "
@@ -416,9 +552,15 @@ def main() -> None:
             f"(M <= {512 * 1024 // (4096 * 2)} for hidden=4096 bf16)"
         )
         print(
-            "  fallback: fused_ar_rms + per_group_quant (2 kernels) "
+            "  fallback: fused_ar_rms + standalone quant (2 kernels) "
             "when single-kernel path is unavailable"
         )
+        if args.quant == "mxfp4":
+            print(
+                "  mxfp4: correctness is bf16-domain (emit_bf16 sidecar vs "
+                "reference AR+RMSNorm); 'Corr fp8' reports the fp4 payload "
+                "structural check"
+            )
 
     run_modes = ("eager", "graph") if args.mode == "both" else (args.mode,)
     csv_rows: List[Dict[str, object]] = []
@@ -454,9 +596,15 @@ def main() -> None:
                 args.iters,
                 args.repeats,
                 mode,
+                args.quant,
             )
 
-            split_us = _mean_across_ranks(m["split_us"], device)
+            split_us = (
+                _mean_across_ranks(m["split_us"], device)
+                if m["split_us"] is not None
+                else None
+            )
+            split_avail = _all_true_across_ranks(m["split_available"], device)
             fused2_avail = _all_true_across_ranks(m["fused2_available"], device)
             fused1_avail = _all_true_across_ranks(m["fused1_available"], device)
             fused1bf16_avail = _all_true_across_ranks(m["fused1bf16_available"], device)
@@ -479,17 +627,18 @@ def main() -> None:
             if rank == 0:
                 M, N = shape
                 nbytes = M * N * 2
+                split_str = f"{split_us:.1f}" if split_us else "N/A"
                 f2_str = f"{fused2_us:.1f}" if fused2_us else "N/A"
                 f1_str = f"{fused1_us:.1f}" if fused1_us else "N/A"
                 f1b_str = f"{fused1bf16_us:.1f}" if fused1bf16_us else "N/A"
                 s2 = (
                     f"{split_us / fused2_us:.2f}x"
-                    if fused2_us and fused2_us > 0
+                    if split_us and fused2_us and fused2_us > 0
                     else "N/A"
                 )
                 s1 = (
                     f"{split_us / fused1_us:.2f}x"
-                    if fused1_us and fused1_us > 0
+                    if split_us and fused1_us and fused1_us > 0
                     else "N/A"
                 )
                 s1b = (
@@ -498,23 +647,25 @@ def main() -> None:
                     else "N/A"
                 )
                 print(
-                    f"| {M}x{N} | {nbytes} | {split_us:.1f} | {f2_str} | "
+                    f"| {M}x{N} | {nbytes} | {split_str} | {f2_str} | "
                     f"{f1_str} | {f1b_str} | {s2} | {s1} | {s1b} | "
                     f"{m['correctness']} | {m['correctness_bf16']} |"
                 )
                 csv_rows.append(
                     {
+                        "quant": args.quant,
                         "mode": mode,
                         "shape": f"{M}x{N}",
                         "m": M,
                         "n": N,
                         "bytes_per_rank": nbytes,
-                        "split_us": split_us,
+                        "split_us": split_us if split_us is not None else "",
                         "fused2_us": fused2_us if fused2_us is not None else "",
                         "fused1_us": fused1_us if fused1_us is not None else "",
                         "fused1bf16_us": (
                             fused1bf16_us if fused1bf16_us is not None else ""
                         ),
+                        "split_available": split_avail,
                         "fused1_available": fused1_avail,
                         "fused2_available": fused2_avail,
                         "fused1bf16_available": fused1bf16_avail,
