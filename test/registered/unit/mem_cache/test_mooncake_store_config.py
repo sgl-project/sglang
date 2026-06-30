@@ -37,7 +37,9 @@ class TestMooncakeStoreConfigLocalHostname(CustomTestCase):
         self.assertEqual(cfg.local_hostname, "10.0.0.3")
 
     def test_load_from_extra_config_prefers_mooncake_env_over_local_hostname(self):
-        with temp_set_env(MOONCAKE_LOCAL_HOSTNAME="10.0.0.7", LOCAL_HOSTNAME="10.0.0.8"):
+        with temp_set_env(
+            MOONCAKE_LOCAL_HOSTNAME="10.0.0.7", LOCAL_HOSTNAME="10.0.0.8"
+        ):
             cfg = self._load_from_extra_config()
         self.assertEqual(cfg.local_hostname, "10.0.0.7")
 
@@ -57,12 +59,16 @@ class TestMooncakeStoreConfigLocalHostname(CustomTestCase):
         self.assertEqual(cfg.local_hostname, "10.0.0.4")
 
     def test_load_from_env_uses_mooncake_env(self):
-        with temp_set_env(MOONCAKE_LOCAL_HOSTNAME="10.0.0.5", MOONCAKE_MASTER="127.0.0.1:50051"):
+        with temp_set_env(
+            MOONCAKE_LOCAL_HOSTNAME="10.0.0.5", MOONCAKE_MASTER="127.0.0.1:50051"
+        ):
             cfg = MooncakeStoreConfig.load_from_env()
         self.assertEqual(cfg.local_hostname, "10.0.0.5")
 
     def test_load_from_env_uses_local_hostname_env(self):
-        with temp_set_env(LOCAL_HOSTNAME="10.0.0.10", MOONCAKE_MASTER="127.0.0.1:50051"):
+        with temp_set_env(
+            LOCAL_HOSTNAME="10.0.0.10", MOONCAKE_MASTER="127.0.0.1:50051"
+        ):
             cfg = MooncakeStoreConfig.load_from_env()
         self.assertEqual(cfg.local_hostname, "10.0.0.10")
 
