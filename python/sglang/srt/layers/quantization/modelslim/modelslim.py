@@ -111,8 +111,6 @@ class ModelSlimConfig(QuantizationConfig):
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
-        if group_size == 0:
-            group_size = quant_config.quant_description.get("group_size", 32)
 
         for name in self.quant_description.keys():
             if "norm.bias" in name:
