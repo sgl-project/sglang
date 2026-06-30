@@ -110,7 +110,12 @@ impl DynamoTokenizer {
 impl TextTokenizer for DynamoTokenizer {
     fn encode(&self, text: &str) -> Result<Vec<i32>, Error> {
         if text.is_empty() {
-            return Err(Error::Tokenize("empty input text".into()));
+            // Match Python sglang: an empty prompt is a client error on both
+            // `/generate` (`_tokenize_texts`: "texts cannot be empty") and
+            // `/v1/completions` ("Prompt cannot be empty"). It does NOT adopt
+            // OpenAI's empty→`<|endoftext|>` convention, so reject — but as a 400
+            // (`Validation`) rather than the misleading 500 a tokenize error gives.
+            return Err(Error::Validation("prompt cannot be empty".into()));
         }
         let encoding = self
             .inner
