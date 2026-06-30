@@ -20,7 +20,9 @@ except ImportError:
     flash_mla_sparse_fwd = None
     HAS_Q16_FLASHMLA = False
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 IS_CI = is_in_ci()
 DTYPE_FP8 = torch.float8_e4m3fn
