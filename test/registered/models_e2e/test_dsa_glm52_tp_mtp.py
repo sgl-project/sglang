@@ -15,7 +15,7 @@ register_cuda_ci(
 )
 
 
-class TestGLM5TPMTP(
+class TestGLM52TPMTP(
     DsaMtpServerBase, DsaMtpEvalConfigDefaults, GSM8KMixin, SpecDecodingMixin
 ):
     model = "zai-org/GLM-5.2-FP8"

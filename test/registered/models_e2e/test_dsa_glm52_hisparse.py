@@ -9,18 +9,18 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=720, stage="extra-b", runner_config="8-gpu-h200")
 
-GLM5_FP8_MODEL_PATH = "zai-org/GLM-5.2-FP8"
+GLM52_FP8_MODEL_PATH = "zai-org/GLM-5.2-FP8"
 
 
-class TestGLM5HiSparse(DefaultServerBase, GSM8KMixin):
+class TestGLM52HiSparse(DefaultServerBase, GSM8KMixin):
     """GLM-5.2 FP8 with HiSparse (host-to-device sparse KV offload) on DSA decode.
 
     HiSparse targets the high-concurrency regime and is not used together with
     EAGLE MTP, so this variant runs without speculative decoding (unlike the
-    DSA-MTP variants in test_dsa_glm5_{dp,tp}_mtp.py).
+    DSA-MTP variants in test_dsa_glm52_{dp,tp}_mtp.py).
     """
 
-    model = GLM5_FP8_MODEL_PATH
+    model = GLM52_FP8_MODEL_PATH
     other_args = [
         "--trust-remote-code",
         "--tp",

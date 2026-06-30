@@ -35,10 +35,10 @@ DP_MTP_ARGS = [
 ]
 
 
-class TestGlm5Nvfp4(unittest.TestCase):
+class TestGlm52Nvfp4(unittest.TestCase):
     """GLM-5.2 NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
 
-    def test_glm5_nvfp4(self):
+    def test_glm52_nvfp4(self):
         variants = [
             ModelLaunchSettings(
                 MODEL_PATH,
