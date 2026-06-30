@@ -312,7 +312,7 @@ python3 -m sglang.launch_server \
 ```
 
 > **Implementation Notes:**
-> 
+>
 > - GGUF weights are pre-dequantized to FP16/BF16 during model loading on CPU, then transferred to NPU for inference. This trades higher memory usage for faster runtime performance (no per-forward-pass dequantization overhead).
 > - MoE layers use `npu_grouped_matmul` and `npu_moe_init_routing` / `npu_moe_finalize_routing` for high-performance expert computation.
 > - TP (tensor parallelism) sharding is supported for both dense and MoE GGUF models.
