@@ -428,7 +428,7 @@ jobs:
       test_type: ${{ matrix.test_config.test_type }}
       test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3'
       install_sglang_from_source: false
       transformers_version: ''
 
