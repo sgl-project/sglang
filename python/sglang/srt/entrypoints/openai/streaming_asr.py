@@ -115,7 +115,12 @@ class StreamingASRState:
             old_confirmed = self.confirmed_text
             self.confirmed_text = self.full_transcript
             common_count = _common_prefix_len(old_confirmed, self.full_transcript)
-            if common_count == 0 and cumulative and old_confirmed and self.full_transcript:
+            if (
+                common_count == 0
+                and cumulative
+                and old_confirmed
+                and self.full_transcript
+            ):
                 return self._record_emit(self.full_transcript[len(old_confirmed) :])
             return self._record_emit(self.full_transcript[common_count:])
 

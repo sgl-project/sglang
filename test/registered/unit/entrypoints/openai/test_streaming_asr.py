@@ -178,9 +178,7 @@ class TestProcessAsrChunk(CustomTestCase):
         _, out = self._chunk(state, "Hello world again tail")
         self.assertEqual(out, "again")
 
-        state = self._state(
-            confirmed_text="hello world", emitted_text="hello world"
-        )
+        state = self._state(confirmed_text="hello world", emitted_text="hello world")
         _, out = self._chunk(state, "Hello world again", is_last=True)
         self.assertEqual(out, "again")
 
