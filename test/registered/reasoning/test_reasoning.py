@@ -141,6 +141,106 @@ class TestEnableThinking(
             has_content, "The stream response does not contain normal content"
         )
 
+    @staticmethod
+    def _responses_output_text(data):
+        return "".join(
+            content["text"]
+            for item in data["output"]
+            if item.get("type") == "message"
+            for content in item.get("content", [])
+            if content.get("type") == "output_text"
+        )
+
+    def assert_responses_has_no_reasoning_item(self, data):
+        self.assertFalse(
+            any(item.get("type") == "reasoning" for item in data["output"]),
+            data["output"],
+        )
+
+    def test_responses_chat_template_kwargs_disable_reasoning(self):
+        response = requests.post(
+            f"{self.base_url}/v1/responses",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "input": "What is 123 + 456? Explain briefly.",
+                "temperature": 0,
+                "max_output_tokens": 64,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+        data = response.json()
+        self.assert_responses_has_no_reasoning_item(data)
+        self.assertTrue(self._responses_output_text(data))
+
+    def test_responses_structured_output_matches_chat_and_disables_reasoning(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+            "additionalProperties": False,
+        }
+        prompt = "Invent a random fictional character and tell me a little about them."
+
+        chat_resp = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": 128,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "person",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
+                **self.additional_chat_kwargs,
+            },
+        )
+        self.assertEqual(chat_resp.status_code, 200, f"Failed with: {chat_resp.text}")
+        chat_text = chat_resp.json()["choices"][0]["message"]["content"]
+        chat_obj = json.loads(chat_text)
+        self.assertIsInstance(chat_obj["name"], str)
+        self.assertIsInstance(chat_obj["age"], int)
+
+        responses_resp = requests.post(
+            f"{self.base_url}/v1/responses",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "input": prompt,
+                "temperature": 0,
+                "max_output_tokens": 128,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "person",
+                        "strict": True,
+                        "schema": schema,
+                    }
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        self.assertEqual(
+            responses_resp.status_code, 200, f"Failed with: {responses_resp.text}"
+        )
+        data = responses_resp.json()
+        self.assert_responses_has_no_reasoning_item(data)
+        output_text = self._responses_output_text(data)
+        responses_obj = json.loads(output_text)
+        self.assertIsInstance(responses_obj["name"], str)
+        self.assertIsInstance(responses_obj["age"], int)
+
     def test_stream_chat_completion_without_reasoning(self):
         # Test streaming with "enable_thinking": False, reasoning_content should be empty
         response = requests.post(
