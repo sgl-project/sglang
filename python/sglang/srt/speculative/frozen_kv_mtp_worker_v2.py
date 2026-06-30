@@ -644,6 +644,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
     are frozen-specific.
     """
 
+    supports_layer_pipeline_hook = False
+
     def __init__(
         self,
         server_args: ServerArgs,

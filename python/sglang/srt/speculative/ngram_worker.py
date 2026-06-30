@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 import torch
@@ -373,8 +373,13 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        layer_pipeline_hook: Optional[Callable] = None,
     ) -> GenerationBatchResult:
+        # NGram speculation does not participate in layer-pipelined KV
+        # transfer; the kwarg is accepted only to keep a uniform worker API.
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
         bs = len(batch.reqs)

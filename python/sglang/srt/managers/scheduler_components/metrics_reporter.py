@@ -143,6 +143,8 @@ class SchedulerMetricsReporter:
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
+        self.kv_transfer_layer_group_chunks_delta: int = 0
+        self.kv_transfer_layer_group_ms_samples: List[float] = []
 
         self.enable_mfu_metrics = False
 
@@ -510,6 +512,16 @@ class SchedulerMetricsReporter:
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
 
+    def _clear_transient_metric_deltas(self) -> None:
+        self.stats.kv_transfer_layer_group_chunks_delta = 0
+        self.stats.kv_transfer_layer_group_ms_samples = []
+
+    def _log_stats_and_clear_transient_deltas(self) -> None:
+        try:
+            self.metrics_collector.log_stats(self.stats)
+        finally:
+            self._clear_transient_metric_deltas()
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -646,6 +658,25 @@ class SchedulerMetricsReporter:
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
+                bootstrap_queue = getattr(
+                    self.scheduler, "disagg_prefill_bootstrap_queue", None
+                )
+                kv_mgr = (
+                    getattr(bootstrap_queue, "kv_manager", None)
+                    if bootstrap_queue is not None
+                    else None
+                )
+                # Gate on layer_pipeline_enabled (not method presence) so a
+                # backend that defines the method but doesn't run LP doesn't
+                # export zero-valued metrics that pollute Prometheus.
+                if kv_mgr is not None and getattr(
+                    kv_mgr, "layer_pipeline_enabled", False
+                ):
+                    pop_lp_metrics = kv_mgr.pop_layer_pipeline_metrics
+                    (
+                        self.stats.kv_transfer_layer_group_chunks_delta,
+                        self.stats.kv_transfer_layer_group_ms_samples,
+                    ) = pop_lp_metrics()
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
@@ -659,7 +690,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
-            self.metrics_collector.log_stats(self.stats)
+            self._log_stats_and_clear_transient_deltas()
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
@@ -877,7 +908,7 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
-            self.metrics_collector.log_stats(self.stats)
+            self._log_stats_and_clear_transient_deltas()
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
@@ -1085,4 +1116,4 @@ class SchedulerMetricsReporter:
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
-        self.metrics_collector.log_stats(self.stats)
+        self._log_stats_and_clear_transient_deltas()
