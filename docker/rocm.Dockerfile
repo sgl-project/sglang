@@ -676,6 +676,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   apt-get update && apt-get install -y --no-install-recommends \
       build-essential autoconf automake libtool pkg-config git \
       libibverbs-dev librdmacm-dev rdma-core && rm -rf /var/lib/apt/lists/*; \
+  apt-get remove -y libabsl-dev libabsl20220623 || true; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
   cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
