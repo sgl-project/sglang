@@ -23,4 +23,5 @@ __all__ = [
     "ModelSlimW4A4Int4MoE",
     "ModelSlimW4A8Int8MoE",
     "ModelSlimW8A8Int8MoE",
+    "ModelSlimW8A8Mxfp8MoE",
 ]
