@@ -5,7 +5,7 @@ import torch
 from sglang.multimodal_gen.runtime.models.encoders.qwen3 import Qwen3ForCausalLM
 
 
-class CaptureLayer(torch.nn.Module):
+class _CaptureLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.position_ids = None
@@ -19,20 +19,20 @@ class CaptureLayer(torch.nn.Module):
         return hidden_states, residual
 
 
-class IdentityNorm(torch.nn.Module):
+class _IdentityNorm(torch.nn.Module):
     def forward(self, hidden_states, residual):
         if residual is not None:
             hidden_states = hidden_states + residual
         return hidden_states, None
 
 
-def test_default_position_ids_match_batch_size():
+def test_default_position_ids_batch_shape():
     model = Qwen3ForCausalLM.__new__(Qwen3ForCausalLM)
     torch.nn.Module.__init__(model)
-    layer = CaptureLayer()
+    layer = _CaptureLayer()
     model.config = SimpleNamespace(output_hidden_states=False)
     model.layers = torch.nn.ModuleList([layer])
-    model.norm = IdentityNorm()
+    model.norm = _IdentityNorm()
 
     def get_input_embeddings(input_ids):
         return torch.zeros(input_ids.shape[0], input_ids.shape[1], 8)
