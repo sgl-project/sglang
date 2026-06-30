@@ -261,10 +261,9 @@ class DeepseekV2WeightLoaderMixin:
                         if self.fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            # Clone: `loaded_weight` may be a view into an IPC
-                            # bucket that gets reused by the next chunk, and
-                            # the RunAI streamer also relies on cloning.
-                            cached_a_proj[name] = loaded_weight.detach().clone()
+                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                                loaded_weight
+                            )
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
