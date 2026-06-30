@@ -1156,8 +1156,9 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
 
 
 class TestGrpcServerArgs(CustomTestCase):
-    """Native gRPC is env-gated (SGLANG_ENABLE_GRPC) and runs alongside HTTP;
-    --smg-grpc (and the deprecated --grpc-mode) select the legacy SMG server.
+    """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
+    alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
+    legacy SMG server. Worker-threads / max-prefill-tokens are env-only knobs.
 
     The gRPC setup lives in ServerArgs._handle_deprecated_args, which
     __post_init__ skips for dummy models, so these tests build a dummy
@@ -1172,53 +1173,64 @@ class TestGrpcServerArgs(CustomTestCase):
     def test_defaults_native_grpc_off_legacy_off(self):
         sa = self._args()
         sa._handle_deprecated_args()
-        self.assertFalse(sa.enable_grpc)
-        self.assertFalse(sa.smg_grpc)
+        self.assertIsNone(sa.grpc_port)  # native off
+        self.assertFalse(sa.smg_grpc_mode)
 
-    def test_grpc_port_derived_from_http_port(self):
+    def test_http_only_high_port_does_not_derive_grpc_port(self):
+        # JustinTong0323: HTTP-only launches must not derive port + 10000 (out of
+        # range for a high --port) — gRPC is off, so grpc_port stays None.
+        sa = self._args(port=56000)
+        sa._handle_deprecated_args()
+        self.assertIsNone(sa.grpc_port)
+
+    def test_grpc_port_enables_native_and_env_knobs(self):
+        sa = self._args(grpc_port=50051)
+        with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
+            sa._handle_deprecated_args()
+        self.assertEqual(sa.grpc_port, 50051)
+        self.assertEqual(sa.grpc_worker_threads, 8)
+
+    def test_env_grpc_port_enables_native(self):
         sa = self._args(port=30000)
+        with envs.SGLANG_GRPC_PORT.override(45000):
+            sa._handle_deprecated_args()
+        self.assertEqual(sa.grpc_port, 45000)
+
+    def test_legacy_smg_derives_grpc_port_from_http_port(self):
+        sa = self._args(port=30000, smg_grpc_mode=True)
         sa._handle_deprecated_args()
         self.assertEqual(sa.grpc_port, 40000)
 
-    def test_grpc_mode_is_deprecated_alias_for_smg(self):
+    def test_grpc_mode_is_deprecated_alias_for_smg_grpc_mode(self):
         sa = self._args(grpc_mode=True)
         with self.assertWarns(DeprecationWarning):
             sa._handle_deprecated_args()
-        self.assertTrue(sa.smg_grpc)
+        self.assertTrue(sa.smg_grpc_mode)
 
-    def test_env_enables_native_grpc_and_knobs(self):
-        sa = self._args(port=30000)
-        with envs.SGLANG_ENABLE_GRPC.override(True):
-            with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
-                sa._handle_deprecated_args()
-        self.assertTrue(sa.enable_grpc)
-        self.assertEqual(sa.grpc_worker_threads, 8)
-        self.assertEqual(sa.grpc_port, 40000)
-
-    def test_native_grpc_rejects_legacy_smg(self):
-        sa = self._args(smg_grpc=True)
-        with envs.SGLANG_ENABLE_GRPC.override(True):
-            with self.assertRaises(ValueError):
-                sa._handle_deprecated_args()
+    def test_legacy_smg_takes_precedence_over_grpc_port(self):
+        # --smg-grpc-mode wins: grpc_port is the SMG port (not a native request),
+        # so the native-only validations do not fire. Keeping this non-erroring
+        # makes __post_init__ idempotent under the Ray path's replace() re-run.
+        sa = self._args(grpc_port=50051, smg_grpc_mode=True)
+        sa._handle_deprecated_args()
+        self.assertTrue(sa.smg_grpc_mode)
+        self.assertEqual(sa.grpc_port, 50051)
 
     def test_native_grpc_rejects_multi_tokenizer(self):
-        sa = self._args(tokenizer_worker_num=2)
-        with envs.SGLANG_ENABLE_GRPC.override(True):
-            with self.assertRaises(ValueError):
-                sa._handle_deprecated_args()
+        sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
+        with self.assertRaises(ValueError):
+            sa._handle_deprecated_args()
 
     def test_native_grpc_rejects_http_auth(self):
-        sa = self._args(api_key="secret")
-        with envs.SGLANG_ENABLE_GRPC.override(True):
-            with self.assertRaises(ValueError):
-                sa._handle_deprecated_args()
+        sa = self._args(grpc_port=40000, api_key="secret")
+        with self.assertRaises(ValueError):
+            sa._handle_deprecated_args()
 
     def test_invalid_grpc_worker_threads_rejected(self):
-        sa = self._args()
-        with envs.SGLANG_ENABLE_GRPC.override(True):
-            with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
-                with self.assertRaises(ValueError):
-                    sa._handle_deprecated_args()
+        sa = self._args(grpc_port=40000)
+        with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
+            with self.assertRaises(ValueError):
+                sa._handle_deprecated_args()
 
 
 if __name__ == "__main__":

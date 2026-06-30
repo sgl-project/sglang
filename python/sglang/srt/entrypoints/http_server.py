@@ -368,12 +368,13 @@ async def lifespan(fast_api_app: FastAPI):
         )
         logger.info("Warmup ended")
 
-    # Start the native gRPC server alongside HTTP when enabled (env-gated via
-    # SGLANG_ENABLE_GRPC). Only the single-tokenizer process is gRPC-capable;
+    # Start the native gRPC server alongside HTTP when enabled (via --grpc-port
+    # or SGLANG_GRPC_PORT). Only the single-tokenizer process is gRPC-capable;
     # __post_init__ already rejects --tokenizer-worker-num > 1 with native gRPC.
     if (
         getattr(fast_api_app, "is_single_tokenizer_mode", False)
-        and server_args.enable_grpc
+        and server_args.grpc_port is not None
+        and not (server_args.smg_grpc_mode or server_args.grpc_mode)
     ):
         grpc_handle = _start_native_grpc_server_for_runtime(
             server_args=server_args,
@@ -2480,9 +2481,9 @@ def _start_native_grpc_server_for_runtime(
     except ImportError as e:
         raise RuntimeError(
             "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
-            "but SGLANG_ENABLE_GRPC was set. The extension is built from "
+            "but --grpc-port was set. The extension is built from "
             "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
-            "install a wheel that includes the extension or unset SGLANG_ENABLE_GRPC."
+            "install a wheel that includes the extension or unset --grpc-port."
         ) from e
 
     runtime_handle = RuntimeHandle(

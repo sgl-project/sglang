@@ -528,13 +528,22 @@ class ServerArgs:
     host: A[str, "The host of the HTTP server."] = "127.0.0.1"
     port: A[int, "The port of the HTTP server."] = 30000
     fastapi_root_path: A[str, "App is behind a path based routing proxy."] = ""
-    grpc_mode: A[bool, "If set, use gRPC server instead of HTTP server."] = False
-    smg_grpc: A[
+    smg_grpc_mode: A[
         bool,
-        "Use the legacy SMG gRPC server. Replaces the deprecated --grpc-mode. "
-        "Distinct from the native gRPC server, which is env-gated via "
-        "SGLANG_ENABLE_GRPC and runs alongside HTTP.",
+        "Use the legacy SMG gRPC server (smg-grpc-servicer) instead of the HTTP "
+        "server. Replaces the deprecated --grpc-mode.",
     ] = False
+    grpc_mode: A[
+        bool,
+        "(Deprecated, use --smg-grpc-mode) Legacy SMG gRPC server selector.",
+    ] = False
+    grpc_port: A[
+        Optional[int],
+        "Port for the native gRPC server, started alongside HTTP. Setting this "
+        "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
+        "default. In legacy --smg-grpc-mode this is the SMG server port and "
+        "defaults to --port + 10000.",
+    ] = None
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
     warmups: A[
         Optional[str],
@@ -1034,9 +1043,12 @@ class ServerArgs:
     ] = None
     show_time_cost: A[bool, "Show time cost of custom marks."] = False
     enable_metrics: A[bool, "Enable log prometheus metrics."] = False
-    grpc_http_sidecar_port: A[
+    smg_http_sidecar_port: A[
         Optional[int],
-        "Port for the HTTP sidecar server in gRPC mode (--grpc-mode). Serves Prometheus metrics and profiling endpoints. Defaults to --port + 1. Not used in HTTP mode.",
+        Arg(
+            help="Port for the HTTP sidecar server in legacy SMG gRPC mode (--smg-grpc-mode). Serves Prometheus metrics and profiling endpoints. Defaults to --port + 1. Not used in HTTP mode.",
+            aliases=["--grpc-http-sidecar-port"],
+        ),
     ] = None
     enable_mfu_metrics: A[bool, "Enable estimated MFU-related prometheus metrics."] = (
         False
@@ -2749,70 +2761,81 @@ class ServerArgs:
                 )
                 setattr(self, attr, "dsv4")
 
-        # --grpc-mode is the legacy SMG gRPC server. It still works but is
-        # deprecated in favor of --smg-grpc; the native gRPC server is a
-        # separate, env-gated path (SGLANG_ENABLE_GRPC) handled below.
-        if self.grpc_mode and not self.smg_grpc:
+        # --grpc-mode is the deprecated alias for the legacy SMG gRPC server,
+        # now selected by --smg-grpc-mode. The native gRPC server is a separate
+        # path, enabled by --grpc-port (or SGLANG_GRPC_PORT), that runs
+        # alongside HTTP.
+        if self.grpc_mode and not self.smg_grpc_mode:
             import warnings
 
             warnings.warn(
                 "--grpc-mode is deprecated and will be removed in a future "
-                "version. Use --smg-grpc for the legacy SMG gRPC server. The "
-                "native gRPC server now starts automatically alongside HTTP.",
+                "version. Use --smg-grpc-mode for the legacy SMG gRPC server, "
+                "or --grpc-port for the native gRPC server.",
                 DeprecationWarning,
                 stacklevel=2,
             )
-            self.smg_grpc = True
+            self.smg_grpc_mode = True
 
-        # Native gRPC flags — env-only for now, not exposed as CLI args.
-        # Set as instance attributes (not dataclass fields) to avoid
-        # argparse namespace lookup in from_cli_args.
-        self.enable_grpc = envs.SGLANG_ENABLE_GRPC.get()
+        # Native gRPC tuning knobs stay env-only (internal). They are set as
+        # instance attributes (not dataclass fields) to avoid argparse namespace
+        # lookup in from_cli_args. grpc_port is the user-facing CLI flag that
+        # enables the native server; fall back to SGLANG_GRPC_PORT when unset.
         self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
         self.grpc_max_prefill_tokens = envs.SGLANG_GRPC_MAX_PREFILL_TOKENS.get()
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
-        self.grpc_port = (
-            grpc_port_env if grpc_port_env is not None else self.port + 10000
-        )
+        if self.grpc_port is None and grpc_port_env is not None:
+            self.grpc_port = grpc_port_env
 
-        if not (1 <= self.grpc_port <= 65535):
-            raise ValueError(
-                f"SGLANG_GRPC_PORT ({self.grpc_port}) must be between 1 and 65535"
-            )
-        if self.grpc_worker_threads < 1:
-            raise ValueError(
-                f"SGLANG_GRPC_WORKER_THREADS ({self.grpc_worker_threads}) must be >= 1"
-            )
+        legacy_grpc = self.smg_grpc_mode or self.grpc_mode
+        # Legacy SMG server: default its port to --port + 10000 when unset. Only
+        # derive a port when gRPC is actually in use, so HTTP-only launches on
+        # high ports (e.g. --port 56000) don't fail validation (JustinTong0323).
+        if legacy_grpc and self.grpc_port is None:
+            self.grpc_port = self.port + 10000
 
-        # The native gRPC server is incompatible with the legacy SMG server and
-        # with launch paths it does not wire into.
-        if self.enable_grpc:
-            if self.smg_grpc or self.grpc_mode:
+        # Validate grpc_port only when it is set (native: user-provided; legacy:
+        # derived above). HTTP-only launches leave it None and skip validation.
+        if self.grpc_port is not None:
+            if not (1 <= self.grpc_port <= 65535):
                 raise ValueError(
-                    "SGLANG_ENABLE_GRPC (native gRPC) is incompatible with the "
-                    "legacy --smg-grpc/--grpc-mode gRPC server. Pick one."
+                    "--grpc-port / SGLANG_GRPC_PORT "
+                    f"({self.grpc_port}) must be between 1 and 65535"
                 )
+            if self.grpc_worker_threads < 1:
+                raise ValueError(
+                    "SGLANG_GRPC_WORKER_THREADS "
+                    f"({self.grpc_worker_threads}) must be >= 1"
+                )
+
+        # The native gRPC server is enabled purely by --grpc-port and is
+        # incompatible with the legacy SMG server and with launch paths it does
+        # not wire into. Legacy --smg-grpc-mode takes precedence and uses
+        # grpc_port as the SMG port; this keeps __post_init__ idempotent under
+        # the Ray path's dataclasses.replace re-run (which re-sees the derived
+        # grpc_port).
+        native_grpc = self.grpc_port is not None and not legacy_grpc
+        if native_grpc:
             if self.use_ray:
                 raise ValueError(
-                    "SGLANG_ENABLE_GRPC is not supported with --use-ray: the Ray "
+                    "--grpc-port is not supported with --use-ray: the Ray "
                     "serve launch path does not start the native gRPC server."
                 )
             if self.encoder_only:
                 raise ValueError(
-                    "SGLANG_ENABLE_GRPC is not supported with --encoder-only: "
+                    "--grpc-port is not supported with --encoder-only: "
                     "encoder disaggregation uses its own server."
                 )
             if self.tokenizer_worker_num > 1:
                 raise ValueError(
                     "Native gRPC does not yet support --tokenizer-worker-num > 1. "
-                    "Unset SGLANG_ENABLE_GRPC or set --tokenizer-worker-num 1."
+                    "Unset --grpc-port or set --tokenizer-worker-num 1."
                 )
             if self.api_key or self.admin_api_key:
                 raise ValueError(
-                    "SGLANG_ENABLE_GRPC is incompatible with --api-key/"
-                    "--admin-api-key: the native gRPC listener bypasses HTTP auth "
-                    "middleware."
+                    "--grpc-port is incompatible with --api-key/--admin-api-key: "
+                    "the native gRPC listener bypasses HTTP auth middleware."
                 )
 
     def _handle_prefill_delayer_env_compat(self):
@@ -6854,12 +6877,12 @@ class ServerArgs:
             )
 
         if (
-            self.enable_grpc
-            and self.grpc_port is not None
+            self.grpc_port is not None
+            and not (self.smg_grpc_mode or self.grpc_mode)
             and self.grpc_port == self.port
         ):
             raise ValueError(
-                f"SGLANG_GRPC_PORT ({self.grpc_port}) must differ from --port ({self.port})"
+                f"--grpc-port ({self.grpc_port}) must differ from --port ({self.port})"
             )
 
         # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port

@@ -725,9 +725,11 @@ class Envs:
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
-    # Native gRPC server (internal, not yet user-facing)
+    # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
+    # --grpc-port CLI flag; setting either enables the native server alongside
+    # HTTP. The worker-threads / max-prefill-tokens knobs stay env-only (internal
+    # tuning, no CLI surface).
     SGLANG_GRPC_PORT = EnvInt(None)
-    SGLANG_ENABLE_GRPC = EnvBool(False)
     SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
     SGLANG_GRPC_MAX_PREFILL_TOKENS = EnvInt(None)
 
@@ -982,6 +984,10 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_GRPC",
+    "Please use '--grpc-port' to enable the native gRPC server.",
+)
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
     "Please use '--enable-prefill-delayer' instead.",
