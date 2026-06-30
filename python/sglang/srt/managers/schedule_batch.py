@@ -2008,12 +2008,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    def prepare_for_extend(self) -> None:
-        """Build extend tensors and allocate KV / req slots.
-
-        ``alloc_for_extend`` raises ``RuntimeError`` (fail-loud) if the pool
-        can't satisfy the batch — the scheduler's admission must not over-admit.
-        """
+    def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -2057,8 +2052,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory. ``alloc_for_extend`` raises ``RuntimeError`` if the
-        # pool is exhausted (fail-loud — the scheduler must not over-admit).
+        # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
@@ -2391,9 +2385,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
 
-    def prepare_for_split_prefill(self) -> None:
-        """Build extend tensors then switch to SPLIT_PREFILL mode.
-        ``prepare_for_extend`` raises ``RuntimeError`` if the pool is exhausted."""
+    def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL

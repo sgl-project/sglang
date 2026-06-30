@@ -283,20 +283,9 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        # Leak invariant balances against the STATIC per-side caps
-        # (`full_tokens_per_layer` / `swa_tokens_per_layer` below), so it must
-        # read the slot-CONSERVATION view, not the physical `full/swa_available_size()`
-        # (which is `min(conserve, schedulable)` and would over-count "used"
-        # under dynamic borrowing → spurious leak). The shared composite exposes
-        # `_conserve_*`; the non-shared allocator aliases them to the physical
-        # view (identical there). See multi_ended_allocator.py / swa.py.
-        full_available_size = (
-            self.token_to_kv_pool_allocator._conserve_full_available_size()
-        )
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = (
-            self.token_to_kv_pool_allocator._conserve_swa_available_size()
-        )
+        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
