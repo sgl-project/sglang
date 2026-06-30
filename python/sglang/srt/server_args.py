@@ -6324,6 +6324,13 @@ class ServerArgs:
             "--enable-shared-kv-pool is not yet compatible with speculative "
             "decoding."
         )
+        assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
+            "--enable-shared-kv-pool is not yet compatible with hierarchical / "
+            "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
+            "the shared-pool init wires up no host pools, and its device mamba / "
+            "full-attention slots are VIRTUAL — the host-offload path does not "
+            "translate them to physical."
+        )
         # Only monolithic decode cuda-graph capture is wired; piecewise prefill
         # capture is not. Guard when the user opts into it.
         _cg_cfg = self.cuda_graph_config
