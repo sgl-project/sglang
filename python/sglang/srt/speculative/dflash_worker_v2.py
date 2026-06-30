@@ -578,7 +578,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         lengths = lengths.to(torch.int64)
         if lengths.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
-        max_len = int(lengths.max().item())
+        # Bound the gather by the compact draft window plus a page of headroom
+        # instead of reading lengths.max() back to the host every step (a per-step
+        # GPU->CPU sync). The compact length page-aligns past the window, so it can
+        # reach window + page_size - 1; window + page_size is a safe upper bound and
+        # the mask below still drops per-request out-of-length columns.
+        if self.draft_window_size is not None:
+            max_len = int(self.draft_window_size) + int(self.page_size)
+        else:
+            max_len = int(lengths.max().item())
         if max_len <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
 
