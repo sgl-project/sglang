@@ -731,14 +731,15 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
+            # AMD gpu-only draft-extend does not keep prefix CPU mirrors; DSA only
+            # needs the fixed per-request extend lengths for this metadata path.
             assert (
-                forward_batch.extend_seq_lens_cpu is not None
-                and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_prefix_lens_cpu is not None
-            ), "All of them must not be None"
-
+                forward_batch.extend_seq_lens is not None
+            ), "extend_seq_lens must not be None"
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            assert forward_batch.extend_seq_lens is not None
+            if extend_seq_lens_cpu is None:
+                extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
+                forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
