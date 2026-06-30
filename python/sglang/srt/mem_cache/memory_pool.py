@@ -1160,6 +1160,12 @@ def unwrap_write_loc(loc_info):
 
 
 class KVCache(abc.ABC):
+    # Whether load_cpu_copy honors a ``start`` token offset (partial restore).
+    # Pools that set this True allow a retracted request to be resumed by reusing
+    # an on-device radix prefix and restoring only the [start, seqlen-1) suffix
+    # from its CPU copy. Pools that leave it False always do a full restore.
+    support_partial_cpu_restore: bool = False
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -1248,14 +1254,30 @@ class KVCache(abc.ABC):
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, start: int = 0):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
 
 
+def _restore_suffix_slice(chunk_indices, i, start):
+    """Slice a CPU-offload chunk to its [start, ...) suffix for partial restore.
+
+    For a chunk covering positions [i, i + len(chunk_indices)), return
+    ``(local, suffix_indices)`` for the part at or after ``start``, or ``None`` if
+    the whole chunk precedes ``start`` (caller skips it). See
+    ``KVCache.support_partial_cpu_restore``.
+    """
+    if i + len(chunk_indices) <= start:
+        return None
+    local = max(0, start - i)
+    return local, chunk_indices[local:]
+
+
 class MHATokenToKVPool(KVCache):
+    support_partial_cpu_restore = True
+
     def __init__(
         self,
         size: int,
@@ -1588,25 +1610,31 @@ class MHATokenToKVPool(KVCache):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, start: int = 0):
         assert not self.use_hnd, (
             "CPU KV offload indexes by slot (NHD); HND KV cache "
             "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
         )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
+        # Partial restore: skip [0, start), keep offload-time alignment.
+        # See KVCache.support_partial_cpu_restore.
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
+                sliced = _restore_suffix_slice(chunk_indices, i, start)
+                if sliced is None:
+                    continue
+                local, sub_indices = sliced
                 k_cpu, v_cpu = (
                     kv_cache_cpu[layer_id][i // chunk_size][0],
                     kv_cache_cpu[layer_id][i // chunk_size][1],
                 )
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
-                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
-                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
-                self.k_buffer[layer_id][chunk_indices] = k_chunk
-                self.v_buffer[layer_id][chunk_indices] = v_chunk
+                k_chunk = k_cpu[local:].to(self.k_buffer[0].device, non_blocking=True)
+                v_chunk = v_cpu[local:].to(self.v_buffer[0].device, non_blocking=True)
+                self.k_buffer[layer_id][sub_indices] = k_chunk
+                self.v_buffer[layer_id][sub_indices] = v_chunk
         current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
@@ -2186,6 +2214,10 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
     mis-indexing the strided views.
     """
 
+    # CPU offloading is unsupported here (get_cpu_copy / load_cpu_copy raise), so
+    # the partial-restore capability inherited from MHATokenToKVPool does not apply.
+    support_partial_cpu_restore = False
+
     def __init__(
         self,
         *args,
@@ -2557,6 +2589,8 @@ class HybridLinearKVPool(KVCache):
 
 
 class MLATokenToKVPool(KVCache):
+    support_partial_cpu_restore = True
+
     def __init__(
         self,
         size: int,
@@ -2802,16 +2836,23 @@ class MLATokenToKVPool(KVCache):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, start: int = 0):
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
+        # Partial restore: skip [0, start). See KVCache.support_partial_cpu_restore.
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
+                sliced = _restore_suffix_slice(chunk_indices, i, start)
+                if sliced is None:
+                    continue
+                local, sub_indices = sliced
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
                 assert kv_cpu.shape[0] == len(chunk_indices)
-                kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
-                self.kv_buffer[layer_id][chunk_indices] = kv_chunk
+                kv_chunk = kv_cpu[local:].to(
+                    self.kv_buffer[0].device, non_blocking=True
+                )
+                self.kv_buffer[layer_id][sub_indices] = kv_chunk
         current_platform.synchronize()
 
 
@@ -3155,11 +3196,21 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu_dict, indices, mamba_indices=None, start: int = 0
+    ):
+        # ``start`` must be page-aligned: the token-level super() restore and the
+        # page-indexed index_k loop below split at the page boundary, so a
+        # straddling start would restore the token half but skip its index_k page.
+        assert (
+            start % self.page_size == 0
+        ), f"partial CPU restore requires a page-aligned start ({start=}, page_size={self.page_size})"
         super().load_cpu_copy(
-            kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
+            kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices, start=start
         )
 
+        # index_k is page-indexed; skip whole pages < page_start.
+        page_start = start // self.page_size
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
         torch.cuda.synchronize()
@@ -3168,12 +3219,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for layer_id in range(self.layer_num):
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
+                sliced = _restore_suffix_slice(chunk_page_indices, i, page_start)
+                if sliced is None:
+                    continue
+                local, sub_page_indices = sliced
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(
+                idx_chunk = idx_cpu[local:].to(
                     self.index_k_with_scale_buffer[0].device, non_blocking=True
                 )
-                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
+                self.index_k_with_scale_buffer[layer_id][sub_page_indices] = idx_chunk
         torch.cuda.synchronize()
 
     def get_state_buf_infos(self):

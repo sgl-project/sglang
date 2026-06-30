@@ -435,5 +435,119 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(cache.protected_size(), 0)
 
 
+class TestRadixAwareResume(unittest.TestCase):
+    """resume_retracted_reqs should match/lock the radix prefix and partial-restore.
+
+    Verifies the control-flow contract of the radix-aware resume path:
+    a retracted request re-matches the tree, reuses its on-device prefix via
+    _pre_alloc(total_prefix_len == prefix_len), restores only the [prefix_len, ...)
+    suffix from the CPU copy (load_kv_cache(start=prefix_len)), and keeps lock_ref
+    balanced by dec_lock_ref'ing on the no-fit early exit.
+    """
+
+    PREFIX_LEN = 3
+
+    def _make_queue(self, *, radix_enabled=True, supports_partial=True):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1 << 20
+
+        queue.token_to_kv_pool_allocator = MagicMock()
+        queue.token_to_kv_pool_allocator.support_partial_cpu_restore = supports_partial
+
+        scheduler = MagicMock()
+        scheduler.server_args.disaggregation_decode_enable_radix_cache = radix_enabled
+        scheduler.enable_hisparse = False
+        queue.scheduler = scheduler
+
+        queue.tree_cache = MagicMock()
+        queue._pre_alloc = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._prealloc_required_tokens = MagicMock(return_value=(10, 0))
+        queue._required_alloc_tokens = MagicMock(return_value=10)
+
+        prefix_indices = torch.arange(self.PREFIX_LEN, dtype=torch.int64)
+        last_node = object()
+        prefix_match = DecodePrefixMatch(
+            prefix_indices=prefix_indices,
+            l2_host_hit_length=0,
+            l3_storage_hit_length=0,
+            last_device_node=last_node,
+        )
+
+        def _match_and_lock(req):
+            req.last_node = last_node  # match_prefix_for_req sets this in real code
+            return prefix_match
+
+        queue._match_prefix_and_lock = MagicMock(side_effect=_match_and_lock)
+        return queue, prefix_indices, last_node
+
+    def _make_req(self):
+        req = MagicMock()
+        req.rid = "req-1"
+        req.origin_input_ids = list(range(5))
+        req.output_ids = [99]
+        req.last_node = None
+        req.cache_protected_len = 0
+        return req
+
+    def test_resume_matches_locks_and_partial_restores(self):
+        queue, prefix_indices, _ = self._make_queue()
+        queue._allocatable_token_budgets = MagicMock(return_value=1 << 20)  # fits
+
+        req = self._make_req()
+        queue.retracted_queue = [req]
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [req])
+        queue._match_prefix_and_lock.assert_called_once_with(req)
+        queue._pre_alloc.assert_called_once_with(
+            req, prefix_indices, self.PREFIX_LEN, self.PREFIX_LEN
+        )
+        self.assertEqual(req.cache_protected_len, self.PREFIX_LEN)
+        req.load_kv_cache.assert_called_once_with(
+            queue.req_to_token_pool,
+            queue.token_to_kv_pool_allocator,
+            start=self.PREFIX_LEN,
+        )
+        # Fit path must not release the lock.
+        queue.tree_cache.dec_lock_ref.assert_not_called()
+
+    def test_resume_releases_lock_when_request_does_not_fit(self):
+        queue, _, last_node = self._make_queue()
+        queue._allocatable_token_budgets = MagicMock(return_value=1)  # too small
+
+        req = self._make_req()
+        queue.retracted_queue = [req]
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [])
+        # Lock taken by _match_prefix_and_lock must be released before bailing.
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(last_node)
+        queue._pre_alloc.assert_not_called()
+
+    def test_resume_falls_back_to_full_restore_without_partial_support(self):
+        # Radix enabled but pool can't partial-restore -> legacy full restore path.
+        queue, _, _ = self._make_queue(supports_partial=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=1 << 20)
+
+        req = self._make_req()
+        queue.retracted_queue = [req]
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [req])
+        queue._match_prefix_and_lock.assert_not_called()
+        queue._pre_alloc.assert_called_once_with(req)
+        req.load_kv_cache.assert_called_once_with(
+            queue.req_to_token_pool, queue.token_to_kv_pool_allocator
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
