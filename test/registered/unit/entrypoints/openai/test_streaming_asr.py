@@ -2,11 +2,11 @@
 
 Drives the shared ``process_asr_chunk`` entry point with a mocked
 ``TokenizerManager`` (same style as ``test_serving_transcription`` /
-``test_serving_embedding``) across the real scenarios: the cumulative (M1) and
-sliced (M2) inference paths, word-level output dedupe, the no-overlap and
-empty-response edges, last-chunk finalize, and word reconciliation -- plus the
-``RealtimeConnection`` guard that decides whether slicing turns on and the
-rolling PCM compaction invariants for sliced realtime ASR.
+``test_serving_embedding``) across the real scenarios: the cumulative and
+sliced inference paths, word-level output dedupe, the no-overlap and
+empty-response edges, last-chunk finalize, word reconciliation, the
+``RealtimeConnection`` guard that decides whether slicing turns on, and rolling
+PCM compaction invariants for sliced realtime ASR.
 """
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -118,7 +118,7 @@ class TestProcessAsrChunk(CustomTestCase):
         return tm, out
 
     def test_cumulative_path_injects_prefix_and_skips_dedupe(self):
-        # prompt=None -> prompt_template + get_prefix_text(), no dedupe (M1).
+        # prompt=None -> prompt_template + get_prefix_text(), no dedupe.
         state = self._state()
         state.emitted_text = "hello"
         state.chunk_index = 5  # past unfixed_chunk_num, so the prefix is live
@@ -128,7 +128,7 @@ class TestProcessAsrChunk(CustomTestCase):
 
     def test_slicing_path_uses_bare_prompt_and_dedupes(self):
         # Bare prompt (no prefix injection); dedupe trims the word that overlaps
-        # the committed tail (M2).
+        # the committed tail.
         state = self._state()
         tm, _ = self._chunk(
             state, "beta gamma", prompt="PROMPT:", dedupe_against="alpha beta"
