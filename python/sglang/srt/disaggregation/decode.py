@@ -596,10 +596,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
         if getattr(req, "pd_rebootstrap_in_progress", False):
-            # Rebootstrap recomputes the full committed sequence (prompt + every
-            # emitted token, including the forced boundary token), so allocate
-            # len(origin)+len(output) with no -1, unlike normal decode where the
-            # last token's KV has not been written yet.
+            # pause_generation(retract) already popped the boundary token out of
+            # output_ids (it is replayed via the decode-side override at commit
+            # time), so output_ids here is prompt + emitted-tokens-minus-boundary,
+            # i.e. the original seqlen - 1. The prefill recomputes KV for *all* of
+            # these tokens, leaving no just-sampled "pending" token in the list, so
+            # we allocate exactly len(origin)+len(output_ids) with no -1 (unlike
+            # normal decode, where the last token's KV has not been written yet).
+            # This is the same token count as offloading-based retraction, where
+            # offload_kv_cache saves seqlen-1 tokens; the boundary token's KV is
+            # (re)computed on the decode side once generation resumes.
             return len(req.origin_input_ids) + len(req.output_ids)
         return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
 
