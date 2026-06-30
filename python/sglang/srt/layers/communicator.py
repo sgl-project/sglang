@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_sm90_supported,
@@ -91,14 +92,18 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter:
-    from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
-    from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
-
     from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+
+    if _is_gfx1250_supported:
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    else:
+        from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
+        from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -128,6 +133,22 @@ def _fused_rmsnorm_fp8_per_token_quant(
         If residual is None:  (out_fp8, scale)
         If residual provided: ((out_fp8, scale), residual_out)
     """
+    if _is_gfx1250_supported:
+        # per-token quant == group quant with group_size == hidden size, giving
+        # an (M, 1) scale.
+        N = hidden_states.shape[-1]
+        (out_fp8, scale), _out1, _out2, residual_out = fused_rms_fp8_group_quant(
+            hidden_states,
+            weight,
+            epsilon,
+            group_size=N,
+            dtype_quant=_aiter_fp8_dtype,
+            res1=residual,
+        )
+        if residual is not None:
+            return (out_fp8, scale), residual_out
+        return (out_fp8, scale)
+
     M, N = hidden_states.shape
     out_fp8 = torch.empty((M, N), dtype=_aiter_fp8_dtype, device=hidden_states.device)
     scale = torch.empty(M, dtype=torch.float32, device=hidden_states.device)

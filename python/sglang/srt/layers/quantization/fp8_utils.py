@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_sm90_supported,
@@ -62,9 +63,15 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
+# CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
+# pure-triton block-fp8 path on gfx1250.
+_use_aiter = (
+    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
+)
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
@@ -930,19 +937,29 @@ def triton_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-    input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[0]]
+    if input_scale is not None:
+        # Pre-quantized input: ``input`` is already fp8 and ``input_scale`` is
+        # its per-group scale (row-major (M, cdiv(K, 128))). Produced on HIP by
+        # fused act/rmsnorm+quant ops (e.g. fused_clamp_act_mul) that feed the
+        # GEMM directly. Skip re-quantization and emit bf16.
+        q_input = input.view(-1, input.shape[-1])
+        x_scale = input_scale
+        output_dtype = torch.bfloat16
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+    else:
+        input_2d = input.view(-1, input.shape[-1])
+        output_dtype = input_2d.dtype
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=False
+        )
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
-    )
     output = w8a8_block_fp8_matmul_triton(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
+        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
     if bias is not None:
         output += bias
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 @lru_cache(maxsize=1)

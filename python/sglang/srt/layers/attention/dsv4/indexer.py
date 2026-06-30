@@ -691,7 +691,15 @@ class C4IndexerBackendMixin:
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
-        if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
+        _use_torch_fn = (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
+        )
+        if (
+            _c4sl.dim() == 1
+            and not _use_tilelang
+            and not _use_aiter
+            and not _use_torch_fn
+        ):
             _c4sl = _c4sl.unsqueeze(-1)
         nonpaged_plan = self._get_nonpaged_indexer_plan(
             c4_indexer=c4_indexer,

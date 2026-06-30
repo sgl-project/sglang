@@ -9,6 +9,7 @@ from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils.common import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,49 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
     return hc_split_sinkhorn_kernel_
 
 
+def _hc_split_sinkhorn_torch(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+):
+    """Pure-torch equivalent of hc_split_sinkhorn_kernel.
+
+    TileLang's CK-backed buffer addressing does not compile on gfx1250, so the
+    sinkhorn kernel is reimplemented here. Layout mirrors the kernel exactly:
+    the flattened ``mixes`` row holds ``pre`` (hc), ``post`` (hc) and the
+    ``comb`` matrix (hc * hc) consecutively.
+    """
+    b, s, _ = mixes.size()
+    hc = hc_mult
+    flat = mixes.reshape(-1, (2 + hc) * hc).float()
+    scale = hc_scale.float()
+    base = hc_base.float()
+
+    pre = torch.sigmoid(flat[:, :hc] * scale[0] + base[:hc]) + eps
+    post = 2 * torch.sigmoid(flat[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
+
+    comb = flat[:, 2 * hc :] * scale[2] + base[2 * hc :]
+    comb = comb.reshape(-1, hc, hc)
+
+    # Initial row softmax (numerically stabilized) then column normalize.
+    row_max = comb.amax(dim=2, keepdim=True)
+    comb = torch.exp(comb - row_max)
+    comb = comb / comb.sum(dim=2, keepdim=True) + eps
+    comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
+
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=2, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=1, keepdim=True) + eps)
+
+    pre = pre.reshape(b, s, hc).to(mixes.dtype)
+    post = post.reshape(b, s, hc).to(mixes.dtype)
+    comb = comb.reshape(b, s, hc, hc).to(mixes.dtype)
+    return pre, post, comb
+
+
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -140,6 +184,10 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
+    if is_gfx1250_supported():
+        return _hc_split_sinkhorn_torch(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
     b, s, _ = mixes.size()
     pre = mixes.new_empty(b, s, hc_mult)
     post = mixes.new_empty(b, s, hc_mult)

@@ -87,6 +87,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -116,6 +117,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 
 def _require_fp4_dtype():
@@ -129,6 +131,7 @@ def _require_fp4_dtype():
 
 if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import (
+        moe_shuffle_scale,
         shuffle_scale,
         shuffle_weight,
     )
@@ -1318,8 +1321,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scale = getattr(layer, scale_name)
                 num_experts, num_rows, _ = scale.shape
                 is_w13_scale = scale_name == "w13_weight_scale_inv"
-                scale_2d = scale.reshape(-1, scale.shape[-1])
-                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
+                if _is_gfx1250_supported:
+                    scale.data = moe_shuffle_scale(
+                        scale.contiguous(), experts_cnt=num_experts
+                    )
+                else:
+                    scale_2d = scale.reshape(-1, scale.shape[-1])
+                    scale.data = shuffle_scale(
+                        scale_2d, num_experts, gu_intv, is_w13_scale
+                    )
 
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
