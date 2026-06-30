@@ -335,9 +335,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The sequence length
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool.
-    # With the unified memory pool enabled these are *virtual* per-token slot ids;
-    # the pools translate them to physical slots on write (set_kv_buffer) and the
-    # attention backends translate the gathered KV indices on read.
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int

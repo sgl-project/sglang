@@ -35,9 +35,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        # Only the shared/unified KV pool's virtual->physical translate emits -1
-        # (freed-slot tombstones), so the state-scatter kernel only needs its
-        # freed-slot guard there; compiled out for the static pool.
         self.enable_unified_memory_pool = model_runner.enable_unified_memory_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []

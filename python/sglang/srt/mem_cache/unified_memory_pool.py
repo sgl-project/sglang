@@ -1191,8 +1191,10 @@ def init_unified_mamba_pools(
     # `translate` lives ONLY here, and callers resolve virtual->physical before
     # touching the pool — the scheduler/backend/radix/compaction paths via
     # `req_to_token_pool.translate_mamba_indices` (which delegates to this
-    # allocator), and the HiCache offload path via the HybridLinearKVPool's
-    # `_mamba_translate` hook wired below.
+    # allocator). The `_mamba_translate` hook wired below feeds the HiCache
+    # offload (`get_cpu_copy`) path, which is currently GATED OFF for the unified
+    # memory pool (ServerArgs._handle_unified_memory_pool asserts no
+    # hierarchical/lmcache), so the hook is wired for completeness but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
 

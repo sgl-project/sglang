@@ -775,10 +775,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             size, stream_idx=stream_idx
         )
-        # The virtual out_cache_loc graph buffer (built in capture_prepare and
-        # carried on the dummy FB). run_once's unified-memory-pool write-path translate
-        # closes over it; capture_prepare keeps it as a local, so surface it here.
-        out_cache_loc = forward_batch.out_cache_loc
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
