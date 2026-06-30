@@ -125,7 +125,7 @@ def test_dispatch_probability_matches_torch_reference():
 def test_solve_ipm_matches_torch_reference():
     """The fused CUDA IPM kernel and the pure-torch reference should agree to
     a small tolerance on a *real* LPLB LP. They are NOT bit-equivalent — the
-    kernel factors the KKT system with a hand-written block Cholesky while the
+    kernel factors/solves the KKT system with cuSolverDx POSV while the
     reference uses torch.linalg.solve (LU) — so we compare with allclose and
     print the max abs difference (the numerical-difference number the review
     asked about).
