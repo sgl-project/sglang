@@ -16,6 +16,7 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.model_loader.pin_h2d_copy import pin_h2d_copy_during_load
 
 logger = logging.getLogger(__name__)
 
