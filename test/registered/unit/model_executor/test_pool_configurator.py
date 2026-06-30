@@ -532,6 +532,46 @@ class TestEagleConfigurator(unittest.TestCase):
         self.assertLessEqual(used, available)
 
 
+class TestHybridSWAEagleConfigurator(unittest.TestCase):
+    """Hybrid SWA + EAGLE/STANDALONE: draft KV cache must be budgeted too,
+    mirroring TestEagleConfigurator for the Default path."""
+
+    def _budget_holds(self, full_layers, swa_layers, eagle_draft_num_layers):
+        available = 10_000_000
+        mr = _make_model_runner(
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(full_layers)),
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            swa_full_tokens_ratio=1.0,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.eagle_draft_num_layers = eagle_draft_num_layers
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+
+        # Target pool usage plus the draft worker's own pool (sized over the
+        # same token budget, modeled as eagle_draft_num_layers extra layers at
+        # the target's per-layer cost) must fit in the budget.
+        target_used = _actual_memory_used(mr, config)
+        total_layers = full_layers + swa_layers
+        total_used = target_used * (1 + eagle_draft_num_layers / total_layers)
+        self.assertLessEqual(total_used, available)
+
+    def test_hybrid_does_not_exceed_budget(self):
+        self._budget_holds(full_layers=16, swa_layers=16, eagle_draft_num_layers=4)
+
+    def test_all_swa_does_not_exceed_budget(self):
+        self._budget_holds(full_layers=0, swa_layers=32, eagle_draft_num_layers=4)
+
+
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(is_hybrid_swa=False)

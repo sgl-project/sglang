@@ -329,6 +329,26 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * self._swa_layers_num
             )
 
+        # EAGLE/STANDALONE: scale cell_size to account for the draft model KV
+        # cache, mirroring DefaultPoolConfigurator. The draft worker allocates
+        # its own KV pool sized by the target's max_total_num_tokens, so the
+        # target profile must reserve for it or the draft pool overruns the
+        # budget. Approximates the draft's per-layer KV with the target's
+        # blended (full + swa) per-token cost, matching the Default/DSV4 path.
+        if (
+            mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
+        ) and not mr.is_draft_worker:
+            eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
+            total_layers = self._full_layers_num + self._swa_layers_num
+            if (
+                eagle_draft_num_layers is not None
+                and int(eagle_draft_num_layers) > 0
+                and total_layers > 0
+            ):
+                self._cell_size = int(
+                    self._cell_size * (1 + int(eagle_draft_num_layers) / total_layers)
+                )
+
     def _solve_pool_sizes(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
