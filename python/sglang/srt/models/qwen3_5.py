@@ -128,6 +128,11 @@ _qknorm_use_alt_stream = _is_cuda or (
 )
 _is_amx_available = cpu_has_amx_support()
 
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+        split_qkvgate_gemma_rmsnorm_rope,
+    )
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -581,6 +586,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
+        seq_len = hidden_states.shape[0]
         if (
             self.alt_stream is not None
             and get_is_capture_mode()
