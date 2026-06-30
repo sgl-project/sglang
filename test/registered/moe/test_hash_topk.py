@@ -27,7 +27,18 @@ def _set_dummy_server_args():
 
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     monkeypatch.setattr(
-        hash_topk_module, "uses_per_rank_fused_shared_slots", lambda *_args: True
+        hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
+    )
+    recorded = {}
+
+    class FakeRecorder:
+        def on_select_experts(self, *, topk_ids):
+            recorded["topk_ids"] = topk_ids.clone()
+
+    monkeypatch.setattr(
+        hash_topk_module,
+        "get_global_expert_distribution_recorder",
+        lambda: FakeRecorder(),
     )
 
     topk = HashTopK(
@@ -70,11 +81,12 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     # shared slot: [0..63, shared, 64..127, shared, ...].
     assert output.topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(output.topk_weights[:, -1], torch.full((2,), 0.4))
+    assert recorded["topk_ids"].tolist() == [[0, 65], [63, 127]]
 
 
 def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     monkeypatch.setattr(
-        hash_topk_module, "uses_per_rank_fused_shared_slots", lambda *_args: True
+        hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
     )
 
     topk = HashTopK(
