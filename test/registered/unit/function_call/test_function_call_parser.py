@@ -2334,6 +2334,34 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(params["unit"], "celsius")
         self.assertEqual(params["days"], 3)
 
+    def test_parameter_end_tag_variants(self):
+        """
+        Test malformed parameter end markers emitted by qwen3_coder structural tags.
+        """
+        cases = [
+            "</parameter/>",
+            "</parameter1>",
+            "</parameter",
+            "</parameter_function>",
+            "</parameterfunction>",
+        ]
+
+        for end_tag in cases:
+            with self.subTest(end_tag=end_tag):
+                text = f"""<tool_call>
+<function=get_current_weather>
+<parameter=location>
+上海
+{end_tag}
+</function>
+</tool_call>"""
+                result = self.detector.detect_and_parse(text, self.tools)
+
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "get_current_weather")
+                params = json.loads(result.calls[0].parameters)
+                self.assertEqual(params["location"], "上海")
+
     def test_single_tool_call_with_text_prefix(self):
         """
         Test parsing of tool call with preceding text.
@@ -2424,6 +2452,32 @@ class TestQwen3CoderDetector(unittest.TestCase):
             params = json.loads(collected_params)
             self.assertEqual(params["location"], "Boston")
             self.assertEqual(params["unit"], "celsius")
+
+    def test_streaming_self_closing_parameter_end(self):
+        """
+        Test streaming parsing when the parameter end marker is </parameter/>.
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=get_current_weather>",
+            "<parameter=location>",
+            "上海\n",
+            "</parameter/>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        params = json.loads(collected_params)
+        self.assertEqual(params["location"], "上海")
 
     def test_streaming_with_text_and_tool(self):
         """

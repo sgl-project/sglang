@@ -26,6 +26,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.function_end_token: str = "</function>"
         self.parameter_prefix: str = "<parameter="
         self.parameter_end_token: str = "</parameter>"
+        self.parameter_end_prefix: str = "</parameter"
+        self.parameter_end_regex = re.compile(r"</parameter[^<>]*>?")
 
         # Regex for non-streaming fallback
         self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
@@ -33,7 +35,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            r"<parameter=(.*?)(?:</parameter\d*/?>|(?=<parameter=)|(?=</function>)|$)",
             re.DOTALL,
         )
 
@@ -56,6 +58,20 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
+
+    def _strip_parameter_end_tokens(self, value: str) -> str:
+        """Remove leaked parameter end tags from the end of a parsed value."""
+        while True:
+            stripped = value.rstrip()
+            match = self.parameter_end_regex.search(stripped)
+            if match and match.end() == len(stripped):
+                value = stripped[: match.start()].rstrip()
+                continue
+            malformed_match = re.search(r"</parameter[^<>]*$", stripped)
+            if malformed_match:
+                value = stripped[: malformed_match.start()].rstrip()
+                continue
+            return value
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -211,6 +227,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             p_val = p_val[1:]
                         if p_val.endswith("\n"):
                             p_val = p_val[:-1]
+                        p_val = self._strip_parameter_end_tokens(p_val)
 
                         parsed_params[p_name] = self._convert_param_value(
                             p_val, p_name, param_config, func_name
@@ -310,14 +327,14 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     # 2. [Abnormal] Encounter next <parameter=
                     # 3. [Abnormal] Encounter </function>
                     # So we need to find the smallest one as the parameter end position.
-                    cand_end_param = rest_of_slice.find(self.parameter_end_token)
                     cand_next_param = rest_of_slice.find(self.parameter_prefix)
                     cand_end_func = rest_of_slice.find(self.function_end_token)
 
                     candidates = []
-                    if cand_end_param != -1:
+                    end_match = self.parameter_end_regex.search(rest_of_slice)
+                    if end_match is not None:
                         candidates.append(
-                            (cand_end_param, len(self.parameter_end_token))
+                            (end_match.start(), end_match.end() - end_match.start())
                         )
                     if cand_next_param != -1:
                         candidates.append((cand_next_param, 0))
@@ -339,6 +356,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             raw_value = raw_value[1:]
                         if raw_value.endswith("\n"):
                             raw_value = raw_value[:-1]
+                        raw_value = self._strip_parameter_end_tokens(raw_value)
 
                         # JSON Construction
                         if not self.json_started:
@@ -431,7 +449,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.tool_call_prefix,
                     self.function_end_token,
                     self.parameter_prefix,
-                    self.parameter_end_token,
+                    self.parameter_end_prefix,
                 ]
 
                 is_potential_tag = False
