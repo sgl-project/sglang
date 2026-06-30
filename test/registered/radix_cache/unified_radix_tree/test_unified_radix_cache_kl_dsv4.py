@@ -112,7 +112,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
 class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
     TestUnifiedDeepSeekV4FlashHiCache
 ):
-    """DeepSeek V4 Flash HiCache layout smoke: page_first_direct + direct."""
+    """DeepSeek V4 Flash HiCache layout check: page_first_direct + direct."""
 
     hicache_io_backend = "kernel"
     hicache_mem_layout = "layer_first"
