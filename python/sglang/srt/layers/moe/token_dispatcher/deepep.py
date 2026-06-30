@@ -184,12 +184,21 @@ class DeepEPBuffer:
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
-            hidden_bytes = hidden_size * param_bytes
-            for config in (
-                DeepEPConfig.get_instance().normal_dispatch_config
-                or Buffer.get_dispatch_config(group.size()),
-                DeepEPConfig.get_instance().normal_combine_config
-                or Buffer.get_combine_config(group.size()),
+            dispatch_hidden_bytes = hidden_size * param_bytes
+            # combine() receives BF16 expert outputs regardless of dispatch dtype,
+            # so the combine NVL buffer must be sized for 2 bytes per element.
+            combine_hidden_bytes = hidden_size * 2
+            for config, hidden_bytes in (
+                (
+                    DeepEPConfig.get_instance().normal_dispatch_config
+                    or Buffer.get_dispatch_config(group.size()),
+                    dispatch_hidden_bytes,
+                ),
+                (
+                    DeepEPConfig.get_instance().normal_combine_config
+                    or Buffer.get_combine_config(group.size()),
+                    combine_hidden_bytes,
+                ),
             ):
                 num_nvl_bytes = max(
                     config.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
@@ -352,7 +361,21 @@ class _DeepEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
-        self.params_bytes = 2
+        self.handle = None
+        self.quant_config: Optional[dict] = None
+        self.overlap_args: Optional[CombineOverlapArgs] = None
+        self.meta_overlap_args: Optional[dict] = None
+
+        self.set_deepep_dispatcher_dtype()
+        # Set params_bytes based on the actual dispatch dtype so buffer size
+        # calculations are correct. FP8/INT8/NVFP4 use 1 byte, BF16 uses 2.
+        _dtype_to_bytes = {
+            DeepEPOutputDtype.BF16: 2,
+            DeepEPOutputDtype.FP8: 1,
+            DeepEPOutputDtype.INT8: 1,
+            DeepEPOutputDtype.NVFP4: 1,
+        }
+        self.params_bytes = _dtype_to_bytes.get(self.deepep_output_dtype, 2)
         # A large value will lead to large memory occupation, thus users should change it accordingly
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
@@ -360,15 +383,6 @@ class _DeepEPDispatcherImplBase:
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
-
-        self.handle = None
-
-        self.quant_config: Optional[dict] = None
-
-        self.overlap_args: Optional[CombineOverlapArgs] = None
-        self.meta_overlap_args: Optional[dict] = None
-
-        self.set_deepep_dispatcher_dtype()
 
     def dispatch_a(
         self,
