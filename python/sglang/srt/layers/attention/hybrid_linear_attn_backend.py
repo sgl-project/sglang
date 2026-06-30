@@ -313,20 +313,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
+            mamba_track_indices=forward_batch.mamba_track_indices,
         )
-        # OPEN-6 FIX: translate the radix prefix-cache mamba TRACK destination
-        # (`mamba_track_indices`) virtual→physical on the cg_on replay path, IN
-        # PLACE on the captured registry slot. The eager `_forward_metadata`
-        # translates it (L133-138); this replay path must too, else the captured
-        # decode track-save (`conv_states[mamba_track_indices] = …`) writes to the
-        # wrong/untranslated slot. Identity (and same-tensor → no copy) for the
-        # non-shared pool, and skipped at capture.
-        if not in_capture:
-            _mt = forward_batch.mamba_track_indices
-            if _mt is not None and _mt.numel() > 0:
-                _phys = self._translate_mamba_indices(_mt)
-                if _phys is not _mt:
-                    _mt.copy_(_phys)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
@@ -663,6 +651,7 @@ class MambaAttnBackendBase(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
         in_capture: bool = False,
+        mamba_track_indices: Optional[torch.Tensor] = None,
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -681,6 +670,21 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_indices = self._translate_mamba_indices(mamba_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        # Shared pool, cg_on replay-prep: rewrite the captured radix-prefix-cache
+        # track destination (`mamba_track_indices`) virtual->physical IN PLACE
+        # against the live v2p, so the captured decode track-save
+        # (`conv_states[mamba_track_indices] = …`) writes the right physical slot.
+        # Only the shared pool needs this (its translate returns a fresh physical
+        # tensor; the static pool's track indices are already physical), and only
+        # at replay (capture runs on dummy slots).
+        if (
+            not in_capture
+            and self.enable_shared_kv_pool
+            and mamba_track_indices is not None
+        ):
+            mamba_track_indices.copy_(
+                self._translate_mamba_indices(mamba_track_indices)
+            )
         # GDN ReplaySSM (slice 1b): refresh the STATIC per-row write cursor the
         # kernel reads, mirroring the eager snapshot-then-advance in
         # _forward_metadata but writing in-place into the captured per-bs buffer
@@ -924,24 +928,8 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
+            mamba_track_indices=forward_batch.mamba_track_indices,
         )
-        # OPEN-6 FIX: translate the Mamba prefix-cache track DESTINATION
-        # (`mamba_track_indices`) virtual->physical on the cg_on replay path, IN
-        # PLACE on the captured registry slot. The eager `_forward_metadata`
-        # translates it (L133-138) but THIS override (the path Falcon-H1 actually
-        # runs) did not — so the captured decode track-save
-        # (`conv_states[mamba_track_indices]`, hybrid_linear_attn_backend.py:947 →
-        # mamba_state_scatter_triton) indexed conv with VIRTUAL ids → wrong
-        # physical slot (NaN) / freed-slot sentinel (OOB). Mirrors the working
-        # index staged by `_replay_metadata` above. Identity (and same-tensor →
-        # no copy) for the non-shared pool, and skipped at capture. The freed-slot
-        # -1 result is now skipped by the kernel's pad_slot_id guard.
-        if not in_capture:
-            _mt = forward_batch.mamba_track_indices
-            if _mt is not None and _mt.numel() > 0:
-                _phys = self._translate_mamba_indices(_mt)
-                if _phys is not _mt:
-                    _mt.copy_(_phys)
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
