@@ -101,10 +101,20 @@ def test_gptq_gemm_output_zero_init(M, N, K):
         b_q_weight, b_gptq_qzeros, b_gptq_scales, K, N, group_size
     )
 
-    # Repeat: the race is nondeterministic, so several trials make it reliable
+    # fp32 ground truth: matmul over the (fp16-representable) dequantized weights.
+    # Compared with an fp16-appropriate tolerance -- outputs here are O(100) and
+    # accumulate over K up to 4096, so a tight fp16-noise-floor tolerance (e.g.
+    # 4e-2) false-fails on a correct kernel. A missing zero-init, on the other
+    # hand, leaks the poisoned allocator bytes into the output and blows the
+    # error up by orders of magnitude (well past any sane tolerance), so this
+    # still catches the bug it is meant to guard.
+    rtol, atol = 2e-2, 1.0
+
+    # Repeat: the cross-block atomicAdd ordering is nondeterministic, so several
+    # trials make a missing zero-init reliable to surface
     for _ in range(20):
         a = torch.randn(M, K, dtype=dtype, device=device)
-        c_ref = torch.matmul(a, b_dequant)
+        c_ref = torch.matmul(a.float(), b_dequant.float())
 
         _poison_allocator(device, dtype, M * N)
         c_out = gptq_gemm(
@@ -112,7 +122,7 @@ def test_gptq_gemm_output_zero_init(M, N, K):
         )
 
         assert not torch.isnan(c_out).any(), "gptq_gemm produced NaNs"
-        torch.testing.assert_close(c_ref, c_out, rtol=4e-2, atol=4e-2)
+        torch.testing.assert_close(c_out.float(), c_ref, rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":
