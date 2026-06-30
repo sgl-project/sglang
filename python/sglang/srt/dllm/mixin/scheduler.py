@@ -223,16 +223,7 @@ class SchedulerDllmMixin:
             self.spec_algorithm,
             dllm_config=self.dllm_config,
         )
-        if not new_batch.prepare_for_extend():
-            # The DLLM scheduler doesn't have the same admission-retry
-            # plumbing as the main scheduler. Preserve crash semantics
-            # here (matches the pre-refactor behavior where the deep
-            # per-req `HybridReqToTokenPool.alloc` would assert).
-            raise RuntimeError(
-                "DLLM prepare_for_extend: planner refused the batch "
-                "(out of mamba slots or shared-pool byte budget). The "
-                "main scheduler has retry logic; DLLM does not yet."
-            )
+        new_batch.prepare_for_extend()
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 
