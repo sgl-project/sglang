@@ -94,7 +94,7 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
+def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
@@ -112,7 +112,7 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 
 
 def forward_mega_moe(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
@@ -149,7 +149,7 @@ def forward_mega_moe(
 
 
 def _run_mega_routed(
-    moe: "DeepseekV2MoE",
+    moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],

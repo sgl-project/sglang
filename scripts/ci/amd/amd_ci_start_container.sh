@@ -54,6 +54,10 @@ while [[ $# -gt 0 ]]; do
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
+      echo ""
+      echo "Environment:"
+      echo "  ENABLE_CACHE_HOST=1|0"
+      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 0."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -173,11 +177,17 @@ find_latest_image() {
     fi
   done
 
-  # If still not found, try finding any image matching ROCm+arch from remote registry
-  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  # Docker Hub's `name=` filter is fuzzy; only accept official version tags.
+  echo "Exact version not found. Searching remote registry for versioned ${ROCM_VERSION}-${gpu_arch} images…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
+    local sgl_tag_regex="^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-${target_date}$"
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
+      if [[ "${tag}" =~ ${sgl_tag_regex} ]]; then
+        echo "${tag}"
+        break
+      fi
+    done || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
@@ -185,9 +195,14 @@ find_latest_image() {
     fi
   done
 
-  echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
+  echo "No recent images found. Searching cached local versioned images matching ROCm+arch…" >&2
   local any_local
-  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
+    local tag="${image#rocm/sgl-dev:}"
+    if [[ "${tag}" =~ ^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-[0-9]{8}$ ]]; then
+      echo "${image}"
+    fi
+  done | sort -r | head -n 1)
   if [[ -n "$any_local" ]]; then
       echo "Using cached fallback image: ${any_local}" >&2
       echo "${any_local}"
@@ -272,13 +287,27 @@ else
   fi
 fi
 
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/temp-sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
+CACHE_HOST=/home/runner/sglang-data
+ENABLE_CACHE_HOST="${ENABLE_CACHE_HOST:-0}"
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ ! -d "$CACHE_HOST" ]]; then
+      echo "Error: ENABLE_CACHE_HOST=1 but ${CACHE_HOST} does not exist." >&2
+      exit 1
+    fi
     CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-else
+    echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    ;;
+  0|false|no|off|"")
     CACHE_VOLUME=""
-fi
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
@@ -299,6 +328,12 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang mkdir -p \
+  /sgl-data/hf-cache/hub \
+  /sgl-data/pip-cache \
+  /sgl-data/miopen-cache \
+  /sgl-data/aiter-kernels
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so

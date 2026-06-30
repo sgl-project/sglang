@@ -6,7 +6,6 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -144,13 +143,16 @@ class CommonKVManager(BaseKVManager):
         )
 
         # bind zmq socket
-        context = zmq.Context()
+        self._zmq_ctx = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
-            context, zmq.PULL, host=self.local_ip
+            self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        self._socket_cache: Dict[str, zmq.Socket] = {}
+        self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -392,11 +394,12 @@ class CommonKVManager(BaseKVManager):
         else:
             # Single-node case: bootstrap server's host is the same as http server's host
             host = self.bootstrap_host
-            # If the server was bound to the wildcard address (0.0.0.0 / ::), use the
-            # actual local IP instead — a PUT to http://0.0.0.0:<port>/route is rejected
-            # with 403 by aiohttp ≥3.9 because 0.0.0.0 is not a valid HTTP Host value.
-            if host in ("0.0.0.0", "::"):
-                host = self.local_ip
+            # A wildcard bind address (0.0.0.0 / ::) is not a valid HTTP Host
+            # and can't be connected to; rewrite it to the same-family loopback,
+            # which the wildcard listener also binds.  (self.local_ip is wrong
+            # here — it can resolve to a different family than the listener,
+            # e.g. IPv6 while the server is bound to 0.0.0.0.)
+            host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
@@ -446,13 +449,44 @@ class CommonKVManager(BaseKVManager):
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
 
-    @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
-        if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
+        with self._socket_lock:
+            sock = self._socket_cache.get(endpoint)
+            if sock is not None:
+                monitor = self._monitor_cache.get(endpoint)
+                disconnected = False
+                if monitor is not None:
+                    try:
+                        monitor.recv_multipart(zmq.NOBLOCK)
+                        disconnected = True
+                    except zmq.Again:
+                        pass
+                    except zmq.ZMQError:
+                        disconnected = True
+                if not disconnected:
+                    return sock
+                sock.close(linger=0)
+                if monitor is not None:
+                    monitor.close()
+                self._socket_cache.pop(endpoint, None)
+                self._monitor_cache.pop(endpoint, None)
+
+            sock = self._zmq_ctx.socket(zmq.PUSH)
+            if is_ipv6:
+                sock.setsockopt(zmq.IPV6, 1)
+            sock.setsockopt(zmq.RECONNECT_IVL, -1)
+            sock.setsockopt(zmq.SNDTIMEO, 30000)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 30)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 5)
+            sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
+            sock.connect(endpoint)
+            self._socket_cache[endpoint] = sock
+            self._monitor_cache[endpoint] = sock.get_monitor_socket(
+                zmq.EVENT_DISCONNECTED
+            )
+            return sock
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -677,6 +711,15 @@ class CommonKVManager(BaseKVManager):
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
+            # Collect TCP endpoints from cached bootstrap_infos before deletion
+            stale_endpoints = set()
+            for k in keys_to_remove:
+                for info in self.connection_pool[k]:
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        na = NetworkAddress(ip, int(port))
+                        stale_endpoints.add(na.to_tcp())
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
@@ -685,6 +728,9 @@ class CommonKVManager(BaseKVManager):
                 failed_bootstrap_addr, []
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
 
         affected_rooms = []
         for room in possible_affected_rooms:
@@ -822,6 +868,7 @@ class CommonKVSender(BaseKVSender):
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
+                total_pages=self.num_kv_indices,
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
@@ -1044,10 +1091,25 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
+                sock.setsockopt(zmq.RECONNECT_IVL, -1)
+                sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
+
+    @classmethod
+    def disconnect_endpoint(cls, endpoint: str):
+        with cls._global_lock:
+            sock = cls._socket_cache.pop(endpoint, None)
+            lock = cls._socket_locks.pop(endpoint, None)
+        if sock:
+            if lock:
+                with lock:
+                    sock.close()
+            else:
+                sock.close()
+            logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):

@@ -257,7 +257,7 @@ def prepare_mlp_sync_batch_raw(
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
-    tp_group: "GroupCoordinator"
+    tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache

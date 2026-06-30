@@ -145,7 +145,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         # Register the fused func at runner construction so the FusedOpPool
         # lookup at `MoeRunner.__init__` finds it.
-        import sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4  # noqa: F401
+        import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
@@ -215,10 +215,10 @@ class Mxfp4FlashinferCutlassMoEMethod:
     def apply(
         self,
         layer: Module,
-        dispatch_output: "DispatchOutput",
-    ) -> "CombineInput":
-        from sglang.srt.layers.moe.moe_runner.flashinfer_mxfp4 import (
-            FlashInferMxfp4CutlassMoeQuantInfo,
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            FlashInferCutlassMxfp4MoeQuantInfo,
         )
 
         # DSv4 always feeds StandardDispatchOutput; the fused func tolerates
@@ -227,7 +227,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        quant_info = FlashInferMxfp4CutlassMoeQuantInfo(
+        quant_info = FlashInferCutlassMxfp4MoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale_inv,

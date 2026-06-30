@@ -1,41 +1,51 @@
+"""Benchmark JIT custom all-reduce (v2) vs NCCL, AOT custom-AR (v1), and
+FlashInfer trtllm allreduce_fusion.
+
+Usage::
+
+    # Benchmark on every supported world size (2..8 GPUs):
+    python benchmark/bench_custom_all_reduce.py
+    # Pick a specific world size (or comma-separated list):
+    python benchmark/bench_custom_all_reduce.py --num-gpu 4
+    python benchmark/bench_custom_all_reduce.py --num-gpu 2,4,8
+
+The script self-relaunches under ``torchrun --nproc_per_node=N`` for each N in
+``num_gpus``; results are printed on rank 0 of every run.
 """
-Benchmark JIT custom all-reduce (v2) vs NCCL vs AOT custom all-reduce (v1).
 
-Usage (torchrun required for multi-GPU):
-    torchrun --nproc_per_node=2 bench_custom_all_reduce.py
-    torchrun --nproc_per_node=4 bench_custom_all_reduce.py --dtype float16
-    torchrun --nproc_per_node=8 bench_custom_all_reduce.py --warmup 10 --iters 100
+from __future__ import annotations
 
-The script initializes all three backends, then benchmarks each over a sweep
-of message sizes.  Results are printed as a comparison table on rank 0.
-"""
-
-import argparse
+import atexit
 import contextlib
-import gc
 import logging
 import os
-from math import isnan
-from typing import Dict, List, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+import sglang.srt.distributed.parallel_state as ps
+from sglang.jit_kernel.benchmark import marker
+from sglang.jit_kernel.benchmark.utils import get_benchmark_range, multigpu_bench_main
+from sglang.jit_kernel.mp import register_comm_cleanup
+from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=120,
-    suite="base-b-kernel-benchmark-1-gpu-large",
+    stage="base-b-kernel-benchmark",
+    runner_config="1-gpu-large",
     disabled="requires multi-GPU, self-skips in CI",
 )
 
-DTYPE_MAP = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-}
 
+# ---------------------------------------------------------------------------
+# Sweep parameters
+# ---------------------------------------------------------------------------
+
+DTYPE = torch.bfloat16
+# torch.dtype.itemsize exists only on newer torch; element_size() is portable.
+DTYPE_ITEMSIZE = torch.tensor([], dtype=DTYPE).element_size()
 MESSAGE_SIZES_BYTES = [
     4 * 1024,  # 4K
     16 * 1024,  # 16K
@@ -50,29 +60,65 @@ MESSAGE_SIZES_BYTES = [
     7 * 128 * 1024,  # 896K
     1 * 1024 * 1024,  # 1M
     2 * 1024 * 1024,  # 2M
-    3 * 1024 * 1024,  # 2M
+    3 * 1024 * 1024,  # 3M
     4 * 1024 * 1024,  # 4M
     8 * 1024 * 1024,  # 8M
     16 * 1024 * 1024,  # 16M
     32 * 1024 * 1024,  # 32M
 ]
+WORLD_SIZES = list(range(2, 9))
+MAX_BYTES = max(MESSAGE_SIZES_BYTES)
+# trtllm allreduce_fusion only supports these world sizes.
+FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
+# AOT custom_all_reduce (v1) only supports these world sizes.
+AOT_SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
+PROVIDERS = ["nccl", "aot", "jit", "fi"]
+WORLD_SIZES = get_benchmark_range(WORLD_SIZES, [2, 4, 8])
+
+# ---------------------------------------------------------------------------
+# Per-rank distributed init (run once per torchrun worker)
+# ---------------------------------------------------------------------------
+
+
+@cache_once
+def _init_cpu_group() -> dist.ProcessGroup:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="gloo")
+    ps._WORLD = coord = ps.init_world_group(
+        ranks=list(range(world_size)),
+        local_rank=local_rank,
+        backend="nccl",
+    )
+    atexit.register(dist.destroy_process_group)
+    # Quieter benchmark output.
+    logging.disable(logging.INFO)
+    torch.cuda.set_stream(torch.cuda.Stream())
+    return coord.cpu_group
+
+
+@cache_once
+def _init_nccl_group() -> dist.ProcessGroup:
+    _init_cpu_group()
+    coord = ps._WORLD
+    assert coord is not None and coord.device_group is not None
+    return coord.device_group
 
 
 # ---------------------------------------------------------------------------
-# Backend wrappers - each exposes a uniform interface:
-#   .name          - display name
-#   .capture()     - context manager for CUDA-graph recording
-#   .all_reduce()  - perform an all-reduce and return the result tensor
+# Backend wrappers - each exposes:
+#   .all_reduce(tensor) -> Tensor
+#   .graph_context()    -> context manager wrapping cuda-graph capture
+#                          (nullcontext when capture is not required)
 # ---------------------------------------------------------------------------
 
 
 class NCCLAllReduceBackend:
-    name = "NCCL"
+    def __init__(self) -> None:
+        self.group = _init_nccl_group()
 
-    def __init__(self, group: dist.ProcessGroup):
-        self.group = group
-
-    def capture(self, register_input: bool):
+    def graph_context(self):
         return contextlib.nullcontext()
 
     def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -80,42 +126,42 @@ class NCCLAllReduceBackend:
         return tensor
 
 
-class AOTAllReduceBackend:
-    name = "AOT"
-
-    def __init__(self, group: dist.ProcessGroup, device: torch.device):
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
+class JITAllReduceBackend:
+    def __init__(self) -> None:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
         )
 
-        max_size = max(MESSAGE_SIZES_BYTES)
-        self.comm = CustomAllreduce(group, device, max_size=max_size)
+        device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+        self.comm = CustomAllReduceV2(
+            _init_cpu_group(), device, max_pull_size=MAX_BYTES
+        )
         if self.comm.disabled:
-            raise RuntimeError("AOT CustomAllreduce is disabled on this system")
+            raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+        register_comm_cleanup(self.comm)
 
-    def capture(self, register_input: bool):
-        return self.comm.capture()  # ignore register_input since v1 always requires it
+    def graph_context(self):
+        return self.comm.capture()
 
     def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
         assert self.comm.should_custom_ar(tensor), str(tensor.shape)
         return self.comm.custom_all_reduce(tensor)
 
 
-class JITAllReduceBackend:
-    name = "JIT"
-
-    def __init__(self, group: dist.ProcessGroup, device: torch.device):
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
+class AOTAllReduceBackend:
+    def __init__(self) -> None:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
         )
 
-        max_size = max(MESSAGE_SIZES_BYTES)
-        self.comm = CustomAllReduceV2(group, device, max_pull_size=max_size)
+        device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+        self.comm = CustomAllreduce(_init_cpu_group(), device, max_size=MAX_BYTES)
         if self.comm.disabled:
-            raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
+            raise RuntimeError("AOT CustomAllreduce is disabled on this system")
+        register_comm_cleanup(self.comm)
 
-    def capture(self, register_input: bool):
-        return self.comm.capture() if register_input else contextlib.nullcontext()
+    def graph_context(self):
+        return self.comm.capture()
 
     def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
         assert self.comm.should_custom_ar(tensor), str(tensor.shape)
@@ -123,262 +169,127 @@ class JITAllReduceBackend:
 
 
 class FlashInferAllReduceBackend:
-    name = "FI"
-
-    def __init__(self, group: dist.ProcessGroup, dtype: torch.dtype):
+    def __init__(self) -> None:
         import flashinfer.comm as comm
 
-        rank = torch.distributed.get_rank(group=group)
-        world_size = torch.distributed.get_world_size(group=group)
-        max_size = max(MESSAGE_SIZES_BYTES)
-        hidden_dim = min(MESSAGE_SIZES_BYTES) // 2
-        num_tokens = max_size // hidden_dim
-        self.comm = comm
-        self.hidden_dim = hidden_dim
-        self.workspace = comm.create_allreduce_fusion_workspace(
+        group = _init_cpu_group()
+        rank = dist.get_rank(group=group)
+        world_size = dist.get_world_size(group=group)
+        # Use the smallest message size as the inner hidden dim, so any
+        # message in the sweep is an integer multiple of it.
+        hidden_dim = min(MESSAGE_SIZES_BYTES) // DTYPE_ITEMSIZE
+        num_tokens = MAX_BYTES // (hidden_dim * DTYPE_ITEMSIZE)
+        self._comm = comm
+        self._hidden_dim = hidden_dim
+        self._workspace = comm.create_allreduce_fusion_workspace(
             backend="trtllm",
             world_size=world_size,
             rank=rank,
             max_token_num=num_tokens,
             hidden_dim=hidden_dim,
-            dtype=dtype,
+            dtype=DTYPE,
         )
 
-    def capture(self, *_):
+    def graph_context(self):
         return contextlib.nullcontext()
 
-    def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
-        return self.comm.allreduce_fusion(
-            input=tensor.view(-1, self.hidden_dim),
-            workspace=self.workspace,
-            pattern=self.comm.AllReduceFusionPattern.kAllReduce,
-            launch_with_pdl=True,
+    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self._comm.allreduce_fusion(
+            input=tensor.view(-1, self._hidden_dim),
+            workspace=self._workspace,
+            pattern=self._comm.AllReduceFusionPattern.kAllReduce,
+            launch_with_pdl=is_arch_support_pdl(),
             fp32_acc=True,
         )
 
 
-# ---------------------------------------------------------------------------
-# Benchmarking helpers
-# ---------------------------------------------------------------------------
+@cache_once
+def _init_nccl_backend() -> NCCLAllReduceBackend:
+    return NCCLAllReduceBackend()
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--dtype", choices=DTYPE_MAP.keys(), default="bfloat16")
-    p.add_argument("--warmup", type=int, default=5)
-    p.add_argument("--iters", type=int, default=50)
-    p.add_argument("--no-inplace", dest="register_input", action="store_false")
-    return p.parse_args()
+@cache_once
+def _init_jit_backend() -> JITAllReduceBackend:
+    return JITAllReduceBackend()
 
 
-@torch.inference_mode()
-def bench_one(
-    backend,
-    inp: torch.Tensor,
-    warmup: int,
-    iters: int,
-    group: dist.ProcessGroup,
-    register_input: bool,
-) -> float:
+@cache_once
+def _init_aot_backend() -> AOTAllReduceBackend:
+    return AOTAllReduceBackend()
+
+
+@cache_once
+def _init_fi_backend() -> FlashInferAllReduceBackend:
+    return FlashInferAllReduceBackend()
+
+
+BACKEND_FACTORY = {
+    "nccl": _init_nccl_backend,
+    "jit": _init_jit_backend,
+    "aot": _init_aot_backend,
+    "fi": _init_fi_backend,
+}
+
+
+@cache_once
+def _init_all_backends() -> None:
+    """Pre-build every supported backend before any timed iteration so JIT
+    compilation / IPC setup don't bleed into the first measured size.
     """
-    Run *warmup* iterations of all-reduce first.
-    Return the average time for *iters* iterations of all-reduce.
-    """
-    dist.barrier(group=group)
-    for _ in range(warmup):
-        backend.all_reduce(inp)
-    torch.cuda.synchronize()
-
-    # Capture a CUDA graph with *iters* all-reduce calls.
-    inp_batch = torch.stack([inp] * 4)
-    graph = torch.cuda.CUDAGraph()
-    with backend.capture(register_input):
-        with torch.cuda.graph(graph):
-            for i in range(iters):
-                backend.all_reduce(inp_batch[i % 4])
-
-    torch.cuda.synchronize()
-    # Warm up the graph once.
-    graph.replay()
-
-    # Timed replay.
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    dist.barrier(group=group)
-    graph.replay()  # make the stream busy
-    start.record()
-    graph.replay()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
-
-
-def bench_sweep(
-    backend,
-    sizes_bytes: List[int],
-    dtype: torch.dtype,
-    device: torch.device,
-    warmup: int,
-    iters: int,
-    group: dist.ProcessGroup,
-    register_input: bool,
-) -> Dict[int, float]:
-    """Benchmark one backend over all message sizes."""
-    elem_size = torch.tensor([], dtype=dtype).element_size()
-    results: Dict[int, float] = {}
-    for sz in sizes_bytes:
-        numel = sz // elem_size
-        inp = torch.zeros(numel, dtype=dtype, device=device)
-        try:
-            elapsed_ms = bench_one(backend, inp, warmup, iters, group, register_input)
-            results[sz] = elapsed_ms * 1000  # convert to us per iter
-        except AssertionError:
-            results[sz] = float("nan")
-    return results
+    world_size = dist.get_world_size(_init_cpu_group())
+    factories = dict(BACKEND_FACTORY)
+    if world_size not in AOT_SUPPORTED_WORLD_SIZES:
+        factories.pop("aot")
+    if world_size not in FI_SUPPORTED_WORLD_SIZES:
+        factories.pop("fi")
+    for fn in factories.values():
+        fn()
 
 
 # ---------------------------------------------------------------------------
-# Result printing
+# Benchmark
 # ---------------------------------------------------------------------------
 
 
-def print_results(
-    backends: list,
-    all_results: Dict[str, Dict[int, float]],
-    sizes_bytes: List[int],
-) -> None:
-    """Print a comparison table on rank 0."""
-
-    def human_bytes(n: int) -> str:
-        for suffix, unit in [("M", 1 << 20), ("K", 1 << 10)]:
-            if n >= unit and n % unit == 0:
-                return f"{n // unit}{suffix}"
-        return f"{n}B"
-
-    def fmt_us(v: float) -> str:
-        return f"{v:13.1f}" if not isnan(v) else "     n/a"
-
-    names = [b.name for b in backends]
-    nccl_name = "NCCL"
-
-    # Header
-    header_cols = [f"{n:>13}" for n in names]
-    speedup_cols = [f"{n:>13}/NCCL" for n in names if n != nccl_name]
-    header = f"{'Size':>8}  " + "  ".join(header_cols)
-    for sc in speedup_cols:
-        header += f"  {sc}"
-    header += "  "
-    print()
-    print(header)
-    print("-" * len(header))
-
-    # Rows
-    for sz in sizes_bytes:
-        row = f"{human_bytes(sz):>8}"
-        nccl_lat = all_results[nccl_name][sz]
-        for n in names:
-            row += f"  {fmt_us(all_results[n][sz])}"
-        for n in names:
-            if n == nccl_name:
-                continue
-            lat = all_results[n][sz]
-            if not isnan(lat):
-                row += f"  {nccl_lat / lat:17.2f}x"
-            else:
-                row += f"  {'n/a':>17}"
-        print(row)
-
-
-# ---------------------------------------------------------------------------
-# Distributed setup
-# ---------------------------------------------------------------------------
-
-
-def init_distributed():
-    """Initialize distributed groups using torchrun env vars.
-
-    Returns (rank, world_size, device, cpu_group, nccl_group).
-    """
-    import sglang.srt.distributed.parallel_state as ps
-
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = local_rank
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    torch.cuda.set_stream(torch.cuda.Stream())  # use a non-default stream
-
-    torch.distributed.init_process_group(backend="gloo")
-    ps._WORLD = coord = ps.init_world_group(
-        ranks=list(range(world_size)),
-        local_rank=local_rank,
-        backend="nccl",
+@marker.parametrize("message_bytes", MESSAGE_SIZES_BYTES)
+@marker.benchmark("provider", PROVIDERS)
+def benchmark(message_bytes: int, provider: str):
+    cpu_group = _init_cpu_group()
+    gpu_group = _init_nccl_group()
+    world_size = dist.get_world_size(cpu_group)
+    if provider == "fi" and world_size not in FI_SUPPORTED_WORLD_SIZES:
+        marker.skip(
+            f"flashinfer trtllm allreduce_fusion needs world_size in "
+            f"{FI_SUPPORTED_WORLD_SIZES}"
+        )
+    if provider == "aot" and world_size not in AOT_SUPPORTED_WORLD_SIZES:
+        marker.skip(
+            f"AOT custom_all_reduce needs world_size in " f"{AOT_SUPPORTED_WORLD_SIZES}"
+        )
+    _init_all_backends()
+    backend = BACKEND_FACTORY[provider]()
+    numel = message_bytes // DTYPE_ITEMSIZE
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    x = torch.randn(numel, dtype=DTYPE, device=device)
+    # Bandwidth-equivalent bytes moved by a ring all-reduce per rank.
+    effective_bytes = int(x.nbytes * 2 * (world_size - 1) / world_size)
+    return marker.do_bench(
+        backend.all_reduce,
+        input_args=(x,),
+        graph_context_fn=backend.graph_context,
+        sync_multigpu_fn=lambda: dist.barrier(gpu_group),
+        # all-reduce is in-place w.r.t. its argument; explicit footprint
+        # captures the cross-GPU traffic instead.
+        memory_args=None,
+        memory_output=None,
+        extra_memory_footprint=effective_bytes,
     )
 
-    cpu_group = coord.cpu_group
-    nccl_group = coord.device_group
-    assert nccl_group is not None
-    return rank, world_size, device, cpu_group, nccl_group
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main():
-    logging.basicConfig(level=logging.WARNING)
-    args = parse_args()
-    dtype = DTYPE_MAP[args.dtype]
-
-    rank, world_size, device, cpu_group, nccl_group = init_distributed()
-
-    # Instantiate backends.
-    backends = [
-        NCCLAllReduceBackend(nccl_group),
-        JITAllReduceBackend(cpu_group, device),
-    ]
-    if world_size in [2, 4, 6, 8]:
-        backends.insert(1, AOTAllReduceBackend(cpu_group, device))
-    if world_size in [2, 4, 8]:
-        backends.append(FlashInferAllReduceBackend(cpu_group, dtype))
-
-    # Run benchmarks.
-    all_results: Dict[str, Dict[int, float]] = {}
-    torch.cuda.synchronize()
-    for backend in backends:
-        if rank == 0:
-            print(f"Benchmarking {backend.name} ...")
-        all_results[backend.name] = bench_sweep(
-            backend,
-            MESSAGE_SIZES_BYTES,
-            dtype,
-            device,
-            args.warmup,
-            args.iters,
-            cpu_group,
-            args.register_input,
-        )
-
-    # Aggregate across ranks (use max to reflect the slowest rank).
-    for name in list(all_results):
-        for sz in MESSAGE_SIZES_BYTES:
-            val = all_results[name].get(sz)
-            if val is None:
-                continue
-            t = torch.tensor([val], dtype=torch.float64, device=device)
-            dist.all_reduce(t, op=dist.ReduceOp.MAX, group=nccl_group)
-            all_results[name][sz] = t.item()
-
-    # Print results on rank 0.
-    if rank == 0:
-        print_results(backends, all_results, MESSAGE_SIZES_BYTES)
-
-    del backends, all_results
-    gc.collect()
-    dist.destroy_process_group()
-
-
-if __name__ == "__main__" and not is_in_ci():
-    main()
+if __name__ == "__main__":
+    multigpu_bench_main(
+        name=__name__,
+        file=__file__,
+        num_gpus=WORLD_SIZES,
+        main_fn=benchmark.run,
+    )

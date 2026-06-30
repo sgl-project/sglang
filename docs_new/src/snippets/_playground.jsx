@@ -13,6 +13,8 @@
 //   pdDisagg     — role + transfer backend + IB device + optional router
 //   hicache     — enable + backend + write policy
 //   hisparse    — enable + host ratio (decode-only)
+//   flagSelects — generic: a config-declared LIST of single-selects, each with
+//                 its own title + strip-prefixes + options (no per-feature code)
 //
 // Adding an axis = one entry in AXIS_HANDLERS below; nothing else switches on
 // an axis id. Each handler implements initState / revertHidden / apply /
@@ -915,6 +917,107 @@ export const Playground = ({ config }) => {
       },
     },
 
+    // ---- Axis: Flag Selects (generic, config-declared) ----------------------
+    // A LIST of single-selects, each declared entirely in config:
+    //   { id, title, stripPrefixes: [...], options: [{ id, label, flags? }] }
+    // Same shape as `speculative` minus its hardcoded title + strip list: pick
+    // an option → strip the family, splice the option's flags. A flagless
+    // option is the "none" / accuracy-safe choice (matches a base carrying none
+    // of the family). Model-specific controls (KV-cache dtype, mamba scheduler
+    // strategy, …) live here as DATA — no per-feature engine code. Supports
+    // multiple selects per page. State: { [selectId]: optionId | null }
+    // (null = inherit base).
+    flagSelects: {
+      initState: (fc) => {
+        const out = {};
+        for (const spec of (fc || [])) out[spec.id] = null;
+        return out;
+      },
+
+      // Per select: match base's family flags (first token ∈ stripPrefixes)
+      // against each option's flags. A flagless option matches an empty family.
+      deriveFromBase: (cell, fc) => {
+        const flags = (cell && cell.flags) || [];
+        const out = {};
+        for (const spec of (fc || [])) {
+          const prefixes = spec.stripPrefixes || [];
+          const fam = flags.filter((f) => prefixes.includes(f.split(/[\s=]/)[0]));
+          let hit = null;
+          for (const opt of (spec.options || [])) {
+            const of = opt.flags || [];
+            if (of.length === fam.length && of.every((x) => fam.includes(x))) {
+              hit = opt.id; break;
+            }
+          }
+          out[spec.id] = hit;
+        }
+        return out;
+      },
+
+      revertHidden: (value, fc, base, h) => {
+        let changed = false;
+        const next = { ...value };
+        for (const spec of (fc || [])) {
+          const cur = next[spec.id];
+          if (cur !== null && cur !== undefined
+              && h.isHidden(spec.options, cur, base)) {
+            next[spec.id] = null; changed = true;
+          }
+        }
+        return changed ? next : value;
+      },
+
+      apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        const evalBase = {
+          ...(sel || {}),
+          dpAttnOn: h.hasFlag(flags, "--enable-dp-attention"),
+          pdMode: h.findFlagArg(flags, "--disaggregation-mode") || "off",
+        };
+        for (const spec of (fc || [])) {
+          const v = value ? value[spec.id] : null;
+          if (v === null || v === undefined) continue;          // inherit base
+          const d = derived ? derived[spec.id] : null;
+          if (v === d) continue;                                // already == base
+          const opt = (spec.options || []).find((o) => o.id === v);
+          if (!opt) continue;
+          if (h.evaluateChip(opt, evalBase).disabled) continue;
+          flags = h.stripFlagsByFirstToken(flags, spec.stripPrefixes || []);
+          if (opt.flags && opt.flags.length) {
+            flags = h.insertBeforeTail(flags, opt.flags);
+          }
+        }
+        return { flags, env };
+      },
+
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, derived }) => {
+        const cards = [];
+        for (const spec of (fc || [])) {
+          const opts = (spec.options || [])
+            .map((o) => h.evaluateChip(o, base))
+            .filter((c) => !c.hidden);
+          if (!opts.length) continue;
+          const explicit = value ? value[spec.id] : null;
+          const display = (explicit !== null && explicit !== undefined)
+            ? explicit : (derived ? derived[spec.id] : null);
+          cards.push(
+            <div key={`${axisId}-${spec.id}`} style={s.card}>
+              <div style={s.compactRow}>
+                <span style={s.axisTitle}>{spec.title}</span>
+                {opts.map((c) => (
+                  <span key={c.value} style={s.field}>
+                    {renderChip(c.label, display, c.value,
+                      () => setValue({ ...value, [spec.id]: c.value }),
+                      { disabled: c.disabled, disabledReason: c.disableReason })}
+                  </span>
+                ))}
+              </div>
+            </div>
+          );
+        }
+        return cards.length ? cards : null;
+      },
+    },
+
   };
 
   // ==========================================================================
@@ -971,7 +1074,9 @@ export const Playground = ({ config }) => {
     }
     let cmd;
     if (mode === "docker") {
-      const image = (config.dockerImages && config.dockerImages[sel.hw]) || "lmsysorg/sglang:dev";
+      // Image keyed by `hw|quant` (most specific) then `hw`; `:dev` if unmapped (matches _deployment.jsx).
+      const di = config.dockerImages || {};
+      const image = di[`${sel.hw}|${sel.quant}`] || di[sel.hw] || "lmsysorg/sglang:dev";
       const portFlag = f.find((x) => x.split(/[\s=]/)[0] === "--port");
       const servePort = portFlag ? portFlag.slice("--port".length).trim() : "{{PORT}}";
       const dockerLines = [
@@ -1202,6 +1307,16 @@ export const Playground = ({ config }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout under the playground command when the effective (post-
+    // override) command turns speculative decoding on without setting
+    // --max-running-requests (SGLang then caps it at 48).
+    mtpWarn: {
+      margin: "8px 0 0", padding: "8px 12px", borderRadius: "8px",
+      fontSize: "12px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     diffLineUnchanged: { display: "block" },
     diffLineAdded: {
@@ -1549,6 +1664,12 @@ export const Playground = ({ config }) => {
   const playgroundVerified = !!(matchedCell && matchedCell.verified);
   const matchedSiblingCell = (matchedCell && matchedCell !== baseCell)
     ? matchedCell : null;
+  // MTP hint on the EFFECTIVE (post-override) command — fires when the user
+  // toggles speculative decoding on without setting --max-running-requests
+  // (NOT keyed on strategy). Mirrors the Deploy panel's hint.
+  const pgMtpHint =
+    pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--speculative-algorithm") &&
+    !pgFlagsLatest.some((f) => f.split(/[\s=]/)[0] === "--max-running-requests");
 
   // Submission snippets: proposed cell + existing cell at the same match.
   const proposedCellSnippet = baseCell
@@ -1798,6 +1919,11 @@ export const Playground = ({ config }) => {
               </span>
             )) : "# No verified base cell at the current Deployment selection.\n# Pick a supported hardware/variant in the Deployment panel to populate the playground base."}
           </pre>
+          {pgMtpHint && (
+            <div style={s.mtpWarn}>
+              ⚠️ Speculative decoding (MTP) is on — SGLang resets <code>--max-running-requests</code> to <strong>48</strong> when it isn't set. Add <code>--max-running-requests &lt;N&gt;</code> sized for your target concurrency.
+            </div>
+          )}
         </div>
       </div>
 

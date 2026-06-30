@@ -21,10 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-)
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -32,9 +29,6 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
     dp_scatter,
-    get_attention_dp_rank,
-    get_attention_dp_size,
-    get_attention_tp_size,
     get_dp_device,
     get_dp_dtype,
     get_dp_hidden_size,
@@ -53,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import (
     is_cpu,
@@ -229,7 +224,7 @@ class LogitsMetadata:
 
     def compute_dp_attention_metadata(self):
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_attention_dp_rank()
+        dp_rank = get_parallel().attn_dp_rank
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(
                 self.global_num_tokens_for_logprob_gpu[0]
@@ -275,17 +270,17 @@ class LogitsProcessor(nn.Module):
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
         if self.use_attn_tp_group:
-            self.attn_tp_size = get_attention_tp_size()
+            self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
                 not skip_all_gather and self.attn_tp_size > 1
             )
             self.do_tensor_parallel_all_gather_dp_attn = False
         else:
             self.do_tensor_parallel_all_gather = (
-                not skip_all_gather and get_tensor_model_parallel_world_size() > 1
+                not skip_all_gather and get_parallel().tp_size > 1
             )
             self.do_tensor_parallel_all_gather_dp_attn = (
-                self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
+                self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
             )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
@@ -298,6 +293,14 @@ class LogitsProcessor(nn.Module):
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_global_server_args().enable_mis
+
+        self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=False, floor=128
+            ),
+            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            skip_entry_sync=True,
+        )
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
@@ -856,7 +859,7 @@ class LogitsProcessor(nn.Module):
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
-                logits = tensor_model_parallel_all_gather(logits)
+                logits = self._logits_gatherer(logits)
 
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
