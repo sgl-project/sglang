@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -486,6 +486,7 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
+        layer_pipeline_hook: Optional[Callable] = None,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -499,6 +500,10 @@ class TpModelWorker(BaseTpWorker):
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
+
+        # Install per-batch hook so RadixAttention.forward sees it for every layer.
+        if layer_pipeline_hook is not None:
+            forward_batch.layer_pipeline_hook = layer_pipeline_hook
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
