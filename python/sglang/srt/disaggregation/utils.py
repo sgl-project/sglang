@@ -774,6 +774,81 @@ def setup_state_kv_args(
             )
 
 
+def merge_main_and_draft_kv_layout(
+    main_ptrs: List[int],
+    main_lens: List[int],
+    main_item_lens: List[int],
+    draft_ptrs: List[int],
+    draft_lens: List[int],
+    draft_item_lens: List[int],
+    *,
+    is_mla_backend: bool,
+) -> Tuple[List[int], List[int], List[int]]:
+    """Combine main + draft KV pool buf infos for the disagg transfer layout.
+
+    `CommonKVManager.get_mha_kv_ptrs_with_pp` splits the merged
+    `kv_data_ptrs` as `src[:half]` (all K) and `src[half:]` (all V),
+    relying on the invariant that the first half is K pointers and the
+    second half is V pointers. The per-pool `get_contiguous_buf_infos`
+    already returns `[K_*, V_*]` for MHA — a naive `main + draft`
+    concat produces `[K_main, V_main, K_draft, V_draft]`, then the
+    `// 2` split interleaves the two pools' K/V and the transfer reads
+    V bytes for K slots (silent KV corruption).
+
+    Reorder so the merged MHA layout is `[K_main, K_draft, V_main,
+    V_draft]` — the first half stays all-K, the second half all-V,
+    and logical layer indices [0, n_main) map to main while
+    [n_main, n_main+n_draft) map to draft on BOTH halves.
+
+    MLA / NSA pools store 1 ptr per layer (no K/V split), so simple
+    concat is correct there.
+
+    Apply identically on prefill and decode sides — the two layouts
+    must match or per-layer transfer points at the wrong tensor.
+    """
+    # Fail loud on malformed input — a wrong descriptor only surfaces as
+    # KV corruption downstream.
+    if len(main_ptrs) != len(main_lens) or len(main_ptrs) != len(main_item_lens):
+        raise ValueError(
+            "main_ptrs / main_lens / main_item_lens length mismatch: "
+            f"{len(main_ptrs)} / {len(main_lens)} / {len(main_item_lens)}"
+        )
+    if len(draft_ptrs) != len(draft_lens) or len(draft_ptrs) != len(draft_item_lens):
+        raise ValueError(
+            "draft_ptrs / draft_lens / draft_item_lens length mismatch: "
+            f"{len(draft_ptrs)} / {len(draft_lens)} / {len(draft_item_lens)}"
+        )
+    if is_mla_backend:
+        return (
+            main_ptrs + draft_ptrs,
+            main_lens + draft_lens,
+            main_item_lens + draft_item_lens,
+        )
+    # MHA: each pool's buf info is [K_*, V_*], so length must be even for the
+    # //2 K/V split to hold.
+    if len(main_ptrs) % 2 != 0:
+        raise ValueError(
+            "MHA main_ptrs length must be even (each layer contributes K + V); "
+            f"got {len(main_ptrs)}"
+        )
+    if len(draft_ptrs) % 2 != 0:
+        raise ValueError(
+            "MHA draft_ptrs length must be even (each layer contributes K + V); "
+            f"got {len(draft_ptrs)}"
+        )
+    n_main = len(main_ptrs) // 2
+    n_draft = len(draft_ptrs) // 2
+
+    def _reorder(m: List, d: List) -> List:
+        return m[:n_main] + d[:n_draft] + m[n_main:] + d[n_draft:]
+
+    return (
+        _reorder(main_ptrs, draft_ptrs),
+        _reorder(main_lens, draft_lens),
+        _reorder(main_item_lens, draft_item_lens),
+    )
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

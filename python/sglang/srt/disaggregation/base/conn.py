@@ -60,20 +60,25 @@ class KVArgs:
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int
-    # Absolute end layer (exclusive) for this prefill PP stage. Needed to
-    # reconstruct PP sub-ranges when kv_data_ptrs does not use a flat
-    # layer-indexed layout (e.g. DeepSeek V4's buffer-type-organized flat
-    # list).
+    # Absolute end layer (exclusive) for this PP stage, needed to reconstruct
+    # PP sub-ranges when kv_data_ptrs isn't flat layer-indexed (e.g. DeepSeek V4).
     prefill_end_layer: Optional[int]
-    # For DeepSeek V4 (and other compressed-MLA) memory pools only.
-    # Full-model compression ratio per layer (entries are 0/4/128). Used by
-    # the connection layer to slice the buffer-type-organized flat list in a
-    # PP-aware manner.
+    # Compressed-MLA pools only. Per-layer compression ratio (0/4/128) for
+    # PP-aware slicing of the buffer-type-organized flat list.
     mla_compression_ratios: Optional[List[int]]
     # Only used of npu, for kv buf groups
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Main-model KV layer count when draft (MTP/EAGLE) ptrs are appended, so
+    # the LP hook's is_last fires on the last main layer, not past it.
+    # None ⇒ no draft, len(kv_data_ptrs) is all main.
+    prefill_num_main_kv_layers: Optional[int] = None
+    # Local main-model KV layer count (excludes draft tail). Equals
+    # ``prefill_num_main_kv_layers`` on prefill; on decode it holds the
+    # full-model main count so the connection layer can fail-loud when the
+    # cross-side layout doesn't match. None ⇒ no draft pool on this side.
+    num_main_kv_layers: Optional[int] = None
 
 
 class KVPoll:
@@ -100,6 +105,16 @@ class BaseKVManager(ABC):
     def register_to_bootstrap(self):
         """Register prefill server info to the bootstrap server."""
         ...
+
+    def make_layer_pipeline_hook_for_reqs(self, reqs_with_indices):
+        """Build a per-batch forward hook for layer-pipelined KV transfer.
+
+        Returns ``None`` by default — non-Mooncake backends opt out.
+        ``MooncakeKVManager`` overrides this. The caller
+        (``Scheduler.build_layer_pipeline_hook``) MUST NOT install a hook
+        when this returns ``None``.
+        """
+        return None
 
 
 class BaseKVSender(ABC):
@@ -133,6 +148,15 @@ class BaseKVSender(ABC):
 
     def pop_decode_prefix_len(self) -> int:
         return 0
+
+    def send_draft_kv(self, kv_indices: npt.NDArray[np.int32]) -> None:
+        """Ship the draft (MTP/EAGLE NEXTN) KV slice for this token chunk.
+
+        Default no-op — backends without a separate draft pool or layer-pipelined
+        transfer don't need it. ``MooncakeKVSender`` overrides this. Callers may
+        invoke it unconditionally; the default keeps the call duck-typing-free.
+        """
+        return
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
