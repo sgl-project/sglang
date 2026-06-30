@@ -781,7 +781,9 @@ class CommonKVSender(BaseKVSender):
             prefill_dp_rank = self._prefill_dp_rank()
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
-            elif prefill_dp_rank != self.bootstrap_room % self.kv_mgr.server_args.dp_size:
+            elif (
+                prefill_dp_rank != self.bootstrap_room % self.kv_mgr.server_args.dp_size
+            ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
                     self._register_prefill_dp_rank()
