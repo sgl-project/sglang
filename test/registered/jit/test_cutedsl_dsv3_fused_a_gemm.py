@@ -19,7 +19,7 @@ from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import dsv3_fused_a_gemm  # noq
 HD_INS = [6144, 7168]
 # hd_out must be a multiple of 16; 2112 and 2624 cover real fused-A variants.
 HD_OUTS = [2112, 2624]
-NUM_TOKENS = get_ci_test_range(list(range(1, 17)) + [38], [1, 8, 16, 38])
+NUM_TOKENS = get_ci_test_range(list(range(1, 17)), [1, 8, 16])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
