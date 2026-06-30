@@ -18,11 +18,6 @@ PeerRange = Tuple[int, int]
 PeerRanges = List[PeerRange]
 
 
-# ---------------------------------------------------------------------------
-# Peer-range helpers
-# ---------------------------------------------------------------------------
-
-
 def compute_peer_ranges(
     *,
     dwdp_size: int,
@@ -47,11 +42,6 @@ def lookup_owner(expert_id: int, peer_ranges: PeerRanges) -> int:
     raise ValueError(
         f"expert_id={expert_id} not owned by any peer in peer_ranges={peer_ranges}"
     )
-
-
-# ---------------------------------------------------------------------------
-# DwdpExpertLayout
-# ---------------------------------------------------------------------------
 
 
 class DwdpExpertLayout:
@@ -104,11 +94,6 @@ class DwdpExpertLayout:
         )
 
 
-# ---------------------------------------------------------------------------
-# WeightSpec
-# ---------------------------------------------------------------------------
-
-
 class WeightSpec:
     """Shape and dtype of one expert weight parameter."""
 
@@ -146,13 +131,7 @@ class WeightSpec:
         return self.chunk_shape[0]
 
 
-# Type alias
 LayerWeightSpecs = Dict[int, Dict[str, WeightSpec]]
-
-
-# ---------------------------------------------------------------------------
-# MnnvlHandleSet  (transport output, weight_buffer input)
-# ---------------------------------------------------------------------------
 
 
 class MnnvlHandleSet:
@@ -182,11 +161,6 @@ class MnnvlHandleSet:
         return [n for (li, n) in self.handles.keys() if li == layer_idx]
 
 
-# ---------------------------------------------------------------------------
-# EdgeInfo
-# ---------------------------------------------------------------------------
-
-
 class EdgeInfo:
     """Page-alignment edge information for setup-time peer data fill."""
 
@@ -214,11 +188,6 @@ class EdgeInfo:
         self.page_start = page_start
         self.page_end = page_end
         self.expert_bytes = expert_bytes
-
-
-# ---------------------------------------------------------------------------
-# PageAlignedLayout
-# ---------------------------------------------------------------------------
 
 
 class PageAlignedLayout:

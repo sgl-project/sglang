@@ -22,7 +22,6 @@ from sglang.srt.layers.moe.dwdp.vmm import (
 
 logger = logging.getLogger(__name__)
 
-# Default pool-page multiplier (each handle = 8 * granularity ≈ 16 MB on GB200).
 DEFAULT_PAGE_SIZE_MULTIPLIER = 8
 
 
@@ -143,6 +142,6 @@ def compute_slot_sizes(
     slot_sizes = [0, 0]
     for layer_idx, weight_layouts in layouts.items():
         slot = buffer_slot_assignments.get(layer_idx, layer_idx % 2)
-        total = sum(l.pre_size + l.post_size for l in weight_layouts.values())
+        total = sum(lo.pre_size + lo.post_size for lo in weight_layouts.values())
         slot_sizes[slot] = max(slot_sizes[slot], total)
     return slot_sizes

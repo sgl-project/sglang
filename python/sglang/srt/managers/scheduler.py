@@ -1497,6 +1497,7 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
+        # [DWDP SYNC POINT 2/CPU] WAR barrier
         # Wait for the prev forward to finish reading the shared buffers this
         # iter's schedule will overwrite. Fast path: wait on the read-done event
         # the forward published after its snapshot (non-spec: decode graph;

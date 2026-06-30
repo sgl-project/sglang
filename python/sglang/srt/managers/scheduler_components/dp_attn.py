@@ -81,6 +81,7 @@ class MLPSyncBatchInfo:
         )
 
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
+        # [DWDP SYNC POINT 1/CPU] allgather token counts across DP ranks, ~50us per call
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
             (self.dp_size, self.tp_size * self.cp_size, 7),
@@ -151,6 +152,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    dwdp: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -221,6 +223,7 @@ def prepare_mlp_sync_batch_raw(
     )
 
     if not skip_all_gather:
+        # [DWDP SYNC POINT 1/CPU] allgather num_tokens across DP ranks — 164x/prefill, avg ~1.6ms
         mlp_sync_info.all_gather(device=device, group=group)
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
@@ -231,8 +234,7 @@ def prepare_mlp_sync_batch_raw(
 
     # Decide whether to emit idle batch
     if skip_all_gather:
-        # Skip idle batch when attn-dp=1
-        need_idle_batch = dp_size > 1
+        need_idle_batch = not dwdp and dp_size > 1
     else:
         need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
 
@@ -281,6 +283,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            dwdp=self.server_args.dwdp_size > 1,
         )
 
     def maybe_prepare_mlp_sync_batch(

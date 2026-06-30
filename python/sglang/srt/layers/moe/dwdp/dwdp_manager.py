@@ -30,7 +30,6 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
-# Global singleton
 _GLOBAL_DWDP_MANAGER: Optional[DwdpManager] = None
 
 
@@ -43,10 +42,6 @@ def set_global_dwdp_manager(manager: Optional[DwdpManager]) -> None:
     _GLOBAL_DWDP_MANAGER = manager
 
 
-# Weight parameter names to handle via the full DWDP pipeline.
-# These are the LARGE expert weight tensors that go through
-# Transport → WeightBuffer → WeightManager.
-# Scale and bias tensors are small — they go through allgather instead.
 _EXPERT_WEIGHT_NAMES = (
     "w13_weight",
     "w2_weight",
@@ -159,10 +154,6 @@ class DwdpManager:
         self._setup_done = True
         logger.info("[DwdpManager] Setup complete.")
 
-    # ------------------------------------------------------------------
-    # Forward hooks (called by DeepseekV2MoE.forward_dwdp)
-    # ------------------------------------------------------------------
-
     def prefetch_first_layers(self) -> None:
         if self._weight_manager is not None:
             self._weight_manager.prefetch_first_layers()
@@ -175,19 +166,11 @@ class DwdpManager:
         if self._weight_manager is not None:
             self._weight_manager.record_compute_and_prefetch_next(layer_idx)
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-
     def cleanup(self) -> None:
         if self._weight_manager is not None:
             self._weight_manager.release()
             self._weight_manager = None
         self._setup_done = False
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _collect_moe_params(self, model: nn.Module) -> Tuple[
         Dict[Tuple[int, str], torch.Tensor],

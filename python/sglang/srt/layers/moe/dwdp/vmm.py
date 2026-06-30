@@ -23,11 +23,6 @@ except ImportError:
     from cuda import cuda  # type: ignore[no-redef]
 
 
-# ---------------------------------------------------------------------------
-# Error checking
-# ---------------------------------------------------------------------------
-
-
 def check_cu_result(cu_func_ret):
     """Check CUDA driver API result and raise on error."""
     if isinstance(cu_func_ret, tuple):
@@ -45,11 +40,6 @@ def check_cu_result(cu_func_ret):
         return None
 
 
-# ---------------------------------------------------------------------------
-# Alignment helpers
-# ---------------------------------------------------------------------------
-
-
 def align_up(value: int, alignment: int) -> int:
     """Align *value* up to the nearest multiple of *alignment* (power of 2)."""
     if alignment <= 0 or (alignment & (alignment - 1)) != 0:
@@ -62,11 +52,6 @@ def align_down(value: int, alignment: int) -> int:
     if alignment <= 0 or (alignment & (alignment - 1)) != 0:
         raise ValueError(f"alignment must be a positive power of 2, got {alignment}")
     return (value // alignment) * alignment
-
-
-# ---------------------------------------------------------------------------
-# Allocation properties
-# ---------------------------------------------------------------------------
 
 
 def peer_handle_type() -> cuda.CUmemAllocationHandleType:
@@ -136,11 +121,6 @@ def get_access_desc(device_id: int) -> cuda.CUmemAccessDesc:
     return desc
 
 
-# ---------------------------------------------------------------------------
-# Handle lifecycle
-# ---------------------------------------------------------------------------
-
-
 def create_fabric_handle(size: int, device_id: int) -> int:
     """Create a peer-shareable memory handle (FABRIC or POSIX_FD)."""
     prop = get_allocation_prop(device_id, fabric_only=False)
@@ -160,11 +140,6 @@ def release_handle(handle: int) -> None:
     """Release a memory handle."""
     if handle != 0:
         check_cu_result(cuda.cuMemRelease(handle))
-
-
-# ---------------------------------------------------------------------------
-# Virtual address operations
-# ---------------------------------------------------------------------------
 
 
 def _to_int(va) -> int:
@@ -207,11 +182,6 @@ def set_access(va: int, size: int, device_id: int) -> None:
     check_cu_result(cuda.cuMemSetAccess(_to_devptr(va), size, [desc], 1))
 
 
-# ---------------------------------------------------------------------------
-# Export / Import
-# ---------------------------------------------------------------------------
-
-
 def export_handle(handle: int):
     """Export a shareable handle.
 
@@ -230,11 +200,6 @@ def import_handle(payload) -> int:
     # cuda.bindings uses (shareableHandle, handleType) — no flags arg
     handle = check_cu_result(cuda.cuMemImportFromShareableHandle(payload, ht))
     return int(handle)
-
-
-# ---------------------------------------------------------------------------
-# DLPack zero-copy tensor creation (ported from TRT-LLM _dlpack_utils.py)
-# ---------------------------------------------------------------------------
 
 
 class _DLDataType(ctypes.Structure):
@@ -307,11 +272,6 @@ def _torch_dtype_to_dl(dtype: torch.dtype) -> Tuple[int, int]:
     raise NotImplementedError(f"Unsupported dtype for DLPack: {dtype}")
 
 
-# ---------------------------------------------------------------------------
-# Tensor from VA pointer
-# ---------------------------------------------------------------------------
-
-
 def tensor_from_ptr(
     ptr: int,
     shape: Tuple[int, ...],
@@ -334,7 +294,6 @@ def tensor_from_ptr(
         numel *= d
 
     dl_code, bits = _torch_dtype_to_dl(dtype)
-    bytes_per_elem = bits // 8
 
     # Build shape array
     ndim = len(shape)
@@ -381,11 +340,6 @@ def tensor_from_ptr(
     if dtype in _FLOAT8_DTYPES:
         tensor = tensor.view(dtype)
     return tensor
-
-
-# ---------------------------------------------------------------------------
-# RAII wrappers
-# ---------------------------------------------------------------------------
 
 
 class VMMHandle:

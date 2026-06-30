@@ -53,9 +53,6 @@ except ImportError:
 
 from sglang.srt.layers.moe.dwdp.vmm import _to_devptr
 
-# ---------------------------------------------------------------------------
-# pidfd syscalls for POSIX_FD path (Linux 5.6+)
-# ---------------------------------------------------------------------------
 _SYS_pidfd_open = 434
 _SYS_pidfd_getfd = 438
 
@@ -158,9 +155,7 @@ class DWDPTransport:
         sorted_keys = sorted(local_params.keys())
 
         try:
-            # --------------------------------------------------------------
             # Phase 0 (POSIX_FD only): exchange PIDs and open pidfds
-            # --------------------------------------------------------------
             if is_posix_fd:
                 all_pids = [None] * layout.dwdp_size
                 dist.all_gather_object(all_pids, os.getpid(), group=group.device_group)
@@ -172,9 +167,7 @@ class DWDPTransport:
                     f"[Transport] POSIX_FD: opened pidfds for {len(peer_pidfds)} peers"
                 )
 
-            # --------------------------------------------------------------
             # Phase 1: alloc handle, copy weights, export, allgather
-            # --------------------------------------------------------------
             for layer_idx, name in sorted_keys:
                 param = local_params[(layer_idx, name)]
                 spec = layer_weight_specs[layer_idx][name]
@@ -230,9 +223,7 @@ class DWDPTransport:
 
             transport._handle_set = MnnvlHandleSet(handles=handles, sizes=sizes)
 
-            # --------------------------------------------------------------
             # Phase 2: import peer handles, create tensor views
-            # --------------------------------------------------------------
             for layer_idx, name in sorted_keys:
                 spec = layer_weight_specs[layer_idx][name]
 
@@ -287,9 +278,7 @@ class DWDPTransport:
                     )
                     transport._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
 
-            # --------------------------------------------------------------
             # Phase 3: barrier + cleanup pidfds and export fds
-            # --------------------------------------------------------------
             dist.barrier(group=group.device_group)
 
             for pidfd in peer_pidfds.values():

@@ -94,10 +94,6 @@ class DWDPWeightManager:
     def first_moe_layer(self) -> int:
         return self._moe_layer_indices[0]
 
-    # ------------------------------------------------------------------
-    # Prefetch
-    # ------------------------------------------------------------------
-
     def prefetch_layer(self, layer_idx: int) -> None:
         """Enqueue async P2P copies for a layer's remote expert slices."""
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
@@ -132,9 +128,7 @@ class DWDPWeightManager:
                     dst_offset += n
                     cursor = chunk_end
 
-    # ------------------------------------------------------------------
     # Wait + bind
-    # ------------------------------------------------------------------
 
     def wait_prefetch(self, layer_idx: int) -> None:
         """Compute stream waits for prefetch completion."""
@@ -160,20 +154,12 @@ class DWDPWeightManager:
             if next_next is not None:
                 self.prefetch_layer(next_next)
 
-    # ------------------------------------------------------------------
-    # Prefetch first layers (warm-up)
-    # ------------------------------------------------------------------
-
     def prefetch_first_layers(self) -> None:
         """Warm-up: prefetch first 2 MoE layers while dense layers compute."""
         if len(self._moe_layer_indices) >= 1:
             self.prefetch_layer(self._moe_layer_indices[0])
         if len(self._moe_layer_indices) >= 2:
             self.prefetch_layer(self._moe_layer_indices[1])
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     def release(self) -> None:
         if self._weight_buffer is not None:
