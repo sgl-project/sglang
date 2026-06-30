@@ -20,6 +20,13 @@ from typing import Optional
 import torch
 
 
+# NOTE: This is intentionally a standalone dataclass, NOT a subclass of
+# layers.cp.base.BaseContextParallelMetadata. It is preserved verbatim from #14194
+# and is stored in its own ForwardBatch field (attn_dcp_metadata), separate from the
+# prefill-CP attn_cp_metadata, so it never participates in the CP-v2 build_metadata
+# contract today. Whether the decode metadata should re-parent onto
+# BaseContextParallelMetadata is deferred to P2 (DecodeContextParallelStrategy); decide
+# it there rather than coupling this relocation to the CP-v2 ABC.
 @dataclass
 class DecodeContextParallelMetadata:
     # For decode context parallel

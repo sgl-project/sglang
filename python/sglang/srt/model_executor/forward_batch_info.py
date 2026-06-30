@@ -504,7 +504,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
-    # For decode context parallel
+    # For decode context parallel.
+    # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
+    # import block above) — available for annotations but NOT bound at runtime in this
+    # module. Import it from sglang.srt.layers.cp.dcp.metadata if a runtime use is added.
     attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
     # Decode context parallel KV write mask.

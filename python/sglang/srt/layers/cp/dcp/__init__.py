@@ -17,10 +17,15 @@ were previously split between layers/attention/utils.py (PR #25090, Triton/MHA)
 and layers/utils/dcp_utils.py (PR #14194, FlashInfer-MLA).
 
 The two ``cp_lse_ag_out_rs`` variants are kept distinct (``_mha`` torch/all-reduce,
-``_mla`` Triton/reduce-scatter) because their bodies are backend-forced."""
+``_mla`` Triton/reduce-scatter) because their bodies are backend-forced.
+
+Only the symbols imported by code OUTSIDE this subpackage are re-exported here.
+Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
+``correct_attn_out``, ``create_dcp_kv_indices``, ``update_kv_lens_and_indices``,
+``_all_gather_dcp_kv_cache``) stay private to their submodules — import them from
+``sglang.srt.layers.cp.dcp.{kernels,comm}`` if ever needed internally."""
 
 from sglang.srt.layers.cp.dcp.comm import (
-    _all_gather_dcp_kv_cache,
     all_gather_kv_cache_for_dcp,
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
@@ -32,14 +37,7 @@ from sglang.srt.layers.cp.dcp.comm import (
     get_attention_dcp_rank,
     get_attention_dcp_world_size,
 )
-from sglang.srt.layers.cp.dcp.kernels import (
-    CPTritonContext,
-    _correct_attn_cp_out_kernel,
-    correct_attn_out,
-    create_dcp_kv_indices,
-    create_triton_kv_indices_for_dcp_triton,
-    update_kv_lens_and_indices,
-)
+from sglang.srt.layers.cp.dcp.kernels import create_triton_kv_indices_for_dcp_triton
 from sglang.srt.layers.cp.dcp.layout import (
     filter_dcp_local_kv_indices,
     get_dcp_lens,
@@ -47,31 +45,28 @@ from sglang.srt.layers.cp.dcp.layout import (
 )
 from sglang.srt.layers.cp.dcp.metadata import DecodeContextParallelMetadata
 
-# NOTE: planner.py is intentionally NOT imported here. It depends on server_args,
-# and this package-init runs whenever attention/utils.py (Triton path) imports
-# comm/kernels/layout. Keeping the init free of server_args avoids a module-load
-# import edge. Import planner functions from sglang.srt.layers.cp.dcp.planner.
+# NOTE: planner.py is intentionally NOT imported here. It depends on server_args
+# (get_global_server_args), whereas this package-init executes at module-load time
+# for every eager importer of the DCP primitives — triton_backend,
+# mem_cache.memory_pool, mem_cache.triton_ops.mla_buffer, mem_cache.kv_cache_builder,
+# the FlashInfer-MLA / FlashMLA backends, and the deepseek forward methods. Keeping
+# the init server_args-free avoids a load-time import edge into server_args. Import
+# planner functions from sglang.srt.layers.cp.dcp.planner directly.
 
 __all__ = [
-    "CPTritonContext",
     "DecodeContextParallelMetadata",
-    "_all_gather_dcp_kv_cache",
-    "_correct_attn_cp_out_kernel",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",
     "all_gather_kv_cache_for_mha_extend",
     "all_gather_kv_cache_for_mla_extend",
     "all_gather_q_for_mla_decode",
-    "correct_attn_out",
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
-    "create_dcp_kv_indices",
     "create_triton_kv_indices_for_dcp_triton",
     "dcp_enabled",
     "filter_dcp_local_kv_indices",
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
     "get_dcp_lens",
-    "update_kv_lens_and_indices",
     "update_local_kv_lens_for_dcp",
 ]
