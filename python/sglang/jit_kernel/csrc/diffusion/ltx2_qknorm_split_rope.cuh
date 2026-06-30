@@ -121,10 +121,8 @@ __global__ void ltx2_qknorm_split_rope_kernel(
     const int64_t idx1 = idx0 + half_dim;
     const float n0 = norm_value(__bfloat162float(xrow[idx0]), __bfloat162float(weight[idx0]), rstd);
     const float n1 = norm_value(__bfloat162float(xrow[idx1]), __bfloat162float(weight[idx1]), rstd);
-    const int64_t cos_offset = static_cast<int64_t>(batch) * stride_cos_b + static_cast<int64_t>(head) * stride_cos_h +
-                               static_cast<int64_t>(token) * stride_cos_t + offset;
-    const int64_t sin_offset = static_cast<int64_t>(batch) * stride_sin_b + static_cast<int64_t>(head) * stride_sin_h +
-                               static_cast<int64_t>(token) * stride_sin_t + offset;
+    const int64_t cos_offset = batch * stride_cos_b + head * stride_cos_h + token * stride_cos_t + offset;
+    const int64_t sin_offset = batch * stride_sin_b + head * stride_sin_h + token * stride_sin_t + offset;
 
     float y0;
     float y1;
