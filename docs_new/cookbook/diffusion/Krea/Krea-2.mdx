@@ -49,7 +49,39 @@ The step count and guidance scale are **request-time** settings (see [API Usage]
 Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
 
 - `--num-gpus`: Number of GPUs to use.
-- `--tp-size`: Tensor parallelism size (the recommended multi-GPU path for Krea-2). Its attention heads (48, with 12 KV heads) and text heads (20) are divisible by a tensor-parallel size of 1, 2, or 4.
+- Multi-GPU (tensor and/or sequence parallelism): see [Section 3.3](#3-3-multi-gpu-tensor-and-sequence-parallelism).
+
+### 3.3 Multi-GPU: tensor and sequence parallelism
+
+Krea-2 supports two multi-GPU axes that can be combined; `--num-gpus` must equal
+`tp_size × ulysses_degree`.
+
+- **Tensor parallelism (`--tp-size N`)** shards the DiT weights across GPUs, lowering
+  per-GPU VRAM. Krea-2's attention heads (48 query / 12 KV) and text heads (20) are
+  divisible by a tp size of 1, 2, or 4.
+- **Sequence parallelism / Ulysses (`--ulysses-degree N`)** shards the image-token
+  sequence across GPUs while keeping the text prefix replicated. It does **not** shard
+  weights (per-GPU VRAM is unchanged), but its output is **bitwise-identical** to
+  single-GPU. It currently requires a single prompt per request (ragged/padded
+  multi-prompt batches under SP are not supported — use `--tp-size` for those).
+
+```bash Command
+# Tensor parallel (2 GPUs) — lowest per-GPU VRAM (DiT weights sharded)
+sglang serve --model-path krea/Krea-2-Turbo --num-gpus 2 --tp-size 2 --port 30000
+
+# Sequence parallel / Ulysses (2 GPUs) — output bitwise-identical to single-GPU
+sglang serve --model-path krea/Krea-2-Turbo --num-gpus 2 --ulysses-degree 2 --port 30000
+
+# Hybrid TP × SP (4 GPUs) — composes both axes
+sglang serve --model-path krea/Krea-2-Turbo --num-gpus 4 --tp-size 2 --ulysses-degree 2 --port 30000
+```
+
+Measured on 2× H200 (Krea-2-Turbo, 8 steps, 1024×1024): `--tp-size 2` and
+`--ulysses-degree 2` each give ~1.7× denoise speedup over single-GPU; the hybrid
+TP=2 × SP=2 reaches ~2.8× on 4 GPUs. **Choosing:** on memory-constrained GPUs prefer
+`--tp-size` (it shards the ~24 GB DiT, e.g. ~38 GB → ~27 GB per GPU on 2 GPUs); on
+large-VRAM GPUs sequence parallelism is marginally faster and numerically exact, and
+the two compose for the highest throughput.
 
 ## 4. API Usage
 
