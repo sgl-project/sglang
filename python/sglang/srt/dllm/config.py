@@ -38,7 +38,10 @@ class DllmConfig:
         }
 
         arch = model_config.hf_config.architectures[0]
-        if arch in DLLM_PARAMS:
+        if arch in {"GFusionForDiffusionLM", "GFusionModelLM"}:
+            block_size = getattr(model_config.hf_config, "diffusion_block_size", 32)
+            mask_id = getattr(model_config.hf_config, "mask_token_id", 128170)
+        elif arch in DLLM_PARAMS:
             params = DLLM_PARAMS[arch]
             block_size = params["block_size"]
             mask_id = params["mask_id"]
@@ -61,7 +64,7 @@ class DllmConfig:
                     "`pip install pyyaml`"
                 )
             with open(server_args.dllm_algorithm_config, "r") as f:
-                algorithm_config = yaml.safe_load(f)
+                algorithm_config = yaml.safe_load(f) or {}
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)

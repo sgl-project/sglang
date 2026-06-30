@@ -104,6 +104,8 @@ def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
         in (
+            "GFusionForDiffusionLM",
+            "GFusionModelLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
@@ -725,6 +727,8 @@ class ModelConfig:
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "GFusionForDiffusionLM" in self.hf_config.architectures
+            or "GFusionModelLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
