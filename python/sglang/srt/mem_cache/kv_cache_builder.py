@@ -236,10 +236,15 @@ def build_kv_cache(
                             "path. Set SGLANG_OPT_USE_ONLINE_COMPRESS=1 and "
                             "SGLANG_EXPERIMENTAL_ONLINE_C128_MTP=1."
                         )
+            # SWA-compress models (MiMo-V2, Gemma4) use different head dims for
+            # SWA vs full layers but do NOT use latent KV compression like DSV4.
+            # The generic SWA decode-radix path (SWA prefix cap, regular radix
+            # match, dual-pool allocation) handles them without model-specific
+            # sidecars. Previously blocked out of caution; now allowed.
             if getattr(model_config, "is_hybrid_swa_compress", False):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache does not support "
-                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+                logger.warning(
+                    "--disaggregation-decode-enable-radix-cache with "
+                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) is experimental."
                 )
         if is_hybrid_ssm:
             raise ValueError(
