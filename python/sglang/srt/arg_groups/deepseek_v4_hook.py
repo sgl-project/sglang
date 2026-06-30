@@ -93,6 +93,18 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     assert (
         server_args.tp_size <= 8
     ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+
+    # The trtllm DSA-prefill path applies RoPE inside the backend (fp8 fused
+    # rope). Under round-robin CP it now re-splits forward_batch.positions to the
+    # rank's global token positions, so CP is allowed on Blackwell for trtllm
+    # prefill — but only for the fp8_e4m3 KV path the rope split assumes.
+    if server_args.dsa_prefill_backend == "trtllm":
+        assert server_args.kv_cache_dtype == "fp8_e4m3", (
+            "trtllm DSA-prefill context parallel requires kv_cache_dtype=fp8_e4m3 "
+            f"(got {server_args.kv_cache_dtype}); the round-robin RoPE split is only "
+            "wired for the fp8 fused-rope path."
+        )
+
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "

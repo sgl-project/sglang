@@ -39,6 +39,7 @@ from sglang.srt.layers.attention.dsa.transform_index import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
+    dsa_cp_round_robin_rope_positions,
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
     is_dsa_enable_prefill_cp,
@@ -2369,12 +2370,21 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
 
+            # Under round-robin CP the q/k rows are a strided 1/cp_size subset,
+            # so RoPE must use the matching global positions, not the full
+            # forward_batch.positions (mirrors the Hopper flashmla_sparse path).
+            rope_positions = (
+                dsa_cp_round_robin_rope_positions(forward_batch)
+                if is_prefill and can_dsa_prefill_cp_round_robin_split(forward_batch)
+                else forward_batch.positions
+            )
+
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
                 k.squeeze(1),
                 k_rope.squeeze(1),
-                forward_batch.positions,
+                rope_positions,
                 cos_sin_cache,
                 is_neox,
                 self.kv_lora_rank,

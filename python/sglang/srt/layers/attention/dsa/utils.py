@@ -143,6 +143,19 @@ def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
 
+def dsa_cp_round_robin_rope_positions(forward_batch: "ForwardBatch") -> torch.Tensor:
+    """Global RoPE positions for this rank's round-robin token subset.
+
+    The Hopper flashmla_sparse path applies RoPE in the model with the already
+    CP-split ``positions`` (see ``cp_split_and_rebuild_position``), but the
+    Blackwell trtllm fp8 path defers RoPE into the backend and would otherwise
+    read the full, unsplit ``forward_batch.positions``. Re-split those positions
+    with the SAME ordering as the q/k rows so token ``i`` keeps its true
+    sequence index ``i`` even though it lives at local slot ``i // cp_size``.
+    """
+    return dsa_cp_round_robin_split_data(forward_batch.positions)
+
+
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
