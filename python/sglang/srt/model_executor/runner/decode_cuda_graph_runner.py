@@ -1024,7 +1024,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 )
 
-            sliced_output = LogitsProcessorOutput(
+            return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
@@ -1034,7 +1034,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 customized_info=output.customized_info,
             )
-            return sliced_output
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
