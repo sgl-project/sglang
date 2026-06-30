@@ -85,8 +85,45 @@ def zimage_rmsnorm_tanh_mul_add(
     gate: torch.Tensor,
     residual: torch.Tensor,
     norm: ZImageRMSNorm,
+    enable_fused: bool = True,
 ) -> torch.Tensor:
+    if enable_fused:
+        from sglang.jit_kernel.diffusion.triton.zimage_native_norm import (
+            zimage_rmsnorm_tanh_residual,
+        )
+
+        y = zimage_rmsnorm_tanh_residual(
+            x,
+            gate,
+            residual,
+            norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
+            norm.variance_epsilon,
+        )
+        if y is not None:
+            return y
     return residual + torch.tanh(gate) * norm(x)
+
+
+def zimage_rmsnorm_scale(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    norm: ZImageRMSNorm,
+    enable_fused: bool = True,
+) -> torch.Tensor:
+    if enable_fused:
+        from sglang.jit_kernel.diffusion.triton.zimage_native_norm import (
+            zimage_rmsnorm_scale as fused_zimage_rmsnorm_scale,
+        )
+
+        y = fused_zimage_rmsnorm_scale(
+            x,
+            norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
+            scale,
+            norm.variance_epsilon,
+        )
+        if y is not None:
+            return y
+    return norm(x) * scale
 
 
 class SelectFirstElement(nn.Module):
@@ -196,6 +233,7 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
+        self.enable_zimage_qk_fusion = quant_config is None
 
         tp_size = get_tp_world_size()
         assert (
@@ -336,7 +374,7 @@ class ZImageAttention(nn.Module):
                         cos_sin_cache=cos_sin_cache,
                         is_neox=False,
                         positions=positions,
-                        allow_inplace=False,
+                        allow_inplace=self.enable_zimage_qk_fusion,
                     )
                 else:
                     q, k = apply_flashinfer_rope_qk_inplace(
@@ -359,7 +397,7 @@ class ZImageAttention(nn.Module):
                         head_dim=self.head_dim,
                         cos_sin_cache=cos_sin_cache,
                         is_neox=False,
-                        allow_inplace=False,
+                        allow_inplace=self.enable_zimage_qk_fusion,
                     )
                 else:
                     q, k = apply_flashinfer_rope_qk_inplace(
@@ -373,7 +411,7 @@ class ZImageAttention(nn.Module):
                         q_norm=self.norm_q,
                         k_norm=self.norm_k,
                         head_dim=self.head_dim,
-                        allow_inplace=False,
+                        allow_inplace=self.enable_zimage_qk_fusion,
                     )
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
@@ -384,7 +422,7 @@ class ZImageAttention(nn.Module):
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
-                allow_inplace=False,
+                allow_inplace=self.enable_zimage_qk_fusion,
             )
 
         if (
@@ -451,6 +489,7 @@ class ZImageTransformerBlock(nn.Module):
         self.head_dim = dim // n_heads
         self.layer_id = layer_id
         self.modulation = modulation
+        self.enable_zimage_native_norm_fusion = quant_config is None
 
         self.attention = ZImageAttention(
             dim=dim,
@@ -531,7 +570,12 @@ class ZImageTransformerBlock(nn.Module):
 
             # Attention block
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
+                zimage_rmsnorm_scale(
+                    x,
+                    scale_msa,
+                    self.attention_norm1,
+                    self.enable_zimage_native_norm_fusion,
+                ),
                 freqs_cis=freqs_cis,
                 attn_mask=attn_mask,
                 attn_mask_meta=attn_mask_meta,
@@ -539,12 +583,29 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
-            x = zimage_rmsnorm_tanh_mul_add(attn_out, gate_msa, x, self.attention_norm2)
-            ffn_in = self.ffn_norm1(x) * (1.0 + scale_mlp)
+            x = zimage_rmsnorm_tanh_mul_add(
+                attn_out,
+                gate_msa,
+                x,
+                self.attention_norm2,
+                self.enable_zimage_native_norm_fusion,
+            )
+            ffn_in = zimage_rmsnorm_scale(
+                x,
+                1.0 + scale_mlp,
+                self.ffn_norm1,
+                self.enable_zimage_native_norm_fusion,
+            )
 
             # FFN block
             ffn_out = self.feed_forward(ffn_in)
-            x = zimage_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
+            x = zimage_rmsnorm_tanh_mul_add(
+                ffn_out,
+                gate_mlp,
+                x,
+                self.ffn_norm2,
+                self.enable_zimage_native_norm_fusion,
+            )
         else:
             # Attention block
             attn_input = self.attention_norm1(x)

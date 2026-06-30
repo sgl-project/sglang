@@ -653,28 +653,28 @@
         },
         "zimage_image_t2i": {
             "stages_ms": {
-                "DecodingStage": 8.86,
+                "DecodingStage": 134.1,
                 "InputValidationStage": 0.04,
-                "DenoisingStage": 675.8,
-                "TextEncodingStage": 130.38,
-                "LatentPreparationStage": 0.14,
-                "TimestepPreparationStage": 31.38
+                "DenoisingStage": 771.7,
+                "TextEncodingStage": 130.68,
+                "LatentPreparationStage": 0.16,
+                "TimestepPreparationStage": 27.67
             },
             "denoise_step_ms": {
-                "0": 19.93,
-                "1": 28.65,
-                "2": 83.91,
-                "3": 83.48,
-                "4": 83.51,
-                "5": 83.69,
-                "6": 84.08,
-                "7": 84.04,
-                "8": 84.35
+                "0": 95.97,
+                "1": 29.8,
+                "2": 91.06,
+                "3": 91.41,
+                "4": 93.26,
+                "5": 90.11,
+                "6": 90.88,
+                "7": 91.93,
+                "8": 93.16
             },
-            "expected_e2e_ms": 1027.94,
-            "expected_avg_denoise_ms": 74.6,
-            "expected_median_denoise_ms": 86.63,
-            "estimated_full_test_time_s": 121.1
+            "expected_e2e_ms": 1068.66,
+            "expected_avg_denoise_ms": 85.29,
+            "expected_median_denoise_ms": 91.41,
+            "estimated_full_test_time_s": 116.3
         },
         "zimage_image_t2i_fp8": {
             "stages_ms": {
