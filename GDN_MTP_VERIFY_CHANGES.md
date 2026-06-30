@@ -131,6 +131,32 @@ if the PR should carry only the throughput-relevant changes (the +5.4% comes ent
 FlashInfer strided-qkv + native-a/b).
 
 ## Validation
-- gsm8k: 0.554 (1000ex) / 0.572 (500ex); accept length 3.39–3.43 (unchanged vs the 13,036 tok/s
-  baseline). conc256 throughput 13,036 → 13,744 tok/s (+5.4%, full stack).
+- gsm8k (Jane #26520 protocol: 1319 ex, 8-shot, max_tokens 16384, T=0.6): **0.9794** (none+FI
+  hybrid) = 0.9794 (none+Triton) ≈ 0.9779 (full+Triton) — lossless. (Earlier 0.55 numbers were a
+  truncated-CoT eval config, not a regression.)
 - Bit-exact gates on the FlashInfer side (`max|Δ|=0`); decode-only nsys + perfetto traces.
+
+## Decode step latency at concurrency 256 (GB300, controlled)
+Cleanest decode metric: the GPU period from one `step[TARGET_VERIFY]` to the next at sustained
+batch=256 — **accept-length-independent** (the verify forward processes bs×draft_tokens
+regardless of accepts) and **prefill-excluded**. Measured from the once-per-step
+`VerifyTreeGreedy` kernel's consecutive GPU timestamps; all configs run back-to-back on the
+SAME node (fixed seed, `num_prompts=256=max_concurrency`, in256/out1024) so node/seed variance
+cancels (±0.5 ms IQR).
+
+| config (cache-mode + backend) | verify / recovery | step latency (ms) | vs hybrid |
+|---|---|--:|--:|
+| **`none` + FlashInfer (this PR's hybrid)** | **WY verify + Triton recovery** | **45.8–46.9** | — |
+| `full` + Triton (baseline) | Triton verify (state cached) | ~47.5 | +1–4% |
+| `none` + Triton | Triton verify + Triton recovery | ~50.2 | +7–10% |
+| `none` + FlashInfer, FI-state verify + Triton recovery | FlashInfer state (non-WY) + Triton | 49.0 | +4.6% |
+| `none` + FlashInfer, FI-state verify + FI recovery (≈ #26520) | FlashInfer state + FlashInfer | 58.7 | +25.2% |
+
+**The hybrid (WY verify + Triton recovery) has the lowest per-step decode latency — faster than
+every other config, including full+Triton.** Isolating the two contributions (same-node
+FlashInfer-decode variants, recovery or verify held fixed):
+- **WY output-only verify: −4.6%/step** vs the FlashInfer state kernel (recovery=Triton fixed; 46.9 vs 49.0 ms).
+- **Triton recovery: −16.4%/step** vs FlashInfer recovery (verify=FI-state fixed; 49.0 vs 58.7 ms).
+
+This is why the original `none`+FlashInfer (FI-state verify + FI recovery, 58.7 ms) was *slower*
+than Triton: the hybrid fixes it via Triton recovery (−16%, dominant) + WY verify (−4.6%).
