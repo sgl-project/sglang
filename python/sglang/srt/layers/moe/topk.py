@@ -1729,6 +1729,9 @@ def _post_process_topk_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
+    use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
+        num_fused_shared_experts
+    )
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
@@ -1754,7 +1757,7 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        elif has_per_rank_fused_shared_slots(num_fused_shared_experts):
+        elif use_per_rank_shared_slots:
             # Shared experts appended as extra columns in topk_ids: their value
             # would be out-of-bounds for the logical-to-physical dispatch table,
             # so split, dispatch the routed cols, recombine.
@@ -1797,9 +1800,6 @@ def _post_process_topk_ids(
         recorder_topk_ids = topk_ids
 
     _aiter_append = num_fused_shared_experts > 0 and _use_aiter
-    use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
-        num_fused_shared_experts
-    )
 
     if _aiter_append and use_per_rank_shared_slots:
         # Fused path: append shared experts AND apply the per-rank shared-slot
@@ -1861,9 +1861,8 @@ def _post_process_topk_ids(
         )
 
     elif use_per_rank_shared_slots:
-        # DeepEP/MegaMOE: remap to interleaved expert layout where each rank's
-        # shared expert has a unique ID for dispatch routing. The aiter path
-        # above already performs this remap in the fused append kernel.
+        # DeepEP/MegaMOE: remap to interleaved expert layout where each
+        # rank's shared expert has a unique ID for dispatch routing.
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
             if expert_location_dispatch_info is not None

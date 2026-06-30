@@ -565,7 +565,7 @@ class DeepseekV2MoE(nn.Module):
             # 256 routed + EP_size shared slots = 272 experts total (for EP=16)
             num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
             top_k_for_moe = config.num_experts_per_tok + 1  # 8 routed + 1 shared
-            # Interleaving for A2A dispatch is handled by TopK internally.
+            # Interleaving for DeepEP/MegaMOE dispatch is handled by TopK internally.
         else:
             num_experts_for_moe = (
                 config.n_routed_experts + self.num_fused_shared_experts
@@ -604,8 +604,8 @@ class DeepseekV2MoE(nn.Module):
         )
 
         # scaling factor for fused shared experts on AMD/standard platforms.
-        # Per-rank shared-slot layouts do not need this: the shared expert is
-        # only computed on its home rank, so no 1/ep_size correction is needed.
+        # DeepEP/MegaMOE doesn't need this: shared expert is only computed on
+        # home rank, so no 1/ep_size correction is needed.
         fused_shared_experts_scaling_factor = None
         if (
             self.moe_ep_size > 1
@@ -688,8 +688,8 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
-        # Shared experts: skip when fused into the MoE kernel. In per-rank
-        # shared-slot layouts, the shared expert is a local slot in FusedMoE.
+        # Shared experts: skip when fused into MoE kernel
+        # (self.num_fused_shared_experts > 0) or when DeepEP/MegaMOE fusion is enabled.
         if (
             config.n_shared_experts is not None
             and config.n_shared_experts > 0
