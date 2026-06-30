@@ -571,8 +571,8 @@ def fused_sigmoid_mul(
 
     Equivalent to: attn_output * sigmoid(gate)
 
-    The production Qwen3.5 path passes a 3D strided gate. A single hidden-block
-    Triton kernel handles both that path and flat contiguous inputs.
+    The production Qwen3.5 path passes a 3D strided gate. Accelerator-backed
+    tensors use Triton, and CPU tensors use a Torch fallback.
 
     When inplace=True, writes result back to attn_output and returns it.
 
@@ -597,6 +597,15 @@ def fused_sigmoid_mul(
         head_dim = hidden_dim
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
+
+    if attn_output.device.type == "cpu":
+        attn_view = attn_output.reshape(num_tokens, hidden_dim)
+        gate_view = gate.reshape(num_tokens, hidden_dim)
+        result = (attn_view * torch.sigmoid(gate_view)).reshape_as(attn_output)
+        if inplace:
+            attn_output.copy_(result)
+            return attn_output
+        return result
 
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
