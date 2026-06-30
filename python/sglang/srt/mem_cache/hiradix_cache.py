@@ -499,7 +499,7 @@ class HiRadixCache(RadixCache):
         try:
             for req_id, info in list(self.ongoing_prefetch.items()):
                 try:
-                    last_host_node, token_ids, _operation = info
+                    last_host_node, prefetch_key, _operation = info
                 except Exception:
                     # Unexpected shape; just drop it.
                     self.ongoing_prefetch.pop(req_id, None)
@@ -521,7 +521,7 @@ class HiRadixCache(RadixCache):
                     )
 
                 try:
-                    cc.prefetch_tokens_occupied -= len(token_ids)
+                    cc.prefetch_tokens_occupied -= len(prefetch_key)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
                 except Exception:
@@ -578,53 +578,43 @@ class HiRadixCache(RadixCache):
                 drained += 1
                 yield item
 
+        def _revoke_prefetch(req_id, info):
+            last_host_node, prefetch_key, _ = info
+            self._abandon_prefetch(req_id, last_host_node, prefetch_key)
+
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                info = self.ongoing_prefetch.pop(req_id, None)
+                info = self.ongoing_prefetch.get(req_id)
                 if info is not None:
-                    last_host_node, token_ids, _ = info
-                    last_host_node.release_host()
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
+                    _revoke_prefetch(req_id, info)
 
         def _drain_storage_hit():
-            if not hasattr(cc, "prefetch_hit_queue"):
-                return
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
-                info = self.ongoing_prefetch.get(operation.request_id)
+                req_id = operation.request_id
+                info = self.ongoing_prefetch.get(req_id)
                 if info is None:
                     # request already aborted/cleaned up, skip
                     continue
                 if operation.is_terminated():
-                    # request was aborted while query was in-flight, clean up
-                    last_host_node, token_ids, _ = info
-                    last_host_node.release_host()
-                    del self.ongoing_prefetch[operation.request_id]
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
+                    # request was aborted while the storage query was in flight
+                    _revoke_prefetch(req_id, info)
                     continue
 
+                # The L3 hit count is now known, so reserve exactly that much host
+                # memory (this is the whole point: no over-allocation up front).
                 host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
                 if host_indices is None:
                     self.evict_host(operation.storage_hit_count)
                     host_indices = cc.mem_pool_host.alloc(operation.storage_hit_count)
-
                 if host_indices is None:
-                    # still can't alloc, revoke this prefetch
-                    last_host_node, token_ids, _ = info
-                    last_host_node.release_host()
-                    del self.ongoing_prefetch[operation.request_id]
-                    cc.prefetch_tokens_occupied -= len(token_ids)
-                    if cc.prefetch_tokens_occupied < 0:
-                        cc.prefetch_tokens_occupied = 0
+                    _revoke_prefetch(req_id, info)
                     logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to host memory allocation failure."
+                        f"Revoking prefetch for request {req_id} due to host memory allocation failure."
                     )
-                else:
-                    operation.host_indices = host_indices
-                    cc.prefetch_buffer.put(operation)
+                    continue
+
+                operation.host_indices = host_indices
+                cc.prefetch_buffer.put(operation)
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -1478,22 +1468,34 @@ class HiRadixCache(RadixCache):
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
+    def _abandon_prefetch(self, req_id: str, last_host_node, prefetch_key):
+        """Forget an in-flight prefetch: drop the host-node protection, remove it
+        from ongoing_prefetch, and decrement the in-flight prefetch token counter.
+        No host_indices is freed here -- under lazy allocation an abandoned prefetch
+        holds none until _drain_storage_hit() runs (and the host_indices-allocated
+        case is cleaned up by the normal completion path instead)."""
+        last_host_node.release_host()
+        self.ongoing_prefetch.pop(req_id, None)
+        cc = self.cache_controller
+        cc.prefetch_tokens_occupied = max(
+            0, cc.prefetch_tokens_occupied - len(prefetch_key)
+        )
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True
 
-        # todo: more policies for prefetch progress such as timeout
-        # the current policy is to prefetch with best effort and terminate when queuing is over
         last_host_node, prefetch_key, operation = self.ongoing_prefetch[req_id]
-
-        if operation.host_indices is None:
-            # host_indices allocated in _drain_storage_hit() after L3 hit confirmation.
-            # None means not ready yet, retry next scheduling cycle.
-            return False
 
         if not self.can_terminate_prefetch(operation):
             return False
+
+        if operation.host_indices is None:
+            # Stopping before allocation happened
+            self.cache_controller.terminate_prefetch(operation)
+            self._abandon_prefetch(req_id, last_host_node, prefetch_key)
+            return True
 
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
