@@ -36,33 +36,34 @@ _AUTOTUNE_CONFIGS = [
     for ns in (1, 2)
 ]
 
-# SM120: the 18-config autotune sweep (nvcc compile + benchmark of every config,
-# on every DP rank at once) overruns the 300s scheduler watchdog on the first
-# prefill. A *single* config means triton skips benchmarking and compiles once.
-# Env-tunable if you want to try other tiles. Off-SM120 keeps the full sweep.
 try:
     from sglang.srt.utils import is_sm120_supported as _is_sm120_supported
 
-    if _is_sm120_supported():
-        # On SM120 (H=64 under DP-attention) BLOCK_N is pinned to 16 by two hard
-        # constraints that intersect at a single value:
-        #   * smem <= 101376 B. Calibrated from two measured points (H=64,
-        #     BLOCK_N=64): stages=2->127232, stages=1->122880 (a pipeline stage
-        #     is only ~4352 B; the q/kv tiles dominate). Model: 640*BLOCK_N +
-        #     81920. => 64->122880(OOM), 32->102400(OOM ~1KB over), 16->92160(OK).
-        #     So BLOCK_N <= 16.
-        #   * the PV dot tl.dot(p[H,BLOCK_N], kv[BLOCK_N,D_V]) contracts over
-        #     BLOCK_N, and triton requires K >= 16. So BLOCK_N >= 16.
-        # Hence a single fixed config BLOCK_N=16 (also avoids autotune compiling
-        # an illegal/over-budget config, which triton does NOT skip for K<16).
-        _w = int(os.environ.get("SGLANG_SM120_DSA_ATTN_WARPS", "4"))
-        _ns = int(os.environ.get("SGLANG_SM120_DSA_ATTN_STAGES", "1"))
-        _bn = int(os.environ.get("SGLANG_SM120_DSA_ATTN_BLOCK_N", "16"))
-        _AUTOTUNE_CONFIGS = [
-            triton.Config({"BLOCK_N": _bn}, num_warps=_w, num_stages=_ns)
-        ]
+    _IS_SM120 = _is_sm120_supported()
 except Exception:  # noqa: BLE001
-    pass
+    _IS_SM120 = False
+
+# SM120 has two hard constraints that the original (all-heads-per-program) kernel
+# cannot satisfy simultaneously at H=64:
+#   * fp8 tl.dot needs K >= 32, and the PV dot contracts over BLOCK_N => BLOCK_N >= 32.
+#   * smem <= 101376 B, and (calibrated) BLOCK_N=32 needs ~102 KB at H=64 => BLOCK_N <= 16.
+# Empty intersection. The fix is to tile HEADS: process HEAD_BLOCK heads per
+# program (grid gains a head-block axis). At HEAD_BLOCK=16 the q tile drops from
+# [64,512]=32 KB to [16,512]=8 KB, so BLOCK_N=32/64 both fit AND give a legal
+# fp8 K (>=32). Off-SM120 keeps HEAD_BLOCK=H (no tiling) and the full autotune,
+# so AMD/Hopper behavior is byte-identical.
+_SM120_HEAD_BLOCK = int(os.environ.get("SGLANG_SM120_DSA_ATTN_HEAD_BLOCK", "16"))
+if _IS_SM120:
+    _w = int(os.environ.get("SGLANG_SM120_DSA_ATTN_WARPS", "4"))
+    _ns = int(os.environ.get("SGLANG_SM120_DSA_ATTN_STAGES", "1"))
+    _bn_env = os.environ.get("SGLANG_SM120_DSA_ATTN_BLOCK_N")
+    # BLOCK_N >= 32 (fp8 K) and, at HEAD_BLOCK=16, 32 & 64 both fit smem. Give
+    # triton both; it picks the faster. Small set => no watchdog risk.
+    _bns = [int(_bn_env)] if _bn_env else [32, 64]
+    _AUTOTUNE_CONFIGS = [
+        triton.Config({"BLOCK_N": bn}, num_warps=_w, num_stages=_ns)
+        for bn in _bns
+    ]
 
 
 @triton.autotune(
@@ -85,10 +86,15 @@ def _sparse_mla_fwd_kernel(
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HB: tl.constexpr,
 ):
     s_i = tl.program_id(0)
+    pid_h = tl.program_id(1)
 
-    h = tl.arange(0, H)
+    # This program handles HB of the H heads (head tiling). Offsets use the full
+    # head stride H; `h` selects the HB heads of this block. HB == H reproduces
+    # the original all-heads-per-program kernel (grid second axis = 1).
+    h = pid_h * HB + tl.arange(0, HB)
     dv = tl.arange(0, D_V)
     dt = tl.arange(0, D_TAIL)
     # q is read as two separate tensors (q_nope width D_V, q_rope width D_TAIL):
@@ -103,9 +109,9 @@ def _sparse_mla_fwd_kernel(
         q_nope_ptr.dtype.element_ty
     )  # [H, D_TAIL]
 
-    m_i = tl.full([H], -float("inf"), tl.float32)
-    l_i = tl.zeros([H], tl.float32)
-    acc = tl.zeros([H, D_V], tl.float32)
+    m_i = tl.full([HB], -float("inf"), tl.float32)
+    l_i = tl.zeros([HB], tl.float32)
+    acc = tl.zeros([HB, D_V], tl.float32)
 
     n = tl.arange(0, BLOCK_N)
     for k0 in range(0, topk, BLOCK_N):
@@ -172,8 +178,18 @@ def triton_sparse_mla_fwd(
     q_nope = q_nope.contiguous()
     q_rope = q_rope.contiguous()
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
+
+    # Head tiling: on SM120 process HEAD_BLOCK heads per program so the q tile and
+    # smem shrink enough for a legal fp8 BLOCK_N (>=32). Elsewhere HB == H (one
+    # head block, grid second axis = 1) -> identical to the original kernel.
+    hb = (
+        _SM120_HEAD_BLOCK
+        if (_IS_SM120 and H % _SM120_HEAD_BLOCK == 0 and H > _SM120_HEAD_BLOCK)
+        else H
+    )
+    grid = (seq, H // hb)
     # BLOCK_N / num_warps / num_stages are chosen by @triton.autotune.
-    _sparse_mla_fwd_kernel[(seq,)](
+    _sparse_mla_fwd_kernel[grid](
         q_nope,
         q_rope,
         kv,
@@ -186,6 +202,7 @@ def triton_sparse_mla_fwd(
         DIM=dim,
         D_V=d_v,
         D_TAIL=d_tail,
+        HB=hb,
     )
     return out.unsqueeze(0)
 
