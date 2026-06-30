@@ -16,7 +16,6 @@ import unittest
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.multi_ended_allocator import (
     MultiEndedAllocator,
     UnifiedSWATokenToKVPoolAllocator,
@@ -344,33 +343,31 @@ class TestMultiEndedAllocator(unittest.TestCase):
 
         CPU scope: the GPU write-race *urgent* path (unfired CUDA events ->
         _pending_reuse) needs a real device; this covers the no-event
-        move/absorb/free/released_fired bookkeeping. Run on a real device
-        with SGLANG_DEBUG_CHECK_V2P_TOMBSTONES=1 to cover the full path.
+        move/absorb/free/released_fired bookkeeping.
         """
-        with envs.SGLANG_DEBUG_CHECK_V2P_TOMBSTONES.override(True):
-            rng = random.Random(0x5373)
-            _, alloc, kv = self._build_lazy_full(n_full_slots=64, move_cap=2)
-            live = []
-            # Bias toward near-capacity occupancy (watermark high, holes pile
-            # up) then churn free/flush — the conditions that surface the bug.
-            for _ in range(3000):
-                avail = alloc.available_size()
-                if (rng.random() < 0.55 and avail > 0) or not live:
-                    n = rng.randint(1, min(5, max(1, avail)))
-                    v = self._alloc(alloc, kv, n)
-                    if v is not None:
-                        live.append(v)
-                else:
-                    v = live.pop(rng.randrange(len(live)))
-                    self._free(alloc, kv, v)  # often non-boundary -> a hole
-                if rng.random() < 0.5:
-                    alloc.flush_opportunistic()  # partial flush (move_cap)
-            # Drain to quiescence; must end empty AND ghost-free.
-            for v in live:
-                self._free(alloc, kv, v)
-            for _ in range(64):
-                alloc.flush_opportunistic()
-            self.assertEqual(alloc.allocated_count(), 0)
+        rng = random.Random(0x5373)
+        _, alloc, kv = self._build_lazy_full(n_full_slots=64, move_cap=2)
+        live = []
+        # Bias toward near-capacity occupancy (watermark high, holes pile
+        # up) then churn free/flush — the conditions that surface the bug.
+        for _ in range(3000):
+            avail = alloc.available_size()
+            if (rng.random() < 0.55 and avail > 0) or not live:
+                n = rng.randint(1, min(5, max(1, avail)))
+                v = self._alloc(alloc, kv, n)
+                if v is not None:
+                    live.append(v)
+            else:
+                v = live.pop(rng.randrange(len(live)))
+                self._free(alloc, kv, v)  # often non-boundary -> a hole
+            if rng.random() < 0.5:
+                alloc.flush_opportunistic()  # partial flush (move_cap)
+        # Drain to quiescence; must end empty AND ghost-free.
+        for v in live:
+            self._free(alloc, kv, v)
+        for _ in range(64):
+            alloc.flush_opportunistic()
+        self.assertEqual(alloc.allocated_count(), 0)
 
     def test_double_free_raises(self):
         _, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()

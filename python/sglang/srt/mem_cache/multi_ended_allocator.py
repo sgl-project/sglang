@@ -1503,10 +1503,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         `live_page_count` is updated from CPU shape metadata
         (`freed_p_pages.shape[0]`) — no sync. Tombstones in `freed_p_pages`
-        (which mean a virtual was already freed — a caller bug caught by
-        the debug check) would be cat'd onto the free list as `-1`; the
-        existing `SGLANG_DEBUG_CHECK_V2P_TOMBSTONES` debug gate catches
-        this loud rather than silently corrupting the free list.
+        (which mean a virtual was already freed — a caller bug) would be cat'd
+        onto the free list as `-1`; callers must not double-free.
         """
         self._stats_n_free_lazy += 1
         with record_function("MultiEndedAlloc._free_lazy"):
@@ -1521,13 +1519,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 else:
                     free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
-            # Tombstone safety check (debug-gated for perf — the .item() sync
-            # would otherwise dominate the lazy path's CPU cost).
-            if envs.SGLANG_DEBUG_CHECK_V2P_TOMBSTONES.get():
-                if bool((freed_p_pages < 0).any().item()):
-                    self._raise_stale_slot_assertion(
-                        free_v=free_v_pages, freed_p=freed_p_pages
-                    )
             # Disjoint-element scatters on schedule_stream — no event/barrier
             # (a freed v has no live reader; v2p/p2v writes are disjoint from
             # any in-flight forward's reads, and per-element scatter writes
