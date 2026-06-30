@@ -19,6 +19,24 @@ def _floor_power_of_2(x: int) -> int:
     return 1 << (int(x).bit_length() - 1)
 
 
+# ---------------------------------------------------------------------------
+# Tunable launch configs for the served decode kernels.
+#
+# Defaults are the validated (num_warps=4, num_stages=2). The bench/tuning
+# scripts override these module globals before the first launch to sweep configs
+# and land the winners here. They are NOT triton.autotune so that each shape
+# bucket compiles to a single deterministic artifact (cuda-graph capture safe).
+# ---------------------------------------------------------------------------
+# NOTE: swept num_warps∈{2,4,8} × num_stages∈{2,3} via sweep_cfg.py on the real
+# captured decode workload (mostly short seqs -> launch-bound). No config beat the
+# validated (4,2) outside run-to-run noise, so 4/2 is kept. The hooks remain for
+# re-tuning if the served batch/context-length profile shifts to compute-bound.
+_SPARSE_DECODE_NW = 4
+_SPARSE_DECODE_NS = 2
+_MERGE_NW = 4
+_MERGE_NS = 2
+
+
 def _get_vectorcore_num_safe() -> int:
     """Return the Ascend NPU vector-core count (sglang-native).
 
@@ -34,6 +52,9 @@ def _get_vectorcore_num_safe() -> int:
         # Conservative fallback.
         return 32
     return max(1, n) if n > 0 else 32
+
+
+
 
 
 def _choose_num_topk_chunks(
@@ -499,11 +520,23 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     # This keeps correctness unchanged while avoiding the backend corner case.
     chunk_size_topk = max(2, chunk_size_topk)
 
-    o_partial = torch.empty(
-        (num_topk_chunks, batch_size, num_q_heads, head_dim),
-        dtype=q.dtype,
-        device=q.device,
-    )
+    # Single-chunk fast path: with NUM_TOPK_CHUNKS==1 the decode kernel writes the
+    # already-final-normalized output (it applies the final exp(m_i - lse_i) scale
+    # before storing), so the merge kernel would be a no-op copy. Alias o_partial
+    # to the final output buffer (pid_c is always 0 -> pid_c*stride_o_c == 0) and
+    # skip the merge launch + the [C,B,QH,D] temp allocation.
+    single_chunk = num_topk_chunks == 1
+    out = torch.empty_like(q)
+    if single_chunk:
+        o_partial = out.view(1, batch_size, num_q_heads, head_dim)
+    else:
+        o_partial = torch.empty(
+            (num_topk_chunks, batch_size, num_q_heads, head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+    # lse_partial is always written by the kernel; unused on the single-chunk path
+    # but required as a store target (small, [C,B,QH]).
     lse_partial = torch.empty(
         (num_topk_chunks, batch_size, num_q_heads),
         dtype=torch.float32,
@@ -562,31 +595,30 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         NUM_TOPK_CHUNKS=num_topk_chunks,
         CHUNK_SIZE_T=chunk_size_topk,
         HAS_SINK=sink is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=_SPARSE_DECODE_NW,
+        num_stages=_SPARSE_DECODE_NS,
     )
 
-    out = torch.empty_like(q)
-
-    merge_grid = (batch_size, num_q_heads)
-    _merge_topk_attn_out_bnsd_kernel[merge_grid](
-        o_partial,
-        lse_partial,
-        out,
-        head_dim,
-        o_partial.stride(0),
-        o_partial.stride(1),
-        o_partial.stride(2),
-        o_partial.stride(3),
-        lse_partial.stride(0),
-        lse_partial.stride(1),
-        lse_partial.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        NUM_TOPK_CHUNKS=num_topk_chunks,
-        num_warps=4,
-        num_stages=2,
-    )
+    if not single_chunk:
+        merge_grid = (batch_size, num_q_heads)
+        _merge_topk_attn_out_bnsd_kernel[merge_grid](
+            o_partial,
+            lse_partial,
+            out,
+            head_dim,
+            o_partial.stride(0),
+            o_partial.stride(1),
+            o_partial.stride(2),
+            o_partial.stride(3),
+            lse_partial.stride(0),
+            lse_partial.stride(1),
+            lse_partial.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            NUM_TOPK_CHUNKS=num_topk_chunks,
+            num_warps=_MERGE_NW,
+            num_stages=_MERGE_NS,
+        )
 
     return out

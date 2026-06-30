@@ -10,10 +10,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
-    ALLOC_MEMORY_FUNCS,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
     MHATokenToKOnlyPoolHost,
     MHATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -30,10 +32,8 @@ def _cuda_major() -> int:
         return 0
 
 
-# direct+page_first_direct host transfer routes to the AOT
-# transfer_kv_all_layer_direct_lf_pf -> cudaMemcpyBatchAsync, which returns
-# cudaErrorInvalidValue on CUDA 13 and throws instead of falling back. M3 sparse
-# production uses io_backend="kernel" + layer_first, not this combo.
+# direct+page_first_direct routes to transfer_kv_all_layer_direct_lf_pf, which on
+# CUDA 13 throws (cudaErrorInvalidValue) instead of falling back. M3 uses kernel+layer_first.
 _DIRECT_PF_BATCHCOPY_BROKEN_CUDA13 = _cuda_major() >= 13
 
 
@@ -316,9 +316,16 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             page_size,
             device="cuda" if io_backend == "kernel" else "cpu",
         )
+        # page_first main-KV backup (staged_write_back.cuh) needs CPU dst_indices,
+        # index-k backup (hicache.cuh) needs CUDA indices — feed a CPU copy to main only.
+        kv_host_indices = (
+            host_indices.cpu()
+            if (io_backend, layout) == ("kernel", "page_first")
+            else host_indices
+        )
 
         kv_host.backup_from_device_all_layer(
-            device_pool.main_pool, host_indices, device_indices, io_backend
+            device_pool.main_pool, kv_host_indices, device_indices, io_backend
         )
         index_host.backup_from_device_all_layer(
             device_pool.index_k_pool, host_indices, device_indices, io_backend

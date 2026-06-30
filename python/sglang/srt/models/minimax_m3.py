@@ -388,7 +388,7 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_alpha=config.swiglu_alpha,
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
-            interleaved=False,
+            gate_up_interleaved=False,
         )
         # use sigmoid_topk, instead of grouped_topk
         self.topk = TopK(
@@ -695,10 +695,14 @@ class MiniMaxM3Attention(nn.Module):
         if self.qk_norm_type == "per_layer":
             if attn_tp_size > 1:
                 self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_heads * self.head_dim,
+                    num_heads=self.total_num_heads,
+                    eps=config.rms_norm_eps,
                 )
                 self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_kv_heads * self.head_dim,
+                    num_heads=self.total_num_kv_heads,
+                    eps=config.rms_norm_eps,
                 )
             else:
                 self.q_norm = RMSNorm(

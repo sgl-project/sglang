@@ -1031,7 +1031,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     )
 
     use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-    if N % 4 != 0 or G % 4 != 0:
+    if N % 4 != 0 or G % 4 != 0 or D // 8 < E:
         use_jit_ep_activation = False
     if gemm1_alpha is not None:
         use_jit_ep_activation = False

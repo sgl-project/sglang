@@ -177,6 +177,29 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
     return config.index_topk
 
 
+def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer reuses the previous layer's top-k indices."""
+    assert is_deepseek_dsa(config)
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", 1)
+    if freq is None:
+        freq = 1
+    assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        assert offset > 0, (
+            "index_skip_topk_offset must be positive; offset <= 0 "
+            "marks layer 0 as skip_topk with no prior topk to reuse"
+        )
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
@@ -324,6 +347,28 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
+        # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
+        self.nvfp4_moe_meta: Optional[dict] = None
+        hybrid_quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if hybrid_quant_cfg is not None and not isinstance(hybrid_quant_cfg, dict):
+            hybrid_quant_cfg = hybrid_quant_cfg.to_dict()
+        if (
+            hybrid_quant_cfg is not None
+            and str(hybrid_quant_cfg.get("quant_algo", "")).upper() == "MIXED_PRECISION"
+            and str(hybrid_quant_cfg.get("moe_quant_algo", "")).upper() == "NVFP4"
+            and hybrid_quant_cfg.get("group_size") is not None
+        ):
+            self.nvfp4_moe_meta = {
+                "group_size": int(hybrid_quant_cfg["group_size"]),
+                "exclude_modules": list(hybrid_quant_cfg.get("ignore") or []),
+            }
+            logger.info(
+                "Auto-detected hybrid FP8+NVFP4 checkpoint "
+                "(NVFP4 MoE group_size=%d, %d exclude_modules)",
+                self.nvfp4_moe_meta["group_size"],
+                len(self.nvfp4_moe_meta["exclude_modules"]),
+            )
+
         # Check model type
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
@@ -387,6 +432,14 @@ class ModelConfig:
                     self.hf_config.architectures
                 )
             )
+        )
+        # Multimodal archs whose language-model prefill is verified safe to capture
+        # under piecewise CUDA graph. ServerArgs otherwise disables prefill piecewise
+        # CG for every multimodal model; this opt-in re-enables it for listed archs
+        # (the vision encoder still runs eagerly via general_mm_embed_routine, only the
+        # LM forward is captured).
+        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1134,9 +1187,12 @@ class ModelConfig:
             return True
 
         # Check for HuggingFace quantization config
-        from sglang.srt.utils import has_hf_quant_config
+        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None:
+            from sglang.srt.utils import has_hf_quant_config
 
-        return has_hf_quant_config(self.model_path)
+            return has_hf_quant_config(self.model_path)
+        return True
 
     def _get_modelopt_quant_type(self) -> str:
         """Extract ModelOpt quantization type from unified quantization flag."""
@@ -1216,6 +1272,7 @@ class ModelConfig:
             "mxfp4",
             "mxfp8",
             "auto-round",
+            "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
         ]
@@ -1251,6 +1308,7 @@ class ModelConfig:
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
+            "auto-round-int8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -1649,6 +1707,7 @@ multimodal_model_archs = [
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
+    "UnlimitedOCRForCausalLM",
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
@@ -1663,6 +1722,14 @@ piecewise_cuda_graph_disabled_model_archs = [
     "Qwen3NextForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
+]
+
+# Multimodal archs allowed to keep prefill piecewise CUDA graph enabled. The
+# generic "multimodal model" rule in ServerArgs disables prefill piecewise CG for
+# all multimodal models; archs here opt back in because their LM prefill captures
+# cleanly (vision encoder runs eagerly outside the graph via general_mm_embed_routine).
+multimodal_piecewise_cuda_graph_supported_model_archs = [
+    "Cohere2VisionForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1732,8 +1799,9 @@ multimodal_piecewise_cuda_graph_supported_archs = [
 
 
 def is_multimodal_piecewise_cuda_graph_supported(model_architectures: List[str]):
+    """Whether a multimodal arch may keep prefill piecewise CUDA graph enabled."""
     return any(
-        arch in multimodal_piecewise_cuda_graph_supported_archs
+        arch in multimodal_piecewise_cuda_graph_supported_model_archs
         for arch in model_architectures
     )
 
@@ -1796,8 +1864,16 @@ def is_hybrid_swa_model(
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
+        "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
+        # Only treat Laguna as hybrid SWA when it actually has a sliding window.
+        if (
+            "LagunaForCausalLM" in model_architectures
+            and hf_text_config is not None
+            and not getattr(hf_text_config, "sliding_window", 0)
+        ):
+            return False
         return True
     # Also recognize models that explicitly opt-in via their HF text config,
     # so custom hybrid-SWA architectures don't need to be added to the allowlist.
@@ -1875,6 +1951,9 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
+    elif "UnlimitedOCRForCausalLM" in model_architectures:
+        swa_attention_layer_ids = list(range(num_hidden_layers))
+        full_attention_layer_ids = []
     elif getattr(hf_text_config, "hybrid_layer_pattern", None) is not None:
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern

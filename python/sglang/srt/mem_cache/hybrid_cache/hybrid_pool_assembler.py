@@ -263,8 +263,8 @@ def _deepseek_v4_num_host_pages(
             "use --hicache-ratio instead."
         )
     ratio = server_args.hicache_ratio
-    full_host_pages = max(int(device_full_pages * ratio), device_full_pages + 1)
-    swa_host_pages = max(int(device_swa_pages * ratio), device_swa_pages + 1)
+    full_host_pages = int(device_full_pages * ratio)
+    swa_host_pages = int(device_swa_pages * ratio)
     return full_host_pages, swa_host_pages
 
 
@@ -287,32 +287,33 @@ def build_deepseek_v4_hicache_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
-    # TODO(hzh0425): Support PP for deepseek v4 with hicache
     transfer_layer_num = kvcache.end_layer - kvcache.start_layer
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
-    swa_layer_mapping = {
-        layer_id: layer_id for layer_id in range(len(kvcache.swa_kv_pool.kv_buffer))
-    }
+    if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_num:
+        raise ValueError(
+            "DeepSeek V4 SWA KV pool must be PP-stage-local: "
+            f"got {len(kvcache.swa_kv_pool.kv_buffer)} buffers for "
+            f"{transfer_layer_num} local layers"
+        )
+    swa_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
     c4_layer_mapping = {}
     c128_layer_mapping = {}
+    c4_state_local_layers = []
     c4_state_global_layers = []
-    c128_state_global_layers = []
-    for layer_id, layer_item in enumerate(
+    for local_layer_id, layer_item in enumerate(
         kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
     ):
+        global_layer_id = kvcache.start_layer + local_layer_id
         if layer_item.compress_ratio == 4:
-            c4_layer_mapping[layer_id] = layer_item.compress_layer_id
-            c4_state_global_layers.append(layer_id)
+            c4_layer_mapping[local_layer_id] = layer_item.compress_layer_id
+            c4_state_local_layers.append(local_layer_id)
+            c4_state_global_layers.append(global_layer_id)
         elif layer_item.compress_ratio == 128:
-            c128_layer_mapping[layer_id] = layer_item.compress_layer_id
-            c128_state_global_layers.append(layer_id)
+            c128_layer_mapping[local_layer_id] = layer_item.compress_layer_id
 
     c4_state_mapping = {
-        layer_id: local_id for local_id, layer_id in enumerate(c4_state_global_layers)
-    }
-    c128_state_mapping = {
-        layer_id: local_id for local_id, layer_id in enumerate(c128_state_global_layers)
+        layer_id: local_id for local_id, layer_id in enumerate(c4_state_local_layers)
     }
     num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
         params=params,
@@ -322,7 +323,9 @@ def build_deepseek_v4_hicache_stack(
         swa_page_size=kvcache.swa_page_size,
     )
 
-    logical_host_pool = LogicalHostPool(num_host_pages * page_size, page_size)
+    logical_host_pool = LogicalHostPool(
+        num_host_pages * page_size, page_size, layout=server_args.hicache_mem_layout
+    )
     swa_host_pool = DeepSeekV4PagedHostPool(
         pool_name=str(PoolName.SWA),
         device_buffers=kvcache.swa_kv_pool.kv_buffer,

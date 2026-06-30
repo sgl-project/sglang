@@ -11,6 +11,18 @@ def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
 
 
+# ---------------------------------------------------------------------------
+# Tunable launch configs for the served decode kernels.
+#
+# Defaults are the validated (num_warps=4, num_stages=2). The bench/tuning
+# scripts override these module globals before the first launch to sweep configs
+# and land the winners here. They are NOT triton.autotune so that each shape
+# bucket compiles to a single deterministic artifact (cuda-graph capture safe).
+# ---------------------------------------------------------------------------
+_SCORE_CHUNK_NW = 4
+_SCORE_CHUNK_NS = 2
+
+
 def _get_vectorcore_num_safe() -> int:
     """Return the Ascend NPU vector-core count (sglang-native).
 
@@ -55,6 +67,25 @@ def _choose_num_kv_chunks(
 
     target = max(1, min(max_num_kv_chunks, target_grid // denom))
     return 1 << (target.bit_length() - 1)
+
+
+def _choose_num_score_chunks(
+    max_seqblock: int,
+    blocks_per_chunk: int = 16,
+    max_chunks: int = 16,
+) -> int:
+    """Pick the number of block-tiles for the chunked score-only kernel.
+
+    Each program iterates over a tile of ~``blocks_per_chunk`` blocks, so the
+    program count no longer scales with context length. We pick enough chunks to
+    keep the per-program serial loop near ``blocks_per_chunk`` while bounding the
+    total (power-of-two to keep the kernel-specialization set small).
+    """
+    if max_seqblock <= 0:
+        return 1
+    balance = (max_seqblock + max(1, blocks_per_chunk) - 1) // max(1, blocks_per_chunk)
+    n = max(1, min(balance, max(1, max_chunks)))
+    return 1 << (n.bit_length() - 1)
 
 
 def _torch_topk_from_score(
@@ -166,6 +197,30 @@ def _topk_index_streaming_bnsd_kernel(
     num_blocks = tl.cdiv(seq_len, block_size)
 
     off_t = tl.arange(0, BLOCK_SIZE_T)
+
+    # Trivial batch: every valid block fits in the top-k budget. Emit
+    # [0..num_blocks) + -1 padding directly, WITHOUT reading score. This is the
+    # safety counterpart to the score-kernel trivial-skip: when num_blocks <=
+    # topk the score columns may be uninitialized (the score kernel early-
+    # returns for this batch), so the score read below must be bypassed.
+    # Per-(batch,head) program -> mixed batches handled naturally, each program
+    # decides from its own seq_len.
+    if num_blocks <= topk:
+        out_idx = tl.where(
+            off_t < num_blocks,
+            off_t,
+            tl.full((BLOCK_SIZE_T,), -1, dtype=tl.int32),
+        )
+        tl.store(
+            topk_idx_ptr
+            + pid_h * stride_tif_h
+            + pid_b * stride_tif_b
+            + off_t * stride_tif_t,
+            out_idx.to(topk_idx_ptr.dtype.element_ty),
+            mask=off_t < topk,
+        )
+        return
+
     valid_topk_lane = off_t < topk
 
     # Invalid lanes are +inf so they never become the replacement target.
@@ -176,7 +231,11 @@ def _topk_index_streaming_bnsd_kernel(
     )
     top_indices = tl.full((BLOCK_SIZE_T,), -1, dtype=tl.int32)
 
-    for block_idx in tl.range(0, max_seqblock):
+    # Scan only the actual valid blocks, not the static padded max_seqblock.
+    # (Runtime loop bound is the same pattern as the score chunk kernels'
+    # `tl.range(num_steps)`; cuda-graph safe -- grid is fixed, only per-program
+    # trip count varies.)
+    for block_idx in tl.range(0, num_blocks):
         valid_block = block_idx < num_blocks
         score = tl.load(
             score_ptr
@@ -310,6 +369,8 @@ def _decode_bnsd_score_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SCORE_TYPE: tl.constexpr,
+    topk: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     tl.static_assert(BLOCK_SIZE_N >= block_size)
@@ -320,6 +381,14 @@ def _decode_bnsd_score_kernel(
 
     seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
     num_blocks = tl.cdiv(seq_len, block_size)
+
+    # Trivial-skip: when the sequence has <= topk blocks, every block is
+    # selected regardless of score, so the QK + scoring work is wasted.
+    # Mirrors the GPU _decode_score_kernel trivial-skip; paired with the
+    # streaming topk short-circuit so the uninitialized score is never read.
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if num_blocks <= topk:
+            return
 
     if pid_blk >= num_blocks:
         return
@@ -397,6 +466,175 @@ def _decode_bnsd_score_kernel(
         score.to(score_ptr.dtype.element_ty),
         mask=off_h < gqa_group_size,
     )
+
+
+# =============================================================================
+# BNSD Decode Score Chunk Kernel (score-only, one program per block-tile)
+# =============================================================================
+
+
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_H": lambda args: max(
+            16, triton.next_power_of_2(args["gqa_group_size"])
+        ),
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    }
+)
+@triton.jit
+def _decode_bnsd_score_chunk_kernel(
+    q_ptr,              # [B, QH, D]
+    k_cache_ptr,        # [NBLOCKS, BLOCK, KVH, D]
+    block_table_ptr,    # [B, max_num_blocks]
+    score_ptr,          # [QH, B, max_seqblock]
+    seq_lens,           # [B]
+    # shape
+    batch_size,
+    gqa_group_size,
+    head_dim,
+    # block/scaling
+    block_size: tl.constexpr,
+    sm_scale,
+    init_blocks,
+    local_blocks,
+    num_kv_chunks,
+    # strides
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_block,
+    stride_k_offset,
+    stride_k_h,
+    stride_k_d,
+    stride_bt_b,
+    stride_bt_n,
+    stride_s_h,
+    stride_s_b,
+    stride_s_n,
+    # meta
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SCORE_TYPE: tl.constexpr,
+    topk: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+):
+    """Score-only chunked kernel.
+
+    Same per-block score math as ``_decode_bnsd_score_kernel``, but one program
+    iterates over a tile of consecutive logical blocks (its chunk), loading Q
+    once and reusing it for every block in the tile. Grid is
+    ``(batch_size * num_kv_chunks, num_kv_heads)`` -- independent of context
+    length -- so total score time no longer scales with ``max_seqblock``.
+    Output score tensor is bit-identical to the 1-block-per-program kernel.
+
+    NOTE: a multi-block K-tile (BLOCKS_PER_K_BLOCK > 1, one tl.dot over several
+    consecutive blocks) was attempted to cut dot/loop count for the full-context
+    scan, but it is NOT viable on this Ascend TBE backend: the 3D tl.reshape of
+    the dot result miscompiles (~400x slowdown at BPK=1), the lane-arithmetic
+    fallback is similarly pathological (~1500x), and BPK>1 hard-crashes the
+    compiler (BLOCK_SIZE_N=256/512 and/or the vectorized block_table gather).
+    Kept as 1-block-per-iteration. A fused/tiled version would need a non-Triton
+    (Ascend C++/TBE) kernel.
+    """
+    tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
+    tl.static_assert(BLOCK_SIZE_N >= block_size)
+
+    pid_bc = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+
+    pid_b = pid_bc % batch_size
+    pid_c = pid_bc // batch_size
+    pid_h = pid_kh * gqa_group_size
+
+    seq_len = tl.load(seq_lens + pid_b).to(tl.int32)
+    num_blocks = tl.cdiv(seq_len, block_size)
+
+    # Trivial-skip: when the sequence has <= topk blocks, every block is
+    # selected regardless of score, so the QK + scoring work is wasted. Early-
+    # return leaves score[(h,b),:] uninitialized; the streaming topk kernel
+    # short-circuits the same (num_blocks <= topk) case without reading score,
+    # so this is safe. Mirrors the GPU _decode_score_kernel trivial-skip.
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if num_blocks <= topk:
+            return
+
+    chunk_size_blocks = tl.maximum(1, tl.cdiv(num_blocks, num_kv_chunks))
+    chunk_start_block = pid_c * chunk_size_blocks
+    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
+
+    if chunk_start_block >= chunk_end_block:
+        return
+
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_n = tl.arange(0, BLOCK_SIZE_N)
+
+    # Q: [H, D] -- loaded once, reused across the whole chunk.
+    q_offsets = (
+        pid_b * stride_q_b
+        + (pid_h + off_h[:, None]) * stride_q_h
+        + off_d[None, :] * stride_q_d
+    )
+    q = tl.load(
+        q_ptr + q_offsets,
+        mask=(off_h[:, None] < gqa_group_size) & (off_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    sm_scale_log2e = sm_scale * 1.4426950409
+    local_start = tl.maximum(0, num_blocks - local_blocks)
+
+    num_steps = chunk_end_block - chunk_start_block
+    for step in tl.range(num_steps):
+        logical_block = chunk_start_block + step
+        physical_block = tl.load(
+            block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n
+        ).to(tl.int64)
+
+        pos = logical_block * block_size + off_n
+        pos_mask = pos < seq_len
+
+        # K: [D, N]
+        k_offsets = (
+            physical_block * stride_k_block
+            + off_n[None, :] * stride_k_offset
+            + pid_kh * stride_k_h
+            + off_d[:, None] * stride_k_d
+        )
+        k = tl.load(
+            k_cache_ptr + k_offsets,
+            mask=(off_d[:, None] < head_dim) & pos_mask[None, :],
+            other=0.0,
+        )
+
+        qk = tl.dot(q, k) * sm_scale_log2e
+        qk = tl.where(pos_mask[None, :], qk, float("-inf"))
+
+        sub_max = tl.max(qk, axis=1)
+        if SCORE_TYPE == "max":
+            score = sub_max
+        else:
+            score = sub_max + tl.log2(
+                tl.sum(tl.exp2(qk - sub_max[:, None]), axis=1)
+            )
+            score = tl.where(score != score, float("-inf"), score)
+
+        is_init = logical_block < init_blocks
+        is_local = (logical_block >= local_start) & (logical_block < num_blocks)
+        score = tl.where(is_init, 1e30, score)
+        score = tl.where(is_local, 1e29, score)
+
+        s_offsets = (
+            (pid_h + off_h) * stride_s_h
+            + pid_b * stride_s_b
+            + logical_block * stride_s_n
+        )
+        tl.store(
+            score_ptr + s_offsets,
+            score.to(score_ptr.dtype.element_ty),
+            mask=off_h < gqa_group_size,
+        )
 
 
 # =============================================================================
@@ -949,14 +1187,19 @@ def flash_decode_bnsd_with_topk_idx(
     disable_index_value: bool = False,
     num_kv_chunks: Optional[int] = None,
     max_num_kv_chunks: int = 8,
-    use_triton_topk: bool = True,
+    use_triton_topk: Optional[bool] = None,
     # Kept for API compatibility with the split-K topk attempt; ignored by
     # the streaming topk implementation.
     num_topk_chunks: Optional[int] = None,
-    # Full decode optimization switch. When True, full decode computes block
-    # scores and attention outputs in one BNSD KV pass. Score-only still uses
-    # the dedicated score kernel.
-    use_fused_score_attn: bool = True,
+    # Score-only path: use the chunked score kernel (one program iterates over a
+    # tile of blocks, loading Q once) instead of the 1-block-per-program kernel.
+    # Same program count regardless of context -> score time stops scaling with
+    # max_seqblock. Score values are bit-identical to the 1-block kernel.
+    use_chunked_score: bool = True,
+    # Target block tiles per program for the chunked score kernel. Larger ->
+    # fewer programs (less scheduling) but longer serial loop; smaller -> more
+    # parallelism. Tuned via bench_sparse_decode / bench_scale.
+    score_blocks_per_chunk: int = 16,
 ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
     """Decode attention with BNSD KV cache and block-level topk indices.
 
@@ -1001,47 +1244,120 @@ def flash_decode_bnsd_with_topk_idx(
     max_seqblock = (max_seqlen + block_size - 1) // block_size
     block_size_n = _next_power_of_2(block_size)
 
-    score = torch.full(
+    # Pick the topk backend adaptively when the caller does not force one. The
+    # fused triton streaming topk (_topk_index_streaming_bnsd_kernel) has minimal
+    # launch overhead and wins for small contexts, but its serial O(max_seqblock)
+    # scan (num_warps=1, one program per (batch, head)) scales linearly and loses
+    # to the flat aclnnTopk vendor kernel for long contexts. Measured crossover on
+    # this part (block_size=128, topk=16, batch=16): triton wins up to
+    # max_seqblock~256, torch wins from ~512. None -> choose by max_seqblock.
+    # Current serving (context-length=10240 -> max_seqblock<=80) stays on triton.
+    if use_triton_topk is None:
+        use_triton_topk = max_seqblock <= 256
+
+    # Trivial-skip gate: only skip score writes when the downstream topk backend
+    # does not read score for trivial batches (num_blocks <= topk). The streaming
+    # triton topk short-circuits per (batch,head) on num_blocks<=topk without
+    # reading score (see _topk_index_streaming_bnsd_kernel); _torch_topk_from_score
+    # reads the whole score tensor in a batched torch.topk and CANNOT tolerate
+    # garbage for trivial batches, so it must not skip. Mirrors GPU's
+    # skip_trivial_topk_score = use_dense_main_attn or use_jit_topk.
+    skip_trivial_topk_score = use_triton_topk
+    import os as _os_skip
+    if _os_skip.environ.get("MINIMAX_NPU_TRITON_DISABLE_TRIVIAL_SKIP"):
+        skip_trivial_topk_score = False
+
+    # Score tensor: columns [0, num_blocks_b) are written per (head, batch) row;
+    # the tail [num_blocks_b, max_seqblock) is NEVER written. Both topk backends
+    # (_streaming_topk_from_score and _torch_topk_from_score) clamp their scan to
+    # num_blocks_b, so the uninitialized tail is never read. Use torch.empty to
+    # skip the fp32 memset (under cuda-graph capture the static score shape can be
+    # much larger than the live context, making a full -inf fill wasted work).
+    # Contract: any future reader of `score` MUST mask by per-batch num_blocks.
+    score = torch.empty(
         (num_q_heads, batch_size, max_seqblock),
-        -float("inf"),
         dtype=torch.float32,
         device=q.device,
     )
 
     if disable_index_value:
-        # Score-only path: keep the minimal dedicated score kernel.
-        grid_score = (batch_size, num_kv_heads, max_seqblock)
-        _decode_bnsd_score_kernel[grid_score](
-            q,
-            k_cache_bnsd,
-            block_table,
-            score,
-            seq_lens,
-            batch_size,
-            gqa_group_size,
-            head_dim,
-            max_seqblock,
-            block_size,
-            sm_scale,
-            init_blocks,
-            local_blocks,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_cache_bnsd.stride(0),
-            k_cache_bnsd.stride(1),
-            k_cache_bnsd.stride(2),
-            k_cache_bnsd.stride(3),
-            block_table.stride(0),
-            block_table.stride(1),
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            BLOCK_SIZE_N=block_size_n,
-            SCORE_TYPE=score_type,
-            num_warps=4,
-            num_stages=2,
-        )
+        # Score-only path.
+        if use_chunked_score:
+            # One program per (batch, kv-head, block-tile); Q loaded once per
+            # tile. Program count is independent of context length.
+            num_score_chunks = _choose_num_score_chunks(
+                max_seqblock, blocks_per_chunk=score_blocks_per_chunk
+            )
+            grid_score = (batch_size * num_score_chunks, num_kv_heads)
+            _decode_bnsd_score_chunk_kernel[grid_score](
+                q,
+                k_cache_bnsd,
+                block_table,
+                score,
+                seq_lens,
+                batch_size,
+                gqa_group_size,
+                head_dim,
+                block_size,
+                sm_scale,
+                init_blocks,
+                local_blocks,
+                num_score_chunks,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k_cache_bnsd.stride(0),
+                k_cache_bnsd.stride(1),
+                k_cache_bnsd.stride(2),
+                k_cache_bnsd.stride(3),
+                block_table.stride(0),
+                block_table.stride(1),
+                score.stride(0),
+                score.stride(1),
+                score.stride(2),
+                BLOCK_SIZE_N=block_size_n,
+                SCORE_TYPE=score_type,
+                topk=topk,
+                SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+                num_warps=_SCORE_CHUNK_NW,
+                num_stages=_SCORE_CHUNK_NS,
+            )
+        else:
+            # Legacy: one program per block (scales with max_seqblock).
+            grid_score = (batch_size, num_kv_heads, max_seqblock)
+            _decode_bnsd_score_kernel[grid_score](
+                q,
+                k_cache_bnsd,
+                block_table,
+                score,
+                seq_lens,
+                batch_size,
+                gqa_group_size,
+                head_dim,
+                max_seqblock,
+                block_size,
+                sm_scale,
+                init_blocks,
+                local_blocks,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k_cache_bnsd.stride(0),
+                k_cache_bnsd.stride(1),
+                k_cache_bnsd.stride(2),
+                k_cache_bnsd.stride(3),
+                block_table.stride(0),
+                block_table.stride(1),
+                score.stride(0),
+                score.stride(1),
+                score.stride(2),
+                BLOCK_SIZE_N=block_size_n,
+                SCORE_TYPE=score_type,
+                topk=topk,
+                SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
+                num_warps=4,
+                num_stages=2,
+            )
 
         if use_triton_topk:
             topk_idx = _streaming_topk_from_score(score, seq_lens, block_size, topk)
@@ -1073,131 +1389,54 @@ def flash_decode_bnsd_with_topk_idx(
     )
 
     grid_attn = (batch_size * num_kv_chunks, num_kv_heads)
-
-    if use_fused_score_attn:
-        _decode_bnsd_score_attn_chunk_kernel[grid_attn](
-            q,
-            sink,
-            k_cache_bnsd,
-            v_cache_bnsd,
-            block_table,
-            o_chunks,
-            lse_chunks,
-            score,
-            seq_lens,
-            batch_size,
-            gqa_group_size,
-            head_dim,
-            block_size,
-            sm_scale,
-            init_blocks,
-            local_blocks,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            sink.stride(0) if sink is not None else 0,
-            sink.stride(1) if sink is not None else 0,
-            k_cache_bnsd.stride(0),
-            k_cache_bnsd.stride(1),
-            k_cache_bnsd.stride(2),
-            k_cache_bnsd.stride(3),
-            v_cache_bnsd.stride(0),
-            v_cache_bnsd.stride(1),
-            v_cache_bnsd.stride(2),
-            v_cache_bnsd.stride(3),
-            block_table.stride(0),
-            block_table.stride(1),
-            o_chunks.stride(0),
-            o_chunks.stride(1),
-            o_chunks.stride(2),
-            o_chunks.stride(3),
-            lse_chunks.stride(0),
-            lse_chunks.stride(1),
-            lse_chunks.stride(2),
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            BLOCK_SIZE_N=block_size_n,
-            NUM_KV_CHUNKS=num_kv_chunks,
-            SCORE_TYPE=score_type,
-            num_warps=4,
-            num_stages=2,
-        )
-    else:
-        # Debug fallback: v3 unfused behavior.
-        grid_score = (batch_size, num_kv_heads, max_seqblock)
-        _decode_bnsd_score_kernel[grid_score](
-            q,
-            k_cache_bnsd,
-            block_table,
-            score,
-            seq_lens,
-            batch_size,
-            gqa_group_size,
-            head_dim,
-            max_seqblock,
-            block_size,
-            sm_scale,
-            init_blocks,
-            local_blocks,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_cache_bnsd.stride(0),
-            k_cache_bnsd.stride(1),
-            k_cache_bnsd.stride(2),
-            k_cache_bnsd.stride(3),
-            block_table.stride(0),
-            block_table.stride(1),
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            BLOCK_SIZE_N=block_size_n,
-            SCORE_TYPE=score_type,
-            num_warps=4,
-            num_stages=2,
-        )
-        _decode_bnsd_attn_chunk_kernel[grid_attn](
-            q,
-            sink,
-            k_cache_bnsd,
-            v_cache_bnsd,
-            block_table,
-            o_chunks,
-            lse_chunks,
-            seq_lens,
-            batch_size,
-            gqa_group_size,
-            head_dim,
-            block_size,
-            sm_scale,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            sink.stride(0) if sink is not None else 0,
-            sink.stride(1) if sink is not None else 0,
-            k_cache_bnsd.stride(0),
-            k_cache_bnsd.stride(1),
-            k_cache_bnsd.stride(2),
-            k_cache_bnsd.stride(3),
-            v_cache_bnsd.stride(0),
-            v_cache_bnsd.stride(1),
-            v_cache_bnsd.stride(2),
-            v_cache_bnsd.stride(3),
-            block_table.stride(0),
-            block_table.stride(1),
-            o_chunks.stride(0),
-            o_chunks.stride(1),
-            o_chunks.stride(2),
-            o_chunks.stride(3),
-            lse_chunks.stride(0),
-            lse_chunks.stride(1),
-            lse_chunks.stride(2),
-            BLOCK_SIZE_N=block_size_n,
-            NUM_KV_CHUNKS=num_kv_chunks,
-            num_warps=4,
-            num_stages=2,
-        )
+    _decode_bnsd_score_attn_chunk_kernel[grid_attn](
+        q,
+        sink,
+        k_cache_bnsd,
+        v_cache_bnsd,
+        block_table,
+        o_chunks,
+        lse_chunks,
+        score,
+        seq_lens,
+        batch_size,
+        gqa_group_size,
+        head_dim,
+        block_size,
+        sm_scale,
+        init_blocks,
+        local_blocks,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        sink.stride(0) if sink is not None else 0,
+        sink.stride(1) if sink is not None else 0,
+        k_cache_bnsd.stride(0),
+        k_cache_bnsd.stride(1),
+        k_cache_bnsd.stride(2),
+        k_cache_bnsd.stride(3),
+        v_cache_bnsd.stride(0),
+        v_cache_bnsd.stride(1),
+        v_cache_bnsd.stride(2),
+        v_cache_bnsd.stride(3),
+        block_table.stride(0),
+        block_table.stride(1),
+        o_chunks.stride(0),
+        o_chunks.stride(1),
+        o_chunks.stride(2),
+        o_chunks.stride(3),
+        lse_chunks.stride(0),
+        lse_chunks.stride(1),
+        lse_chunks.stride(2),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        BLOCK_SIZE_N=block_size_n,
+        NUM_KV_CHUNKS=num_kv_chunks,
+        SCORE_TYPE=score_type,
+        num_warps=4,
+        num_stages=2,
+    )
 
     if use_triton_topk:
         topk_idx = _streaming_topk_from_score(score, seq_lens, block_size, topk)

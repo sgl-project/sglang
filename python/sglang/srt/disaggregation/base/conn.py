@@ -101,7 +101,6 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -157,7 +156,6 @@ class BaseKVSender(ABC):
 
 
 class BaseKVReceiver(ABC):
-
     @abstractmethod
     def __init__(
         self,

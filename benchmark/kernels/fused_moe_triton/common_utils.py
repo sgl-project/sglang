@@ -8,7 +8,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_d
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_config
 
 
@@ -166,6 +166,10 @@ def get_model_config(
             0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
         )
         intermediate_size = config.intermediate_size
+    elif architecture == "UnlimitedOCRForCausalLM":
+        E = config.n_routed_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
@@ -176,13 +180,14 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
-    # MiniMax-M3 ships an MXFP8 checkpoint (weight_block_size=[1,32]) but on
-    # gfx942 the weights are converted to block-fp8 [128,128] at load, so the
-    # serving MoE kernel looks up block_shape=[128,128] configs. Tune for that.
-    if architecture == "MiniMaxM3SparseForConditionalGeneration" and block_shape == [
-        1,
-        32,
-    ]:
+    # gfx942 (MI300X) remaps MXFP8 [1,32]->[128,128] at load; tune must match.
+    # sm100/gfx95 run native [1,32] and must not remap (mirrors fp8.py).
+    if (
+        architecture == "MiniMaxM3SparseForConditionalGeneration"
+        and is_hip()
+        and not is_gfx95_supported()
+        and block_shape == [1, 32]
+    ):
         block_shape = [128, 128]
 
     # text_config may not carry torch_dtype; fall back to bf16.
