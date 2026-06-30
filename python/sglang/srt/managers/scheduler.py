@@ -3248,35 +3248,29 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
-                        # Record a dedicated `forward_done`
-                        # event right after the forward (BEFORE copy_to_cpu).
-                        # This is what lazy-compaction `_flush` uses to gate
-                        # src reuse: when this fires, the in-flight forward's
-                        # KV reads have settled. Distinct from `copy_done`
-                        # (which fires later, after the host-side D2H of the
-                        # output) so compaction is not coupled to copy_to_cpu's
-                        # call site.
-                        forward_done = self.device_module.Event()
-                        forward_done.record(stream=self.forward_stream)
                         allocator = self.token_to_kv_pool_allocator
-                        if hasattr(allocator, "set_latest_forward_done_event"):
-                            allocator.set_latest_forward_done_event(forward_done)
-                        # Write-set classification.
-                        # Hand the allocator the virtual `out_cache_loc` of
-                        # this forward as a TENSOR REFERENCE (no GPU work
-                        # here — the earlier `register_inflight_batch`
-                        # design materialized via `.tolist()` inside this
-                        # forward_stream_ctx and forced a sync on the
-                        # just-launched forward, costing 5-16 ms/forward
-                        # under SWA × overlap × cg_on).
-                        # The allocator's `_flush` materializes the
-                        # write-set lazily on schedule_stream only when a
-                        # survivor candidate actually needs to be checked.
-                        if hasattr(allocator, "set_inflight_forward"):
-                            allocator.set_inflight_forward(
-                                forward_done,
-                                batch.out_cache_loc,
-                            )
+                        need_forward_done = hasattr(
+                            allocator, "set_latest_forward_done_event"
+                        ) or hasattr(allocator, "set_inflight_forward")
+                        if need_forward_done:
+                            # Record a dedicated `forward_done` event right
+                            # after the forward (BEFORE copy_to_cpu). This is
+                            # what lazy-compaction `_flush` uses to gate src
+                            # reuse: when this fires, the in-flight forward's KV
+                            # reads have settled. Keep it gated so static
+                            # allocators pay no extra event-record overhead.
+                            forward_done = self.device_module.Event()
+                            forward_done.record(stream=self.forward_stream)
+                            if hasattr(allocator, "set_latest_forward_done_event"):
+                                allocator.set_latest_forward_done_event(forward_done)
+                            # Write-set classification. Hand the allocator the
+                            # virtual `out_cache_loc` of this forward as a
+                            # TENSOR REFERENCE (no GPU work here).
+                            if hasattr(allocator, "set_inflight_forward"):
+                                allocator.set_inflight_forward(
+                                    forward_done,
+                                    batch.out_cache_loc,
+                                )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
