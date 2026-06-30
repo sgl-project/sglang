@@ -1632,6 +1632,34 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_e2e_request_latency,
         )
 
+        # Scheduling lag of this process's asyncio event loop, i.e. how far past
+        # its scheduled wake-up the lag monitor coroutine actually ran. The loop
+        # that stamps a request's received_time is the same one served here, so
+        # sustained lag is delay that accrues *before* received_time -- the slice
+        # of client-observed TTFT that engine TTFT (received_time -> first token)
+        # cannot see. Healthy lag is sub-millisecond; starvation lands at 0.1s+.
+        self.histogram_event_loop_lag = Histogram(
+            name="sglang:event_loop_lag_seconds",
+            documentation="Histogram of tokenizer-process asyncio event loop scheduling lag in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.0005,
+                0.001,
+                0.0025,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+            ],
+        )
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1687,6 +1715,11 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)
+
+    def observe_event_loop_lag(self, lag: float):
+        # Process-wide signal, so it carries the collector's own labels rather
+        # than per-request ones.
+        self.histogram_event_loop_lag.labels(**self.labels).observe(lag)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
         his = self.histogram_time_to_first_token.labels(**self.labels)
