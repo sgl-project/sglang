@@ -5,7 +5,7 @@
 import datetime
 import logging
 from collections.abc import Iterable
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 import orjson
 from openai.types.responses import (
@@ -236,6 +236,24 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
     return StreamableParser(get_encoding(), role=Role.ASSISTANT)
 
 
+def parse_browser_call_args(content_text: str) -> dict[str, Any]:
+    """Parse browser call args without crashing retry output construction."""
+    try:
+        browser_call = orjson.loads(content_text)
+        if not isinstance(browser_call, dict):
+            raise ValueError("Expected a JSON object")
+        return browser_call
+    except (orjson.JSONDecodeError, ValueError):
+        json_retry_output_message = (
+            f"Invalid JSON args, caught and retried: {content_text}"
+        )
+        return {
+            "query": json_retry_output_message,
+            "url": json_retry_output_message,
+            "pattern": json_retry_output_message,
+        }
+
+
 def parse_output_message(message: Message):
     if message.author.role != "assistant":
         # This is a message from a tool to the assistant (e.g., search result).
@@ -249,21 +267,7 @@ def parse_output_message(message: Message):
         if len(message.content) != 1:
             raise ValueError("Invalid number of contents in browser message")
         content = message.content[0]
-        # With retry on, call_search_tool already returned a tool error for this
-        # invalid JSON; render a placeholder so output building does not crash.
-        try:
-            browser_call = orjson.loads(content.text)
-            if not isinstance(browser_call, dict):
-                raise ValueError("Expected a JSON object")
-        except (orjson.JSONDecodeError, ValueError):
-            json_retry_output_message = (
-                f"Invalid JSON args, caught and retried: {content.text}"
-            )
-            browser_call = {
-                "query": json_retry_output_message,
-                "url": json_retry_output_message,
-                "pattern": json_retry_output_message,
-            }
+        browser_call = parse_browser_call_args(content.text)
         # TODO: translate to url properly!
         if recipient == "browser.search":
             action = ActionSearch(

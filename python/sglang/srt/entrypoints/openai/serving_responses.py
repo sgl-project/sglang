@@ -48,6 +48,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     get_stop_tokens_for_assistant_actions,
     get_system_message,
     get_user_message,
+    parse_browser_call_args,
     parse_output_message,
     parse_remaining_state,
     parse_response_input,
@@ -1524,7 +1525,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ):
                     function_name = previous_item.recipient[len("browser.") :]
                     action = None
-                    parsed_args = orjson.loads(previous_item.content[0].text)
+                    parsed_args = parse_browser_call_args(previous_item.content[0].text)
                     if function_name == "search":
                         action = openai_responses_types.response_function_web_search.ActionSearch(
                             type="search",

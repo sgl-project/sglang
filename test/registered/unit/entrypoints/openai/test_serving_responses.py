@@ -8,7 +8,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from utils import make_serving
+from utils import event_payloads, make_serving
 
 from sglang.srt.entrypoints.context import SimpleContext
 from sglang.srt.entrypoints.openai.protocol import (
@@ -589,6 +589,73 @@ class HarmonyResponsesTestCase(unittest.TestCase):
         items = parse_output_message(msg)
         self.assertEqual(len(items), 1)
         self.assertIn("caught and retried", items[0].action.query)
+
+    def test_streaming_browser_action_tolerates_malformed_json_args(self):
+        from types import SimpleNamespace
+
+        async def stream_browser_action(raw_args: str):
+            serving = make_serving()
+            serving.supports_browsing = True
+            request = ResponsesRequest(
+                model="x",
+                input="search",
+                request_id="resp_stream_browser",
+                store=False,
+            )
+            metadata = RequestResponseMetadata(request_id=request.request_id)
+            msg = SimpleNamespace(
+                recipient="browser.search",
+                content=[SimpleNamespace(text=raw_args)],
+            )
+            ctx = SimpleNamespace(
+                parser=SimpleNamespace(
+                    messages=[msg],
+                    last_content_delta="",
+                    current_channel=None,
+                    current_recipient=None,
+                ),
+                is_expecting_start=lambda: False,
+                is_assistant_action_turn=lambda: True,
+            )
+
+            async def fake_result_generator():
+                yield ctx
+
+            events = []
+            generator = serving.responses_stream_generator(
+                request,
+                sampling_params={},
+                result_generator=fake_result_generator(),
+                context=ctx,
+                model_name="x",
+                tokenizer=serving.tokenizer_manager.tokenizer,
+                request_metadata=metadata,
+                created_time=123,
+            )
+            try:
+                async for chunk in generator:
+                    events.append(chunk)
+                    if chunk.startswith("event: response.output_item.done"):
+                        break
+            finally:
+                await generator.aclose()
+            return events
+
+        for raw_args in ("{bad json", "[1, 2, 3]"):
+            with self.subTest(raw_args=raw_args):
+                events = asyncio.run(stream_browser_action(raw_args))
+                payloads = event_payloads(events)
+                done_events = [
+                    payload
+                    for payload in payloads
+                    if payload["type"] == "response.output_item.done"
+                ]
+                self.assertEqual(len(done_events), 1)
+                item = done_events[0]["item"]
+                self.assertEqual(item["type"], "web_search_call")
+                self.assertEqual(item["status"], "completed")
+                self.assertEqual(item["action"]["type"], "search")
+                self.assertIn("caught and retried", item["action"]["query"])
 
 
 if __name__ == "__main__":
