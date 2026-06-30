@@ -1692,6 +1692,134 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
+    def test_streaming_partial_non_string_param_does_not_throw(self):
+        """Regression: a partial non-string parameter value whose streamed
+        prefix is bare text (e.g. agentic code-exec `python3 -c "..."`) makes
+        partial_json_parser raise MalformedJSON -- a ValueError that is NOT a
+        stdlib json.JSONDecodeError. The detector must tolerate it (fall back
+        to the raw string) rather than let it escape, which would dump the raw
+        DSML buffer into normal_text and wedge the stream.
+        """
+        run_tool = Tool(
+            type="function",
+            function=Function(
+                name="run",
+                parameters={
+                    "type": "object",
+                    "properties": {"code": {"type": "object"}},
+                },
+            ),
+        )
+        detector = DeepSeekV32Detector()
+        # `string="false"` selects the JSON-typed parameter path; the value
+        # streams in as bare (not-yet-valid-JSON) text before any closer.
+        chunks = [
+            '<｜DSML｜function_calls>\n<｜DSML｜invoke name="run">\n',
+            '<｜DSML｜parameter name="code" string="false">python3 -c "',
+            "import json",
+        ]
+        names = {}
+        for chunk in chunks:
+            # Must not raise, and must never leak DSML markers as user content.
+            result = detector.parse_streaming_increment(chunk, [run_tool])
+            self.assertNotIn(
+                "｜DSML｜",
+                result.normal_text,
+                "raw DSML markers leaked into normal_text",
+            )
+            for call in result.calls:
+                if call.name:
+                    names[call.tool_index] = call.name
+        # The tool name is still recovered despite the malformed partial value.
+        self.assertEqual(names, {0: "run"})
+
+    def test_streaming_increment_error_does_not_leak_dsml_markup(self):
+        """Fail-safe for the outer handler: if anything inside
+        parse_streaming_increment raises while the buffer still holds tool-call
+        markup, the detector must NOT dump the raw DSML buffer into normal_text.
+        Doing so leaks the markers into user content AND -- because _buffer is
+        retained across increments -- re-emits the whole buffer on every
+        subsequent chunk, ballooning the response to the output-token cap
+        (observed downstream with tool_calls empty / finish_reason=stop). It
+        must emit empty normal_text and keep buffering instead.
+        """
+        run_tool = Tool(
+            type="function",
+            function=Function(
+                name="run",
+                parameters={
+                    "type": "object",
+                    "properties": {"code": {"type": "object"}},
+                },
+            ),
+        )
+        detector = DeepSeekV32Detector()
+        # Force an unexpected failure inside the try block while the buffer
+        # holds DSML markup, exercising the outer except fail-safe directly
+        # (independent of which specific payload triggers it).
+        detector._parse_parameters_from_xml = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        result = detector.parse_streaming_increment(
+            '<｜DSML｜function_calls>\n<｜DSML｜invoke name="run">\n'
+            '<｜DSML｜parameter name="code" string="false">{"ops":[',
+            [run_tool],
+        )
+        # No raw markup leaked, and the markup is kept buffered (not dropped)
+        # so a still-arriving invoke can complete on a later chunk.
+        self.assertEqual(result.normal_text, "")
+        self.assertIn("｜DSML｜", detector._buffer)
+
+    def test_streaming_array_recipe_partial_value_chunked_1_7_64(self):
+        """Regression (V4-Flash, array-valued args): a non-string parameter
+        carrying a spreadsheet-edit ``operations: [...]`` recipe streams in as a
+        not-yet-valid-JSON prefix (the model emits Python-style single quotes),
+        so partial_json_parser raises MalformedJSON -- a ValueError that is NOT
+        a stdlib json.JSONDecodeError. Replaying the whole tool call at chunk
+        sizes 1, 7 and 64 must never raise, never leak DSML markers into
+        normal_text, and must still recover the tool name. Leaks on the
+        unpatched detector at every chunk size; clean after the fix.
+        """
+        apply_tool = Tool(
+            type="function",
+            function=Function(
+                name="apply_edits",
+                parameters={
+                    "type": "object",
+                    "properties": {"operations": {"type": "array"}},
+                },
+            ),
+        )
+        payload = (
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="apply_edits">\n'
+            '<｜DSML｜parameter name="operations" string="false">'
+            "[{'set': 'A1', 'value': 42}, {'set': 'B2', 'value': 7}]"
+            "</｜DSML｜parameter>\n"
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+        for chunk_size in (1, 7, 64):
+            detector = DeepSeekV32Detector()
+            names = {}
+            for i in range(0, len(payload), chunk_size):
+                result = detector.parse_streaming_increment(
+                    payload[i : i + chunk_size], [apply_tool]
+                )
+                self.assertNotIn(
+                    "｜DSML｜",
+                    result.normal_text,
+                    f"raw DSML markers leaked into normal_text at chunk_size={chunk_size}",
+                )
+                for call in result.calls:
+                    if call.name:
+                        names[call.tool_index] = call.name
+            self.assertEqual(
+                names,
+                {0: "apply_edits"},
+                f"tool name not recovered at chunk_size={chunk_size}",
+            )
+
     def test_self_closing_zero_arg_invoke(self):
         """V32 inherits the same regex; verify self-closing parses to empty
         params here too (V32 model rarely emits this shape, but the parser
