@@ -435,18 +435,14 @@ def alloc_req_slots(
     """
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        # Byte-coordinated availability: the shared `SharedMambaSlotAllocator`
-        # exposes `schedulable_available_size`, which accounts for the peer pool's
-        # byte usage and triggers eviction when the shared byte buffer is tight
-        # even if slot-wise free space looks plentiful. Fall back to the slot
-        # allocator's plain free count (upstream's `MambaSlotAllocator.available_size`)
-        # for the non-shared pool, where the two views coincide. The
-        # lazy-extra-buffer factor below is upstream's (kept intact).
-        mamba_available_size = getattr(
-            req_to_token_pool.mamba_allocator,
-            "schedulable_available_size",
-            req_to_token_pool.mamba_allocator.available_size,
-        )()
+        # Byte-coordinated availability: the shared `SharedMambaSlotAllocator`'s
+        # `schedulable_available_size` accounts for the peer (full) sub-pool's
+        # byte usage; the non-shared `MambaSlotAllocator` returns its plain slot
+        # free count (the two views coincide there). The lazy-extra-buffer factor
+        # below is upstream's (kept intact).
+        mamba_available_size = (
+            req_to_token_pool.mamba_allocator.schedulable_available_size()
+        )
         # The eviction-trigger factor: how much "headroom" to ask the tree
         # cache to free. For radix this is 3× — or the upstream
         # lazy-extra-buffer variant when enabled — to leave room for potential
@@ -479,15 +475,11 @@ def alloc_req_slots(
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, evict_target - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
-                # Re-read after eviction so we know whether it
-                # freed enough for the strict minimum. Same byte-coordinated
-                # accessor (with the upstream slot-allocator fallback) as the
-                # initial read above.
-                mamba_available_size = getattr(
-                    req_to_token_pool.mamba_allocator,
-                    "schedulable_available_size",
-                    req_to_token_pool.mamba_allocator.available_size,
-                )()
+                # Re-read after eviction to see whether it freed enough for the
+                # strict minimum.
+                mamba_available_size = (
+                    req_to_token_pool.mamba_allocator.schedulable_available_size()
+                )
             # Refuse ONLY when the strict minimum cannot be honored —
             # i.e., the ``mamba_pool.alloc(1)`` per-req loop would
             # genuinely fail. The 3× evict target was a "best effort"
