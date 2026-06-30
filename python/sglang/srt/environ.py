@@ -610,7 +610,14 @@ class Envs:
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
-    SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
+    SGLANG_DG_CACHE_DIR = EnvStr(
+        os.path.expanduser(
+            os.path.join(
+                os.getenv("SGLANG_CACHE_DIR") or "~/.cache/sglang",
+                "deep_gemm_cache",
+            )
+        )
+    )
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
