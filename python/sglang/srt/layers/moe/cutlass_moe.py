@@ -12,14 +12,16 @@ if _is_cuda:
     from sgl_kernel import (
         apply_shuffle_mul_sum,
         es_fp8_blockwise_scaled_grouped_mm,
-        es_sm100_mxfp8_blockscaled_grouped_mm,
-        es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
         shuffle_rows,
     )
 
     from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.jit_kernel.mxfp8 import (
+        es_sm100_mxfp8_blockscaled_grouped_quant,
+        es_sm100_mxfp8_blockscaled_moe_grouped_gemm,
+    )
     from sglang.jit_kernel.nvfp4 import (
         cutlass_fp4_group_mm,
         scaled_fp4_experts_quant,
@@ -79,9 +81,9 @@ def cutlass_fused_experts_fp8(
             intermediate size (`I // 2`). Expected dtype: `torch.float8_e4m3fn`.
             Note: This shape implies weights are stored as (num_experts, intermediate_size // 2, hidden_size).
         w1_scale (torch.Tensor): Scales corresponding to `w1_q` (per-block scales).
-            Shape: `(E, num_blocks_n, num_blocks_k)`. Dtype: `torch.float32`.
+            Shape: `(E, num_blocks_k, num_blocks_n)`. Dtype: `torch.float32`.
         w2_scale (torch.Tensor): Scales corresponding to `w2_q` (per-block scales).
-             Shape: `(E, num_blocks_k, num_blocks_n)`. Dtype: `torch.float32`.
+             Shape: `(E, num_blocks_n, num_blocks_k)`. Dtype: `torch.float32`.
         topk_weights (torch.Tensor): Router weights for the selected top-k experts
             for each token. Shape: `(m, topk)`. Dtype should ideally match `a`.
         topk_ids (torch.Tensor): Indices of the selected top-k experts for each token.
@@ -124,9 +126,8 @@ def cutlass_fused_experts_fp8(
     assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
     assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
-    assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
-    assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
+    assert w2_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
     if is_cuda:
@@ -149,8 +150,9 @@ def cutlass_fused_experts_fp8(
     if use_mxfp8:
         assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
         assert is_sm100_supported(), "MXFP8 requires SM100"
-        assert k % 32 == 0, "MXFP8 requires hidden size to be divisible by 32"
-        assert n % 32 == 0, "MXFP8 requires intermediate size to be divisible by 32"
+        # The reason it is not 32 is due to the format requirements of the MXFP8 Scale Factor.
+        assert k % 128 == 0, "MXFP8 requires hidden size to be divisible by 128"
+        assert n % 128 == 0, "MXFP8 requires intermediate size to be divisible by 128"
         assert w1_scale.dtype == torch.uint8, "MXFP8 w1_scale must be uint8"
         assert w2_scale.dtype == torch.uint8, "MXFP8 w2_scale must be uint8"
         expected_w1_scale_shape = (
@@ -184,6 +186,7 @@ def cutlass_fused_experts_fp8(
             (num_experts + 1,), dtype=torch.int32, device=device
         )
 
+    # TODO: Compute `tokens_per_expert` in `prepare_moe_input`
     prepare_moe_input(
         topk_ids,
         expert_offsets,
@@ -198,6 +201,7 @@ def cutlass_fused_experts_fp8(
     )
 
     if use_mxfp8 and es_up:
+        tokens_per_expert = problem_sizes1[:, 0].contiguous()
         rep_a = shuffle_rows(a, a_map, (m * topk, k))
         rep_a_q = torch.empty_like(rep_a, dtype=torch.float8_e4m3fn)
         rep_a1_scales = torch.empty(
@@ -205,7 +209,7 @@ def cutlass_fused_experts_fp8(
         )
         es_sm100_mxfp8_blockscaled_grouped_quant(
             rep_a,
-            problem_sizes1,
+            tokens_per_expert,
             expert_offsets[:-1],
             blockscale_offsets[:-1],
             rep_a_q,
@@ -237,15 +241,19 @@ def cutlass_fused_experts_fp8(
             workspace,
         )
     elif use_mxfp8 and es_up:
-        es_sm100_mxfp8_blockscaled_grouped_mm(
+        es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
             c1,
+            w1_q.transpose(1, 2),
             rep_a_q,
-            w1_q,
+            w1_scale.transpose(1, 2),
             rep_a1_scales,
-            w1_scale,
-            problem_sizes1,
             expert_offsets[:-1],
             blockscale_offsets[:-1],
+            tokens_per_expert,
+            out_ptrs,
+            b_ptrs,
+            b_scales_ptrs,
+            workspace,
         )
     else:
         fp8_blockwise_scaled_grouped_mm(
@@ -279,7 +287,7 @@ def cutlass_fused_experts_fp8(
         )
         es_sm100_mxfp8_blockscaled_grouped_quant(
             intermediate,
-            problem_sizes2,
+            tokens_per_expert,
             expert_offsets[:-1],
             blockscale_offsets[:-1],
             intemediate_q,
@@ -303,15 +311,19 @@ def cutlass_fused_experts_fp8(
             workspace,
         )
     elif use_mxfp8 and es_down:
-        es_sm100_mxfp8_blockscaled_grouped_mm(
+        es_sm100_mxfp8_blockscaled_moe_grouped_gemm(
             c2,
+            w2_q.transpose(1, 2),
             intemediate_q,
-            w2_q,
+            w2_scale.transpose(1, 2),
             a2_scale,
-            w2_scale,
-            problem_sizes2,
             expert_offsets[:-1],
             blockscale_offsets[:-1],
+            tokens_per_expert,
+            out_ptrs,
+            b_ptrs,
+            b_scales_ptrs,
+            workspace,
         )
     else:
         fp8_blockwise_scaled_grouped_mm(
