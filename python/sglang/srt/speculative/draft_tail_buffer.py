@@ -65,6 +65,8 @@ class DraftTailSnapshot:
 
     request_id: str
     committed_len: int
+    # Consumable tail: what the verify step may consume (empty while the request
+    # is verifier-ahead). raw_tail_* below is the unfiltered buffer.
     tail_tokens: list[int]
     raw_tail_len: int = 0
     raw_tail_tokens: list[int] = field(default_factory=list)
