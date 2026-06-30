@@ -94,9 +94,20 @@ EXPLICIT = {
     "/diffusion/reference": "/docs/sglang-diffusion/installation",
     "/diffusion/support_new_models": "/docs/sglang-diffusion/installation",
     "/diffusion/usage": "/docs/sglang-diffusion/installation",
-    # basic_usage dropped pages
-    "/basic_usage/deepseek_ocr": "/docs/basic_usage/overview",
-    "/basic_usage/qwen3_5": "/docs/basic_usage/qwen3",
+    # basic_usage pages migrated to cookbook
+    "/basic_usage/kimi_k2_5": "/cookbook/autoregressive/Moonshotai/Kimi-K2.5",
+    "/basic_usage/deepseek_ocr": "/cookbook/autoregressive/DeepSeek/DeepSeek-OCR",
+    "/basic_usage/deepseek_v3": "/cookbook/autoregressive/DeepSeek/DeepSeek-V3",
+    "/basic_usage/deepseek_v32": "/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
+    "/basic_usage/glm45": "/cookbook/autoregressive/GLM/GLM-4.5",
+    "/basic_usage/glmv": "/cookbook/autoregressive/GLM/GLM-4.6V",
+    "/basic_usage/gpt_oss": "/cookbook/autoregressive/OpenAI/GPT-OSS",
+    "/basic_usage/llama4": "/cookbook/autoregressive/Llama/Llama4",
+    "/basic_usage/minimax_m2": "/cookbook/autoregressive/MiniMax/MiniMax-M2",
+    "/basic_usage/popular_model_usage": "/cookbook/autoregressive/intro",
+    "/basic_usage/qwen3": "/cookbook/autoregressive/Qwen/Qwen3",
+    "/basic_usage/qwen3_5": "/cookbook/autoregressive/Qwen/Qwen3.5",
+    "/basic_usage/qwen3_vl": "/cookbook/autoregressive/Qwen/Qwen3-VL",
     # advanced_features dropped pages
     "/advanced_features/adaptive_speculative_decoding": "/docs/advanced_features/speculative_decoding",
     "/advanced_features/hisparse_guide": "/docs/advanced_features/overview",

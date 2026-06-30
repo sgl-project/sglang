@@ -16,6 +16,11 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
@@ -27,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -447,6 +453,16 @@ def _get_precomputed_embedding(
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
+
+        # Normalize device across chunks before concat.
+        target_device = next(
+            (t.device for t in precomputed_embeddings if t.is_cuda),
+            precomputed_embeddings[0].device,
+        )
+        precomputed_embeddings = [
+            t if t.device == target_device else t.to(target_device, non_blocking=True)
+            for t in precomputed_embeddings
+        ]
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
@@ -459,18 +475,38 @@ DataEmbeddingFunc = Callable[
 ]
 
 
+def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
+    """qwen-vl visual forward already moves batched features to the target device.
+
+    instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
+    for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
+    """
+    owner = getattr(data_embedding_func, "__self__", None)
+    if owner is None:
+        return False
+    if getattr(data_embedding_func, "__name__", None) not in (
+        "get_image_feature",
+        "get_video_feature",
+    ):
+        return False
+    return owner.__class__.__name__ in {
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+
+
 def _move_items_to_device(
     items: List[MultimodalDataItem], device: torch.device
 ) -> None:
-    """Move item features to the target device (in-place, non-blocking).
-    Saves a CPU reference so the offload path can restore without GPU->CPU copy."""
+    """Move item features to the target device (in-place, non-blocking)."""
     for item in items:
         if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
-            item._cpu_feature = item.feature
             item.feature = item.feature.to(device, non_blocking=True)
 
 
-def get_chunked_embedding_legacy(
+def _get_chunked_embedding_full(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
     items_offset: List[Tuple[int, int]],
@@ -488,7 +524,8 @@ def get_chunked_embedding_legacy(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        _move_items_to_device(embedding_items_per_req, device)
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
         embedding_per_req = (
             EmbeddingResult(embedding=embedding)
@@ -518,83 +555,75 @@ def get_chunked_embedding_legacy(
     return embedding_per_req_chunk, input_ids
 
 
-def find_chunk_items_and_check_cache(
+def _get_chunked_embedding_by_item(
+    data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
     items_offset: List[Tuple[int, int]],
-    chunk_start: int,
-    chunk_end: int,
-) -> List[Tuple[MultimodalDataItem, Optional[torch.Tensor], int, int]]:
-    """Return (item, cached_embedding_or_None, start, end) for items in [chunk_start, chunk_end)."""
-    chunk_entries = []
-    for item, (start, end) in zip(embedding_items_per_req, items_offset):
-        if end >= chunk_start and start < chunk_end:
-            cached = embedding_cache.get_single(item.hash)
-            emb = cached.embedding if cached is not None else None
-            chunk_entries.append((item, emb, start, end))
-    return chunk_entries
-
-
-def assemble_chunk_embedding(
-    chunk_entries: List[Tuple[Any, torch.Tensor, int, int]],
-    chunk_start: int,
-    chunk_end: int,
+    extend_prefix_len: int,
+    extend_seq_len: int,
+    device: torch.device,
 ) -> Optional[torch.Tensor]:
     """
-    Assemble a chunk of embeddings by slicing each item's embedding
-    to the portion that falls within [chunk_start, chunk_end).
+    Per-image chunk-aware encoding: only encode images overlapping with the
+    current chunk, cache each image individually.
+    Items must already be split per-image (each item has exactly one offset).
     """
+    chunk_start = extend_prefix_len
+    chunk_end = extend_prefix_len + extend_seq_len  # exclusive
+
+    if extend_seq_len <= 0:
+        return None
+
+    # 1. Find items overlapping with current chunk
+    # offsets are (start, end) inclusive on both ends
+    overlapping = []
+    for idx, (item, offset) in enumerate(zip(embedding_items_per_req, items_offset)):
+        start, end = offset
+        if end >= chunk_start and start < chunk_end:
+            overlapping.append((idx, item, start, end))
+
+    if not overlapping:
+        return None
+
+    # 2. Check per-image cache for each overlapping item
+    cached_embeddings = {}  # idx -> tensor
+    miss_items = []  # (idx, item, start, end)
+    for idx, item, start, end in overlapping:
+        cached = embedding_cache.get_single(item.hash)
+        if cached is not None:
+            cached_embeddings[idx] = cached.embedding
+        else:
+            miss_items.append((idx, item, start, end))
+
+    # 3. Batch encode all cache-miss items in one ViT call
+    if miss_items:
+        miss_item_list = [item for _, item, _, _ in miss_items]
+        _move_items_to_device(miss_item_list, device)
+        all_miss_embedding = data_embedding_func(miss_item_list)
+        all_miss_embedding = all_miss_embedding.reshape(
+            -1, all_miss_embedding.shape[-1]
+        )
+
+        # Split output by per-item token count
+        token_counts = [end - start + 1 for _, _, start, end in miss_items]
+        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+
+        for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
+            cached_embeddings[idx] = emb
+            emb_result = EmbeddingResult(embedding=emb)
+            embedding_cache.set(item.hash, emb_result)
+
+    # 4. Assemble chunk: for each overlapping item, extract the overlap slice
     chunk_slices = []
-    for _, emb, start, end in chunk_entries:
+    for idx, _, start, end in overlapping:
+        emb = cached_embeddings[idx]  # shape: (end - start + 1, hidden)
         overlap_start = max(start, chunk_start)
         overlap_end = min(end, chunk_end - 1)  # inclusive
         local_start = overlap_start - start
         local_end = overlap_end - start + 1  # exclusive for slicing
         chunk_slices.append(emb[local_start:local_end])
 
-    if not chunk_slices:
-        return None
     return torch.cat(chunk_slices, dim=0)
-
-
-def get_chunked_prefill_embedding_legacy(
-    data_embedding_func: DataEmbeddingFunc,
-    embedding_items: List[MultimodalDataItem],
-    items_size: List[int],
-    prefix_length: List[int],
-    extend_length: List[int],
-    items_offset_list: List[List[Tuple[int, int]]],
-    input_ids: torch.Tensor,
-    max_iterations: int,
-) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """Non-per-image path: encode each request independently."""
-    embedding_list = []
-    device = input_ids.device
-
-    for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
-            continue
-        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
-        items_offset = items_offset_list[i]
-        assert items_offset is not None, items_offset
-
-        extend_prefix_len = prefix_length[i]
-        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
-
-        chunk_embedding, input_ids = get_chunked_embedding_legacy(
-            data_embedding_func,
-            embedding_items_per_req,
-            items_offset,
-            extend_prefix_len,
-            extend_seq_len,
-            input_ids,
-            device,
-        )
-        if chunk_embedding is not None:
-            embedding_list.append(chunk_embedding)
-
-    if len(embedding_list) == 0:
-        return None, input_ids
-    return torch.concat(embedding_list, dim=0), input_ids
 
 
 def _get_chunked_prefill_embedding(
@@ -607,98 +636,56 @@ def _get_chunked_prefill_embedding(
     input_ids: torch.Tensor,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
-    Chunked prefill embedding: collect cache misses across all per-image
-    requests, batch them into a single ViT call, then assemble per-request
-    chunk embeddings from the results.
+    Chunked prefill embedding: encode per-request items and extract the chunk.
+    Items are already split per-image at processor stage.
     """
     embedding_list = []
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
-    # FIXME(yhyang201): check this
     max_iterations = min(len(items_size) - 1, len(prefix_length))
-
-    per_image_process = (
-        len(embedding_items) > 0 and len(embedding_items[0].offsets) == 1
-    )
-
-    if not per_image_process:
-        return get_chunked_prefill_embedding_legacy(
-            data_embedding_func,
-            embedding_items,
-            items_size,
-            prefix_length,
-            extend_length,
-            items_offset_list,
-            input_ids,
-            max_iterations,
-        )
-
-    # collect chunk entries per request, accumulate all misses
-    pending_requests = []
-    all_miss_items = []
-    all_miss_token_counts = []
 
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
-        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
-        if extend_seq_len <= 0:
-            continue
-
-        extend_prefix_len = prefix_length[i]
         embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
 
-        chunk_start = extend_prefix_len
-        chunk_end = extend_prefix_len + extend_seq_len
-        chunk_entries = find_chunk_items_and_check_cache(
-            embedding_items_per_req,
-            items_offset,
-            chunk_start,
-            chunk_end,
-        )
-        if not chunk_entries:
+        extend_prefix_len = prefix_length[i]
+        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+
+        # Skip if all items already prefilled
+        if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
             continue
 
-        for item, emb, start, end in chunk_entries:
-            if emb is None:
-                all_miss_items.append(item)
-                all_miss_token_counts.append(end - start + 1)
+        # Use per-image path when all items have exactly one offset (already
+        # split per-image) — this avoids encoding images not in this chunk.
+        # Fall back to combined path for non-split items or EVS.
+        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
 
-        pending_requests.append((chunk_entries, chunk_start, chunk_end))
-
-    miss_embeddings = []
-    if all_miss_items:
-        _move_items_to_device(all_miss_items, device)
-        # vit_input_tokens = sum(
-        #     item.feature.shape[0] for item in all_miss_items
-        #     if isinstance(item.feature, torch.Tensor)
-        # )
-        # logger.info(f"ViT batch: {len(all_miss_items)} items, {vit_input_tokens} input patches, {sum(all_miss_token_counts)} output tokens")
-        all_miss_embedding = data_embedding_func(all_miss_items)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
-        miss_embeddings = list(
-            torch.split(all_miss_embedding, all_miss_token_counts, dim=0)
-        )
-        for item, emb in zip(all_miss_items, miss_embeddings):
-            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
-
-    # fill in miss embeddings and assemble per-request chunks
-    miss_iter = iter(miss_embeddings)
-    for chunk_entries, chunk_start, chunk_end in pending_requests:
-        chunk_entries = [
-            (item, next(miss_iter) if emb is None else emb, start, end)
-            for item, emb, start, end in chunk_entries
-        ]
-
-        chunk_embedding = assemble_chunk_embedding(
-            chunk_entries, chunk_start, chunk_end
-        )
-        if chunk_embedding is not None:
-            embedding_list.append(chunk_embedding)
+        if is_per_image:
+            chunk_embedding = _get_chunked_embedding_by_item(
+                data_embedding_func,
+                embedding_items_per_req,
+                items_offset,
+                extend_prefix_len,
+                extend_seq_len,
+                device,
+            )
+            if chunk_embedding is not None:
+                embedding_list.append(chunk_embedding)
+        else:
+            chunk_embedding, input_ids = _get_chunked_embedding_full(
+                data_embedding_func,
+                embedding_items_per_req,
+                items_offset,
+                extend_prefix_len,
+                extend_seq_len,
+                input_ids,
+                device,
+            )
+            if chunk_embedding is not None:
+                embedding_list.append(chunk_embedding)
 
     if len(embedding_list) == 0:
         return None, input_ids
@@ -857,19 +844,18 @@ def embed_mm_inputs(
                 device=input_ids.device,
             )
             # calculate per request items length offset
-            items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
+            items_size = [0]
             items_offsets = []
-            for i, mm_inputs in enumerate(mm_inputs_list):
+            for mm_inputs in mm_inputs_list:
                 mm_items = [
                     item
                     for item in mm_inputs.mm_items
                     if item.is_modality(modality=modality)
                 ]
-                items_size[i + 1] = len(mm_items)
+                items_size.append(items_size[-1] + len(mm_items))
                 items_offsets.append(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
-            items_size = torch.cumsum(items_size, dim=0).tolist()
 
             embedding, mask, input_ids = get_embedding_and_mask(
                 data_embedding_func=embedder,
@@ -919,18 +905,18 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
+    # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
+    def _scatter(dest, mask, src):
+        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
+
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+        _scatter(input_embeds, mask, embedding)
         if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                input_embeds.device, input_embeds.dtype
-            )
+            _scatter(input_deepstack_embeds, mask, deepstack_embeddings[i])
 
     return input_embeds, other_info
 
@@ -1039,25 +1025,6 @@ def _embed_mm_inputs_with_split(
     return input_embeds, other_info
 
 
-def offload_mm_features_to_cpu(mm_inputs_list: List[MultimodalInputs]):
-    """Free GPU features after embedding. CPU copies are kept for later use
-    (e.g. chunked prefill or recovery after retraction)."""
-    language_only = get_global_server_args().language_only
-    for mm_input in mm_inputs_list or []:
-        if not mm_input or not hasattr(mm_input, "mm_items"):
-            continue
-        for item in mm_input.mm_items:
-            if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                if item._cpu_feature is not None:
-                    item.feature = item._cpu_feature
-                else:
-                    item.feature = item.feature.to("cpu", non_blocking=True)
-            if language_only:
-                pe = item.precomputed_embeddings
-                if isinstance(pe, torch.Tensor) and pe.is_cuda:
-                    item.precomputed_embeddings = pe.to("cpu", non_blocking=True)
-
-
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
@@ -1070,6 +1037,18 @@ def general_mm_embed_routine(
 ) -> torch.Tensor:
     """
     Process multimodal inputs and forward through language model.
+
+    Args:
+        input_ids: Input token IDs tensor
+        forward_batch: Batch information for model forward pass
+        language_model: Base language model to use
+        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
+        placeholder_tokens: Token IDs for multimodal placeholders
+        use_deepstack: Whether to use deepstack embeddings for each modality, default False
+        **kwargs: Additional arguments passed to language model
+
+    Returns:
+        Hidden states from language model forward pass
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
@@ -1123,9 +1102,34 @@ def general_mm_embed_routine(
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            # Free GPU features after embedding. CPU copies are kept for
-            # later use (e.g. chunked prefill or recovery after retraction).
-            offload_mm_features_to_cpu(mm_inputs_list)
+            # Offload GPU features to CPU instead of discarding them to balance memory
+            # efficiency and data persistence.
+            # In chunked-prefill, a request is processed across multiple batches, and
+            # the original multimodal data must remain accessible until the entire
+            # prefill phase is complete. Since the multimodal embedding cache is
+            # best-effort, offloading to CPU ensures we have a reliable fallback
+            # if a cache miss occurs in subsequent chunks, while still freeing up
+            # critical GPU memory.
+            if mm_inputs_list:
+                for mm_input_obj in mm_inputs_list:
+                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
+                        for mm_item in mm_input_obj.mm_items:
+                            feature = getattr(mm_item, "feature", None)
+                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                                mm_item.feature = feature.to("cpu", non_blocking=True)
+                            if get_global_server_args().language_only:
+                                precomputed_embeddings = getattr(
+                                    mm_item, "precomputed_embeddings", None
+                                )
+                                if (
+                                    isinstance(precomputed_embeddings, torch.Tensor)
+                                    and precomputed_embeddings.is_cuda
+                                ):
+                                    mm_item.precomputed_embeddings = (
+                                        precomputed_embeddings.to(
+                                            "cpu", non_blocking=True
+                                        )
+                                    )
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:
@@ -1144,6 +1148,66 @@ def general_mm_embed_routine(
         **kwargs,
     )
     return hidden_states
+
+
+def get_multimodal_data_bounds(
+    input_ids: torch.Tensor, pad_values: List[int], token_pairs: List[Tuple[int, int]]
+) -> torch.Tensor:
+    """
+    Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
+
+    Returns:
+        [bounds_count, 2]
+    """
+    # All the multimodal data in the batch should share the same special bound token ids.
+    start_tokens = {s for s, _e in token_pairs}
+    end_tokens = {e for _s, e in token_pairs}
+
+    assert all(isinstance(t, int) for t in start_tokens)
+    assert all(isinstance(t, int) for t in end_tokens)
+
+    start_cond = torch.isin(
+        input_ids, torch.as_tensor(start_tokens, device=input_ids.device)
+    )
+    end_cond = torch.isin(
+        input_ids, torch.as_tensor(end_tokens, device=input_ids.device)
+    )
+
+    (data_start_tokens,) = torch.where(start_cond)
+    (data_end_tokens,) = torch.where(end_cond)
+
+    data_start_tokens_cpu = data_start_tokens.cpu().tolist()
+    data_end_tokens_cpu = data_end_tokens.cpu().tolist()
+
+    # the im_start_id sometimes can be cached as prefix, but it is needed for the embedding of the multimodal data
+    if len(data_start_tokens_cpu) != len(data_end_tokens_cpu):
+        if (
+            len(data_start_tokens_cpu) + 1 == len(data_end_tokens_cpu)
+            and input_ids[0].item() in pad_values
+            and data_end_tokens_cpu
+            and data_start_tokens_cpu
+            and data_end_tokens_cpu[0] < data_start_tokens_cpu[0]
+        ):
+            data_start_tokens_cpu.insert(0, 0)
+    valid_mm_data_nums = min(len(data_start_tokens_cpu), len(data_end_tokens_cpu))
+
+    if valid_mm_data_nums == 0:
+        return torch.zeros((0, 2), device=input_ids.device)
+
+    # Filter out pairs where start_token >= end_token
+    valid_pairs = []
+    for i in range(valid_mm_data_nums):
+        start_token = data_start_tokens_cpu[i]
+        end_token = data_end_tokens_cpu[i]
+        if start_token < end_token:
+            valid_pairs.append((start_token + 1, end_token - 1))
+
+    if not valid_pairs:
+        return torch.zeros((0, 2), device=input_ids.device)
+
+    # Convert valid pairs to tensor
+    valid_pairs_tensor = torch.as_tensor(valid_pairs, device=input_ids.device)
+    return valid_pairs_tensor
 
 
 def data_hash(data) -> int:
@@ -1168,24 +1232,26 @@ def tensor_hash(tensor_list) -> int:
         # CPU path: hash each tensor incrementally without concat
         hasher = hashlib.sha256()
         for t in tensors:
-            t = t.detach().contiguous()
-            hasher.update(memoryview(t.view(torch.uint8).numpy()))
+            t = t.detach().cpu().contiguous()
+            hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().contiguous()
+    tensor = tensor.detach().cpu().contiguous()
     hasher = hashlib.sha256()
-    hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
+    hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def hash_feature(f):
     if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
+        if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
+            return tensor_hash([x.tensor for x in f])
+        if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
@@ -1199,6 +1265,10 @@ def hash_feature(f):
     elif isinstance(f, CudaIpcTensorTransportProxy):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
+    elif isinstance(f, ShmPointerMMData):
+        if f.precomputed_hash is not None:
+            return f.precomputed_hash
+        return tensor_hash([f.tensor])
     return data_hash(f)
 
 
@@ -1256,6 +1326,22 @@ def _get_length(value):
     return None
 
 
+def _is_rank2_grid(value):
+    """True if `value` is a rank-2 grid ([N, dims]) suitable for per-row prod.
+
+    Tensors/arrays must have ndim == 2; nested lists/tuples must have each row
+    be a sequence. Anything flat (1-D / scalars) is rejected so callers fall
+    back to a simple split instead of mis-collapsing it with prod(dim=-1).
+    """
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value.ndim == 2
+    if isinstance(value, (list, tuple)):
+        return len(value) > 0 and all(
+            isinstance(row, (list, tuple, torch.Tensor, np.ndarray)) for row in value
+        )
+    return False
+
+
 def _slice_value(value, start, end):
     if isinstance(value, torch.Tensor):
         return value[start:end]
@@ -1269,24 +1355,6 @@ def _slice_value(value, start, end):
         return value[start:end]
     except Exception:
         return value
-
-
-def _grid_rows_to_cpu_list(value):
-    if isinstance(value, torch.Tensor):
-        value = value.detach()
-        if value.device.type != "cpu":
-            value = value.cpu()
-        return value.tolist()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    return value
-
-
-def _prod_grid_values(grid):
-    result = 1
-    for value in grid:
-        result *= int(value)
-    return result
 
 
 def _slice_model_data(
@@ -1309,6 +1377,84 @@ def _slice_model_data(
     return sliced
 
 
+def _compute_patch_slices(model_specific_data: dict, num_items: int) -> tuple:
+    """Compute per-item patch slice boundaries from 'num_patches' metadata.
+
+    Returns (patch_slices, total_num_patches) where patch_slices is a list of
+    (start, end) tuples for each item, or (None, None) if not applicable.
+    This function can be replaced or extended by model-specific plugins that
+    need custom patch-level splitting logic.
+    """
+    num_patches = model_specific_data.get("num_patches")
+    if _get_length(num_patches) != num_items:
+        return None, None
+
+    if isinstance(num_patches, torch.Tensor):
+        patch_counts = [int(x) for x in num_patches.flatten().cpu().tolist()]
+    elif isinstance(num_patches, np.ndarray):
+        patch_counts = [int(x) for x in num_patches.reshape(-1).tolist()]
+    else:
+        patch_counts = [
+            int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+            for x in num_patches
+        ]
+
+    if not all(count >= 0 for count in patch_counts):
+        return None, None
+
+    patch_slices = []
+    patch_start = 0
+    for count in patch_counts:
+        patch_end = patch_start + count
+        patch_slices.append((patch_start, patch_end))
+        patch_start = patch_end
+    return patch_slices, patch_start
+
+
+# Keys whose dim-0 aligns with total patch count rather than num_items.
+_PATCH_ALIGNED_KEYS = frozenset(("patch_pixel_values", "patch_newline_mask"))
+
+
+def _split_model_data_for_item(
+    model_specific_data: dict,
+    index: int,
+    num_items: int,
+    patch_slices,
+    total_num_patches,
+) -> dict:
+    """Split model_specific_data for a single item during simple-split expansion.
+
+    This function encapsulates the per-item splitting logic for model-specific
+    data fields. It handles three categories:
+      1. Patch-aligned fields (dim-0 == total_num_patches): sliced by patch boundaries.
+      2. Item-aligned fields (dim-0 == num_items): sliced by item index.
+      3. Shared/scalar fields: copied as-is.
+
+    To support additional models, extend `_PATCH_ALIGNED_KEYS` or override this
+    function with a model-specific variant.
+    """
+    new_data = {}
+    for k, v in model_specific_data.items():
+        if (
+            k in _PATCH_ALIGNED_KEYS
+            and patch_slices is not None
+            and _get_length(v) == total_num_patches
+        ):
+            patch_start, patch_end = patch_slices[index]
+            new_data[k] = _slice_value(v, patch_start, patch_end)
+        elif isinstance(v, (list, tuple)) and len(v) == num_items:
+            new_data[k] = [v[index]]
+        elif (
+            isinstance(v, (torch.Tensor, np.ndarray))
+            and len(v.shape) > 0
+            and v.shape[0] == num_items
+        ):
+            new_data[k] = v[index : index + 1]
+        else:
+            new_data[k] = v
+    return new_data
+
+
 def _try_simple_split(item, num_items, expanded_mm_items):
     """Try to split a bundled item by matching feature dim-0 to offset count.
     Returns True if split succeeded, False otherwise."""
@@ -1326,6 +1472,10 @@ def _try_simple_split(item, num_items, expanded_mm_items):
     if feature_count != num_items:
         return False
 
+    patch_slices, total_num_patches = _compute_patch_slices(
+        item.model_specific_data, num_items
+    )
+
     for i in range(num_items):
         new_item = copy.copy(item)
         if item.feature is not None:
@@ -1339,19 +1489,9 @@ def _try_simple_split(item, num_items, expanded_mm_items):
             else:
                 new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
         new_item.offsets = [item.offsets[i]]
-        new_data = {}
-        for k, v in item.model_specific_data.items():
-            if isinstance(v, (list, tuple)) and len(v) == num_items:
-                new_data[k] = [v[i]]
-            elif (
-                isinstance(v, (torch.Tensor, np.ndarray))
-                and len(v.shape) > 0
-                and v.shape[0] == num_items
-            ):
-                new_data[k] = v[i : i + 1]
-            else:
-                new_data[k] = v
-        new_item.model_specific_data = new_data
+        new_item.model_specific_data = _split_model_data_for_item(
+            item.model_specific_data, i, num_items, patch_slices, total_num_patches
+        )
         new_item.hash = None
         expanded_mm_items.append(new_item)
     return True
@@ -1366,7 +1506,15 @@ def get_new_expanded_mm_items(original_mm_items):
             num_items = len(item.offsets)
 
             if item.is_image():
+                # MoonViT-style models (e.g. LocateAnything) carry per-image
+                # grids under `image_grid_hws` ([h, w]) rather than
+                # `image_grid_thw` ([t, h, w]); both encode dim-0 patch counts
+                # via prod over the last axis, so accept either key. (Use an
+                # explicit None check, not `a or b`: the value is a multi-element
+                # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
                     # No grid info — fall back to simple split by feature dim-0
@@ -1374,10 +1522,24 @@ def get_new_expanded_mm_items(original_mm_items):
                         expanded_mm_items.append(item)
                     continue
 
-                image_grid_rows = _grid_rows_to_cpu_list(image_grid_thw)
-                patches_per_item = []
-                for grid in image_grid_rows:
-                    patches_per_item.append(_prod_grid_values(grid))
+                # The grid must be rank-2 ([N, dims]) so `prod` over the last
+                # axis yields one patch count per image. A flat 1-D grid (e.g.
+                # `tensor([h, w])` with num_items==2) would pass the length check
+                # above but `prod(dim=-1)` collapses it to a scalar and mis-splits.
+                # The HF processor always emits rank-2, so this only guards the
+                # degenerate case — fall back to simple split rather than corrupt
+                # the slice boundaries.
+                if not _is_rank2_grid(image_grid_thw):
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
+                    continue
+
+                if isinstance(image_grid_thw, torch.Tensor):
+                    patches_per_item = (
+                        torch.prod(image_grid_thw, dim=-1).long().tolist()
+                    )
+                else:
+                    patches_per_item = [int(np.prod(grid)) for grid in image_grid_thw]
 
                 cumulative = torch.cumsum(
                     torch.tensor(patches_per_item, dtype=torch.long), dim=0
@@ -1425,16 +1587,13 @@ def get_new_expanded_mm_items(original_mm_items):
                 # grid_len = num_videos, num_items = sum(T for each video) = total frames
                 grid_len = _get_length(video_grid_thw)
                 num_videos = grid_len
-                video_grid_rows = _grid_rows_to_cpu_list(video_grid_thw)
 
                 # Calculate total frames and frames per video
-                frames_per_video = []
-                total_frames = 0
-                for i in range(num_videos):
-                    grid = video_grid_rows[i]
-                    T = int(grid[0])  # T is the first element [T, H, W]
-                    frames_per_video.append(T)
-                    total_frames += T
+                if isinstance(video_grid_thw, torch.Tensor):
+                    frames_per_video = video_grid_thw[:, 0].long().tolist()
+                else:
+                    frames_per_video = [int(grid[0]) for grid in video_grid_thw]
+                total_frames = sum(frames_per_video)
 
                 # num_items should equal total_frames when T > 1
                 if num_items != total_frames:
@@ -1442,10 +1601,12 @@ def get_new_expanded_mm_items(original_mm_items):
                     continue
 
                 # Calculate patches per video: T * H * W for each video
-                patches_per_video = []
-                for i in range(num_videos):
-                    grid = video_grid_rows[i]
-                    patches_per_video.append(_prod_grid_values(grid))
+                if isinstance(video_grid_thw, torch.Tensor):
+                    patches_per_video = (
+                        torch.prod(video_grid_thw, dim=-1).long().tolist()
+                    )
+                else:
+                    patches_per_video = [int(np.prod(grid)) for grid in video_grid_thw]
 
                 # Calculate cumulative patches to get slice indices for each video
                 cumulative = torch.cumsum(
@@ -1514,15 +1675,18 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
-    def __init__(self, tensor: torch.Tensor):
+    def __init__(self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
         if not tensor.is_cpu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         self.shape = tensor.shape
         self.dtype = tensor.dtype
+        self.precomputed_hash = precomputed_hash
         nbytes = tensor.numel() * tensor.element_size()
-        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        shm = shared_memory.SharedMemory(
+            create=True, size=nbytes, name=make_shm_name("mm")
+        )
         try:
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
@@ -1539,12 +1703,14 @@ class ShmPointerMMData:
             "shm_name": self.shm_name,
             "shape": self.shape,
             "dtype": self.dtype,
+            "precomputed_hash": self.precomputed_hash,
         }
 
     def __setstate__(self, state):
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
+        self.precomputed_hash = state.get("precomputed_hash")
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1583,10 +1749,15 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
-def _wrap_tensor_or_list(value):
-    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData."""
+def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
+
+    ``precomputed_hash`` is only forwarded for the single-tensor case.
+    For list features the item-level hash covers all elements jointly,
+    so per-element hashes are not applicable.
+    """
     if isinstance(value, torch.Tensor) and value.is_cpu:
-        return ShmPointerMMData(value)
+        return ShmPointerMMData(value, precomputed_hash=precomputed_hash)
     elif isinstance(value, (list, tuple)):
         wrapped = [
             (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
@@ -1603,16 +1774,16 @@ def wrap_shm_features(obj):
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
 
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            if hasattr(item, "feature") and item.feature is not None:
-                item.feature = _wrap_tensor_or_list(item.feature)
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            item_hash = item.hash
+            if item.feature is not None:
+                item.feature = _wrap_tensor_or_list(
+                    item.feature, precomputed_hash=item_hash
+                )
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _wrap_tensor_or_list(
-                    item.precomputed_embeddings
+                    item.precomputed_embeddings, precomputed_hash=item_hash
                 )
     return obj
 
@@ -1629,14 +1800,17 @@ def _feature_has_shm(feat) -> bool:
 def has_shm_features(recv_reqs):
     """Return True if any request in the list contains ShmPointerMMData."""
     for req in recv_reqs:
-        if hasattr(req, "batch"):
+        if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
                 return True
-        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+        elif (
+            isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+            and req.mm_inputs
+        ):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
-                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                if _feature_has_shm(item.precomputed_embeddings):
                     return True
     return False
 
@@ -1661,19 +1835,19 @@ def unwrap_shm_features(obj):
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
     # Handle batch requests
-    if hasattr(obj, "batch"):
+    if isinstance(obj, BaseBatchReq):
         for sub_obj in obj.batch:
             unwrap_shm_features(sub_obj)
         return obj
     # Handle single requests
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if (
+        isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+        and obj.mm_inputs
+    ):
         for item in obj.mm_inputs.mm_items:
-            if hasattr(item, "feature") and item.feature is not None:
+            if item.feature is not None:
                 item.feature = _unwrap_tensor_or_list(item.feature)
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )

@@ -22,7 +22,17 @@ It is recommended to use uv for faster installation:
 ```bash Command
 pip install --upgrade pip
 pip install uv
-uv pip install sglang
+uv pip install --prerelease=allow sglang
+```
+
+The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
+```bash Command
+pip install --upgrade pip
+pip install uv
+uv pip install --prerelease=allow sglang
+uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
 ```
 
 ### Quick fixes to common problems
@@ -157,7 +167,9 @@ sky status --endpoint 30000 sglang
 
 To deploy on SGLang on AWS SageMaker, check out [AWS SageMaker Inference](https://aws.amazon.com/sagemaker/ai/deploy)
 
-Amazon Web Services provide supports for SGLang containers along with routine security patching. For available SGLang containers, check out [AWS SGLang DLCs](https://github.com/aws/deep-learning-containers/blob/master/available_images.md#sglang-containers)
+Amazon Web Services provide supports for SGLang containers along with routine security patching. For available SGLang containers, check out [AWS SGLang DLCs](https://aws.github.io/deep-learning-containers/reference/available_images/#sglang).
+
+To deploy a pre-built SGLang Deep Learning Container without building your own image, see [Amazon SageMaker AI](/docs/basic_usage/aws_sagemaker).
 
 To host a model with your own container, follow the following steps:
 

@@ -496,12 +496,16 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
+        layer.w13_weight.data = npu_format_cast(
+            layer.w13_weight.data.transpose(1, 2).contiguous()
+        )
         layer.w13_weight.data = self._pack_to_int32(
             layer.w13_weight.data.to(torch.int32)
         )
 
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
+        layer.w2_weight.data = npu_format_cast(
+            layer.w2_weight.data.transpose(1, 2).contiguous()
+        )
 
         scale_np = layer.w13_weight_scale.data.cpu().numpy()
         scale_np.dtype = np.uint32
@@ -618,8 +622,12 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self._maybe_apply_fuseep_weights(layer):
             return
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
+        layer.w13_weight.data = npu_format_cast(
+            layer.w13_weight.data.transpose(1, 2).contiguous()
+        )
+        layer.w2_weight.data = npu_format_cast(
+            layer.w2_weight.data.transpose(1, 2).contiguous()
+        )
         layer.w13_weight_scale = torch.nn.Parameter(
             layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
         )
@@ -733,7 +741,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
-            scale=[layer.w2_weight_scale.to(output_dtype)],
+            scale=[layer.w2_weight_scale_bf16],
             per_token_scale=[swiglu_out_scale],
             split_item=2,
             group_list_type=group_list_type,

@@ -105,7 +105,7 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     if tok_cls is None:
         return None
 
-    logger.info(
+    logger.debug(
         "Loading tokenizer for %s directly as %s (bypassing AutoTokenizer)",
         tokenizer_name,
         tok_class_name,
@@ -159,6 +159,33 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
     return tokenizer_name
 
 
+# TODO: Remove after bumping huggingface transformers to v5.12
+def _retry_auto_tokenizer_with_glm_moe_dsa_config(
+    tokenizer_name, args, common_kwargs, error
+):
+    from .config import (
+        _is_legacy_glm_moe_dsa_layer_types_error,
+        _load_glm_moe_dsa_config_without_legacy_layer_types,
+    )
+
+    if not _is_legacy_glm_moe_dsa_layer_types_error(error):
+        return None
+
+    config = _load_glm_moe_dsa_config_without_legacy_layer_types(
+        tokenizer_name, revision=common_kwargs.get("tokenizer_revision")
+    )
+    if config is None:
+        return None
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, *args, **{**common_kwargs, "config": config}
+    )
+    logging.getLogger(tokenizer.__class__.__module__).addFilter(
+        TokenizerWarningsFilter()
+    )
+    return tokenizer
+
+
 def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
     """Call ``AutoTokenizer.from_pretrained`` with error handling."""
     try:
@@ -170,6 +197,11 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
         )
         return tokenizer
     except TypeError as e:
+        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
+            tokenizer_name, args, common_kwargs, e
+        )
+        if tokenizer is not None:
+            return tokenizer
         err_msg = (
             "Failed to load the tokenizer. If you are using a LLaMA V1 model "
             f"consider using '{_FAST_LLAMA_TOKENIZER}' instead of the "
@@ -177,6 +209,11 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
         )
         raise RuntimeError(err_msg) from e
     except ValueError as e:
+        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
+            tokenizer_name, args, common_kwargs, e
+        )
+        if tokenizer is not None:
+            return tokenizer
         # MistralCommon tokenizers reject standard HF kwargs like
         # trust_remote_code, use_fast etc. Retry without them.
         if "are not supported by" in str(e) and "MistralCommon" in str(e):
@@ -197,6 +234,13 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
             )
             raise RuntimeError(err_msg) from e
         raise
+    except Exception as e:
+        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
+            tokenizer_name, args, common_kwargs, e
+        )
+        if tokenizer is not None:
+            return tokenizer
+        raise
 
 
 def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
@@ -208,7 +252,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
     ``tokenizer_config.json``.  May still return a ``TokenizersBackend``
     if all retries fail (with a warning).
     """
-    logger.warning(
+    logger.debug(
         "Tokenizer loaded as generic TokenizersBackend for %s, "
         "retrying with use_fast=False",
         tokenizer_name,
@@ -218,7 +262,16 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs
         )
-    except (ValueError, TypeError, OSError, ImportError, RuntimeError) as e:
+    except Exception as e:
+        tokenizer = _retry_auto_tokenizer_with_glm_moe_dsa_config(
+            tokenizer_name, args, common_kwargs, e
+        )
+        if tokenizer is not None:
+            return tokenizer
+        if not isinstance(
+            e, (ValueError, TypeError, OSError, ImportError, RuntimeError)
+        ):
+            raise
         raise RuntimeError(
             f"Retry with use_fast=False for {tokenizer_name} also failed "
             f"(initial load returned TokenizersBackend): {e}"
@@ -239,7 +292,7 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
                 tokenizer_name,
             )
         else:
-            logger.warning(
+            logger.debug(
                 "Tokenizer for %s loaded as generic TokenizersBackend. "
                 "Set --trust-remote-code to load the model-specific tokenizer.",
                 tokenizer_name,

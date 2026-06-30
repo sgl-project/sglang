@@ -10,6 +10,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+DIFFUSION_TRACE_MODULE = "diffusion"
+
 
 @dataclass(frozen=True)
 class DiffStageConfig:
@@ -24,6 +26,24 @@ class DiffStage:
 
     SCHEDULER_DISPATCH = DiffStageConfig("scheduler_dispatch", level=1)
     GPU_FORWARD = DiffStageConfig("gpu_forward", level=2)
+
+
+def init_diffusion_tracing(server_args, thread_label: str):
+    if not server_args.enable_trace:
+        return
+
+    from sglang.srt.observability.trace import (
+        process_tracing_init,
+        trace_set_thread_info,
+    )
+
+    # srt owns TraceReqContext and filters spans through its trace_modules list
+    process_tracing_init(
+        server_args.otlp_traces_endpoint,
+        "sglang-diffusion",
+        trace_modules=DIFFUSION_TRACE_MODULE,
+    )
+    trace_set_thread_info(thread_label)
 
 
 @contextmanager

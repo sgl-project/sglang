@@ -27,6 +27,9 @@ at::Tensor silu_and_mul_cpu(at::Tensor& input);
 at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input);
 at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
+// fused_sigmoid_mul
+at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool inplace);
+
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 
@@ -100,7 +103,9 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
-    std::optional<at::Tensor> encoder_lens);
+    int64_t slidling_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -118,7 +123,9 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
-    std::optional<at::Tensor> encoder_lens);
+    int64_t sliding_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -143,7 +150,8 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     const at::Tensor& cu_seqlens,
     bool head_first,
     bool use_qk_l2norm_in_kernel,
-    double eps = 1e-5);
+    const at::Tensor& initial_state_indices,
+    double eps = 1e-6);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -229,6 +237,10 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
     bool is_vnni);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
@@ -410,6 +422,15 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// kvcache
+void store_cache_cpu(
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& indices,
+    std::optional<int64_t> row_dim);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -421,6 +442,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_tanh_and_mul_cpu", torch::kCPU, &gelu_tanh_and_mul_cpu);
   m.def("gelu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
+  m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate, bool inplace) -> Tensor(a!)");
+  m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
 
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
@@ -469,15 +492,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
       "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap, bool is_cross_attn, Tensor? encoder_lens) -> ()");
+      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
   m.def(
       "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, Tensor? "
-      "encoder_lens) -> ()");
+      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
+      "sliding_window_size, Tensor? "
+      "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -490,7 +514,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
       "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
-      "bool use_qk_l2norm_in_kernel, float eps=1e-5) -> (Tensor, Tensor)");
+      "bool use_qk_l2norm_in_kernel, Tensor initial_state_indices, float eps=1e-6) -> (Tensor, Tensor)");
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack
@@ -556,7 +580,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
+      "limit, bool is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
@@ -658,6 +683,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // kvcache
+  m.def(
+      "store_cache_cpu(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor indices, int? row_dim) -> "
+      "()");
+  m.impl("store_cache_cpu", torch::kCPU, &store_cache_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {

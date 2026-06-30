@@ -9,6 +9,12 @@ from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_p
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.utils.dcp_utils import (
+    all_gather_kv_cache_for_mha_chunk_extend,
+    all_gather_kv_cache_for_mha_extend,
+    dcp_enabled,
+    filter_dcp_local_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -19,6 +25,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -152,6 +159,7 @@ class DeepseekMHAForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
+                        transpose_scale=_use_aiter_bpreshuffle_gfx95,
                     )
                     q = self.q_b_proj(q_quanted)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
@@ -193,6 +201,7 @@ class DeepseekMHAForwardMixin:
                     dtype_quant=torch.float8_e4m3fn,
                     res1=None,
                     output_unquantized_inp1=False,
+                    transpose_scale=_use_aiter_bpreshuffle_gfx95,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             else:
@@ -222,6 +231,7 @@ class DeepseekMHAForwardMixin:
                 dtype_quant=torch.float8_e4m3fn,
                 res1=None,
                 output_unquantized_inp1=True,  # return unqaunt kv_a
+                transpose_scale=_use_aiter_bpreshuffle_gfx95,
             )
 
         else:
@@ -267,11 +277,24 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                kv_a, k_pe = self._get_mla_kv_buffer(
-                    forward_batch.fetch_mha_one_shot_kv_indices(),
-                    q.dtype,
-                    forward_batch,
-                )
+                if dcp_enabled():
+                    kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mha,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens,
+                        kv_a,
+                        k_pe,
+                    )
+                else:
+                    kv_a, k_pe = self._get_mla_kv_buffer(
+                        forward_batch.fetch_mha_one_shot_kv_indices(),
+                        q.dtype,
+                        forward_batch,
+                    )
         if _use_fp8_prefill_attn and self.kv_b_proj.weight.dtype == torch.uint8:
             # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
             # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
@@ -417,6 +440,12 @@ class DeepseekMHAForwardMixin:
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
                 kv_indices, kv_a_dtype, forward_batch
             )
+            kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+                kv_a_normed,
+                k_pe,
+                forward_batch.prefix_chunk_seq_lens_cpu[i],
+                forward_batch.prefix_chunk_starts_cpu[i],
+            )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -481,6 +510,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
+            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

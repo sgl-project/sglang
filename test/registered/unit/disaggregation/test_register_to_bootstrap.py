@@ -183,6 +183,54 @@ class TestRegisterToBootstrap(CustomTestCase):
         url_used = mock_put.call_args[0][0]
         self.assertIn("10.0.0.1", url_used)
 
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_wildcard_host_0000_uses_ipv4_loopback(self, mock_put, mock_time):
+        """When --host 0.0.0.0 is used, the PUT must target IPv4 loopback.
+
+        Scenario: cross-node P/D disagg where each role runs on a single node
+        (tp=1).  Each machine runs its own SGLang instance with --host 0.0.0.0
+        to accept remote connections.  dist_init_addr is None because tp=1
+        needs no multi-node rendezvous, so register_to_bootstrap takes the
+        else-branch and would use bootstrap_host="0.0.0.0" as the PUT target.
+        aiohttp >=3.9 rejects that with HTTP 403 because 0.0.0.0 is not a
+        valid Host header value.
+
+        Fix: substitute same-family loopback when bootstrap_host is a wildcard.
+        """
+        mock_time.monotonic.return_value = 0.0
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        mgr = self._make_manager()
+        mgr.bootstrap_host = "0.0.0.0"
+        mgr.local_ip = "192.168.1.10"
+        mgr.register_to_bootstrap()
+
+        url_used = mock_put.call_args[0][0]
+        self.assertNotIn("0.0.0.0", url_used)
+        self.assertIn("127.0.0.1", url_used)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_wildcard_host_ipv6_uses_ipv6_loopback(self, mock_put, mock_time):
+        """Same fix for the IPv6 wildcard \"::\": must use IPv6 loopback."""
+        mock_time.monotonic.return_value = 0.0
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        mgr = self._make_manager()
+        mgr.bootstrap_host = "::"
+        mgr.local_ip = "fd00::1"
+        mgr.register_to_bootstrap()
+
+        url_used = mock_put.call_args[0][0]
+        # "::" bracketed as "[::]:port" should not appear; loopback should.
+        self.assertNotIn("[::]", url_used)
+        self.assertIn("[::1]", url_used)
+
     def _make_manager(self, dist_init_addr=None):
         """Create a lightweight mock manager that has the attributes needed
         by register_to_bootstrap, without going through CommonKVManager.__init__

@@ -32,11 +32,13 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.utils.common import Range
 
 
 def _make_cache_with_pools(page_size=1):
@@ -66,7 +68,8 @@ class MockReq:
     """Minimal mock Req with fields needed by cache_unfinished/finished_req."""
 
     def __init__(self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
-        self.fill_ids = array("q", fill_ids)
+        self.full_untruncated_fill_ids = array("q", fill_ids)
+        self.extend_range = Range(0, len(self.full_untruncated_fill_ids))
         self.origin_input_ids = array(
             "q", fill_ids[:-1] if len(fill_ids) > 1 else fill_ids
         )
@@ -80,6 +83,9 @@ class MockReq:
         self.kv_committed_len = len(fill_ids)
         self.kv_allocated_len = len(fill_ids)
         self.kv_committed_freed = False
+
+    def get_fill_ids(self):
+        return self.full_untruncated_fill_ids[: self.extend_range.end]
 
     def pop_committed_kv_cache(self):
         self.kv_committed_freed = True
@@ -312,7 +318,12 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._match_prefix_and_lock = MagicMock(
-            return_value=(torch.arange(4, dtype=torch.int64), 4)
+            return_value=DecodePrefixMatch(
+                prefix_indices=torch.arange(4, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=0,
+                last_device_node=req.last_node,
+            )
         )
         queue._pre_alloc = MagicMock(
             side_effect=AssertionError("_pre_alloc should not run")

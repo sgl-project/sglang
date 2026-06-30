@@ -22,14 +22,12 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 import heapq
 from array import array
 from collections import defaultdict
-from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from numpy import float64
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -148,13 +146,12 @@ class TreeNode:
             return None
         return self.hash_value[-1]
 
-    @lru_cache(maxsize=1)
-    def get_prefix_hash_values(self, node: "TreeNode") -> List[str]:
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
         if node is None or node.hash_value is None:
             return []
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -322,7 +319,7 @@ class LRUList:
             return False
         return node.id in self.cache
 
-    def pretty_print(self, tree_cache: Optional["MambaRadixCache"] = None):
+    def pretty_print(self, tree_cache: Optional[MambaRadixCache] = None):
         """
         Pretty print the lru list
         """
@@ -361,7 +358,7 @@ class LRUList:
         return evictable_size
 
     # Note: this is expensive, only use for debug or idle check
-    def sanity_check(self, tree_cache: "MambaRadixCache"):
+    def sanity_check(self, tree_cache: MambaRadixCache):
         """
         Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
         checking if the lru list is valid.
@@ -428,11 +425,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
@@ -508,7 +507,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
 
         if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+            value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
@@ -531,11 +530,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ]
 
         if is_insert:
-            cache_len = (
-                req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
-                else len(token_ids)
-            )
+            if self.enable_mamba_extra_buffer:
+                cache_len = req.mamba_last_track_seqlen
+            else:
+                cache_len = len(token_ids)
+                # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by
+                # the slot's unflushed ring depth (`write_pos`), so cap the
+                # donate to the last flush boundary (where temporal is current)
+                # and reset the cursor, keeping the donated checkpoint consistent
+                # with its key length. page_size is asserted == 1, so no realign.
+                write_pos_buf = self.req_to_token_pool.mamba_pool.replayssm_write_pos
+                if write_pos_buf is not None:
+                    cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
+                    write_pos_buf[req.mamba_pool_idx] = 0
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
@@ -561,19 +568,31 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
                 mamba_ping_pong_track_buffer_to_keep = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
+                    self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
                 )
-                mamba_value = (
-                    req.mamba_ping_pong_track_buffer[
-                        mamba_ping_pong_track_buffer_to_keep
-                    ]
-                    .unsqueeze(-1)
-                    .clone()
+                src_active = req.mamba_ping_pong_track_buffer[
+                    mamba_ping_pong_track_buffer_to_keep
+                ].unsqueeze(-1)
+                assert src_active.item() != -1, (
+                    f"Cached mamba slot is -1: keep_idx={mamba_ping_pong_track_buffer_to_keep}, "
+                    f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+                    f"next_track_idx={req.mamba_next_track_idx}, "
+                    f"last_track_seqlen={req.mamba_last_track_seqlen}, "
+                    f"rid={req.rid}"
                 )
+                if self.int8_ckpt_pool is not None:
+                    mamba_value = self._commit_int8_checkpoint(src_active)
+                    # quantized -> no ping-pong slot needs keeping
+                    mamba_ping_pong_track_buffer_to_keep = None
+                else:
+                    mamba_value = src_active.clone()
             else:
-                mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
+                if self.int8_ckpt_pool is not None:
+                    mamba_value = self._commit_int8_checkpoint(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                else:
+                    mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
                 mamba_ping_pong_track_buffer_to_keep = None
 
             result = self.insert(
@@ -585,6 +604,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
             mamba_exist = result.mamba_exist
+            if mamba_exist and self.int8_ckpt_pool is not None:
+                # state already cached -> the int8 slot we just allocated is a duplicate
+                self.int8_ckpt_pool.free(mamba_value)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
@@ -592,7 +614,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if mamba_exist:
             mamba_ping_pong_track_buffer_to_keep = None
 
-        free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
+        # With int8 checkpoints the radix owns an int8 slot (not the request's active
+        # slot), so the active mamba slot must always be returned to the active pool.
+        free_mamba_cache = (
+            True
+            if (self.enable_mamba_extra_buffer or self.int8_ckpt_pool is not None)
+            else mamba_exist
+        )
 
         if free_mamba_cache:
             self.req_to_token_pool.free_mamba_cache(
@@ -607,14 +635,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         def _skip_cache_unfinished_req(req: Req) -> None:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.extend_range.end
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
@@ -639,30 +667,31 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert page_aligned_len == len(
             kv_indices
-        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {FLA_CHUNK_SIZE=}"
+        ), f"page_aligned_len != len(kv_indices), {page_aligned_len=}, {len(kv_indices)=}, {cache_len=}, {self.page_size=}, {self.mamba_cache_chunk_size=}"
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         # Donate the mamba index to the radix cache instead of copying.
         # This avoids a data copy that would race with the forward stream.
-        if self.enable_mamba_extra_buffer:
-            mamba_ping_pong_track_buffer_to_keep = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+        if self.int8_ckpt_pool is not None:
+            # int8 path: quantize the to-be-cached active state into an int8 slot
+            # (strategy-agnostic donate hook).
+            if self.enable_mamba_extra_buffer:
+                new_slot = self._alloc_mamba_slot()
+                src_active = self.req_to_token_pool.donate_mamba_ping_pong_slot(
+                    req, new_slot
                 )
-            )
-            mamba_value_donated = (
-                req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
-                .unsqueeze(-1)
-                .clone()
-            )
+                mamba_value_donated = self._commit_int8_checkpoint(src_active)
+                self.req_to_token_pool.mamba_allocator.free(src_active)
+            else:
+                mamba_value_donated = self._commit_int8_checkpoint(
+                    req.mamba_pool_idx.view(-1)
+                )
+        elif self.enable_mamba_extra_buffer:
             new_slot = self._alloc_mamba_slot()
-            req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep] = (
-                new_slot[0]
+            mamba_value_donated = self.req_to_token_pool.donate_mamba_ping_pong_slot(
+                req, new_slot
             )
-            self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-                req.req_pool_idx
-            ] = req.mamba_ping_pong_track_buffer
         else:
             mamba_value_donated = self._alloc_mamba_slot()
             self.req_to_token_pool.mamba_pool.copy_from(
@@ -680,7 +709,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
         if mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_donated)
+            self._free_mamba_value(mamba_value_donated)
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
@@ -738,7 +767,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._record_remove_event(x)
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
-        self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+        self._free_mamba_value(x.mamba_value)
         mamba_num_evicted = len(x.mamba_value)
 
         # 2. get the next node, update the lru lists
@@ -791,7 +820,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if len(x.children) > 0:
                 # 1. an internal node, free mamba tokens.
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                self._free_mamba_value(x.mamba_value)
                 mamba_num_evicted += len(x.mamba_value)
 
                 # 2. get the next node, update the lru lists
@@ -956,12 +985,47 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
-        slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        slot = self.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            slot = self.req_to_token_pool.mamba_pool.alloc(1)
+            slot = self.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
         return slot
+
+    @property
+    def int8_ckpt_pool(self):
+        """The int8 checkpoint pool, or None when --enable-int8-mamba-checkpoint is off.
+        When enabled, radix-cached mamba states live HERE (int8), not in the active
+        bf16 pool -> ~2x cached-prefix capacity at fixed memory."""
+        return getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
+
+    def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
+        """Allocate one int8 checkpoint slot, evicting cached states if the pool is full."""
+        slot = self.int8_ckpt_pool.alloc(1)
+        if slot is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.int8_ckpt_pool.alloc(1)
+            assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
+        return slot
+
+    def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
+        """Quantize the active-pool state at ``active_slots`` into a fresh int8
+        checkpoint slot and return that slot. Strategy-agnostic donate hook: both
+        no_buffer (copy_from) and extra_buffer (ping-pong) converge here. The caller
+        frees ``active_slots`` separately."""
+        ckpt_slot = self._alloc_int8_ckpt_slot()
+        self.int8_ckpt_pool.store_from_active(
+            self.req_to_token_pool.mamba_pool, active_slots, ckpt_slot
+        )
+        return ckpt_slot
+
+    def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
+        """Free a node's mamba_value to the right allocator (int8 ckpt pool or the
+        active mamba allocator)."""
+        if self.int8_ckpt_pool is not None:
+            self.int8_ckpt_pool.free(mamba_value)
+        else:
+            self.req_to_token_pool.mamba_allocator.free(mamba_value)
 
     def _match_prefix_helper(
         self, key: RadixKey
@@ -1043,14 +1107,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Calculate the branching point. It is defined as the last aligned position that
         # does not have a mamba value.
         if len(value) > best_value_len:
-            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
-            mamba_cache_chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // mamba_cache_chunk_size
-            ) * mamba_cache_chunk_size
+            chunk_aligned_seqlen = (
+                sum(len(v) for v in value) // self.mamba_cache_chunk_size
+            ) * self.mamba_cache_chunk_size
             mamba_branching_seqlen = (
-                mamba_cache_chunk_aligned_seqlen
-                if mamba_cache_chunk_aligned_seqlen > 0
-                else None
+                chunk_aligned_seqlen if chunk_aligned_seqlen > 0 else None
             )
         else:
             mamba_branching_seqlen = None
@@ -1058,11 +1119,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
-                dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
                     self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
+                    dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
                 req.mamba_pool_idx = dst_index[0]
