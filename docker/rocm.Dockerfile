@@ -754,20 +754,27 @@ RUN cd /tmp/whl \
 # of the wheel becomes unnecessary once we apply the trick to fake
 # the version string as we do here.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip uninstall -y triton \
+        TRITON_INSTALLED_VERSION=$(pip show triton 2>/dev/null | grep '^Version:' | cut -d' ' -f2 || echo "") \
+     && TRITON_BASE_VERSION=$(echo "$TRITON_INSTALLED_VERSION" | cut -d'+' -f1) \
+     && TRITON_VERSION_SUFFIX=$(echo "$TRITON_INSTALLED_VERSION" | grep -o '+.*' || echo "") \
+     && echo "Captured Triton version: $TRITON_INSTALLED_VERSION (base: $TRITON_BASE_VERSION, suffix: $TRITON_VERSION_SUFFIX)" \
+     && pip uninstall -y triton \
      && apt install -y cmake \
      && git clone ${TRITON_REPO} triton-custom \
      && cd triton-custom \
      && git checkout ${TRITON_COMMIT} \
-     && if [ "$GPU_ARCH" = "gfx950-rocm7_14" ]; then \
-            sed -i 's/TRITON_VERSION = "3\.7\.0"/TRITON_VERSION = "3.6.0"/' setup.py \
-         && sed -i "s/__version__ = '3\.7\.0'/__version__ = '3.6.0'/" python/triton/__init__.py \
+     && if [ -n "$TRITON_BASE_VERSION" ]; then \
+            TRITON_SOURCE_VERSION=$(grep -oP 'TRITON_VERSION = "\K[^"]+' setup.py || echo "") \
+         && if [ -n "$TRITON_SOURCE_VERSION" ]; then \
+                sed -i "s/TRITON_VERSION = \"$TRITON_SOURCE_VERSION\"/TRITON_VERSION = \"$TRITON_BASE_VERSION\"/" setup.py \
+             && sed -i "s/__version__ = '$TRITON_SOURCE_VERSION'/__version__ = '$TRITON_BASE_VERSION'/" python/triton/__init__.py; \
+            fi \
          && sed -i '/^def get_git_version_suffix():/,/^def get_triton_version_suffix():/{ /^def get_triton_version_suffix():/!{ /^def get_git_version_suffix():/!d; }; }' setup.py \
          && sed -i '/^def get_git_version_suffix():/a\    return ""' setup.py; \
         fi \
      && pip install -r python/requirements.txt \
-     && if [ "$GPU_ARCH" = "gfx950-rocm7_14" ]; then \
-            TRITON_WHEEL_VERSION_SUFFIX=+rocm7.15.0a20260628 pip install -e .; \
+     && if [ -n "$TRITON_VERSION_SUFFIX" ]; then \
+            TRITON_WHEEL_VERSION_SUFFIX="$TRITON_VERSION_SUFFIX" pip install -e .; \
         else \
             pip install -e .; \
         fi \
