@@ -1,3 +1,4 @@
+import gc
 from typing import Any, Dict, Optional
 
 import torch
@@ -112,6 +113,10 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
+        # super().__init__ already built a LlamaAttention into self.self_attn; drop it
+        # before replacing with Ministral3Attention so the orphan's weights aren't kept
+        # alive (it lingers via module ref-cycles until the gc in Ministral3Model below).
+        del self.self_attn
         self.self_attn = Ministral3Attention(
             config=config,
             hidden_size=self.hidden_size,
@@ -141,6 +146,16 @@ class Ministral3Model(LlamaModel):
         # Override layer creation to use Ministral3Attention
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
+        # super().__init__ (LlamaModel) already built a full stack of LlamaDecoderLayers
+        # into self.layers; we rebuild them with Ministral3DecoderLayer below. Free the
+        # orphan stack BEFORE make_layers, otherwise both the old and the new stacks are
+        # resident while make_layers runs -> ~2x model weights -> OOM on memory-tight
+        # setups (e.g. a quantized 128B model on 4 GPUs). The modules linger via
+        # nn.Module ref-cycles, so a plain del isn't enough — collect explicitly.
+        del self.layers
+        gc.collect()
+        torch.get_device_module().empty_cache()
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Ministral3DecoderLayer(
@@ -154,6 +169,11 @@ class Ministral3Model(LlamaModel):
             pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
+
+        # Reclaim the per-layer orphan LlamaAttention modules dropped in
+        # Ministral3DecoderLayer.__init__ (held alive by ref-cycles until now).
+        gc.collect()
+        torch.get_device_module().empty_cache()
 
 
 class Ministral3ForCausalLM(LlamaForCausalLM):
