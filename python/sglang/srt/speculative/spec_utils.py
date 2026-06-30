@@ -97,6 +97,7 @@ def renorm_draft_probs(
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
+SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = (
@@ -320,37 +321,31 @@ def generate_simulated_accept_index(
     target_predict,
     bs,
     spec_steps,
-    topk,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
-    if topk != 1:
-        raise ValueError(
-            "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently requires "
-            "speculative_eagle_topk=1."
-        )
+    use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
-    assert candidates.shape == (bs, spec_steps + 1)
-    assert target_predict.shape == candidates.shape
-    assert accept_index.shape == candidates.shape
-    assert predict.numel() == candidates.numel()
     simulate_acc_len = _sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
 
-    # topk=1 is a contiguous chain per request. The first accepted index is the
-    # chain root, and SGLang enforces num_draft_tokens == spec_steps + 1.
-    chain_offsets = torch.arange(
-        simulate_acc_len, dtype=accept_index.dtype, device=accept_index.device
+    accept_indx_first_col = accept_index[:, 0].view(-1, 1)
+    sim_accept_index = torch.full(
+        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
     )
-    sim_accept_index = torch.full_like(accept_index, -1)
-    sim_accept_index[:, :simulate_acc_len] = accept_index[
-        :, :1
-    ] + chain_offsets.unsqueeze(0)
+    sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
+        simulate_acc_len, device=accept_index.device
+    )
+    num_correct_drafts.fill_(simulate_acc_len - 1)
 
-    # Each accepted draft token must match the target-verified chain node whose
-    # KV state will be committed. The final accepted slot is the target bonus.
+    if not use_real_draft_tokens:
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+
+    # Use the topk=1 draft chain for forced acceptance, then a target-derived bonus.
     if simulate_acc_len > 1:
         draft_node_indices = sim_accept_index[:, : simulate_acc_len - 1].long()
         predict[draft_node_indices] = candidates[:, 1:simulate_acc_len].to(
@@ -360,7 +355,6 @@ def generate_simulated_accept_index(
     predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
         dtype=predict.dtype
     )
-    num_correct_drafts.fill_(simulate_acc_len - 1)
     return sim_accept_index
 
 

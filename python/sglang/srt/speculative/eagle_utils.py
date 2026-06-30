@@ -436,6 +436,7 @@ def eagle_sample(
     from sglang.srt.server_args import get_global_server_args
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
+        SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
     from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
@@ -605,22 +606,28 @@ def eagle_sample(
             tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
-        if verify_input.tree_topk != 1:
-            raise ValueError(
-                "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently requires "
-                "speculative_eagle_topk=1."
-            )
-
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
-        # For non-greedy requests, use a target-derived terminal token as the
-        # synthetic bonus. Synthetic acceptance is benchmark-only, but keeping
-        # the accepted prefix on a real draft path preserves token/KV coherence.
-        if target_predict is None:
-            target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
-                bs, verify_input.draft_token_num
+        if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                "'real-draft-token'."
             )
+
+        if SIMULATE_ACC_TOKEN_MODE == "real-draft-token":
+            if verify_input.tree_topk != 1:
+                raise ValueError(
+                    "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently "
+                    "requires speculative_eagle_topk=1."
+                )
+
+            # Use target argmax as the synthetic bonus for non-greedy requests.
+            if target_predict is None:
+                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+                    bs, verify_input.draft_token_num
+                )
         accept_index = generate_simulated_accept_index(
             accept_index=accept_index,
             predict=predict,  # mutable
@@ -628,9 +635,9 @@ def eagle_sample(
             candidates=candidates,
             target_predict=target_predict,
             simulate_acc_len=SIMULATE_ACC_LEN,
+            simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
-            topk=verify_input.tree_topk,
         )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
