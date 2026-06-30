@@ -414,7 +414,7 @@ class NPUW8A8Mxfp8MoEMethod(_NPUMoEMethodBase):
 
         # Set dispatcher output dtype – mxfp8_e4m3fn
         if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "mxfp8_e4m3fn")
+            self._set_dispatcher_output_dtype(layer, "bf16") # add "mxfp8_e4m3fn" in future
 
     # ------------------------------------------------------------------
     # Forward pass with dynamic MX quantization
