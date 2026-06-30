@@ -223,11 +223,6 @@ class RealtimeConnection:
         )
         left_overlap_ms = int(slicing_cfg.get("left_overlap_ms", 0))
         min_audio_sec = float(slicing_cfg.get("min_audio_sec", 0.0))
-        left_overlap_bytes = int(left_overlap_ms / 1000 * self.bytes_per_second)
-        # Snap to a whole int16 frame: odd model_sample_rate*left_overlap_ms
-        # (e.g. 44.1kHz) yields an odd byte count, and an odd slice start splits
-        # a PCM sample, which raises in pcm_to_float_samples (np.int16 view).
-        left_overlap_bytes -= left_overlap_bytes % PCM_SAMPLE_WIDTH
 
         state = StreamingASRState(**adapter.chunked_streaming_config)
         chunk_size_bytes = int(state.chunk_size_sec * self.bytes_per_second)
@@ -236,6 +231,33 @@ class RealtimeConnection:
                 f"adapter.chunked_streaming_config produced non-positive "
                 f"chunk_size_sec; got {state.chunk_size_sec!r}"
             )
+        if state.unfixed_chunk_num < 0 or state.unfixed_token_num < 0:
+            raise RuntimeError(
+                f"adapter.chunked_streaming_config produced negative holdback "
+                f"values; got unfixed_chunk_num={state.unfixed_chunk_num!r}, "
+                f"unfixed_token_num={state.unfixed_token_num!r}"
+            )
+
+        invalid_slicing_fields = []
+        if left_overlap_ms < 0:
+            invalid_slicing_fields.append(f"left_overlap_ms={left_overlap_ms!r}")
+        if min_audio_sec < 0:
+            invalid_slicing_fields.append(f"min_audio_sec={min_audio_sec!r}")
+        if slicing_opt_in and invalid_slicing_fields:
+            logger.warning(
+                "[realtime] invalid realtime_slicing_config (%s); "
+                "audio slicing disabled, falling back to cumulative inference",
+                ", ".join(invalid_slicing_fields),
+            )
+            slicing_opt_in = False
+        left_overlap_ms = max(left_overlap_ms, 0)
+        min_audio_sec = max(min_audio_sec, 0.0)
+
+        left_overlap_bytes = int(left_overlap_ms / 1000 * self.bytes_per_second)
+        # Snap to a whole int16 frame: odd model_sample_rate*left_overlap_ms
+        # (e.g. 44.1kHz) yields an odd byte count, and an odd slice start splits
+        # a PCM sample, which raises in pcm_to_float_samples (np.int16 view).
+        left_overlap_bytes -= left_overlap_bytes % PCM_SAMPLE_WIDTH
         slicing_min_chunk_index = (
             math.ceil(min_audio_sec / state.chunk_size_sec) if slicing_opt_in else 0
         )

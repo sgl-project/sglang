@@ -207,16 +207,17 @@ class _SlicingAdapter:
 
     model_sample_rate = 16000
 
-    def __init__(self, left_overlap_ms, enabled=True):
+    def __init__(self, left_overlap_ms, enabled=True, min_audio_sec=16.0):
         self._left_overlap_ms = left_overlap_ms
         self._enabled = enabled
+        self._min_audio_sec = min_audio_sec
 
     @property
     def realtime_slicing_config(self):
         return {
             "enabled": self._enabled,
             "left_overlap_ms": self._left_overlap_ms,
-            "min_audio_sec": 16.0,
+            "min_audio_sec": self._min_audio_sec,
         }
 
     @property
@@ -245,12 +246,15 @@ class _RuntimeSlicingAdapter:
 
 
 class TestSlicingEnabledGuard(CustomTestCase):
-    def _conn(self, left_overlap_ms, enabled=True):
+    def _conn(self, left_overlap_ms, enabled=True, min_audio_sec=16.0):
         server_args = SimpleNamespace(
             asr_max_buffer_seconds=60, asr_disable_input_slicing=False
         )
         return RealtimeConnection(
-            object(), object(), _SlicingAdapter(left_overlap_ms, enabled), server_args
+            object(),
+            object(),
+            _SlicingAdapter(left_overlap_ms, enabled, min_audio_sec),
+            server_args,
         )
 
     def test_enabled_only_when_overlap_fits_unfixed_window(self):
@@ -263,6 +267,12 @@ class TestSlicingEnabledGuard(CustomTestCase):
         # enabled=False (the base-adapter default) -> never slices.
         self.assertFalse(
             self._conn(left_overlap_ms=2000, enabled=False).audio.slicing_enabled
+        )
+
+    def test_invalid_slicing_config_disables_slicing(self):
+        self.assertFalse(self._conn(left_overlap_ms=-1).audio.slicing_enabled)
+        self.assertFalse(
+            self._conn(left_overlap_ms=2000, min_audio_sec=-1.0).audio.slicing_enabled
         )
 
 
