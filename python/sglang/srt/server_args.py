@@ -4525,9 +4525,13 @@ class ServerArgs:
         if self.mamba_radix_cache_strategy == "auto":
             wants_overlap = not self.disable_overlap_schedule
             wants_paging = self.page_size is not None and self.page_size > 1
+            # extra_buffer relies on FLA kernels that only run on CUDA/MUSA/NPU,
+            # so fall back to no_buffer on other platforms (e.g. ROCm).
             if (
-                wants_overlap or wants_paging
-            ) and self._support_mamba_cache_extra_buffer(model_arch):
+                (wants_overlap or wants_paging)
+                and self._support_mamba_cache_extra_buffer(model_arch)
+                and (is_cuda() or is_musa() or is_npu())
+            ):
                 self.mamba_radix_cache_strategy = "extra_buffer"
             else:
                 self.mamba_radix_cache_strategy = "no_buffer"
