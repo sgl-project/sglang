@@ -188,11 +188,10 @@ def fused_q_indexer_rope_first_quant(
     q_input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: float,
-    freqs_cis: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """DeepSeek-V3.2 only. Indexer Q: RoPE on the leading dims + fp8 act-quant. CUDA only."""
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
@@ -204,7 +203,7 @@ def fused_q_indexer_rope_first_quant(
         weight,
         weights_out,
         float(weight_scale),
-        freqs_real,
+        cos_sin_cache,
         positions,
     )
     return q_fp8, weights_out
