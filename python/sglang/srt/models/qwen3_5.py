@@ -220,9 +220,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
         )
 
-        # Override weight loaders for packed checkpoint format.
-        # Important: for FP8, this must cover not only `.weight` but also
-        # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
+        # Override weight loaders for packed checkpoint format. Quantized
+        # params may have scales that need the same split mapping as weights.
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
 
@@ -232,14 +231,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self._override_weight_loader(
             self.conv1d.weight,
-            mamba_v2_sharded_weight_loader(
-                [
-                    query_key_settings,
-                    query_key_settings,
-                    value_settings,
-                ],
-                self.attn_tp_size,
-                self.attn_tp_rank,
+            self._make_conv1d_weight_loader(
+                mamba_v2_sharded_weight_loader(
+                    [
+                        query_key_settings,
+                        query_key_settings,
+                        value_settings,
+                    ],
+                    self.attn_tp_size,
+                    self.attn_tp_rank,
+                )
             ),
         )
 
@@ -322,7 +323,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _bind_packed_weight_loaders(self, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "weight_scale_2",
+            "input_scale",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
@@ -356,7 +363,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """Wrap the param's original loader so split checkpoints:
           - in_proj_qkv + in_proj_z -> merged in_proj_qkvz
           - in_proj_b + in_proj_a   -> merged in_proj_ba
-        can load correctly for both normal and FP8 params.
+        can load correctly for normal and quantized params.
         """
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
@@ -399,6 +406,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 return
 
             return original_weight_loader(param, loaded_weight, loaded_shard_id)
+
+        return weight_loader
+
+    @staticmethod
+    def _make_conv1d_weight_loader(loader):
+        """Adapt GDN conv1d checkpoints with or without the singleton channel dim.
+
+        Some checkpoints store the depthwise-conv weight as [N, 1, K], while
+        the TP-sharded runtime parameter may be [N, K]. Keep this wrapper
+        limited to that single representation difference before delegating to
+        the real loader, so other shape mismatches still fail normally.
+        """
+
+        def weight_loader(param, loaded_weight):
+            param_data = param.data
+            if (
+                loaded_weight.ndim == param_data.ndim + 1
+                and loaded_weight.ndim > 1
+                and loaded_weight.shape[1] == 1
+            ):
+                loaded_weight = loaded_weight.squeeze(1)
+            elif (
+                loaded_weight.ndim + 1 == param_data.ndim
+                and param_data.ndim > 1
+                and param_data.shape[1] == 1
+            ):
+                loaded_weight = loaded_weight.unsqueeze(1)
+            loader(param, loaded_weight)
 
         return weight_loader
 
@@ -587,11 +622,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        linear_attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
+        linear_attn_quant_config = quant_config
         self.linear_attn = Qwen3_5GatedDeltaNet(
             config, layer_id, linear_attn_quant_config, alt_stream, prefix
         )
@@ -764,11 +795,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "modelopt_fp4"
-            else quant_config
-        )
+        attn_quant_config = quant_config
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
