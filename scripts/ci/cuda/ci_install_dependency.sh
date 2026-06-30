@@ -46,11 +46,15 @@ configure_environment() {
     fi
     mkdir -p "${SGLANG_CACHE_DIR}"
     echo "SGLANG_CACHE_DIR=${SGLANG_CACHE_DIR}"
-    if [ -z "${TVM_FFI_CACHE_DIR:-}" ]; then
+    if [ -z "${TVM_FFI_CACHE_DIR:-}" ] && [[ "${GITHUB_JOB:-}" != jit-kernel-* ]]; then
         export TVM_FFI_CACHE_DIR="${RUNNER_TEMP:-/tmp}/tvm-ffi-cache"
     fi
-    mkdir -p "${TVM_FFI_CACHE_DIR}"
-    echo "TVM_FFI_CACHE_DIR=${TVM_FFI_CACHE_DIR}"
+    if [ -n "${TVM_FFI_CACHE_DIR:-}" ]; then
+        mkdir -p "${TVM_FFI_CACHE_DIR}"
+        echo "TVM_FFI_CACHE_DIR=${TVM_FFI_CACHE_DIR}"
+    else
+        echo "TVM_FFI_CACHE_DIR is unset; using tvm-ffi default cache"
+    fi
     if [ -z "${OUTLINES_CACHE_DIR:-}" ]; then
         export OUTLINES_CACHE_DIR="${RUNNER_TEMP:-/tmp}/outlines-cache"
     fi
@@ -59,7 +63,9 @@ configure_environment() {
     if [ -n "${GITHUB_ENV:-}" ]; then
         echo "UV_CACHE_DIR=${UV_CACHE_DIR}" >> "${GITHUB_ENV}" || true
         echo "SGLANG_CACHE_DIR=${SGLANG_CACHE_DIR}" >> "${GITHUB_ENV}" || true
-        echo "TVM_FFI_CACHE_DIR=${TVM_FFI_CACHE_DIR}" >> "${GITHUB_ENV}" || true
+        if [ -n "${TVM_FFI_CACHE_DIR:-}" ]; then
+            echo "TVM_FFI_CACHE_DIR=${TVM_FFI_CACHE_DIR}" >> "${GITHUB_ENV}" || true
+        fi
         echo "OUTLINES_CACHE_DIR=${OUTLINES_CACHE_DIR}" >> "${GITHUB_ENV}" || true
     fi
 
