@@ -1150,7 +1150,7 @@ class KVWriteLoc:
       SWA pools (``None`` otherwise).
     - ``full_loc``: the pre-translated full-attention-sub-pool PHYSICAL location
       for the shared KV pool (``None`` otherwise), computed once per forward in
-      attention metadata (``ForwardBatch.out_cache_loc_full_physical``). The
+      attention metadata (``ForwardMetadata.out_cache_loc_full_physical``). The
       shared full pool writes it directly; the pool never translates (replacing
       the former per-layer v2p gather / ``set_full_loc`` pin).
 

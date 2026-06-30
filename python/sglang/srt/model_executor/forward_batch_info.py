@@ -352,13 +352,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
-    # Per-batch full-physical-token-id translation of
-    # `out_cache_loc`, used by the full-attention write path under the
-    # shared-KV-pool. Set only when `model_runner.enable_shared_kv_pool`
-    # is on (else None — the write path falls back to the per-call translate
-    # in `SharedMHATokenToKVPool.set_kv_buffer`). int64 to match the v2p
-    # table dtype.
-    out_cache_loc_full_physical: Optional[torch.Tensor] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -1373,12 +1366,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
-        # Pad the shared-pool full-physical precompute. Padding value 0 →
-        # virtual token 0 → physical token 0 (the reserved padding sink).
-        if self.out_cache_loc_full_physical is not None:
-            self.out_cache_loc_full_physical = self._pad_tensor_to_size(
-                self.out_cache_loc_full_physical, num_tokens
-            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

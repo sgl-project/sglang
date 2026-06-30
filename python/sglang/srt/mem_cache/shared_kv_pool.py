@@ -1485,14 +1485,14 @@ class SharedSWAKVPool(SWAKVPool):
             )
             return
         # Full layer. The full-PHYSICAL write loc is carried in the write metadata
-        # (`KVWriteLoc.full_loc`, from `ForwardBatch.out_cache_loc_full_physical` —
-        # translated once per forward and tombstone-clamped by `translate_kv_loc`).
-        # The shared pool always precomputes it (eager + cuda-graph capture), so
-        # it must be present.
+        # (`KVWriteLoc.full_loc`, from the attention backend's
+        # `ForwardMetadata.out_cache_loc_full_physical` — translated once per
+        # forward and tombstone-clamped by `translate_kv_loc`). The shared pool
+        # always precomputes it (eager + cuda-graph capture), so it must be present.
         assert full_loc is not None, (
             "SharedSWAKVPool.set_kv_buffer: full layer received no full_loc; "
-            "ForwardBatch.out_cache_loc_full_physical must be precomputed for the "
-            "shared KV pool."
+            "ForwardMetadata.out_cache_loc_full_physical must be precomputed for "
+            "the shared KV pool."
         )
         self.full_kv_pool.set_kv_buffer(
             None,

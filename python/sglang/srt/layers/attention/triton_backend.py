@@ -98,6 +98,11 @@ class ForwardMetadata:
     swa_attn_logits: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # full-attention PHYSICAL out_cache_loc (shared-pool write target). Mirror of
+    # swa_out_cache_loc for the full-attn KV store: eager carries the translated
+    # tensor; cuda-graph carries the capture-stable backend buffer view. None for
+    # non-shared pools (the pool then falls back to its per-call translate).
+    out_cache_loc_full_physical: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -637,10 +642,16 @@ class TritonAttnBackend(AttentionBackend):
             )
             # Shared pool: eager v2p translate of the read/write loc buffers
             # (full kv_indices, SWA window, out_cache_loc) — see method docstring.
-            self._translate_cuda_graph_shared_pool_locs(forward_batch, bs)
+            out_cache_loc_full_physical = self._translate_cuda_graph_shared_pool_locs(
+                forward_batch, bs
+            )
             swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
-                bs, forward_mode, spec_info, swa_out_cache_loc
+                bs,
+                forward_mode,
+                spec_info,
+                swa_out_cache_loc,
+                out_cache_loc_full_physical,
             )
         else:
             self._apply_cuda_graph_metadata(
@@ -677,7 +688,7 @@ class TritonAttnBackend(AttentionBackend):
 
     def _translate_cuda_graph_shared_pool_locs(
         self, forward_batch: ForwardBatch, bs: int
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         """Shared KV pool: eager virtual->physical translate of the cuda-graph
         read + write LOC buffers, run in `init_forward_metadata_out_graph`
         (capture AND replay-prep, i.e. BEFORE ``graph.replay()``), reading the
@@ -685,18 +696,22 @@ class TritonAttnBackend(AttentionBackend):
         nodes (Invariant 2) and reads already-physical locs — mirroring
         `_fill_cuda_graph_swa_out_cache_loc`. No-op for non-shared pools.
 
-        The build (`_update_*_kv_buffers`) left these buffers VIRTUAL:
+        The read buffers are translated IN PLACE (the metadata already points at
+        them):
         - full-attention read: ``cuda_graph_kv_indices[:kv_indptr[bs]]``
         - SWA window read: ``cuda_graph_window_kv_indices[:window_kv_indptr[bs]]``
-        - full-attention write: ``out_cache_loc`` -> the backend-owned
-          ``cuda_graph_out_cache_loc_full_physical`` buffer, surfaced on
-          ``forward_batch.out_cache_loc_full_physical`` (-> ``KVWriteLoc.full_loc``).
+
+        The full-attention WRITE loc is RETURNED (like
+        `_fill_cuda_graph_swa_out_cache_loc`): ``out_cache_loc`` -> the
+        backend-owned ``cuda_graph_out_cache_loc_full_physical`` buffer; the caller
+        stores the ``[:n]`` view in ``ForwardMetadata.out_cache_loc_full_physical``
+        (-> ``KVWriteLoc.full_loc``). Returns None for non-shared pools.
 
         Eager ``.item()`` bounds are fine here (runs out-of-graph), which is why
         no GPU-bounded in-graph translate variant is needed.
         """
         if self._translate_kv_loc is None:
-            return
+            return None
         # Full-attention read path.
         n_kv = int(self.kv_indptr[bs].item())
         if n_kv > 0:
@@ -712,39 +727,18 @@ class TritonAttnBackend(AttentionBackend):
                         self.cuda_graph_window_kv_indices[:n_win]
                     )
                 )
-        # Full-attention write path.
+        # Full-attention write path: translate out_cache_loc -> physical into the
+        # capture-stable buffer and RETURN the [:n] view (the decode cuda-graph
+        # out_cache_loc is always present and bs <= max_bs, so no guard needed).
         out_cache_loc = forward_batch.out_cache_loc
-        if (
-            out_cache_loc is not None
-            and out_cache_loc.shape[0]
-            <= self.cuda_graph_out_cache_loc_full_physical.shape[0]
-        ):
-            n = out_cache_loc.shape[0]
-            self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
-                self._translate_kv_loc(out_cache_loc)
-            )
-            forward_batch.out_cache_loc_full_physical = (
-                self.cuda_graph_out_cache_loc_full_physical[:n]
-            )
+        n = out_cache_loc.shape[0]
+        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
+            self._translate_kv_loc(out_cache_loc)
+        )
+        return self.cuda_graph_out_cache_loc_full_physical[:n]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
-
-        # Shared KV pool: materialize the full-attention WRITE location
-        # (virtual `out_cache_loc` -> physical) into the attention metadata —
-        # the write-path companion to the read-path `_translate_kv_loc` below.
-        # `set_kv_buffer` reads it from `KVWriteLoc.full_loc`; the pool never
-        # translates. No-op for non-shared pools (`_translate_kv_loc is None`).
-        # The decode cuda-graph path does this translate in-graph at capture and
-        # never reaches here.
-        if (
-            self._translate_kv_loc is not None
-            and forward_batch.out_cache_loc is not None
-            and forward_batch.out_cache_loc_full_physical is None
-        ):
-            forward_batch.out_cache_loc_full_physical = self._translate_kv_loc(
-                forward_batch.out_cache_loc
-            )
 
         bs = forward_batch.batch_size
         window_kv_indptr = self.window_kv_indptr
@@ -961,6 +955,19 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc
             )
 
+        # Shared KV pool: full-attention WRITE location (virtual out_cache_loc ->
+        # physical), the write-path companion of the read-path translate. Carried
+        # in the metadata (-> KVWriteLoc.full_loc); the pool never translates.
+        # None for non-shared pools (_translate_kv_loc is None).
+        out_cache_loc_full_physical = None
+        if (
+            self._translate_kv_loc is not None
+            and forward_batch.out_cache_loc is not None
+        ):
+            out_cache_loc_full_physical = self._translate_kv_loc(
+                forward_batch.out_cache_loc
+            )
+
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -977,6 +984,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
+            out_cache_loc_full_physical=out_cache_loc_full_physical,
         )
 
     def init_cuda_graph_state(
@@ -1070,7 +1078,7 @@ class TritonAttnBackend(AttentionBackend):
         if self._translate_kv_loc is not None:
             # Shared pool: full-attention write-target buffer, refilled at replay
             # from out_cache_loc by `_translate_cuda_graph_shared_pool_locs`
-            # (-> forward_batch.out_cache_loc_full_physical -> KVWriteLoc.full_loc).
+            # (-> ForwardMetadata.out_cache_loc_full_physical -> KVWriteLoc.full_loc).
             # Backend-owned + capture-stable, mirroring cuda_graph_swa_out_cache_loc.
             self.cuda_graph_out_cache_loc_full_physical = torch.zeros(
                 (max_num_tokens,),
@@ -1084,6 +1092,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         swa_out_cache_loc: Optional[torch.Tensor] = None,
+        out_cache_loc_full_physical: Optional[torch.Tensor] = None,
     ) -> ForwardMetadata:
         """Construct ForwardMetadata from the current cuda-graph buffer state.
 
@@ -1114,6 +1123,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_kv_offsets=None,
                 swa_attn_logits=self.cuda_graph_swa_attn_logits,
                 swa_out_cache_loc=swa_out_cache_loc,
+                out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
         elif forward_mode.is_target_verify():
             custom_mask = (
@@ -1139,6 +1149,7 @@ class TritonAttnBackend(AttentionBackend):
                 ),
                 window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
                 swa_out_cache_loc=swa_out_cache_loc,
+                out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
         elif forward_mode.is_draft_extend_v2():
             return ForwardMetadata(
@@ -1164,6 +1175,7 @@ class TritonAttnBackend(AttentionBackend):
                 window_num_kv_splits=None,
                 window_kv_offsets=None,
                 swa_out_cache_loc=swa_out_cache_loc,
+                out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=} for CUDA Graph.")
@@ -1291,7 +1303,7 @@ class TritonAttnBackend(AttentionBackend):
                 loc_info = KVWriteLoc(
                     forward_batch.out_cache_loc,
                     self.forward_metadata.swa_out_cache_loc,
-                    full_loc=forward_batch.out_cache_loc_full_physical,
+                    full_loc=self.forward_metadata.out_cache_loc_full_physical,
                 )
                 if layer.k_scale is None:
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
@@ -1737,7 +1749,7 @@ class TritonAttnBackend(AttentionBackend):
                     KVWriteLoc(
                         forward_batch.out_cache_loc,
                         self.forward_metadata.swa_out_cache_loc,
-                        full_loc=forward_batch.out_cache_loc_full_physical,
+                        full_loc=self.forward_metadata.out_cache_loc_full_physical,
                     ),
                     k,
                     v,

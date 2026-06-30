@@ -714,9 +714,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._post_process_after_profile(prof)
 
         # No pool-side pin to clear: the captured full-physical write loc is
-        # bound via the capture forward_batch's `out_cache_loc_full_physical`
-        # (-> `KVWriteLoc.full_loc`), and the eager path carries its own per-batch
-        # `out_cache_loc_full_physical` in the attention metadata.
+        # bound via the backend's `ForwardMetadata.out_cache_loc_full_physical`
+        # (-> `KVWriteLoc.full_loc`); the eager path carries the same metadata
+        # field per batch.
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
@@ -869,7 +869,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             # Full-physical write loc lives in the attention metadata and is
             # filled by the backend's `init_forward_metadata_out_graph` (which
-            # points `forward_batch.out_cache_loc_full_physical` at its own
+            # stores `ForwardMetadata.out_cache_loc_full_physical`, its own
             # capture-stable buffer -> `KVWriteLoc.full_loc`), so the runner does
             # NOT wire a buffer here. (The SWA write loc rides the backend
             # `swa_out_cache_loc` rail, consumed in `SharedSWAKVPool.set_kv_buffer`.)
