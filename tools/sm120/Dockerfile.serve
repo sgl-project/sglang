@@ -1,0 +1,39 @@
+# Serving image: an SGLang base with the SM120 fork branch baked in.
+# This is the container equivalent of, on the box:
+#   cd /sgl-workspace/sglang && git fetch <repo> <branch> && git reset --hard FETCH_HEAD
+#
+# Build arg SGLANG_IMAGE must be an SGLang runtime image that works on your SM120
+# nodes (same one you run today). The branch is overlaid onto its /sgl-workspace
+# editable checkout, so the serving entrypoint from the base image is preserved.
+
+ARG SGLANG_IMAGE=lmsysorg/sglang:latest
+FROM ${SGLANG_IMAGE}
+
+# Some base images are missing the `distro` module (needed transitively at import).
+RUN pip install --no-cache-dir distro
+
+ARG SGLANG_REPO=https://github.com/shivajid/sglang.git
+ARG SGLANG_BRANCH=sm120-glm5.2-fp8
+ARG SGLANG_DIR=/sgl-workspace/sglang
+# Bumped each build (Cloud Build passes $BUILD_ID) to bust the git-fetch cache.
+ARG CACHEBUST=0
+
+RUN if [ -d "${SGLANG_DIR}/.git" ]; then \
+        cd "${SGLANG_DIR}" && \
+        git config --global --add safe.directory "${SGLANG_DIR}" && \
+        echo "cachebust=${CACHEBUST}" && \
+        git fetch --depth=1 "${SGLANG_REPO}" "${SGLANG_BRANCH}" && \
+        git reset --hard FETCH_HEAD && \
+        git log --oneline -3 ; \
+    else \
+        echo "ERROR: ${SGLANG_DIR}/.git not found in base image ${SGLANG_IMAGE}" >&2 ; \
+        exit 1 ; \
+    fi
+
+# Patch the installed tilelang CUDA template so the DSA attention kernels compile
+# on SM120 (adds a no-op tl::wait_wgmma to gemm_sm120.h). tilelang JIT-compiles
+# with these headers at runtime, so this is all that's needed (no tilelang rebuild).
+RUN python3 "${SGLANG_DIR}/tools/sm120/patch_tilelang_wait_wgmma.py"
+
+# Inherit the base image's ENTRYPOINT/CMD (sglang). Launch args are supplied at
+# `docker run` / in the GKE pod spec.

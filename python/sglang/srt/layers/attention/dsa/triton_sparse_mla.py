@@ -7,6 +7,8 @@ prefill regime (n_groups=1): the attention tile is tiny (M=16 heads = one
 coordination overhead of the 256-thread TileLang block.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -33,6 +35,33 @@ _AUTOTUNE_CONFIGS = [
     for w in (1, 2, 4)
     for ns in (1, 2)
 ]
+
+# SM120: the 18-config autotune sweep (nvcc compile + benchmark of every config,
+# on every DP rank at once) overruns the 300s scheduler watchdog on the first
+# prefill. A *single* config means triton skips benchmarking and compiles once.
+# Env-tunable if you want to try other tiles. Off-SM120 keeps the full sweep.
+try:
+    from sglang.srt.utils import is_sm120_supported as _is_sm120_supported
+
+    if _is_sm120_supported():
+        # SM120 smem cap is 101376 B. Calibrated from two measured points at
+        # H=64, BLOCK_N=64: stages=2 -> 127232 B, stages=1 -> 122880 B (so a
+        # pipeline stage is only ~4352 B; the q/kv TILES dominate, not stages).
+        # Decompose: BLOCK_N-scaling = (D_V + D_TAIL + H)*BLOCK_N = 640*BLOCK_N;
+        # fixed = 122880 - 640*64 = 81920 (q tile [H,D_V] + scratch).
+        # Predicted (stages=1):  BLOCK_N=64->122880(OOM), 32->102400(OOM, ~1KB
+        # over), 16->92160(FITS), 8->87040(FITS). So 32+ do NOT fit at H=64.
+        # Use {8, 16}: both provably fit; triton picks 16 (faster), 8 is a floor.
+        _w = int(os.environ.get("SGLANG_SM120_DSA_ATTN_WARPS", "4"))
+        _ns = int(os.environ.get("SGLANG_SM120_DSA_ATTN_STAGES", "1"))
+        _bn_env = os.environ.get("SGLANG_SM120_DSA_ATTN_BLOCK_N")
+        _bns = [int(_bn_env)] if _bn_env else [8, 16]
+        _AUTOTUNE_CONFIGS = [
+            triton.Config({"BLOCK_N": bn}, num_warps=_w, num_stages=_ns)
+            for bn in _bns
+        ]
+except Exception:  # noqa: BLE001
+    pass
 
 
 @triton.autotune(
@@ -158,3 +187,53 @@ def triton_sparse_mla_fwd(
         D_TAIL=d_tail,
     )
     return out.unsqueeze(0)
+
+
+_sm120_route_logged = False
+
+
+def sm120_triton_sparse_mla(layer, q_nope, q_rope, kv_cache, page_table_1):
+    """SM120 has no working tilelang sparse-attention kernel (it is Hopper-only:
+    166 KB smem / block_I=64 hardwired, exceeds SM120's ~100 KB). Use this triton
+    sparse-MLA kernel instead when the absorbed-MLA shapes/dtype match (fp8 KV,
+    d_v=512, tail=64, topk=2048 -- the GLM-5.2 DSA path). The head count is NOT
+    fixed: under DP-attention each rank carries the full 64 heads; under plain TP
+    it is fewer. The triton kernel handles any (power-of-2) head count. Returns
+    the attn output, or None to fall back to the (tilelang) path.
+
+    Lives here (not in dsa_backend) so it can be imported without pulling in the
+    heavy dsa_backend import chain (flashinfer.comm etc.).
+    """
+    global _sm120_route_logged
+    if q_rope is None:
+        return None
+
+    h = layer.tp_q_head_num
+    ok = (
+        kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        and h in (16, 32, 64, 128)
+        and layer.v_head_dim == 512
+        and (layer.head_dim - layer.v_head_dim) == 64
+        and page_table_1.shape[-1] == 2048
+    )
+    if not _sm120_route_logged:
+        _sm120_route_logged = True
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "SM120 DSA attention: %s triton sparse-MLA "
+            "(heads=%s kv_dtype=%s v_head_dim=%s head_dim=%s topk=%s)",
+            "USING" if ok else "FALLING BACK (tilelang) -- gate not matched, from",
+            h, kv_cache.dtype, layer.v_head_dim, layer.head_dim,
+            page_table_1.shape[-1],
+        )
+    if not ok:
+        return None
+    return triton_sparse_mla_fwd(
+        q_nope=q_nope,
+        q_rope=q_rope,
+        kv=kv_cache,
+        indices=page_table_1.unsqueeze(1),
+        sm_scale=layer.scaling,
+        d_v=layer.v_head_dim,
+    )

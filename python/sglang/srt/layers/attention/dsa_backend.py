@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_sm100_supported,
+    is_sm120_supported,
 )
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
@@ -64,6 +65,15 @@ from sglang.srt.utils import (
 # concat). Enable with SGLANG_DSA_TRITON_PREFILL=1. Decode stays on TileLang.
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
+# SM120 (Blackwell desktop / RTX PRO 6000): module-level so all SM120 guards work
+# regardless of __init__ ordering / partial patch application.
+_IS_SM120 = is_sm120_supported()
+
+# SM120 DSA attention routing helper lives in triton_sparse_mla (a light module)
+# so tools can import it without pulling in the heavy dsa_backend import chain.
+from sglang.srt.layers.attention.dsa.triton_sparse_mla import (
+    sm120_triton_sparse_mla as _sm120_triton_sparse_mla,
+)
 
 if is_cuda():
     import deep_gemm
@@ -411,10 +421,31 @@ class DeepseekSparseAttnBackend(
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        self.is_sm120 = _IS_SM120
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
+        # SM120 (Blackwell desktop / RTX PRO 6000) cannot run the flashinfer or
+        # sgl_kernel.flash_mla based DSA impls (no tcgen05/TMEM). The auto-selector
+        # picks "tilelang" on SM120; fail loudly if one of the unsupported impls was
+        # forced via --dsa-prefill-backend / --dsa-decode-backend.
+        if _IS_SM120:
+            _sm120_unsupported = {"trtllm", "flashmla_sparse", "flashmla_kv", "fa3"}
+            for _impl, _label in (
+                (self.dsa_prefill_impl, "dsa_prefill_backend"),
+                (self.dsa_decode_impl, "dsa_decode_backend"),
+            ):
+                if _impl in _sm120_unsupported:
+                    raise ValueError(
+                        f"DSA backend '{_impl}' ({_label}) is not supported on SM120 "
+                        f"(no flashinfer / flash_mla kernels). Use 'tilelang' "
+                        f"(or 'triton') instead."
+                    )
+
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
+        # SM120 never uses the trtllm/flashinfer ragged path, so skip the allocation there.
+        if (
+            self.device_sm_major >= 10 and not _IS_SM120
+        ) or self.dsa_decode_impl == "trtllm":
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -880,8 +911,14 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            # deep_gemm has no SM120 kernel and the SM120 indexer (tilelang/torch)
+            # ignores this schedule metadata, so skip the (crashing) call there.
+            paged_mqa_schedule_metadata = (
+                None
+                if _IS_SM120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
             )
 
         metadata = DSAMetadata(
@@ -1157,8 +1194,14 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            # deep_gemm has no SM120 kernel and the SM120 indexer (tilelang/torch)
+            # ignores this schedule metadata, so skip the (crashing) call there.
+            paged_mqa_schedule_metadata = (
+                None
+                if _IS_SM120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
             )
 
         metadata = DSAMetadata(
@@ -1328,8 +1371,12 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded,
                 bs,
             )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            new_schedule = (
+                None
+                if _IS_SM120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                )
             )
             if metadata.paged_mqa_schedule_metadata is None:
                 object.__setattr__(
@@ -1528,8 +1575,12 @@ class DeepseekSparseAttnBackend(
                     metadata.dsa_seqlens_expanded,
                     bs,
                 )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+            new_schedule = (
+                None
+                if _IS_SM120
+                else deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                )
             )
             if metadata.paged_mqa_schedule_metadata is None:
                 object.__setattr__(
@@ -1705,6 +1756,14 @@ class DeepseekSparseAttnBackend(
                         sm_scale=layer.scaling,
                         d_v=layer.v_head_dim,
                     )
+                # SM120: the tilelang sparse-attn kernel can't run (Hopper smem);
+                # route to the portable triton kernel when shapes/dtype match.
+                if _IS_SM120:
+                    _o = _sm120_triton_sparse_mla(
+                        layer, q_nope, q_rope, kv_cache, page_table_1
+                    )
+                    if _o is not None:
+                        return _o
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
@@ -1894,6 +1953,14 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif self.dsa_decode_impl == "tilelang":
+            # SM120: tilelang sparse-attn kernel can't run (Hopper smem); use the
+            # portable triton kernel when shapes/dtype match.
+            if _IS_SM120:
+                _o = _sm120_triton_sparse_mla(
+                    layer, q_nope, q_rope, kv_cache, page_table_1
+                )
+                if _o is not None:
+                    return _o
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
             # has already been set to a zero-copy view of q in the else branch
             # above and we can reuse it directly. The `not _is_hip` clause keeps
@@ -1989,8 +2056,11 @@ class DeepseekSparseAttnBackend(
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
 
-        # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
+        # Determine required padding based on GPU architecture (use cached value).
+        # SM120 uses the 64-pad path (it does not run the SM100 flashmla kernels).
+        required_padding = (
+            128 if (self.device_sm_major >= 10 and not _IS_SM120) else 64
+        )
 
         need_padding = num_heads % required_padding != 0
 
@@ -2111,8 +2181,10 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
-        if self.device_sm_major >= 10:
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+        # SM120 has no flashinfer kernels; it never enters MHA_ONE_SHOT (gated to SM90/SM100
+        # below), so this branch is excluded defensively.
+        if self.device_sm_major >= 10 and not _IS_SM120:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32

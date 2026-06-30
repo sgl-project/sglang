@@ -3584,6 +3584,15 @@ class ServerArgs:
         if not user_set_prefill and not user_set_decode and is_hip():
             self.dsa_prefill_backend = "tilelang"
             self.dsa_decode_backend = "tilelang"
+        elif is_sm120_supported():
+            # SM120 (Blackwell desktop / RTX PRO 6000) lacks tcgen05/TMEM and the
+            # flashinfer / sgl_kernel.flash_mla kernels used by the trtllm and
+            # flashmla_* DSA impls. TileLang sparse MLA runs on SM120 and supports
+            # both bf16 and fp8_e4m3 KV cache. Respect explicit user overrides.
+            if not user_set_prefill:
+                self.dsa_prefill_backend = "tilelang"
+            if not user_set_decode:
+                self.dsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 if not user_set_prefill:
@@ -3683,6 +3692,24 @@ class ServerArgs:
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "dsa"
                     logger.info("Use dsa attention backend for DeepSeek with DSA.")
+
+                if is_sm120_supported():
+                    # SM120 (Blackwell desktop / RTX PRO 6000) lacks tcgen05/TMEM,
+                    # so deep_gemm is unavailable. The TileLang paged-logits kernel
+                    # (with the SM120 2-D K-tile fix) is validated on SM120 and is
+                    # faster than the torch fallback, so default the DSA indexer
+                    # paged (decode) logits to TileLang. The ragged (prefill) logits
+                    # still use the torch reference (no tilelang ragged kernel yet).
+                    # Honor an explicit torch opt-in if the user set it.
+                    if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+                        envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                    envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                    envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                    logger.warning(
+                        "SM120 detected for DSA model: using TileLang paged-logits "
+                        "kernel and disabling DeepGEMM/large-SMEM optimizations."
+                    )
 
                 index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
                 index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
@@ -4484,6 +4511,20 @@ class ServerArgs:
                 "FlashInfer allreduce fusion is forcibly disabled "
                 "via --enforce-disable-flashinfer-allreduce-fusion."
             )
+
+        # FlashInfer allreduce fusion has no SM120 (Blackwell desktop / RTX PRO
+        # 6000) kernel; _resolve_backend() rejects it and crashes at warmup. If it
+        # was requested (e.g. via the deprecated --enable-flashinfer-allreduce-fusion
+        # flag or an explicit backend), disable it with a warning rather than fail.
+        if (
+            self.flashinfer_allreduce_fusion_backend is not None
+            and is_sm120_supported()
+        ):
+            logger.warning(
+                "FlashInfer allreduce fusion is not supported on SM120; "
+                "disabling it. SM120 multi-GPU TP uses standard all-reduce."
+            )
+            self.flashinfer_allreduce_fusion_backend = None
 
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
         if model_arch in [

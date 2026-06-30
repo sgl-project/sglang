@@ -1,4 +1,5 @@
 import functools
+import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -42,6 +43,27 @@ if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
     pass_configs[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = True
 elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
     pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
+
+# SM120 (Blackwell desktop / RTX PRO 6000) has no Hopper WGMMA. tilelang would
+# otherwise emit wgmma (tl::wait_wgmma) for these gemms and fail to compile, so
+# force the MMA path on SM120. Empty (no-op) on every other architecture, so
+# Hopper/SM100 behavior is unchanged. Merge `**_SM120_WGMMA_OFF` into each
+# kernel's pass_configs.
+from sglang.srt.utils import is_sm120_supported as _is_sm120_supported
+
+_IS_SM120 = _is_sm120_supported()
+_SM120_WGMMA_OFF = {}
+if _IS_SM120 and hasattr(tilelang.PassConfigKey, "TL_DISABLE_WGMMA"):
+    _SM120_WGMMA_OFF[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
+    pass_configs[tilelang.PassConfigKey.TL_DISABLE_WGMMA] = True
+
+# NOTE: the v2 DSA attention kernel hardwires its load offsets to block_I=64
+# (~166 KB smem), which exceeds SM120's ~100 KB cap. block_I<64 compiles but
+# reads past the smaller K buffers (illegal memory access), so it is NOT safely
+# tunable -- the v2 tilelang kernel cannot run on SM120 bf16. SM120 should use
+# the triton sparse-MLA path (fp8 KV) instead. Kept as an env knob (default 64)
+# only for experimentation.
+_SM120_DSA_BLOCK_I = int(os.environ.get("SGLANG_SM120_DSA_BLOCK_I", "64"))
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
@@ -255,6 +277,7 @@ def fp8_index(
 @tilelang.jit(
     out_idx=[-1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
@@ -435,6 +458,7 @@ def sparse_attention_fwd_kernel_v1(
         "--ptxas-options=-v,--register-usage-level=10",
         "-DNDEBUG",
     ],
+    pass_configs=_SM120_WGMMA_OFF,
 )  # type: ignore
 def sparse_attention_fwd_kernel_v2(
     num_heads: int,
@@ -820,6 +844,7 @@ def sparse_attention_fwd_kernel_v2(
 @tilelang.jit(
     out_idx=[-2, -1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
@@ -998,6 +1023,7 @@ def sparse_mla_fwd_decode_partial(
 @tilelang.jit(
     out_idx=[-1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
@@ -1396,8 +1422,10 @@ def tilelang_sparse_fwd(
         )
         out = kernel_combine(partial_o_batched, partial_lse_batched)
     else:
+        # SM120 has ~100 KB smem; shrink the K block so the kernel fits.
+        _kw = {"block_I": _SM120_DSA_BLOCK_I} if _IS_SM120 else {}
         kernel = sparse_attention_fwd_kernel_v2(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **_kw
         )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
@@ -1459,8 +1487,15 @@ def fp8_paged_mqa_logits_kernel(
             for j in T.Pipelined(n_iters, num_stages=2):
                 i = i_start + j
                 page = page_table[bx, i]
-                k_smem_u8 = T.alloc_shared((B * D,), UINT8)
-                T.copy(kvcache_u8[page, 0:SCALE_OFFSET], k_smem_u8)
+                # SM120 (Blackwell desktop / RTX PRO 6000): the non-TMA swizzled
+                # copy path reindexes via CheckAndGetBufferRowSize, which requires
+                # a >=2-D shared buffer. Allocate the K tile as (B, D) and fill it
+                # with the same bytes as before (value region = first B*D bytes of
+                # the page, row-major) via an explicit parallel copy (T.view only
+                # accepts a Buffer, not a global slice).
+                k_smem_u8 = T.alloc_shared((B, D), UINT8)
+                for b_, d_ in T.Parallel(B, D):
+                    k_smem_u8[b_, d_] = kvcache_u8[page, b_ * D + d_]
                 k_smem = T.view(k_smem_u8, (B, D), FP8)
                 k_s_smem_u8 = T.alloc_shared((B * 4,), UINT8)
                 T.copy(kvcache_u8[page, SCALE_OFFSET:BLOCK_BYTES], k_s_smem_u8)
@@ -1574,6 +1609,7 @@ def _topk_length_sentinel(device: torch.device, batch: int) -> torch.Tensor:
 @tilelang.jit(
     out_idx=[-2, -1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -2215,6 +2251,7 @@ def dpsk_v4_fp8_partial_kernel(
 @tilelang.jit(
     out_idx=[-2, -1],
     pass_configs={
+        **_SM120_WGMMA_OFF,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
