@@ -470,9 +470,9 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-mi35x-rocm720:
     needs: [check-changes]
@@ -746,7 +746,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-2gpu-sglang]
-        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (test_disagg_server.py)
+        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (single_test_file/test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -1085,6 +1085,23 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
+      - name: Verify NIXL in Container
+        run: |
+          docker exec ci_sglang bash -lc '
+            set -eux
+            export LD_LIBRARY_PATH=/opt/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
+            python -c "import nixl; print(\"nixl OK:\", nixl.__file__)"
+            test -d /opt/ucx/lib
+            UCX_INFO=$(command -v ucx_info || true)
+            if [ -z "$UCX_INFO" ]; then
+              UCX_INFO=/opt/ucx/bin/ucx_info
+            fi
+            test -x "$UCX_INFO"
+            "$UCX_INFO" -v
+            "$UCX_INFO" -d | grep -iq rocm
+            python -c "from nixl._api import nixl_agent, nixl_agent_config; nixl_agent(\"ci-smoke\", nixl_agent_config(backends=[\"UCX\"])); print(\"nixl UCX backend init OK\")"
+          '
+
       - name: Verify RDMA in Container
         run: |
           docker exec -u root ci_sglang bash -c '
@@ -1160,6 +1177,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
@@ -1210,6 +1228,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |

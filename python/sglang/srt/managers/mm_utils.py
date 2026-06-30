@@ -16,6 +16,11 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
@@ -1227,7 +1232,7 @@ def tensor_hash(tensor_list) -> int:
         # CPU path: hash each tensor incrementally without concat
         hasher = hashlib.sha256()
         for t in tensors:
-            t = t.detach().contiguous()
+            t = t.detach().cpu().contiguous()
             hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -1235,7 +1240,7 @@ def tensor_hash(tensor_list) -> int:
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().contiguous()
+    tensor = tensor.detach().cpu().contiguous()
     hasher = hashlib.sha256()
     hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
@@ -1319,6 +1324,22 @@ def _get_length(value):
     if isinstance(value, (list, tuple)):
         return len(value)
     return None
+
+
+def _is_rank2_grid(value):
+    """True if `value` is a rank-2 grid ([N, dims]) suitable for per-row prod.
+
+    Tensors/arrays must have ndim == 2; nested lists/tuples must have each row
+    be a sequence. Anything flat (1-D / scalars) is rejected so callers fall
+    back to a simple split instead of mis-collapsing it with prod(dim=-1).
+    """
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value.ndim == 2
+    if isinstance(value, (list, tuple)):
+        return len(value) > 0 and all(
+            isinstance(row, (list, tuple, torch.Tensor, np.ndarray)) for row in value
+        )
+    return False
 
 
 def _slice_value(value, start, end):
@@ -1485,10 +1506,30 @@ def get_new_expanded_mm_items(original_mm_items):
             num_items = len(item.offsets)
 
             if item.is_image():
+                # MoonViT-style models (e.g. LocateAnything) carry per-image
+                # grids under `image_grid_hws` ([h, w]) rather than
+                # `image_grid_thw` ([t, h, w]); both encode dim-0 patch counts
+                # via prod over the last axis, so accept either key. (Use an
+                # explicit None check, not `a or b`: the value is a multi-element
+                # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
                     # No grid info — fall back to simple split by feature dim-0
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
+                    continue
+
+                # The grid must be rank-2 ([N, dims]) so `prod` over the last
+                # axis yields one patch count per image. A flat 1-D grid (e.g.
+                # `tensor([h, w])` with num_items==2) would pass the length check
+                # above but `prod(dim=-1)` collapses it to a scalar and mis-splits.
+                # The HF processor always emits rank-2, so this only guards the
+                # degenerate case — fall back to simple split rather than corrupt
+                # the slice boundaries.
+                if not _is_rank2_grid(image_grid_thw):
                     if not _try_simple_split(item, num_items, expanded_mm_items):
                         expanded_mm_items.append(item)
                     continue
@@ -1733,17 +1774,14 @@ def wrap_shm_features(obj):
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
 
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            item_hash = getattr(item, "hash", None)
-            if hasattr(item, "feature") and item.feature is not None:
+            item_hash = item.hash
+            if item.feature is not None:
                 item.feature = _wrap_tensor_or_list(
                     item.feature, precomputed_hash=item_hash
                 )
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings, precomputed_hash=item_hash
                 )
@@ -1762,14 +1800,17 @@ def _feature_has_shm(feat) -> bool:
 def has_shm_features(recv_reqs):
     """Return True if any request in the list contains ShmPointerMMData."""
     for req in recv_reqs:
-        if hasattr(req, "batch"):
+        if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
                 return True
-        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+        elif (
+            isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+            and req.mm_inputs
+        ):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
-                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                if _feature_has_shm(item.precomputed_embeddings):
                     return True
     return False
 
@@ -1794,19 +1835,19 @@ def unwrap_shm_features(obj):
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
     # Handle batch requests
-    if hasattr(obj, "batch"):
+    if isinstance(obj, BaseBatchReq):
         for sub_obj in obj.batch:
             unwrap_shm_features(sub_obj)
         return obj
     # Handle single requests
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if (
+        isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+        and obj.mm_inputs
+    ):
         for item in obj.mm_inputs.mm_items:
-            if hasattr(item, "feature") and item.feature is not None:
+            if item.feature is not None:
                 item.feature = _unwrap_tensor_or_list(item.feature)
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
