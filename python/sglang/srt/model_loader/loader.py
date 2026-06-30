@@ -85,6 +85,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
+from sglang.srt.model_loader.weight_utils import pin_h2d_copy_during_load
 from sglang.srt.utils.common import is_cuda_alike
 
 # Constants for memory management
@@ -92,7 +93,6 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs, temp_set_env
-from sglang.srt.model_loader.pin_h2d_copy import pin_h2d_copy_during_load
 from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,

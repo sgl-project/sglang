@@ -4,14 +4,30 @@ import contextlib
 import os
 import threading
 import unittest
-from unittest.mock import mock_open, patch
+from unittest.mock import patch
 
 os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
 import torch
 
 from sglang.srt.model_loader import loader as loader_module
-from sglang.srt.model_loader import pin_h2d_copy
+from sglang.srt.model_loader import weight_utils as pin_h2d_copy
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+"""Unit tests for model-load H2D copy pinning."""
+
+import contextlib
+import os
+import threading
+import unittest
+from unittest.mock import patch
+
+os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+
+import torch
+
+from sglang.srt.model_loader import loader as loader_module
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,14 +50,15 @@ class _FakeStream:
 
 
 class _FakeCuda:
-    def __init__(self):
-        self.current_device_idx = 0
+    def __init__(self, available=True, current_device_idx=0):
+        self.available = available
+        self.current_device_idx = current_device_idx
         self.created_streams = []
         self.device_contexts = []
         self.stream_contexts = []
 
     def is_available(self):
-        return True
+        return self.available
 
     def current_device(self):
         return self.current_device_idx
@@ -95,84 +112,32 @@ class _FakeTensor:
 class _FakeTorch:
     Tensor = _FakeTensor
 
-    def __init__(self):
-        self.cuda = _FakeCuda()
+    def __init__(self, *, cuda_available=True, current_device_idx=0):
+        self.cuda = _FakeCuda(
+            available=cuda_available, current_device_idx=current_device_idx
+        )
 
 
 class TestPinH2DCopy(CustomTestCase):
-    def setUp(self):
-        pin_h2d_copy._is_grace_cpu_platform.cache_clear()
+    def _run_with_fake_torch(self, fake_torch):
+        return patch.object(pin_h2d_copy, "torch", fake_torch)
 
-    def tearDown(self):
-        pin_h2d_copy._is_grace_cpu_platform.cache_clear()
-
-    @patch("sglang.srt.model_loader.pin_h2d_copy.platform.machine")
-    @patch("sglang.srt.model_loader.pin_h2d_copy.subprocess.check_output")
-    @patch("builtins.open", new_callable=mock_open, read_data="")
-    def test_grace_cpu_platform_detected_from_lscpu(
-        self, _mock_file, mock_check_output, mock_machine
-    ):
-        mock_machine.return_value = "aarch64"
-        mock_check_output.return_value = (
-            "BIOS Vendor ID: NVIDIA\n"
-            "BIOS Model name: Grace A02P 900-2G548-0001-000 CPU @ 3.3GHz\n"
-        )
-
-        self.assertTrue(pin_h2d_copy._is_grace_cpu_platform())
-
-    @patch("sglang.srt.model_loader.pin_h2d_copy.platform.machine")
-    @patch("sglang.srt.model_loader.pin_h2d_copy.subprocess.check_output")
-    @patch("builtins.open", side_effect=OSError)
-    def test_grace_cpu_platform_rejects_non_grace_arm(
-        self, _mock_file, mock_check_output, mock_machine
-    ):
-        mock_machine.return_value = "aarch64"
-        mock_check_output.return_value = "Vendor ID: ARM\nModel name: Neoverse-V2\n"
-
-        self.assertFalse(pin_h2d_copy._is_grace_cpu_platform())
-
-    @patch("sglang.srt.model_loader.pin_h2d_copy.platform.machine")
-    @patch("sglang.srt.model_loader.pin_h2d_copy.subprocess.check_output")
-    def test_grace_cpu_platform_rejects_non_arm(self, mock_check_output, mock_machine):
-        mock_machine.return_value = "x86_64"
-
-        self.assertFalse(pin_h2d_copy._is_grace_cpu_platform())
-        mock_check_output.assert_not_called()
-
-    @patch("sglang.srt.model_loader.pin_h2d_copy._is_grace_cpu_platform")
-    def test_context_does_not_patch_when_cuda_unavailable(self, mock_is_grace):
-        fake_torch = _FakeTorch()
+    def test_context_does_not_patch_when_cuda_unavailable(self):
+        fake_torch = _FakeTorch(cuda_available=False)
         original_copy = fake_torch.Tensor.copy_
-        fake_torch.cuda.is_available = lambda: False
-        mock_is_grace.return_value = True
 
-        with patch.object(pin_h2d_copy, "torch", fake_torch):
+        with self._run_with_fake_torch(fake_torch):
             with pin_h2d_copy.pin_h2d_copy_during_load():
                 self.assertIs(fake_torch.Tensor.copy_, original_copy)
             self.assertIs(fake_torch.Tensor.copy_, original_copy)
 
-    @patch("sglang.srt.model_loader.pin_h2d_copy._is_grace_cpu_platform")
-    def test_context_does_not_patch_when_not_grace(self, mock_is_grace):
+    def test_cpu_to_cuda_copy_uses_destination_device_stream_and_restores(self):
         fake_torch = _FakeTorch()
         original_copy = fake_torch.Tensor.copy_
-        mock_is_grace.return_value = False
-
-        with patch.object(pin_h2d_copy, "torch", fake_torch):
-            with pin_h2d_copy.pin_h2d_copy_during_load():
-                self.assertIs(fake_torch.Tensor.copy_, original_copy)
-            self.assertIs(fake_torch.Tensor.copy_, original_copy)
-
-    @patch("sglang.srt.model_loader.pin_h2d_copy._is_grace_cpu_platform")
-    def test_cpu_to_cuda_copy_uses_destination_device_stream_and_restores(
-        self, mock_is_grace
-    ):
-        fake_torch = _FakeTorch()
-        original_copy = fake_torch.Tensor.copy_
-        mock_is_grace.return_value = True
         dst = _FakeTensor(is_cuda=True, device=_FakeDevice("cuda", 2))
         src = _FakeTensor(is_cuda=False, device=_FakeDevice("cpu"), pinned=False)
 
-        with patch.object(pin_h2d_copy, "torch", fake_torch), patch.object(
+        with self._run_with_fake_torch(fake_torch), patch.object(
             pin_h2d_copy, "_wload_pin_tls", threading.local()
         ):
             with pin_h2d_copy.pin_h2d_copy_during_load():
@@ -182,26 +147,98 @@ class TestPinH2DCopy(CustomTestCase):
 
         self.assertEqual(fake_torch.cuda.device_contexts, [2])
         self.assertEqual(fake_torch.cuda.stream_contexts, [2])
-        self.assertEqual([stream.device_idx for stream in fake_torch.cuda.created_streams], [2])
+        self.assertEqual(
+            [stream.device_idx for stream in fake_torch.cuda.created_streams], [2]
+        )
         self.assertTrue(fake_torch.cuda.created_streams[0].synchronized)
-        self.assertEqual(dst.copy_calls, [(src.pinned_tensor, (), {"non_blocking": True})])
+        self.assertEqual(
+            dst.copy_calls, [(src.pinned_tensor, (), {"non_blocking": True})]
+        )
 
-    @patch("sglang.srt.model_loader.pin_h2d_copy._is_grace_cpu_platform")
-    def test_pin_failure_falls_back_to_original_copy(self, mock_is_grace):
+    def test_cuda_copy_with_none_device_index_uses_current_device(self):
+        fake_torch = _FakeTorch(current_device_idx=3)
+        dst = _FakeTensor(is_cuda=True, device=_FakeDevice("cuda", None))
+        src = _FakeTensor(is_cuda=False, device=_FakeDevice("cpu"), pinned=False)
+
+        with self._run_with_fake_torch(fake_torch), patch.object(
+            pin_h2d_copy, "_wload_pin_tls", threading.local()
+        ):
+            with pin_h2d_copy.pin_h2d_copy_during_load():
+                self.assertIs(dst.copy_(src), dst)
+
+        self.assertEqual(fake_torch.cuda.device_contexts, [3])
+        self.assertEqual(
+            [stream.device_idx for stream in fake_torch.cuda.created_streams], [3]
+        )
+
+    def test_same_thread_reuses_stream_for_same_device(self):
         fake_torch = _FakeTorch()
-        mock_is_grace.return_value = True
+        dst = _FakeTensor(is_cuda=True, device=_FakeDevice("cuda", 1))
+        src1 = _FakeTensor(is_cuda=False, device=_FakeDevice("cpu"), pinned=False)
+        src2 = _FakeTensor(is_cuda=False, device=_FakeDevice("cpu"), pinned=False)
+
+        with self._run_with_fake_torch(fake_torch), patch.object(
+            pin_h2d_copy, "_wload_pin_tls", threading.local()
+        ):
+            with pin_h2d_copy.pin_h2d_copy_during_load():
+                dst.copy_(src1)
+                dst.copy_(src2)
+
+        self.assertEqual(len(fake_torch.cuda.created_streams), 1)
+        self.assertEqual(fake_torch.cuda.stream_contexts, [1, 1])
+
+    def test_pin_failure_falls_back_to_original_copy(self):
+        fake_torch = _FakeTorch()
         dst = _FakeTensor(is_cuda=True, device=_FakeDevice("cuda", 1))
         src = _FakeTensor(
             is_cuda=False, device=_FakeDevice("cpu"), pinned=False, pin_error=True
         )
 
-        with patch.object(pin_h2d_copy, "torch", fake_torch), patch.object(
+        with self._run_with_fake_torch(fake_torch), patch.object(
             pin_h2d_copy, "_wload_pin_tls", threading.local()
         ):
             with pin_h2d_copy.pin_h2d_copy_during_load():
                 self.assertIs(dst.copy_(src), dst)
 
         self.assertEqual(dst.copy_calls, [(src, (), {})])
+
+    def test_non_intercepted_copies_use_original_copy(self):
+        fake_torch = _FakeTorch()
+        cases = [
+            (
+                _FakeTensor(is_cuda=False, device=_FakeDevice("cpu")),
+                _FakeTensor(is_cuda=False, device=_FakeDevice("cpu")),
+            ),
+            (
+                _FakeTensor(is_cuda=True, device=_FakeDevice("cuda", 0)),
+                _FakeTensor(is_cuda=True, device=_FakeDevice("cuda", 0)),
+            ),
+            (
+                _FakeTensor(is_cuda=True, device=_FakeDevice("cuda", 0)),
+                _FakeTensor(is_cuda=False, device=_FakeDevice("cpu"), pinned=True),
+            ),
+            (_FakeTensor(is_cuda=True, device=_FakeDevice("cuda", 0)), object()),
+        ]
+
+        with self._run_with_fake_torch(fake_torch):
+            with pin_h2d_copy.pin_h2d_copy_during_load():
+                for dst, src in cases:
+                    self.assertIs(dst.copy_(src), dst)
+
+        for dst, src in cases:
+            self.assertEqual(dst.copy_calls, [(src, (), {})])
+        self.assertEqual(fake_torch.cuda.created_streams, [])
+
+    def test_copy_restored_after_exception_in_context_body(self):
+        fake_torch = _FakeTorch()
+        original_copy = fake_torch.Tensor.copy_
+
+        with self._run_with_fake_torch(fake_torch):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                with pin_h2d_copy.pin_h2d_copy_during_load():
+                    self.assertIsNot(fake_torch.Tensor.copy_, original_copy)
+                    raise RuntimeError("boom")
+            self.assertIs(fake_torch.Tensor.copy_, original_copy)
 
     def test_default_model_loader_wraps_load_weights_with_pin_context(self):
         events = []
@@ -222,9 +259,9 @@ class TestPinH2DCopy(CustomTestCase):
                 events.append(("exit", None))
 
         weights = [("weight", torch.empty(0))]
-        with patch.object(loader_module, "is_cuda_alike", return_value=False), patch.object(
-            loader_module, "pin_h2d_copy_during_load", fake_pin_context
-        ):
+        with patch.object(
+            loader_module, "is_cuda_alike", return_value=False
+        ), patch.object(loader_module, "pin_h2d_copy_during_load", fake_pin_context):
             loader_module.DefaultModelLoader.load_weights_and_postprocess(
                 DummyModel(), weights, torch.device("cpu")
             )
