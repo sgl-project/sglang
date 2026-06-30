@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import random
 import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,8 +28,24 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     if envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
+            # _numactl_cpu_mem_args already returns None (after warning / optional
+            # raise) when there is no allowed-CPU intersection (#26983).
             numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
             if numactl_args is not None:
+                # Verify numactl can actually apply the binding before we exec it
+                # in front of the interpreter; relax the memory policy if not.
+                numactl_args = _probe_numactl_args(numactl_args)
+                if numactl_args is None:
+                    # numactl could not apply even a CPU-only binding (e.g.
+                    # set_mempolicy(2) blocked by seccomp, which the read-only
+                    # get_mempolicy(2) probe in _can_set_mempolicy cannot detect).
+                    # Reuse #26983's failure semantics: warn and start without
+                    # binding, or raise when SGLANG_CRASH_ON_NUMA_BIND_FAILURE.
+                    _handle_numa_bind_failure(
+                        numa_node, os.sched_getaffinity(0), gpu_id
+                    )
+                    yield
+                    return
                 executable, debug_str = _create_numactl_executable(
                     numactl_args=numactl_args
                 )
@@ -190,6 +207,81 @@ def _numactl_cpu_mem_args(node: int, gpu_id: int) -> Optional[str]:
         return f"--cpunodebind={node} --membind={node}"
     cpu_list = ",".join(str(c) for c in sorted(target_cpus))
     return f"--physcpubind={cpu_list} --membind={node}"
+
+
+def _strip_memory_args(numactl_args: str) -> str:
+    """Return ``numactl_args`` with the memory-policy segment removed, keeping
+    only the CPU binding (``--cpunodebind`` / ``--physcpubind``)."""
+    return " ".join(
+        token
+        for token in numactl_args.split()
+        if not token.startswith(("--membind", "--preferred"))
+    )
+
+
+def _probe_numactl_args(numactl_args: str) -> Optional[str]:
+    """Dry-run ``numactl <args> true`` and fall back to a weaker binding when the
+    kernel rejects the strongest one.
+
+    ``configure_subprocess`` applies NUMA binding by exec-ing ``numactl`` in front
+    of the Python interpreter (see ``_create_numactl_executable``), so a binding
+    that ``numactl`` refuses kills the worker before Python starts, with no
+    traceback. ``_can_set_mempolicy`` only probes ``get_mempolicy(2)`` (read),
+    which does not catch ``set_mempolicy(2)`` being denied (e.g. by a seccomp
+    profile) or a ``--membind`` that the cpuset rejects with ``EINVAL``.
+
+    To avoid that silent crash we probe the requested args and progressively relax
+    the *memory* policy while keeping the CPU binding intact::
+
+        --membind=N  ->  --preferred=N  ->  drop the memory segment
+
+    Returns the strongest args that actually run, or ``None`` if even CPU-only
+    binding fails (or ``numactl`` is missing / errors out).
+    """
+
+    def _probe(args: str) -> bool:
+        try:
+            return (
+                subprocess.run(
+                    ["numactl", *args.split(), "true"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).returncode
+                == 0
+            )
+        except Exception as e:
+            # Missing numactl, timeout, etc. Treat as "this binding does not work".
+            logger.debug(f"numactl probe for {args!r} failed: {e}")
+            return False
+
+    # 1. Strongest binding: exactly what was requested.
+    if _probe(numactl_args):
+        return numactl_args
+
+    # 2. Relax a hard --membind=N to a soft --preferred=N. The memory segment here
+    #    is always a single node, which maps cleanly onto --preferred (single-node
+    #    only). MPOL_PREFERRED is a hint and can succeed where MPOL_BIND is denied.
+    if "--membind=" in numactl_args:
+        preferred_args = numactl_args.replace("--membind=", "--preferred=")
+        if _probe(preferred_args):
+            logger.warning(
+                f"numactl rejected hard memory binding ({numactl_args!r}); "
+                f"falling back to soft preferred policy ({preferred_args!r})."
+            )
+            return preferred_args
+
+    # 3. Drop the memory segment entirely, keep only the CPU binding.
+    cpu_only_args = _strip_memory_args(numactl_args)
+    if cpu_only_args and cpu_only_args != numactl_args and _probe(cpu_only_args):
+        logger.warning(
+            f"numactl rejected memory binding ({numactl_args!r}); falling back "
+            f"to CPU-only binding ({cpu_only_args!r})."
+        )
+        return cpu_only_args
+
+    # 4. Nothing worked.
+    return None
 
 
 def _handle_numa_bind_failure(
