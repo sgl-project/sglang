@@ -101,6 +101,13 @@ emit("CHUNK", rt["chunked_prefill_size"])
 emit("SWA", rt["swa_full_tokens_ratio"])
 emit("PTP", b["prefill"]["tensor-parallel-size"])
 emit("DTP", b["decode"]["tensor-parallel-size"])
+emit("PEP", b["prefill"].get("expert-parallel-size", 1))
+emit("PDP", b["prefill"].get("data-parallel-size", 1))
+m = r.get("mtp", {}) or {}
+emit("MTP_ENABLED", 1 if m.get("enabled") else 0)
+emit("MTP_STEPS", m.get("num_steps", 3))
+emit("MTP_TOPK", m.get("eagle_topk", 1))
+emit("MTP_DRAFT", m.get("num_draft_tokens", 4))
 # Worker counts double as node counts here: one server per node (TP == GPUs/node).
 # 1P1D today; bumping these reserves 2P2D / 1P3D / 3P1D. Multi-node-per-worker
 # (TP > GPUs/node, needs --dist-init-addr/--nnodes/--node-rank) is out of scope.
@@ -175,12 +182,24 @@ DSV4_ENV=(
 DSV4_ENV_STR="${DSV4_ENV[*]}"
 MORI_ENV="-e MORI_DISABLE_AUTO_XGMI=1 -e NCCL_IB_HCA=ionic -e NCCL_IB_GID_INDEX=1 -e NCCL_CROSS_NIC=1"
 
+# Optional topology / speculative-decode flags driven by the recipe. Base recipes
+# (EP1/DP1, no mtp) leave EXTRA_FLAGS empty, preserving prior behavior exactly.
+EXTRA_FLAGS=""
+(( PDP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --enable-dp-attention --dp-size $PDP"
+(( PEP > 1 )) && EXTRA_FLAGS="$EXTRA_FLAGS --ep-size $PEP"
+if [[ "$MTP_ENABLED" == "1" ]]; then
+    EXTRA_FLAGS="$EXTRA_FLAGS --speculative-algorithm EAGLE \
+--speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
+--speculative-num-draft-tokens $MTP_DRAFT"
+fi
+echo "extra flags: ${EXTRA_FLAGS:-<none>} (pep=$PEP pdp=$PDP mtp=$MTP_ENABLED)"
+
 COMMON_FLAGS="--trust-remote-code --tp $PTP --disable-radix-cache \
 --attention-backend $ATTN --max-running-requests $MAXREQ --page-size $PAGE \
 --mem-fraction-static $MEMFRAC --swa-full-tokens-ratio $SWA \
 --chunked-prefill-size $CHUNK --disable-shared-experts-fusion \
 --tool-call-parser deepseekv4 --reasoning-parser deepseek-v4 \
---disaggregation-transfer-backend mori --disaggregation-ib-device $IB"
+--disaggregation-transfer-backend mori --disaggregation-ib-device $IB$EXTRA_FLAGS"
 
 DOCKER_COMMON="--rm --network host --ipc host --shm-size 32g --privileged \
 --security-opt seccomp=unconfined \
