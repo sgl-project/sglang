@@ -1047,6 +1047,13 @@ class FusedMoE(torch.nn.Module):
         SHARD_ID_TO_SHARDED_DIM = {"w13": 1, "w2": 2}
         SHARD_ID_TO_SHARDED_DIM_TRANSPOSE = {"w13": 2, "w2": 1}
 
+        # Narrow to local experts for EP (mirrors weight_loader's
+        # _map_global_expert_id_to_local_expert_id filtering)
+        if self.moe_ep_size > 1:
+            loaded_weight = loaded_weight.narrow(
+                0, self.moe_ep_rank * self._num_local_routed, self._num_local_routed
+            )
+
         expert_data = param.data
         is_bias = expert_data.dim() == 2
 
